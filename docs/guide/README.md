@@ -1,0 +1,60 @@
+<div align="center">
+
+# 🧭 letify guides
+
+**Task-oriented walkthroughs. Pick the one that matches what you are trying to do.**
+
+[한국어 가이드](ko/README.md) · [Back to the project](../../README.md)
+
+</div>
+
+---
+
+## 📚 The guides
+
+| | Guide | Read it when |
+|---|---|---|
+| 1️⃣ | **[Getting started](01-getting-started.md)** | You have an account and want something running in ten minutes |
+| 2️⃣ | **[Providers and accounts](02-providers.md)** | You are adding Colab, a lab server, Modal or Elice, or juggling several accounts |
+| 3️⃣ | **[Choosing the execution mode](03-execution-modes.md)** | You want to know whether to ship the loop or forward CUDA calls, with the arithmetic |
+| 4️⃣ | **[Environments and data](04-environments-and-data.md)** | Session start is slow and you want the cache to fix it |
+| 5️⃣ | **[Sweeps and concurrency](05-sweeps.md)** | You are running many configurations and want them in parallel |
+| 6️⃣ | **[Cost control](06-cost.md)** | You are paying for this yourself and want no surprises |
+| 7️⃣ | **[Troubleshooting](07-troubleshooting.md)** | Something failed and you want the specific cause |
+
+---
+
+## 🗺️ If you are in a hurry
+
+```python
+import letify
+
+let = letify.Launcher()
+colab = let.providers.colab_a
+
+@let.function(gpu=colab.G4)
+def train(lr, bs):
+    ...
+    return {"loss": loss}
+
+with let.run():
+    print(train(lr=1e-4, bs=32))
+```
+
+Three things to know before you read anything else:
+
+1. **Calling the function runs it.** There is no `.remote()`. Sync or async is decided by whether you wrote `def` or `async def`.
+2. **`with let.run():` is where money starts and stops.** Outside it, a call raises.
+3. **letify never silently takes a slower path.** If a mode is unavailable you get an exception explaining why.
+
+---
+
+## 🧩 Reference, not guides
+
+| | |
+|---|---|
+| [PROJECT.md](../../PROJECT.md) | Every feature and the whole API surface |
+| [docs/SPEC.md](../SPEC.md) | The design, decision by decision |
+| [docs/COMPONENT.md](../COMPONENT.md) | Classes and vocabulary |
+| [docs/NETWORK.md](../NETWORK.md) | Transports and measured latency |
+| [docs/INTENT.md](../INTENT.md) | Goals, claims and open questions |

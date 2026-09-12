@@ -1,0 +1,72 @@
+# Intent
+
+> Why letify exists, what it claims, and what it will not do.
+
+## The problem
+
+A researcher with no GPU of their own, or one whose lab GPU is always queued, has to rent one. The cheapest way to rent a given card is often the least convenient: a notebook session that is evicted, has no persistent disk, and hands out whichever accelerator is free. The convenient way costs several times more per hour for the same silicon.
+
+The gap is large enough to change what research is affordable. The same RTX PRO 6000 costs about 975 KRW per hour through Colab credits and about 4,070 KRW per hour on Modal, a factor of four. For a graduate student paying out of pocket, that factor decides how many experiments get run.
+
+letify exists so that the cheap option can be used like the expensive one. You declare what a function needs, and it runs on whichever infrastructure you have, without the session management, the repeated environment setup and the repeated data transfer that make the cheap option painful.
+
+## Goals
+
+1. **One declaration, several providers.** The same declared function runs on Colab, on Modal, on a lab server over SSH, and on the local machine. Changing provider is changing one value, not rewriting the code.
+2. **Setup cost paid once, not per call.** Provider boot, environment installation and data transfer are billed as GPU time, so they must be amortized across calls rather than repeated.
+3. **No silent performance cliff.** If the fast path is unavailable, letify says so and stops. It never quietly takes a path that is four times slower.
+4. **A bill that cannot run away.** A session cannot outlive the process that started it. A crashed script must not leave a GPU billing.
+5. **Short sessions are the normal case.** The design assumes one to two hours of work, frequent restarts, and eviction at any moment.
+
+## Claims
+
+Each claim is one sentence to agree or disagree with. An experiment that tests one lists it in its pull request YAML as `claims: [N1]`.
+
+### N1. Shipping the whole loop keeps efficiency near a local run even over a high-latency link
+
+Sending a training or generation loop to the remote machine and running it there reaches at least 95 percent of the throughput of running on that machine directly, at a 150 ms round trip, because the loop's host synchronizations become local to the remote process.
+
+### N2. Forwarding CUDA calls is only viable at low latency and low synchronization count
+
+Efficiency for call forwarding follows `T / (T + k * RTT)`, where `T` is GPU time per step and `k` is host synchronizations per step. It is therefore unusable for token by token decoding at any useful round trip, and it gets worse as the GPU gets faster.
+
+### N3. Pooling runtimes by declaration removes per-call setup cost
+
+Reusing a session across calls with the same instance and environment reduces the amortized setup cost per call to near zero, where starting a session per call pays provider boot time every time.
+
+### N4. A content addressed store with archive-level granularity beats file-level synchronization
+
+For an environment or a model cache, packing a tree into one hash-named blob transfers faster than synchronizing files individually, and immutable naming removes the write conflicts that a two way synchronization has between concurrent sessions.
+
+### N5. Storage persistence, not the provider's identity, decides the right execution mode
+
+Whether a provider's storage outlives a runtime determines whether shipping the function or forwarding calls is the better default, and a cache tier attached to an ephemeral provider is enough to move it into the persistent case.
+
+### N6. One declarative surface can cover every provider without a user-visible mode switch
+
+A user can express their intent as resources, that is which accelerator and where the CPU side runs, and never name a transport mechanism, with letify choosing the mechanism from the provider's properties.
+
+## Constraints
+
+- **Python only.** No compiled extension in the package. A wheel that has to be built for each platform is a maintenance cost this project will not carry, and hashing and transfer are not CPU bound at the link speeds involved.
+- **The local process stays alive for the duration of a run.** letify does not offer detached execution. A detached run whose remote side is evicted loses its results, so the local process stays the owner and the durable artifacts are checkpoints in the store.
+- **No credential in a tracked file.** Accounts and keys live in `~/.letify` or in the environment or the OS keyring.
+- **Colab accelerators require a paid entitlement.** The remote control features letify uses are permitted on paid plans while the compute unit balance is positive.
+
+## Non-goals
+
+- **Not a scheduler for a shared cluster.** letify targets one researcher's own accounts, not queue management for a group.
+- **Not a training framework.** It runs the user's code. It does not own the training loop, the metrics or the checkpoint format.
+- **Not a way around a provider's limits.** It does not attempt to bypass session limits, quotas or terms.
+- **No bitwise reproducibility.** Kernel selection by measured timing and batch dependent reduction order make that unachievable in general. The project aims for comparable results under fixed seeds, fixed batch size and fixed padding.
+
+## Open decisions
+
+Each of these would change a claim or a default. Answering one is a good first experiment.
+
+1. **How many concurrent sessions does one Colab account allow?** Undocumented, and it moves with tier, credit balance and demand. `max_runtimes` is a guess until this is measured.
+2. **What is the real host synchronization count per step, `k`, for the target workload?** Measurable with `torch.cuda.set_sync_debug_mode("warn")`. This sets whether call forwarding is worth implementing at all.
+3. **Does `colab ssh --proxy-mode` support port forwarding with `ssh -L`?** The CLI documents the ProxyCommand bridge but not forwarding. This decides whether a data channel separate from `colab exec` is available.
+4. **Is NVFP4 reachable in a stock Colab runtime?** Needs the CUDA version, the compute capability and whether the quantization stack installs.
+5. **Is the Elice SSH port stable across a restart?** If it is not, the configuration needs a command that resolves the current port.
+6. **What does Elice spot pricing cost?** The API exposes a pricing id, which suggests preemptible instances are available. This is a direct cost lever.

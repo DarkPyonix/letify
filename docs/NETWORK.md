@@ -1,0 +1,129 @@
+# Network
+
+> How each provider is reached, what that path costs, and why the tunnel choices are what they are. Measurements are dated, because these numbers move.
+
+All latency figures below assume a client in South Korea. Substitute your own round trip; every conclusion here is a function of it.
+
+## Why latency decides the design
+
+One number governs everything: `efficiency = T / (T + k * RTT)`, where `T` is GPU time per step and `k` is the number of points in that step where the host has to read a value back from the device.
+
+This is why letify ships whole loops. Inside a shipped loop, those reads are local to the remote process and `k * RTT` disappears. Outside one, every read is a network round trip.
+
+It is also why a faster GPU makes call forwarding worse. `T` shrinks and `RTT` does not.
+
+| Round trip | LoRA step, 0.5 s, k=3 | Decode step, 3 ms, k=1 |
+|---|---|---|
+| 20 ms | 89 percent | about 12 percent, 43 tokens per second |
+| 150 ms | 53 percent | about 2 percent, 6.5 tokens per second |
+| 450 ms | 27 percent | under 1 percent, 2 tokens per second |
+
+Decode throughput under forwarding is bounded near `1000 / (k * RTT)` tokens per second. At a 150 ms round trip an L4 and an RTX PRO 6000 both land near 5 to 6 tokens per second, so the card stops mattering. A generation loop that needs real speed has to be shipped, not forwarded.
+
+## Colab
+
+> Reached by the official Colab CLI. No tunnel, no terms risk.
+
+The CLI creates and destroys sessions with `colab new` and `colab stop`, runs commands with `colab exec`, and offers `colab ssh`, which opens a shell over a WebSocket and can act as an OpenSSH `ProxyCommand` bridge with `--proxy-mode`. A background daemon keeps the runtime from idling out without a browser tab open, and authentication uses Application Default Credentials, so the whole path automates without a prompt.
+
+**Terms.** Colab's FAQ disallows remote control such as SSH shells and remote desktops on free runtimes. Those restrictions are lifted on a paid plan while the compute unit balance is positive, and an exhausted balance reverts the account to the free tier policy. Accelerators themselves require a Pro or Pro plus entitlement. Session length is capped at 12 hours on the free tier and 24 hours on Pro plus.
+
+**Storage does not survive.** Changing the accelerator type produces a new virtual machine with an empty disk, which was checked by writing a marker file and looking for it after the switch. This is why `Colab` is ephemeral and why a volume matters so much there.
+
+**No fast path.** The control path crosses a Google frontend, so the round trip from Korea is on the order of 150 ms to 200 ms. `Colab.has_fast_path` is therefore false and asking for `cpu="local"` raises.
+
+**Open question.** Whether `ssh -L` port forwarding works over `colab ssh --proxy-mode` is not documented. Since the bridge hands off to a standard OpenSSH client, forwarding should follow, but it has not been verified. A verified answer would give letify a data channel independent of `colab exec`.
+
+## Shell
+
+> A direct SSH address is the best path and the first one tried.
+
+Order of preference is a direct address, then a jump host with `-J`, then a tunnel. University machines frequently allow one of the first two, and each step avoids a whole class of failure.
+
+Where the machine hands out a fresh port on each restart, the configuration can set `port_command` to a command that prints the current port, which is read at connection time.
+
+This is also the only provider family where call forwarding is worth offering. Root access allows a kernel mode tunnel, the path is layer 3 so raw sockets work, and the round trip on a domestic or campus link is small enough for the efficiency formula to come out well.
+
+## Tunnel
+
+> For a machine behind NAT that cannot accept an inbound connection. Tailscale by default, frp when UDP is blocked.
+
+### Why Tailscale is the default
+
+It needs no server of your own. It authenticates from an auth key with no prompt, which is what makes it scriptable. It is a layer 3 tunnel, so any TCP port works without declaring it. And when UDP is blocked it relays over TCP 443 instead of failing.
+
+Costs to know about. The free personal plan covers 6 users with unlimited user devices, but only 1,000 ephemeral resource minutes per month, which is about 16 hours. Bringing up a Colab node on every session runs into that. The seventh user converts the whole tailnet to paid and bills every seat.
+
+### Why frp is the fallback
+
+Tailscale's relay fallback is a performance trap rather than a failure. Throughput on a relayed path has been measured as low as 2.2 Mbit/s across continents, where the direct path expected 30 to 40 Mbit/s, and Tailscale states that its relay servers limit throughput for fairness. A relayed path also adds 5 ms to 30 ms.
+
+frp runs over TLS on port 443, supports arbitrary TCP as its main purpose, and is the easiest of the candidates to self-host. It needs a relay server with a public address, typically a small virtual machine at 4 to 6 USD per month, and relayed traffic counts against that machine's bandwidth twice.
+
+### Candidates considered and rejected
+
+| Candidate | Why not |
+|---|---|
+| ngrok | 1 GB per month free, then 0.10 USD per GB. Uneconomical for dataset transfer. |
+| Cloudflare Tunnel | No peer to peer path, requires the client side to install cloudflared too, and the documentation warns that persistent connections may close unexpectedly. |
+| ZeroTier | Always userspace crypto, so 200 to 400 Mbit/s at full CPU. Free tier narrowed to 10 devices and one network. Its Python binding has been unmaintained since 2022 and ships no wheel for current Python. |
+| Nebula | No TCP fallback at all, so a network that blocks UDP blocks it entirely. Needs a lighthouse with a public address. Managed Nebula is free to 100 hosts, which is why it stays on the list as an alternative. |
+| Raw WireGuard | No NAT traversal of its own, so it needs a relay server and a small control plane written by hand. No TCP fallback. |
+| Headscale | A self-hosted Tailscale control plane. Removes the ephemeral minute limit, at the cost of a public server, TLS, and running your own relay, which Tailscale's own documentation calls an advanced operation. Worth it only if the free plan limit is actually reached. |
+
+### MTU
+
+Hold it at 1280 to 1400. Every mesh VPN in this class shows the same failure mode above that: the tunnel comes up, interactive commands work, and bulk transfers stall silently because a path MTU discovery black hole swallows large segments. WireGuard defaults to 1420, ZeroTier to 2800, and Nebula to 1300 precisely because of this. 1280 is the IPv6 minimum and always works.
+
+### Why no tunnel helps Colab
+
+Every candidate needs `/dev/net/tun` for a full layer 3 tunnel, and a Colab runtime does not have it. Tailscale's own issue tracker carries a report of running there that fails with `is CONFIG_TUN enabled in your kernel?`, and both Tailscale and ZeroTier documentation list Colab-style containers among the environments without the device.
+
+Without the device, each candidate falls back to a userspace mode that is a SOCKS5 proxy rather than a network interface. Arbitrary TCP still works through the proxy, but nothing is captured transparently, no raw sockets or ICMP exist, and the throughput cost is severe: one report measured 902 Kbit/s through Tailscale's SOCKS5 userspace mode where the direct link did 83.9 Mbit/s, and Nebula's own project measures its userspace stack at roughly a quarter of kernel throughput.
+
+The official CLI makes all of this unnecessary, which is why `Colab` does not use a tunnel.
+
+## Elice
+
+> Allocated through the Elice Cloud Infrastructure REST API, then reached over SSH.
+
+The API base is `https://portal.elice.cloud/api` with a bearer token. Paths are published in Elice's own Terraform provider, which is open source, so this is a documented interface rather than a reverse engineered one.
+
+The model separates a declared machine from a running one:
+
+```
+POST   /user/resource/compute/virtual_machine             declare a machine
+POST   /user/resource/compute/virtual_machine_allocation  power on
+DELETE /user/resource/compute/virtual_machine_allocation/{id}  power off
+```
+
+An allocation is exactly a letify runtime, so `with let.run():` maps onto Elice's own lifecycle. letify allocates and releases, and does not create the machine; declare that once in the console or with Terraform and put its id in the configuration.
+
+Costs. Compute bills by the second while allocated. Block storage keeps billing while the machine is stopped, and it disappears when the machine is deleted, so a forgotten machine still costs money with no allocation running. Object storage is Data Hub, which speaks S3 and is what letify uses as the blob store backend there.
+
+Two product lines exist and only one is automatable. Elice Cloud Infrastructure has the API, the Terraform provider and a CLI. Run Box, the container product, is driven from the web console, and its SSH access is a tunnel host with an allocated port rather than a public address. letify's `Elice` provider targets Elice Cloud Infrastructure; a Run Box machine can still be used by declaring it as a plain `Shell` with the tunnel address and port.
+
+**Open question.** Whether the SSH port is stable across a restart is not documented. If it is not, use `port_command` in the configuration.
+
+## Modal
+
+> Not a network path at all. Modal exposes function calls into a container.
+
+There is nothing to tunnel to and no device to forward calls at, so `Modal.has_fast_path` is false and `cpu="local"` raises. Its volume is mounted from outside the container and sits in the same data centre as the GPU, which is why a persistent provider needs no separate cache tier.
+
+## Measuring your own numbers
+
+Three checks settle most of what is provider specific.
+
+```bash
+# Round trip to the machine, which sets the efficiency formula.
+letify probe gpu.lab.example.edu
+
+# Whether a layer 3 tunnel is possible at all.
+ls -l /dev/net/tun
+
+# Whether UDP egress is allowed, which decides direct path versus relay.
+nc -zvu stun.l.google.com 19302
+```
+
+For the synchronization count `k`, run one real training step with `torch.cuda.set_sync_debug_mode("warn")` and count the warnings. That number, together with the round trip, is enough to decide whether call forwarding is worth using for a given workload, and it can be measured on any CUDA GPU because it does not depend on where the GPU is.
