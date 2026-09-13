@@ -309,25 +309,44 @@ def test_an_elice_token_goes_to_the_account_directory_and_not_the_config(
         assert token_file.stat().st_mode & 0o777 == 0o600
 
 
-def test_a_vendor_owned_credential_is_left_to_the_vendor(
-    isolated_home, patch_which, capsys
+def test_logging_in_to_colab_runs_the_colab_login_inside_the_account_directory(
+    isolated_home, patch_which, patch_run, capsys
 ) -> None:
-    # letify has no way to refresh a Colab token, so it does not take custody of one.
-    patch_which(login, present=True)
+    # The user never runs the Colab CLI themselves. letify runs it through uv, with the
+    # account directory as its home, so the token lands in ~/.letify/accounts/<alias>/.
+    from letify import tools
+
+    patch_which(tools, present=True)
+    recorder = patch_run(login)
     assert main(["login", "colab", "colab_a", "--account", "me@example.com", "--no-input"]) == 0
-    out = capsys.readouterr().out
-    assert "colab" in out
+    call = recorder.calls[-1]
+    assert call["command"][:3] == ["/usr/bin/uv", "tool", "run"]
+    assert call["command"][-2:] == ["colab", "sessions"]
+    assert call["env"]["HOME"] == str(Path.home() / ".letify" / "accounts" / "colab_a")
     home_file = (Path.home() / ".letify" / "config.toml").read_text(encoding="utf-8")
     assert "me@example.com" in home_file
     assert "token" not in home_file
 
 
-def test_logging_in_to_a_vendor_whose_cli_is_absent_says_what_to_install(
+def test_a_colab_login_that_fails_writes_nothing(
+    isolated_home, patch_which, patch_run, capsys
+) -> None:
+    from letify import tools
+
+    patch_which(tools, present=True)
+    patch_run(login, result=FakeCompleted(returncode=1))
+    assert main(["login", "colab", "colab_a", "--account", "me@example.com", "--no-input"]) == 1
+    assert not (Path.home() / ".letify" / "config.toml").exists()
+
+
+def test_logging_in_to_colab_without_uv_says_how_to_get_it(
     isolated_home, patch_which, capsys
 ) -> None:
-    patch_which(login, present=False)
+    from letify import tools
+
+    patch_which(tools, present=False)
     assert main(["login", "colab", "colab_a", "--account", "me@example.com", "--no-input"]) == 1
-    assert "colab" in capsys.readouterr().err
+    assert "uv was not found" in capsys.readouterr().err
 
 
 def test_logging_out_takes_the_account_and_its_directory(isolated_home, capsys) -> None:

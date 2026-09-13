@@ -12,12 +12,14 @@ line, the request and the instance table letify builds, which is what a caller o
 from __future__ import annotations
 
 from importlib import import_module
+from pathlib import Path
 
 import pytest
 from conftest import FakeCompleted, FakeResponse, FakeSandbox, provider_of
 
 import letify
 from letify import providers
+from letify import tools as tools_module
 from letify.config.schema import ProviderConfig
 from letify.declare.instance import Host, Instance
 from letify.providers import colab as colab_module
@@ -353,66 +355,84 @@ def test_colab_reports_its_round_trip_rather_than_refusing() -> None:
     assert provider.expected_round_trip_ms == 175.0
 
 
-def test_a_missing_colab_cli_names_the_command_and_the_extra(patch_which) -> None:
-    patch_which(colab_module, present=False)
+COLAB_CLI = [
+    "/usr/bin/uv",
+    "tool",
+    "run",
+    "--python",
+    "3.13",
+    "--from",
+    "google-colab-cli",
+    "colab",
+]
+
+
+def test_a_missing_uv_says_how_to_get_it(patch_which) -> None:
+    # The Colab CLI runs through uv, so uv is the one thing that has to be installed.
+    patch_which(tools_module, present=False)
     provider = provider_of(Colab, "colab_a")
     assert provider.available() is False
-    with pytest.raises(letify.ProviderUnavailable, match=r"'colab'.*letify\[colab\]"):
+    with pytest.raises(letify.ProviderUnavailable, match="uv was not found"):
         provider.create_session(Instance(provider, gpu="G4"), "letify-g4-1")
 
 
 def test_creating_a_colab_session_names_the_accelerator_the_cli_accepts(
     patch_which, patch_run
 ) -> None:
-    patch_which(colab_module, present=True)
+    patch_which(tools_module, present=True)
     recorder = patch_run(colab_module)
     provider = provider_of(Colab, "colab_a")
     provider.create_session(provider.RTX_PRO_6000, "letify-g4-1")
-    assert recorder.command == ["colab", "new", "-s", "letify-g4-1", "--gpu", "G4"]
+    assert recorder.command == [*COLAB_CLI, "new", "-s", "letify-g4-1", "--gpu", "G4"]
 
 
 def test_creating_a_colab_session_for_a_tpu_asks_for_a_tpu(patch_which, patch_run) -> None:
-    patch_which(colab_module, present=True)
+    patch_which(tools_module, present=True)
     recorder = patch_run(colab_module)
     provider = provider_of(Colab, "colab_a")
     provider.create_session(provider.v5e1, "letify-v5e1-1")
-    assert recorder.command == ["colab", "new", "-s", "letify-v5e1-1", "--tpu", "v5e1"]
+    assert recorder.command == [*COLAB_CLI, "new", "-s", "letify-v5e1-1", "--tpu", "v5e1"]
 
 
 def test_the_declared_account_reaches_the_cli(patch_which, patch_run) -> None:
-    patch_which(colab_module, present=True)
+    patch_which(tools_module, present=True)
     recorder = patch_run(colab_module)
     provider = provider_of(Colab, "colab_a", account="someone@example.com")
     provider.sessions()
     assert recorder.calls[-1]["env"]["COLAB_ACCOUNT"] == "someone@example.com"
 
 
-def test_no_declared_account_leaves_the_environment_alone(patch_which, patch_run) -> None:
-    patch_which(colab_module, present=True)
+def test_the_colab_cli_keeps_its_login_in_the_account_directory(
+    isolated_home, patch_which, patch_run
+) -> None:
+    # The CLI stores its token under the home directory, so each alias gets its own home.
+    patch_which(tools_module, present=True)
     recorder = patch_run(colab_module)
     provider_of(Colab, "colab_a").sessions()
-    assert recorder.calls[-1]["env"] is None
+    env = recorder.calls[-1]["env"]
+    assert env["HOME"] == str(Path.home() / ".letify" / "accounts" / "colab_a")
+    assert "COLAB_ACCOUNT" not in env
 
 
 def test_the_sessions_an_account_holds_are_read_from_the_cli(patch_which, patch_run) -> None:
-    patch_which(colab_module, present=True)
+    patch_which(tools_module, present=True)
     listing = "NAME        STATE\n-------     -----\nletify-g4-1  running\nletify-t4-2  idle\n"
     patch_run(colab_module, result=FakeCompleted(stdout=listing))
     assert provider_of(Colab, "colab_a").sessions() == ["letify-g4-1", "letify-t4-2"]
 
 
 def test_a_failing_cli_command_carries_the_command_and_the_error(patch_which, patch_run) -> None:
-    patch_which(colab_module, present=True)
+    patch_which(tools_module, present=True)
     patch_run(colab_module, result=FakeCompleted(returncode=2, stderr="not entitled\n"))
     provider = provider_of(Colab, "colab_a")
     with pytest.raises(letify.RuntimeFailure) as caught:
         provider.sessions()
     assert caught.value.stderr == "not entitled"
-    assert caught.value.command == "colab sessions"
+    assert caught.value.command == " ".join([*COLAB_CLI, "sessions"])
 
 
 def test_stopping_a_session_that_is_already_gone_is_not_an_error(patch_which, patch_run) -> None:
-    patch_which(colab_module, present=True)
+    patch_which(tools_module, present=True)
     patch_run(colab_module, result=FakeCompleted(returncode=1, stderr="no such session"))
     provider = provider_of(Colab, "colab_a")
     runtime = type("R", (), {"name": "letify-g4-1"})()
@@ -422,15 +442,15 @@ def test_stopping_a_session_that_is_already_gone_is_not_an_error(patch_which, pa
 def test_colab_is_reached_through_the_cli_websocket_bridge(patch_which) -> None:
     # An OpenSSH ProxyCommand over the CLI's bridge, which is an official path and needs
     # no tunnel.
-    patch_which(colab_module, present=True)
+    patch_which(tools_module, present=True)
     command = provider_of(Colab, "colab_a").ssh_command("echo hello")
     assert command[:3] == ["ssh", "-o", "BatchMode=yes"]
-    assert "ProxyCommand=colab ssh --proxy-mode" in command
+    assert f"ProxyCommand={' '.join(COLAB_CLI)} ssh --proxy-mode" in command
     assert command[-2:] == ["colab", "echo hello"]
 
 
 def test_the_persistent_colab_channel_starts_a_worker_over_that_bridge(patch_which) -> None:
-    patch_which(colab_module, present=True)
+    patch_which(tools_module, present=True)
     provider = provider_of(Colab, "colab_a")
     assert provider.channel_kind == "ssh"
     assert provider.persistent_channel is True
@@ -443,7 +463,7 @@ def test_the_persistent_colab_channel_starts_a_worker_over_that_bridge(patch_whi
 def test_the_exec_fallback_keeps_nothing_between_calls(patch_which, patch_run) -> None:
     # colab exec always works and needs nothing beyond the CLI, at the cost of a fresh
     # process per call.
-    patch_which(colab_module, present=True)
+    patch_which(tools_module, present=True)
     recorder = patch_run(colab_module)
     provider = provider_of(Colab, "colab_a", channel="exec")
     assert provider.persistent_channel is False
@@ -452,7 +472,7 @@ def test_the_exec_fallback_keeps_nothing_between_calls(patch_which, patch_run) -
     assert isinstance(channel, OneShotChannel)
 
     channel.runner("print('hello')", 60)
-    assert recorder.command == ["colab", "exec", "-s", "letify-g4-1"]
+    assert recorder.command == [*COLAB_CLI, "exec", "-s", "letify-g4-1"]
     assert recorder.calls[-1]["input"] == "print('hello')"
 
 
@@ -875,7 +895,7 @@ def test_a_provider_without_a_fast_path_warns_with_its_round_trip_and_then_tries
 ) -> None:
     # The warning carries the arithmetic. The refusal that follows is about letify-core
     # being absent from this machine, not about the latency.
-    patch_which(colab_module, present=True)
+    patch_which(tools_module, present=True)
     monkeypatch.setattr(probe_module, "core_path", lambda: None)
     provider = provider_of(Colab, "colab_a")
     with (
@@ -1090,7 +1110,7 @@ def test_a_configured_command_supplies_the_balance_a_service_does_not_publish(
 ) -> None:
     # The last number in the output is the remaining amount, so a command that prints a
     # sentence around it still works.
-    patch_which(colab_module, present=True)
+    patch_which(tools_module, present=True)
     provider = provider_of(
         Colab,
         "colab_a",
@@ -1110,7 +1130,7 @@ def test_a_configured_command_supplies_the_balance_a_service_does_not_publish(
 def test_a_usage_command_that_prints_no_number_reports_nothing_rather_than_zero(
     patch_run, patch_which
 ) -> None:
-    patch_which(colab_module, present=True)
+    patch_which(tools_module, present=True)
     provider = provider_of(Colab, "colab_a", usage_command="broken")
     patch_run(usage_module, result=FakeCompleted(stdout="quota service unreachable\n"))
     assert provider.usage().remaining is None
@@ -1119,7 +1139,7 @@ def test_a_usage_command_that_prints_no_number_reports_nothing_rather_than_zero(
 def test_a_usage_command_that_fails_does_not_take_the_table_down_with_it(
     patch_run, patch_which
 ) -> None:
-    patch_which(colab_module, present=True)
+    patch_which(tools_module, present=True)
     provider = provider_of(Colab, "colab_a", usage_command="broken")
     patch_run(usage_module, result=FakeCompleted(returncode=1, stderr="no such command"))
     usage = provider.usage()

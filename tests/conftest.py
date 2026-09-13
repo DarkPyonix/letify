@@ -168,6 +168,12 @@ def patch_run(monkeypatch):
     return patch
 
 
+@pytest.fixture(autouse=True)
+def no_uv_variable(monkeypatch):
+    """`uv run pytest` sets UV, which would let the real uv answer where tests patch PATH."""
+    monkeypatch.delenv("UV", raising=False)
+
+
 @pytest.fixture
 def patch_which(monkeypatch):
     """Decide what is on PATH for one module, without touching the real PATH."""

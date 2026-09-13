@@ -494,6 +494,8 @@ An account that is already in the home file is not asked for again. `letify logi
 
 `letify logout <alias>` removes the account from `~/.letify/config.toml` and deletes `~/.letify/accounts/<alias>/` with everything in it. It leaves the project reference alone, because the repository still needs that account; what changed is only that this machine no longer has it.
 
+`letify login colab <alias>` signs in to Colab itself. It runs `colab sessions` through `uv tool run --python 3.13 --from google-colab-cli colab`, with `HOME` set to `~/.letify/accounts/<alias>/`. The Colab CLI keeps its token at a fixed path under its home directory, so the token lands in the account directory and the CLI refreshes it on later calls. Every later Colab command runs with the same `HOME`, which is what lets two Colab accounts live on one machine. uv's cache, Python installs and tools stay pinned to the real home, so a changed `HOME` downloads nothing again. A sign in that exits non zero writes nothing.
+
 Credentials never enter either `config.toml`. A token goes to a file in the account directory. An SSH password is never stored at all, which the next section explains.
 
 ### SSH authentication
@@ -527,7 +529,7 @@ For `colab` and `modal`, letify does not touch the vendor's credential store. Wr
 
 ## letify-core
 
-> The native component behind `host="local"`. A Rust workspace, built separately, needed only by whoever forwards CUDA calls.
+> The native component behind `host="local"`. A Rust workspace, built in CI and shipped inside platform wheels.
 
 The Python package is pure Python. Standing in for the CUDA driver cannot be done from Python, so that job lives in `letify-core/` as three crates.
 
@@ -537,7 +539,9 @@ The Python package is pure Python. Standing in for the CUDA driver cannot be don
 | `letify-driver` | A cdylib that stands in for the driver and forwards its calls. |
 | `letify-agent` | Holds the real device and executes what arrives. |
 
-`python letify-core/build.py` builds them and installs the library under the name of the one it replaces: `nvcuda.dll` on Windows, `libcuda.so.1` on Linux and WSL2. Being found before the real driver is the whole mechanism.
+`python letify-core/build.py` builds them and copies the library into `letify/remoting/lib/` under the name of the one it replaces: `nvcuda.dll` on Windows, `libcuda.so.1` on Linux and WSL2, `libletify_driver.dylib` on macOS. Being found before the real driver is the whole mechanism. The agent is copied beside it.
+
+letify looks for the library in `LETIFY_CORE_PATH`, then in `letify/remoting/lib/`. It looks for the agent in `letify/remoting/lib/`, then on `PATH`.
 
 ### Batching
 
@@ -584,6 +588,19 @@ letify is a dependency inside a research repository, so it adds as little as pos
 Provider tools run out of process and never in the user's `.venv`. Colab runs through `uv tool run --from google-colab-cli colab`. Modal runs in a separate uv environment that letify manages. Elice uses the standard library HTTP client. The `gcs` blob store uses a standard library client too.
 
 uv must be installed. letify finds it from the `UV` environment variable, then from `PATH`. If neither has it, letify raises an error that says uv is required.
+
+The Python code is pure and links no Python extension. letify-core binaries are built in CI and placed in `letify/remoting/lib/`, so each release has one wheel per desktop platform, tagged `py3-none-<platform>`:
+
+| Platform | Wheel platform tag |
+|---|---|
+| Linux x86_64 | `manylinux_2_28_x86_64` |
+| Linux aarch64 | `manylinux_2_28_aarch64` |
+| Windows x86_64 | `win_amd64` |
+| Windows arm64 | `win_arm64` |
+| macOS arm64 | `macosx_11_0_arm64` |
+| macOS x86_64 | `macosx_10_12_x86_64` |
+
+Linux wheels are built inside the `manylinux_2_28` containers, so the binaries need glibc 2.28 or newer. That covers RHEL 8, Debian 10 and Ubuntu 18.10 onward. The sdist carries no binaries, and an install from it has no letify-core.
 
 ## Known gaps
 

@@ -39,7 +39,6 @@ DEFAULT_KEY = "~/.ssh/id_letify"
 
 #: Kinds whose credential belongs to the vendor's own tool, with the command that owns it.
 VENDOR_COMMANDS = {
-    "colab": ("colab", "colab auth login"),
     "modal": ("modal", "modal setup"),
 }
 
@@ -288,16 +287,37 @@ def vendor_account(answers: Answers) -> dict[str, Any]:
             f"'{command}'."
         )
     options: dict[str, Any] = {"kind": answers.kind}
-    if answers.kind == "colab":
-        account = ask(answers, "account", "Google account email: ", required=False)
-        if account:
-            options["account"] = account
-    else:
-        workspace = ask(
-            answers, "workspace", "Modal workspace (blank for the default): ", required=False
-        )
-        if workspace:
-            options["workspace"] = workspace
+    workspace = ask(
+        answers, "workspace", "Modal workspace (blank for the default): ", required=False
+    )
+    if workspace:
+        options["workspace"] = workspace
+    return options
+
+
+def colab_account(answers: Answers) -> dict[str, Any]:
+    """Sign in to Colab by running the Colab CLI's own login through uv.
+
+    The CLI keeps its token under its home directory, and letify runs it with the account
+    directory as that home, so the token ends up in ``~/.letify/accounts/<alias>/``. The
+    CLI refreshes the token itself on later calls. ``colab sessions`` is the command run,
+    because it signs in when there is no token and changes nothing when there is one.
+    """
+    from .. import tools
+
+    uv = tools.find_uv()
+    if uv is None:
+        raise LoginError(tools.missing_uv_message())
+    options: dict[str, Any] = {"kind": answers.kind}
+    account = ask(answers, "account", "Google account email: ", required=False)
+    if account:
+        options["account"] = account
+    result = subprocess.run(
+        [*tools.command(tools.COLAB, uv), "sessions"],
+        env=tools.environment(answers.alias),
+    )
+    if result.returncode != 0:
+        raise LoginError(f"the Colab sign in exited {result.returncode}, so nothing was written")
     return options
 
 
@@ -305,7 +325,7 @@ FLOWS = {
     "shell": shell_account,
     "tunnel": shell_account,
     "elice": elice_account,
-    "colab": vendor_account,
+    "colab": colab_account,
     "modal": vendor_account,
 }
 

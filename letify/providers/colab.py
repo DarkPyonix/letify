@@ -31,13 +31,12 @@ exhausted balance reverts the account to the free tier policy, which disallows t
 
 from __future__ import annotations
 
-import os
 import shlex
-import shutil
 import subprocess
 from collections.abc import Mapping
 from typing import TYPE_CHECKING
 
+from .. import tools
 from ..declare.instance import Instance
 from ..errors import ProviderUnavailable, RuntimeFailure
 from .shell import Shell
@@ -87,10 +86,6 @@ class Colab(Shell):
     usage_source = "the Colab CLI has no balance command; the figure is in the web console"
 
     @property
-    def binary(self) -> str:
-        return str(self.config.option("binary", "colab"))
-
-    @property
     def account(self) -> str | None:
         value = self.config.option("account")
         return value if isinstance(value, str) else None
@@ -105,13 +100,17 @@ class Colab(Shell):
         return self.channel_kind == "ssh"
 
     def available(self) -> bool:
-        return shutil.which(self.binary) is not None
+        return tools.find_uv() is not None
+
+    def _colab(self) -> list[str]:
+        """The Colab CLI, run through uv so it never enters the user's environment."""
+        uv = tools.find_uv()
+        if uv is None:
+            raise ProviderUnavailable(self.kind, tools.missing_uv_message())
+        return tools.command(tools.COLAB, uv)
 
     def _require_cli(self) -> None:
-        if not self.available():
-            raise ProviderUnavailable(
-                self.kind, f"the {self.binary!r} command is not on PATH", self.extra
-            )
+        self._colab()
 
     # -- instances -----------------------------------------------------------
 
@@ -143,8 +142,7 @@ class Colab(Shell):
     # -- the CLI -------------------------------------------------------------
 
     def _cli(self, *args: str, timeout: float | None = None, stdin: str | None = None) -> str:
-        self._require_cli()
-        command = [self.binary, *args]
+        command = [*self._colab(), *args]
         result = subprocess.run(
             command,
             input=stdin,
@@ -161,10 +159,11 @@ class Colab(Shell):
             )
         return result.stdout
 
-    def _env(self) -> dict[str, str] | None:
-        if not self.account:
-            return None
-        return {**os.environ, "COLAB_ACCOUNT": self.account}
+    def _env(self) -> dict[str, str]:
+        env = tools.environment(self.alias)
+        if self.account:
+            env["COLAB_ACCOUNT"] = self.account
+        return env
 
     def sessions(self) -> list[str]:
         """Names of the sessions this account currently holds."""
@@ -183,7 +182,7 @@ class Colab(Shell):
             "-o",
             "BatchMode=yes",
             "-o",
-            f"ProxyCommand={self.binary} ssh --proxy-mode",
+            f"ProxyCommand={' '.join(self._colab())} ssh --proxy-mode",
             "colab",
         ]
         if remote_command:
