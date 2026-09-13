@@ -225,6 +225,8 @@ Both hand back the user's own stdout separately from the outcome, because they s
 
 The worker source cannot be sent on standard input as a script, because `python -` reads to end of file before compiling anything and the pipe has to stay open for requests. A small bootstrap stub passed with `-c` reads a length-prefixed base64 blob, executes it, and leaves standard input where it was.
 
+The worker announces itself with one line, `__LETIFY_WORKER_READY__ <major>.<minor>`, naming the version of the interpreter it runs on. A worker asked to move to another interpreter replies, then replaces its process with `os.execv(<interpreter>, [<interpreter>, "-u", "-c", <bootstrap stub>])` on the same pipes, and the channel sends the worker source again and waits for the new ready line.
+
 ## Call protocol
 
 > A call is a serialized function plus arguments, and the outcome comes back on the same channel.
@@ -282,7 +284,16 @@ letify never falls back to local execution or to a slower mode when the declared
 
 Everything above a runtime is declaration. Creating one is when a provider actually powers something on; shutting it down is when the charge stops.
 
-A runtime boots in four steps: open the channel, arm the lease, install the declared environment, attach volumes. Installation is skipped where the machine already runs in the environment, which is the local provider.
+A runtime boots in six steps:
+
+1. Open the channel. The worker starts on the bootstrap interpreter: the account's `python` option, `python3` by default.
+2. Arm the lease.
+3. Build the environment: restore the environment archive, or run `uv sync` in the project directory, as Environment describes.
+4. Move the worker to `<project directory>/.venv/bin/python`.
+5. Check the worker's interpreter version against the local one.
+6. Attach volumes.
+
+Steps 3 to 5 are skipped on the local provider, which already runs in the project's environment. Steps 3 and 4 are skipped when the account sets `python`, which means the user manages the interpreter on that machine. Step 5 still runs then.
 
 ### Pooling
 
@@ -351,13 +362,13 @@ refs/<name>
 
 Immutability buys two things. Concurrent writers cannot conflict, because different contents get different names, where a two way synchronization loses one writer's changes to the other. And nothing is verified twice, because holding a digest is proof of holding the contents.
 
-Refs carry the mutable part, in the way Git keeps branch names apart from objects. A ref is a few dozen bytes, so a last writer wins race on one is harmless and both blobs survive it. letify reserves `env/<env key>` for environment archives and `path/<path key>` for project data; nothing else is written there.
+Refs carry the mutable part, in the way Git keeps branch names apart from objects. A ref is a few dozen bytes, so a last writer wins race on one is harmless and both blobs survive it. letify reserves `env/<env key>-<platform>` for environment archives and `path/<path key>` for project data; nothing else is written there.
 
 ### Blob granularity
 
 > The unit of a blob is a decision. Large files stand alone; trees of small files are packed.
 
-A model shard is already large, so one file is one blob. An environment is tens of thousands of small files, so the whole tree is packed into one archive keyed by the hash of its lock file. That is where the speedup is: tens of thousands of round trips become one.
+A model shard is already large, so one file is one blob. An environment is tens of thousands of small files, so the whole tree is packed into one archive keyed by the environment key and the runtime's platform. That is where the speedup is: tens of thousands of round trips become one.
 
 A content addressed store does not by itself reduce the bytes of a first transfer. What it improves is the metadata exchange, which becomes a single manifest read instead of one request per file, and every repeat transfer, which is skipped by name. Neither it nor a synchronization tool sends deltas within a changed file.
 
@@ -377,7 +388,7 @@ A backend offers a pull by answering with a URL and the request headers that rea
 
 The `gcs` read token is downscoped with a Credential Access Boundary: the local token is exchanged at `https://sts.googleapis.com/v1/token` for one that holds `roles/storage.objectViewer` on the volume's bucket only, with an availability condition restricting it to object names under the volume's prefix. A volume option `sts_endpoint` points the exchange elsewhere. A failed exchange raises `RuntimeFailure` rather than sending the unscoped token.
 
-The environment archive is automatic. The first session that installs a declared environment packs it into the volume under `env/<env key>`, and every later session on the provider pulls that archive instead of installing. Nothing in the public surface names this step.
+The environment archive is automatic. The first session that runs `uv sync` for an environment packs its project directory, `.venv` included, into its first volume under `env/<env key>-<platform>`. `<platform>` is the runtime's `sys.platform` and `platform.machine()` joined by a hyphen, for example `linux-x86_64`, and the env key includes the interpreter's major.minor version. Every later session on the provider with the same key and platform pulls that archive and unpacks it at `~/.letify/project` instead of syncing. A restored `.venv/bin/python` that does not start is treated as no archive, and the session syncs. Nothing in the public surface names this step.
 
 Nothing hands a session to the caller. There is no call that returns one, no argument that takes one, and no way to hold the wrong one, because which session serves a call is the pool's answer to work out from the declaration.
 
@@ -429,11 +440,45 @@ A token is reused until 60 s before it expires. A service account key file is re
 
 ## Environment
 
-> An `Env` is a declaration keyed by the hash of a uv lock file, not a built image.
+> An `Env` is a declaration keyed by the project's uv files, not a built image. Every remote runtime builds it with `uv sync` into a project `.venv` and runs the worker with that `.venv`'s Python.
 
-`Env()` reads `uv.lock`. `pip_install`, `run`, `vars` and `ship` refine it and return a new value. The key is a hash of the lock file contents together with the refinements, so two declarations that agree share a pooled runtime and a cached archive.
+`Env()` reads `uv.lock`. `pip_install`, `run`, `vars` and `ship` refine it and return a new value. The project directory is the directory holding the lock file. The key is a hash of the contents of `uv.lock`, `pyproject.toml` and `.python-version` in that directory, `Env.python`, and the refinements, so two declarations that agree share a pooled runtime and a cached archive.
 
 A uv lock file resolves for every platform uv supports, so one lock file drives a Linux runtime from a Windows or macOS client. A `pip freeze` list does not, because it carries platform specific pins.
+
+### Building the environment on a runtime <!-- id: remote-uv-sync -->
+
+> The runtime receives `pyproject.toml`, `uv.lock` and `.python-version`, runs `uv sync --frozen --no-install-project` in a project directory, and starts the worker with that directory's `.venv/bin/python`. A default `Env()` does the same; no path installs into the system Python or installs nothing.
+
+1. The local side reads `pyproject.toml` and `uv.lock` from the project directory, and `.python-version` when it exists. A missing `pyproject.toml` or `uv.lock` raises `ConfigError` naming the file and `uv lock`, before anything runs on the runtime.
+2. The worker writes them into the runtime's project directory, `~/.letify/project/<env key>`, with `~` expanded on the runtime.
+3. The worker runs `uv sync --frozen --no-install-project --python <major>.<minor>` in that directory, with the version `Env` records, as Interpreter version describes. uv creates `.venv` there, and downloads the interpreter when the runtime has none that matches.
+4. Packages from `Env.pip_install` are installed with `uv pip install --python <project directory>/.venv/bin/python <packages>`. Commands from `Env.run` run through the shell with `<project directory>/.venv/bin` first on `PATH` and `VIRTUAL_ENV` set to the `.venv`. Variables from `Env.vars` are set in the worker's environment before the sync, so they reach every later step and user code.
+5. The worker moves to `<project directory>/.venv/bin/python`, as Channels describes. On a one-shot channel every later program runs as `<project directory>/.venv/bin/python -c <program>`, a child of the provider's command, with its standard output passed through.
+
+`--frozen` installs exactly what `uv.lock` says and never re-resolves, so the runtime holds the library versions the local `.venv` holds. `--no-install-project` is used because only the three metadata files travel: the project's own source is not on the runtime, so building the project there would fail. The project's own modules reach the runtime with the call instead, as Module shipping describes. letify itself is installed by the sync, because the project depends on it. A path dependency is installed from its locked path on the runtime, so one that exists only on the local disk fails the sync.
+
+A failed sync raises `EnvironmentFailure` saying `uv sync failed on <runtime>`, with the command and the last lines of uv's standard error. `EnvironmentFailure` is a `RuntimeFailure`, so the call is retried on a fresh runtime.
+
+### Interpreter version <!-- id: interpreter-version -->
+
+> The runtime's `.venv` always runs the same Python major.minor as the local process, and `Env` guarantees it.
+
+`Env.python` records the major.minor of the interpreter in the process that declares the `Env`, `sys.version_info[:2]`, and the runtime always runs `uv sync` with `--python <Env.python>`, whether or not the project has a `.python-version`. Without this a wide `requires-python` such as `>=3.11` lets uv pick a different minor version remotely, and cloudpickle's bytecode for a `__main__` function fails on it.
+
+Two declarations cannot diverge from the local process. Before any session starts, a `.python-version` whose major.minor differs from the local interpreter, or an `Env.python` that differs from it, raises `InterpreterMismatch` naming both versions. A `.python-version` naming a patch release, such as `3.12.3`, is compared by its major.minor.
+
+### uv on the runtime <!-- id: uv-on-runtime -->
+
+> The runtime uses the uv it has, and installs uv under the home directory when it has none.
+
+The worker looks for `uv` on `PATH`, then at `~/.local/bin/uv`. When neither exists it downloads `https://astral.sh/uv/install.sh` over HTTPS with the bootstrap interpreter's `urllib` and runs it with `sh`, with `UV_INSTALL_DIR=~/.local/bin` and `UV_NO_MODIFY_PATH=1`. That is the same as `curl -LsSf https://astral.sh/uv/install.sh | env UV_INSTALL_DIR="$HOME/.local/bin" UV_NO_MODIFY_PATH=1 sh`, without needing `curl`. It needs no root, because it writes only under the home directory. A failed download or a non-zero exit raises `EnvironmentFailure` saying `uv could not be installed on <runtime>` with the reason.
+
+### Interpreter check <!-- id: interpreter-check -->
+
+> A worker whose Python major.minor differs from the local process fails the session start with both versions named, before any call is sent.
+
+The worker reports `sys.version_info[:2]` in its ready line. After the environment step, the local side compares it with its own `sys.version_info[:2]`. A difference raises `InterpreterMismatch`, naming both versions and saying that cloudpickle's bytecode cannot run across them. It is not retried, because a fresh runtime builds the same interpreter. The check applies to every provider that builds its environment, and to an account that sets `python`. It does not apply to the local provider.
 
 ### Module shipping
 
@@ -689,6 +734,12 @@ Two other approaches were considered and are not the default. Connection multipl
 | `local` | nothing | none; this machine needs no declaration |
 
 For `colab` and `modal`, letify does not touch the vendor's credential store. Wrapping another tool's login would mean owning a token letify has no way to refresh, and the vendor's own command already works.
+
+### Interpreter override <!-- id: python-option -->
+
+> `python` on an account names the interpreter the worker runs with. Setting it means the user manages that interpreter, so letify does not build the environment there.
+
+Without `python`, a `shell`, `tunnel`, `colab` or `elice` account starts its bootstrap worker with `python3` and then runs the worker from the project `.venv`, as Building the environment on a runtime describes. With `python = "/path/to/python"`, the worker is started with that interpreter and stays on it: no project files are sent, no uv runs and no environment archive is read or written. The interpreter check still applies. On `local`, `python` names the interpreter of the worker subprocess, which defaults to the interpreter running letify.
 
 ## letify-core
 
