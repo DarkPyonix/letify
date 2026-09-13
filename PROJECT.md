@@ -242,6 +242,8 @@ An account in `~/.letify/config.toml` is available in a project only when the pr
 
 SSH authenticates by key, because letify opens sessions with `ssh -o BatchMode=yes`: a session is started by the pool in the background, with nobody present to answer a password prompt. So `letify login shell` generates an ed25519 key if there is none, asks for the password once to install it, drops the password, and confirms the key works before declaring the alias. It then runs `nvidia-smi` on the machine once, asks which indices of each accelerator letify may use, and writes them to `[<alias>.devices]` in the home file, so editor completion knows the names. `--indices NAME=SPEC` chooses them in a script, `--detect-devices` asks an already declared machine again, and a machine where `nvidia-smi` does not answer is logged in with no table. Nothing about the password is written to a file or the environment. A machine whose administrator forbids key authentication can use `--auth password`, which reads the password from `~/.letify/accounts/<alias>/password` and drives `sshpass`; it is refused on Windows, where that tool does not exist.
 
+Everything letify writes on a remote machine lives under one directory per account, the workspace root: the project `.venv`, materialized volume data, temporary files and the worker's working directory. An account in `~/.letify/config.toml` sets it with `workspace = "<path>"`, a path that starts with `/` or `~`, expanded on the machine. A project file cannot set it. The default is `~/.letify-runtime` for `shell`, `tunnel` and `elice`, `/content/letify` for `colab`, and `/letify` for `modal`, where a Modal volume is mounted so the root persists across sandboxes. `letify login shell` and `letify login tunnel` ask for it, take `--workspace PATH` in a script, and check over SSH that the path can be created and written without root before anything is written. `letify check <alias>` reports whether the root is writable.
+
 `letify login modal <alias>` runs Modal's own `modal token new` through `uv tool run`, with `MODAL_CONFIG_PATH` pointing at `~/.letify/accounts/<alias>/modal.toml`, and approves in the browser. The Modal provider and the `modal` volume backend never import `modal` in the letify process: they drive a small adapter, `letify/providers/modal_adapter.py`, run with `uv run --no-project --with "modal>=1.0,<2"` as that account and spoken to in JSON lines.
 
 ```toml
@@ -258,6 +260,7 @@ address = "gpu.lab.example.edu"
 user = "researcher"
 key = "~/.ssh/id_ed25519"
 persistent = true
+workspace = "/workspace/researcher/letify"
 
 [elice_a100]
 kind = "elice"
