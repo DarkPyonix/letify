@@ -1803,9 +1803,7 @@ def test_a_process_whose_owner_is_not_visible_makes_its_card_busy(patch_run) -> 
 
 def test_a_root_login_still_reads_root_owned_foreign_processes_as_busy(patch_run) -> None:
     apps = "GPU-aaa, 10\nGPU-bbb, 777\n"
-    patch_run(
-        shell_module, result=remote_smi(apps, owners={10: "root", 777: "root"}, login="root")
-    )
+    patch_run(shell_module, result=remote_smi(apps, owners={10: "root", 777: "root"}, login="root"))
     provider = indexed_shell(P100={"indices": "0-1"})
     provider.add_worker_pid(777)
     assert provider.busy() == (0,)

@@ -83,6 +83,8 @@ class Provider(abc.ABC):
         self._worker_pids: set[int] = set()
         #: The busy indices the most recent reservation read, for the refusal message.
         self.last_busy: tuple[int, ...] = ()
+        #: The users owning the processes on each index of ``last_busy``, for the same message.
+        self.last_busy_owners: dict[int, tuple[str, ...]] = {}
 
     # -- inventory -----------------------------------------------------------
 
@@ -145,7 +147,7 @@ class Provider(abc.ABC):
         return tuple(index for index in entry.indices if index not in held | set(busy))
 
     def busy(self) -> tuple[int, ...]:
-        """Device indices another process holds. Nothing for a provider letify cannot ask.
+        """Device indices another user is computing on. Nothing for a provider letify cannot ask.
 
         Overridden where the machine can be asked. The base answer is nothing, which is
         right for a provider that assigns the device itself.

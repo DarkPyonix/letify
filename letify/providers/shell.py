@@ -297,7 +297,7 @@ class Shell(Provider):
         return table
 
     def busy(self) -> tuple[int, ...]:
-        """Ask the machine over its link which cards another process is computing on.
+        """Ask the machine over its link which cards another user is computing on.
 
         Read at every reservation, never cached. A query that cannot run raises rather than
         reading as free, because free would put a run on a card someone else is using.
@@ -320,7 +320,10 @@ class Shell(Provider):
                 )
             return result.stdout
 
-        return telemetry.busy_indices(exclude_pids=self.worker_pids(), run=run)
+        owners: dict[int, tuple[str, ...]] = {}
+        busy = telemetry.busy_indices(exclude_pids=self.worker_pids(), run=run, owners_out=owners)
+        self.last_busy_owners = owners
+        return busy
 
     def store_backend(self) -> str:
         backend = self.config.option("store")
