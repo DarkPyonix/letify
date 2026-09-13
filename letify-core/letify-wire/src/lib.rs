@@ -535,6 +535,83 @@ pub fn read_incoming<R: Read>(reader: &mut R, staging: &mut Vec<u8>) -> io::Resu
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))
 }
 
+/// What [`read_copy_to_host`] took off the wire.
+#[derive(Debug, Clone, PartialEq)]
+pub enum HostCopy {
+    /// A `Payload` of exactly the requested length, now in the destination.
+    Filled,
+    /// Any other reply, decoded whole.
+    Reply(Reply),
+}
+
+/// Tag byte of a `Payload` reply.
+const TAG_PAYLOAD: u8 = 5;
+
+/// Bytes of a `Payload` body before its bytes: tag, length.
+const PAYLOAD_FIXED_BYTES: usize = 1 + 8;
+
+/// Write a `Payload` reply for bytes the agent already holds.
+///
+/// Produces the same bytes as `write_frame(encode_reply(Payload { .. }))`, but the
+/// payload is handed to `write_vectored` as the caller's own slice. Behind a
+/// `BufWriter`, a payload larger than its buffer goes to the socket without being
+/// copied into it.
+pub fn write_payload_reply<W: Write>(writer: &mut W, payload: &[u8]) -> io::Result<()> {
+    let length = payload.len() as u64;
+    let mut head = [0u8; FRAME_HEADER_BYTES + PAYLOAD_FIXED_BYTES];
+    head[..8].copy_from_slice(&encode_frame_header(PAYLOAD_FIXED_BYTES as u64 + length));
+    head[8] = TAG_PAYLOAD;
+    head[9..17].copy_from_slice(&length.to_le_bytes());
+    write_all_vectored(writer, &mut [IoSlice::new(&head), IoSlice::new(payload)])
+}
+
+/// Read the reply to a copy to the host, putting a `Payload` into `destination`.
+///
+/// The tag is read before the body, so a `Payload` of exactly `destination.len()` bytes
+/// is read with `read_exact` straight into `destination`. Nothing is allocated from a
+/// length on the wire. A `Payload` of another length is read into nothing and reported
+/// as `InvalidInput`, with the stream still in step. A `Payload` whose length fields
+/// disagree is `InvalidData`, after which the stream cannot be trusted. Any other reply
+/// is decoded whole.
+pub fn read_copy_to_host<R: Read>(reader: &mut R, destination: &mut [u8]) -> io::Result<HostCopy> {
+    let mut header = [0u8; FRAME_HEADER_BYTES];
+    reader.read_exact(&mut header)?;
+    let length = decode_frame_header(header);
+    if length == 0 {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "empty frame"));
+    }
+    let mut tag = [0u8; 1];
+    reader.read_exact(&mut tag)?;
+
+    if tag[0] == TAG_PAYLOAD && length >= PAYLOAD_FIXED_BYTES as u64 {
+        let mut declared = [0u8; 8];
+        reader.read_exact(&mut declared)?;
+        let declared = u64::from_le_bytes(declared);
+        if declared != length - PAYLOAD_FIXED_BYTES as u64 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "a payload declares a length that disagrees with its frame",
+            ));
+        }
+        if declared != destination.len() as u64 {
+            let discarded = io::copy(&mut reader.by_ref().take(declared), &mut io::sink())?;
+            if discarded != declared {
+                return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "frame is short"));
+            }
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "a copy to the host answered with a payload of another length",
+            ));
+        }
+        reader.read_exact(destination)?;
+        return Ok(HostCopy::Filled);
+    }
+
+    let mut frame = vec![tag[0]];
+    read_body(reader, length - 1, &mut frame)?;
+    decode_reply(&frame).map(HostCopy::Reply)
+}
+
 /// Content address of a payload, used so the same module travels once.
 ///
 /// This is not a cryptographic decision. A module is identified by its own bytes, and a
@@ -764,6 +841,87 @@ mod tests {
         let mut staging = Vec::new();
         assert!(read_incoming(&mut frame.as_slice(), &mut staging).is_err());
         assert!(read_frame(&mut frame.as_slice()).is_err());
+    }
+
+    fn encoded_reply_frame(reply: &Reply) -> Vec<u8> {
+        let mut frame = Vec::new();
+        write_frame(&mut frame, &encode_reply(reply)).unwrap();
+        frame
+    }
+
+    #[test]
+    fn a_streamed_payload_reply_writes_the_same_bytes_as_an_encoded_frame() {
+        let payload = patterned(100_000);
+        let mut writer = RecordingWriter::default();
+        write_payload_reply(&mut writer, &payload).unwrap();
+        assert_eq!(writer.bytes, encoded_reply_frame(&Reply::Payload { payload: payload.clone() }));
+    }
+
+    #[test]
+    fn a_streamed_payload_reply_hands_the_staged_bytes_to_the_writer_uncopied() {
+        let payload = patterned(100_000);
+        let mut writer = RecordingWriter::default();
+        write_payload_reply(&mut writer, &payload).unwrap();
+        assert!(
+            writer.slices.contains(&(payload.as_ptr() as usize, payload.len())),
+            "the payload reached the writer through another buffer: {:?}",
+            writer.slices
+        );
+    }
+
+    #[test]
+    fn a_payload_reply_is_read_straight_into_the_destination() {
+        let payload = patterned(100_000);
+        let frame = encoded_reply_frame(&Reply::Payload { payload: payload.clone() });
+        let mut reader = RecordingReader { bytes: &frame, destinations: Vec::new() };
+        let mut destination = vec![0u8; payload.len()];
+        let copied = read_copy_to_host(&mut reader, &mut destination).unwrap();
+
+        assert_eq!(copied, HostCopy::Filled);
+        assert_eq!(destination, payload);
+        let start = destination.as_ptr() as usize;
+        let end = start + destination.len();
+        let elsewhere: usize = reader
+            .destinations
+            .iter()
+            .filter(|(address, _)| *address < start || *address >= end)
+            .map(|(_, count)| count)
+            .sum();
+        // Only the frame header and the fixed fields may land outside the destination.
+        assert!(elsewhere <= 64, "{elsewhere} bytes were read into an intermediate buffer");
+    }
+
+    #[test]
+    fn a_payload_of_another_length_is_refused_and_the_stream_stays_in_step() {
+        let mut frames = encoded_reply_frame(&Reply::Payload { payload: patterned(1000) });
+        frames.extend(encoded_reply_frame(&Reply::Payload { payload: patterned(10) }));
+        let mut reader = frames.as_slice();
+        let mut destination = vec![0u8; 10];
+
+        let refused = read_copy_to_host(&mut reader, &mut destination).unwrap_err();
+        assert_eq!(refused.kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(read_copy_to_host(&mut reader, &mut destination).unwrap(), HostCopy::Filled);
+        assert_eq!(destination, patterned(10));
+    }
+
+    #[test]
+    fn a_failed_copy_to_the_host_arrives_decoded() {
+        let failed = Reply::Failed { code: 700, message: "illegal address".into() };
+        let frame = encoded_reply_frame(&failed);
+        let mut destination = vec![0u8; 16];
+        assert_eq!(
+            read_copy_to_host(&mut frame.as_slice(), &mut destination).unwrap(),
+            HostCopy::Reply(failed)
+        );
+    }
+
+    #[test]
+    fn a_corrupt_payload_length_is_an_error_not_an_allocation() {
+        let mut frame = encode_frame_header(1 << 62).to_vec();
+        frame.push(5);
+        frame.extend_from_slice(&((1u64 << 62) - 9).to_le_bytes());
+        let mut destination = vec![0u8; 16];
+        assert!(read_copy_to_host(&mut frame.as_slice(), &mut destination).is_err());
     }
 
     #[test]

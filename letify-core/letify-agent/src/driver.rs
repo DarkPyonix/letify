@@ -186,19 +186,19 @@ impl Driver {
         Ok(())
     }
 
-    pub fn copy_to_host(&self, pointer: u64, bytes: u64) -> Result<Vec<u8>, String> {
-        let mut buffer = vec![0u8; bytes as usize];
+    /// Copy `destination.len()` bytes of device memory at `pointer` into `destination`.
+    pub fn copy_to_host(&self, pointer: u64, destination: &mut [u8]) -> Result<(), String> {
         let status = unsafe {
             self.symbol::<CuMemcpyDtoH>("cuMemcpyDtoH_v2")?(
-                buffer.as_mut_ptr() as *mut c_void,
+                destination.as_mut_ptr() as *mut c_void,
                 pointer,
-                buffer.len(),
+                destination.len(),
             )
         };
         if status != 0 {
             return Err(format!("cuMemcpyDtoH returned {status}"));
         }
-        Ok(buffer)
+        Ok(())
     }
 
     pub fn load_module(&self, image: &[u8]) -> Result<u64, String> {
