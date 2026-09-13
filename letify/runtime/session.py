@@ -68,6 +68,9 @@ class Runtime:
     #: The runtime's ``sys.platform`` and machine, such as ``linux-x86_64``, once probed.
     platform: str | None = None
 
+    #: The workspace root with ``~`` expanded on the runtime, once the boot prepared it.
+    workspace: str | None = None
+
     #: Digests this runtime is known to hold, so an argument is sent once.
     _blobs: set[str] = field(default_factory=set, repr=False)
 
@@ -89,15 +92,19 @@ class Runtime:
     # -- lifecycle -----------------------------------------------------------
 
     def boot(self) -> None:
-        """Open the channel, arm the lease, build the environment, check the interpreter,
-        attach volumes."""
+        """Open the channel, arm the lease, prepare the workspace root, build the environment,
+        check the interpreter, attach volumes."""
         if self.channel is None:
             self.channel = self.provider.open_channel(self)
         self.channel.start()
         if self.provider.needs_lease:
             self.lease = Lease(self)
             self.lease.arm()
+        self.prepare_workspace()
         self.install_env()
+        if self.env_source is not None:
+            # The worker moved to the project interpreter, so enter the root again there.
+            self.prepare_workspace()
         try:
             self.check_interpreter()
         except InterpreterMismatch:
@@ -305,6 +312,22 @@ class Runtime:
 
     # -- environment and volumes ---------------------------------------------
 
+    def prepare_workspace(self) -> None:
+        """Expand, create and enter the workspace root, and point TMPDIR under it.
+
+        A provider whose worker is this machine's subprocess keeps its working directory, and
+        its root is expanded here instead.
+        """
+        root = self.provider.workspace_root
+        if not self.provider.prepares_workspace:
+            import os
+
+            self.workspace = os.path.expanduser(root)
+            return
+        from . import bootstrap
+
+        self.workspace = self.eval(bootstrap.workspace_source(root), timeout=120)
+
     def install_env(self) -> None:
         """Build the project's environment in the session and move the worker onto it.
 
@@ -319,7 +342,7 @@ class Runtime:
 
         assert self.channel is not None
         files = bootstrap.project_files(self.env)
-        root = bootstrap.project_dir(self.provider.workspace_root, self.env)
+        root = bootstrap.project_dir(self.workspace or self.provider.workspace_root, self.env)
         where = self.eval(bootstrap.probe_source(self.env, root), timeout=120)
         self.platform = where["platform"]
 
@@ -368,10 +391,11 @@ class Runtime:
             )
 
     def attach(self, volume: Volume) -> None:
-        """Make a volume's mount point exist and apply its environment variables."""
+        """Make a volume's directory exist under the workspace root."""
         self.exec(
             "import os, pathlib\n"
-            f"pathlib.Path({volume.mount!r}).mkdir(parents=True, exist_ok=True)\n",
+            f"pathlib.Path(os.path.expanduser({volume.directory(self)!r}))"
+            ".mkdir(parents=True, exist_ok=True)\n",
             timeout=120,
         )
 

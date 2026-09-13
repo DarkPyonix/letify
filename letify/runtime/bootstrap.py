@@ -13,6 +13,7 @@ This module does not decide when a step runs or which channel carries it. That i
 from __future__ import annotations
 
 import base64
+import shlex
 import sys
 from typing import TYPE_CHECKING
 
@@ -21,8 +22,44 @@ from ..errors import ConfigError, InterpreterMismatch
 if TYPE_CHECKING:
     from ..declare.env import Env
 
-#: Where letify writes on a runtime unless a provider says otherwise. Expanded on the runtime.
-DEFAULT_WORKSPACE_ROOT = "~/.letify"
+#: Where letify writes on a runtime unless the account or its kind says otherwise. Expanded
+#: on the runtime.
+DEFAULT_WORKSPACE_ROOT = "~/.letify-runtime"
+
+#: The file written and removed to prove a workspace root is writable.
+PROBE_FILE = ".letify-probe"
+
+
+def shell_path(path: str) -> str:
+    """Quote a path for a POSIX shell, leaving a leading ``~`` to the remote ``$HOME``."""
+    if path == "~" or path.startswith("~/"):
+        rest = path[1:]
+        return '"$HOME"' + (shlex.quote(rest) if rest else "")
+    return shlex.quote(path)
+
+
+def workspace_check(root: str) -> str:
+    """A shell command that creates the root and writes and removes a probe file in it.
+
+    Run as the account's own user, so a root that needs elevated rights fails.
+    """
+    quoted = shell_path(root)
+    probe = shell_path(f"{root.rstrip('/')}/{PROBE_FILE}")
+    return f"mkdir -p {quoted} && : > {probe} && rm -f {probe}"
+
+
+def workspace_source(root: str) -> str:
+    """Source that expands and creates the root, enters it, and points TMPDIR under it."""
+    return (
+        "import os, tempfile\n"
+        f"_letify_workspace = os.path.expanduser({root!r})\n"
+        "os.makedirs(os.path.join(_letify_workspace, 'tmp'), exist_ok=True)\n"
+        "os.chdir(_letify_workspace)\n"
+        "os.environ['TMPDIR'] = os.path.join(_letify_workspace, 'tmp')\n"
+        "tempfile.tempdir = None\n"
+        "__letify_value__ = _letify_workspace\n"
+    )
+
 
 #: The official standalone uv installer. It writes under the home directory and needs no root.
 UV_INSTALLER = "https://astral.sh/uv/install.sh"

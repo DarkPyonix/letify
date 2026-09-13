@@ -331,7 +331,8 @@ def begin(request: dict):
                 return {"address": found.group(1)}, process.wait
         raise RuntimeError("tailcat serve exited without printing its address")
     if kind == "reverse_ssh":
-        key = Path(request["key_directory"]) / "letify_reverse"
+        # The directory is under the account's workspace root, which may start with ~.
+        key = Path(os.path.expanduser(request["key_directory"])) / "letify_reverse"
         key.parent.mkdir(parents=True, exist_ok=True)
         descriptor = os.open(key, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
         with os.fdopen(descriptor, "w") as handle:

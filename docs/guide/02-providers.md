@@ -115,6 +115,7 @@ persistent = true
 | `gpus` | A list, to skip connecting during discovery |
 | `port_command` | A command that prints the current port, for hosts that reassign it |
 | `store` | Override the cache backend |
+| `workspace` | The one directory letify writes under on the machine: the project `.venv`, volume data and temporary files. Default `~/.letify-runtime`. Home file only |
 
 **Persistence defaults to ephemeral,** which is the pessimistic choice on purpose. Assuming ephemeral when the disk actually survives only costs time, because letify rebuilds the environment and the work still succeeds. Assuming persistent when the disk is wiped fails outright.
 
@@ -125,6 +126,15 @@ Declaring `gpus` avoids an SSH connection at import time:
 ```toml
 gpus = ["A100", "A100", "A100", "A100"]
 ```
+
+Some servers allow writes only under a given directory, such as `/workspace`. Right after the key works, `letify login shell` asks where letify may write, and checks over SSH that it can create and write that directory without root. A path that fails writes nothing and names the error.
+
+```
+$ letify login shell lab_a100 --address gpu.lab.example.edu
+Workspace root on gpu.lab.example.edu [~/.letify-runtime]: /workspace/researcher/letify
+```
+
+In a script, pass `--workspace /workspace/researcher/letify` with `--no-input`. To move an account that is already declared, run the login again with `--workspace`, and the new path is checked before it is written. `letify check lab_a100` prints `workspace <path>: writable` or the reason it is not.
 
 `letify login shell` writes the devices table for you. Right after the key works, it runs `nvidia-smi` on the machine once, shows what it found and asks which cards letify may use. A blank answer takes them all.
 
@@ -185,9 +195,9 @@ Sign in once per account:
 letify login modal modal_lab
 ```
 
-letify asks for an optional workspace name, then runs Modal's own `modal token new` through uv. It prints a link; approve it in the browser. The token is written to `~/.letify/accounts/modal_lab/modal.toml`, so two Modal accounts can live on one machine. You never install `modal` yourself, on `PATH` or in your project's `.venv`. uv is the only requirement.
+letify asks for an optional Modal profile, which names the Modal workspace to sign in to (`--profile` in a script), then runs Modal's own `modal token new` through uv. It prints a link; approve it in the browser. The token is written to `~/.letify/accounts/modal_lab/modal.toml`, so two Modal accounts can live on one machine. You never install `modal` yourself, on `PATH` or in your project's `.venv`. uv is the only requirement.
 
-Storage is persistent because a Modal volume is mounted from outside the container, so function shipping is the default and no separate cache tier is needed.
+Storage is persistent because a Modal volume is mounted from outside the container, so function shipping is the default and no separate cache tier is needed. letify's own files in the sandbox, the project `.venv` included, live under `/letify`, where a Modal volume named `<app>-workspace` is mounted, so the next sandbox finds them. `--workspace PATH` at login moves that mount.
 
 `host="local"` raises. Modal exposes function calls into a container, not a device to forward calls at.
 

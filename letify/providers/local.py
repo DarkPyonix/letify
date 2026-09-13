@@ -54,6 +54,9 @@ class Local(Provider):
     #: A local subprocess ends with this process and costs nothing.
     needs_lease = False
 
+    #: The worker keeps the working directory of the process that started it.
+    prepares_workspace = False
+
     #: Nothing to run out of, which is a different answer from an unknown balance.
     usage_unit = "hours"
     usage_source = "nothing to ask; this machine bills nobody"
@@ -97,6 +100,13 @@ class Local(Provider):
 
     def store_backend(self) -> str:
         return "filesystem"
+
+    @property
+    def workspace_root(self) -> str:
+        """The default root, where a volume without ``mount`` lands. ``workspace`` is not used."""
+        from ..runtime import bootstrap
+
+        return bootstrap.DEFAULT_WORKSPACE_ROOT
 
     def open_channel(self, runtime: Runtime) -> Channel:
         """A Python subprocess of this machine, with pipes for framed requests.

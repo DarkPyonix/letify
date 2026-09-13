@@ -31,9 +31,6 @@ if TYPE_CHECKING:
     from ..providers.base import Provider
     from ..runtime.session import Runtime
 
-#: Where a runtime keeps the files a volume materializes.
-DEFAULT_MOUNT = "/opt/letify"
-
 #: Ref names letify itself uses. The rest of the namespace belongs to the user.
 ENV_REF = "env/{key}"
 CHECKPOINT_REF = "ckpt/{name}"
@@ -66,7 +63,19 @@ class Volume:
 
     @property
     def mount(self) -> str:
-        return str(self.options.get("mount", DEFAULT_MOUNT))
+        """The volume directory, ``<workspace root>/volumes/<name>``, before ``~`` is expanded.
+
+        The ``mount`` option names another directory for this volume.
+        """
+        return self.directory(None)
+
+    def directory(self, runtime: Runtime | None) -> str:
+        """The volume directory, under the root a booted runtime expanded when there is one."""
+        configured = self.options.get("mount")
+        if configured:
+            return str(configured)
+        root = getattr(runtime, "workspace", None) or self.provider.workspace_root
+        return f"{root.rstrip('/')}/volumes/{self.name}"
 
     @property
     def key(self) -> str:
@@ -174,13 +183,14 @@ class Volume:
     ) -> RemoteFile:
         """Put a blob inside the runtime, optionally unpacking it at ``target``.
 
-        ``target`` defaults to the mount. ``links`` allows symlinks to absolute paths in the
-        archive, which an environment archive needs. The runtime pulls the blob from the
-        backend itself when the backend offers a pull and the channel keeps a worker alive to
-        perform it. Otherwise the bytes go through the channel.
+        ``target`` defaults to the volume directory. ``links`` allows symlinks to absolute
+        paths in the archive, which an environment archive needs. The runtime pulls the blob
+        from the backend itself when the backend offers a pull and the channel keeps a worker
+        alive to perform it. Otherwise the bytes go through the channel.
         """
-        destination = path or f"{self.mount.rstrip('/')}/blobs/{digest[:2]}/{digest}"
-        into = target or self.mount
+        directory = self.directory(runtime)
+        destination = path or f"{directory.rstrip('/')}/blobs/{digest[:2]}/{digest}"
+        into = target or directory
         if runtime.persistent_channel:
             source = self.store.backend.pull_source(digest)
             if source is not None:
@@ -216,4 +226,4 @@ class Volume:
         return f"<Volume {self.key} on {self.provider.store_backend()}>"
 
 
-__all__ = ["CHECKPOINT_REF", "DEFAULT_MOUNT", "ENV_REF", "Volume"]
+__all__ = ["CHECKPOINT_REF", "ENV_REF", "Volume"]

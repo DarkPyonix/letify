@@ -32,7 +32,7 @@ from typing import TYPE_CHECKING, Literal
 from ..config import ProviderConfig
 from ..config.inventory import Devices, read_table
 from ..declare.instance import Host, Instance
-from ..errors import LetifyError, UnknownInstance
+from ..errors import ConfigError, LetifyError, UnknownInstance
 from .usage import Usage, from_command
 
 if TYPE_CHECKING:
@@ -291,16 +291,30 @@ class Provider(abc.ABC):
 
     # -- sessions ------------------------------------------------------------
 
+    #: The workspace root when the account sets no ``workspace``. None means the default
+    #: per-user directory, which needs no elevated rights.
+    default_workspace: str | None = None
+
+    #: Whether a session boot expands, creates and enters the workspace root on the runtime.
+    prepares_workspace: bool = True
+
     @property
     def workspace_root(self) -> str:
         """Where letify may write on the runtime, before ``~`` is expanded there.
 
         Every remote path letify introduces, such as the project directory a sync runs in,
-        derives from this one value.
+        derives from this one value: the account's ``workspace``, or this kind's default.
         """
         from ..runtime import bootstrap
 
-        return bootstrap.DEFAULT_WORKSPACE_ROOT
+        value = self.config.option("workspace")
+        if value is None:
+            return self.default_workspace or bootstrap.DEFAULT_WORKSPACE_ROOT
+        if not isinstance(value, str) or not value.startswith(("/", "~")):
+            raise ConfigError(
+                f"{self.alias}: workspace must be an absolute path or start with ~, not {value!r}"
+            )
+        return value
 
     @property
     def managed_python(self) -> str | None:

@@ -28,6 +28,10 @@ CONFIG_FILE = "config.toml"
 #: other repository on the machine can reach.
 GLOBAL_FIELD = "global"
 
+#: The workspace root of an account. Read from the home file only, because the directories an
+#: account may write in are set by the machine, not by a repository.
+WORKSPACE_FIELD = "workspace"
+
 #: Fields that say where an account applies rather than how to connect to it.
 _MARKERS = frozenset({"kind", GLOBAL_FIELD, "from_home"})
 
@@ -59,6 +63,12 @@ def load(path: str | Path | None = None, *, home: bool = True) -> Config:
         counter += 1
 
     for alias, body in project_entries.items():
+        if WORKSPACE_FIELD in body:
+            raise ConfigError(
+                f"{project_path}: {alias!r} sets 'workspace', which belongs in the home file "
+                f"~/.letify/config.toml, because where letify may write is a rule of one "
+                f"machine rather than of the repository"
+            )
         base = home_entries.get(alias, {})
         kind = body.get("kind", base.get("kind"))
         if not isinstance(kind, str):

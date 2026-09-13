@@ -25,7 +25,7 @@ from letify.store.backends import layout
 from letify.store.backends.filesystem import FilesystemBackend
 from letify.store.backends.objects import GCSBackend, ModalBackend
 from letify.store.cas import Backend, BlobInfo, Store
-from letify.store.volume import CHECKPOINT_REF, DEFAULT_MOUNT, ENV_REF, Volume
+from letify.store.volume import CHECKPOINT_REF, ENV_REF, Volume
 
 
 @pytest.fixture
@@ -464,7 +464,9 @@ def test_a_volume_elsewhere_naming_the_modal_backend_needs_an_account(let) -> No
 
 
 def test_a_volume_mounts_where_the_runtime_keeps_materialized_files(let, tmp_path) -> None:
-    assert Volume(let.providers.local, "cache", {"root": str(tmp_path)}).mount == DEFAULT_MOUNT
+    # Spec "Workspace root": local uses no workspace, so the default root holds its volumes.
+    default = Volume(let.providers.local, "cache", {"root": str(tmp_path)}).mount
+    assert default == "~/.letify-runtime/volumes/cache"
     volume = Volume(let.providers.local, "cache", {"mount": "/mnt/study"})
     assert volume.mount == "/mnt/study"
     assert volume.key == "local/cache"

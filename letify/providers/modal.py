@@ -212,6 +212,9 @@ class Modal(Provider):
     #: A sandbox keeps a process alive, so handles and blob reuse work.
     persistent_channel = True
 
+    #: A sandbox loses its disk, so the root is a Modal volume mounted at this path.
+    default_workspace = "/letify"
+
     def __init__(self, config: ProviderConfig):
         super().__init__(config)
         self._sandboxes: dict[str, str] = {}
@@ -259,11 +262,17 @@ class Modal(Provider):
         from ..protocol.worker import BOOTSTRAP
 
         adapter = self.adapter()
+        app = str(self.config.option("app", "letify"))
+        root = self.workspace_root
+        # The workspace root is a Modal volume, so it outlives each sandbox. A mount path
+        # has to be absolute inside the sandbox.
+        volumes = {root: f"{app}-workspace"} if root.startswith("/") else {}
         # Not `python3 -`: that reads standard input to the end before running anything, so
         # the requests that follow the source would be compiled as source too.
         created = adapter.request(
             "create",
-            app=str(self.config.option("app", "letify")),
+            app=app,
+            volumes=volumes,
             args=["python3", "-u", "-c", BOOTSTRAP],
             packages=list(WORKER_PACKAGES),
             gpu=self.wire_name(runtime.instance) or None,
