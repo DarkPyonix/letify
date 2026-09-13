@@ -361,6 +361,8 @@ COLAB_CLI = [
     "run",
     "--python",
     "3.13",
+    "--with",
+    "jupyter-kernel-client<1",
     "--from",
     "google-colab-cli",
     "colab",

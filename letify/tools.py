@@ -31,10 +31,19 @@ class Tool:
     package: str
     executable: str
     python: str
+    #: Requirements the tool needs but does not pin itself, added with ``--with``.
+    pins: tuple[str, ...] = ()
 
 
-#: The official Colab CLI. It has no release for Python older than 3.13.
-COLAB = Tool(package="google-colab-cli", executable="colab", python="3.13")
+#: The official Colab CLI. It has no release for Python older than 3.13. Release 0.6.0 calls
+#: ``jupyter_kernel_client.KernelClient``, which jupyter-kernel-client 1.0 removed, and does not
+#: pin that package, so every command that reaches a kernel fails without the pin.
+COLAB = Tool(
+    package="google-colab-cli",
+    executable="colab",
+    python="3.13",
+    pins=("jupyter-kernel-client<1",),
+)
 
 
 def find_uv() -> str | None:
@@ -54,7 +63,18 @@ def missing_uv_message() -> str:
 
 def command(tool: Tool, uv: str) -> list[str]:
     """The argument list that runs ``tool`` through ``uv``."""
-    return [uv, "tool", "run", "--python", tool.python, "--from", tool.package, tool.executable]
+    pinned = [part for pin in tool.pins for part in ("--with", pin)]
+    return [
+        uv,
+        "tool",
+        "run",
+        "--python",
+        tool.python,
+        *pinned,
+        "--from",
+        tool.package,
+        tool.executable,
+    ]
 
 
 def environment(alias: str) -> dict[str, str]:
