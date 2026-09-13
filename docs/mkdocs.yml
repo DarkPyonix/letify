@@ -1,0 +1,69 @@
+# The guide site published to GitHub Pages by .github/workflows/docs.yml.
+#
+# Lives beside what it builds. Paths below are relative to this file: the site is built from
+# docs/guide, which survives on main, and written to site/ at the repository root. Each
+# README.md is served as the index of its folder.
+#
+#   uv run --only-group docs mkdocs serve -f docs/mkdocs.yml
+site_name: letify guides
+site_description: Declarations that become infrastructure.
+site_url: https://darkpyonix.github.io/letify/
+repo_url: https://github.com/DarkPyonix/letify
+repo_name: DarkPyonix/letify
+edit_uri: ""
+
+docs_dir: guide
+site_dir: ../site
+
+theme:
+  name: material
+  features:
+    - navigation.sections
+    - navigation.footer
+    - content.code.copy
+  palette:
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      toggle:
+        icon: material/weather-night
+        name: Dark mode
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      toggle:
+        icon: material/weather-sunny
+        name: Light mode
+
+markdown_extensions:
+  - tables
+  - admonition
+  - toc:
+      permalink: true
+  - pymdownx.highlight
+  - pymdownx.superfences
+
+nav:
+  - English:
+      - Guides: README.md
+      - Getting started: 01-getting-started.md
+      - Providers and accounts: 02-providers.md
+      - Choosing the execution mode: 03-execution-modes.md
+      - Environments and data: 04-environments-and-data.md
+      - Sweeps and capacity: 05-sweeps.md
+      - Cost control: 06-cost.md
+      - Troubleshooting: 07-troubleshooting.md
+  - 한국어:
+      - 가이드: ko/README.md
+      - 시작하기: ko/01-시작하기.md
+      - 프로바이더와 계정: ko/02-프로바이더.md
+      - 실행 방식 고르기: ko/03-실행-방식.md
+      - 환경과 데이터: ko/04-환경과-데이터.md
+      - 스윕과 용량: ko/05-스윕.md
+      - 비용 관리: ko/06-비용.md
+      - 문제 해결: ko/07-문제-해결.md
+
+# The guides link to design documents that live on develop only, so those links are reported
+# rather than failing the build.
+validation:
+  links:
+    not_found: info
+    unrecognized_links: info
