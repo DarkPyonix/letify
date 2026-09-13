@@ -448,15 +448,19 @@ The public IP address is learned from the same STUN servers the punch uses. The 
 
 ### Rendezvous <!-- id: rendezvous -->
 
-> Hole punching needs a way to start a program on the remote side and swap addresses. Colab and Elice provide one; any other machine runs `letify client shell connect`.
+> Hole punching needs a way to start a program on the remote side and swap addresses. For Colab and Elice the provider layer fills that role; a plain machine behind NAT runs `letify client shell connect`.
 
 | Provider | Rendezvous |
 |---|---|
-| `Colab` | `colab exec` |
-| `Elice` | the Elice Cloud API |
-| `Tunnel`, and a plain `Shell` behind NAT | the remote agent started by `letify client shell connect` |
+| `Colab` | the provider layer: `colab new` creates the runtime and `colab exec` runs the remote half |
+| `Elice` | the provider layer: the Elice Cloud API creates and allocates the machine, and the remote half runs over forward SSH to it |
+| `Tunnel`, and a plain `Shell` behind NAT | the remote agent started by `letify client shell connect`, reached over Tailcat |
 
-`letify client shell connect` is run once on the remote machine by its user. It starts the remote agent, which stays running, keeps a connection to the rendezvous relay, and answers punch requests for the account it was started for. Installing letify on that machine is therefore a requirement for ranks 2 and 3 on a machine without a provider API.
+Colab and Elice never need `letify client shell connect`. Their create and open step is what puts letify's remote half on the machine.
+
+`letify client shell connect` is run once on a plain machine by its user. It starts the remote agent on a port the operating system chooses, starts `tailcat serve <agent port>` in front of it, and prints the Tailcat address and the agent port. The user writes both into the account once, as `tailcat = "<address>"` and `tailcat_port = <agent port>`. The agent needs letify installed on that machine.
+
+A connection to the agent is told apart by its first bytes: `SSH-` is spliced to the machine's SSH server, `LETIFY-RDV ` is followed by one JSON request line and answered with one JSON line, and `LETIFY-PROBE` is followed by the probe. For such an account the pipeline connects over Tailcat first, runs `tailcat <address> <agent port>` to exchange the TCP punch mapping and start time over that link, and then races as specified: the Tailcat link is the rank 3 candidate, and when TCP punching passes the probe it takes over.
 
 Both sides learn their public mapping from STUN servers reached over TCP on port 443, because networks that restrict outbound ports usually still allow 443. A punch starts at a time both sides agree on through the rendezvous. Each side connects from its bound port to the other's mapping and listens on the same port, so whichever direction's SYN arrives first completes the connection.
 
@@ -466,11 +470,9 @@ A punched connection first answers the probe, then on request is spliced to the 
 
 A local port that letify binds for forwarding is chosen by the operating system, never fixed, because Windows reserves port ranges that vary by machine. The remote end of a reverse forward is chosen the same way, with `ssh -R 0:`.
 
-The remote half of a punch, a Tailcat listener or a reverse forward is one standard library Python module sent as source, so the remote machine needs Python and nothing else. Through a command rendezvous it runs as a detached process that prints its answer and outlives the command.
+The remote half of a punch, a Tailcat listener or a reverse forward is one standard library Python module sent as source, so a Colab or Elice machine needs Python and nothing else. Through the provider layer it runs as a detached process that prints its answer and outlives the command.
 
-The remote agent reaches the user's machine through a `Relay`: two mailboxes per account, one for requests and one for answers. The only relay letify has is a directory both machines can read and write, named by `letify client shell connect <account> --relay <directory>` and by `relay = "<directory>"` in the account's configuration. A `Shell` whose account names a relay has the remote agent as its rendezvous.
-
-Tailcat is run as `tailcat listen --token <token> --forward 127.0.0.1:<ssh port>` on the remote side and as `tailcat connect --token <token>` in an SSH `ProxyCommand` on the user's side. It is applicable only when `tailcat` is on the user's PATH.
+Tailcat is run as `tailcat serve <port>` on the remote side, which prints `Server listening with new address: <address>`, and as `tailcat <address> <port>` in an SSH `ProxyCommand` on the user's side. It is applicable only when `tailcat` is on the user's PATH.
 
 ### Reverse SSH <!-- id: reverse-ssh -->
 
@@ -484,9 +486,9 @@ kind = "shell"
 reverse_ssh = { address = "home.example.com", port = 2222, user = "me" }
 ```
 
-The key installed in the user's `authorized_keys` carries `restrict,port-forwarding,command="/bin/false"`. Its private half reaches the remote side through the rendezvous. Closing the link removes the line.
+It is opt-in because it needs the user's machine to accept inbound SSH and needs a key on the remote side that can log in to it.
 
-It is opt-in because it needs the user's machine to accept inbound SSH and needs a key on the remote side that can log in to it. letify generates a key per session, installs it in the user's `authorized_keys` restricted to port forwarding with no shell, and removes it when the session ends. Installing that restriction is done once by an explicit command, not by the pipeline.
+The key is per session. letify generates a new ed25519 key pair for each session and appends the public key to the user's `~/.ssh/authorized_keys` with `restrict,port-forwarding,command="/bin/false"` and the comment `letify-session <alias>`. The private key reaches the remote side through the rendezvous. Closing the link removes the line. Before a new session's key is added, every line carrying the `letify-session` marker for that alias is removed, so a crashed session never leaves a key behind.
 
 ### Colab <!-- id: colab-transport -->
 
@@ -496,7 +498,7 @@ The Colab CLI runs as `uv tool run --from google-colab-cli colab`, with `jupyter
 
 Colab limits outbound UDP to roughly 200 packets per second, so rank 3 is expected to lose the probe there. It stays in the list because the ratio rule removes it without a special case.
 
-A `channel = "exec"` entry skips the pipeline and uses the fallback directly. The rendezvous request to a Colab runtime carries the account's public key, `key` with `.pub` appended, which the remote side adds to `authorized_keys`; SSH over a punched link logs in as `root` unless `user` says otherwise.
+A `channel = "exec"` entry skips the pipeline and uses the fallback directly. A Colab VM has no SSH server by default, so the rendezvous request asks the remote half to install `openssh-server` and start `sshd` first. The request carries the account's public key, `key` with `.pub` appended, which the remote side adds to `authorized_keys`. SSH over a punched or Tailcat link logs in as `root` unless `user` says otherwise.
 
 The fallback sends calls with `colab exec` and bulk data through the Jupyter contents API that the Colab runtime proxy exposes: uploads are split into parts sent in parallel, each part in chunked `PUT` requests, and downloads read `/files/<path>` in parallel parts. The contents API root is `/` on the VM, not `/content`.
 
@@ -710,11 +712,9 @@ Linux wheels are built inside the `manylinux_2_28` containers, so the binaries n
 
 - **`letify-driver` covers one milestone.** The entry points a PyTorch process needs to start up and run one kernel are forwarded and verified against a real GPU. Kernel argument marshalling reads the pointer list without knowing the kernel's signature, and fatbin size comes from a conservative window rather than the image header. Both need a real workload to shape them.
 - **`Modal` and `Elice` are not exercised against the live services.** Their code follows each service's published interface, and the Elice paths come from Elice's own Terraform provider, but neither has been run end to end.
-- **The connection pipeline is not exercised against live networks.** `Rendezvous`, `Strategy`, `Link`, `Probe`, `Pipeline`, `LinkCache` and the remote agent are implemented and tested over loopback sockets and faked commands. That the Colab VM runs an SSH server on port 22, and the Tailcat command line, are assumptions not yet checked against the real systems.
-- **There is no relay server.** The remote agent speaks to a `Relay` interface, and the only implementation is a shared directory. A machine behind NAT that shares no directory with the user's machine has only forward SSH until a network relay exists.
-- **Elice has no rendezvous.** The Elice Cloud API paths letify uses allocate and release machines and run no command on them, so ranks 2 and 3 are skipped for Elice and it is reached by forward SSH only.
+- **The connection pipeline is not exercised against live networks.** `Rendezvous`, `Strategy`, `Link`, `Probe`, `Pipeline`, `LinkCache` and the remote agent are implemented and tested over loopback sockets and faked commands. Installing and starting `sshd` on a Colab VM over `colab exec` is not yet checked against a live runtime.
+- **The Elice API runs no command on a machine.** The paths letify uses (virtual machine, allocation, instance type, pricing) create and power machines only, so Elice's remote half runs over forward SSH to the allocated machine, and the punch and Tailcat strategies need that SSH to succeed first.
 - **The Colab file API is not part of the fallback link.** The fallback carries calls over `colab exec`; bulk transfer through the Jupyter contents API is not implemented.
-- **Installing the reverse SSH restriction once by an explicit command is not implemented.** The pipeline installs each session key with the restriction options itself.
 - **Orphan reconciliation is not implemented.** A session whose controlling machine was killed outright is released by the lease on the providers where the process is the cost. Where the platform bills for the machine and takes no deadline, nothing ends it: an Elice allocation bills until a delete is issued. The intended answer is that the next letify process asks the provider what is running under this project's name and ends what nothing is watching, with a command to do it on demand. Neither exists yet.
 - **Whether the Elice allocation API takes a deadline is unverified.** If it does, that is where the guarantee belongs, because the platform outlives the caller.
 - **Persistence detection is not implemented.** Deciding a machine's disk policy by writing a marker file and looking for it in a later runtime is a decision recorded here, not yet code.
