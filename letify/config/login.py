@@ -12,6 +12,10 @@ No credential is written to either config.toml. A token goes to a file in
 not stored at all: letify opens sessions with ``BatchMode=yes``, because a session is
 started by the pool in the background with nobody present to answer a prompt, so the
 password is accepted once, used to install a key, and dropped.
+
+A shell or tunnel login also asks the machine for its GPUs once, over the confirmed key,
+and writes the cards the user chose to ``[<alias>.devices]`` in the home file. What a
+session later reserves from that table is the inventory's business, not this module's.
 """
 
 from __future__ import annotations
@@ -19,12 +23,15 @@ from __future__ import annotations
 import getpass
 import subprocess
 import sys
+import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from ..errors import ConfigError
+from ..errors import ConfigError, LetifyError
+from ..providers.naming import gib_from_mib, normalize_gpu
 from . import secrets, writer
+from .inventory import read_indices
 from .schema import RESERVED_ALIASES
 from .secrets import CONFIG_DIRECTORY
 
@@ -167,6 +174,26 @@ def install_key(*, address: str, user: str | None, port: int, key_path: str) -> 
         )
 
 
+def batch_ssh(
+    *, address: str, user: str | None, port: int, key_path: str, remote: str
+) -> list[str]:
+    """The SSH command a pooled session would run, with no way to prompt."""
+    target = f"{user}@{address}" if user else address
+    return [
+        "ssh",
+        "-p",
+        str(port),
+        "-i",
+        str(expand(key_path)),
+        "-o",
+        "BatchMode=yes",
+        "-o",
+        "StrictHostKeyChecking=accept-new",
+        target,
+        remote,
+    ]
+
+
 def confirm_key(*, address: str, user: str | None, port: int, key_path: str) -> None:
     """Prove the key works before the alias is declared.
 
@@ -175,19 +202,7 @@ def confirm_key(*, address: str, user: str | None, port: int, key_path: str) -> 
     """
     target = f"{user}@{address}" if user else address
     result = subprocess.run(
-        [
-            "ssh",
-            "-p",
-            str(port),
-            "-i",
-            str(expand(key_path)),
-            "-o",
-            "BatchMode=yes",
-            "-o",
-            "StrictHostKeyChecking=accept-new",
-            target,
-            "echo letify",
-        ],
+        batch_ssh(address=address, user=user, port=port, key_path=key_path, remote="echo letify"),
         capture_output=True,
         text=True,
         timeout=120,
@@ -197,6 +212,161 @@ def confirm_key(*, address: str, user: str | None, port: int, key_path: str) -> 
             f"the key does not let letify into {target} without a prompt: "
             f"{result.stderr.strip() or result.stdout.strip()}"
         )
+
+
+# -- GPUs found at login -------------------------------------------------------
+
+#: The one query run at login. ``index`` is the physical position the inventory names.
+DEVICE_QUERY = "nvidia-smi --query-gpu=index,name,memory.total --format=csv,noheader"
+
+#: What a machine with no devices table falls back to, said whenever nothing is recorded.
+FALLBACK_NOTE = (
+    "No devices table was written, so letify asks the machine for its GPUs at first use."
+)
+
+
+@dataclass(frozen=True)
+class FoundDevices:
+    """The cards of one normalized accelerator name, with their physical indices."""
+
+    name: str
+    indices: tuple[int, ...]
+    memory_gb: int | None = None
+
+    def describe(self) -> str:
+        """One line such as ``A100: 4 cards, indices 0-3 (80 GB each)``."""
+        many = len(self.indices) > 1
+        line = (
+            f"{self.name}: {len(self.indices)} card{'s' if many else ''}, "
+            f"{'indices' if many else 'index'} {compact_indices(self.indices)}"
+        )
+        if self.memory_gb:
+            line += f" ({self.memory_gb} GB{' each' if many else ''})"
+        return line
+
+
+def compact_indices(indices: tuple[int, ...] | list[int]) -> str:
+    """``"0-3"`` for a contiguous run, ``"0,1,6"`` otherwise, both forms the inventory reads."""
+    ordered = sorted(indices)
+    if len(ordered) > 1 and ordered[-1] - ordered[0] == len(ordered) - 1:
+        return f"{ordered[0]}-{ordered[-1]}"
+    return ",".join(str(index) for index in ordered)
+
+
+def group_devices(output: str) -> list[FoundDevices]:
+    """Group nvidia-smi rows by normalized name, in the order the names first appear."""
+    indices: dict[str, list[int]] = {}
+    memory: dict[str, int | None] = {}
+    for line in output.splitlines():
+        index, _, rest = line.partition(",")
+        name, _, total = rest.partition(",")
+        if not index.strip().isdigit() or not name.strip():
+            continue
+        label = normalize_gpu(name)
+        indices.setdefault(label, []).append(int(index))
+        size = gib_from_mib(total)
+        if size is not None and (memory.get(label) or 0) < size:
+            memory[label] = size
+    return [
+        FoundDevices(label, tuple(sorted(found)), memory.get(label))
+        for label, found in indices.items()
+    ]
+
+
+def detect_devices(
+    *, address: str, user: str | None, port: int, key_path: str
+) -> tuple[list[FoundDevices], str | None]:
+    """Ask the machine for its GPUs once. Returns the groups, or none and the reason.
+
+    A failure here never fails the login, because the account works without a table.
+    """
+    target = f"{user}@{address}" if user else address
+    command = batch_ssh(
+        address=address, user=user, port=port, key_path=key_path, remote=DEVICE_QUERY
+    )
+    try:
+        result = subprocess.run(command, capture_output=True, text=True, timeout=120)
+    except (OSError, subprocess.SubprocessError) as exc:
+        return [], f"nvidia-smi could not be run on {target}: {exc}"
+    if result.returncode != 0:
+        detail = result.stderr.strip() or result.stdout.strip() or f"exit {result.returncode}"
+        return [], f"nvidia-smi did not answer on {target}: {detail}"
+    groups = group_devices(result.stdout)
+    if not groups:
+        return [], f"nvidia-smi reports no GPU on {target}"
+    return groups, None
+
+
+def _chosen(group: FoundDevices, spec: str) -> tuple[int, ...]:
+    """Read a choice of indices and refuse any the machine does not have."""
+    try:
+        indices = read_indices(spec)
+    except ConfigError as exc:
+        raise LoginError(f"{group.name}: {exc}") from None
+    missing = [index for index in indices if index not in group.indices]
+    if missing:
+        raise LoginError(
+            f"{group.name} has no card at index {', '.join(str(i) for i in missing)}. "
+            f"The machine has {compact_indices(group.indices)}."
+        )
+    return indices
+
+
+def choose_devices(answers: Answers, groups: list[FoundDevices]) -> dict[str, dict[str, str]]:
+    """Decide which indices of each accelerator letify may use, and return the table.
+
+    ``--indices NAME=SPEC`` decides one name. Otherwise a terminal is asked, and a script
+    or a blank answer takes every card found.
+    """
+    given: dict[str, str] = {}
+    for item in answers.get("indices") or []:
+        name, separator, spec = str(item).partition("=")
+        if not separator or not name.strip() or not spec.strip():
+            raise LoginError(f"--indices takes NAME=SPEC, such as A100=0-3, not {item!r}")
+        given[name.strip()] = spec.strip()
+    found = {group.name: group for group in groups}
+    unknown = sorted(set(given) - set(found))
+    if unknown:
+        raise LoginError(
+            f"--indices names {', '.join(unknown)}, which the machine does not have. "
+            f"It has {', '.join(found)}."
+        )
+
+    for group in groups:
+        print(group.describe())
+    table: dict[str, dict[str, str]] = {}
+    for group in groups:
+        if group.name in given:
+            indices = _chosen(group, given[group.name])
+        elif answers.interactive:
+            indices = _ask_indices(group)
+        else:
+            indices = group.indices
+        table[group.name] = {"indices": compact_indices(indices)}
+    return table
+
+
+def _ask_indices(group: FoundDevices) -> tuple[int, ...]:
+    prompt = f"Indices letify may use for {group.name} [{compact_indices(group.indices)}]: "
+    while True:
+        answer = read_line(prompt)
+        if not answer:
+            return group.indices
+        try:
+            return _chosen(group, answer)
+        except LoginError as exc:
+            print(exc)
+
+
+def record_devices(
+    answers: Answers, *, address: str, user: str | None, port: int, key_path: str
+) -> dict[str, dict[str, str]] | None:
+    """Detect the machine's GPUs and return the chosen table, or ``None`` with a note."""
+    groups, reason = detect_devices(address=address, user=user, port=port, key_path=key_path)
+    if not groups:
+        print(f"{reason}. {FALLBACK_NOTE}")
+        return None
+    return choose_devices(answers, groups)
 
 
 # -- one flow per kind ---------------------------------------------------------
@@ -242,6 +412,10 @@ def shell_account(answers: Answers) -> dict[str, Any]:
         ensure_key(key_path)
         install_key(address=address, user=user, port=port, key_path=key_path)
     confirm_key(address=address, user=user, port=port, key_path=key_path)
+    devices = record_devices(answers, address=address, user=user, port=port, key_path=key_path)
+    if devices:
+        # Written by log_in as its own [<alias>.devices] table, not as a field of the account.
+        options["devices"] = devices
     return options
 
 
@@ -397,9 +571,15 @@ def log_in(answers: Answers, *, project: str | Path | None = None) -> tuple[bool
     home = home_path()
     existing = home.read_text(encoding="utf-8") if home.is_file() else ""
     fresh = not writer.has_block(existing, answers.alias)
+    devices = None
     if fresh:
         options = FLOWS[answers.kind](answers)
+        devices = options.pop("devices", None)
         writer.update(home, answers.alias, options, private=True)
+    elif answers.get("detect_devices"):
+        devices = detect_again(answers, existing, home)
+    if devices:
+        writer.update(home, devices_table(answers.alias), devices, private=True)
 
     # An empty table names the account and carries no connection detail, so it is safe in a
     # repository. A table that is already there is left alone, because the project may have
@@ -408,7 +588,53 @@ def log_in(answers: Answers, *, project: str | Path | None = None) -> tuple[bool
     existing_project = target.read_text(encoding="utf-8") if target.is_file() else ""
     if not writer.has_block(existing_project, answers.alias):
         writer.update(target, answers.alias, {})
+    if devices:
+        refresh_stubs(project)
     return fresh, home, target
+
+
+def devices_table(alias: str) -> str:
+    return f"{alias}.devices"
+
+
+def detect_again(answers: Answers, text: str, home: Path) -> dict[str, dict[str, str]] | None:
+    """Ask an already declared machine for its GPUs, and return the table once confirmed."""
+    entry = tomllib.loads(text).get(answers.alias, {})
+    kind = entry.get("kind", answers.kind)
+    if kind not in ("shell", "tunnel"):
+        raise LoginError(f"--detect-devices applies to shell and tunnel accounts, not {kind!r}")
+    if entry.get("auth") == "password" or not entry.get("address"):
+        raise LoginError(
+            f"{answers.alias} has no key and address to ask the machine with, so its GPUs "
+            f"cannot be detected. Declare them in [{devices_table(answers.alias)}] by hand."
+        )
+    devices = record_devices(
+        answers,
+        address=str(entry["address"]),
+        user=entry.get("user"),
+        port=int(entry.get("port") or 22),
+        key_path=str(entry.get("key") or DEFAULT_KEY),
+    )
+    if devices and answers.interactive:
+        reply = read_line(f"Replace the devices table of {answers.alias} in {home}? [y/N] ")
+        if not reply.lower().startswith("y"):
+            print("The devices table was left as it was.")
+            return None
+    return devices
+
+
+def refresh_stubs(project: str | Path | None) -> None:
+    """Regenerate the provider types, so an editor completes the names just recorded.
+
+    Building a launcher is what regenerates them. A stub that cannot be written never fails
+    a login that has already written the account.
+    """
+    from ..launcher import Launcher
+
+    try:
+        Launcher(project, announce=False)
+    except (OSError, LetifyError):
+        pass
 
 
 def log_out(alias: str) -> tuple[bool, bool]:
@@ -418,6 +644,8 @@ def log_out(alias: str) -> tuple[bool, bool]:
     has it, so the reference stays and says what to run to get it back.
     """
     removed = writer.drop(home_path(), alias)
+    # A devices table left behind would declare an account with no kind.
+    writer.drop(home_path(), devices_table(alias))
     forgotten = forget_secret(alias)
     return removed, forgotten
 
@@ -425,13 +653,20 @@ def log_out(alias: str) -> tuple[bool, bool]:
 __all__ = [
     "AUTH_METHODS",
     "DEFAULT_KEY",
+    "DEVICE_QUERY",
     "Answers",
+    "FoundDevices",
     "LoginError",
     "ask",
+    "batch_ssh",
     "check_alias",
+    "choose_devices",
+    "compact_indices",
     "confirm_key",
+    "detect_devices",
     "ensure_key",
     "forget_secret",
+    "group_devices",
     "home_path",
     "install_key",
     "log_in",
@@ -439,5 +674,7 @@ __all__ = [
     "project_path",
     "read_line",
     "read_password",
+    "record_devices",
+    "refresh_stubs",
     "store_secret",
 ]

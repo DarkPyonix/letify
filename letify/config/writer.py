@@ -6,7 +6,8 @@ is textual: the block belonging to one alias is found, replaced or appended, and
 other byte of the file is left exactly as it was.
 
 Only the value types TOML needs for an account are written: string, integer, float,
-boolean and a list of strings. A value keeps the type it came in as, because a port
+boolean, a list of strings and an inline table, which is how one line of a ``devices``
+table is written. A value keeps the type it came in as, because a port
 written as a string is a different value to whoever reads it back.
 """
 
@@ -30,7 +31,16 @@ def format_value(value: Any) -> str:
         return repr(value)
     if isinstance(value, (list, tuple)):
         return "[" + ", ".join(format_value(item) for item in value) + "]"
+    if isinstance(value, dict):
+        pairs = ", ".join(f"{_key(key)} = {format_value(item)}" for key, item in value.items())
+        return "{ " + pairs + " }"
     return _quote(str(value))
+
+
+def _key(name: Any) -> str:
+    """A TOML key, bare when TOML allows it and quoted otherwise."""
+    text = str(name)
+    return text if re.fullmatch(r"[A-Za-z0-9_-]+", text) else _quote(text)
 
 
 def _quote(text: str) -> str:

@@ -704,3 +704,268 @@ def test_installing_a_key_that_the_machine_refuses_is_reported(patch_run, tmp_pa
 def test_forgetting_an_account_with_no_directory_is_not_an_error(isolated_home) -> None:
     # There is nothing to do either way: this machine holds nothing for that account.
     assert login.forget_secret("never-logged-in") is False
+
+
+# -- Spec: Recording devices at login ------------------------------------------
+
+#: What nvidia-smi prints for a shared box with four A100 cards and two RTX PRO 6000 cards.
+MIXED_MACHINE = (
+    "0, NVIDIA A100-SXM4-80GB, 81920 MiB\n"
+    "1, NVIDIA A100-SXM4-80GB, 81920 MiB\n"
+    "2, NVIDIA A100-SXM4-80GB, 81920 MiB\n"
+    "3, NVIDIA A100-SXM4-80GB, 81920 MiB\n"
+    "4, NVIDIA RTX PRO 6000 Blackwell Server Edition, 97887 MiB\n"
+    "5, NVIDIA RTX PRO 6000 Blackwell Server Edition, 97887 MiB\n"
+)
+
+SHELL_LOGIN = ["login", "shell", "lab", "--address", "gpu.example.edu", "--skip-key-install"]
+
+
+def machine(stdout: str = MIXED_MACHINE, *, returncode: int = 0, stderr: str = ""):
+    """Answer the GPU query with this output and every other SSH command with success."""
+
+    def answer(command: list[str]) -> FakeCompleted:
+        if "nvidia-smi" in command[-1]:
+            return FakeCompleted(returncode=returncode, stdout=stdout, stderr=stderr)
+        return FakeCompleted()
+
+    return answer
+
+
+def home_config() -> dict:
+    return tomllib.loads((Path.home() / ".letify" / "config.toml").read_text(encoding="utf-8"))
+
+
+def gpu_queries(recorder) -> list[list[str]]:
+    return [call["command"] for call in recorder.calls if "nvidia-smi" in call["command"][-1]]
+
+
+def answer_prompts(monkeypatch, replies: dict[str, list[str]]) -> list[str]:
+    """Answer each prompt that starts with a key from its list, in order, and record prompts."""
+    asked: list[str] = []
+
+    def read(prompt: str) -> str:
+        asked.append(prompt)
+        for start, queue in replies.items():
+            if prompt.startswith(start):
+                return queue.pop(0)
+        return ""
+
+    monkeypatch.setattr(login, "read_line", read)
+    return asked
+
+
+def test_login_groups_the_cards_by_name_and_records_every_one_without_input(
+    isolated_home, patch_run
+) -> None:
+    recorder = patch_run(login, result=machine())
+    assert main([*SHELL_LOGIN, "--no-input"]) == 0
+
+    (query,) = gpu_queries(recorder)
+    assert "BatchMode=yes" in query
+    assert query[-1] == "nvidia-smi --query-gpu=index,name,memory.total --format=csv,noheader"
+    config = home_config()
+    assert config["lab"]["address"] == "gpu.example.edu"
+    assert config["lab"]["devices"] == {
+        "A100": {"indices": "0-3"},
+        "RTX_PRO_6000": {"indices": "4-5"},
+    }
+
+
+def test_the_devices_table_is_written_as_its_own_table_after_the_account(
+    isolated_home, patch_run
+) -> None:
+    (Path.home() / ".letify" / "config.toml").write_text(
+        '# my other machine\n[other]\nkind = "shell"\naddress = "o.example.edu"\n',
+        encoding="utf-8",
+    )
+    patch_run(login, result=machine())
+    assert main([*SHELL_LOGIN, "--no-input", "--indices", "A100=0,1,3"]) == 0
+    text = (Path.home() / ".letify" / "config.toml").read_text(encoding="utf-8")
+    assert text == (
+        "# my other machine\n"
+        "[other]\n"
+        'kind = "shell"\n'
+        'address = "o.example.edu"\n'
+        "\n"
+        "[lab]\n"
+        'kind = "shell"\n'
+        'address = "gpu.example.edu"\n'
+        'key = "~/.ssh/id_letify"\n'
+        "\n"
+        "[lab.devices]\n"
+        'A100 = { indices = "0,1,3" }\n'
+        'RTX_PRO_6000 = { indices = "4-5" }\n'
+    )
+
+
+def test_the_indices_option_chooses_a_subset_for_one_name(isolated_home, patch_run) -> None:
+    patch_run(login, result=machine())
+    command = [*SHELL_LOGIN, "--no-input", "--indices", "A100=1-2", "--indices", "RTX_PRO_6000=5"]
+    assert main(command) == 0
+    assert home_config()["lab"]["devices"] == {
+        "A100": {"indices": "1-2"},
+        "RTX_PRO_6000": {"indices": "5"},
+    }
+
+
+def test_an_index_the_machine_does_not_have_fails_a_login_without_input(
+    isolated_home, patch_run, capsys
+) -> None:
+    patch_run(login, result=machine())
+    assert main([*SHELL_LOGIN, "--no-input", "--indices", "A100=0-7"]) == 1
+    assert "4, 5, 6, 7" in capsys.readouterr().err
+    assert not (Path.home() / ".letify" / "config.toml").exists()
+
+
+def test_an_accelerator_the_machine_does_not_have_fails_a_login_without_input(
+    isolated_home, patch_run, capsys
+) -> None:
+    patch_run(login, result=machine())
+    assert main([*SHELL_LOGIN, "--no-input", "--indices", "H100=0"]) == 1
+    assert "H100" in capsys.readouterr().err
+    assert not (Path.home() / ".letify" / "config.toml").exists()
+
+
+def test_an_interactive_login_shows_each_name_and_records_the_chosen_indices(
+    isolated_home, patch_run, monkeypatch, capsys
+) -> None:
+    patch_run(login, result=machine())
+    asked = answer_prompts(
+        monkeypatch,
+        {"Indices letify may use for A100": ["0,2"], "Indices letify may use for RTX": [""]},
+    )
+    assert main(SHELL_LOGIN) == 0
+
+    out = capsys.readouterr().out
+    assert "A100: 4 cards, indices 0-3 (80 GB each)" in out
+    assert "RTX_PRO_6000: 2 cards, indices 4-5 (96 GB each)" in out
+    assert "Indices letify may use for A100 [0-3]: " in asked
+    assert "Indices letify may use for RTX_PRO_6000 [4-5]: " in asked
+    assert home_config()["lab"]["devices"] == {
+        "A100": {"indices": "0,2"},
+        "RTX_PRO_6000": {"indices": "4-5"},
+    }
+
+
+def test_an_interactive_answer_naming_a_missing_index_is_refused_and_asked_again(
+    isolated_home, patch_run, monkeypatch, capsys
+) -> None:
+    patch_run(login, result=machine())
+    asked = answer_prompts(
+        monkeypatch,
+        {
+            "Indices letify may use for A100": ["7", "two", "3"],
+            "Indices letify may use for RTX": [""],
+        },
+    )
+    assert main(SHELL_LOGIN) == 0
+    assert sum(prompt.startswith("Indices letify may use for A100") for prompt in asked) == 3
+    assert "7" in capsys.readouterr().out
+    assert home_config()["lab"]["devices"]["A100"] == {"indices": "3"}
+
+
+def test_a_machine_without_nvidia_smi_still_logs_in_and_records_nothing(
+    isolated_home, patch_run, capsys
+) -> None:
+    patch_run(login, result=machine("", returncode=127, stderr="nvidia-smi: command not found"))
+    assert main([*SHELL_LOGIN, "--no-input"]) == 0
+    assert "devices" not in home_config()["lab"]
+    assert "nvidia-smi" in capsys.readouterr().out
+
+
+def test_a_machine_with_no_gpu_still_logs_in_and_records_nothing(
+    isolated_home, patch_run, capsys
+) -> None:
+    patch_run(login, result=machine(""))
+    assert main([*SHELL_LOGIN, "--no-input"]) == 0
+    assert "devices" not in home_config()["lab"]
+    assert "no GPU" in capsys.readouterr().out
+
+
+def test_an_account_already_declared_is_not_asked_for_its_devices_again(
+    isolated_home, patch_run
+) -> None:
+    (Path.home() / ".letify" / "config.toml").write_text(
+        '[lab]\nkind = "shell"\naddress = "gpu.example.edu"\n', encoding="utf-8"
+    )
+    recorder = patch_run(login, result=machine())
+    assert main(["login", "shell", "lab", "--no-input"]) == 0
+    assert gpu_queries(recorder) == []
+    assert "devices" not in home_config()["lab"]
+
+
+EXISTING_HOME = (
+    "[lab]\n"
+    'kind = "shell"\n'
+    'address = "gpu.example.edu"\n'
+    'user = "researcher"\n'
+    "port = 2222\n"
+    "\n"
+    "# cards the admin gave me\n"
+    "[lab.devices]\n"
+    'A100 = { indices = "0" }\n'
+    "\n"
+    "[other]\n"
+    'kind = "shell"\n'
+    'address = "o.example.edu"\n'
+)
+
+
+def test_detect_devices_asks_an_existing_machine_again_and_replaces_the_table(
+    isolated_home, patch_run
+) -> None:
+    (Path.home() / ".letify" / "config.toml").write_text(EXISTING_HOME, encoding="utf-8")
+    recorder = patch_run(login, result=machine())
+    assert main(["login", "shell", "lab", "--no-input", "--detect-devices"]) == 0
+
+    (query,) = gpu_queries(recorder)
+    assert "researcher@gpu.example.edu" in query
+    assert "2222" in query
+    text = (Path.home() / ".letify" / "config.toml").read_text(encoding="utf-8")
+    assert "# cards the admin gave me" in text
+    config = tomllib.loads(text)
+    assert config["lab"]["devices"] == {
+        "A100": {"indices": "0-3"},
+        "RTX_PRO_6000": {"indices": "4-5"},
+    }
+    assert config["other"] == {"kind": "shell", "address": "o.example.edu"}
+
+
+def test_detect_devices_keeps_the_table_when_the_user_does_not_confirm(
+    isolated_home, patch_run, monkeypatch
+) -> None:
+    (Path.home() / ".letify" / "config.toml").write_text(EXISTING_HOME, encoding="utf-8")
+    patch_run(login, result=machine())
+    asked = answer_prompts(monkeypatch, {"Replace": ["n"]})
+    assert main(["login", "shell", "lab", "--detect-devices"]) == 0
+    assert any(prompt.startswith("Replace the devices table of lab") for prompt in asked)
+    text = (Path.home() / ".letify" / "config.toml").read_text(encoding="utf-8")
+    assert text == EXISTING_HOME
+
+
+def test_detect_devices_leaves_the_table_alone_when_nothing_is_found(
+    isolated_home, patch_run
+) -> None:
+    (Path.home() / ".letify" / "config.toml").write_text(EXISTING_HOME, encoding="utf-8")
+    patch_run(login, result=machine("", returncode=127))
+    assert main(["login", "shell", "lab", "--no-input", "--detect-devices"]) == 0
+    text = (Path.home() / ".letify" / "config.toml").read_text(encoding="utf-8")
+    assert text == EXISTING_HOME
+
+
+def test_recording_devices_regenerates_the_provider_types(
+    isolated_home, patch_run, monkeypatch
+) -> None:
+    monkeypatch.setenv("LETIFY_STUBS", "1")
+    patch_run(login, result=machine())
+    assert main([*SHELL_LOGIN, "--no-input"]) == 0
+    stub = (isolated_home / "typings" / "letify_providers.pyi").read_text(encoding="utf-8")
+    assert "A100" in stub
+    assert "RTX_PRO_6000" in stub
+
+
+def test_logging_out_removes_the_devices_table_with_the_account(isolated_home) -> None:
+    (Path.home() / ".letify" / "config.toml").write_text(EXISTING_HOME, encoding="utf-8")
+    assert main(["logout", "lab"]) == 0
+    assert home_config() == {"other": {"kind": "shell", "address": "o.example.edu"}}
