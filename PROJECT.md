@@ -115,6 +115,8 @@ Launcher(
 | `let.reap_idle()` | Take idle sessions now instead of waiting for the reaper |
 | `let.grid`, `let.zip` | Build a search space |
 | `let.status()` | What is running, in what mode, and for how long |
+| `let.usage(alias=None)` | What is left on each account, or why it is not reported |
+| `let.utilization(alias=None)` | How busy each instance's accelerator is right now |
 
 ### `let.function`
 
@@ -224,6 +226,8 @@ space.with_fixed(epochs=3)
 letify providers              # declared providers, storage, channel kind
 letify devices                # accelerators each provider offers
 letify status                 # live sessions and what they are costing
+letify usage [alias]          # what is left on each account
+letify utilization [alias]    # how busy each instance's accelerator is
 letify check <alias>          # confirm a machine answers
 letify probe <host>           # whether host="local" is worth using
 letify efficiency 0.5 3 150   # expected share of a direct run
@@ -258,6 +262,8 @@ access_token_env = "ELICE_ACCESS_TOKEN"
 ```
 
 An alias must be a Python identifier, because providers are reached by attribute. `any`, `devices` and `active` are reserved. Declaration order sets the priority for `let.providers.any`.
+
+Where a service publishes no balance, an entry names a command that prints one: `usage_command` is run when `letify usage` asks, `usage_unit` names what it counts and `usage_limit` gives the ceiling. The last number in the output is read as the remaining amount.
 
 A credential is referenced, never written: `<name>_env` names an environment variable, `<name>_keyring` names a keyring entry as `service/user`.
 

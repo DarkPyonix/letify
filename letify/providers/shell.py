@@ -40,6 +40,9 @@ class Shell(Provider):
     #: is a real option here.
     has_fast_path = True
 
+    #: A machine letify only runs commands on has no account behind it to meter.
+    usage_source = "a machine reached by SSH has no account behind it"
+
     #: SSH keeps a process alive behind pipes, so handles and blob reuse work.
     persistent_channel = True
 

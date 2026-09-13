@@ -57,6 +57,11 @@ class Modal(Provider):
     default_persistence = "persistent"
     has_fast_path = False
 
+    #: Modal bills in dollars and exposes no workspace balance through its SDK, so the
+    #: figure has to come from a configured command or from the dashboard.
+    usage_unit = "USD"
+    usage_source = "the Modal SDK exposes no workspace balance"
+
     #: A sandbox keeps a process alive, so handles and blob reuse work.
     persistent_channel = True
 

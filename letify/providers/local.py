@@ -25,6 +25,7 @@ from typing import TYPE_CHECKING
 from ..declare.instance import Instance
 from .base import Provider
 from .naming import gib_from_mib, normalize_gpu
+from .usage import Usage
 
 if TYPE_CHECKING:
     from ..runtime.channel import Channel
@@ -41,6 +42,9 @@ class Local(Provider):
     #: Nothing crosses a network, so there is no round trip to pay.
     has_fast_path = True
 
+    #: The device is in this machine, so there is no second machine to install on.
+    needs_remote_agent = False
+
     #: A subprocess with pipes, so the object and blob tables persist.
     persistent_channel = True
 
@@ -49,6 +53,19 @@ class Local(Provider):
 
     #: A local subprocess ends with this process and costs nothing.
     needs_lease = False
+
+    #: Nothing to run out of, which is a different answer from an unknown balance.
+    usage_unit = "hours"
+    usage_source = "nothing to ask; this machine bills nobody"
+
+    def report_usage(self) -> Usage:
+        return Usage(
+            alias=self.alias,
+            kind=self.kind,
+            unit=self.usage_unit,
+            source=self.usage_source,
+            unmetered=True,
+        )
 
     def discover(self) -> Mapping[str, Instance]:
         """List the GPUs in this machine, plus a plain CPU instance.

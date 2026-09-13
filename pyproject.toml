@@ -53,6 +53,7 @@ letify = "letify.cli:main"
 dev = [
     "pytest>=8.0",
     "pytest-asyncio>=0.23",
+    "pytest-cov>=5.0",
     "ruff>=0.6",
     "researchtree>=1.3",
 ]

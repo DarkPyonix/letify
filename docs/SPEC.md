@@ -102,6 +102,36 @@ A provider is built from one entry in the configuration file and reached by attr
 
 `Shell` and its subclasses default to ephemeral because a machine's disk policy is not knowable in advance. Assuming ephemeral costs time, since letify rebuilds the environment each runtime and the work still succeeds; assuming persistent fails outright when the disk turns out to be wiped. A configuration entry overrides it with `persistent = true`.
 
+### Remaining usage
+
+> Every provider is asked the same question, and a provider that cannot answer says so instead of guessing.
+
+`Provider.usage()` returns a `Usage` record: the alias, the unit the account is metered in, how much is left, how much is spent, the ceiling, the hourly rate of what is running now, when the figure was taken, and where it came from. Every field except the alias, the unit and the source may be `None`, because a missing number is information and a fabricated one is not.
+
+A provider reports what its service actually publishes:
+
+| Provider | Unit | Remaining | Comes from |
+|---|---|---|---|
+| `Local` | hours | unmetered | nothing to ask; this machine bills nobody |
+| `Elice` | KRW | not published | live allocations priced from the zone price list, which gives the rate and the spend, not the balance |
+| `Colab` | compute units | not published | the CLI has no balance command; the figure is in the web console |
+| `Modal` | USD | not published | the SDK exposes no workspace balance |
+| `Shell`, `Tunnel` | hours | not published | a machine letify only runs commands on has no account behind it |
+
+Where the service publishes nothing, a configuration entry supplies the number itself:
+
+```toml
+[colab_a]
+kind = "colab"
+usage_command = "my-colab-units"   # prints the remaining amount
+usage_unit = "compute units"
+usage_limit = 100.0
+```
+
+The last number in the command's output is read as the remaining amount. This exists because the alternative is letify inventing an endpoint, and a wrong balance is worse than an absent one. The command runs only when usage is asked for, never during a call.
+
+`letify usage` prints one row per declared provider, and `letify usage <alias>` one provider. A provider whose optional dependency or setting is missing is reported as unavailable rather than skipped, so the table always lists every alias.
+
 ### Instances
 
 > An `Instance` is one accelerator shape on one provider account.
@@ -115,6 +145,18 @@ Instance discovery is lazy and cached. A provider that must connect to enumerate
 `Local` reads its accelerator names once per process, because asking `nvidia-smi` takes seconds on a laptop whose discrete GPU is asleep and the answer does not change while the process runs.
 
 Accelerator names are normalized so they can be attributes. `NVIDIA RTX PRO 6000 Blackwell` becomes `RTX_PRO_6000`. Colab calls the same card `G4`, which is what its CLI accepts, and accepts `RTX_PRO_6000` as an alias for it.
+
+### GPU utilization
+
+> How hard each declared instance's accelerator is working right now, read from the machine that owns it.
+
+`letify utilization` reports one row per instance: the provider alias, the accelerator, and for each physical device its utilization percentage, memory used against memory total, temperature and power draw. `nvidia-smi --query-gpu` is the single source, because it is the only reading present on every machine letify reaches and it needs no framework loaded.
+
+Where the reading comes from depends on where the device is. An instance on the local provider is read by running `nvidia-smi` here. An instance on a remote provider is read inside its live session, by shipping the same reader function through the ordinary call protocol, so no new channel and no new remote dependency is involved.
+
+An instance with no live session reports no devices and says why, because starting a session to measure its load would cost money and change the answer. A machine without `nvidia-smi` reports no devices with that as the reason. Neither is an error: the table lists every declared instance either way.
+
+The reading is taken at the moment it is asked for and carries no history. A load that has to be watched over time belongs in the caller's own loop, not in a CLI that shells out to `nvidia-smi` per poll.
 
 ## Execution modes
 

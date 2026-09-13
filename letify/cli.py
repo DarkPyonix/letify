@@ -27,6 +27,16 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("devices", help="list the accelerators each provider offers")
     sub.add_parser("status", help="show live runtimes and what they are costing")
 
+    usage = sub.add_parser("usage", help="show what each account has left")
+    usage.add_argument("alias", nargs="?", help="one provider instead of all of them")
+    usage.add_argument("--json", action="store_true", help="print the records unformatted")
+
+    utilization = sub.add_parser(
+        "utilization", help="show how hard each instance's accelerator is working"
+    )
+    utilization.add_argument("alias", nargs="?", help="one provider instead of all of them")
+    utilization.add_argument("--json", action="store_true", help="print the records unformatted")
+
     check = sub.add_parser("check", help="check that a provider answers")
     check.add_argument("alias", help="provider alias from the configuration")
 
@@ -41,6 +51,40 @@ def build_parser() -> argparse.ArgumentParser:
     efficiency.add_argument("round_trip_ms", type=float, help="network round trip")
 
     return parser
+
+
+def _describe_usage(row: dict) -> str:
+    """One line for a usage row, saying plainly when there is no number."""
+    if row.get("unmetered"):
+        return "unmetered"
+    unit = row.get("unit") or ""
+    parts = []
+    if row.get("remaining") is not None:
+        left = f"{row['remaining']:g} {unit} left"
+        if row.get("limit"):
+            left += f" of {row['limit']:g}"
+        parts.append(left)
+    if row.get("rate_per_hour") is not None:
+        parts.append(f"{row['rate_per_hour']:g} {unit}/hour running now")
+    return ", ".join(parts) or f"not reported ({row.get('source')})"
+
+
+def _describe_device(device: dict) -> str:
+    """One line for a device reading, leaving out what the card did not report."""
+    load = (
+        f"{device['utilization_percent']:.0f}% busy"
+        if device.get("utilization_percent") is not None
+        else "load unknown"
+    )
+    parts = [f"gpu{device['index']}", str(device["name"]), load]
+    if device.get("memory_total_gb"):
+        used = device.get("memory_used_gb") or 0.0
+        parts.append(f"{used:.1f}/{device['memory_total_gb']:.1f} GiB")
+    if device.get("temperature_c") is not None:
+        parts.append(f"{device['temperature_c']:.0f}C")
+    if device.get("power_w") is not None:
+        parts.append(f"{device['power_w']:.0f}W")
+    return " ".join(parts)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -75,6 +119,41 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps(let.status(), indent=2))
         return 0
 
+    if args.command == "usage":
+        rows = let.usage(args.alias)
+        if args.json:
+            print(json.dumps(rows, indent=2))
+            return 0
+        for row in rows:
+            alias = str(row["alias"])
+            if "unavailable" in row:
+                print(f"{alias:20} unavailable: {row['unavailable']}")
+                continue
+            line = f"{alias:20} {row['kind']!s:10} {_describe_usage(row)}"
+            print(line)
+            if row.get("note"):
+                print(f"{'':20} {row['note']}")
+        return 0
+
+    if args.command == "utilization":
+        rows = let.utilization(args.alias)
+        if args.json:
+            print(json.dumps(rows, indent=2))
+            return 0
+        for row in rows:
+            alias = str(row["alias"])
+            if "unavailable" in row:
+                print(f"{alias:20} unavailable: {row['unavailable']}")
+                continue
+            head = f"{alias}.{row['accelerator']}"
+            devices = row.get("devices") or []
+            if not devices:
+                print(f"{head:28} {row.get('reason') or 'nothing reported'}")
+                continue
+            for device in devices:
+                print(f"{head:28} {_describe_device(device)}")
+        return 0
+
     if args.command == "check":
         provider = let.provider(args.alias)
         checker = getattr(provider, "check", None)
@@ -92,7 +171,7 @@ def main(argv: list[str] | None = None) -> int:
             json.dumps(
                 {
                     "platform": capability.platform,
-                    "shim": capability.shim,
+                    "core": capability.core,
                     "agent": capability.agent,
                     "round_trip_ms": capability.round_trip_ms,
                     "usable": capability.usable,

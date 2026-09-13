@@ -363,6 +363,8 @@ def test_train_returns_a_loss():
 letify providers              # who is declared, storage, channel kind
 letify devices                # what each one offers
 letify status                 # what is running right now
+letify usage                  # what is left on each account
+letify utilization            # how busy each instance's GPU is
 letify check lab              # does this machine answer?
 letify probe lab              # is host="local" worth using here?
 letify efficiency 0.5 3 150   # the formula, from measured terms

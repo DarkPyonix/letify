@@ -82,6 +82,10 @@ class Env:
                 self.commands,
                 self.variables,
                 self.python,
+                # Shipped modules travel with every call made against this environment,
+                # so two declarations that ship different code are not interchangeable
+                # and must not share a pooled session or a cached archive.
+                tuple(sorted(self.ship_modules)),
             )
         ).encode()
         return hashlib.blake2b(payload, digest_size=6).hexdigest()

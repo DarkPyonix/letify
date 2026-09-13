@@ -81,6 +81,11 @@ class Colab(Shell):
     #: Measured from Seoul to a Colab runtime in the United States.
     expected_round_trip_ms = 175.0
 
+    #: Colab meters in compute units and keeps the balance in the web console; the CLI has
+    #: no command that prints it. A configuration entry can name one.
+    usage_unit = "compute units"
+    usage_source = "the Colab CLI has no balance command; the figure is in the web console"
+
     @property
     def binary(self) -> str:
         return str(self.config.option("binary", "colab"))

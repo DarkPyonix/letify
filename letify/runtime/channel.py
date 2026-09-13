@@ -160,6 +160,16 @@ class PersistentChannel(Channel):
             process.wait(timeout=30)
         except (OSError, ValueError, subprocess.TimeoutExpired):
             process.kill()
+            process.wait(timeout=5)
+        finally:
+            # Closing the read ends too, because leaving them to the garbage collector
+            # raises an ignored OSError on Windows when the process is already gone.
+            for stream in (process.stdout, process.stderr):
+                if stream is not None and not stream.closed:
+                    try:
+                        stream.close()
+                    except OSError:
+                        pass
 
     @property
     def alive(self) -> bool:
@@ -184,11 +194,11 @@ class PersistentChannel(Channel):
                 raise RuntimeLost(f"{self.name}: the worker pipe is closed") from exc
 
             logs: list[str] = []
-            deadline = None if timeout is None else time.monotonic() + timeout
+            watchdog = self._arm_watchdog(timeout)
             while True:
-                if deadline is not None and time.monotonic() > deadline:
-                    raise RuntimeFailure(f"{self.name}: the call exceeded {timeout}s")
                 line = process.stdout.readline()
+                if watchdog is not None and watchdog.expired:
+                    raise RuntimeFailure(f"{self.name}: the call exceeded {timeout}s")
                 if not line:
                     stderr = process.stderr.read() if process.stderr else ""
                     raise ProtocolError(
@@ -199,9 +209,49 @@ class PersistentChannel(Channel):
                         f"{''.join(logs)[-2000:]}{stderr[-2000:]}"
                     )
                 if protocol.is_reply(line):
+                    if watchdog is not None:
+                        watchdog.cancel()
                     outcome = protocol.decode_reply(line)
                     return protocol.unwrap(outcome, runtime_key=self.name), "".join(logs)
                 logs.append(line)
+
+    def _arm_watchdog(self, timeout: float | None) -> _Watchdog | None:
+        """Start the timer that makes a silent call give up.
+
+        Checking a deadline between output lines is not enough: a call that prints
+        nothing sits in ``readline`` for as long as it likes, and the timeout the
+        declaration asked for never arrives. So the worker's pipe is closed from a timer
+        thread, which is what wakes the read up.
+        """
+        if timeout is None or self._process is None:
+            return None
+        return _Watchdog(self._process, timeout)
+
+
+class _Watchdog:
+    """Closes a worker's output pipe when a call runs past its timeout.
+
+    A blocking read does not notice a deadline on its own, so something has to make the
+    read return. Closing the pipe does that, and the session is discarded afterwards
+    anyway, so nothing is lost by breaking it.
+    """
+
+    def __init__(self, process: subprocess.Popen[str], timeout: float):
+        self.expired = False
+        self._process = process
+        self._timer = threading.Timer(timeout, self._fire)
+        self._timer.daemon = True
+        self._timer.start()
+
+    def _fire(self) -> None:
+        self.expired = True
+        try:
+            self._process.kill()
+        except OSError:
+            pass
+
+    def cancel(self) -> None:
+        self._timer.cancel()
 
 
 class OneShotChannel(Channel):

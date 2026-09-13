@@ -20,6 +20,7 @@ forgotten machine still costs money with no allocation running.
 
 from __future__ import annotations
 
+import time
 from collections.abc import Mapping
 from typing import TYPE_CHECKING, Any
 
@@ -27,6 +28,7 @@ from ..declare.instance import Instance
 from ..errors import ProviderUnavailable, RuntimeFailure
 from .naming import normalize_gpu
 from .shell import Shell
+from .usage import Usage
 
 if TYPE_CHECKING:
     from ..runtime.session import Runtime
@@ -158,6 +160,41 @@ class Elice(Shell):
 
     def machines(self) -> list[dict[str, Any]]:
         return self._items(self._call("GET", VM_PATH, params={"zone_id": self.zone_id}))
+
+    #: Elice bills in Korean won and publishes no account balance, so what it can answer
+    #: is the rate of what is powered on right now.
+    usage_unit = "KRW"
+    usage_source = "live allocations priced from the zone price list; Elice publishes no balance"
+
+    def report_usage(self) -> Usage:
+        """Price the allocations that exist against the zone's own price list.
+
+        There is no balance endpoint, so the honest answer is the burn rate: an allocation
+        bills by the second while it is powered on, and a machine nobody stopped is the
+        way money disappears here. Storage keeps billing with no allocation running and is
+        not included, because the API prices the machine, not the disk.
+        """
+        rates = {
+            str(item.get("instance_type_id")): item
+            for item in self.pricing()
+            if item.get("instance_type_id")
+        }
+        rate = 0.0
+        for allocation in self.allocations():
+            priced = rates.get(str(allocation.get("instance_type_id")))
+            if priced is None:
+                continue
+            amount = priced.get("price_per_hour")
+            if isinstance(amount, (int, float)):
+                rate += float(amount)
+        return Usage(
+            alias=self.alias,
+            kind=self.kind,
+            unit=self.usage_unit,
+            source=self.usage_source,
+            rate_per_hour=rate,
+            as_of=time.time(),
+        )
 
     # -- allocations, which are runtimes -------------------------------------
 

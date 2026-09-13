@@ -45,7 +45,7 @@ from .declare.env import Env
 from .declare.function import Function
 from .declare.instance import AnyInstance, Host, Instance, Lifetime
 from .declare.sweep import grid, zip_
-from .errors import UnknownInstance, UnknownProvider
+from .errors import LetifyError, UnknownInstance, UnknownProvider
 from .runtime.pool import DEFAULT_IDLE_TIMEOUT, RuntimePool
 
 if TYPE_CHECKING:
@@ -278,17 +278,95 @@ class Launcher:
         Useful when a session takes a while to come up and there is local work to do
         meanwhile, such as preparing data. It lives for the process, so the idle reaper or
         process exit is what ends it.
+
+        The session is handed straight back, because the point is for the next call to
+        find it warm. Holding it would make the pool skip it and start a second one,
+        which is the opposite of what starting early is for.
         """
         self._register_at_exit()
-        return self.pool.acquire(
+        runtime = self.pool.acquire(
             self.resolve(instance), env or Env(), volumes, lifetime=Lifetime.process
         )
+        self.pool.release(runtime)
+        return runtime
 
     def reap_idle(self) -> list[str]:
         """Shut down runtimes idle past the timeout, without waiting for the reaper."""
         return self.pool.reap_idle()
 
     # -- reporting -----------------------------------------------------------
+
+    def usage(self, alias: str | None = None) -> list[dict[str, Any]]:
+        """What each account has left, or why the figure is not available.
+
+        Every declared alias is listed, including one whose provider could not even be
+        built, because an account missing from a table reads as an account with nothing
+        left on it.
+        """
+        wanted = [alias] if alias else list(self.config.order)
+        rows: list[dict[str, Any]] = []
+        for name in wanted:
+            try:
+                provider = self.provider(name)
+            except LetifyError as exc:
+                rows.append({"alias": name, "unavailable": str(exc)})
+                continue
+            rows.append(provider.usage().to_dict())
+        return rows
+
+    def utilization(self, alias: str | None = None) -> list[dict[str, Any]]:
+        """How hard each declared instance's accelerator is working right now.
+
+        A local instance is read here. A remote one is read inside its live session, and
+        an instance with no session reports no devices and says so, because starting one
+        to measure its load would cost money and change the answer.
+        """
+        from .runtime.telemetry import parse_smi, read_smi
+
+        wanted = [alias] if alias else list(self.config.order)
+        live = {
+            (runtime.provider.alias, runtime.instance.accelerator): runtime
+            for runtime in self.pool.live
+        }
+        rows: list[dict[str, Any]] = []
+        for name in wanted:
+            try:
+                provider = self.provider(name)
+                instances = provider.instances
+            except LetifyError as exc:
+                rows.append({"alias": name, "unavailable": str(exc)})
+                continue
+
+            for accelerator, instance in instances.items():
+                if instance.gpu is None:
+                    continue
+                row: dict[str, Any] = {
+                    "alias": name,
+                    "accelerator": accelerator,
+                    "devices": [],
+                    "reason": None,
+                }
+                runtime = live.get((name, accelerator))
+                try:
+                    if provider.kind == "local":
+                        output = read_smi()
+                    elif runtime is not None:
+                        output, _logs = runtime.call(read_smi, (), {})
+                    else:
+                        row["reason"] = "no live session, so nothing to measure"
+                        rows.append(row)
+                        continue
+                except LetifyError as exc:
+                    row["reason"] = str(exc)
+                    rows.append(row)
+                    continue
+
+                devices = parse_smi(output or "")
+                row["devices"] = [device.to_dict() for device in devices]
+                if not devices:
+                    row["reason"] = "nvidia-smi reported nothing on that machine"
+                rows.append(row)
+        return rows
 
     def status(self) -> dict[str, Any]:
         """What is running right now, and what it is costing."""

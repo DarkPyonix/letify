@@ -30,7 +30,8 @@ from typing import TYPE_CHECKING, Literal
 
 from ..config import ProviderConfig
 from ..declare.instance import Host, Instance
-from ..errors import UnknownInstance
+from ..errors import LetifyError, UnknownInstance
+from .usage import Usage, from_command
 
 if TYPE_CHECKING:
     from ..declare.env import Env
@@ -212,7 +213,24 @@ class Provider(abc.ABC):
             self.warn_slow_forwarding()
         from ..remoting import require
 
-        require(getattr(self, "address", None))
+        require(self.forwarding_host(), remote=self.needs_remote_agent)
+
+    #: Whether forwarding needs the agent installed on another machine. False only
+    #: where the device is in this machine, so nothing has to be reached.
+    needs_remote_agent: bool = True
+
+    def forwarding_host(self) -> str | None:
+        """The name to measure the round trip against, if this provider has one.
+
+        A provider that has no address, or whose address depends on configuration it does
+        not need, reports None. Reading the attribute directly would let an unrelated
+        configuration error surface as a refusal to forward, which says the wrong thing
+        about why the mode is unavailable.
+        """
+        try:
+            return getattr(self, "address", None)
+        except LetifyError:
+            return None
 
     def warn_slow_forwarding(self) -> None:
         """Report the expected efficiency of forwarding over a long link."""
@@ -226,6 +244,44 @@ class Provider(abc.ABC):
             f"run for fine-tuning and a handful of tokens per second for decoding. "
             f"cpu='remote' avoids it by running the loop on the machine.",
             stacklevel=3,
+        )
+
+    # -- remaining usage -----------------------------------------------------
+
+    #: What the account is metered in, where the provider knows. Overridden per provider.
+    usage_unit: str = "hours"
+
+    #: Why this provider cannot report a balance of its own. A provider that can report
+    #: one overrides ``usage()`` instead.
+    usage_source: str = "this provider publishes no balance"
+
+    def usage(self) -> Usage:
+        """Report what is left on this account.
+
+        A configured command wins, because a user who wired one up knows something letify
+        does not. Otherwise the provider answers for itself, and a provider with no source
+        says so rather than returning a number nobody measured.
+        """
+        command = self.config.option("usage_command")
+        if isinstance(command, str) and command:
+            limit = self.config.option("usage_limit")
+            unit = self.config.option("usage_unit")
+            return from_command(
+                self.alias,
+                self.kind,
+                command,
+                str(unit) if isinstance(unit, str) else self.usage_unit,
+                float(limit) if isinstance(limit, (int, float)) else None,
+            )
+        return self.report_usage()
+
+    def report_usage(self) -> Usage:
+        """What the provider itself can answer, with no configured command in the way."""
+        return Usage(
+            alias=self.alias,
+            kind=self.kind,
+            unit=self.usage_unit,
+            source=self.usage_source,
         )
 
     def __repr__(self) -> str:

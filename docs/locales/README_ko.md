@@ -343,6 +343,8 @@ def test_train_returns_a_loss():
 letify providers      # 선언된 프로바이더, 저장소 수명, 기본 배치
 letify devices           # 각자 제공하는 GPU
 letify status         # 지금 돌고 있는 것
+letify usage          # 계정마다 남은 사용량
+letify utilization    # 인스턴스별 GPU가 얼마나 바쁜가
 letify check lab      # 이 머신이 응답하나?
 letify probe lab      # 호출 중계를 쓸 만큼 가까운가?
 ```

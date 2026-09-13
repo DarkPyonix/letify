@@ -48,6 +48,15 @@ class FilesystemBackend(Backend):
             if path.is_file() and path.name.startswith(prefix):
                 yield path.name
 
+    def missing(self, digests: list[str]) -> list[str]:
+        """Answer with one directory walk rather than one stat per digest.
+
+        The same habit as the object stores, for the same reason: a caller asking about
+        thousands of blobs should pay for one listing.
+        """
+        held = set(self.list_digests())
+        return [digest for digest in digests if digest not in held]
+
     def read_ref(self, name: str) -> str | None:
         path = self._path(ref_key(name))
         return path.read_text(encoding="utf-8").strip() if path.is_file() else None

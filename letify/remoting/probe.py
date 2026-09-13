@@ -20,6 +20,7 @@ trip sets the ceiling.
 
 from __future__ import annotations
 
+import re
 import shutil
 import subprocess
 import sys
@@ -48,24 +49,33 @@ def core_path() -> Path | None:
     return candidate if candidate.exists() else None
 
 
-def probe(host: str | None = None) -> Capability:
-    """Report whether forwarding could run against a host, and what it would cost."""
+def probe(host: str | None = None, *, remote: bool | None = None) -> Capability:
+    """Report whether forwarding could run against a host, and what it would cost.
+
+    ``host`` is a name to measure the round trip against. ``remote`` says whether the
+    agent has to be present on another machine, which is a separate question: a provider
+    can need the agent and still have no name to ping, as Colab does, and deciding it
+    from the presence of a name would let that provider skip the check it needs most.
+    Left unset, a named host means a remote machine.
+    """
+    if remote is None:
+        remote = host is not None
     return Capability(
         core=core_path() is not None,
-        agent=shutil.which("letify-agent") is not None or host is None,
+        agent=shutil.which("letify-agent") is not None or not remote,
         round_trip_ms=ping(host) if host else None,
         platform=sys.platform,
     )
 
 
-def require(host: str | None = None) -> Capability:
+def require(host: str | None = None, *, remote: bool | None = None) -> Capability:
     """Raise unless forwarding can actually run.
 
     Speed is not a reason to refuse. A declaration that asked for forwarding over a long
     link runs, with a warning carrying the arithmetic. Only a missing shim or agent stops
     it, because then there is nothing to run.
     """
-    capability = probe(host)
+    capability = probe(host, remote=remote)
     if not capability.usable:
         raise UnsupportedMode(
             f"host='local' cannot run here: {capability.explain()}. Build letify-core from "
@@ -74,8 +84,18 @@ def require(host: str | None = None) -> Capability:
     return capability
 
 
+#: How ping reports a time, in the two dialects that matter. Windows writes
+#: ``time=12ms`` or ``time<1ms``; everything else writes ``time=12.3 ms``.
+_TIME = re.compile(r"time[=<]\s*([0-9]+(?:\.[0-9]+)?)\s*ms", re.IGNORECASE)
+
+
 def ping(host: str) -> float | None:
-    """Measure the round trip in milliseconds, or return None if it cannot be."""
+    """Measure the round trip in milliseconds, or return None if it cannot be.
+
+    Only the reported times are read. Taking the smallest number in the output instead
+    picks up the packet size on Windows and the sequence number on Linux, so a 150 ms
+    link reports as 1 ms, which is worse than reporting nothing at all.
+    """
     flag = "-n" if sys.platform.startswith("win") else "-c"
     try:
         result = subprocess.run(
@@ -85,14 +105,8 @@ def ping(host: str) -> float | None:
         return None
     if result.returncode != 0:
         return None
-    values = []
-    for token in result.stdout.replace("=", " ").replace("ms", " ").split():
-        try:
-            values.append(float(token))
-        except ValueError:
-            continue
-    plausible = [value for value in values if 0.01 < value < 10000]
-    return min(plausible) if plausible else None
+    times = [float(match) for match in _TIME.findall(result.stdout)]
+    return min(times) if times else None
 
 
 def efficiency(step_seconds: float, syncs: int, round_trip_ms: float) -> float:
