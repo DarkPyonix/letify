@@ -2,12 +2,12 @@
 
 Five pieces, each with one job.
 
-``handle`` holds the reference types ``Blob`` and ``RemoteFile``, so a large argument can be named rather than
-resent and a file inside a runtime can be pointed at. ``codec`` serializes a call and reads an
-outcome back. ``framing`` wraps a message as one line, which is what survives SSH
-and WebSocket channels. ``worker`` is the source of the process that lives inside
-a runtime. ``driver`` is the fallback for a channel that can only run a command
-and collect its output.
+``handle`` holds the reference types ``Blob`` and ``RemoteFile``, so a large
+argument can be named rather than resent and a file inside a runtime can be pointed
+at. ``codec`` serializes a call and reads an outcome back. ``framing`` wraps a
+message as one line, which is what survives SSH and WebSocket channels. ``worker``
+is the source of the process that lives inside a runtime. ``driver`` is the fallback
+for a channel that can only run a command and collect its output.
 """
 
 from __future__ import annotations
