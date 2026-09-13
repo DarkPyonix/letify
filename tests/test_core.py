@@ -9,7 +9,7 @@ Narrower tests live beside this file: declaration values in test_declare.py, the
 test_protocol.py, channels and the pool in test_runtime.py, providers in
 test_providers.py, storage in test_store.py.
 
-Spec sections pinned here: "Invocation", "Fan-out", "Call protocol", "Handles",
+Spec sections pinned here: "Invocation", "Concurrency", "Call protocol", "Handles",
 "Argument addressing", "Failure and retry", "Pooling" and "Lifetime", which covers keep_alive.
 """
 
@@ -70,71 +70,25 @@ def test_an_async_body_can_await_inside_the_runtime(
     assert asyncio.run(work()) == "finished"
 
 
-# -- Spec: Fan-out -------------------------------------------------------------
+# -- Spec: Concurrency ---------------------------------------------------------
 
 
-def test_a_space_fans_out_to_one_call_per_point(let: letify.Launcher, cpu: letify.Instance) -> None:
-    @let.function(device=cpu, host="remote")
-    def identity(lr: float, bs: int) -> tuple[float, int]:
-        return lr, bs
-
-    results = identity(letify.grid(lr=[1e-4, 3e-4], bs=[16, 32]))
-    assert len(results) == 4
-    assert set(results) == {(1e-4, 16), (1e-4, 32), (3e-4, 16), (3e-4, 32)}
-
-
-def test_a_sync_declaration_returns_its_results_in_input_order(
-    let: letify.Launcher, cpu: letify.Instance
-) -> None:
-    @let.function(device=cpu, host="remote")
-    def identity(n: int) -> int:
-        return n
-
-    assert identity(letify.grid(n=[3, 1, 2])) == [3, 1, 2]
-
-
-def test_a_space_may_be_passed_by_keyword_or_by_position(
-    let: letify.Launcher, cpu: letify.Instance
-) -> None:
-    # train(space) and train(over=space) mean the same thing, because a space names the
-    # arguments it varies.
-    @let.function(device=cpu, host="remote")
-    def identity(n: int) -> int:
-        return n
-
-    assert identity(letify.grid(n=[1, 2])) == [1, 2]
-    assert identity(over=letify.grid(n=[1, 2])) == [1, 2]
-
-
-def test_awaiting_a_space_collects_in_input_order(
+def test_gathered_calls_return_their_values_in_the_order_they_were_made(
     let: letify.Launcher, cpu: letify.Instance
 ) -> None:
     @let.function(device=cpu, host="remote")
     async def slow(n: int) -> int:
         import asyncio as remote_asyncio
 
-        # The later points finish first, so completion order is not input order.
+        # The later calls finish first, so completion order is not call order.
         await remote_asyncio.sleep(0.05 / n)
         return n
 
-    assert asyncio.run(_collect(slow(letify.grid(n=[1, 2, 3])))) == [1, 2, 3]
-
-
-async def _collect(call) -> list[int]:
-    return await call
-
-
-def test_an_async_space_can_be_iterated_as_it_completes(
-    let: letify.Launcher, cpu: letify.Instance
-) -> None:
-    @let.function(device=cpu, host="remote")
-    async def square(n: int) -> int:
-        return n * n
-
     async def run() -> list[int]:
-        return [r async for r in square(letify.grid(n=[1, 2, 3]))]
+        with let.keep_alive():
+            return list(await asyncio.gather(*(slow(n) for n in (1, 2, 3))))
 
-    assert sorted(asyncio.run(run())) == [1, 4, 9]
+    assert asyncio.run(run()) == [1, 2, 3]
 
 
 # -- Spec: Handles -------------------------------------------------------------
@@ -341,9 +295,42 @@ def test_two_declarations_on_one_device_share_a_session(
         assert len(let.pool.live) == 1
 
 
-def test_a_sweep_is_one_invocation(launcher_from) -> None:
-    # Its runtimes start once and are released once, and the inventory still holds: two
-    # cards declared means two sessions however many points there are.
+def test_concurrent_calls_run_no_wider_than_the_inventory(launcher_from) -> None:
+    # Two cards declared means at most two sessions, however many calls are gathered, and the
+    # calls beyond the inventory wait for a card rather than failing.
+    limited = launcher_from('[box]\nkind = "local"\n[box.devices]\nCPU = { count = 2 }\n')
+    here = limited.provider("box").CPU
+
+    @limited.function(device=here, host=letify.remote)
+    async def slow(n: int) -> int:
+        import asyncio as remote_asyncio
+
+        await remote_asyncio.sleep(0.05)
+        return n
+
+    widest = 0
+
+    async def watch() -> None:
+        nonlocal widest
+        for _ in range(40):
+            widest = max(widest, len(limited.pool.live))
+            await asyncio.sleep(0.01)
+
+    async def run() -> list[int]:
+        with limited.keep_alive():
+            calls = asyncio.gather(*(slow(n) for n in (1, 2, 3, 4)))
+            _, results = await asyncio.gather(watch(), calls)
+            return list(results)
+
+    assert asyncio.run(run()) == [1, 2, 3, 4]
+    assert 1 <= widest <= 2
+    assert limited.pool.live == []
+
+
+def test_overlapping_calls_release_their_sessions_when_the_last_one_finishes(
+    launcher_from,
+) -> None:
+    # Outside keep_alive, calls that overlap in time share one span, so nothing outlives them.
     limited = launcher_from('[box]\nkind = "local"\n[box.devices]\nCPU = { count = 2 }\n')
     here = limited.provider("box").CPU
 
@@ -355,11 +342,9 @@ def test_a_sweep_is_one_invocation(launcher_from) -> None:
         return n
 
     async def run() -> list[int]:
-        results = await slow(letify.grid(n=[1, 2, 3, 4]))
-        assert len(limited.pool.live) <= 2
-        return results
+        return list(await asyncio.gather(*(slow(n) for n in (1, 2, 3))))
 
-    assert sorted(asyncio.run(run())) == [1, 2, 3, 4]
+    assert asyncio.run(run()) == [1, 2, 3]
     assert limited.pool.live == []
 
 
@@ -401,8 +386,8 @@ def test_status_counts_the_sessions_against_the_ceiling(let, cpu) -> None:
 
 
 def test_status_does_not_report_the_pools_own_bookkeeping(let, cpu) -> None:
-    # The pool holds a guard so one invocation does not restart a session between the
-    # points of a sweep. Whether that guard is open is a fact about the pool rather than
+    # The pool holds a guard so a session released by one call is not ended while an
+    # overlapping call is still running. Whether that guard is open is a fact about the pool rather than
     # about what is running, and a boolean sitting among counts gets read as a count.
     report = let.status()
     assert "holding" not in report

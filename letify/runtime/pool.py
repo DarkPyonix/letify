@@ -52,6 +52,10 @@ class RuntimePool:
         self._guard = threading.RLock()
         self._free = threading.Condition(self._guard)
         self._hold_depth = 0
+        # Sessions being started by this process, per provider and accelerator. A start holds
+        # its cards before the runtime is registered, so without this count a concurrent call
+        # would take those cards for another process's and refuse instead of waiting.
+        self._starting: dict[tuple[int, str], int] = {}
 
     # -- holding -------------------------------------------------------------
 
@@ -97,15 +101,23 @@ class RuntimePool:
 
             # No free session, so this needs cards. Taking them outside the pool guard,
             # because the provider may have to ask the machine who else is on them.
-            held = instance.provider.reserve(instance)
-            if held is not None:
-                try:
-                    return self._start(instance, env, volumes, key, held=held)
-                except BaseException:
-                    instance.provider.unreserve(instance.accelerator, held, instance.devices)
-                    with self._free:
-                        self._free.notify_all()
-                    raise
+            starting = (id(instance.provider), instance.accelerator.casefold())
+            with self._guard:
+                self._starting[starting] = self._starting.get(starting, 0) + 1
+            try:
+                held = instance.provider.reserve(instance)
+                if held is not None:
+                    try:
+                        return self._start(instance, env, volumes, key, held=held)
+                    except BaseException:
+                        instance.provider.unreserve(instance.accelerator, held, instance.devices)
+                        raise
+            finally:
+                with self._free:
+                    self._starting[starting] -= 1
+                    if not self._starting[starting]:
+                        del self._starting[starting]
+                    self._free.notify_all()
 
             # Every card this instance could use is taken. That is worth waiting for only while a
             # session here is serving a call on one, because it gives the card back when the call
@@ -145,6 +157,9 @@ class RuntimePool:
             and runtime.instance.accelerator.casefold() == name.casefold()
         ]
         if any(runtime.busy for runtime in holders):
+            return None
+        if self._starting.get((id(provider), name.casefold())):
+            # A session this process is still starting holds a card and will serve a call.
             return None
         if holders:
             names = ", ".join(runtime.name for runtime in holders)

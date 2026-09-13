@@ -542,7 +542,7 @@ def test_a_released_runtime_ends_unless_something_says_otherwise(let, remote_cpu
 def test_a_held_invocation_keeps_released_runtimes_until_the_last_hold_goes(
     let, remote_cpu
 ) -> None:
-    # This is what makes a sweep start its runtimes once and release them once.
+    # This is what lets overlapping calls reuse a session until the last of them finishes.
     pool = let.pool
     pool.hold()
     assert pool.holding is True
