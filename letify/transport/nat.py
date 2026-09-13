@@ -9,6 +9,7 @@ remote side.
 
 from __future__ import annotations
 
+import errno
 import json
 import os
 import re
@@ -287,6 +288,14 @@ def serve_link(sock: socket.socket, target: tuple[str, int] = ("127.0.0.1", 22))
 # -- one rendezvous request ------------------------------------------------------------
 
 
+#: Errors that mean the peer cannot be reached, an expected outcome of a punch.
+_UNREACHABLE = frozenset(
+    getattr(errno, name)
+    for name in ("ENETUNREACH", "EHOSTUNREACH", "ECONNREFUSED", "ECONNRESET", "ETIMEDOUT")
+    if hasattr(errno, name)
+)
+
+
 def _noop() -> None:
     return None
 
@@ -313,8 +322,31 @@ def begin(request: dict):
         peer = tuple(request["mapping"])
         ssh = ("127.0.0.1", int(request.get("ssh_port", 22)))
 
+        window = float(request.get("window", 15.0))
+
         def punch_and_serve() -> None:
-            sock = punch(port, peer, token, initiator=False, start_at=float(request["start_at"]))
+            where = f"{peer[0]}:{peer[1]}"
+            fallback = "the Tailcat link is used instead"
+            try:
+                sock = punch(
+                    port,
+                    peer,
+                    token,
+                    initiator=False,
+                    start_at=float(request["start_at"]),
+                    window=window,
+                )
+            except TimeoutError:
+                # A punch that does not connect is the normal path to the Tailcat link.
+                message = f"TCP punch with {where} did not connect within {window:g} s"
+                print(f"letify agent: {message}; {fallback}", file=sys.stderr, flush=True)
+                return
+            except OSError as error:
+                if error.errno in _UNREACHABLE:
+                    message = f"TCP punch with {where} failed ({error.strerror or error})"
+                    print(f"letify agent: {message}; {fallback}", file=sys.stderr, flush=True)
+                    return
+                raise
             serve_link(sock, ssh)
 
         return {"mapping": list(mapping)}, punch_and_serve
