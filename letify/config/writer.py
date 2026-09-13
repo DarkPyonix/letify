@@ -90,9 +90,44 @@ def write_block(text: str, alias: str, options: dict[str, Any]) -> str:
         )
         return text + separator + block
     start, end = span
-    # One blank line after the block, so the next table is not glued to it.
-    trailing = "\n" if end < len(text) else ""
-    return text[:start] + block + trailing + text[end:]
+    return text[:start] + _merge(text[start:end], options) + text[end:]
+
+
+def _merge(block: str, options: dict[str, Any]) -> str:
+    """Rewrite an existing table in place.
+
+    A key already there keeps its line position, a key no longer given is dropped, and a
+    new key is appended after the last key line. Comments and blank lines stay where the
+    user put them, and the blank lines after the table are outside ``block`` entirely.
+    """
+    wanted = {_key(key): key for key, value in options.items() if value is not None}
+    lines = block.splitlines(keepends=True)
+    kept: list[str] = []
+    seen: set[str] = set()
+    last_key = 0
+    for index, line in enumerate(lines):
+        stripped = line.strip()
+        if index == 0 or not stripped or stripped.startswith("#") or "=" not in stripped:
+            kept.append(line)
+            continue
+        name = stripped.split("=", 1)[0].strip()
+        if name not in wanted:
+            continue
+        seen.add(name)
+        ending = "\n" if line.endswith("\n") else ""
+        kept.append(f"{name} = {format_value(options[wanted[name]])}{ending}")
+        last_key = len(kept)
+    ordered = ["kind", *sorted(key for key in options if key != "kind")]
+    added = [
+        f"{_key(key)} = {format_value(options[key])}\n"
+        for key in ordered
+        if key in options and options[key] is not None and _key(key) not in seen
+    ]
+    if not last_key:
+        last_key = 1
+    if added and kept and not kept[last_key - 1].endswith("\n"):
+        kept[last_key - 1] += "\n"
+    return "".join(kept[:last_key] + added + kept[last_key:])
 
 
 def remove_block(text: str, alias: str) -> str:

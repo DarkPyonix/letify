@@ -155,7 +155,7 @@ For a `shell` or `tunnel` account, `letify login` writes this table from what th
 
 Which registered indices are free is read with `nvidia-smi` at reservation time, not cached, because the answer changes while a run is queued. A card is taken as busy when another process is computing on it. Nothing else on the machine is inspected, and letify never kills anything.
 
-A reserved session sets the visible devices for its own process, so the training code sees its cards as 0 upward and needs to know nothing about which physical indices it was given.
+A reserved session sets `CUDA_VISIBLE_DEVICES` to its reserved physical indices and `CUDA_DEVICE_ORDER=PCI_BUS_ID` in its worker before any user code runs, and keeps both when the worker moves to the project interpreter. The training code sees its cards as 0 upward in `nvidia-smi` order and needs to know nothing about which physical indices it was given. A provider that assigns the device itself sets neither.
 
 ### Instances
 

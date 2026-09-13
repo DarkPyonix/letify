@@ -1022,6 +1022,15 @@ def test_the_workspace_flag_answers_the_prompt_for_a_script(isolated_home, patch
     assert home_config()["lab"]["workspace"] == "~/scratch/letify"
 
 
+def test_a_workspace_that_passes_the_check_is_reported_writable(
+    isolated_home, patch_run, capsys
+) -> None:
+    # The same wording letify check prints, so the two commands read alike.
+    patch_run(login, result=workspace_machine())
+    assert main([*SHELL_LOGIN, "--no-input", "--workspace", "/workspace/me"]) == 0
+    assert "workspace /workspace/me: writable" in capsys.readouterr().out
+
+
 def test_a_workspace_that_cannot_be_written_fails_the_login_with_nothing_written(
     isolated_home, patch_run, capsys
 ) -> None:

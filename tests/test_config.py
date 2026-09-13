@@ -253,6 +253,43 @@ def test_an_alias_block_is_replaced_without_disturbing_the_rest_of_the_file() ->
     assert updated.count("[lab]") == 1
 
 
+LAYOUT_FILE = """# lab machines
+[defaults]
+name = "nvfp4"
+
+[dept_gpu]
+kind = "shell"
+address = "gpu.example.edu"
+port = 2222
+user = "me"
+persistent = true
+
+# cards letify may use
+[dept_gpu.devices]
+Tesla_P100 = { indices = "0-7" }
+
+[other]
+kind = "modal"
+"""
+
+
+def test_rewriting_an_account_keeps_its_key_order_and_the_blank_lines() -> None:
+    # Spec "Logging in": the file is the user's, so a rewrite changes values, not layout.
+    options = {
+        "kind": "shell",
+        "address": "gpu.example.edu",
+        "persistent": True,
+        "port": 2222,
+        "user": "me",
+        "workspace": "/workspace",
+    }
+    updated = writer.write_block(LAYOUT_FILE, "dept_gpu", options)
+    expected = LAYOUT_FILE.replace(
+        "persistent = true\n", 'persistent = true\nworkspace = "/workspace"\n'
+    )
+    assert updated == expected
+
+
 def test_a_new_alias_block_is_appended_and_the_file_stays_parseable() -> None:
     updated = writer.write_block("", "lab", {"kind": "shell", "port": 2222, "persistent": True})
     parsed = tomllib.loads(updated)

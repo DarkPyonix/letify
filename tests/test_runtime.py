@@ -1158,6 +1158,58 @@ def test_a_provider_that_assigns_its_own_devices_reserves_by_count(reserving) ->
     assert provider.reserve(provider.G4) is None
 
 
+# -- Spec: Inventory, the visible devices of a reserved session ---------------
+
+VISIBLE_SOURCE = (
+    "import os\n"
+    "__letify_value__ = (os.environ.get('CUDA_VISIBLE_DEVICES'),"
+    " os.environ.get('CUDA_DEVICE_ORDER'))\n"
+)
+
+
+def started_with_reservation(provider, instance) -> letify.Runtime:
+    held = provider.reserve(instance)
+    return provider.start(instance, Env(), name="box-1", held=held)
+
+
+def test_a_reserved_session_sees_only_its_one_card(reserving, patch_smi) -> None:
+    provider = reserving(A100={"indices": "0-3"})
+    patch_smi(busy=[0, 1])
+    runtime = started_with_reservation(provider, provider.A100._placed("remote"))
+    try:
+        assert list(runtime.eval(VISIBLE_SOURCE)) == ["2", "PCI_BUS_ID"]
+    finally:
+        runtime.shutdown()
+
+
+def test_a_session_of_two_cards_sees_exactly_those_two(reserving, patch_smi) -> None:
+    provider = reserving(A100={"indices": "0-3"})
+    patch_smi(busy=[1])
+    runtime = started_with_reservation(provider, (provider.A100 * 2)._placed("remote"))
+    try:
+        assert list(runtime.eval(VISIBLE_SOURCE)) == ["0,2", "PCI_BUS_ID"]
+    finally:
+        runtime.shutdown()
+
+
+def test_the_visible_devices_survive_the_move_to_the_project_interpreter(
+    uv_project: Path, patch_smi, monkeypatch
+) -> None:
+    provider = provider_of(PreparingLocal, "lab", devices={"A100": {"indices": "0-3"}})
+    monkeypatch.setattr(
+        provider,
+        "discover",
+        lambda: {name: Instance(provider, gpu=name) for name in provider.inventory},
+    )
+    patch_smi(busy=[0])
+    runtime = started_with_reservation(provider, provider.A100._placed("remote"))
+    try:
+        assert runtime.env_source == "sync"
+        assert list(runtime.eval(VISIBLE_SOURCE)) == ["1", "PCI_BUS_ID"]
+    finally:
+        runtime.shutdown()
+
+
 def test_a_call_waits_for_a_card_rather_than_asking_for_a_refusal(launcher_from) -> None:
     # One card, two declarations. The second waits for the first to finish instead of
     # starting a session the machine cannot serve.
