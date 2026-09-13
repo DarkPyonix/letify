@@ -595,3 +595,162 @@ def local_one_shot_runner(record: list[str] | None = None):
         return result.stdout
 
     return run
+
+
+# -- the connection pipeline ---------------------------------------------------
+
+
+class StunServer:
+    """A STUN binding responder over TCP on loopback.
+
+    A public STUN server needs the network. This one answers with the address the request
+    came from, which is what a real server reports, so the client parser, the bound port and
+    the reuse options all run for real.
+    """
+
+    def __init__(self) -> None:
+        import socket
+        import threading
+
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.sock.bind(("127.0.0.1", 0))
+        self.sock.listen(16)
+        self.address = self.sock.getsockname()
+        self._thread = threading.Thread(target=self._serve, daemon=True)
+        self._thread.start()
+
+    def _serve(self) -> None:
+        import struct
+
+        while True:
+            try:
+                conn, peer = self.sock.accept()
+            except OSError:
+                return
+            with conn:
+                header = conn.recv(20)
+                if len(header) < 20:
+                    continue
+                _, _, cookie = struct.unpack("!HHI", header[:8])
+                transaction = header[8:20]
+                port = peer[1] ^ (cookie >> 16)
+                ip = struct.unpack("!I", bytes(int(p) for p in peer[0].split(".")))[0] ^ cookie
+                value = struct.pack("!BBHI", 0, 1, port, ip)
+                attribute = struct.pack("!HH", 0x0020, len(value)) + value
+                conn.sendall(
+                    struct.pack("!HHI", 0x0101, len(attribute), cookie) + transaction + attribute
+                )
+
+    def close(self) -> None:
+        self.sock.close()
+
+
+@pytest.fixture
+def stun_server():
+    server = StunServer()
+    yield server
+    server.close()
+
+
+class FakeLink:
+    """A link with no connection behind it, carrying the probe result a test chose."""
+
+    persistent = True
+
+    def __init__(self, strategy: str, rank: int, result: Any = None, *, probe_error: bool = False):
+        self.strategy = strategy
+        self.rank = rank
+        self.result = result
+        self.probe_error = probe_error
+        self.closed = False
+
+    def probe_stream(self) -> Any:
+        return self if self.result is not None or self.probe_error else None
+
+    def ssh_command(self, remote_command: str | None = None) -> list[str]:
+        return ["ssh", self.strategy, *([remote_command] if remote_command else [])]
+
+    def close(self) -> None:
+        self.closed = True
+
+
+class FakeProbe:
+    """Hands back the result a FakeLink carries, standing in for seconds of transfer."""
+
+    def __init__(self) -> None:
+        self.measured: list[str] = []
+
+    def measure(self, stream: Any) -> Any:
+        self.measured.append(stream.strategy)
+        if stream.probe_error:
+            raise OSError("the link dropped during the probe")
+        return stream.result
+
+
+class FakeStrategy:
+    """A strategy that connects after a delay, fails, or is not applicable."""
+
+    def __init__(
+        self,
+        name: str,
+        rank: int,
+        *,
+        result: Any = None,
+        delay: float = 0.0,
+        error: str | None = None,
+        unmet: str | None = None,
+        probe_error: bool = False,
+    ):
+        self.name = name
+        self.rank = rank
+        self.result = result
+        self.delay = delay
+        self.error = error
+        self.unmet = unmet
+        self.probe_error = probe_error
+        self.attempts = 0
+        self.assumed = 0
+        self.links: list[FakeLink] = []
+
+    def needs(self, target: Any) -> str | None:
+        return self.unmet
+
+    def _link(self) -> FakeLink:
+        link = FakeLink(self.name, self.rank, self.result, probe_error=self.probe_error)
+        self.links.append(link)
+        return link
+
+    def attempt(self, target: Any) -> FakeLink:
+        import time
+
+        self.attempts += 1
+        time.sleep(self.delay)
+        if self.error:
+            raise OSError(self.error)
+        return self._link()
+
+    def assume(self, target: Any) -> FakeLink:
+        self.assumed += 1
+        return self._link()
+
+
+class LoopbackRendezvous:
+    """A rendezvous whose remote side is a thread on this machine, running the real remote half."""
+
+    def __init__(self, **overrides: Any):
+        self.requests: list[dict[str, Any]] = []
+        self.overrides = overrides
+
+    def unavailable(self) -> str | None:
+        return None
+
+    def exchange(self, request: dict[str, Any], timeout: float) -> dict[str, Any]:
+        import threading
+
+        from letify.transport import nat
+
+        self.requests.append(request)
+        answer, continuation = nat.begin({**request, **self.overrides})
+        threading.Thread(target=continuation, daemon=True).start()
+        return answer
