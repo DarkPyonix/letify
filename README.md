@@ -11,7 +11,7 @@
 [![Providers](https://img.shields.io/badge/providers-Colab%20%7C%20Modal%20%7C%20SSH%20%7C%20Local-6C5CE7)](#-providers)
 [![letify-core](https://img.shields.io/badge/letify--core-rust-DEA584?logo=rust&logoColor=white)](letify-core/)
 
-[Quickstart](#-quickstart) · [Why](#-why-declare-instead-of-connect) · [Providers](#-providers) · [Sweeps](#-sweeps) · [Docs](docs/) · [한국어](docs/locales/README_ko.md)
+[Quickstart](#-quickstart) · [Why](#-why-declare-instead-of-connect) · [Providers](#-providers) · [Docs](docs/) · [한국어](docs/locales/README_ko.md)
 
 </div>
 
@@ -81,8 +81,8 @@ runtime, a lab box over SSH, an Elice allocation or this laptop by changing one 
 configuration, and when one account runs out you add another rather than rewriting anything.
 
 That is also how the work scales sideways. Capacity is what the provider entry declares it
-has, so a sweep spreads across every card available to you, across accounts and across
-machines:
+has, so calls made at the same time spread across every card available to you, across
+accounts and across machines:
 
 ```toml
 [colab_pro.devices]
@@ -235,7 +235,7 @@ Two words, and neither of them is a mechanism.
 
 Leave `host` out and you get `letify.local`. When the device is far away, forwarding every CUDA call is slow, so the call warns with the expected efficiency and then runs. For a remote GPU, `host=letify.remote` is usually what you want.
 
-How long a session lives is not a declaration argument. A call ends its session, counting a search space as one call. `with let.keep_alive():` keeps sessions for the length of a block, so a run of separate calls does not pay session start each time.
+How long a session lives is not a declaration argument. A call ends its session. `with let.keep_alive():` keeps sessions for the length of a block, so a run of separate calls does not pay session start each time.
 
 <details>
 <summary><b>📐 Which host to pick, with the arithmetic</b></summary>
@@ -279,7 +279,7 @@ Provider
 |---|---|---|
 | 💻 `Local` | persistent | your own GPU, and testing everything else |
 | ☁️ `Modal` | persistent | production serving, reproducible images |
-| 📓 `Colab` | ephemeral | cheap batch work, sweeps, NVFP4 on `G4` |
+| 📓 `Colab` | ephemeral | cheap batch work, NVFP4 on `G4` |
 | 🐚 `Shell` | overridable | lab and university servers |
 | 🕳️ `Tunnel` | overridable | a machine behind NAT you cannot port-forward |
 | 🇰🇷 `Elice` | persistent | Korean GPU cloud, per-second billing |
@@ -315,30 +315,30 @@ def train(lr): ...
 
 ---
 
-## 🔭 Sweeps
+## ⚡ Many calls at once
 
-Fan-out is a **declared space**, not a `.map()` call. Passing a space where a scalar is expected says that argument varies.
-
-```python
-space = letify.grid(lr=[1e-4, 3e-4, 1e-3], bs=[16, 32])   # 6 points
-pairs = letify.zip(lr=[1e-4, 3e-4], bs=[16, 32])          # 2 points
-both  = letify.grid(lr=[1e-4]) | letify.grid(lr=[1e-3])   # union
-```
-
-Then consume it with the language you already know. 🐍
+Declare the function with `async def`, and a call gives you a coroutine. Run as many as you like with `asyncio.gather`, inside `with let.keep_alive():` so they share sessions instead of each starting its own.
 
 ```python
+import asyncio
+
 @let.function(device=colab.G4, host=letify.remote)
 async def train(lr, bs):
-    ...
+    loss = ...                          # your training loop
+    return {"loss": loss}
 
-results = await train(space)              # list, in input order
+async def main():
+    with let.keep_alive():
+        return await asyncio.gather(*(
+            train(lr=lr, bs=bs) for lr in (1e-4, 3e-4, 1e-3) for bs in (16, 32)
+        ))
 
-async for r in train(space):              # streamed, as each finishes
-    print(r)
+results = asyncio.run(main())           # six results, in the order they were asked for
 ```
 
-> 🧵 **Sync or async is declared at the `def`, not at the call.** A plain `def` blocks. An `async def` gives you a coroutine, so `await` and `asyncio.gather` work exactly as they always do. letify adds no future type of its own, and there is no `.remote()`, `.spawn()` or `.map()` to remember.
+The calls run on as many cards as the account declares, and a call waits for a card when all of them are busy. Nothing on the declaration sets the width.
+
+> 🧵 **Sync or async is declared at the `def`, not at the call.** A plain `def` blocks and returns its value. An `async def` returns a coroutine, so `await`, `asyncio.gather` and `asyncio.as_completed` work exactly as they always do. letify adds no future type of its own, and there is no `.remote()`, `.spawn()` or `.map()` to remember.
 
 ---
 
@@ -347,11 +347,13 @@ async for r in train(space):              # streamed, as each finishes
 A **volume** is a content addressed blob store. Contents are named by their hash, and mutable names live in a separate tiny namespace, exactly like Git objects and refs.
 
 ```python
-cache = colab.volume("hf-cache")
+project = colab.volume("my-project")    # a copy of what this project needs, kept in a bucket
 
-@let.function(device=colab.G4, host=letify.remote, volumes=[cache])
+@let.function(device=colab.G4, host=letify.remote, volumes=[project])
 def train(lr): ...
 ```
+
+The runtime pulls the volume straight from the bucket, not through your machine. It uses a short-lived token borrowed from your own login, so no credential is left on the remote side.
 
 Why this shape:
 
@@ -401,9 +403,9 @@ A handle names the session that holds it. Passing one to a different session rai
 
 Nothing has to be torn down by hand.
 
-**A call ends its own session.** That is the default, and a sweep counts as one call, so six points start one set of sessions and end them once.
+**A call ends its own session.** That is the default.
 
-**`with let.keep_alive():` is the opt in**, for a run of separate calls that would otherwise pay session start each time. Leaving the block ends every idle session. Nothing ends one on a timer.
+**`with let.keep_alive():` is the opt in**, for a run of separate calls that would otherwise pay session start each time. Calls made at the same time inside it, for example with `asyncio.gather`, run on as many cards as the account declares and wait for one when all are busy. Leaving the block ends every idle session. Nothing ends one on a timer.
 
 **Devices that cannot be allocated raise.** A call that asks for cards held by an idle kept session, by another process or beyond what the account declares raises `letify.InsufficientDevices` at once, instead of waiting for a device nothing will free.
 
@@ -452,7 +454,7 @@ letify efficiency 0.5 3 150   # the formula, from measured terms
 
 | | |
 |---|---|
-| 🧪 [examples/](examples/) | Working scenarios, starting with a LoRA sweep on a rented card |
+| 🧪 [examples/](examples/) | Working scenarios, starting with LoRA runs on a rented card |
 | 📖 [PROJECT.md](PROJECT.md) | The full feature set and API surface |
 | 🎯 [docs/INTENT.md](docs/INTENT.md) | Goals, claims, constraints, open questions |
 | 📐 [docs/SPEC.md](docs/SPEC.md) | The design as it stands, decision by decision |
@@ -468,7 +470,7 @@ letify efficiency 0.5 3 150   # the formula, from measured terms
 
 Alpha, and honest about it. What works today:
 
-✅ Declarations, sync and async, sweeps, pooling, session lifetimes and the lease
+✅ Declarations, sync and async, pooling, session lifetimes and the lease
 ✅ Persistent sessions: handles resolve in later calls, large arguments travel once
 ✅ Content addressed storage, configuration and secrets
 ✅ The `Local` and `Colab` providers

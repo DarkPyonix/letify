@@ -11,7 +11,7 @@
 [![Providers](https://img.shields.io/badge/providers-Colab%20%7C%20Modal%20%7C%20SSH%20%7C%20Local-6C5CE7)](#-프로바이더)
 [![Pure Python](https://img.shields.io/badge/pure-python-2ECC71)](../../pyproject.toml)
 
-[빠른 시작](#-빠른-시작) · [왜 선언인가](#-접속하는-대신-선언하는-이유) · [프로바이더](#-프로바이더) · [스윕](#-스윕) · [문서](../) · [English](../../README.md)
+[빠른 시작](#-빠른-시작) · [왜 선언인가](#-접속하는-대신-선언하는-이유) · [프로바이더](#-프로바이더) · [문서](../) · [English](../../README.md)
 
 </div>
 
@@ -76,7 +76,7 @@ train(lr=1e-4, bs=32)     # 방금까지 편집하던 그 파일
 런타임에서도, SSH로 붙는 연구실 머신에서도, Elice allocation에서도, 이 노트북에서도 돕니다. 계정
 하나가 소진되면 아무것도 고치지 않고 계정을 늘립니다.
 
-수평 확장도 같은 방식입니다. 용량은 프로바이더 항목이 가졌다고 선언한 것이고, 스윕은 내가 쓸 수
+수평 확장도 같은 방식입니다. 용량은 프로바이더 항목이 가졌다고 선언한 것이고, 동시에 부른 호출들은 내가 쓸 수
 있는 모든 카드로 퍼집니다. 계정을 넘어서, 머신을 넘어서.
 
 ```toml
@@ -229,7 +229,7 @@ print(train(lr=1e-4, bs=32))
 
 `host`를 생략하면 `letify.local`이 됩니다. 장치가 멀면 CUDA 호출을 매번 중계하는 것이 느리므로, 호출할 때 예상 효율이 담긴 경고를 띄운 뒤 실행합니다. 원격 GPU라면 보통 `host=letify.remote`가 맞습니다.
 
-세션이 얼마나 오래 사는지는 선언 인자가 아닙니다. 호출 하나가 끝나면 세션도 끝나고, 탐색 공간 하나는 호출 하나로 셉니다. `with let.keep_alive():` 블록 안에서는 세션이 유지되므로, 따로따로 부르는 호출들이 매번 세션 시작 비용을 내지 않습니다.
+세션이 얼마나 오래 사는지는 선언 인자가 아닙니다. 호출 하나가 끝나면 세션도 끝납니다. `with let.keep_alive():` 블록 안에서는 세션이 유지되므로, 따로따로 부르는 호출들이 매번 세션 시작 비용을 내지 않습니다.
 
 <details>
 <summary><b>📐 어떤 host를 고를지, 계산식과 함께</b></summary>
@@ -273,7 +273,7 @@ Provider
 |---|---|---|
 | 💻 `Local` | persistent | 내 GPU, 그리고 나머지 전부의 테스트 |
 | ☁️ `Modal` | persistent | 프로덕션 서빙, 재현 가능한 이미지 |
-| 📓 `Colab` | ephemeral | 저렴한 배치 작업, 스윕, `G4`에서 NVFP4 |
+| 📓 `Colab` | ephemeral | 저렴한 배치 작업, `G4`에서 NVFP4 |
 | 🐚 `Shell` | 덮어쓰기 가능 | 연구실과 학교 서버 |
 | 🕳️ `Tunnel` | 덮어쓰기 가능 | 포트를 열 수 없는 NAT 뒤의 머신 |
 | 🇰🇷 `Elice` | persistent | 한국 GPU 클라우드, 초 단위 과금 |
@@ -309,30 +309,30 @@ def train(lr): ...
 
 ---
 
-## 🔭 스윕
+## ⚡ 여러 호출을 한꺼번에
 
-병렬 실행은 `.map()` 호출이 아니라 **선언된 공간**입니다. 스칼라가 올 자리에 공간을 넘기면 그 인자가 변한다는 선언이 됩니다.
-
-```python
-space = letify.grid(lr=[1e-4, 3e-4, 1e-3], bs=[16, 32])   # 6개
-pairs = letify.zip(lr=[1e-4, 3e-4], bs=[16, 32])          # 2개
-both  = letify.grid(lr=[1e-4]) | letify.grid(lr=[1e-3])   # 합집합
-```
-
-소비하는 방법은 이미 알고 있는 파이썬 문법입니다. 🐍
+함수를 `async def`로 선언하면 호출이 코루틴을 돌려줍니다. `with let.keep_alive():` 안에서 `asyncio.gather`로 원하는 만큼 함께 돌리면, 호출마다 세션을 새로 열지 않고 세션을 나눠 씁니다.
 
 ```python
+import asyncio
+
 @let.function(device=colab.G4, host=letify.remote)
 async def train(lr, bs):
-    ...
+    loss = ...                          # 학습 루프
+    return {"loss": loss}
 
-results = await train(space)              # 입력 순서대로 리스트
+async def main():
+    with let.keep_alive():
+        return await asyncio.gather(*(
+            train(lr=lr, bs=bs) for lr in (1e-4, 3e-4, 1e-3) for bs in (16, 32)
+        ))
 
-async for r in train(space):              # 끝나는 대로 하나씩
-    print(r)
+results = asyncio.run(main())           # 결과 6개, 요청한 순서대로
 ```
 
-> 🧵 **동기와 비동기는 호출이 아니라 `def` 자리에서 선언합니다.** 평범한 `def`는 블로킹이고, `async def`는 코루틴을 주니 `await`와 `asyncio.gather`가 평소와 똑같이 동작합니다. letify가 자체 future 타입을 만들지 않고, 외울 `.remote()`나 `.spawn()`, `.map()`도 없습니다.
+호출들은 계정이 선언한 카드 수만큼 동시에 돌고, 카드가 모두 바쁘면 하나가 빌 때까지 기다립니다. 동시 실행 수를 선언에서 정하지 않습니다.
+
+> 🧵 **동기와 비동기는 호출이 아니라 `def` 자리에서 선언합니다.** 평범한 `def`는 블로킹이고 값을 돌려줍니다. `async def`는 코루틴을 돌려주니 `await`, `asyncio.gather`, `asyncio.as_completed`가 평소와 똑같이 동작합니다. letify가 자체 future 타입을 만들지 않고, 외울 `.remote()`나 `.spawn()`, `.map()`도 없습니다.
 
 ---
 
@@ -341,11 +341,13 @@ async for r in train(space):              # 끝나는 대로 하나씩
 **볼륨**은 내용 주소 블롭 저장소입니다. 내용을 해시로 이름 붙이고, 바뀌는 이름은 별도의 작은 공간에 둡니다. Git의 객체와 ref와 같은 구조입니다.
 
 ```python
-cache = colab.volume("hf-cache")
+project = colab.volume("my-project")    # 이 프로젝트에 필요한 것의 복사본, 버킷에 보관
 
-@let.function(device=colab.G4, host=letify.remote, volumes=[cache])
+@let.function(device=colab.G4, host=letify.remote, volumes=[project])
 def train(lr): ...
 ```
+
+런타임은 볼륨을 여러분의 컴퓨터를 거치지 않고 버킷에서 바로 받습니다. 이때 로컬 로그인에서 잠시 빌린 짧은 수명의 토큰을 쓰므로, 원격에는 인증 정보가 남지 않습니다.
 
 이 구조를 고른 이유입니다.
 
@@ -397,11 +399,10 @@ with let.keep_alive():               # 세션이 호출보다 오래 삽니다
 
 손으로 내릴 것이 없습니다.
 
-**호출이 자기 세션을 끝냅니다.** 이게 기본이고, 스윕도 호출 하나로 세니 6개 조합이 세션을 한 번
-열고 한 번 닫습니다.
+**호출이 자기 세션을 끝냅니다.** 이게 기본입니다.
 
 **`with let.keep_alive():`가 선택 사항입니다.** 이어지는 호출들이 매번 세션 시작 비용을 내야 하는
-경우를 위한 것입니다. 블록을 나가면 쉬고 있는 세션이 모두 끝납니다. 타이머로 끝내는 것은 없습니다.
+경우를 위한 것입니다. 블록 안에서 `asyncio.gather` 등으로 동시에 부른 호출들은 계정이 선언한 카드 수만큼 함께 돌고, 카드가 모두 바쁘면 하나가 빌 때까지 기다립니다. 블록을 나가면 쉬고 있는 세션이 모두 끝납니다. 타이머로 끝내는 것은 없습니다.
 
 **할당할 수 없는 장치는 예외를 냅니다.** 유지 중인 유휴 세션이나 다른 프로세스가 잡고 있는 카드, 또는
 계정이 선언한 것보다 많은 카드를 요청하면 기다리지 않고 바로 `letify.InsufficientDevices`를 냅니다.
@@ -454,7 +455,7 @@ letify probe lab      # 호출 중계를 쓸 만큼 가까운가?
 
 | | |
 |---|---|
-| 🧪 [examples/](../../examples/) | 동작하는 시나리오, 빌린 카드에서의 LoRA 스윕부터 |
+| 🧪 [examples/](../../examples/) | 동작하는 시나리오, 빌린 카드에서의 LoRA 학습부터 |
 | 📖 [PROJECT.md](../../PROJECT.md) | 전체 기능과 API |
 | 🎯 [docs/INTENT.md](../INTENT.md) | 목표, 주장, 제약, 열린 질문 |
 | 📐 [docs/SPEC.md](../SPEC.md) | 현재 설계, 결정 단위로 |
@@ -469,7 +470,7 @@ letify probe lab      # 호출 중계를 쓸 만큼 가까운가?
 
 알파이고, 그 점을 숨기지 않습니다. 지금 동작하는 것입니다.
 
-✅ 선언, 동기와 비동기, 스윕, 풀링, 세션 수명과 리스
+✅ 선언, 동기와 비동기, 풀링, 세션 수명과 리스
 ✅ 상주 세션: 핸들이 나중 호출에서 해소되고, 큰 인자는 한 번만 전송됩니다
 ✅ 내용 주소 저장소, 설정과 비밀 관리
 ✅ `Local`과 `Colab` 프로바이더
