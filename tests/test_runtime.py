@@ -632,6 +632,29 @@ def test_an_infrastructure_failure_is_retried_on_a_fresh_runtime(let, remote_cpu
     assert let.pool.live == []
 
 
+def test_the_last_failures_command_and_stderr_survive_the_retry(
+    let, remote_cpu, monkeypatch
+) -> None:
+    from letify.runtime.session import Runtime
+
+    def fail(self, *args, **kwargs):
+        raise RuntimeFailure(
+            "`colab exec` exited 1", command="colab exec -s s", stderr="SyntaxError: bad"
+        )
+
+    monkeypatch.setattr(Runtime, "call", fail)
+
+    @let.function(device=remote_cpu, host="remote", retries=1)
+    def noop() -> None:
+        return None
+
+    with pytest.raises(letify.RuntimeLost) as caught:
+        noop()
+    assert "SyntaxError: bad" in str(caught.value)
+    assert caught.value.stderr == "SyntaxError: bad"
+    assert caught.value.command == "colab exec -s s"
+
+
 def test_user_code_failure_is_never_retried(let, remote_cpu, tmp_path) -> None:
     # Retrying a body that raises only reproduces it, so the traceback comes straight
     # back instead.

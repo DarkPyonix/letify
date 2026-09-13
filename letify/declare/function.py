@@ -135,10 +135,14 @@ class Function(Generic[R]):
                 last = exc
                 launcher.pool.discard(runtime)
                 if attempt == self.retries:
-                    raise RuntimeLost(
+                    lost = RuntimeLost(
                         f"{self.__name__} failed after {attempt + 1} attempt(s) on "
                         f"{instance!r}: {exc}"
-                    ) from exc
+                    )
+                    # Kept as attributes only: str(exc) above already carries the tail.
+                    lost.command = getattr(exc, "command", "")
+                    lost.stderr = getattr(exc, "stderr", "")
+                    raise lost from exc
                 continue
             except BaseException:
                 launcher.pool.release(runtime)

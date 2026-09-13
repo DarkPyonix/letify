@@ -400,6 +400,20 @@ def test_creating_a_colab_session_for_a_tpu_asks_for_a_tpu(
     assert recorder.command == [*COLAB_CLI, "new", "-s", "letify-v5e1-1", "--tpu", "v5e1"]
 
 
+def test_a_failing_cli_command_names_the_command_and_the_end_of_its_stderr(
+    isolated_home, patch_which, patch_run
+) -> None:
+    patch_which(tools_module, present=True)
+    stderr = "".join(f"line {n}\n" for n in range(100)) + "not entitled\n"
+    patch_run(colab_module, result=FakeCompleted(returncode=2, stderr=stderr))
+    with pytest.raises(letify.RuntimeFailure) as caught:
+        provider_of(Colab, "colab_a").sessions()
+    message = str(caught.value)
+    assert "colab sessions" in message
+    assert "not entitled" in message and "line 99" in message
+    assert "line 60\n" not in message
+
+
 def test_the_declared_account_reaches_the_cli(isolated_home, patch_which, patch_run) -> None:
     patch_which(tools_module, present=True)
     recorder = patch_run(colab_module)
