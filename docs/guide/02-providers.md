@@ -156,29 +156,41 @@ In a script, `--no-input` records every card, and `--indices A100=0-1` (repeatab
 
 ## 🕳️ Tunnel, for a machine behind NAT
 
-For a machine that cannot accept an inbound connection. The tunnel builds the path; SSH still does the work.
+For a machine that cannot accept an inbound connection. letify reaches it over [Tailcat](https://github.com/tailscale/tailcat), which needs no account and no server of your own. SSH still does the work.
+
+Setup is two commands, one on each machine. Both machines need `tailcat`, and the remote one needs letify and an SSH server.
+
+**1. On the remote machine**, start the agent:
+
+```bash
+letify client shell connect --name home_box
+```
+
+If `tailcat` or an SSH server is missing, the command prints the exact install steps for that machine and exits. Otherwise it prints one command to run on your own machine:
+
+```
+letify login tunnel home_box --connect eyJ0YWlsY2F0Ijoi...
+```
+
+Keep the agent running, for example inside `tmux`. It carries every connection, and a restart gives it a new address, so you would log in again with the new token.
+
+**2. On your own machine**, run the printed command:
+
+```bash
+letify login tunnel home_box --connect eyJ0YWlsY2F0Ijoi...
+```
+
+It installs your SSH key over Tailcat (you type the remote password once), confirms the key, checks the workspace root and records the GPUs, as `letify login shell` does. Then `letify check home_box` confirms the machine answers. The account in `~/.letify/config.toml` looks like this, with no address:
 
 ```toml
 [home_box]
 kind = "tunnel"
-transport = "tailscale"
-address = "home-box"               # the Tailscale machine name
+tailcat = "tc..."
+tailcat_port = 40123
 user = "researcher"
-auth_key_env = "TS_AUTHKEY"
-mtu = 1280
-persistent = true
+port = 22
+key = "~/.ssh/id_letify"
 ```
-
-Tailscale is the default because it needs no server of your own, authenticates from an auth key without a prompt, and carries any TCP port. When UDP is blocked it relays over TCP 443, which keeps working but slowly.
-
-If your network blocks UDP and the relay is too slow, switch transports:
-
-```toml
-transport = "frp"
-frp_config = "~/.config/frp/frpc.toml"
-```
-
-> ⚠️ **Leave the MTU low.** Every mesh VPN in this class shows the same failure above roughly 1400: the tunnel comes up, small commands work, and bulk transfers stall silently. 1280 always works.
 
 Try the simpler paths first. A direct address, then a jump host, then this. Campus machines often allow one of the first two. Details and measurements are in [docs/NETWORK.md](../NETWORK.md).
 
