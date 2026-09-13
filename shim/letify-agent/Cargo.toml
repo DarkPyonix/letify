@@ -1,0 +1,13 @@
+[package]
+name = "letify-agent"
+description = "Holds the real CUDA device and executes the calls a letify shim forwards."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+letify-wire.workspace = true
+# The driver is opened at runtime rather than linked, so this builds on a machine with
+# no CUDA toolkit and runs against whatever driver version is present.
+libloading.workspace = true

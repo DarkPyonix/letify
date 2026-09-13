@@ -1,0 +1,18 @@
+[package]
+name = "letify-shim"
+description = "Stands in for the CUDA driver and forwards its calls to a remote agent."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+# The output has to be named for the library it replaces, because being found first in
+# the loader's search order is the whole mechanism. Linux and WSL2 want libcuda.so.1,
+# reached with LD_PRELOAD; Windows wants nvcuda.dll, reached by putting this directory
+# ahead of the real one. The build script in shim/build.py does the renaming.
+name = "letify_shim"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+letify-wire.workspace = true

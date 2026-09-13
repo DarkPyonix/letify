@@ -1,15 +1,15 @@
 """Shell, a machine where letify can run commands.
 
-The shared ability is command execution, not any one transport. SSH is the
-default and the subclasses change how the connection is made: ``Colab`` creates
-the session with the Colab CLI, ``Tunnel`` builds a network path first, and
-``Elice`` allocates the machine through the Elice Cloud API.
+The shared ability is command execution, not any one transport. SSH is the default,
+and the subclasses change only how the connection is obtained: ``Colab`` creates
+the session with a CLI, ``Tunnel`` builds a network path first, and ``Elice``
+allocates the machine through an API.
 
 Persistence defaults to ephemeral. Guessing wrong in that direction only costs
 time, because letify rebuilds the environment each runtime and the work still
 succeeds. Guessing persistent when the disk is actually wiped fails outright, so
-the safe default is the pessimistic one. Declare ``persistent = true`` in the
-configuration once you know the machine keeps its disk.
+the safe default is the pessimistic one. Declare ``persistent = true`` once you
+know the machine keeps its disk.
 """
 
 from __future__ import annotations
@@ -19,13 +19,14 @@ import subprocess
 from collections.abc import Mapping
 from typing import TYPE_CHECKING
 
+from ..declare.instance import Instance
 from ..errors import ProviderUnavailable, RuntimeFailure
-from ..instance import Instance
 from .base import Provider
+from .naming import gib_from_mib, normalize_gpu
 
 if TYPE_CHECKING:
-    from ..env import Env
-    from ..runtime import Runtime
+    from ..runtime.channel import Channel
+    from ..runtime.session import Runtime
 
 
 class Shell(Provider):
@@ -35,9 +36,12 @@ class Shell(Provider):
     extra = "shell"
     default_persistence = "ephemeral"
 
-    #: A machine reached directly has a short round trip, so forwarding CUDA
-    #: calls is a real option here.
+    #: A machine reached directly has a short round trip, so forwarding CUDA calls
+    #: is a real option here.
     has_fast_path = True
+
+    #: SSH keeps a process alive behind pipes, so handles and blob reuse work.
+    persistent_channel = True
 
     # -- connection ----------------------------------------------------------
 
@@ -58,14 +62,16 @@ class Shell(Provider):
         """SSH port.
 
         Some hosts hand out a fresh port every time the machine starts. Set
-        ``port_command`` in the configuration to a shell command that prints the
-        current port, and it is read at connection time instead.
+        ``port_command`` to a command that prints the current port and it is read at
+        connection time instead of being fixed in the configuration.
         """
         command = self.config.option("port_command")
         if isinstance(command, str):
-            out = subprocess.run(shlex.split(command), capture_output=True, text=True, timeout=60)
-            if out.returncode == 0 and out.stdout.strip().isdigit():
-                return int(out.stdout.strip())
+            result = subprocess.run(
+                shlex.split(command), capture_output=True, text=True, timeout=60
+            )
+            if result.returncode == 0 and result.stdout.strip().isdigit():
+                return int(result.stdout.strip())
         value = self.config.option("port", 22)
         return int(value) if isinstance(value, (int, str)) else 22
 
@@ -74,10 +80,23 @@ class Shell(Provider):
         value = self.config.option("key")
         return value if isinstance(value, str) else None
 
+    @property
+    def remote_python(self) -> str:
+        value = self.config.option("python", "python3")
+        return str(value)
+
     def ssh_command(self, remote_command: str | None = None) -> list[str]:
-        """Build the OpenSSH command line used to reach this machine."""
+        """Build the OpenSSH command line that reaches this machine."""
         target = f"{self.user}@{self.address}" if self.user else self.address
-        command = ["ssh", "-p", str(self.port), "-o", "BatchMode=yes"]
+        command = [
+            "ssh",
+            "-p",
+            str(self.port),
+            "-o",
+            "BatchMode=yes",
+            "-o",
+            "ServerAliveInterval=30",
+        ]
         if self.key_path:
             command += ["-i", self.key_path]
         jump = self.config.option("jump")
@@ -89,31 +108,32 @@ class Shell(Provider):
         return command
 
     def connect(self) -> None:
-        """Open whatever path this provider needs. SSH needs nothing extra."""
+        """Open whatever path this provider needs. Plain SSH needs nothing."""
         return None
 
     def check(self) -> str:
         """Run one command to confirm the machine answers."""
-        out = subprocess.run(
-            self.ssh_command("uname -a && nvidia-smi --query-gpu=name --format=csv,noheader"),
+        self.connect()
+        result = subprocess.run(
+            self.ssh_command("uname -a; nvidia-smi --query-gpu=name --format=csv,noheader"),
             capture_output=True,
             text=True,
             timeout=120,
         )
-        if out.returncode != 0:
+        if result.returncode != 0:
             raise RuntimeFailure(
                 f"{self.alias} did not answer over SSH",
                 command=" ".join(self.ssh_command("...")),
-                stderr=out.stderr.strip(),
+                stderr=result.stderr.strip(),
             )
-        return out.stdout
+        return result.stdout
 
     # -- instances -----------------------------------------------------------
 
     def discover(self) -> Mapping[str, Instance]:
         """Ask the machine which GPUs it has.
 
-        The configuration may list them instead, which avoids connecting during
+        A configuration entry may list them instead, which avoids connecting during
         import. A declared list is trusted without checking.
         """
         declared = self.config.option("gpus")
@@ -121,59 +141,44 @@ class Shell(Provider):
             return {str(name): Instance(self, gpu=str(name)) for name in declared}
 
         self.connect()
-        out = subprocess.run(
+        result = subprocess.run(
             self.ssh_command("nvidia-smi --query-gpu=name,memory.total --format=csv,noheader"),
             capture_output=True,
             text=True,
             timeout=120,
         )
-        if out.returncode != 0:
+        if result.returncode != 0:
             raise ProviderUnavailable(
                 self.kind,
-                f"could not list GPUs on {self.alias}: {out.stderr.strip() or 'ssh failed'}",
+                f"could not list GPUs on {self.alias}: {result.stderr.strip() or 'ssh failed'}",
                 self.extra,
             )
         table: dict[str, Instance] = {}
-        for line in out.stdout.splitlines():
+        for line in result.stdout.splitlines():
             if not line.strip():
                 continue
             name, _, memory = line.partition(",")
-            label = _normalize_gpu_name(name)
-            vram = _parse_mib(memory)
-            table[label] = Instance(self, gpu=label, vram_gb=vram)
+            label = normalize_gpu(name)
+            table[label] = Instance(self, gpu=label, vram_gb=gib_from_mib(memory))
         return table
 
     def store_backend(self) -> str:
         backend = self.config.option("store")
         return str(backend) if isinstance(backend, str) else "shell"
 
-    # -- runtimes ------------------------------------------------------------
+    # -- sessions ------------------------------------------------------------
 
-    def start(self, instance: Instance, env: Env, *, name: str) -> Runtime:
-        from ..runtime import Runtime
+    def open_channel(self, runtime: Runtime) -> Channel:
+        """One remote Python reading framed requests from standard input."""
+        from ..runtime.channel import PersistentChannel
 
         self.connect()
-        runtime = Runtime(name=name, provider=self, instance=instance, env=env)
-        runtime.boot()
-        return runtime
+        from ..protocol.worker import BOOTSTRAP
+
+        return PersistentChannel(
+            self.ssh_command(f"{self.remote_python} -u -c {shlex.quote(BOOTSTRAP)}"),
+            name=runtime.name,
+        )
 
 
-def _normalize_gpu_name(raw: str) -> str:
-    """Turn an nvidia-smi product name into a short attribute-friendly label.
-
-    ``NVIDIA RTX PRO 6000 Blackwell`` becomes ``RTX_PRO_6000``, and
-    ``NVIDIA A100-SXM4-80GB`` becomes ``A100``.
-    """
-    text = raw.strip().removeprefix("NVIDIA").strip()
-    for marker in ("-SXM", "-PCIE", " SXM", " PCIe", " Blackwell", " Laptop"):
-        index = text.find(marker)
-        if index > 0:
-            text = text[:index]
-    return text.strip().replace(" ", "_").replace("-", "_")
-
-
-def _parse_mib(raw: str) -> int | None:
-    digits = "".join(ch for ch in raw if ch.isdigit())
-    if not digits:
-        return None
-    return round(int(digits) / 1024)
+__all__ = ["Shell"]

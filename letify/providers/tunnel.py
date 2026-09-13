@@ -1,27 +1,25 @@
 """Tunnel, a Shell that builds a network path before connecting.
 
-Use this for a machine behind NAT or a firewall that cannot accept an inbound
-connection, which is the normal situation for a lab server on a campus network.
-The tunnel only creates the path; commands still run over SSH through the parent
-class.
+For a machine behind NAT or a firewall that cannot accept an inbound connection,
+which is the normal situation for a lab server on a campus network. The tunnel only
+creates the path; commands still run over SSH through the parent class.
 
 Tailscale is the default. It is the only candidate that needs no server of your
-own, it authenticates without a prompt from an auth key, it carries any TCP port
-because it is a layer 3 tunnel, and it falls back to a relay when UDP is blocked
-instead of failing outright.
+own, it authenticates from an auth key with no prompt, it carries any TCP port
+because it is a layer 3 tunnel, and it relays over TCP 443 when UDP is blocked
+instead of failing.
 
-frp is the fallback for the case that fallback creates. When a campus network
-blocks UDP, Tailscale keeps working through its relay, but throughput drops hard:
-a cross-continent relay has been measured at 2.2 Mbit/s where a direct path
-expects 30 Mbit/s to 40 Mbit/s. frp runs over TLS on port 443 and is the easiest
-of the candidates to self-host, so it is the path to take when the relay is the
-problem.
+frp is the fallback for the case that relay creates. A relayed Tailscale path keeps
+working but slowly: 2.2 Mbit/s has been measured across continents where a direct
+path expected 30 to 40 Mbit/s, because the relay servers limit throughput for
+fairness. frp runs over TLS on port 443 and is the easiest of the candidates to
+self-host.
 
-Two settings are not defaults but requirements learned from the alternatives.
+Two settings are requirements learned from the alternatives rather than preferences.
 MTU is held at 1280 to 1400, because every mesh VPN in this class shows the same
 failure otherwise: the connection works, small commands work, and bulk transfers
-stall silently. And the tunnel is the last resort, not the first: a direct SSH
-address is tried first, then a jump host, then this.
+stall silently. And the tunnel is the last resort, after a direct address and a jump
+host, because those need no setup at all.
 """
 
 from __future__ import annotations
@@ -52,8 +50,7 @@ class Tunnel(Shell):
 
     @property
     def transport(self) -> Transport:
-        value = self.config.option("transport", "tailscale")
-        return str(value)  # type: ignore[return-value]
+        return str(self.config.option("transport", "tailscale"))  # type: ignore[return-value]
 
     @property
     def mtu(self) -> int:
@@ -61,7 +58,7 @@ class Tunnel(Shell):
         return int(value) if isinstance(value, (int, str)) else DEFAULT_MTU
 
     def connect(self) -> None:
-        """Bring up the path once per process."""
+        """Bring the path up once per process."""
         if self._connected or self.transport == "none":
             self._connected = True
             return
@@ -72,6 +69,8 @@ class Tunnel(Shell):
         else:
             raise ProviderUnavailable(self.kind, f"unknown transport {self.transport!r}")
         self._connected = True
+
+    # -- tailscale -----------------------------------------------------------
 
     def _connect_tailscale(self) -> None:
         binary = str(self.config.option("tailscale_binary", "tailscale"))
@@ -108,9 +107,10 @@ class Tunnel(Shell):
             )
         except (OSError, subprocess.TimeoutExpired):
             return False
-        return result.returncode == 0 and '"BackendState":"Running"' in result.stdout.replace(
-            " ", ""
-        )
+        compact = result.stdout.replace(" ", "")
+        return result.returncode == 0 and '"BackendState":"Running"' in compact
+
+    # -- frp -----------------------------------------------------------------
 
     def _connect_frp(self) -> None:
         binary = str(self.config.option("frp_binary", "frpc"))
@@ -123,29 +123,34 @@ class Tunnel(Shell):
             raise ProviderUnavailable(
                 self.kind, f"{self.alias} needs an frp_config path in the configuration"
             )
-        # frpc stays alive for the life of the path, so it runs detached and the
-        # local port it publishes is what SSH then connects to.
+        # frpc stays alive for the life of the path, so it runs detached and the local
+        # port it publishes is what SSH then connects to.
         subprocess.Popen(
             [binary, "-c", config_path],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )
 
+    # -- diagnosis -----------------------------------------------------------
+
     def diagnose(self) -> dict[str, object]:
         """Report what the path looks like right now.
 
-        Useful when bulk transfers stall: a relayed path and an MTU above 1400
-        are the two usual causes.
+        Run this when bulk transfers stall. A relayed path and an MTU above 1400 are
+        the two usual causes, and this names which one applies.
         """
         report: dict[str, object] = {"transport": self.transport, "mtu": self.mtu}
-        if self.transport == "tailscale":
-            binary = str(self.config.option("tailscale_binary", "tailscale"))
-            try:
-                result = subprocess.run(
-                    [binary, "status"], capture_output=True, text=True, timeout=30
-                )
-                report["relayed"] = "relay" in result.stdout.lower()
-                report["status"] = result.stdout.strip()[:2000]
-            except (OSError, subprocess.TimeoutExpired) as exc:
-                report["error"] = str(exc)
+        if self.transport != "tailscale":
+            return report
+        binary = str(self.config.option("tailscale_binary", "tailscale"))
+        try:
+            result = subprocess.run([binary, "status"], capture_output=True, text=True, timeout=30)
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            report["error"] = str(exc)
+            return report
+        report["relayed"] = "relay" in result.stdout.lower()
+        report["status"] = result.stdout.strip()[:2000]
         return report
+
+
+__all__ = ["DEFAULT_MTU", "Transport", "Tunnel"]

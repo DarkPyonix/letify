@@ -1,53 +1,59 @@
-"""Colab, a Google Colab runtime driven by the official Colab CLI.
+"""Colab, a Google Colab runtime driven by the official CLI.
 
-Sessions are created and destroyed with ``colab new`` and ``colab stop``, and
-commands run through ``colab exec``. Because the CLI also offers
-``colab ssh --proxy-mode``, which is an OpenSSH ProxyCommand bridge over a
-WebSocket, this is a Shell like any other once the session exists.
+Sessions are created and destroyed with ``colab new`` and ``colab stop``. For
+running work there are two paths, and which one is used decides what letify can do.
 
-Two things are settled by measurement and are not configurable.
+``colab ssh --proxy-mode`` is an OpenSSH ProxyCommand bridge over a WebSocket, so a
+worker process can be kept alive behind pipes exactly as on any other machine. That
+is the preferred channel, because it is what makes handles resolvable and lets a
+large argument be sent once.
 
-Storage does not survive a runtime, so this provider is ephemeral. Changing the
-accelerator type gives a new virtual machine and an empty disk, which was
-verified by writing a marker file and looking for it after the switch.
+``colab exec`` runs one command and returns its output. It always works, needs
+nothing beyond the CLI, and keeps nothing between calls. It is the fallback, and it
+is what ``channel = "exec"`` in the configuration selects.
 
-CUDA call forwarding is not offered here. The control path goes through a Google
-frontend, so a round trip from Korea is on the order of 150 ms to 200 ms. With a
-NVFP4 micro step near 0.5 s and about three host synchronizations per step, that
-leaves roughly half the throughput of a local run, and token by token decoding
-falls to a few percent. Shipping the loop keeps both near a local run, so that is
-the only mode this provider exposes.
+Two facts here are settled by measurement rather than preference.
 
-One account matters: accelerators need a Colab Pro or Pro+ entitlement, and the
-remote control features are allowed on paid plans while the compute unit balance
-is positive. A balance that runs out reverts the account to the free tier policy,
-which disallows them.
+Storage does not survive a runtime. Changing the accelerator type gives a new
+virtual machine with an empty disk, which was checked by writing a marker file and
+looking for it after the switch.
+
+CUDA call forwarding works but costs. The control path crosses a Google frontend, so
+a round trip from Korea is 150 ms to 200 ms. With a NVFP4 micro step near 0.5 s and
+about three host synchronizations per step that leaves roughly half the throughput,
+and token by token decoding falls to a few percent. letify warns with those numbers
+and then does what the declaration asked for.
+
+One account detail matters: accelerators need a Pro or Pro plus entitlement, and the
+remote control features are permitted while the compute unit balance is positive. An
+exhausted balance reverts the account to the free tier policy, which disallows them.
 """
 
 from __future__ import annotations
 
+import os
+import shlex
 import shutil
 import subprocess
-import uuid
 from collections.abc import Mapping
 from typing import TYPE_CHECKING
 
-from ..errors import ProviderUnavailable, RuntimeFailure, UnsupportedMode
-from ..instance import Instance
+from ..declare.instance import Instance
+from ..errors import ProviderUnavailable, RuntimeFailure
 from .shell import Shell
 
 if TYPE_CHECKING:
-    from ..env import Env
-    from ..runtime import Runtime
+    from ..runtime.channel import Channel
+    from ..runtime.session import Runtime
 
-#: Accelerators the CLI accepts. G4 is the RTX PRO 6000 Blackwell part, which is
-#: the only Colab option with NVFP4 tensor cores.
+#: Accelerators the CLI accepts. G4 is the RTX PRO 6000 Blackwell part, which is the
+#: only Colab option with NVFP4 tensor cores.
 GPUS = {
-    "T4": dict(vram_gb=16),
-    "L4": dict(vram_gb=22),
-    "G4": dict(vram_gb=96),
-    "A100": dict(vram_gb=40),
-    "H100": dict(vram_gb=80),
+    "T4": {"vram_gb": 16},
+    "L4": {"vram_gb": 22},
+    "G4": {"vram_gb": 96},
+    "A100": {"vram_gb": 40},
+    "H100": {"vram_gb": 80},
 }
 TPUS = ("v5e1", "v6e1")
 
@@ -67,19 +73,31 @@ class Colab(Shell):
     extra = "colab"
     default_persistence = "ephemeral"
 
-    #: The control path crosses a Google frontend, so the round trip is too long
-    #: for CUDA call forwarding to pay off.
+    #: The control path crosses a Google frontend rather than reaching the machine
+    #: directly, so forwarding pays a long round trip per synchronization. Possible,
+    #: since ``colab ssh --proxy-mode`` carries arbitrary TCP, but slow.
     has_fast_path = False
+
+    #: Measured from Seoul to a Colab runtime in the United States.
+    expected_round_trip_ms = 175.0
 
     @property
     def binary(self) -> str:
-        value = self.config.option("binary", "colab")
-        return str(value)
+        return str(self.config.option("binary", "colab"))
 
     @property
     def account(self) -> str | None:
         value = self.config.option("account")
         return value if isinstance(value, str) else None
+
+    @property
+    def channel_kind(self) -> str:
+        """``ssh`` for a persistent worker, ``exec`` for one command per call."""
+        return str(self.config.option("channel", "ssh"))
+
+    @property
+    def persistent_channel(self) -> bool:  # type: ignore[override]
+        return self.channel_kind == "ssh"
 
     def available(self) -> bool:
         return shutil.which(self.binary) is not None
@@ -87,9 +105,7 @@ class Colab(Shell):
     def _require_cli(self) -> None:
         if not self.available():
             raise ProviderUnavailable(
-                self.kind,
-                f"the {self.binary!r} command is not on PATH",
-                self.extra,
+                self.kind, f"the {self.binary!r} command is not on PATH", self.extra
             )
 
     # -- instances -----------------------------------------------------------
@@ -97,9 +113,8 @@ class Colab(Shell):
     def discover(self) -> Mapping[str, Instance]:
         """Return the fixed Colab accelerator list.
 
-        No connection is needed. Whether an accelerator is actually free at this
-        moment is decided when a runtime starts, because Colab does not promise
-        availability.
+        No connection is needed. Whether an accelerator is free right now is decided
+        when a runtime starts, because Colab does not promise availability.
         """
         table = {
             name: Instance(self, gpu=name, vram_gb=spec.get("vram_gb"))
@@ -120,21 +135,18 @@ class Colab(Shell):
         backend = self.config.option("store")
         return str(backend) if isinstance(backend, str) else "gcs"
 
-    # -- sessions ------------------------------------------------------------
+    # -- the CLI -------------------------------------------------------------
 
     def _cli(self, *args: str, timeout: float | None = None, stdin: str | None = None) -> str:
         self._require_cli()
         command = [self.binary, *args]
-        env_overrides = {}
-        if self.account:
-            env_overrides["COLAB_ACCOUNT"] = self.account
         result = subprocess.run(
             command,
             input=stdin,
             capture_output=True,
             text=True,
             timeout=timeout,
-            env=_merged_env(env_overrides),
+            env=self._env(),
         )
         if result.returncode != 0:
             raise RuntimeFailure(
@@ -144,31 +156,15 @@ class Colab(Shell):
             )
         return result.stdout
 
-    def session_name(self, runtime_name: str) -> str:
-        return runtime_name
-
-    def create_session(self, instance: Instance, name: str) -> None:
-        args = ["new", "-s", name]
-        if instance.gpu:
-            args += ["--gpu", ALIASES.get(instance.gpu, instance.gpu)]
-        elif instance.tpu:
-            args += ["--tpu", instance.tpu]
-        self._cli(*args, timeout=900)
-
-    def stop_session(self, name: str) -> None:
-        try:
-            self._cli("stop", "-s", name, timeout=180)
-        except RuntimeFailure:
-            # Stopping is best effort. A session that is already gone is fine.
-            pass
-
-    def exec(self, name: str, code: str, *, timeout: float | None = None) -> str:
-        return self._cli("exec", "-s", name, stdin=code, timeout=timeout)
+    def _env(self) -> dict[str, str] | None:
+        if not self.account:
+            return None
+        return {**os.environ, "COLAB_ACCOUNT": self.account}
 
     def sessions(self) -> list[str]:
-        output = self._cli("sessions", timeout=120)
+        """Names of the sessions this account currently holds."""
         names = []
-        for line in output.splitlines():
+        for line in self._cli("sessions", timeout=120).splitlines():
             token = line.strip().split()[:1]
             if token and not token[0].lower().startswith(("name", "session", "-")):
                 names.append(token[0])
@@ -183,35 +179,44 @@ class Colab(Shell):
             "BatchMode=yes",
             "-o",
             f"ProxyCommand={self.binary} ssh --proxy-mode",
+            "colab",
         ]
-        command.append("colab")
         if remote_command:
             command.append(remote_command)
         return command
 
-    # -- runtimes ------------------------------------------------------------
+    # -- sessions ------------------------------------------------------------
 
-    def start(self, instance: Instance, env: Env, *, name: str | None = None) -> Runtime:
-        from ..runtime import Runtime
+    def create_session(self, instance: Instance, name: str) -> None:
+        args = ["new", "-s", name]
+        if instance.gpu:
+            args += ["--gpu", ALIASES.get(instance.gpu, instance.gpu)]
+        elif instance.tpu:
+            args += ["--tpu", instance.tpu]
+        self._cli(*args, timeout=900)
 
-        if instance.placement == "local":
-            raise UnsupportedMode(
-                "Colab does not support cpu='local'. Forwarding CUDA calls over the "
-                "Colab control path costs one round trip of about 150 ms per host "
-                "synchronization, which leaves roughly half the throughput for "
-                "fine-tuning and a few percent for token by token decoding. Use "
-                "cpu='remote' so the loop runs inside the runtime."
+    def stop(self, runtime: Runtime) -> None:
+        try:
+            self._cli("stop", "-s", runtime.name, timeout=180)
+        except (RuntimeFailure, ProviderUnavailable):
+            # Stopping is best effort. A session that is already gone is fine.
+            pass
+
+    def open_channel(self, runtime: Runtime) -> Channel:
+        from ..runtime.channel import OneShotChannel, PersistentChannel
+
+        if self.channel_kind == "ssh":
+            from ..protocol.worker import BOOTSTRAP
+
+            return PersistentChannel(
+                self.ssh_command(f"{self.remote_python} -u -c {shlex.quote(BOOTSTRAP)}"),
+                name=runtime.name,
             )
-        runtime_name = name or f"letify-{instance.accelerator.lower()}-{uuid.uuid4().hex[:6]}"
-        self.create_session(instance, runtime_name)
-        runtime = Runtime(name=runtime_name, provider=self, instance=instance, env=env)
-        runtime.boot()
-        return runtime
+
+        def run(source: str, timeout: float | None) -> str:
+            return self._cli("exec", "-s", runtime.name, stdin=source, timeout=timeout)
+
+        return OneShotChannel(run, name=runtime.name)
 
 
-def _merged_env(overrides: dict[str, str]) -> dict[str, str] | None:
-    import os
-
-    if not overrides:
-        return None
-    return {**os.environ, **overrides}
+__all__ = ["ALIASES", "GPUS", "TPUS", "Colab"]

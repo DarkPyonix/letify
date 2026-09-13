@@ -5,30 +5,34 @@ Declare what a function needs and it runs there:
     import letify
 
     let = letify.Launcher()
-    env = letify.Env()
-
     colab = let.providers.colab_a
 
-    @let.function(gpu=colab.G4, env=env, concurrency=3)
+    @let.function(device=colab.G4, host=letify.Host.remote)
     def train(lr, bs):
         ...
 
-    with let.run():
-        train(lr=1e-4, bs=32)
+    train(lr=1e-4, bs=32)
 
-Nothing in this module imports a provider's optional dependency, so
-``import letify`` works with the base install and a provider whose package is
-missing simply reports itself unavailable.
+A declaration places two things. ``device`` says where the device is, carrying the provider
+and the account with it. ``host`` says where the host code runs: ``local``, the default,
+keeps Python here and forwards only CUDA calls, and ``remote`` ships the function to the
+machine that holds the device.
+
+Nothing here imports a provider's optional dependency, so ``import letify`` works with
+the base install and a provider whose package is missing reports itself unavailable.
 """
 
 from __future__ import annotations
 
-from .env import Env
+from .declare.env import Env
+from .declare.function import Function
+from .declare.instance import AnyInstance, Host, Instance
+from .declare.sweep import Sweep, grid
+from .declare.sweep import zip_ as zip
 from .errors import (
     ConfigError,
     HandleScopeError,
     LetifyError,
-    NotRunning,
     ProtocolError,
     ProviderUnavailable,
     RemoteError,
@@ -38,13 +42,9 @@ from .errors import (
     UnknownProvider,
     UnsupportedMode,
 )
-from .function import Function
-from .instance import AnyInstance, Instance
 from .launcher import Launcher, Providers
-from .store import Volume
-from .sweep import Sweep, grid
-from .sweep import zip_ as zip
-from .wire import Blob, Handle
+from .protocol.handle import Blob, Handle, RemoteFile
+from .store.volume import Volume
 
 __version__ = "1.0.0"
 
@@ -56,14 +56,15 @@ __all__ = [
     "Function",
     "Handle",
     "HandleScopeError",
+    "Host",
     "Instance",
     "Launcher",
     "LetifyError",
-    "NotRunning",
     "ProtocolError",
     "ProviderUnavailable",
     "Providers",
     "RemoteError",
+    "RemoteFile",
     "RuntimeFailure",
     "RuntimeLost",
     "Sweep",
