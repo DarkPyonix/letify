@@ -187,6 +187,13 @@ def test_the_worker_announces_itself_before_it_reads_requests() -> None:
     assert not framing.is_ready("still installing\n")
 
 
+def test_the_ready_line_names_the_python_version_the_worker_runs_on() -> None:
+    # Spec "Channels" and "Interpreter check".
+    assert framing.is_ready(READY + " 3.12\n")
+    assert framing.ready_version(READY + " 3.12\n") == "3.12"
+    assert framing.ready_version(READY + "\n") is None
+
+
 def test_the_bootstrap_stub_leaves_standard_input_open_for_requests() -> None:
     # python - reads to end of file before compiling anything, so the worker source
     # cannot be sent as a script. The stub reads a length-prefixed blob instead.

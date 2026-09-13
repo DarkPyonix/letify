@@ -118,6 +118,43 @@ class PreparingLocal(Local):
     prepares_env = True
 
 
+@pytest.fixture
+def uv_project(tmp_path: Path, monkeypatch) -> Path:
+    """A tiny uv project that depends on this checkout of letify, locked with the real uv.
+
+    The working directory moves into it, so a default ``Env()`` names its ``uv.lock``. The
+    runtime's project root moves under the test's temporary directory, so a sync through
+    PreparingLocal never writes into the developer's home.
+    """
+    import shutil
+
+    from letify.runtime import bootstrap
+
+    uv = shutil.which("uv")
+    if uv is None:  # pragma: no cover - every machine that runs this suite has uv
+        pytest.skip("uv is not installed on this machine")
+    project = tmp_path / "uv-project"
+    project.mkdir()
+    checkout = Path(letify.__file__).resolve().parent.parent
+    (project / "pyproject.toml").write_text(
+        "[project]\n"
+        'name = "tiny"\n'
+        'version = "0.1.0"\n'
+        'requires-python = ">=3.11"\n'
+        'dependencies = ["letify"]\n'
+        "\n"
+        "[tool.uv.sources]\n"
+        f"letify = {{ path = {checkout.as_posix()!r} }}\n",
+        encoding="utf-8",
+    )
+    locked = subprocess.run([uv, "lock", "--offline"], cwd=project, capture_output=True, text=True)
+    if locked.returncode != 0:  # pragma: no cover - only a machine with a cold uv cache
+        subprocess.run([uv, "lock"], cwd=project, capture_output=True, check=True)
+    monkeypatch.chdir(project)
+    monkeypatch.setattr(bootstrap, "DEFAULT_WORKSPACE_ROOT", str(tmp_path / "runtime-workspace"))
+    return project
+
+
 # -- subprocess ----------------------------------------------------------------
 
 

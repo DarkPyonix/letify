@@ -616,15 +616,18 @@ def test_the_pull_token_is_kept_nowhere_once_the_pull_finishes(
     let.pool.shutdown()
 
 
-def test_a_cached_environment_is_pulled_and_unpacked_by_the_runtime(fake_gcs, tmp_path) -> None:
-    # The archive the local machine uploaded directly is what the next session pulls.
+def test_a_cached_environment_is_pulled_and_unpacked_by_the_runtime(
+    fake_gcs, tmp_path, uv_project
+) -> None:
+    # The archive the first session stored is what the next session pulls.
+    import shutil
+
     from conftest import PreparingLocal, provider_of
 
+    from letify.runtime import bootstrap
+
     provider = provider_of(PreparingLocal, "lab")
-    env = letify.Env(lock=str(tmp_path / "absent.lock"))
-    installed = tmp_path / "site"
-    installed.mkdir()
-    (installed / "marker.txt").write_text("cached", encoding="utf-8")
+    env = letify.Env()
     mount = tmp_path / "mount"
     volume = provider.volume(
         "bucket",
@@ -634,15 +637,16 @@ def test_a_cached_environment_is_pulled_and_unpacked_by_the_runtime(fake_gcs, tm
         sts_endpoint=f"{fake_gcs.endpoint}/v1/token",
         mount=str(mount),
     )
-    volume.cache_env(env, installed)
-    assert fake_gcs.downloads() == []
-
     from letify.declare.instance import Instance
 
     instance = Instance(provider, gpu=None)._placed("remote")
-    runtime = provider.start(instance, env, name="lab-1", volumes=(volume,))
+    provider.start(instance, env, name="lab-1", volumes=(volume,)).shutdown()
+    assert not [r for r in fake_gcs.downloads() if "/blobs/" in unquote(r["path"])]
+
+    shutil.rmtree(Path(bootstrap.DEFAULT_WORKSPACE_ROOT) / "project")
+    runtime = provider.start(instance, env, name="lab-2", volumes=(volume,))
     try:
-        assert (mount / "site" / "marker.txt").read_text(encoding="utf-8") == "cached"
+        assert runtime.env_source == "archive"
         # The ref is read by this process with its own login; the blob is read by the
         # runtime with the downscoped token.
         blobs = [r for r in fake_gcs.downloads() if "/blobs/" in unquote(r["path"])]
