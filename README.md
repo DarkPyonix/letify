@@ -26,7 +26,7 @@ colab = let.providers.colab_pro_plus
 @let.function(device=colab.G4, host=letify.remote)
 def train(lr, bs):
     import torch
-    ...
+    loss = ...                          # your training loop
     return {"loss": loss}
 
 print(train(lr=1e-4, bs=32))
@@ -205,11 +205,10 @@ import letify
 let = letify.Launcher()
 env = letify.Env()                      # reads uv.lock
 colab = let.providers.colab_pro_plus
-cache = colab.volume("hf-cache")        # survives the session
 
-@let.function(device=colab.G4, host=letify.remote, env=env, volumes=[cache])
+@let.function(device=colab.G4, host=letify.remote, env=env)
 def train(lr, bs):
-    ...
+    loss = ...                          # your training loop
     return {"loss": loss}
 
 print(train(lr=1e-4, bs=32))
@@ -260,7 +259,7 @@ Measure your own `k` with `torch.cuda.set_sync_debug_mode("warn")` and your roun
 
 </details>
 
-> ⚠️ letify **never** silently changes the mode. `host` runs exactly as declared. Ask for something a provider cannot serve and you get an exception naming the reason. Ask for something slow and you get a warning with the numbers, and then it runs, because the choice is yours. The one thing letify does choose on its own is the network path to the machine, and it picks the fastest path that works.
+> ⚠️ letify **never** silently changes the mode. Ask for something a provider cannot serve and you get an exception naming the reason. Ask for something slow and you get a warning with the numbers, and then it runs, because the choice is yours.
 
 ---
 

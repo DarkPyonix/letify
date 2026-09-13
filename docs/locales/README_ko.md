@@ -26,7 +26,7 @@ colab = let.providers.colab_pro_plus
 @let.function(device=colab.G4, host=letify.remote)
 def train(lr, bs):
     import torch
-    ...
+    loss = ...                          # 학습 루프
     return {"loss": loss}
 
 print(train(lr=1e-4, bs=32))
@@ -199,11 +199,10 @@ import letify
 let = letify.Launcher()
 env = letify.Env()                      # uv.lock을 읽습니다
 colab = let.providers.colab_pro_plus
-cache = colab.volume("hf-cache")        # 세션보다 오래 살아남습니다
 
-@let.function(device=colab.G4, host=letify.remote, env=env, volumes=[cache])
+@let.function(device=colab.G4, host=letify.remote, env=env)
 def train(lr, bs):
-    ...
+    loss = ...                          # 학습 루프
     return {"loss": loss}
 
 print(train(lr=1e-4, bs=32))
