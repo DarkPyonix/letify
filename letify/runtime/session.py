@@ -24,7 +24,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from .. import protocol
-from ..errors import RuntimeFailure
+from ..errors import EnvironmentFailure, InterpreterMismatch, RemoteError, RuntimeFailure
 from .lease import Lease
 
 if TYPE_CHECKING:
@@ -62,6 +62,12 @@ class Runtime:
     #: How long this session lives, from the declaration that started it.
     lease: Lease | None = field(default=None, repr=False)
 
+    #: How the environment was built: ``"sync"``, ``"archive"``, or None where it was not.
+    env_source: str | None = None
+
+    #: The runtime's ``sys.platform`` and machine, such as ``linux-x86_64``, once probed.
+    platform: str | None = None
+
     #: Digests this runtime is known to hold, so an argument is sent once.
     _blobs: set[str] = field(default_factory=set, repr=False)
 
@@ -83,7 +89,8 @@ class Runtime:
     # -- lifecycle -----------------------------------------------------------
 
     def boot(self) -> None:
-        """Open the channel, install the environment, attach volumes, arm the lease."""
+        """Open the channel, arm the lease, build the environment, check the interpreter,
+        attach volumes."""
         if self.channel is None:
             self.channel = self.provider.open_channel(self)
         self.channel.start()
@@ -91,6 +98,12 @@ class Runtime:
             self.lease = Lease(self)
             self.lease.arm()
         self.install_env()
+        try:
+            self.check_interpreter()
+        except InterpreterMismatch:
+            # Not retried, so nothing else would end this session.
+            self.shutdown()
+            raise
         for volume in self.volumes:
             self.attach(volume)
         self.ready = True
@@ -126,6 +139,13 @@ class Runtime:
     def exec(self, source: str, *, timeout: float | None = None) -> None:
         """Run plain source inside the runtime, sharing the worker's globals."""
         self.request({"op": "exec", "source": source}, timeout=timeout)
+
+    def eval(self, source: str, *, timeout: float | None = None) -> Any:
+        """Run plain source inside the runtime and return its ``__letify_value__``."""
+        if self.channel is None:
+            raise RuntimeFailure(f"{self.name}: the channel is not open")
+        self.last_used = time.monotonic()
+        return self.channel.eval(source, timeout=timeout)
 
     def stat(self) -> dict[str, Any]:
         """What the worker is holding: blobs, bytes, process id."""
@@ -211,7 +231,13 @@ class Runtime:
     # -- files ---------------------------------------------------------------
 
     def put_bytes(
-        self, payload: bytes, path: str, *, unpack: bool = False, target: str | None = None
+        self,
+        payload: bytes,
+        path: str,
+        *,
+        unpack: bool = False,
+        target: str | None = None,
+        links: bool = False,
     ) -> protocol.RemoteFile:
         """Write bytes to a path inside the runtime, optionally unpacking an archive."""
         import base64
@@ -223,6 +249,7 @@ class Runtime:
                 "payload": base64.b64encode(payload).decode(),
                 "unpack": unpack,
                 "target": target,
+                "links": links,
             },
             timeout=3600,
         )
@@ -238,6 +265,7 @@ class Runtime:
         digest: str,
         unpack: bool = False,
         target: str | None = None,
+        links: bool = False,
     ) -> protocol.RemoteFile:
         """Have the runtime download a blob from its backend, optionally unpacking it.
 
@@ -252,6 +280,7 @@ class Runtime:
                 "path": path,
                 "unpack": unpack,
                 "target": target,
+                "links": links,
             },
             timeout=3600,
         )
@@ -277,26 +306,66 @@ class Runtime:
     # -- environment and volumes ---------------------------------------------
 
     def install_env(self) -> None:
-        """Bring the declared environment up inside the session.
+        """Build the project's environment in the session and move the worker onto it.
 
         An archive cached in a volume is preferred, because unpacking one file is a
-        single transfer while installing from a lock file is thousands of small
-        ones.
+        single transfer while syncing from a lock file is thousands of small ones. A
+        provider whose account names ``python`` manages its own interpreter, so nothing
+        is built there.
         """
-        if not self.provider.prepares_env:
+        if not self.provider.prepares_env or self.provider.managed_python:
             return
-        from .bootstrap import env_archive_path, install_source
+        from . import bootstrap
+
+        assert self.channel is not None
+        files = bootstrap.project_files(self.env)
+        root = bootstrap.project_dir(self.provider.workspace_root, self.env)
+        where = self.eval(bootstrap.probe_source(self.env, root), timeout=120)
+        self.platform = where["platform"]
 
         for volume in self.volumes:
-            digest = volume.cached_env(self.env)
+            digest = volume.cached_env(self.env, self.platform)
             if not digest:
                 continue
+            archive = f"{where['parent']}/.{digest}.tar.gz"
             volume.materialize(
-                self, digest, path=env_archive_path(volume.mount, digest), unpack=True
+                self, digest, path=archive, unpack=True, target=where["parent"], links=True
             )
-            self.exec(f"import sys; sys.path.insert(0, {volume.mount!r})", timeout=120)
+            if self.eval(bootstrap.venv_check_source(where["python"], archive), timeout=600):
+                self.env_source = "archive"
+                break
+
+        if self.env_source != "archive":
+            source = bootstrap.sync_source(self.env, files, root=root, name=self.name)
+            try:
+                self.eval(source, timeout=3600)
+            except RemoteError as exc:
+                message = str(exc).split("\n\n--- remote traceback ---")[0]
+                raise EnvironmentFailure(
+                    message.removeprefix("RuntimeError: "), stderr=exc.remote_traceback
+                ) from exc
+            self.env_source = "sync"
+            if self.volumes:
+                self.volumes[0].cache_env_from(
+                    self, self.env, where["root"], platform=self.platform
+                )
+        self.channel.switch_interpreter(where["python"])
+
+    def check_interpreter(self) -> None:
+        """Refuse a worker whose Python major.minor differs from this process."""
+        if not self.provider.prepares_env:
             return
-        self.exec(install_source(self.env), timeout=3600)
+        from . import bootstrap
+
+        assert self.channel is not None
+        remote = self.channel.python_version or self.eval(bootstrap.VERSION_SOURCE, timeout=120)
+        local = bootstrap.local_python()
+        if remote != local:
+            raise InterpreterMismatch(
+                f"{self.name}: the worker runs Python {remote} and this process runs Python "
+                f"{local}. cloudpickle ships a __main__ function as bytecode, which does not "
+                f"run across minor versions, so the session is not used"
+            )
 
     def attach(self, volume: Volume) -> None:
         """Make a volume's mount point exist and apply its environment variables."""

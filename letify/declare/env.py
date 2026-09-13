@@ -6,16 +6,29 @@ the same key are interchangeable, which is what lets the pool reuse them and
 what lets the blob store cache one prebuilt archive per environment.
 
 The lock file is resolved for every platform uv supports, so the same lock drives
-a Linux runtime from a Windows or macOS client.
+a Linux runtime from a Windows or macOS client. A runtime syncs from the lock file's
+directory with the Python major.minor this Env records, which is the one running the
+process that declares it. Building the environment is not this module's job; that is
+``letify.runtime.bootstrap``.
 """
 
 from __future__ import annotations
 
 import hashlib
+import sys
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 DEFAULT_LOCK = "uv.lock"
+
+
+def _local_python() -> str:
+    """The major.minor of the interpreter declaring the Env."""
+    return f"{sys.version_info[0]}.{sys.version_info[1]}"
+
+
+def _digest_of(path: Path) -> str:
+    return hashlib.blake2b(path.read_bytes(), digest_size=8).hexdigest() if path.is_file() else ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -26,7 +39,7 @@ class Env:
     packages: tuple[str, ...] = ()
     commands: tuple[str, ...] = ()
     variables: tuple[tuple[str, str], ...] = ()
-    python: str | None = None
+    python: str | None = field(default_factory=_local_python)
     ship_modules: tuple[str, ...] = ()
     _lock_digest: str | None = field(default=None, compare=True)
 
@@ -73,11 +86,18 @@ class Env:
         return hashlib.blake2b(path.read_bytes(), digest_size=8).hexdigest()
 
     @property
+    def project_dir(self) -> Path:
+        """The directory holding the lock file, which a runtime syncs from."""
+        return Path(self.lock).parent
+
+    @property
     def key(self) -> str:
         """Identity of the environment. Runtimes are pooled by this value."""
         payload = repr(
             (
                 self.lock_digest,
+                _digest_of(self.project_dir / "pyproject.toml"),
+                _digest_of(self.project_dir / ".python-version"),
                 tuple(sorted(self.packages)),
                 self.commands,
                 self.variables,

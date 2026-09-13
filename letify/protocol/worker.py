@@ -142,15 +142,21 @@ def _op_put_file(request):
     with open(path, "wb") as handle:
         handle.write(payload)
     if request.get("unpack"):
-        _unpack(path, request.get("target") or os.path.dirname(path))
+        _unpack(path, request.get("target") or os.path.dirname(path), request.get("links"))
     return {"ok": True, "value": {"path": path, "size": len(payload)}}
 
 
-def _unpack(path, target):
+def _unpack(path, target, links=False):
+    """Extract an archive inside target.
+
+    Both filters keep every member path inside target. ``links`` allows symlinks to
+    absolute paths, which an environment archive needs because a .venv links its
+    interpreter by absolute path.
+    """
     os.makedirs(target, exist_ok=True)
     with tarfile.open(path, "r:gz") as archive:
         try:
-            archive.extractall(target, filter="data")
+            archive.extractall(target, filter="tar" if links else "data")
         except TypeError:
             archive.extractall(target)
 
@@ -184,7 +190,7 @@ def _op_pull(request):
         fetch = None
     os.replace(partial, path)
     if request.get("unpack"):
-        _unpack(path, request.get("target") or os.path.dirname(path))
+        _unpack(path, request.get("target") or os.path.dirname(path), request.get("links"))
     return {"ok": True, "value": {"path": path, "size": size}}
 
 
@@ -223,6 +229,30 @@ def _op_exec(request):
     """Run plain source inside the worker, sharing its globals."""
     exec(compile(request["source"], "<letify>", "exec"), globals())
     return {"ok": True, "value": None}
+
+
+def _op_eval(request):
+    """Run plain source inside the worker and return what it left in __letify_value__."""
+    scope = globals()
+    scope.pop("__letify_value__", None)
+    exec(compile(request["source"], "<letify>", "exec"), scope)
+    return {"ok": True, "value": scope.pop("__letify_value__", None)}
+
+
+def _reexec(request):
+    """Reply, then replace this process with another interpreter on the same pipes.
+
+    The caller waits for the reply before it writes anything else, so nothing it sends is
+    left in this process's input buffer when the new interpreter starts reading.
+    """
+    python = request["python"]
+    if not os.access(python, os.X_OK):
+        _reply({"ok": False, "error": "%s is not an executable interpreter" % python,
+                "traceback": ""})
+        return
+    _reply({"ok": True, "value": None})
+    sys.stderr.flush()
+    os.execv(python, [python, "-u", "-c", request["bootstrap"]])
 
 
 def _op_release(request):
@@ -276,6 +306,7 @@ _OPS = {
     "get_file": _op_get_file,
     "pack_dir": _op_pack_dir,
     "exec": _op_exec,
+    "eval": _op_eval,
     "release": _op_release,
     "stat": _op_stat,
     "lease": _op_lease,
@@ -283,7 +314,9 @@ _OPS = {
 
 
 def _serve():
-    sys.stdout.write(_READY + "\n")
+    # The version travels in the ready line, so the caller can refuse a worker whose
+    # interpreter cannot run the bytecode it is about to send.
+    sys.stdout.write(_READY + " %d.%d\n" % sys.version_info[:2])
     sys.stdout.flush()
     for line in sys.stdin:
         line = line.strip()
@@ -301,6 +334,9 @@ def _serve():
                 "error": "the request could not be decoded",
                 "traceback": traceback.format_exc(),
             })
+            continue
+        if request.get("op") == "reexec":
+            _reexec(request)
             continue
         op = _OPS.get(request.get("op"))
         if op is None:

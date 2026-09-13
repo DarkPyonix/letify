@@ -107,3 +107,14 @@ class UnsupportedMode(LetifyError):
     Raised, for example, when ``host="local"`` is asked for on a provider with no
     low-latency data path. letify never downgrades silently.
     """
+
+
+class EnvironmentFailure(RuntimeFailure):
+    """uv could not be installed on a runtime, or ``uv sync`` failed there. Retryable."""
+
+
+class InterpreterMismatch(LetifyError):
+    """The runtime's Python major.minor differs from this process, or would.
+
+    Not retried, because a fresh runtime builds the same interpreter.
+    """

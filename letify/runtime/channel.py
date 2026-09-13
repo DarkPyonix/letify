@@ -26,6 +26,10 @@ from typing import TYPE_CHECKING, Any
 
 from .. import protocol
 from ..errors import ProtocolError, RuntimeFailure, RuntimeLost
+from ..protocol.framing import ready_version
+
+#: Marks the line a one-shot ``eval`` prints its value on.
+EVAL_MARKER = "__LETIFY_EVAL__"
 
 if TYPE_CHECKING:
     pass
@@ -40,8 +44,20 @@ class Channel(abc.ABC):
     #: Whether state survives between calls on this channel.
     persistent: bool = False
 
+    #: The major.minor of the worker's interpreter, once the channel has learned it.
+    python_version: str | None = None
+
     @abc.abstractmethod
     def start(self) -> None: ...
+
+    @abc.abstractmethod
+    def switch_interpreter(self, python: str, *, timeout: float | None = None) -> None:
+        """Run everything after this with another interpreter on the runtime."""
+
+    def eval(self, source: str, *, timeout: float | None = None) -> Any:
+        """Run source inside the runtime and return what it left in ``__letify_value__``."""
+        value, _logs = self.request({"op": "eval", "source": source}, timeout=timeout)
+        return value
 
     @abc.abstractmethod
     def close(self) -> None: ...
@@ -143,8 +159,18 @@ class PersistentChannel(Channel):
                     stderr=stderr.strip(),
                 )
             if protocol.is_ready(line):
+                self.python_version = ready_version(line)
                 return
         raise RuntimeFailure(f"{self.name}: the worker did not become ready in time")
+
+    def switch_interpreter(self, python: str, *, timeout: float | None = 120) -> None:
+        """Have the worker exec ``python`` on the same pipes, then start the worker again."""
+        from ..protocol.worker import BOOTSTRAP
+
+        self.request({"op": "reexec", "python": python, "bootstrap": BOOTSTRAP}, timeout=timeout)
+        with self._lock:
+            self._send_worker()
+            self._await_ready()
 
     def close(self) -> None:
         process, self._process = self._process, None
@@ -267,6 +293,8 @@ class OneShotChannel(Channel):
         #: A provider's own file transfer, which serves ``put_file``, ``get_file`` and
         #: ``pack_dir`` where a program per call cannot carry the bytes.
         self.files = files
+        #: The interpreter every program runs with once set, as a child of the runner's own.
+        self.interpreter: str | None = None
 
     def start(self) -> None:
         return None
@@ -274,16 +302,29 @@ class OneShotChannel(Channel):
     def close(self) -> None:
         return None
 
+    def _run(self, source: str, timeout: float | None) -> str:
+        if self.interpreter is not None:
+            source = _child_source(self.interpreter, source)
+        return self.runner(source, timeout)
+
+    def switch_interpreter(self, python: str, *, timeout: float | None = 120) -> None:
+        from .bootstrap import VERSION_SOURCE
+
+        self.interpreter = python
+        self.python_version = self.eval(VERSION_SOURCE, timeout=timeout)
+
     def request(self, payload: dict[str, Any], *, timeout: float | None = None) -> tuple[Any, str]:
         op = payload.get("op")
         if op == "exec":
-            self.runner(payload["source"], timeout)
+            self._run(payload["source"], timeout)
             return None, ""
+        if op == "eval":
+            return _parse_eval(self._run(_eval_source(payload["source"]), timeout), self.name)
         if op == "have":
             # Nothing persists, so the runtime holds nothing.
             return [], ""
         if op == "lease":
-            self.runner(_lease_source(payload["grace"]), timeout)
+            self._run(_lease_source(payload["grace"]), timeout)
             return None, ""
         if self.files is not None and op in ("put_file", "get_file", "pack_dir"):
             return self.files.serve(payload, timeout), ""
@@ -304,9 +345,50 @@ class OneShotChannel(Channel):
         from ..protocol import driver
 
         source = driver.build(fn, args, kwargs)
-        stdout = self.runner(source, timeout)
+        stdout = self._run(source, timeout)
         logs, value = protocol.parse(stdout, runtime_key=self.name)
         return value, logs
+
+
+def _child_source(python: str, source: str) -> str:
+    """Wrap a program so it runs as a child of ``python``, its output passed through."""
+    return (
+        "import subprocess as _letify_s, sys as _letify_y\n"
+        f"_letify_r = _letify_s.run([{python!r}, '-c', {source!r}],"
+        " capture_output=True, text=True)\n"
+        "_letify_y.stdout.write(_letify_r.stdout)\n"
+        "_letify_y.stderr.write(_letify_r.stderr)\n"
+        "_letify_y.stdout.flush()\n"
+    )
+
+
+def _eval_source(source: str) -> str:
+    """Append the line that prints ``__letify_value__`` behind the eval marker."""
+    return (
+        f"{source}\n"
+        "import base64 as _letify_b, pickle as _letify_p\n"
+        f"print({EVAL_MARKER!r} + _letify_b.b64encode("
+        "_letify_p.dumps(globals().get('__letify_value__'), protocol=4)).decode(), flush=True)\n"
+    )
+
+
+def _parse_eval(stdout: str, name: str) -> tuple[Any, str]:
+    import base64
+    import pickle
+
+    logs: list[str] = []
+    found = None
+    for line in stdout.splitlines(keepends=True):
+        if line.startswith(EVAL_MARKER):
+            found = line[len(EVAL_MARKER) :].strip()
+        else:
+            logs.append(line)
+    if found is None:
+        raise ProtocolError(
+            f"{name}: the program ended without reporting its value, so it failed or died."
+            f"\n--- last remote output ---\n{stdout[-2000:]}"
+        )
+    return pickle.loads(base64.b64decode(found)), "".join(logs)
 
 
 def _lease_source(grace: float) -> str:

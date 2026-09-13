@@ -36,7 +36,13 @@ def decode_reply(line: str) -> dict[str, Any]:
 
 
 def is_ready(line: str) -> bool:
-    return line.strip() == READY
+    return line.strip().split(" ", 1)[0] == READY
+
+
+def ready_version(line: str) -> str | None:
+    """The interpreter major.minor a ready line names, or None when it names none."""
+    marker, _, version = line.strip().partition(" ")
+    return version.strip() or None if marker == READY else None
 
 
 __all__ = [
@@ -47,4 +53,5 @@ __all__ = [
     "encode_request",
     "is_ready",
     "is_reply",
+    "ready_version",
 ]

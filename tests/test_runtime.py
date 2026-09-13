@@ -10,6 +10,8 @@ Spec sections pinned here: "Channels", "Call protocol", "Failure and retry", "Se
 
 from __future__ import annotations
 
+import shutil
+import subprocess
 import sys
 import threading
 import time
@@ -42,6 +44,11 @@ def channel():
     opened = PersistentChannel([sys.executable, "-u", "-c", BOOTSTRAP], name="test-runtime")
     yield opened
     opened.close()
+
+
+def remote_projects() -> Path:
+    """Where PreparingLocal keeps its project directories, under the default workspace root."""
+    return Path(bootstrap.DEFAULT_WORKSPACE_ROOT) / "project"
 
 
 @pytest.fixture
@@ -280,30 +287,35 @@ def test_a_directory_inside_a_runtime_can_be_packed_in_one_payload(let, remote_c
     let.pool.shutdown()
 
 
-def test_a_prebuilt_environment_archive_is_unpacked_instead_of_being_installed(
-    tmp_path: Path,
+def test_a_synced_environment_is_archived_and_the_next_session_restores_it_instead_of_syncing(
+    uv_project: Path, tmp_path: Path
 ) -> None:
-    # Spec "Blob granularity" and "Materializing into a runtime": the first session pays
-    # the installation and every later one unpacks one blob at the mount.
+    # Spec "Materializing into a runtime": the first session that syncs packs its project
+    # directory into its first volume, and a later session with the same key and platform
+    # unpacks that archive instead of running uv sync.
     provider = provider_of(PreparingLocal, "lab")
-    env = Env(lock=str(tmp_path / "absent.lock"))
-    installed = tmp_path / "site"
-    installed.mkdir()
-    (installed / "marker.txt").write_text("cached", encoding="utf-8")
-
-    mount = tmp_path / "mount"
     volume = provider.volume(
-        "cache", backend="filesystem", root=str(tmp_path / "store"), mount=str(mount)
+        "cache", backend="filesystem", root=str(tmp_path / "store"), mount=str(tmp_path / "mount")
     )
-    volume.cache_env(env, installed)
-    assert volume.cached_env(env)
-
+    env = Env()
     instance = Instance(provider, gpu=None)._placed("remote")
-    runtime = provider.start(instance, env, name="lab-1", volumes=(volume,))
+
+    first = provider.start(instance, env, name="lab-1", volumes=(volume,))
     try:
-        assert (mount / "site" / "marker.txt").read_text(encoding="utf-8") == "cached"
+        assert first.env_source == "sync"
+        platform = first.platform
     finally:
-        runtime.shutdown()
+        first.shutdown()
+    assert volume.cached_env(env, platform)
+
+    shutil.rmtree(remote_projects())
+    second = provider.start(instance, env, name="lab-2", volumes=(volume,))
+    try:
+        assert second.env_source == "archive"
+        executable, _version, _letify = second.call(reports_interpreter(), (), {})[0]
+        assert Path(executable).parent == remote_projects() / env.key / ".venv" / "bin"
+    finally:
+        second.shutdown()
 
 
 def test_a_runtime_boots_its_channel_then_arms_its_lease(tmp_path: Path) -> None:
@@ -323,30 +335,28 @@ def test_a_runtime_boots_its_channel_then_arms_its_lease(tmp_path: Path) -> None
     assert runtime.lease is None
 
 
-def test_a_volume_with_no_cached_archive_is_passed_over(tmp_path: Path) -> None:
-    # Spec "Blob granularity": the archive is keyed by the environment, so a volume that
-    # does not hold this one is not the place to look.
+def test_a_volume_with_no_cached_archive_is_passed_over(uv_project: Path, tmp_path: Path) -> None:
+    # Spec "Blob granularity": the archive is keyed by the environment and the platform, so
+    # a volume that does not hold this one is not the place to look.
     provider = provider_of(PreparingLocal, "lab")
-    env = Env(lock=str(tmp_path / "absent.lock"))
-    installed = tmp_path / "site"
-    installed.mkdir()
-    (installed / "marker.txt").write_text("cached", encoding="utf-8")
-
-    empty = Volume(
-        provider, "empty", {"backend": "filesystem", "root": str(tmp_path / "empty-store")}
-    )
-    mount = tmp_path / "mount"
+    env = Env()
+    instance = Instance(provider, gpu=None)._placed("remote")
     stocked = Volume(
         provider,
         "stocked",
-        {"backend": "filesystem", "root": str(tmp_path / "store"), "mount": str(mount)},
+        {"backend": "filesystem", "root": str(tmp_path / "store"), "mount": str(tmp_path / "m")},
     )
-    stocked.cache_env(env, installed)
+    provider.start(instance, env, name="lab-1", volumes=(stocked,)).shutdown()
 
-    instance = Instance(provider, gpu=None)._placed("remote")
-    runtime = provider.start(instance, env, name="lab-1", volumes=(empty, stocked))
+    empty = Volume(
+        provider,
+        "empty",
+        {"backend": "filesystem", "root": str(tmp_path / "empty-store"), "mount": str(tmp_path)},
+    )
+    shutil.rmtree(remote_projects())
+    runtime = provider.start(instance, env, name="lab-2", volumes=(empty, stocked))
     try:
-        assert (mount / "site" / "marker.txt").read_text(encoding="utf-8") == "cached"
+        assert runtime.env_source == "archive"
     finally:
         runtime.shutdown()
 
@@ -377,26 +387,289 @@ def test_a_worker_whose_pipe_is_gone_is_reported_lost(channel) -> None:
         channel.request({"op": "stat"})
 
 
-# -- Spec: Environment, the source that prepares a runtime ---------------------
+# -- Spec: Building the environment on a runtime -------------------------------
+
+LOCAL_PYTHON = f"{sys.version_info[0]}.{sys.version_info[1]}"
+OTHER_PYTHON = "3.11" if LOCAL_PYTHON != "3.11" else "3.12"
 
 
-def test_the_install_source_uses_uv_and_carries_the_declared_refinements() -> None:
-    # uv rather than pip because a uv lock file resolves for every platform, which is
-    # what lets one lock file drive a Linux runtime from a Windows client.
-    source = bootstrap.install_source(
-        Env().pip_install("torch").run("nvidia-smi").vars(HF_HOME="/opt/cache")
-    )
-    compile(source, "<install>", "exec")
-    assert "'uv', 'pip', 'install'" in source
+def reports_interpreter():
+    """A body that reports the interpreter running it and where letify was imported from."""
+
+    def body() -> tuple[str, str, str]:
+        import sys
+
+        import letify
+
+        return sys.executable, f"{sys.version_info[0]}.{sys.version_info[1]}", letify.__file__
+
+    return body
+
+
+def remote_instance(provider) -> Instance:
+    return Instance(provider, gpu=None)._placed("remote")
+
+
+def test_a_default_env_is_synced_with_uv_and_the_worker_runs_from_the_project_venv(
+    uv_project: Path,
+) -> None:
+    # A default Env() takes the same path as any other: uv sync into the project .venv,
+    # then the worker moves to that .venv's Python, where letify is importable.
+    provider = provider_of(PreparingLocal, "lab")
+    env = Env()
+    runtime = provider.start(remote_instance(provider), env, name="lab-1")
+    try:
+        executable, version, imported = runtime.call(reports_interpreter(), (), {})[0]
+        venv = remote_projects() / env.key / ".venv"
+        assert Path(executable).parent == venv / "bin"
+        assert version == LOCAL_PYTHON
+        assert Path(imported).is_relative_to(venv)
+        assert runtime.env_source == "sync"
+        assert runtime.channel.python_version == LOCAL_PYTHON
+    finally:
+        runtime.shutdown()
+
+
+def test_the_sync_is_frozen_skips_the_project_and_always_names_the_local_python(
+    uv_project: Path,
+) -> None:
+    # Spec "Interpreter version": --python is passed with or without .python-version.
+    expected = ["uv", "sync", "--frozen", "--no-install-project", "--python", LOCAL_PYTHON]
+    assert bootstrap.sync_command(Env()) == expected
+    assert sorted(bootstrap.project_files(Env())) == ["pyproject.toml", "uv.lock"]
+
+    (uv_project / ".python-version").write_text(LOCAL_PYTHON + "\n", encoding="utf-8")
+    assert bootstrap.sync_command(Env()) == expected
+    assert sorted(bootstrap.project_files(Env())) == [
+        ".python-version",
+        "pyproject.toml",
+        "uv.lock",
+    ]
+
+
+def test_the_workspace_root_is_a_per_user_directory_that_needs_no_root() -> None:
+    from letify.providers.colab import Colab
+    from letify.providers.modal import Modal
+    from letify.providers.shell import Shell
+
+    for kind in (Shell, Colab, Modal):
+        assert provider_of(kind, "lab", address="gpu.example").workspace_root == "~/.letify"
+
+
+def test_modal_builds_the_project_environment_like_every_remote_runtime() -> None:
+    # Spec "Building the environment on a runtime": a Modal sandbox syncs the project .venv
+    # too, because nothing in its image carries letify.
+    from letify.providers.modal import Modal
+
+    modal = provider_of(Modal, "lab")
+    assert modal.prepares_env is True
+    assert modal.managed_python is None
+
+
+def test_every_remote_path_derives_from_the_provider_workspace_root(uv_project: Path) -> None:
+    provider = provider_of(PreparingLocal, "lab")
+    assert provider.workspace_root == bootstrap.DEFAULT_WORKSPACE_ROOT
+    env = Env()
+    assert bootstrap.project_dir(provider.workspace_root, env) == f"{remote_projects()}/{env.key}"
+
+
+def test_an_env_records_the_local_interpreter_version() -> None:
+    assert Env().python == LOCAL_PYTHON
+
+
+def test_the_sync_source_carries_the_declared_refinements(uv_project: Path) -> None:
+    env = Env().pip_install("torch").run("nvidia-smi").vars(HF_HOME="/opt/cache")
+    source = bootstrap.sync_source(env, bootstrap.project_files(env))
+    compile(source, "<sync>", "exec")
     assert "'torch'" in source
     assert "'nvidia-smi'" in source
-    assert "os.environ['HF_HOME'] = '/opt/cache'" in source
+    assert "'HF_HOME': '/opt/cache'" in source
+    assert "'--system'" not in source
 
 
-def test_syncing_from_a_lock_file_already_in_the_runtime_is_frozen() -> None:
-    source = bootstrap.sync_lock_source(Env(), "/opt/project")
-    compile(source, "<sync>", "exec")
-    assert "'uv', 'sync', '--frozen', '--project', '/opt/project'" in source
+@pytest.mark.parametrize("declared", ["python-version", "env"])
+def test_a_python_other_than_the_local_one_is_refused_before_a_session_starts(
+    uv_project: Path, monkeypatch, declared: str
+) -> None:
+    provider = provider_of(PreparingLocal, "lab")
+    created: list[object] = []
+    monkeypatch.setattr(provider, "create_session", lambda *args: created.append(args))
+    if declared == "python-version":
+        (uv_project / ".python-version").write_text(OTHER_PYTHON + ".4\n", encoding="utf-8")
+        env = Env()
+    else:
+        env = Env(python=OTHER_PYTHON)
+
+    with pytest.raises(letify.InterpreterMismatch) as caught:
+        provider.start(remote_instance(provider), env, name="lab-1")
+    assert OTHER_PYTHON in str(caught.value)
+    assert LOCAL_PYTHON in str(caught.value)
+    assert created == []
+
+
+def test_a_project_without_a_lock_file_is_refused_before_a_session_starts(
+    tmp_path: Path, monkeypatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "pyproject.toml").write_text("[project]\nname = 'x'\n", encoding="utf-8")
+    provider = provider_of(PreparingLocal, "lab")
+    with pytest.raises(letify.ConfigError, match="uv lock"):
+        provider.start(remote_instance(provider), Env(), name="lab-1")
+
+
+# -- Spec: uv on the runtime ---------------------------------------------------
+
+
+def run_without_uv(source: str, home: Path) -> subprocess.CompletedProcess[str]:
+    """Run bootstrap source in a fresh interpreter whose PATH and home hold no uv."""
+    return subprocess.run(
+        [sys.executable, "-c", source],
+        env={"HOME": str(home), "PATH": "/usr/bin:/bin"},
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+
+
+def test_the_default_installer_is_the_official_standalone_script_over_https() -> None:
+    assert bootstrap.UV_INSTALLER == "https://astral.sh/uv/install.sh"
+
+
+def test_a_runtime_without_uv_installs_it_under_home_and_then_syncs(
+    uv_project: Path, tmp_path: Path
+) -> None:
+    home = tmp_path / "home"
+    record = tmp_path / "uv-arguments"
+    installer = tmp_path / "install.sh"
+    # Stands in for the standalone installer: it writes a uv into UV_INSTALL_DIR, and that
+    # uv records its arguments and makes the .venv the worker expects.
+    installer.write_text(
+        'test "$UV_NO_MODIFY_PATH" = 1 || exit 9\n'
+        'mkdir -p "$UV_INSTALL_DIR"\n'
+        "cat > \"$UV_INSTALL_DIR/uv\" <<'EOF'\n"
+        "#!/bin/sh\n"
+        f'echo "$@" > {record}\n'
+        f"{sys.executable} -m venv --without-pip .venv\n"
+        "EOF\n"
+        'chmod +x "$UV_INSTALL_DIR/uv"\n',
+        encoding="utf-8",
+    )
+    source = bootstrap.sync_source(
+        Env(), bootstrap.project_files(Env()), installer=installer.as_uri()
+    )
+    result = run_without_uv(source, home)
+    assert result.returncode == 0, result.stderr
+    assert (home / ".local" / "bin" / "uv").is_file()
+    assert record.read_text(encoding="utf-8").split() == [
+        "sync",
+        "--frozen",
+        "--no-install-project",
+        "--python",
+        LOCAL_PYTHON,
+    ]
+
+
+def test_a_failed_uv_install_is_named(uv_project: Path, tmp_path: Path) -> None:
+    installer = tmp_path / "install.sh"
+    installer.write_text("exit 3\n", encoding="utf-8")
+    source = bootstrap.sync_source(
+        Env(), bootstrap.project_files(Env()), installer=installer.as_uri()
+    )
+    result = run_without_uv(source, tmp_path / "home")
+    assert result.returncode != 0
+    assert "uv could not be installed" in result.stderr
+
+
+def test_a_failed_sync_raises_environment_failure_naming_uv_sync(
+    uv_project: Path, tmp_path: Path
+) -> None:
+    # A lock file that names a package no index has makes the real uv fail.
+    (uv_project / "uv.lock").write_text("version = 1\nnot a lock\n", encoding="utf-8")
+    provider = provider_of(PreparingLocal, "lab")
+    with pytest.raises(letify.EnvironmentFailure, match="uv sync failed"):
+        provider.start(remote_instance(provider), Env(), name="lab-1")
+
+
+# -- Spec: Materializing into a runtime, the archive key -----------------------
+
+
+def test_the_environment_archive_is_keyed_by_env_key_python_version_and_platform(
+    tmp_path: Path,
+) -> None:
+    volume = provider_of(PreparingLocal, "lab").volume(
+        "cache", backend="filesystem", root=str(tmp_path / "store")
+    )
+    env = Env()
+    assert volume.env_ref(env, "linux-x86_64") == f"env/{env.key}-linux-x86_64"
+    assert Env(python="3.11").key != Env(python="3.12").key
+
+
+# -- Spec: Interpreter check and Interpreter override --------------------------
+
+
+def test_the_ready_line_carries_the_worker_python_version(channel) -> None:
+    channel.start()
+    assert channel.python_version == LOCAL_PYTHON
+
+
+def test_a_worker_on_another_python_version_fails_the_start_naming_both(
+    tmp_path: Path, monkeypatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(bootstrap, "local_python", lambda: "3.99")
+    provider = provider_of(PreparingLocal, "lab", python=sys.executable)
+    with pytest.raises(letify.InterpreterMismatch) as caught:
+        provider.start(remote_instance(provider), Env(), name="lab-1")
+    assert "3.99" in str(caught.value)
+    assert LOCAL_PYTHON in str(caught.value)
+
+
+def test_an_account_python_runs_the_worker_on_that_interpreter_without_syncing(
+    tmp_path: Path, monkeypatch
+) -> None:
+    # No pyproject.toml or uv.lock here, so a sync could not have run.
+    monkeypatch.chdir(tmp_path)
+    provider = provider_of(PreparingLocal, "lab", python=sys.executable)
+    runtime = provider.start(remote_instance(provider), Env(), name="lab-1")
+    try:
+        assert runtime.stat()["executable"] == sys.executable
+        assert runtime.env_source is None
+    finally:
+        runtime.shutdown()
+
+
+def test_a_shell_account_python_is_the_worker_interpreter_and_marks_it_user_managed() -> None:
+    from letify.providers.shell import Shell
+
+    plain = provider_of(Shell, "lab", address="gpu.example")
+    assert plain.remote_python == "python3"
+    assert plain.managed_python is None
+    managed = provider_of(Shell, "lab", address="gpu.example", python="/opt/py/bin/python")
+    assert managed.remote_python == "/opt/py/bin/python"
+    assert managed.managed_python == "/opt/py/bin/python"
+
+
+def test_a_one_shot_channel_moved_to_the_venv_runs_each_program_with_that_python(
+    tmp_path: Path,
+) -> None:
+    # What colab exec offers: one program per request. After the move every program runs as
+    # a child of the given interpreter, which a symlinked name makes visible.
+    link = tmp_path / "bin" / "python"
+    link.parent.mkdir()
+    link.symlink_to(sys.executable)
+    record: list[str] = []
+    channel = OneShotChannel(local_one_shot_runner(record), name="colab-1")
+    channel.switch_interpreter(str(link))
+    assert channel.python_version == LOCAL_PYTHON
+    value, _logs = channel.request(
+        {"op": "eval", "source": "import sys\n__letify_value__ = sys.executable\n"}
+    )
+    assert value == str(link)
+    assert repr(str(link)) in record[-1]
+
+
+def test_the_local_provider_still_runs_in_the_local_environment(let) -> None:
+    assert let.providers.local.prepares_env is False
 
 
 def test_a_cached_environment_archive_lands_in_the_content_addressed_layout() -> None:
