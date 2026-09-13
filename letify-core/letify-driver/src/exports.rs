@@ -248,9 +248,8 @@ pub extern "C" fn cuModuleLoadData(module: *mut u64, image: *const c_void) -> CU
     if module.is_null() || image.is_null() {
         return CUDA_ERROR_INVALID_VALUE;
     }
-    // A fatbin has no length argument here, so its size comes from its own header. Until
-    // that parsing is in, a conservative window is copied and the agent trims it.
-    let payload = unsafe { std::slice::from_raw_parts(image as *const u8, 4096) }.to_vec();
+    // There is no length argument here, so the size comes from the image itself.
+    let payload = unsafe { crate::image::module_image(image as *const u8) }.to_vec();
     let digest = letify_wire::digest(&payload);
     with_client!(|connection| {
         match connection.request(Request::LoadModule { digest, payload }) {
