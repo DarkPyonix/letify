@@ -319,16 +319,17 @@ letify never falls back to local execution or to a slower mode when the declared
 
 Everything above a runtime is declaration. Creating one is when a provider actually powers something on; shutting it down is when the charge stops.
 
-A runtime boots in six steps:
+A runtime boots in seven steps:
 
 1. Open the channel. The worker starts on the bootstrap interpreter: the account's `python` option, `python3` by default.
 2. Arm the lease.
-3. Build the environment: restore the environment archive, or run `uv sync` in the project directory, as Environment describes.
-4. Move the worker to `<project directory>/.venv/bin/python`.
-5. Check the worker's interpreter version against the local one.
-6. Attach volumes.
+3. Prepare the workspace root, as Workspace root describes: expand `~` on the runtime, create the directory, make it the worker's working directory, and point `TMPDIR` at `<workspace root>/tmp`.
+4. Build the environment: restore the environment archive, or run `uv sync` in the project directory, as Environment describes.
+5. Move the worker to `<project directory>/.venv/bin/python`.
+6. Check the worker's interpreter version against the local one.
+7. Attach volumes.
 
-Steps 3 to 5 are skipped on the local provider, which already runs in the project's environment. Steps 3 and 4 are skipped when the account sets `python`, which means the user manages the interpreter on that machine. Step 5 still runs then.
+Step 3 is skipped on the local provider, whose worker keeps the working directory of the process that started it. Steps 4 to 6 are skipped on the local provider, which already runs in the project's environment. Steps 4 and 5 are skipped when the account sets `python`, which means the user manages the interpreter on that machine. Step 6 still runs then.
 
 ### Pooling
 
@@ -419,11 +420,13 @@ The local machine writes to the backend directly as well. It does not relay thro
 
 No credential is stored on the remote side. For each materialization the local process derives a short-lived access token from its own login, scoped to reading the volume's prefix where the backend supports scoping, and sends it over the channel. The worker keeps it in memory only, never on disk or in the environment of user code, and drops it when the pull finishes. A backend that has no network path from the runtime, such as `filesystem` on a machine the local process can reach but the runtime cannot, falls back to writing through the channel.
 
-A backend offers a pull by answering with a URL and the request headers that read one blob. The local process sends them in one `pull` request naming the destination path and whether to unpack at the mount. The worker streams the response to the path, unpacks it when asked, and discards the request, headers included, before it reads the next one. `gcs` offers a pull. `filesystem` and `modal` do not, so they write through the channel. A one-shot channel has no worker to pull, so it writes through the channel as well.
+A backend offers a pull by answering with a URL and the request headers that read one blob. The local process sends them in one `pull` request naming the destination path and whether to unpack it in the volume directory. The worker streams the response to the path, unpacks it when asked, and discards the request, headers included, before it reads the next one. `gcs` offers a pull. `filesystem` and `modal` do not, so they write through the channel. A one-shot channel has no worker to pull, so it writes through the channel as well.
 
 The `gcs` read token is downscoped with a Credential Access Boundary: the local token is exchanged at `https://sts.googleapis.com/v1/token` for one that holds `roles/storage.objectViewer` on the volume's bucket only, with an availability condition restricting it to object names under the volume's prefix. A volume option `sts_endpoint` points the exchange elsewhere. A failed exchange raises `RuntimeFailure` rather than sending the unscoped token.
 
-The environment archive is automatic. The first session that runs `uv sync` for an environment packs its project directory, `.venv` included, into its first volume under `env/<env key>-<platform>`. `<platform>` is the runtime's `sys.platform` and `platform.machine()` joined by a hyphen, for example `linux-x86_64`, and the env key includes the interpreter's major.minor version. Every later session on the provider with the same key and platform pulls that archive and unpacks it at `<workspace root>/project` instead of syncing. A restored `.venv/bin/python` that does not start is treated as no archive, and the session syncs. Nothing in the public surface names this step.
+The environment archive is automatic. The first session that runs `uv sync` for an environment packs its project directory, `.venv` included, into its first volume under `env/<env key>-<platform>`. `<platform>` is the runtime's `sys.platform` and `platform.machine()` joined by a hyphen, for example `linux-x86_64`, and the env key includes the interpreter's major.minor version. Every later session on the provider with the same key and platform pulls that archive and unpacks it at `<workspace root>/project` instead of syncing.
+
+A volume's files on a runtime live in its volume directory, `<workspace root>/volumes/<volume name>`. A blob materialized without a named destination is written to `<volume directory>/blobs/<first two hex characters>/<digest>`. The volume option `mount` names another directory for one volume; nothing else sets it. A restored `.venv/bin/python` that does not start is treated as no archive, and the session syncs. Nothing in the public surface names this step.
 
 Nothing hands a session to the caller. There is no call that returns one, no argument that takes one, and no way to hold the wrong one, because which session serves a call is the pool's answer to work out from the declaration.
 
@@ -437,7 +440,7 @@ A path is project data when it exists on the local machine at call time, as a fi
 
 1. The local contents are packed into content addressed blobs, large files as their own blobs and trees of small files as one archive, and only the digests the volume is missing are uploaded, directly to the backend.
 2. The ref `path/<path key>` records the manifest, where the path key is the digest of the path resolved against the project root.
-3. In the pickled call, the path is replaced by the path the runtime materializes it at, under the mount, so the function body uses it unchanged.
+3. In the pickled call, the path is replaced by the path the runtime materializes it at, under the volume directory, so the function body uses it unchanged.
 4. Before the call runs, the runtime pulls the manifest's blobs straight from the backend, as Materializing into a runtime describes.
 
 A path that does not exist locally is an output location. It is created empty in the runtime and replaced the same way.
@@ -490,7 +493,7 @@ A uv lock file resolves for every platform uv supports, so one lock file drives 
 This applies to every provider except `local`: `shell`, `tunnel`, `colab`, `elice` and `modal`. A Modal sandbox image carries only what starts the bootstrap worker, so letify reaches the sandbox through the sync like every other package.
 
 1. The local side reads `pyproject.toml` and `uv.lock` from the project directory, and `.python-version` when it exists. A missing `pyproject.toml` or `uv.lock` raises `ConfigError` naming the file and `uv lock`, before anything runs on the runtime.
-2. The worker writes them into the runtime's project directory, `<workspace root>/project/<env key>`. The workspace root is the provider's `workspace_root`, the one place every path letify writes on the runtime derives from. It is `~/.letify` for every provider, with `~` expanded on the runtime, so it needs no root.
+2. The worker writes them into the runtime's project directory, `<workspace root>/project/<env key>`. The workspace root is the provider's `workspace_root`, the one place every path letify writes on the runtime derives from, as Workspace root describes.
 3. The worker runs `uv sync --frozen --no-install-project --python <major>.<minor>` in that directory, with the version `Env` records, as Interpreter version describes. uv creates `.venv` there, and downloads the interpreter when the runtime has none that matches.
 4. Packages from `Env.pip_install` are installed with `uv pip install --python <project directory>/.venv/bin/python <packages>`. Commands from `Env.run` run through the shell with `<project directory>/.venv/bin` first on `PATH` and `VIRTUAL_ENV` set to the `.venv`. Variables from `Env.vars` are set in the worker's environment before the sync, so they reach every later step and user code.
 5. The worker moves to `<project directory>/.venv/bin/python`, as Channels describes. On a one-shot channel every later program runs as `<project directory>/.venv/bin/python -c <program>`, a child of the provider's command, with its standard output passed through.
@@ -645,7 +648,7 @@ The fallback sends calls with `colab exec` and bulk data through the Jupyter con
 
 The proxy URL and token are the session's `url` and `token` in `.config/colab-cli/sessions.json` under the account directory, where the Colab CLI records them when `colab new` creates the session. A session that file does not name raises `RuntimeFailure` naming the file. Every request carries the token as the `colab-runtime-proxy-token` query parameter and the `X-Colab-Runtime-Proxy-Token` header, with `authuser=0`, as the CLI does.
 
-An upload of a file to `<path>` sends parts of 32 MiB, eight at a time, each to `<path>.letify-part-<n>`. Eight is the most parallel parts [measured](NETWORK.md#colabs-own-paths), and it was the fastest in both directions. A part is sent as base64 chunks of 8 MiB: chunk `1` creates the file, later chunks append, and the last chunk of a part of more than one chunk is numbered `-1`. One `colab exec` program then joins the parts into `<path>` in order, removes them, and unpacks the archive when the request asks for it. A download reads the file's size from the contents model with `content=0`, then reads `/files/<path>` with `Range` requests of 32 MiB, eight at a time. `put_file`, `get_file` and `pack_dir` on the fallback channel use this path; `pack_dir` packs into a temporary file with `colab exec` first. Any other status than 2xx raises `RuntimeFailure` naming the path and the status.
+An upload of a file to `<path>` sends parts of 32 MiB, eight at a time, each to `<path>.letify-part-<n>`. Eight is the most parallel parts [measured](NETWORK.md#colabs-own-paths), and it was the fastest in both directions. A part is sent as base64 chunks of 8 MiB: chunk `1` creates the file, later chunks append, and the last chunk of a part of more than one chunk is numbered `-1`. One `colab exec` program then joins the parts into `<path>` in order, removes them, and unpacks the archive when the request asks for it. A download reads the file's size from the contents model with `content=0`, then reads `/files/<path>` with `Range` requests of 32 MiB, eight at a time. `put_file`, `get_file` and `pack_dir` on the fallback channel use this path; `pack_dir` packs into a temporary file under `<workspace root>/tmp` with `colab exec` first. Any other status than 2xx raises `RuntimeFailure` naming the path and the status.
 
 ## Configuration
 
@@ -700,6 +703,7 @@ address = "gpu.lab.example.edu"
 user = "researcher"
 key = "~/.ssh/id_ed25519"
 persistent = true
+workspace = "/workspace/researcher/letify"   # this server allows writes under /workspace only
 
 # Eight cards in the box, four of them ours. letify takes only those of these four that are
 # actually free when a session starts, so a card a colleague is computing on is skipped.
@@ -714,6 +718,36 @@ access_token_env = "ELICE_ACCESS_TOKEN"
 ```
 
 The older `gpus = ["A100", "H100"]` list still works and means one of each, with letify choosing no indices. `devices` is what an entry uses once a count or an index range matters.
+
+### Workspace root <!-- id: workspace-root -->
+
+> Everything letify writes on a remote machine lives under one directory per account, the workspace root. An account sets it with `workspace`; otherwise its kind decides.
+
+A machine sets rules on where an account may write. A department GPU server may allow writes only under `/workspace`, a Modal sandbox loses its disk when it ends while a Modal volume persists, and a Colab VM is discarded after the session. So the root is a property of one account on one machine.
+
+`workspace = "<path>"` is set on an account entry in `~/.letify/config.toml`. The path starts with `/` or `~`, and `~` is expanded on the runtime, not on the local machine. Any other value raises `ConfigError` naming the account. A `workspace` field in a project `.letify/config.toml` raises `ConfigError` saying that it belongs in the home file, because a repository cannot know the rules of each machine its users reach.
+
+When `workspace` is not set, the root is:
+
+| Kind | Workspace root |
+|---|---|
+| `shell`, `tunnel`, `elice` | `~/.letify-runtime` |
+| `colab` | `/content/letify` |
+| `modal` | `/letify`, where a Modal volume named `<app>-workspace` is mounted in every sandbox, so the root persists across sandboxes |
+| `local` | not used. A volume materialized on `local` without `mount` lands under `~/.letify-runtime` on this machine |
+
+A `modal` account with `workspace` set mounts the same volume at that path instead, when the path starts with `/`.
+
+Everything letify writes on the runtime is under the root:
+
+| Path | Holds |
+|---|---|
+| `<workspace root>/project/<env key>` | the project files `uv sync` reads, and the `.venv` it builds |
+| `<workspace root>/project/.<digest>.tar.gz` | an environment archive while it is unpacked, removed once the `.venv` starts |
+| `<workspace root>/volumes/<volume name>` | a volume's materialized blobs and project data |
+| `<workspace root>/tmp` | temporary files, including the archive `pack_dir` builds on a one-shot channel; `TMPDIR` points here |
+
+The worker's working directory is the root, so a relative path in user code resolves under it. The uv installer is the one exception to the root: uv goes to `~/.local/bin`, as uv on the runtime describes, because it is shared by every account on that home directory.
 
 ### Generated provider types
 
@@ -737,6 +771,12 @@ The file is rewritten only when its content would change, so loading the configu
 
 `~/.letify/config.toml` gets the account: the address, the user, the key path, the zone, whatever that kind of provider needs to connect. It belongs to the machine and is never in a repository, so it is where a connection detail may live. A credential the login collects goes to `~/.letify/accounts/<alias>/`, created with owner only permissions where the platform has them.
 
+Every kind except `local` takes `--workspace PATH`, which writes `workspace` to the account. `letify login shell` and `letify login tunnel` also ask for it, after the BatchMode key check and before devices are detected, with the kind's default in brackets: `Workspace root on <address> [~/.letify-runtime]: `. A blank answer, or `--no-input` without `--workspace`, takes the default and writes no field. The chosen path is then checked over the same BatchMode SSH options: `mkdir -p` on the path, then a write and removal of the probe file `<path>/.letify-probe`, as the account's own user, so a path that needs root fails. A failure writes nothing to either file and raises `LoginError` naming the path, the machine and the error the command printed. A password account has no BatchMode connection, so its workspace is recorded without the check. `colab`, `modal` and `elice` record `--workspace` without a remote check, because there is no machine to reach at login.
+
+An account that is already in the home file is checked again only when `--workspace` is given. The check then runs with the connection details the home file holds, and the field is written when it passes.
+
+`letify check <alias>` on a `shell`, `tunnel`, `colab` or `elice` account runs the same probe on the account's workspace root in the command that confirms the machine answers, and prints `workspace <path>: writable` or `workspace <path>: not writable: <error>`.
+
 The project's `.letify/config.toml` gets the alias as an empty table, `[colab_pro]`. Nothing else, because everything else is either a secret or a detail of one person's machine, and naming the alias is what makes the account available in the project. That table is what makes the repository self describing: a teammate who clones it can run `letify login` for the aliases it names and nothing else has to be explained. A named alias the home file does not declare is a configuration error naming the command that fixes it.
 
 An account that is already in the home file is not asked for again. `letify login lab` in a second repository writes only the reference, which is the common case: the account was set up once and every project since then just needs to name it.
@@ -745,7 +785,7 @@ An account that is already in the home file is not asked for again. `letify logi
 
 `letify login colab <alias>` signs in to Colab itself. It runs `colab sessions` through `uv tool run --python 3.13 --from google-colab-cli colab`, with `HOME` set to `~/.letify/accounts/<alias>/`. The Colab CLI keeps its token at a fixed path under its home directory, so the token lands in the account directory and the CLI refreshes it on later calls. Every later Colab command runs with the same `HOME`, which is what lets two Colab accounts live on one machine. uv's cache, Python installs and tools stay pinned to the real home, so a changed `HOME` downloads nothing again. A sign in that exits non zero writes nothing.
 
-`letify login modal <alias>` signs in to Modal itself. It first asks for an optional workspace. It then runs `modal token new` through `uv tool run --python 3.12 --with "modal>=1.0,<2" --from modal modal`, with `MODAL_CONFIG_PATH` set to `~/.letify/accounts/<alias>/modal.toml` and, when a workspace was given, `--profile <workspace>`. Modal's command prints a link and waits for the browser approval, so `modal` never has to be on `PATH` or in the project's environment. The token lands in the account directory, and the adapter reads it from there. A sign in that exits non zero, or exits zero without writing `modal.toml`, writes nothing to either `config.toml` and removes a `modal.toml` the attempt created.
+`letify login modal <alias>` signs in to Modal itself. It first asks for an optional Modal profile, which names the Modal workspace to sign in to. It then runs `modal token new` through `uv tool run --python 3.12 --with "modal>=1.0,<2" --from modal modal`, with `MODAL_CONFIG_PATH` set to `~/.letify/accounts/<alias>/modal.toml` and, when a profile was given, `--profile <profile>`. The profile is written as `profile`, because `workspace` is the workspace root. Modal's command prints a link and waits for the browser approval, so `modal` never has to be on `PATH` or in the project's environment. The token lands in the account directory, and the adapter reads it from there. A sign in that exits non zero, or exits zero without writing `modal.toml`, writes nothing to either `config.toml` and removes a `modal.toml` the attempt created.
 
 Credentials never enter either `config.toml`. A token goes to a file in the account directory. An SSH password is never stored at all, which the next section explains.
 
@@ -788,10 +828,10 @@ Two other approaches were considered and are not the default. Connection multipl
 
 | Kind | Written to the home file | Credential |
 |---|---|---|
-| `shell`, `tunnel` | address, user, port, key path, and the `devices` table the machine reported | an SSH key, installed by `login`; no password stored |
-| `elice` | endpoint, zone, machine | access token in `~/.letify/accounts/<alias>/access_token` |
-| `colab` | account email | the Colab CLI's token, written by its own sign in under `~/.letify/accounts/<alias>/` |
-| `modal` | workspace, when given | Modal's token, written by `modal token new` to `~/.letify/accounts/<alias>/modal.toml` |
+| `shell`, `tunnel` | address, user, port, key path, `workspace` when it is not the default, and the `devices` table the machine reported | an SSH key, installed by `login`; no password stored |
+| `elice` | endpoint, zone, machine, `workspace` when given | access token in `~/.letify/accounts/<alias>/access_token` |
+| `colab` | account email, `workspace` when given | the Colab CLI's token, written by its own sign in under `~/.letify/accounts/<alias>/` |
+| `modal` | `profile` and `workspace`, each when given | Modal's token, written by `modal token new` to `~/.letify/accounts/<alias>/modal.toml` |
 | `local` | nothing | none; this machine needs no declaration |
 
 For `colab` and `modal`, letify runs the vendor's sign in through uv and does not parse or refresh the token. The vendor's client reads and refreshes it from the account directory.
