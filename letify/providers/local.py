@@ -87,16 +87,21 @@ class Local(Provider):
         return super().refresh()
 
     def busy(self) -> tuple[int, ...]:
-        """Ask this machine which cards another process is computing on.
+        """Ask this machine which cards another user is computing on.
 
         Excluding this process, because a session asking for a second card must not see its
-        own first one as taken.
+        own first one as taken. The login user is the current user, the one running letify.
         """
         import os
 
         from ..runtime import telemetry
 
-        return telemetry.busy_indices(exclude_pids={os.getpid(), *self.worker_pids()})
+        owners: dict[int, tuple[str, ...]] = {}
+        busy = telemetry.busy_indices(
+            exclude_pids={os.getpid(), *self.worker_pids()}, owners_out=owners
+        )
+        self.last_busy_owners = owners
+        return busy
 
     def store_backend(self) -> str:
         return "filesystem"

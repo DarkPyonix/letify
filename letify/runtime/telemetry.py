@@ -151,27 +151,50 @@ APPS_COMMAND = (
 
 UUID_COMMAND = ("nvidia-smi", "--query-gpu=index,uuid", "--format=csv,noheader,nounits")
 
+#: One shell script that lists the compute processes, the owner of each one visible here and
+#: the login user. The owners are read in the same command as the listing, so a process id
+#: cannot be reused in between. A process id with no /proc entry prints no owner line.
+OWNERS_SCRIPT = (
+    "command -v stat >/dev/null || exit 127; "
+    f"apps=$({' '.join(APPS_COMMAND)}) || exit $?; "
+    "printf '%s\\n' \"$apps\"; "
+    "echo '#owners'; "
+    "for pid in $(printf '%s\\n' \"$apps\" | cut -d, -f2); do "
+    'owner=$(stat -c %U "/proc/$pid" 2>/dev/null) && echo "$pid $owner"; '
+    "done; "
+    "echo '#login'; "
+    "id -un || exit 1"
+)
+
+OWNERS_COMMAND = ("sh", "-c", OWNERS_SCRIPT)
+
+#: The owner named for a process whose owner could not be read.
+UNKNOWN_OWNER = "unknown"
+
 
 def busy_indices(
     exclude_pids: set[int] | None = None,
     run: Callable[[tuple[str, ...]], str] | None = None,
+    owners_out: dict[int, tuple[str, ...]] | None = None,
 ) -> tuple[int, ...]:
-    """Device indices another process is currently computing on.
+    """Device indices another user is currently computing on.
 
     Registered is permission, not availability: a card a colleague is training on is not
     something to fight over. Compute processes are read rather than utilization, because a
-    card between steps reads as idle and is not.
+    card between steps reads as idle and is not. A process owned by the login user does not
+    count, except when the login user is root, which many people share.
 
     ``exclude_pids`` leaves out processes letify itself started, so a session asking for a
-    second card does not see its own as taken. ``run`` answers one nvidia-smi query with
-    its output, and defaults to running it on this machine. A remote provider passes a
-    runner that asks its own machine and raises when the query cannot run.
+    second card does not see its own as taken. ``run`` answers one command with its output,
+    and defaults to running it on this machine. A remote provider passes a runner that asks
+    its own machine and raises when the command cannot run. ``owners_out``, when given, is
+    filled with the owners of the processes on each busy index.
     """
     runner = run or _run
     uuids = parse_uuids(runner(UUID_COMMAND))
     if not uuids:
         return ()
-    return parse_busy(runner(APPS_COMMAND), uuids, exclude_pids)
+    return parse_busy(runner(OWNERS_COMMAND), uuids, exclude_pids, owners_out)
 
 
 def parse_uuids(output: str) -> dict[str, int]:
@@ -186,12 +209,33 @@ def parse_uuids(output: str) -> dict[str, int]:
 
 
 def parse_busy(
-    output: str, uuids: dict[str, int], exclude_pids: set[int] | None = None
+    output: str,
+    uuids: dict[str, int],
+    exclude_pids: set[int] | None = None,
+    owners_out: dict[int, tuple[str, ...]] | None = None,
 ) -> tuple[int, ...]:
-    """The indices the compute apps listing shows a process on, leaving out ``exclude_pids``."""
+    """The indices another user computes on, read from the output of ``OWNERS_COMMAND``.
+
+    Raises ``RuntimeFailure`` when the output carries no login user, because without it no
+    process can be told apart from the login user's own.
+    """
+    from ..errors import RuntimeFailure
+
+    apps, _, rest = output.partition("#owners")
+    owner_lines, _, login_lines = rest.partition("#login")
+    login = login_lines.strip()
+    if not login:
+        raise RuntimeFailure(
+            "the busy check could not read the login user, so which cards are free is unknown"
+        )
+    owner_of: dict[int, str] = {}
+    for line in owner_lines.splitlines():
+        pid_text, _, user = line.strip().partition(" ")
+        if pid_text.isdigit() and user:
+            owner_of[int(pid_text)] = user.strip()
     mine = exclude_pids or set()
-    taken: set[int] = set()
-    for line in output.splitlines():
+    taken: dict[int, set[str]] = {}
+    for line in apps.splitlines():
         fields = [part.strip() for part in line.split(",")]
         if len(fields) < 2 or fields[0] not in uuids:
             continue
@@ -199,8 +243,14 @@ def parse_busy(
             pid = int(fields[1])
         except ValueError:
             continue
-        if pid not in mine:
-            taken.add(uuids[fields[0]])
+        if pid in mine:
+            continue
+        owner = owner_of.get(pid)
+        if owner is not None and owner == login and login != "root":
+            continue
+        taken.setdefault(uuids[fields[0]], set()).add(owner or UNKNOWN_OWNER)
+    if owners_out is not None:
+        owners_out.update({index: tuple(sorted(users)) for index, users in taken.items()})
     return tuple(sorted(taken))
 
 
@@ -222,9 +272,12 @@ def local_load() -> list[DeviceLoad]:
 
 __all__ = [
     "APPS_COMMAND",
+    "OWNERS_COMMAND",
+    "OWNERS_SCRIPT",
     "SMI_COMMAND",
     "SMI_FIELDS",
     "SMI_TIMEOUT",
+    "UNKNOWN_OWNER",
     "UUID_COMMAND",
     "DeviceLoad",
     "busy_indices",

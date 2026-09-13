@@ -300,11 +300,17 @@ def one_card_cpu(monkeypatch) -> letify.Instance:
 
 @pytest.fixture
 def patch_smi(monkeypatch):
-    """Say which device indices another process is computing on."""
+    """Say which device indices another user is computing on, and who owns them."""
 
-    def patch(busy: list[int] | None = None) -> None:
+    def patch(busy: list[int] | None = None, owners: dict[int, tuple[str, ...]] | None = None):
         taken = set(busy or ())
-        monkeypatch.setattr(telemetry, "busy_indices", lambda **kwargs: tuple(sorted(taken)))
+
+        def busy_indices(owners_out: dict[int, tuple[str, ...]] | None = None, **kwargs):
+            if owners_out is not None:
+                owners_out.update(owners or {index: ("someone",) for index in taken})
+            return tuple(sorted(taken))
+
+        monkeypatch.setattr(telemetry, "busy_indices", busy_indices)
 
     return patch
 

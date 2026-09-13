@@ -1273,17 +1273,19 @@ def test_cards_another_process_is_using_cannot_be_allocated(reserving, patch_smi
     provider = reserving(A100={"indices": "0"})
     patch_smi(busy=[0])
     pool = RuntimePool()
-    with pytest.raises(letify.InsufficientDevices, match="another process"):
+    with pytest.raises(letify.InsufficientDevices, match="another user"):
         pool.acquire(provider.A100._placed("remote"), Env())
     assert pool.live == []
 
 
-def test_the_refusal_names_the_cards_another_process_is_computing_on(reserving, patch_smi) -> None:
+def test_the_refusal_names_the_busy_cards_and_the_users_computing_on_them(
+    reserving, patch_smi
+) -> None:
     provider = reserving(A100={"indices": "0-2"})
-    patch_smi(busy=[0, 2])
+    patch_smi(busy=[0, 2], owners={0: ("alice",), 2: ("bob", "unknown")})
     provider.reserve(provider.A100)
     pool = RuntimePool()
-    with pytest.raises(letify.InsufficientDevices, match=r"0, 2"):
+    with pytest.raises(letify.InsufficientDevices, match=r"0 \(alice\), 2 \(bob, unknown\)"):
         pool.acquire((provider.A100 * 2)._placed("remote"), Env())
 
 
