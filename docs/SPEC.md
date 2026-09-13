@@ -71,10 +71,10 @@ A declaration taking two cards halves the width on a four card machine, which is
 Provider (abstract)
 ├── Local                 persistent
 ├── Modal                 persistent
-└── Shell                 ephemeral by default, SSH transport
-    ├── Colab             session created by the Colab CLI
-    ├── Tunnel            network path built first, then SSH
-    └── Elice             machine allocated through the Elice Cloud API
+└── Shell                 ephemeral by default, reached through the connection pipeline
+    ├── Colab             session created by the Colab CLI, rendezvous over colab exec
+    ├── Tunnel            a machine behind NAT, rendezvous through letify client shell connect
+    └── Elice             machine allocated through the Elice Cloud API, rendezvous over its API
 ```
 
 `Shell` is named for the shared ability, which is running a command on a remote machine, rather than for SSH, which is only its default transport.
@@ -388,15 +388,97 @@ A package the lock file names is installed in the runtime and referenced by name
 
 ## Transport
 
-> A provider reaches its machine by the shortest path available. A tunnel is the last resort.
+> A `Shell` reaches its machine through a connection pipeline: several strategies are tried at once, the fastest acceptable one wins, and the winner is cached per account.
 
-Order of preference: a direct SSH address, then a jump host, then a tunnel. Campus machines often accept one of the first two, which removes the tunnel's setup and its failure modes.
+`Modal` and `Local` are not part of this. Modal is reached through its own API, and Local starts its worker as a child process.
 
-`Tunnel` builds the path and then uses the parent class's SSH path for everything else. Tailscale is the default because it needs no server of the user's own, authenticates from an auth key without a prompt, and carries any TCP port. frp on TLS port 443 is the fallback for a network that blocks UDP, where Tailscale keeps working but falls to a relay whose throughput has been measured as low as 2.2 Mbit/s across continents.
+The measurements behind the order and the rules below are in [NETWORK.md](NETWORK.md#connection-pipeline-measurements).
 
-MTU is held at 1280 to 1400. Every mesh VPN in this class shows the same failure above that: the connection works, small commands work, and bulk transfers stall silently.
+### Connection strategies <!-- id: connection-strategies -->
 
-Colab is reached through the Colab CLI, run as `uv tool run --from google-colab-cli colab`: `colab new` and `colab stop` for the session, `colab ssh --proxy-mode` as an OpenSSH ProxyCommand bridge for the persistent channel, and `colab exec` as the one-shot fallback. That is an official path, so it carries no terms risk and needs no tunnel. Network details and the measurements behind these choices are in [NETWORK.md](NETWORK.md).
+> Four default strategies, ranked. A lower rank wins whenever it is acceptable.
+
+| Rank | Strategy | Needs |
+|---|---|---|
+| 1 | Forward SSH to the machine's address | an address the user's machine can reach |
+| 2 | TCP hole punching | a rendezvous, and NATs on both sides that allow a simultaneous open |
+| 3 | UDP hole punching with Tailcat, then SSH over it | a rendezvous, and UDP in both directions |
+| 4 | Provider fallback | the provider's own path, such as `colab exec` and the Colab file API |
+
+Forward SSH is first because it needs no remote agent and costs one connection attempt, and when it works it is a kernel TCP connection. TCP hole punching comes before UDP because a punched TCP connection is also kernel TCP and is not subject to UDP rate limits. Tailcat comes next because its NAT traversal succeeds more often, but it runs in user space and a network that limits UDP limits it too. The provider fallback is last because it is the slowest.
+
+A strategy whose needs are not met is skipped, not attempted. A `Shell` with no rendezvous has only rank 1.
+
+Each stage is its own object behind a small interface, so a strategy can be added, removed or reordered by changing the subclass's list:
+
+| Object | Owns |
+|---|---|
+| `Rendezvous` | sending a command to the remote side and exchanging addresses with it |
+| `Strategy` | one way to connect: checking its needs, attempting, and returning a `Link` |
+| `Link` | an established connection, used by both the worker channel and bulk transfer |
+| `Probe` | a short measurement of a `Link` |
+| `Pipeline` | running strategies, choosing one, and consulting the cache |
+| `LinkCache` | remembering the winning strategy |
+
+A `Shell` subclass differs from its parent only in its `Rendezvous` and its strategy list.
+
+### Choosing a link <!-- id: choosing-a-link -->
+
+> All applicable strategies start together. Among those that connect and pass the probe, the lowest rank is chosen, unless it is far slower than the fastest.
+
+Strategies are raced rather than tried in turn, so a strategy that times out does not delay the others. Once the first strategy connects, the pipeline waits a grace period of 2 s for lower ranked strategies before choosing.
+
+Every connected strategy is probed: 30 round trips, then 2 s of transfer in each direction. A strategy whose throughput in either direction is below 25% of the fastest connected strategy in that direction is rejected. The lowest ranked strategy that remains is chosen. When only one strategy connects, it is chosen without comparison.
+
+Strategies that lose are closed.
+
+### Link cache <!-- id: link-cache -->
+
+> The winning strategy is remembered per account and per network, so the next connection starts with it alone.
+
+The cache lives in `~/.letify/accounts/<alias>/link.json`. It records the strategy, the probe results, and a network fingerprint: the local machine's public IP address and the name of its default route interface.
+
+On the next connection the cached strategy is attempted alone. When it connects and its probe is at least 50% of the cached throughput, it is used. Otherwise, or when the fingerprint differs, the full race runs and the cache is rewritten.
+
+### Rendezvous <!-- id: rendezvous -->
+
+> Hole punching needs a way to start a program on the remote side and swap addresses. Colab and Elice provide one; any other machine runs `letify client shell connect`.
+
+| Provider | Rendezvous |
+|---|---|
+| `Colab` | `colab exec` |
+| `Elice` | the Elice Cloud API |
+| `Tunnel`, and a plain `Shell` behind NAT | the remote agent started by `letify client shell connect` |
+
+`letify client shell connect` is run once on the remote machine by its user. It starts the remote agent, which stays running, keeps a connection to the rendezvous relay, and answers punch requests for the account it was started for. Installing letify on that machine is therefore a requirement for ranks 2 and 3 on a machine without a provider API.
+
+Both sides learn their public mapping from STUN servers reached over TCP on port 443, because networks that restrict outbound ports usually still allow 443. A punch starts at a time both sides agree on through the rendezvous. Each side connects from its bound port to the other's mapping and listens on the same port, so whichever direction's SYN arrives first completes the connection.
+
+A local port that letify binds for forwarding is chosen by the operating system, never fixed, because Windows reserves port ranges that vary by machine.
+
+### Reverse SSH <!-- id: reverse-ssh -->
+
+> An opt-in strategy for a remote machine that can reach the user's machine over SSH. It is not raced by default.
+
+When an account sets `reverse_ssh`, the remote side opens an SSH connection to the user's machine and forwards a port back with `ssh -R`. It then takes rank 4 and the provider fallback moves to rank 5.
+
+```toml
+[lab_behind_nat]
+kind = "shell"
+reverse_ssh = { address = "home.example.com", port = 2222, user = "me" }
+```
+
+It is opt-in because it needs the user's machine to accept inbound SSH and needs a key on the remote side that can log in to it. letify generates a key per session, installs it in the user's `authorized_keys` restricted to port forwarding with no shell, and removes it when the session ends. Installing that restriction is done once by an explicit command, not by the pipeline.
+
+### Colab <!-- id: colab-transport -->
+
+> Colab is a `Shell` whose rendezvous is `colab exec`. It has no forward SSH, and its fallback is `colab exec` with the Colab file API.
+
+The Colab CLI runs as `uv tool run --from google-colab-cli colab`, with `jupyter-kernel-client<1` pinned, because release 0.6.0 of the CLI calls an API that jupyter-kernel-client 1.0 removed. `colab new` and `colab stop` manage the session.
+
+Colab limits outbound UDP to roughly 200 packets per second, so rank 3 is expected to lose the probe there. It stays in the list because the ratio rule removes it without a special case.
+
+The fallback sends calls with `colab exec` and bulk data through the Jupyter contents API that the Colab runtime proxy exposes: uploads are split into parts sent in parallel, each part in chunked `PUT` requests, and downloads read `/files/<path>` in parallel parts. The contents API root is `/` on the VM, not `/content`.
 
 ## Configuration
 
@@ -608,7 +690,7 @@ Linux wheels are built inside the `manylinux_2_28` containers, so the binaries n
 
 - **`letify-driver` covers one milestone.** The entry points a PyTorch process needs to start up and run one kernel are forwarded and verified against a real GPU. Kernel argument marshalling reads the pointer list without knowing the kernel's signature, and fatbin size comes from a conservative window rather than the image header. Both need a real workload to shape them.
 - **`Modal` and `Elice` are not exercised against the live services.** Their code follows each service's published interface, and the Elice paths come from Elice's own Terraform provider, but neither has been run end to end.
-- **The Colab data channel is unverified.** Whether `ssh -L` works over `colab ssh --proxy-mode` is an open decision in [INTENT.md](INTENT.md).
+- **The connection pipeline is not implemented.** `Rendezvous`, `Strategy`, `Link`, `Probe`, `Pipeline`, `LinkCache`, `letify client shell connect` and the rendezvous relay exist only in this document. The current code connects `Tunnel` through Tailscale or frp and `Colab` through a channel setting.
 - **Orphan reconciliation is not implemented.** A session whose controlling machine was killed outright is released by the lease on the providers where the process is the cost. Where the platform bills for the machine and takes no deadline, nothing ends it: an Elice allocation bills until a delete is issued. The intended answer is that the next letify process asks the provider what is running under this project's name and ends what nothing is watching, with a command to do it on demand. Neither exists yet.
 - **Whether the Elice allocation API takes a deadline is unverified.** If it does, that is where the guarantee belongs, because the platform outlives the caller.
 - **Persistence detection is not implemented.** Deciding a machine's disk policy by writing a marker file and looking for it in a later runtime is a decision recorded here, not yet code.

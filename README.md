@@ -268,9 +268,9 @@ Measure your own `k` with `torch.cuda.set_sync_debug_mode("warn")` and your roun
 Provider
 ├── 💻 Local      your machine            persistent
 ├── ☁️  Modal      serverless GPU          persistent
-└── 🐚 Shell      any machine over SSH    ephemeral by default
+└── 🐚 Shell      any remote machine      ephemeral by default
     ├── 📓 Colab   via the official CLI
-    ├── 🕳️  Tunnel  Tailscale or frp, for NAT
+    ├── 🕳️  Tunnel  a machine behind NAT
     └── 🇰🇷 Elice   Elice Cloud, allocated by API
 ```
 
@@ -282,6 +282,15 @@ Provider
 | 🐚 `Shell` | overridable | lab and university servers |
 | 🕳️ `Tunnel` | overridable | a machine behind NAT you cannot port-forward |
 | 🇰🇷 `Elice` | persistent | Korean GPU cloud, per-second billing |
+
+**letify finds the fastest way in.** For any `Shell`, letify tries several ways to reach the machine at once and keeps the fastest one that works:
+
+1. SSH straight to the machine's address
+2. TCP hole punching, for two machines that are both behind NAT
+3. UDP hole punching with [Tailcat](https://github.com/tailscale/tailcat), then SSH over it
+4. The provider's own path, such as `colab exec` and the Colab file API
+
+A lower number wins unless it is far slower than the fastest one that connected. The winner is remembered per account and per network, so the next connection starts with it. A machine that is behind NAT and has no provider API needs letify installed and `letify client shell connect` run on it once. Colab and Elice do that part automatically. Modal is reached through its own API and is not part of this.
 
 **Multiple accounts are first class.** Each configuration entry is one account, and entries of the same kind coexist. Two Colab accounts means twice the concurrent sessions.
 
@@ -425,6 +434,7 @@ def test_train_returns_a_loss():
 ```bash
 letify login shell lab        # declare an account, and reference it here
 letify logout lab             # take the account off this machine
+letify client shell connect   # run on a remote machine behind NAT, so letify can reach it
 letify providers              # who is declared, storage, channel kind
 letify devices                # what each one offers
 letify status                 # what is running right now

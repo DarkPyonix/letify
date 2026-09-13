@@ -111,6 +111,54 @@ Two product lines exist and only one is automatable. Elice Cloud Infrastructure 
 
 There is nothing to tunnel to and no device to forward calls at, so `Modal.has_fast_path` is false and `host="local"` raises. Its volume is mounted from outside the container and sits in the same data centre as the GPU, which is why a persistent provider needs no separate cache tier.
 
+## Connection pipeline measurements
+
+> The evidence for the strategy order and the rules in the spec's Transport section. Measured on 2026-09-13.
+
+Setup: the client is a Linux Docker container on a university network in Daejeon, Korea, or a Windows 11 desktop on home Wi-Fi in Korea. The Colab VMs were CPU sessions; their region changed per session (Taiwan, Iowa, South Carolina, California, Oregon). Transfers were verified by SHA-256 where a size is given.
+
+### Colab limits outbound UDP
+
+Raw UDP, numbered 1200 byte packets sent at a fixed rate for 5 s, NAT punched by hand through STUN:
+
+| Path | 1 MiB/s sent | 5 MiB/s sent | 20 MiB/s sent |
+|---|---|---|---|
+| Colab to Daejeon server | 788 of 4369 arrived | 804 of 21845 | 804 of 87381 |
+| Daejeon server to Colab | 4372 of 4372 | 21881 of 21881 | 31970 of 87600 |
+| Colab session A to session B | 1071 of 4369 | 1002 of 21863 | 988 of 87527 |
+| Colab session B to session A | 1071 of 4369 | 1004 of 21863 | 1078 of 87527 |
+
+About 1000 packets arrive per 5 s whatever the send rate, and the same holds between two Colab sessions. The limit is on Colab's outbound UDP, about 200 packets per second or 0.23 MiB/s. Inbound UDP to Colab is not limited at 5 MiB/s. Tailcat over the same path gave 0.59 MiB/s up and 0.10 MiB/s down, and pacing the sender at 2 MiB/s did not help, which rules out buffer overflow as the cause.
+
+### Tailcat between two ordinary NATs
+
+Windows desktop on home Wi-Fi to the Daejeon server, both behind NAT, no Colab:
+
+| Round trip median | Upload | Download at 1 / 5 / 20 MiB/s | Download unpaced | Path |
+|---|---|---|---|---|
+| 3.2 ms | 24.31 MiB/s | 1.00 / 5.00 / 19.92 MiB/s | 32.03 MiB/s | direct for the whole run |
+
+### TCP hole punching with Colab
+
+Both sides bound one TCP port, learned the mapping from `stun.nextcloud.com:443`, and connected to each other at an agreed time while listening on the same port. Both NATs preserved the local port number. STUN servers on ports 3478 and 19302 timed out from the Daejeon network.
+
+| Result | Round trip median | Upload, 1 connection | Download, 1 connection |
+|---|---|---|---|
+| connected on the first attempt, both sides | 180.5 ms (VM in the United States) | 12.97 MiB/s | 14.01 MiB/s |
+
+### Colab's own paths
+
+| Path | Upload | Download |
+|---|---|---|
+| `colab exec` round trip, `print(1)` | 1.7 s to 3.7 s | |
+| `colab upload` / `colab download`, 32 MiB | 3.86 MiB/s | 7.35 MiB/s |
+| `colab upload` / `colab download`, 256 MiB | fails: the whole file is one base64 request | 9.60 MiB/s |
+| contents API direct, 256 MiB, 1 part | 2.65 MiB/s | 14.77 MiB/s |
+| contents API direct, 256 MiB, 4 parallel parts | 9.74 MiB/s | 46.98 MiB/s |
+| contents API direct, 256 MiB, 8 parallel parts | 17.77 MiB/s | 64.13 MiB/s |
+
+`colab console` is not a usable channel: it is a terminal inside tmux, and a single input line of 4000 characters or more arrives truncated or mixed with terminal control sequences. The Colab runtime proxy reaches only port 8080 on the VM; other port prefixes return 404.
+
 ## Measuring your own numbers
 
 Three checks settle most of what is provider specific.

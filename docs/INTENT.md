@@ -72,7 +72,7 @@ Each of these would change a claim or a default. Answering one is a good first e
 
 1. **How many concurrent sessions does one Colab account allow?** Undocumented, and it moves with tier, credit balance and demand. Until it is measured, a `devices` count in the provider entry is where the answer goes, so a user who has measured their own account is not overruled by a number letify guessed.
 2. **What is the real host synchronization count per step, `k`, for the target workload?** Measurable with `torch.cuda.set_sync_debug_mode("warn")`. This sets whether call forwarding is worth implementing at all.
-3. **Does `colab ssh --proxy-mode` support port forwarding with `ssh -L`?** The CLI documents the ProxyCommand bridge but not forwarding. This decides whether a data channel separate from `colab exec` is available.
+3. **How often does TCP hole punching succeed on the networks researchers actually use?** It succeeded between a Colab VM and a university network in Korea, where both NATs preserved the port. Home routers, office networks and mobile tethering are unmeasured. This decides how often the pipeline falls to UDP or to the provider's own path.
 4. **Is NVFP4 reachable in a stock Colab runtime?** Needs the CUDA version, the compute capability and whether the quantization stack installs.
 5. **Is the Elice SSH port stable across a restart?** If it is not, the configuration needs a command that resolves the current port.
 6. **What does Elice spot pricing cost?** The API exposes a pricing id, which suggests preemptible instances are available. This is a direct cost lever.

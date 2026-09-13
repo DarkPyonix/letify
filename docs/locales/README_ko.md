@@ -264,9 +264,9 @@ Hugging Face 학습 스텝은 기본 설정에서 `k ≈ 3`입니다. Trainer의
 Provider
 ├── 💻 Local      내 컴퓨터              persistent
 ├── ☁️  Modal      서버리스 GPU           persistent
-└── 🐚 Shell      SSH로 붙는 모든 머신   기본 ephemeral
+└── 🐚 Shell      원격 머신 전반         기본 ephemeral
     ├── 📓 Colab   공식 CLI 경유
-    ├── 🕳️  Tunnel  Tailscale 또는 frp, NAT 뒤
+    ├── 🕳️  Tunnel  NAT 뒤의 머신
     └── 🇰🇷 Elice   엘리스 클라우드, API로 할당
 ```
 
@@ -278,6 +278,15 @@ Provider
 | 🐚 `Shell` | 덮어쓰기 가능 | 연구실과 학교 서버 |
 | 🕳️ `Tunnel` | 덮어쓰기 가능 | 포트를 열 수 없는 NAT 뒤의 머신 |
 | 🇰🇷 `Elice` | persistent | 한국 GPU 클라우드, 초 단위 과금 |
+
+**letify가 가장 빠른 연결 방법을 찾습니다.** `Shell` 계열 머신에 대해 letify는 여러 연결 방법을 동시에 시도하고, 성공한 것 중 가장 빠른 방법을 씁니다.
+
+1. 머신 주소로 바로 SSH
+2. TCP 홀펀칭, 양쪽이 모두 NAT 뒤에 있을 때
+3. [Tailcat](https://github.com/tailscale/tailcat)으로 UDP 홀펀칭한 뒤 그 위로 SSH
+4. 프로바이더 자체 경로, 예를 들어 `colab exec`와 Colab 파일 API
+
+번호가 낮은 방법이 이깁니다. 다만 연결된 방법 중 가장 빠른 것보다 훨씬 느리면 탈락합니다. 이긴 방법은 계정과 네트워크별로 기억해 두고, 다음 연결에서 먼저 시도합니다. NAT 뒤에 있고 프로바이더 API도 없는 머신은 letify를 설치한 뒤 그 머신에서 `letify client shell connect`를 한 번 실행해야 합니다. Colab과 Elice는 이 단계를 자동으로 합니다. Modal은 자체 API로 연결하므로 여기에 해당하지 않습니다.
 
 **여러 계정을 정식으로 지원합니다.** 설정 항목 하나가 계정 하나이고, 같은 종류를 여러 개 둘 수 있습니다. Colab 계정이 두 개면 동시 세션도 두 배가 됩니다.
 
@@ -430,6 +439,7 @@ def test_train_returns_a_loss():
 ```bash
 letify login shell lab # 계정을 등록하고, 이 저장소에서 참조
 letify logout lab     # 이 머신에서 계정 제거
+letify client shell connect  # NAT 뒤 원격 머신에서 실행해, letify가 접속할 수 있게 함
 letify providers      # 선언된 프로바이더, 저장소 수명, 기본 배치
 letify devices           # 각자 제공하는 GPU
 letify status         # 지금 돌고 있는 것
