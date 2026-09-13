@@ -481,7 +481,9 @@ A `Shell` subclass differs from its parent only in its `Rendezvous` and its stra
 
 > All applicable strategies start together. Among those that connect and pass the probe, the lowest rank is chosen, unless it is far slower than the fastest.
 
-Strategies are raced rather than tried in turn, so a strategy that times out does not delay the others. Once the first strategy connects, the pipeline waits a grace period of 2 s for lower ranked strategies before choosing.
+Strategies are raced rather than tried in turn, so a strategy that times out does not delay the others. Once the first strategy that can carry the probe connects, the pipeline waits a grace period of 2 s for lower ranked strategies before choosing.
+
+A strategy that cannot carry the probe, such as the provider fallback, does not start the grace period when it connects. It is held back until every strategy that can carry the probe has failed, or until the race timeout of 60 s passes with none of them connected. A rendezvous that takes seconds, such as `colab exec` before a TCP punch, therefore runs inside its strategy's own attempt time, not inside the grace period.
 
 Every connected strategy is probed: 30 round trips, then 2 s of transfer in each direction. A strategy whose throughput in either direction is below 25% of the fastest connected strategy in that direction is rejected. The lowest ranked strategy that remains is chosen. When only one strategy connects, it is chosen without comparison.
 

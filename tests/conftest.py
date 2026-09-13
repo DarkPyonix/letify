@@ -929,8 +929,10 @@ class FakeStrategy:
         error: str | None = None,
         unmet: str | None = None,
         probe_error: bool = False,
+        probed: bool = True,
     ):
         self.name = name
+        self.probed = probed
         self.rank = rank
         self.result = result
         self.delay = delay

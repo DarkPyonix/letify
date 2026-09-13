@@ -184,7 +184,11 @@ class Pipeline:
                 late = state["decided"]
                 if not late:
                     outcomes[index] = outcome
-                    if not isinstance(outcome, Exception) and state["first"] is None:
+                    if (
+                        not isinstance(outcome, Exception)
+                        and getattr(strategy, "probed", True)
+                        and state["first"] is None
+                    ):
                         state["first"] = time.monotonic()
                     condition.notify_all()
             if late and not isinstance(outcome, Exception):
@@ -193,9 +197,14 @@ class Pipeline:
         for index, strategy in enumerate(applicable):
             threading.Thread(target=run, args=(index, strategy), daemon=True).start()
 
+        probed = {i for i, s in enumerate(applicable) if getattr(s, "probed", True)}
         deadline = time.monotonic() + self.timeout
         with condition:
             while len(outcomes) < len(applicable):
+                connected = [i for i, o in outcomes.items() if not isinstance(o, Exception)]
+                if state["first"] is None and probed <= outcomes.keys() and connected:
+                    # Every probed strategy failed, so an unprobed one is all that is left.
+                    break
                 now = time.monotonic()
                 limit = deadline if state["first"] is None else state["first"] + self.grace
                 if now >= limit:

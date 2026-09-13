@@ -220,6 +220,24 @@ def test_a_lower_rank_that_connects_within_the_grace_period_is_waited_for(isolat
     assert pipeline([direct, punch], grace=1.0).connect().strategy == "direct_ssh"
 
 
+def test_the_fallback_connecting_first_does_not_start_the_grace_period(isolated_home) -> None:
+    # Colab: colab exec answers at once, while the punch waits on a rendezvous that takes
+    # seconds. The punch has to be given its own attempt time, not the grace period.
+    punch = FakeStrategy("tcp_punch", 2, delay=0.8, result=result(10, 10))
+    fallback = FakeStrategy("fallback", 4, probed=False)
+    cache = LinkCache("lab")
+    assert pipeline([punch, fallback], grace=0.2, cache=cache).connect().strategy == "tcp_punch"
+    assert cache.load().strategy == "tcp_punch"
+
+
+def test_the_fallback_is_chosen_once_every_probed_strategy_has_failed(isolated_home) -> None:
+    punch = FakeStrategy("tcp_punch", 2, delay=0.5, error="no mapping")
+    fallback = FakeStrategy("fallback", 4, probed=False)
+    began = time.monotonic()
+    assert pipeline([punch, fallback], grace=0.1).connect().strategy == "fallback"
+    assert time.monotonic() - began >= 0.5
+
+
 def test_the_default_grace_period_is_two_seconds() -> None:
     assert Pipeline([], target=None, alias="lab").grace == 2.0
 
