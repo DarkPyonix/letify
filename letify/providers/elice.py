@@ -20,7 +20,11 @@ forgotten machine still costs money with no allocation running.
 
 from __future__ import annotations
 
+import json as _json
 import time
+import urllib.error
+import urllib.parse
+import urllib.request
 from collections.abc import Mapping
 from typing import TYPE_CHECKING, Any
 
@@ -93,30 +97,42 @@ class Elice(Shell):
 
     # -- the API -------------------------------------------------------------
 
-    def _call(self, method: str, path: str, **kwargs: Any) -> Any:
+    def _call(
+        self,
+        method: str,
+        path: str,
+        *,
+        params: Mapping[str, Any] | None = None,
+        json: Any = None,
+    ) -> Any:
+        """One request with the standard library HTTP client, answering the decoded body."""
+        url = f"{self.endpoint}{path}"
+        if params:
+            url = f"{url}?{urllib.parse.urlencode(params)}"
+        data = None if json is None else _json.dumps(json).encode()
+        request = urllib.request.Request(url, data=data, method=method)
+        request.add_header("Authorization", f"Bearer {self._token()}")
+        request.add_header("Accept", "application/json")
+        if data is not None:
+            request.add_header("Content-Type", "application/json")
         try:
-            import httpx
-        except ImportError as exc:
-            raise ProviderUnavailable(
-                self.kind, "the httpx package is not installed", self.extra
-            ) from exc
+            with urllib.request.urlopen(request, timeout=60.0) as response:
+                status, raw = response.status, response.read()
+        except urllib.error.HTTPError as exc:
+            status, raw = exc.code, exc.read()
+        except (urllib.error.URLError, OSError) as exc:
+            raise RuntimeFailure(f"Elice {method} {path} failed: {exc}") from exc
 
-        with httpx.Client(
-            base_url=self.endpoint,
-            headers={"Authorization": f"Bearer {self._token()}"},
-            timeout=60.0,
-        ) as client:
-            response = client.request(method, path, **kwargs)
-
+        text = raw.decode(errors="replace")
         # This API answers 200 for every success, so anything else is a failure.
-        if response.status_code != 200:
+        if status != 200:
             try:
-                body = response.json()
+                body = _json.loads(text)
                 detail = body.get("message") or str(body)
             except Exception:
-                detail = response.text[:500]
-            raise RuntimeFailure(f"Elice {method} {path} returned {response.status_code}: {detail}")
-        return response.json()
+                detail = text[:500]
+            raise RuntimeFailure(f"Elice {method} {path} returned {status}: {detail}")
+        return _json.loads(text) if text else {}
 
     @staticmethod
     def _items(body: Any) -> list[dict[str, Any]]:

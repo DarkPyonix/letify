@@ -306,61 +306,96 @@ def renewal_recorder() -> RenewalRecorder:
 # -- the Elice HTTP API --------------------------------------------------------
 
 
+@dataclass
 class FakeResponse:
-    """One HTTP response, with a body that may refuse to decode."""
+    """One canned answer: a status, and a body sent as JSON unless ``text`` is given."""
 
-    def __init__(self, status_code: int = 200, body: Any = None, text: str = ""):
-        self.status_code = status_code
-        self._body = body
-        self.text = text
-
-    def json(self) -> Any:
-        if self._body is None:
-            raise ValueError("the body is not JSON")
-        return self._body
+    status_code: int = 200
+    body: Any = None
+    text: str = ""
 
 
-class FakeHttpx:
-    """The parts of httpx the Elice provider uses, with no network behind them."""
+class FakeEliceServer:
+    """The Elice Cloud API on loopback, answering what a test tells it to.
+
+    A real HTTP server, so the standard library client the provider uses is the one under
+    test. The API lives under ``/api`` as it does on the portal. Each request is recorded
+    with its method, path below ``/api``, query parameters (None when there are none),
+    JSON body and Authorization header.
+    """
 
     def __init__(self) -> None:
-        self.clients: list[dict[str, Any]] = []
+        import http.server
+        import threading
+
         self.requests: list[dict[str, Any]] = []
         self.responses: dict[tuple[str, str], FakeResponse] = {}
         self.default = FakeResponse(200, {})
+        owner = self
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def log_message(self, *args: Any) -> None:
+                return None
+
+            def do_GET(self) -> None:
+                owner._handle(self, "GET")
+
+            def do_POST(self) -> None:
+                owner._handle(self, "POST")
+
+            def do_DELETE(self) -> None:
+                owner._handle(self, "DELETE")
+
+        self._server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self._server.daemon_threads = True
+        self.endpoint = f"http://127.0.0.1:{self._server.server_address[1]}/api"
+        threading.Thread(target=self._server.serve_forever, daemon=True).start()
+
+    def close(self) -> None:
+        self._server.shutdown()
+        self._server.server_close()
 
     def answer(self, method: str, path: str, response: FakeResponse) -> None:
         self.responses[(method, path)] = response
-
-    def Client(self, **kwargs: Any) -> FakeHttpxClient:
-        self.clients.append(kwargs)
-        return FakeHttpxClient(self)
 
     @property
     def last(self) -> dict[str, Any]:
         return self.requests[-1]
 
+    def _handle(self, handler: Any, method: str) -> None:
+        import json
+        import urllib.parse
 
-class FakeHttpxClient:
-    def __init__(self, owner: FakeHttpx):
-        self.owner = owner
-
-    def __enter__(self) -> FakeHttpxClient:
-        return self
-
-    def __exit__(self, *exc: object) -> bool:
-        return False
-
-    def request(self, method: str, path: str, **kwargs: Any) -> FakeResponse:
-        self.owner.requests.append({"method": method, "path": path, **kwargs})
-        return self.owner.responses.get((method, path), self.owner.default)
+        parsed = urllib.parse.urlsplit(handler.path)
+        path = parsed.path.removeprefix("/api")
+        length = int(handler.headers.get("Content-Length") or 0)
+        body = handler.rfile.read(length) if length else b""
+        self.requests.append(
+            {
+                "method": method,
+                "path": path,
+                "params": dict(urllib.parse.parse_qsl(parsed.query)) or None,
+                "json": json.loads(body) if body else None,
+                "authorization": handler.headers.get("Authorization"),
+            }
+        )
+        response = self.responses.get((method, path), self.default)
+        if response.text:
+            payload, kind = response.text.encode(), "text/html"
+        else:
+            payload, kind = json.dumps(response.body).encode(), "application/json"
+        handler.send_response(response.status_code)
+        handler.send_header("Content-Type", kind)
+        handler.send_header("Content-Length", str(len(payload)))
+        handler.end_headers()
+        handler.wfile.write(payload)
 
 
 @pytest.fixture
-def fake_httpx(monkeypatch):
-    fake = FakeHttpx()
-    monkeypatch.setitem(sys.modules, "httpx", fake)
-    return fake
+def fake_elice():
+    server = FakeEliceServer()
+    yield server
+    server.close()
 
 
 # -- Modal ---------------------------------------------------------------------
