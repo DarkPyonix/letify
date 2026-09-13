@@ -140,6 +140,27 @@ def test_host_and_lifetime_accept_the_plain_lowercase_string() -> None:
     assert Lifetime.call == "call"
 
 
+def test_the_two_host_placements_are_named_values_on_the_package() -> None:
+    # Two named values say everything a declaration needs, so the enum class that holds them
+    # is not one more public name to learn.
+    assert letify.local is Host.local
+    assert letify.remote is Host.remote
+    assert letify.remote == "remote"
+    assert not hasattr(letify, "Host")
+    assert "Host" not in letify.__all__
+    assert {"local", "remote"} <= set(letify.__all__)
+
+
+def test_a_declaration_takes_the_named_placement(
+    let: letify.Launcher, cpu: letify.Instance
+) -> None:
+    @let.function(device=cpu, host=letify.remote)
+    def noop() -> None:
+        return None
+
+    assert noop.device.placement is letify.remote
+
+
 def test_the_accelerator_name_falls_back_from_gpu_to_tpu_to_the_cpu(let: letify.Launcher) -> None:
     provider = let.providers.local
     assert Instance(provider, gpu="H100").accelerator == "H100"

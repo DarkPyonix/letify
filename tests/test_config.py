@@ -108,11 +108,17 @@ def test_an_alias_that_is_not_an_identifier_is_refused(config_file) -> None:
         load(path, home=False)
 
 
-def test_a_provider_entry_without_a_kind_is_refused(config_file) -> None:
-    # kind is what selects the provider class, so there is nothing to build without it.
-    path = config_file('[lab]\naddress = "gpu.example.edu"\n')
+def test_a_provider_entry_without_a_kind_is_refused(home_file, config_file) -> None:
+    # kind is what selects the provider class, so there is nothing to build without it. A
+    # project table may leave it out to take it from the home entry, so there the refusal
+    # names how to declare the account instead.
+    project = config_file('[lab]\naddress = "gpu.example.edu"\n')
+    with pytest.raises(letify.ConfigError, match="letify login"):
+        load(project, home=False)
+
+    home_file('[lab]\naddress = "gpu.example.edu"\n')
     with pytest.raises(letify.ConfigError, match="has no 'kind' field"):
-        load(path, home=False)
+        load(project)
 
 
 def test_malformed_toml_names_the_file_it_could_not_read(config_file) -> None:
@@ -249,29 +255,73 @@ def test_a_value_is_written_in_the_toml_type_it_came_in_as() -> None:
     assert parsed["x"]["gpus"] == ["A100", "H100"]
 
 
-def test_a_project_reference_to_an_account_this_machine_does_not_have_says_what_to_run(
-    tmp_path,
-) -> None:
-    # The point of the reference is that a teammate can tell what to set up.
-    project = tmp_path / ".letify"
-    project.write_text('[lab]\nkind = "shell"\nfrom_home = true\n', encoding="utf-8")
-    with pytest.raises(letify.ConfigError, match="letify login shell lab"):
-        load(project, home=False)
+# -- Spec: The two files ---------------------------------------------------------
 
 
-def test_a_reference_is_satisfied_by_the_home_file(tmp_path, monkeypatch) -> None:
-    home = tmp_path / "home"
-    home.mkdir()
-    (home / ".letify").write_text(
-        '[lab]\nkind = "shell"\naddress = "gpu.example.edu"\n', encoding="utf-8"
+def test_a_home_account_the_project_does_not_name_is_not_available(home_file, config_file) -> None:
+    # The home file is what this machine has. The project chooses from it.
+    home_file('[lab]\nkind = "shell"\naddress = "gpu.example.edu"\n')
+    config = load(config_file('[other]\nkind = "local"\n'))
+    assert "lab" not in config.providers
+    assert config.order == ["other", "local"]
+
+
+def test_naming_the_alias_is_enough_to_use_a_home_account(home_file, config_file) -> None:
+    # An empty table brings every setting with it, kind included.
+    home_file('[lab]\nkind = "shell"\naddress = "gpu.example.edu"\nuser = "researcher"\n')
+    config = load(config_file("[lab]\n"))
+    entry = config.providers["lab"]
+    assert entry.kind == "shell"
+    assert entry.option("address") == "gpu.example.edu"
+    assert entry.option("user") == "researcher"
+
+
+def test_a_global_home_account_is_available_without_being_named(home_file, config_file) -> None:
+    home_file(
+        '[colab_pro]\nkind = "colab"\nglobal = true\n'
+        '[lab]\nkind = "shell"\naddress = "gpu.example.edu"\n'
     )
-    monkeypatch.setattr(Path, "home", classmethod(lambda cls: home))
-    project = tmp_path / ".letify"
-    project.write_text('[lab]\nkind = "shell"\nfrom_home = true\n', encoding="utf-8")
-    config = load(project)
-    assert config.providers["lab"].option("address") == "gpu.example.edu"
-    # The marker is not a connection detail and must not reach the provider.
-    assert config.providers["lab"].option("from_home") is None
+    config = load(config_file('[other]\nkind = "local"\n'))
+    assert "colab_pro" in config.providers
+    assert "lab" not in config.providers
+    # The marker says where an account is visible, not how to connect to it.
+    assert config.providers["colab_pro"].option("global") is None
+
+
+def test_with_no_project_file_only_global_accounts_and_local_exist(
+    home_file, tmp_path, monkeypatch
+) -> None:
+    home_file(
+        '[colab_pro]\nkind = "colab"\nglobal = true\n'
+        '[lab]\nkind = "shell"\naddress = "gpu.example.edu"\n'
+    )
+    empty = tmp_path / "no-project"
+    empty.mkdir()
+    monkeypatch.chdir(empty)
+    config = load()
+    assert sorted(config.providers) == ["colab_pro", "local"]
+
+
+def test_a_project_cannot_make_an_account_global(home_file, config_file) -> None:
+    # Only the home file decides what every repository on the machine can reach, so the
+    # marker is not read from a project and does not reach the provider.
+    home_file('[lab]\nkind = "shell"\naddress = "gpu.example.edu"\n')
+    config = load(config_file('[lab]\nglobal = true\n'))
+    assert config.providers["lab"].option("global") is None
+
+
+def test_naming_an_account_this_machine_does_not_have_says_what_to_run(
+    home_file, config_file
+) -> None:
+    # With no kind in the project and no home entry, there is nothing to take the kind from.
+    home_file('[other]\nkind = "local"\n')
+    with pytest.raises(letify.ConfigError, match="letify login"):
+        load(config_file("[lab]\n"))
+
+
+def test_a_project_table_with_a_kind_needs_no_home_entry(config_file) -> None:
+    config = load(config_file('[box]\nkind = "local"\n'), home=False)
+    assert config.providers["box"].kind == "local"
 
 
 def test_an_option_with_no_value_is_left_out_of_the_block() -> None:

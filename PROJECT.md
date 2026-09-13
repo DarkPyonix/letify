@@ -209,7 +209,8 @@ space.with_fixed(epochs=3)
 |---|---|
 | `Launcher`, `Providers` | the entry point and its provider view |
 | `Instance`, `AnyInstance` | an accelerator shape, and a deferred one |
-| `Host`, `Lifetime` | string enums for the two declared placements |
+| `local`, `remote` | the two values `host` takes |
+| `Lifetime` | a string enum for how long a session lives |
 | `Env` | an environment declaration |
 | `Sweep` | a declared search space |
 | `Volume` | a content addressed store on a provider |
@@ -248,7 +249,9 @@ letify efficiency 0.5 3 150   # expected share of a direct run
 
 `~/.letify` holds accounts, the project's `.letify` holds defaults, and neither holds a secret.
 
-`letify login <kind> [alias]` writes both. The account goes to `~/.letify`, which belongs to the machine. The project file gets a reference to it, `kind` plus `from_home = true` and nothing else, which is safe to commit and tells a teammate which accounts the repository needs. An account already declared is not asked for again, so `letify login` in a second repository writes only the reference. A reference to an account this machine does not have is a configuration error naming the command that fixes it.
+An account in `~/.letify` is available in a project only when the project's `.letify` names its alias, even as an empty `[colab_pro]` table, when the home entry sets `global = true`, or when it is `local`. A named alias takes every home setting and the project's own fields override them one by one. With no project `.letify` at all, only global accounts and `local` exist.
+
+`letify login <kind> [alias]` writes both. The account goes to `~/.letify`, which belongs to the machine. The project file gets the alias as an empty table and nothing else, which is safe to commit and tells a teammate which accounts the repository needs. An account already declared is not asked for again, so `letify login` in a second repository writes only the table. An alias the project names that this machine does not have is a configuration error naming the command that fixes it.
 
 SSH authenticates by key, because letify opens sessions with `ssh -o BatchMode=yes`: a session is started by the pool in the background, with nobody present to answer a password prompt. So `letify login shell` generates an ed25519 key if there is none, asks for the password once to install it, drops the password, and confirms the key works before declaring the alias. Nothing about the password is written to a file, the keyring or the environment. A machine whose administrator forbids key authentication can use `--auth password`, which keeps the password in the OS keyring and drives `sshpass`; it is refused on Windows, where that tool does not exist.
 

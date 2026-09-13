@@ -1,10 +1,10 @@
 """Declaring one account, and setting up whatever it needs to be reachable.
 
 Two files are written, because they answer different questions. ``~/.letify`` gets the
-account, since a connection detail belongs to the machine. The project's ``.letify`` gets a
-reference to it, which is the alias, its kind and ``from_home = true``, and nothing else,
-since everything else is either a secret or a detail of one person's machine. That
-reference is what makes a repository self describing: a teammate who clones it can see
+account, since a connection detail belongs to the machine. The project's ``.letify`` gets the
+alias as an empty table, and nothing else, since everything else is either a secret or a
+detail of one person's machine. Naming the alias is what makes the account available in the
+project, and it is what makes a repository self describing: a teammate who clones it can see
 which accounts it needs and run this command for them.
 
 No credential is written to either file. A token goes to the OS keyring. An SSH password is
@@ -386,10 +386,13 @@ def log_in(answers: Answers, *, project: str | Path | None = None) -> tuple[bool
         options = FLOWS[answers.kind](answers)
         writer.update(home, answers.alias, options, private=True)
 
-    # The reference carries no connection detail, so it is safe in a repository.
-    reference = {"kind": answers.kind, "from_home": True}
+    # An empty table names the account and carries no connection detail, so it is safe in a
+    # repository. A table that is already there is left alone, because the project may have
+    # overridden settings in it.
     target = project_path(project)
-    writer.update(target, answers.alias, reference)
+    existing_project = target.read_text(encoding="utf-8") if target.is_file() else ""
+    if not writer.has_block(existing_project, answers.alias):
+        writer.update(target, answers.alias, {})
     return fresh, home, target
 
 

@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 import sys
+import tomllib
 from pathlib import Path
 
 import pytest
@@ -247,7 +248,8 @@ def test_logging_in_writes_the_account_at_home_and_a_reference_in_the_project(
     assert "researcher" in home_file
 
     project_file = (isolated_home / ".letify").read_text(encoding="utf-8")
-    assert "from_home = true" in project_file
+    # Naming the alias is what makes the account available here, so the table is empty.
+    assert tomllib.loads(project_file) == {"lab": {}}
     assert "gpu.example.edu" not in project_file
     assert "researcher" not in project_file
 
@@ -260,7 +262,7 @@ def test_an_account_already_set_up_gets_only_the_reference(isolated_home, capsys
     assert main(["login", "shell", "lab", "--no-input"]) == 0
     out = capsys.readouterr().out
     assert "already" in out
-    assert "from_home = true" in (isolated_home / ".letify").read_text(encoding="utf-8")
+    assert tomllib.loads((isolated_home / ".letify").read_text(encoding="utf-8")) == {"lab": {}}
 
 
 def test_declaring_an_account_with_nothing_to_connect_to_is_refused(isolated_home, capsys) -> None:
@@ -343,7 +345,7 @@ def test_logging_out_takes_the_account_and_its_keyring_entry(
     assert main(["logout", "e"]) == 0
     assert "[e]" not in (Path.home() / ".letify").read_text(encoding="utf-8")
     assert ("letify", "e") not in keyring_store.stored
-    assert "from_home = true" in (isolated_home / ".letify").read_text(encoding="utf-8")
+    assert "e" in tomllib.loads((isolated_home / ".letify").read_text(encoding="utf-8"))
 
 
 def test_logging_out_of_an_account_this_machine_never_had_says_so(isolated_home, capsys) -> None:

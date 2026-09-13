@@ -37,7 +37,7 @@ The decorator takes `device`, `host`, `lifetime`, `env`, `volumes`, `timeout`, `
 
 `lifetime` is how long the session lives. `"call"`, the default, ends it when the call finishes. `"process"` keeps it, so a run of separate calls does not pay session start each time.
 
-All three accept the plain lowercase string. `Host` and `Lifetime` are string enums, so `host=letify.Host.remote` and `host="remote"` are the same thing. An unrecognized value raises at declaration time with both options named.
+`host` takes `letify.local` or `letify.remote`, which are the two members of a string enum defined next to `Instance`. The enum class itself is not part of the public surface: two named values say everything a declaration needs, and a class at the top of the package was one more name to learn for the same two choices. Because the members are strings, `host="remote"` is the same value. `lifetime` takes `"call"` or `"process"`. An unrecognized value raises at declaration time with both options named.
 
 ### Invocation
 
@@ -399,7 +399,23 @@ Colab is reached through the Colab CLI: `colab new` and `colab stop` for the ses
 
 > Accounts live in the home file, project defaults live in the repository file, secrets live in neither.
 
-`~/.letify` holds accounts and connection details, which belong to the machine. The project's `.letify` holds defaults that are safe to commit. The project file refines what the home file declared, so a repository can be cloned by someone else and run under their own accounts.
+`~/.letify` holds accounts and connection details, which belong to the machine. The project's `.letify` holds defaults that are safe to commit, and names which of those accounts the project uses.
+
+### The two files <!-- id: two-files -->
+
+> The home file is the set of accounts this machine has. The project file chooses from it and may override it. An account the project does not name is not available in that project.
+
+An account in `~/.letify` is available in a project in exactly three cases:
+
+1. **The project file names it.** A table with the same alias, even an empty one, is enough: `[colab_pro]` on its own makes the home account `colab_pro` available with all of its settings.
+2. **The home entry is global.** `global = true` in the home entry makes the account available in every project, including one with no `.letify` at all. It is how an account meant for everything, such as a personal Colab, avoids being named in every repository.
+3. **It is `local`.** The local machine is always available and never needs a declaration.
+
+Every other home account does not exist as far as that project is concerned: `let.providers.<alias>` raises `UnknownProvider`, it is absent from `let.providers.aliases`, and `let.providers.any` never resolves to it.
+
+When the project file names an account, its fields override the home entry's field by field. Fields the project does not set come from the home entry, including `kind`. A project table that sets `kind` itself is a complete declaration and needs no home entry, which is how an account with no connection details, such as a second `local`, is declared in the repository. A project table with no `kind` whose alias the home file does not have is a configuration error naming `letify login`, because there is nothing to take the kind from.
+
+`global` is read from the home file only. A project cannot make an account global, because a repository deciding what every other repository on the machine can reach is the wrong direction.
 
 An alias must be a Python identifier, because providers are reached by attribute access. `any`, `devices` and `active` are reserved. Declaration order sets the priority for `let.providers.any`.
 
@@ -445,7 +461,7 @@ The older `gpus = ["A100", "H100"]` list still works and means one of each, with
 
 `~/.letify` gets the account: the address, the user, the key path, the zone, whatever that kind of provider needs to connect. This file belongs to the machine and is never in a repository, so it is where a connection detail may live. It is created with owner-only permissions where the platform has them.
 
-The project's `.letify` gets a reference: the alias, its kind, and `from_home = true`. Nothing else, because everything else is either a secret or a detail of one person's machine. The reference is what makes the repository self describing: a teammate who clones it can run `letify login` for the aliases it names and nothing else has to be explained. A reference to an alias the home file does not declare is a configuration error naming the command that fixes it.
+The project's `.letify` gets the alias as an empty table, `[colab_pro]`. Nothing else, because everything else is either a secret or a detail of one person's machine, and naming the alias is what makes the account available in the project. That table is what makes the repository self describing: a teammate who clones it can run `letify login` for the aliases it names and nothing else has to be explained. A named alias the home file does not declare is a configuration error naming the command that fixes it.
 
 An account that is already in the home file is not asked for again. `letify login lab` in a second repository writes only the reference, which is the common case: the account was set up once and every project since then just needs to name it.
 

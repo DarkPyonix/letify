@@ -7,7 +7,7 @@ Declare what a function needs and it runs there:
     let = letify.Launcher()
     colab = let.providers.colab_a
 
-    @let.function(device=colab.G4, host=letify.Host.remote)
+    @let.function(device=colab.G4, host=letify.remote)
     def train(lr, bs):
         ...
 
@@ -49,6 +49,14 @@ from .launcher import Launcher, Providers
 from .protocol.handle import Blob, Handle, RemoteFile
 from .store.volume import Volume
 
+#: Where a declaration's host code runs. Two named values rather than the enum class that holds
+#: them, because a declaration only ever needs one of the two.
+local = Host.local
+remote = Host.remote
+
+# The enum class stays importable from letify.declare.instance for letify's own use.
+del Host
+
 __version__ = "1.0.0"
 
 __all__ = [
@@ -59,7 +67,6 @@ __all__ = [
     "Function",
     "Handle",
     "HandleScopeError",
-    "Host",
     "Instance",
     "Launcher",
     "LetifyError",
@@ -78,5 +85,7 @@ __all__ = [
     "Volume",
     "__version__",
     "grid",
+    "local",
+    "remote",
     "zip",
 ]

@@ -22,75 +22,90 @@ from .secrets import from_keyring, resolve_secret
 
 CONFIG_NAME = ".letify"
 
-#: A project entry carrying this and nothing else is a reference to an account in the home
-#: file, written by ``letify login``. It is not a connection detail and never reaches a
-#: provider.
-REFERENCE_FIELD = "from_home"
+#: A home entry with this set to true is available in every project, including one with no
+#: ``.letify``. Read from the home file only, because a repository must not decide what every
+#: other repository on the machine can reach.
+GLOBAL_FIELD = "global"
+
+#: Fields that say where an account applies rather than how to connect to it.
+_MARKERS = frozenset({"kind", GLOBAL_FIELD, "from_home"})
 
 
 def load(path: str | Path | None = None, *, home: bool = True) -> Config:
-    """Read the configuration files and merge them.
+    """Read the configuration files and decide which accounts this project can use.
+
+    The home file is the set of accounts this machine has. The project file chooses from it:
+    an account is available when the project names its alias, when the home entry says
+    ``global = true``, or when it is ``local``. A named alias takes every home setting,
+    ``kind`` included, and the project's own fields override them one by one.
 
     ``path`` overrides the project file. Set ``home`` to false to ignore ``~/.letify``,
     which is what tests do to stay isolated from the developer's own accounts.
     """
     config = Config()
-    files: list[Path] = []
-    if home:
-        files.append(Path.home() / CONFIG_NAME)
-    files.append(Path(path) if path else Path.cwd() / CONFIG_NAME)
+    home_path = Path.home() / CONFIG_NAME
+    project_path = Path(path) if path else Path.cwd() / CONFIG_NAME
+
+    home_entries = _read_entries(home_path, config, require_kind=True) if home else {}
+    project_entries = _read_entries(project_path, config, require_kind=False)
 
     counter = 0
-    # Aliases the project file expects to find in the home file, so a reference to an
-    # account this machine does not have can name the command that fixes it.
-    referenced: dict[str, tuple[str, Path]] = {}
-    declared: set[str] = set()
-    home_file = files[0] if home else None
-    for file in files:
-        if not file.is_file():
-            continue
-        config.sources.append(file)
-        raw = _parse(file)
 
-        defaults = raw.pop("defaults", None)
-        if isinstance(defaults, dict):
-            config.defaults.update(defaults)
+    def add(alias: str, kind: str, options: dict[str, Any]) -> None:
+        nonlocal counter
+        config.providers[alias] = ProviderConfig(alias, kind, options, counter)
+        counter += 1
 
-        for alias, body in raw.items():
-            if not isinstance(body, dict):
-                continue
-            _check_alias(alias, file)
-            kind = body.get("kind")
-            if not isinstance(kind, str):
-                raise ConfigError(f"{file}: provider {alias!r} has no 'kind' field")
-            options = {
-                key: value for key, value in body.items() if key not in ("kind", REFERENCE_FIELD)
-            }
-            if body.get(REFERENCE_FIELD) is True:
-                referenced.setdefault(alias, (kind, file))
-            if file == home_file:
-                declared.add(alias)
-            existing = config.providers.get(alias)
-            if existing is None:
-                config.providers[alias] = ProviderConfig(alias, kind, options, counter)
-                counter += 1
-            else:
-                # The project file refines what the home file declared.
-                existing.kind = kind
-                existing.options.update(options)
+    for alias, body in project_entries.items():
+        base = home_entries.get(alias, {})
+        kind = body.get("kind", base.get("kind"))
+        if not isinstance(kind, str):
+            raise ConfigError(
+                f"{project_path}: {alias!r} names an account that ~/.letify does not have. "
+                f"Run 'letify login <kind> {alias}' to declare it on this machine, or give "
+                f"the table a 'kind' to declare it here."
+            )
+        add(alias, kind, {**_settings(base), **_settings(body)})
 
-    for alias, (kind, file) in referenced.items():
-        if alias in declared:
-            continue
-        raise ConfigError(
-            f"{file}: {alias!r} refers to an account in ~/.letify that is not there. "
-            f"Run 'letify login {kind} {alias}' to declare it on this machine."
-        )
+    for alias, body in home_entries.items():
+        if alias not in config.providers and body.get(GLOBAL_FIELD) is True:
+            add(alias, body["kind"], _settings(body))
 
     # The local machine is always available and needs no declaration.
     if "local" not in config.providers:
-        config.providers["local"] = ProviderConfig("local", "local", {}, counter)
+        add("local", "local", {})
     return config
+
+
+def _read_entries(file: Path, config: Config, *, require_kind: bool) -> dict[str, dict[str, Any]]:
+    """Read one file's provider tables in order, folding its defaults into the config."""
+    if not file.is_file():
+        return {}
+    config.sources.append(file)
+    raw = _parse(file)
+
+    defaults = raw.pop("defaults", None)
+    if isinstance(defaults, dict):
+        config.defaults.update(defaults)
+
+    entries: dict[str, dict[str, Any]] = {}
+    for alias, body in raw.items():
+        if not isinstance(body, dict):
+            continue
+        _check_alias(alias, file)
+        if require_kind and not isinstance(body.get("kind"), str):
+            raise ConfigError(f"{file}: provider {alias!r} has no 'kind' field")
+        entries[alias] = body
+    return entries
+
+
+def _settings(body: dict[str, Any]) -> dict[str, Any]:
+    """The fields that configure a provider, without the ones that only say where it applies.
+
+    ``from_home`` is what letify 1.0.0 wrote into a project file, and it still reads as
+    naming the alias, which is all it ever meant.
+    """
+    return {key: value for key, value in body.items() if key not in _MARKERS}
 
 
 def _parse(file: Path) -> dict[str, Any]:
@@ -116,7 +131,7 @@ def _check_alias(alias: str, file: Path) -> None:
 
 __all__ = [
     "CONFIG_NAME",
-    "REFERENCE_FIELD",
+    "GLOBAL_FIELD",
     "RESERVED_ALIASES",
     "Config",
     "ProviderConfig",

@@ -584,15 +584,20 @@ def test_a_session_started_early_is_the_one_the_first_call_uses(let, remote_cpu,
     assert let.pool.live == [started]
 
 
-def test_a_process_lifetime_runtime_survives_a_release(let, remote_cpu) -> None:
+def test_a_process_lifetime_runtime_survives_a_release(launcher_from) -> None:
+    # Two CPU slots, because the kept runtime holds one for the rest of the process and the
+    # call lifetime runtime below has a different environment, so it needs a slot of its own.
+    let = launcher_from('[box]\nkind = "local"\n[box.devices]\nCPU = { count = 2 }\n')
+    instance = let.provider("box").CPU.on_host("remote")
     pool = let.pool
-    runtime = pool.acquire(remote_cpu, Env(), lifetime=Lifetime.process)
+    runtime = pool.acquire(instance, Env(), lifetime=Lifetime.process)
     pool.release(runtime)
     assert pool.live == [runtime]
     # A call lifetime runtime is the other half: its release is its end.
-    other = pool.acquire(remote_cpu, Env(lock="other.lock"))
+    other = pool.acquire(instance, Env(lock="other.lock"))
     pool.release(other)
     assert pool.live == [runtime]
+    pool.shutdown()
 
 
 def test_shutdown_takes_everything_including_a_runtime_still_marked_busy(let, remote_cpu) -> None:
