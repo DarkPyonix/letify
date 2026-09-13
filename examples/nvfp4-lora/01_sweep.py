@@ -45,41 +45,40 @@ def main() -> int:
     space = letify.grid(lr=[1e-4, 3e-4, 1e-3], rank=[8, 32]).with_fixed(steps=arguments.steps)
     print(f"{len(space)} points")
 
-    # lifetime='process' keeps the session between points, so the second point pays nothing
-    # for setup. Without it each point would start and stop its own session, and on a
-    # provider that bills by the second the setup would cost more than the training. How many
-    # sessions exist at once is the provider's inventory, not a number here.
+    # The keep_alive block below keeps the session between points, so the second point pays
+    # nothing for setup, and keeps it long enough to pull the best adapter out afterwards. How
+    # many sessions exist at once is the provider's inventory, not a number here.
     train = let.function(
         device=instance,
         host=arguments.host,
         env=common.ENV,
         volumes=[cache],
-        lifetime="process",
         timeout=3600,
         retries=1,
     )(recipe.train)
 
-    results = train(space)
+    with let.keep_alive():
+        results = train(space)
 
-    print()
-    print(recipe.summarize(results))
-    recipe.write_report(results, "sweep-report.json")
-    print("\nwrote sweep-report.json")
+        print()
+        print(recipe.summarize(results))
+        recipe.write_report(results, "sweep-report.json")
+        print("\nwrote sweep-report.json")
 
-    # The session is still warm, and it is the one holding the adapters, which is what makes
-    # a checkpoint something that can be pulled out after the calls are done.
-    best = min(results, key=lambda row: row["final_loss"])
-    # The declaration is what is named, not a session. Which session ran the calls is
-    # letify's answer, and it is the only one holding the adapter.
-    digest = cache.absorb(train, best["adapter"], f"{arguments.tag}-best")
-    print(
-        f"kept the best adapter (rank {best['rank']}, lr {best['lr']:g}, "
-        f"loss {best['final_loss']:.4f}) as {arguments.tag}-best at {digest[:12]}"
-    )
+        # The session is still warm, and it is the one holding the adapters, which is what makes
+        # a checkpoint something that can be pulled out after the calls are done.
+        best = min(results, key=lambda row: row["final_loss"])
+        # The declaration is what is named, not a session. Which session ran the calls is
+        # letify's answer, and it is the only one holding the adapter.
+        digest = cache.absorb(train, best["adapter"], f"{arguments.tag}-best")
+        print(
+            f"kept the best adapter (rank {best['rank']}, lr {best['lr']:g}, "
+            f"loss {best['final_loss']:.4f}) as {arguments.tag}-best at {digest[:12]}"
+        )
 
-    # Nothing to release. The session ends with this process, and the lease means it would
-    # end itself even if this process were killed.
-    print(f"\n{let.status()['live']} session(s) live; they end with this process")
+    # Nothing to release. Leaving the keep_alive block ended the session, and the lease would
+    # have ended it even if this process had been killed.
+    print(f"\n{let.status()['live']} session(s) live after the block")
     return 0
 
 
