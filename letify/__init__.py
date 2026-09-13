@@ -35,6 +35,7 @@ from .declare.sweep import zip_ as zip
 from .errors import (
     ConfigError,
     HandleScopeError,
+    InsufficientDevices,
     LetifyError,
     ProtocolError,
     ProviderUnavailable,
@@ -68,6 +69,7 @@ __all__ = [
     "Handle",
     "HandleScopeError",
     "Instance",
+    "InsufficientDevices",
     "Launcher",
     "LetifyError",
     "ProtocolError",

@@ -83,8 +83,7 @@ def test_two_aliases_that_would_share_a_name_are_told_apart_in_order(project) ->
 
 def test_each_alias_subclasses_its_kind_and_names_its_accelerators(project) -> None:
     project(
-        '[colab_pro]\nkind = "colab"\n'
-        '[lab_a100]\nkind = "shell"\naddress = "h"\ngpus = ["A100"]\n'
+        '[colab_pro]\nkind = "colab"\n[lab_a100]\nkind = "shell"\naddress = "h"\ngpus = ["A100"]\n'
     )
     text = stubs.render(letify.Launcher())
     found = classes(text)

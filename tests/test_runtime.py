@@ -798,3 +798,58 @@ def test_a_call_waits_for_a_card_rather_than_asking_for_a_refusal(launcher_from)
         assert wait_a_moment() == 1
         assert let.status()["live"] == 1
         started.set()
+
+
+# -- Spec: Pooling, devices that cannot be allocated ------------------------------
+
+
+def test_a_card_held_by_an_idle_kept_session_cannot_be_allocated(launcher_from) -> None:
+    # The only card is kept by an idle session the block is holding, and a call with a different
+    # environment needs a card of its own. Nothing running would free it, so waiting would
+    # never end.
+    let = launcher_from('[one]\nkind = "local"\n[one.devices]\nCPU = { count = 1 }\n')
+    card = let.provider("one").CPU
+
+    @let.function(device=card, host=letify.remote)
+    def prepare() -> int:
+        return 1
+
+    @let.function(device=card, host=letify.remote, env=Env().vars(STAGE="evaluate"), retries=2)
+    def evaluate() -> int:
+        return 2
+
+    with let.keep_alive():
+        assert prepare() == 1
+        started = time.monotonic()
+        with pytest.raises(letify.InsufficientDevices, match="keep_alive"):
+            evaluate()
+        # Raised at once rather than after a wait, and not retried.
+        assert time.monotonic() - started < 5
+        assert let.status()["live"] == 1
+
+
+def test_asking_for_more_cards_than_the_account_has_is_refused_at_once(launcher_from) -> None:
+    let = launcher_from('[one]\nkind = "local"\n[one.devices]\nCPU = { count = 1 }\n')
+
+    @let.function(device=let.provider("one").CPU * 2, host=letify.remote)
+    def wide() -> int:
+        return 1
+
+    with pytest.raises(letify.InsufficientDevices, match="2"):
+        wide()
+
+
+def test_cards_another_process_is_using_cannot_be_allocated(reserving, patch_smi) -> None:
+    # letify cannot know when someone else's job ends, so there is nothing to wait for.
+    provider = reserving(A100={"indices": "0"})
+    patch_smi(busy=[0])
+    pool = RuntimePool()
+    with pytest.raises(letify.InsufficientDevices, match="another process"):
+        pool.acquire(provider.A100._placed("remote"), Env())
+    assert pool.live == []
+
+
+def test_devices_that_cannot_be_allocated_are_not_an_infrastructure_failure() -> None:
+    # A retry asks for the same devices from the same inventory, so it is never retried.
+    assert issubclass(letify.InsufficientDevices, letify.LetifyError)
+    assert not issubclass(letify.InsufficientDevices, letify.RuntimeFailure)

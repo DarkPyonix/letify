@@ -22,7 +22,7 @@ import uuid
 from collections.abc import Sequence
 from typing import TYPE_CHECKING
 
-from ..errors import LetifyError
+from ..errors import InsufficientDevices, LetifyError
 
 if TYPE_CHECKING:
     from ..declare.env import Env
@@ -85,8 +85,7 @@ class RuntimePool:
         env: Env,
         volumes: Sequence[Volume] = (),
     ) -> Runtime:
-        """Return a runtime for this declaration, starting one if a slot is free.
-        """
+        """Return a runtime for this declaration, starting one if a slot is free."""
         key = f"{instance.key}|{env.key}"
         while True:
             with self._guard:
@@ -108,10 +107,57 @@ class RuntimePool:
                         self._free.notify_all()
                     raise
 
-            # Every card this instance could use is taken. Wait for a session to give some
-            # back rather than asking the provider for a machine it would refuse.
+            # Every card this instance could use is taken. That is worth waiting for only while a
+            # session here is serving a call on one, because it gives the card back when the call
+            # finishes. Otherwise nothing running would free a card, and waiting would never end.
             with self._free:
-                self._free.wait(timeout=POLL_INTERVAL)
+                if any(not runtime.busy for runtime in self._runtimes.get(key, ())):
+                    continue
+                reason = self._unallocatable(instance)
+                if reason is None:
+                    self._free.wait(timeout=POLL_INTERVAL)
+                    continue
+            raise InsufficientDevices(reason)
+
+    def _unallocatable(self, instance: Instance) -> str | None:
+        """Why the devices cannot be allocated, or ``None`` when a busy session will free one.
+
+        Called with the pool guard held, after a reservation failed.
+        """
+        provider = instance.provider
+        name = instance.accelerator
+        try:
+            declared = provider.devices_of(name).count
+        except LetifyError:
+            declared = None
+        if declared is not None and instance.devices > declared:
+            return (
+                f"{instance!r} asks for {instance.devices} {name} but {provider.alias} declares "
+                f"{declared}, so it can never be allocated. Ask for fewer, or declare more in "
+                f"the account's devices table."
+            )
+
+        holders = [
+            runtime
+            for bucket in self._runtimes.values()
+            for runtime in bucket
+            if runtime.provider is provider
+            and runtime.instance.accelerator.casefold() == name.casefold()
+        ]
+        if any(runtime.busy for runtime in holders):
+            return None
+        if holders:
+            names = ", ".join(runtime.name for runtime in holders)
+            return (
+                f"every {name} on {provider.alias} is held by a session that is idle but kept by "
+                f"let.keep_alive() ({names}), and this call needs a session with a different "
+                f"environment. Nothing running would free a card. Make the call outside the "
+                f"block, or give {provider.alias} more {name} in its devices table."
+            )
+        return (
+            f"no {name} on {provider.alias} can be allocated: the cards it may use are taken by "
+            f"another process, and letify cannot know when that process ends."
+        )
 
     def release(self, runtime: Runtime) -> None:
         """Give a runtime back. It ends here unless the pool is held."""

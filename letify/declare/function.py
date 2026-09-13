@@ -136,9 +136,7 @@ class Function(Generic[R]):
         last: Exception | None = None
 
         for attempt in range(self.retries + 1):
-            runtime = launcher.pool.acquire(
-                instance, self.env, self.volumes
-            )
+            runtime = launcher.pool.acquire(instance, self.env, self.volumes)
             try:
                 value, logs = runtime.call(
                     self.fn,

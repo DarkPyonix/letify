@@ -84,6 +84,16 @@ class HandleScopeError(LetifyError):
     """
 
 
+class InsufficientDevices(LetifyError):
+    """The devices a call needs cannot be allocated, and nothing running would free them.
+
+    Raised instead of waiting when every holder of the accelerator is an idle session kept by
+    ``let.keep_alive()``, when the cards are taken by another process, or when a call asks for
+    more devices than the account declares. Not retried, because a retry asks for the same
+    devices from the same inventory.
+    """
+
+
 class UnsupportedMode(LetifyError):
     """The requested execution mode cannot work on this provider.
 

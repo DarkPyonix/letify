@@ -306,7 +306,7 @@ def test_a_project_cannot_make_an_account_global(home_file, config_file) -> None
     # Only the home file decides what every repository on the machine can reach, so the
     # marker is not read from a project and does not reach the provider.
     home_file('[lab]\nkind = "shell"\naddress = "gpu.example.edu"\n')
-    config = load(config_file('[lab]\nglobal = true\n'))
+    config = load(config_file("[lab]\nglobal = true\n"))
     assert config.providers["lab"].option("global") is None
 
 
