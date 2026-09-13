@@ -5,14 +5,13 @@ from __future__ import annotations
 from .bootstrap import env_archive_path, install_source, sync_lock_source
 from .channel import Channel, OneShotChannel, PersistentChannel
 from .lease import GRACE, INTERVAL, Lease
-from .pool import DEFAULT_IDLE_TIMEOUT, REAP_INTERVAL, RuntimePool
+from .pool import POLL_INTERVAL, RuntimePool
 from .session import Runtime
 
 __all__ = [
-    "DEFAULT_IDLE_TIMEOUT",
     "GRACE",
     "INTERVAL",
-    "REAP_INTERVAL",
+    "POLL_INTERVAL",
     "Channel",
     "Lease",
     "OneShotChannel",

@@ -32,7 +32,7 @@ from letify.protocol.worker import BOOTSTRAP
 from letify.runtime import bootstrap, telemetry
 from letify.runtime.channel import OneShotChannel, PersistentChannel
 from letify.runtime.lease import GRACE, INTERVAL, Lease
-from letify.runtime.pool import DEFAULT_IDLE_TIMEOUT, RuntimePool
+from letify.runtime.pool import POLL_INTERVAL, RuntimePool
 from letify.store.volume import Volume
 
 
@@ -465,11 +465,15 @@ def test_a_lease_stops_renewing_once_the_session_is_gone(renewal_recorder) -> No
 # -- Spec: Pooling -------------------------------------------------------------
 
 
-def test_the_pool_has_no_ceiling_of_its_own() -> None:
-    # A number here would be a guess about hardware the provider entry already describes,
-    # and when the two disagreed the smaller would win silently.
-    assert not hasattr(RuntimePool(), "max_runtimes")
-    assert DEFAULT_IDLE_TIMEOUT == 600.0
+def test_the_pool_has_no_ceiling_and_no_timer() -> None:
+    # A ceiling would be a guess about hardware the provider entry already describes. A timer
+    # would overrule a declaration that said to keep the session.
+    pool = RuntimePool()
+    assert not hasattr(pool, "max_runtimes")
+    assert not hasattr(pool, "idle_timeout")
+    # The one interval left is how long a call waiting for a card sleeps between looks, which
+    # bounds nothing except how long a lost notification goes unnoticed.
+    assert POLL_INTERVAL == 30.0
 
 
 def test_a_call_that_finds_every_card_taken_waits_for_one_to_come_free(
@@ -549,12 +553,24 @@ def test_a_held_invocation_keeps_released_runtimes_until_the_last_hold_goes(
     assert pool.live == []
 
 
-def test_a_runtime_idle_past_the_timeout_is_reaped(let, remote_cpu) -> None:
-    let.pool.idle_timeout = 0.0
+def test_a_declared_session_is_not_ended_on_a_timer(let, remote_cpu) -> None:
+    # lifetime="process" declares that the session lives for the process. A thread ending it
+    # after some idle period overrules the declaration it was given, which is the same
+    # mistake as keeping one alive on the chance a call arrives.
     runtime = let.pool.acquire(remote_cpu, Env(), lifetime=Lifetime.process)
     let.pool.release(runtime)
-    assert let.reap_idle() == [runtime.name]
-    assert let.pool.live == []
+    assert let.pool.live == [runtime]
+
+    assert not hasattr(let, "idle_timeout")
+    assert not hasattr(let, "reap_idle")
+    assert not hasattr(let.pool, "idle_timeout")
+    assert not hasattr(let.pool, "shutdown_idle")
+    assert [t.name for t in threading.enumerate() if "reap" in t.name] == []
+    with pytest.raises(TypeError):
+        letify.Launcher(idle_timeout=1.0)
+
+    # It still goes at process exit, which is what the registered shutdown does.
+    assert let.pool.shutdown() == [runtime.name]
 
 
 def test_a_session_started_early_is_the_one_the_first_call_uses(let, remote_cpu, live) -> None:
@@ -568,15 +584,15 @@ def test_a_session_started_early_is_the_one_the_first_call_uses(let, remote_cpu,
     assert let.pool.live == [started]
 
 
-def test_a_process_lifetime_runtime_survives_a_release_but_not_an_explicit_sweep(
-    let, remote_cpu
-) -> None:
+def test_a_process_lifetime_runtime_survives_a_release(let, remote_cpu) -> None:
     pool = let.pool
     runtime = pool.acquire(remote_cpu, Env(), lifetime=Lifetime.process)
     pool.release(runtime)
-    assert pool.shutdown_idle() == []
     assert pool.live == [runtime]
-    assert pool.shutdown_idle(every=True) == [runtime.name]
+    # A call lifetime runtime is the other half: its release is its end.
+    other = pool.acquire(remote_cpu, Env(lock="other.lock"))
+    pool.release(other)
+    assert pool.live == [runtime]
 
 
 def test_shutdown_takes_everything_including_a_runtime_still_marked_busy(let, remote_cpu) -> None:

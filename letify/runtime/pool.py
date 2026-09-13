@@ -14,9 +14,16 @@ calls in a row are cheaper with one session than with several.
 itself with it so that a search space, which is many calls, starts its runtimes once and
 releases them when the last point finishes.
 
-Two backstops cover a process-lifetime runtime nobody uses any more. A reaper thread tears down
-runtimes idle past the timeout, and each runtime's lease makes the remote worker exit if
-this process stops renewing.
+Nothing ends a runtime on a timer. ``lifetime="process"`` declares that the session lives
+for the process, and a thread ending it after some idle period would overrule the
+declaration it was given, which is the same mistake as keeping one alive on the chance a
+call arrives. It goes at process exit.
+
+The one thing that is not a timer on the work is the lease: a killed process cannot say
+anything to anybody, so the worker holds a deadline and exits if this process stops pushing
+it forward. That releases the occupancy. Whether it also stops the billing depends on the
+provider, and the providers that charge for the machine rather than the process say so for
+themselves.
 """
 
 from __future__ import annotations
@@ -36,11 +43,10 @@ if TYPE_CHECKING:
     from ..store.volume import Volume
     from .session import Runtime
 
-#: How long a held runtime may sit unused before the reaper tears it down.
-DEFAULT_IDLE_TIMEOUT = 600.0
-
-#: How often the reaper looks.
-REAP_INTERVAL = 30.0
+#: How long a call waits for a card before looking again. Not a deadline on anything: the
+#: wait ends as soon as a session gives devices back, and this only bounds how long a lost
+#: notification can go unnoticed.
+POLL_INTERVAL = 30.0
 
 
 class RuntimePool:
@@ -53,20 +59,12 @@ class RuntimePool:
     would win silently.
     """
 
-    def __init__(
-        self,
-        *,
-        idle_timeout: float = DEFAULT_IDLE_TIMEOUT,
-        on_start: object | None = None,
-    ):
-        self.idle_timeout = idle_timeout
+    def __init__(self, *, on_start: object | None = None):
         self.on_start = on_start
         self._runtimes: dict[str, list[Runtime]] = {}
         self._guard = threading.RLock()
         self._free = threading.Condition(self._guard)
         self._hold_depth = 0
-        self._reaper: threading.Thread | None = None
-        self._stop_reaper = threading.Event()
 
     # -- holding -------------------------------------------------------------
 
@@ -90,7 +88,7 @@ class RuntimePool:
             self._hold_depth = max(0, self._hold_depth - 1)
             closing = self._hold_depth == 0
         if closing:
-            self.shutdown_idle()
+            self.release_call_lifetimes()
 
     # -- acquisition ---------------------------------------------------------
 
@@ -133,7 +131,7 @@ class RuntimePool:
             # Every card this instance could use is taken. Wait for a session to give some
             # back rather than asking the provider for a machine it would refuse.
             with self._free:
-                self._free.wait(timeout=REAP_INTERVAL)
+                self._free.wait(timeout=POLL_INTERVAL)
 
     def release(self, runtime: Runtime) -> None:
         """Give a runtime back. It ends here unless its lifetime says otherwise."""
@@ -185,52 +183,20 @@ class RuntimePool:
         runtime.lifetime = lifetime
         with self._guard:
             self._runtimes.setdefault(key, []).append(runtime)
-        self._ensure_reaper()
         return runtime
 
-    # -- upkeep --------------------------------------------------------------
+    def release_call_lifetimes(self) -> list[str]:
+        """End the runtimes whose lifetime was the call, now that the invocation is over.
 
-    def _ensure_reaper(self) -> None:
-        if self._reaper is not None:
-            return
-        self._stop_reaper.clear()
-        self._reaper = threading.Thread(target=self._reap_loop, name="letify-reaper", daemon=True)
-        self._reaper.start()
-
-    def _reap_loop(self) -> None:
-        while not self._stop_reaper.wait(REAP_INTERVAL):
-            self.reap_idle()
-            with self._guard:
-                if self._count == 0:
-                    self._reaper = None
-                    return
-
-    def reap_idle(self) -> list[str]:
-        """Shut down runtimes that have been idle past the timeout."""
-        with self._guard:
-            candidates = [
-                runtime
-                for bucket in self._runtimes.values()
-                for runtime in bucket
-                if not runtime.busy and runtime.idle_for > self.idle_timeout
-            ]
-        stopped = []
-        for runtime in candidates:
-            self.discard(runtime)
-            stopped.append(runtime.name)
-        return stopped
-
-    def shutdown_idle(self, *, every: bool = False) -> list[str]:
-        """Shut down runtimes that are not running a call.
-
-        A runtime whose lifetime is the process is left alone unless ``every`` is set.
+        A runtime declared for the process is left alone. This is not a timer: it runs when
+        the work that needed the session finishes, which is the moment the declaration named.
         """
         with self._guard:
             candidates = [
                 runtime
                 for bucket in self._runtimes.values()
                 for runtime in bucket
-                if not runtime.busy and (every or runtime.lifetime is not Lifetime.process)
+                if not runtime.busy and runtime.lifetime is not Lifetime.process
             ]
         stopped = []
         for runtime in candidates:
@@ -239,15 +205,18 @@ class RuntimePool:
         return stopped
 
     def shutdown(self) -> list[str]:
-        """Shut everything down, including runtimes still marked busy."""
+        """Shut everything down, including runtimes still marked busy.
+
+        Registered at process exit, which is the one moment everything goes.
+        """
         with self._guard:
             everything = [r for bucket in self._runtimes.values() for r in bucket]
             self._runtimes.clear()
-            self._count = 0
             self._hold_depth = 0
-        self._stop_reaper.set()
-        self._reaper = None
         for runtime in everything:
+            runtime.provider.unreserve(
+                runtime.instance.accelerator, runtime.held_devices, runtime.instance.devices
+            )
             try:
                 runtime.shutdown()
             except LetifyError:
@@ -256,10 +225,12 @@ class RuntimePool:
             self._free.notify_all()
         return [r.name for r in everything]
 
+    # -- upkeep --------------------------------------------------------------
+
     @property
     def live(self) -> list[Runtime]:
         with self._guard:
             return [r for bucket in self._runtimes.values() for r in bucket]
 
 
-__all__ = ["DEFAULT_IDLE_TIMEOUT", "REAP_INTERVAL", "RuntimePool"]
+__all__ = ["POLL_INTERVAL", "RuntimePool"]

@@ -74,7 +74,9 @@ Runtimes are pooled by instance and environment, so two declarations that agree 
 
 ### Teardown with nothing to call
 
-A call ends its own session. `lifetime="process"` keeps it for a run of separate calls. An idle reaper takes what is left, and a heartbeat lease makes the session terminate itself if this process stops renewing, so a crashed script cannot leave a GPU billing.
+A call ends its own session. `lifetime="process"` keeps it for a run of separate calls, until the process exits. Nothing ends a session on a timer, because a timer would overrule the declaration that asked to keep it.
+
+A heartbeat lease covers the one case nothing else can: a process killed outright says nothing to anybody. The worker exits on its own, which frees the card. Whether that also stops the billing depends on what the provider charges for, and letify states that per provider rather than implying a guarantee it cannot make. See [docs/SPEC.md](docs/SPEC.md).
 
 There is no release call, no shutdown call and no detached mode. Durability comes from checkpoints in the store rather than from a session that outlives you.
 
@@ -106,7 +108,6 @@ Everything a user needs is on `letify` itself.
 Launcher(
     config=None,        # path to a .letify file; defaults to the project and home files
     name=None,          # session and app name; defaults to the pyproject project name
-    idle_timeout=600,   # seconds a session may sit unused before the reaper takes it
     stream_logs=True,   # print remote stdout to stderr
     announce=True,      # say when a session starts, because that is when money starts
     home=True,          # read ~/.letify
@@ -122,7 +123,6 @@ Launcher(
 | `let.providers.aliases` | Declared aliases, in configuration order |
 | `let.provider(alias)` | Same as attribute access, for a computed alias |
 | `let.function(...)` | Declare a function, returning a decorator |
-| `let.reap_idle()` | Take idle sessions now instead of waiting for the reaper |
 | `let.grid`, `let.zip` | Build a search space |
 | `let.status()` | How many sessions are live and busy against the ceiling, and what each one is |
 | `let.usage(alias=None)` | What is left on each account, or why it is not reported |
@@ -137,7 +137,7 @@ Launcher(
     lifetime="process",    # "call" ends with the call, "process" keeps the session
     env=env,               # an Env; defaults to Env()
     volumes=[cache],       # volumes to attach
-    timeout=3600,          # seconds one call may take
+    timeout=None,          # seconds one call may take; no default deadline
     retries=1,             # retries on infrastructure failure, never on user code failure
     keep_remote=False,     # return a Handle instead of the value
 )
@@ -255,7 +255,6 @@ SSH authenticates by key, because letify opens sessions with `ssh -o BatchMode=y
 ```toml
 [defaults]
 name = "nvfp4"
-idle_timeout = 900
 
 [colab_a]
 kind = "colab"

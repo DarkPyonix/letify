@@ -53,7 +53,7 @@ class Function(Generic[R]):
         env: Env,
         host: Host | str | None = None,
         volumes: Sequence[Volume] = (),
-        timeout: float | None = 3600,
+        timeout: float | None = None,
         retries: int = 1,
         lifetime: Lifetime | str | None = None,
         keep_remote: bool = False,

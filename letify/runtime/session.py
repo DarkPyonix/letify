@@ -10,8 +10,10 @@ nothing. The counter-argument is real and the reason that option exists: startin
 costs provider boot plus environment installation, which on Colab is minutes, so a run of
 several separate calls is cheaper with one session than with several.
 
-Two backstops cover a session nobody uses any more. The idle reaper tears down one that has
-been unused too long, and the lease makes the worker exit if this process stops renewing.
+Nothing ends a session on a timer. The lease is the one thing that ends one without being
+asked, and it is for a process killed outright: the worker holds a deadline and exits if this
+process stops pushing it forward, which frees the card. Whether that also stops the billing
+depends on what the provider charges for.
 """
 
 from __future__ import annotations

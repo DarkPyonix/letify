@@ -332,9 +332,9 @@ Nothing has to be torn down by hand.
 
 **A call ends its own session.** That is the default, and a sweep counts as one call, so six points start one set of sessions and end them once.
 
-**`lifetime="process"` is the opt in**, for a run of separate calls that would otherwise pay session start each time. The idle reaper takes it once it stops being used.
+**`lifetime="process"` is the opt in**, for a run of separate calls that would otherwise pay session start each time. It ends when your process does, because a timer that ended it sooner would overrule what you declared.
 
-**The lease is the backstop.** The session holds a deadline that this process keeps renewing. Kill your script, lose your laptop, crash your kernel: the GPU shuts itself down. The grace period is long enough that a flaky connection does not kill a training run.
+**The lease is the backstop.** The session holds a deadline that this process keeps renewing. Kill your script, lose your laptop, crash your kernel, and the worker exits on its own, which frees the card. The grace period is long enough that a flaky connection does not kill a training run. Whether it also stops the billing depends on what the provider charges for: [docs/guide/06-cost.md](docs/guide/06-cost.md) says which providers are covered and which are not.
 
 > 🚫 There is deliberately **no detached mode**. A detached run whose remote side gets preempted loses its results. Instead, the local process stays the owner, and durability comes from checkpoints in the store.
 

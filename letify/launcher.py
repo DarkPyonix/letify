@@ -46,7 +46,7 @@ from .declare.function import Function
 from .declare.instance import AnyInstance, Host, Instance, Lifetime
 from .declare.sweep import grid, zip_
 from .errors import LetifyError, UnknownInstance, UnknownProvider
-from .runtime.pool import DEFAULT_IDLE_TIMEOUT, RuntimePool
+from .runtime.pool import RuntimePool
 
 if TYPE_CHECKING:
     from .providers.base import Provider
@@ -135,22 +135,17 @@ class Launcher:
         config: str | Path | None = None,
         *,
         name: str | None = None,
-        idle_timeout: float = DEFAULT_IDLE_TIMEOUT,
         stream_logs: bool = True,
         announce: bool = True,
         home: bool = True,
     ):
         self.config: Config = load(config, home=home)
         self.name = name or self.config.defaults.get("name") or _project_name()
-        self.idle_timeout = float(self.config.defaults.get("idle_timeout", idle_timeout))
         self.stream_logs = stream_logs
         self.announce = announce
         self.providers = Providers(self)
         self.functions: list[Function] = []
-        self.pool = RuntimePool(
-            idle_timeout=self.idle_timeout,
-            on_start=self._announce_start,
-        )
+        self.pool = RuntimePool(on_start=self._announce_start)
         self._cache: dict[str, Provider] = {}
         self._guard = threading.Lock()
         self._at_exit_registered = False
@@ -202,7 +197,7 @@ class Launcher:
         host: Host | str | None = None,
         lifetime: Lifetime | str | None = None,
         volumes: Sequence[Volume] = (),
-        timeout: float | None = 3600,
+        timeout: float | None = None,
         retries: int = 1,
         keep_remote: bool = False,
     ) -> Callable[[Callable[..., R]], Function[R]]:
@@ -215,7 +210,7 @@ class Launcher:
 
         ``lifetime`` says how long the session lives. ``"call"``, the default, ends it
         with the call. ``"process"`` keeps it so the next call skips session start, at the
-        cost of an unused session billing until the idle reaper takes it.
+        cost of an unused session billing until the process exits.
 
         There is no width argument. A space runs as wide as the provider has devices for,
         which the provider entry already says.
@@ -262,10 +257,6 @@ class Launcher:
             yield self
         finally:
             self.pool.unhold()
-
-    def reap_idle(self) -> list[str]:
-        """Shut down runtimes idle past the timeout, without waiting for the reaper."""
-        return self.pool.reap_idle()
 
     # -- reporting -----------------------------------------------------------
 

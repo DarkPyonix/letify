@@ -29,8 +29,8 @@ class Lifetime(StrEnum):
 
     ``process`` keeps the session past the call, because starting one costs provider boot
     plus environment installation, which is minutes on Colab and worth avoiding across a
-    run of separate calls. It then ends when the idle reaper takes it or the process
-    exits, whichever comes first.
+    run of separate calls. It then ends when the process exits. Nothing ends it sooner,
+    because a timer would overrule the declaration that asked to keep it.
 
     A string enum, so ``lifetime="process"`` works wherever ``lifetime=Lifetime.process``
     does.

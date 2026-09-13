@@ -75,10 +75,11 @@ session. Both take the declaration rather than a session, because which session 
 is letify's answer and naming a different one would read from a session holding no files. Blobs are immutable and a name is a few dozen bytes, so two sessions writing at once
 cannot lose each other's work: one name wins and both checkpoints remain.
 
-**There is nothing to release.** A call ends its own session, `lifetime="process"` keeps it
-until the process exits or the idle reaper takes it, and a heartbeat lease means a killed
-script cannot leave a GPU billing. Durability is the checkpoint in the store, not a session
-that outlives you.
+**There is nothing to release.** A call ends its own session and `lifetime="process"` keeps
+it until the process exits. Nothing ends one on a timer. A heartbeat lease covers a process
+killed outright, which frees the card; whether it also stops the billing depends on the
+provider, and [docs/guide/06-cost.md](../../docs/guide/06-cost.md) says which. Durability is
+the checkpoint in the store, not a session that outlives you.
 
 ## The two execution modes, and which one to use here
 

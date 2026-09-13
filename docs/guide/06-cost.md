@@ -36,19 +36,32 @@ train(lr=3e-4)        # reuses it
 Two declarations that agree on device and environment share a session either way, because
 the pool keys by those rather than by which function asked.
 
-**3. The idle reaper.** A background thread ends any session unused for longer than
-`idle_timeout`, default 600 seconds. That is the backstop for a process-lifetime session
-nobody uses any more.
+Nothing ends a session on a timer. `lifetime="process"` says it lives for the process,
+and a thread ending it after some idle period would overrule what you declared. It goes when
+your process does.
 
-```python
-let = letify.Launcher(idle_timeout=300)
-```
+**3. The lease.** The session holds a deadline that your process renews every 30 seconds,
+and the worker exits on its own if the deadline passes. The grace period is 300 seconds, so a
+flaky connection does not kill a training run. This is for the one case nothing else covers:
+`kill -9`, the out of memory killer and a power cut all run no code, so a session that ends
+only when asked would never be asked.
 
-**4. The lease.** The session holds a deadline that your process renews every 30 seconds,
-and it terminates itself if the deadline passes. The grace period is 300 seconds, so a
-flaky connection does not kill a training run while a crashed script cannot leave a GPU
-billing. Without this layer, a killed script leaves a session billing until the provider's
-own timeout, which on Colab can be 12 or 24 hours.
+**What that does and does not buy.** The worker exiting releases the card. It does not switch
+off a machine that somebody else's platform is billing you for, because infrastructure cannot
+choose to end itself: something that owns it has to.
+
+| Provider | What you pay for | Your machine is killed |
+|---|---|---|
+| `local` | nothing | the subprocess dies with its parent |
+| `shell`, `tunnel` | nothing; the card is occupied | the worker exits, the card frees |
+| `modal` | the sandbox | **covered.** letify sets a deadline when the sandbox is created and Modal enforces it |
+| `colab` | the runtime | not covered. Colab's own idle policy ends it, which can be 12 or 24 hours |
+| `elice` | the allocation | **not covered.** It bills until something issues the delete |
+
+For the last two, nothing letify does today will end them. Reconciliation on the next run is
+the intended answer and is not built yet, so an Elice allocation left behind by a killed
+machine bills until somebody deletes it. Check the provider's own console after a crash, and
+if you know your machine is about to go down, stop the run yourself first.
 
 ## Why there is no detached mode
 
@@ -80,7 +93,6 @@ Time based saving bounds your loss in wall clock terms, which is what you actual
 let.providers.active        # {'colab_a': ['letify-g4-a1b2c3']}
 let.status()                # counts against the ceiling, then a row per session
 let.pool.live               # the Runtime objects
-let.reap_idle()             # tear down anything past the idle timeout now
 ```
 
 ```bash

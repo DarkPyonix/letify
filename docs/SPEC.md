@@ -25,7 +25,7 @@ def train(lr, bs):
 train(lr=1e-4, bs=32)
 ```
 
-The decorator takes `device`, `host`, `lifetime`, `env`, `volumes`, `timeout`, `retries` and `keep_remote`. It takes no transport, no mode and no width: the three placements below settle where the work runs, and how much can run at once is the provider's inventory rather than a number on the declaration.
+The decorator takes `device`, `host`, `lifetime`, `env`, `volumes`, `timeout`, `retries` and `keep_remote`. `timeout` has no default: a deadline letify invented would end a two hour training run at whatever hour it guessed, which is letify deciding how long the user's own work is allowed to take. It takes no transport, no mode and no width: the three placements below settle where the work runs, and how much can run at once is the provider's inventory rather than a number on the declaration.
 
 ### The three placements
 
@@ -283,14 +283,29 @@ A session is never a value the caller holds. Pooling, reuse, lifetime and teardo
 
 ### Lifetime
 
-> A session ends with the call that needed it. Keeping one is declared. Two backstops cover what is left.
+> A session ends with the call that needed it. Keeping one is declared. Nothing else decides.
 
 1. **The call.** `lifetime="call"` ends the session when the call finishes. A search space counts as one call, so a sweep starts its runtimes once and releases them once.
 2. **The declaration.** `lifetime="process"` keeps the session past the call, because starting one costs provider boot plus environment installation, which is minutes on Colab.
-3. **The idle reaper.** A background thread tears down any runtime unused for longer than `idle_timeout`, default 600 seconds.
-4. **The lease.** The local process renews a deadline inside the session every 30 seconds, and the session terminates itself if the deadline passes. The grace period is 300 seconds, so a brief network drop does not kill a training run while a crashed local process cannot leave a GPU billing.
+3. **The lease.** The local process renews a deadline inside the session every 30 seconds, and the worker exits on its own if the deadline passes. The grace period is 300 seconds, so a brief network drop does not kill a training run.
 
-Nothing is torn down by hand. There is no release call and no shutdown call on the public surface, and everything goes at process exit.
+Nothing is torn down by hand, and nothing is torn down on a timer either. An idle reaper was tried and removed: `"process"` declares that the session lives for the process, and a thread ending it after ten idle minutes overrules the declaration it was given. The same reasoning that rules out keeping a session alive on the chance a call arrives rules out killing one the declaration asked to keep. There is no release call and no shutdown call on the public surface, and everything goes at process exit.
+
+The lease is the one exception, and it is not a timer on the work: it covers the moment a process is killed outright, which is the one moment nothing can be told to anybody. `SIGKILL`, the out of memory killer and a power cut all run no code at all, so a session that only ends when asked would never be asked.
+
+What the lease actually does is exit the worker process, which releases the occupancy. Whether that stops the billing depends on what the provider charges for, and infrastructure cannot choose to switch itself off: something that owns it has to. So the guarantee is per provider and letify states it rather than implying one.
+
+| Provider | What is billed | Killed local process |
+|---|---|---|
+| `Local` | nothing | the subprocess dies with its parent |
+| `Shell`, `Tunnel` | nothing; the card is occupied | the worker exits, so the card frees |
+| `Modal` | the sandbox | **guaranteed.** A deadline is set when the sandbox is created and Modal enforces it |
+| `Colab` | the runtime | not guaranteed. Colab's own idle policy is what ends it |
+| `Elice` | the allocation | **not guaranteed.** An allocation bills until something issues the delete |
+
+Where it is not guaranteed, the preferred answer is a deadline at creation time, because the platform outlives the caller. Modal takes one and letify sets it. Whether the Elice allocation API takes one is unverified.
+
+Where the platform takes none, the intended bound is reconciliation: the next letify process asks the provider what is running under this project's name and ends what nothing is watching. That is not immediate, and it is **not implemented yet**, so today an Elice allocation left by a killed machine bills until somebody deletes it. It is listed under Known gaps.
 
 There is no detached execution. A detached run whose remote side is preempted would lose its results, so the local process stays the owner and durability comes from checkpoints in the store.
 
@@ -530,4 +545,6 @@ Unified memory is the one exception that no amount of implementation removes. Ma
 - **`letify-driver` covers one milestone.** The entry points a PyTorch process needs to start up and run one kernel are forwarded and verified against a real GPU. Kernel argument marshalling reads the pointer list without knowing the kernel's signature, and fatbin size comes from a conservative window rather than the image header. Both need a real workload to shape them.
 - **`Modal` and `Elice` are not exercised against the live services.** Their code follows each service's published interface, and the Elice paths come from Elice's own Terraform provider, but neither has been run end to end.
 - **The Colab data channel is unverified.** Whether `ssh -L` works over `colab ssh --proxy-mode` is an open decision in [INTENT.md](INTENT.md).
+- **Orphan reconciliation is not implemented.** A session whose controlling machine was killed outright is released by the lease on the providers where the process is the cost. Where the platform bills for the machine and takes no deadline, nothing ends it: an Elice allocation bills until a delete is issued. The intended answer is that the next letify process asks the provider what is running under this project's name and ends what nothing is watching, with a command to do it on demand. Neither exists yet.
+- **Whether the Elice allocation API takes a deadline is unverified.** If it does, that is where the guarantee belongs, because the platform outlives the caller.
 - **Persistence detection is not implemented.** Deciding a machine's disk policy by writing a marker file and looking for it in a later runtime is a decision recorded here, not yet code.
