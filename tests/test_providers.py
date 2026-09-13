@@ -701,6 +701,32 @@ def test_the_ssh_command_names_the_port_the_user_and_the_key() -> None:
     assert command[-2:] == ["researcher@gpu.lab.example.edu", "uname -a"]
 
 
+@pytest.mark.parametrize("platform", ["posix", "nt"])
+def test_ssh_commands_share_one_connection_and_prefer_fast_ciphers(
+    isolated_home, monkeypatch, platform: str
+) -> None:
+    # Spec "SSH authentication": multiplexing where OpenSSH implements it, never on Windows.
+    from letify.transport import sshopts
+    from letify.transport.strategies import Target
+
+    monkeypatch.setattr(sshopts, "WINDOWS", platform == "nt")
+    provider = provider_of(Shell, "lab", address="gpu.lab.example.edu", user="researcher")
+    for command in (
+        provider.ssh_command("true"),
+        Target(alias="lab", user="researcher").forwarded_ssh(2200, "true"),
+    ):
+        assert "Ciphers=^aes128-gcm@openssh.com,chacha20-poly1305@openssh.com" in command
+        assert not any(part.startswith("Compression=yes") for part in command)
+        control = Path.home() / ".letify" / "accounts" / "lab" / "ssh-%C"
+        if platform == "nt":
+            assert not any(part.startswith("Control") for part in command)
+        else:
+            assert "ControlMaster=auto" in command
+            assert "ControlPersist=60" in command
+            assert f"ControlPath={control}" in command
+            assert control.parent.is_dir()
+
+
 def test_a_jump_host_is_used_before_any_tunnel() -> None:
     # Order of preference is a direct address, then a jump host, then a tunnel.
     provider = provider_of(Shell, "lab", address="gpu.internal", jump="bastion.example.edu")
