@@ -24,6 +24,7 @@ from letify.config.schema import ProviderConfig
 from letify.declare.instance import Host, Instance
 from letify.providers import colab as colab_module
 from letify.providers import local as local_module
+from letify.providers import modal as modal_module
 from letify.providers import shell as shell_module
 from letify.providers.base import Provider
 from letify.providers.colab import ALIASES, Colab
@@ -35,7 +36,6 @@ from letify.providers.elice import (
     Elice,
 )
 from letify.providers.local import Local
-from letify.providers import modal as modal_module
 from letify.providers.modal import Adapter, Modal, SandboxChannel
 from letify.providers.naming import gib_from_mib, normalize_gpu
 from letify.providers.shell import Shell

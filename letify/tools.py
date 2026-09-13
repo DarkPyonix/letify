@@ -8,7 +8,8 @@ Each account gets its own home directory for the tool, ``~/.letify/accounts/<ali
 because tools such as the Colab CLI keep their login at a fixed path under the home
 directory. Pointing ``HOME`` there is what lets two accounts of one provider live on one
 machine. uv's own cache and Python installs are pinned to the real home first, so the
-changed ``HOME`` does not make uv download everything again per account.
+changed ``HOME`` does not make uv download everything again per account. Modal takes its
+config file path from ``MODAL_CONFIG_PATH`` instead, so its environment keeps ``HOME``.
 
 This module does not own what a tool is asked to do. The provider and the login flow do.
 """
@@ -44,6 +45,22 @@ COLAB = Tool(
     python="3.13",
     pins=("jupyter-kernel-client<1",),
 )
+
+
+#: Modal's client and CLI. The range is the major version the Modal adapter was written
+#: against; ``modal token new`` and the sandbox and volume calls it makes are 1.x API.
+MODAL = Tool(
+    package="modal",
+    executable="modal",
+    python="3.12",
+    pins=("modal>=1.0,<2",),
+)
+
+#: The adapter file, run by path so it needs nothing of letify's own environment.
+MODAL_ADAPTER = Path(__file__).parent / "providers" / "modal_adapter.py"
+
+#: Variables that would make Modal act as someone other than the account's file says.
+MODAL_OVERRIDES = ("MODAL_TOKEN_ID", "MODAL_TOKEN_SECRET", "MODAL_PROFILE")
 
 
 def find_uv() -> str | None:
@@ -99,4 +116,48 @@ def environment(alias: str) -> dict[str, str]:
     return env
 
 
-__all__ = ["COLAB", "Tool", "command", "environment", "find_uv", "missing_uv_message"]
+def script_command(tool: Tool, uv: str, script: Path) -> list[str]:
+    """The argument list that runs a Python file in a throwaway uv environment with ``tool``."""
+    pinned = [part for pin in tool.pins for part in ("--with", pin)]
+    return [uv, "run", "--no-project", "--python", tool.python, *pinned, "python", str(script)]
+
+
+def modal_adapter_command(uv: str) -> list[str]:
+    """The argument list that starts the Modal adapter."""
+    return script_command(MODAL, uv, MODAL_ADAPTER)
+
+
+def modal_config_path(alias: str) -> Path:
+    """``~/.letify/accounts/<alias>/modal.toml``, where one account's Modal token lives."""
+    return account_directory(alias) / "modal.toml"
+
+
+def modal_environment(alias: str) -> dict[str, str]:
+    """The environment Modal runs in for one account.
+
+    ``HOME`` is left alone, because Modal takes the path of its config file from
+    ``MODAL_CONFIG_PATH``. Variables that would override that file are removed.
+    """
+    env = {key: value for key, value in os.environ.items() if key not in MODAL_OVERRIDES}
+    path = modal_config_path(alias)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if sys.platform != "win32":
+        path.parent.chmod(0o700)
+    env["MODAL_CONFIG_PATH"] = str(path)
+    return env
+
+
+__all__ = [
+    "COLAB",
+    "MODAL",
+    "MODAL_ADAPTER",
+    "Tool",
+    "command",
+    "environment",
+    "find_uv",
+    "missing_uv_message",
+    "modal_adapter_command",
+    "modal_config_path",
+    "modal_environment",
+    "script_command",
+]

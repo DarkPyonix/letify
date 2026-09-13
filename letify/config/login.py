@@ -17,7 +17,6 @@ password is accepted once, used to install a key, and dropped.
 from __future__ import annotations
 
 import getpass
-import shutil
 import subprocess
 import sys
 from dataclasses import dataclass, field
@@ -36,11 +35,6 @@ CONFIG_FILE = "config.toml"
 #: Where a key generated for letify goes. Its own name, so it is never confused with a key
 #: the user made for something else and never regenerated over one.
 DEFAULT_KEY = "~/.ssh/id_letify"
-
-#: Kinds whose credential belongs to the vendor's own tool, with the command that owns it.
-VENDOR_COMMANDS = {
-    "modal": ("modal", "modal setup"),
-}
 
 #: How a shell account authenticates. A key is the default because it is the only method
 #: that works unattended on every platform letify runs on.
@@ -272,26 +266,43 @@ def elice_account(answers: Answers) -> dict[str, Any]:
     return options
 
 
-def vendor_account(answers: Answers) -> dict[str, Any]:
-    """Record the account identity and leave the credential to the vendor's own tool.
+def modal_account(answers: Answers) -> dict[str, Any]:
+    """Sign in to Modal by running ``modal token new`` through uv.
 
-    Wrapping another tool's login would mean owning a token letify has no way to refresh,
-    and the vendor's command already works. So what is checked is only that the tool is
-    installed, which is the failure a user would otherwise meet at the first call.
+    ``MODAL_CONFIG_PATH`` points at ``~/.letify/accounts/<alias>/modal.toml``, so the token
+    Modal writes lands in the account directory and the Modal adapter reads it from there.
+    The command prints a link and waits for the browser approval, so its output is not
+    captured. A sign in that fails, or that leaves no token file, writes nothing and removes
+    a token file the attempt created.
     """
-    binary, command = VENDOR_COMMANDS[answers.kind]
-    if shutil.which(binary) is None:
-        raise LoginError(
-            f"the {binary!r} command is not on PATH, so letify cannot reach {answers.kind}. "
-            f"Install it with the letify[{answers.kind}] extra, then authenticate with "
-            f"'{command}'."
-        )
+    from .. import tools
+
+    uv = tools.find_uv()
+    if uv is None:
+        raise LoginError(tools.missing_uv_message())
     options: dict[str, Any] = {"kind": answers.kind}
     workspace = ask(
         answers, "workspace", "Modal workspace (blank for the default): ", required=False
     )
+    arguments = ["token", "new"]
     if workspace:
         options["workspace"] = workspace
+        arguments += ["--profile", workspace]
+    env = tools.modal_environment(answers.alias)
+    token = Path(env["MODAL_CONFIG_PATH"])
+    existed = token.exists()
+    result = subprocess.run([*tools.command(tools.MODAL, uv), *arguments], env=env)
+    if result.returncode != 0 or not token.is_file():
+        if not existed:
+            token.unlink(missing_ok=True)
+        if result.returncode != 0:
+            raise LoginError(
+                f"the Modal sign in exited {result.returncode}, so nothing was written"
+            )
+        raise LoginError(
+            f"the Modal sign in finished without writing {token}, so nothing was written"
+        )
+    writer.restrict(token)
     return options
 
 
@@ -326,7 +337,7 @@ FLOWS = {
     "tunnel": shell_account,
     "elice": elice_account,
     "colab": colab_account,
-    "modal": vendor_account,
+    "modal": modal_account,
 }
 
 
@@ -414,7 +425,6 @@ def log_out(alias: str) -> tuple[bool, bool]:
 __all__ = [
     "AUTH_METHODS",
     "DEFAULT_KEY",
-    "VENDOR_COMMANDS",
     "Answers",
     "LoginError",
     "ask",

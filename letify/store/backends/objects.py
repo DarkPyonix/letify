@@ -1,8 +1,9 @@
 """Object store backends: Google Cloud Storage and Modal volumes.
 
 Google Cloud Storage is reached with the standard library HTTP client against the JSON
-API, with a token borrowed from the user's own Google login. The Modal client is imported
-lazily, so importing letify never pulls in a cloud SDK.
+API, with a token borrowed from the user's own Google login. A Modal volume is reached
+through the Modal adapter, a separate process, so importing letify never pulls in a cloud
+SDK.
 
 One habit is shared by every backend: ``missing`` answers with a single listing rather
 than one request per digest. Object level requests are billed and add latency, and
@@ -11,14 +12,14 @@ avoiding that is the whole point of diffing against a manifest.
 
 from __future__ import annotations
 
-import io
+import base64
 import json
 import urllib.error
 import urllib.parse
 import urllib.request
 from collections.abc import Iterator
 
-from ...errors import ProviderUnavailable, RuntimeFailure
+from ...errors import ConfigError, ProviderUnavailable, RuntimeFailure
 from ..cas import Backend
 from .google_auth import TokenSource
 from .layout import BLOB_PREFIX, blob_key, ref_key
@@ -198,41 +199,70 @@ class ModalBackend(Backend):
     """A Modal volume, mounted from outside the container.
 
     A Modal volume sits in the same data centre as the GPU and caches read blocks on
-    local disk, which is why a persistent provider needs no separate cache tier.
+    local disk, which is why a persistent provider needs no separate cache tier. Every
+    operation goes through the Modal adapter acting as ``account``, so the letify process
+    never imports ``modal``.
     """
 
     name = "modal"
 
-    def __init__(self, volume_name: str, prefix: str = "letify"):
-        try:
-            import modal
-        except ImportError as exc:
-            raise ProviderUnavailable(
-                "modal", "the modal package is not installed", "modal"
-            ) from exc
+    def __init__(self, volume_name: str, prefix: str = "letify", account: str | None = None):
+        from ... import tools
+        from ...providers.modal import Adapter
+
+        if not account:
+            raise ConfigError(
+                f"the modal backend for volume {volume_name!r} needs an account to act as. "
+                f"Set account = '<alias of a modal login>' on the volume."
+            )
+        if tools.find_uv() is None:
+            raise ProviderUnavailable("modal", tools.missing_uv_message())
+        self.volume_name = volume_name
+        self.account = account
         self.prefix = prefix.strip("/")
-        self._volume = modal.Volume.from_name(volume_name, create_if_missing=True)
+        self._adapter = Adapter.for_account(account)
 
     def _key(self, key: str) -> str:
         return f"/{self.prefix}/{key}" if self.prefix else f"/{key}"
 
-    def has(self, digest: str) -> bool:
+    def _put(self, path: str, payload: bytes) -> None:
+        data = base64.b64encode(payload).decode()
+        self._adapter.request("volume_put", volume=self.volume_name, path=path, data=data)
+
+    def _get(self, path: str) -> bytes | None:
+        from ...providers.modal import VolumePathMissing
+
         try:
-            next(iter(self._volume.listdir(self._key(blob_key(digest)))))
-        except Exception:
-            return False
-        return True
+            data = self._adapter.request("volume_get", volume=self.volume_name, path=path)
+        except VolumePathMissing:
+            return None
+        return base64.b64decode(str(data))
+
+    def _list(self, path: str) -> list[str]:
+        from ...providers.modal import VolumePathMissing
+
+        try:
+            found = self._adapter.request("volume_list", volume=self.volume_name, path=path)
+        except VolumePathMissing:
+            return []
+        return [str(entry) for entry in found]
+
+    def has(self, digest: str) -> bool:
+        return bool(self._list(self._key(blob_key(digest))))
 
     def put(self, digest: str, payload: bytes) -> None:
-        with self._volume.batch_upload(force=True) as batch:
-            batch.put_file(io.BytesIO(payload), self._key(blob_key(digest)))
+        self._put(self._key(blob_key(digest)), payload)
 
     def get(self, digest: str) -> bytes:
-        return b"".join(self._volume.read_file(self._key(blob_key(digest))))
+        path = self._key(blob_key(digest))
+        payload = self._get(path)
+        if payload is None:
+            raise RuntimeFailure(f"modal volume {self.volume_name}:{path} does not exist")
+        return payload
 
     def list_digests(self, prefix: str = "") -> Iterator[str]:
-        for entry in self._volume.listdir(self._key(BLOB_PREFIX), recursive=True):
-            name = entry.path.rsplit("/", 1)[-1]
+        for path in self._list(self._key(BLOB_PREFIX)):
+            name = path.rsplit("/", 1)[-1]
             if name.startswith(prefix):
                 yield name
 
@@ -241,15 +271,15 @@ class ModalBackend(Backend):
         return [digest for digest in digests if digest not in held]
 
     def read_ref(self, name: str) -> str | None:
-        try:
-            payload = b"".join(self._volume.read_file(self._key(ref_key(name))))
-        except Exception:
-            return None
-        return payload.decode().strip()
+        payload = self._get(self._key(ref_key(name)))
+        return payload.decode().strip() if payload is not None else None
 
     def write_ref(self, name: str, digest: str) -> None:
-        with self._volume.batch_upload(force=True) as batch:
-            batch.put_file(io.BytesIO(digest.encode()), self._key(ref_key(name)))
+        self._put(self._key(ref_key(name)), digest.encode())
+
+    def close(self) -> None:
+        """Stop the adapter process this backend started."""
+        self._adapter.close()
 
 
 __all__ = ["GCSBackend", "ModalBackend"]
