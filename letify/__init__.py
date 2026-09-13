@@ -33,7 +33,9 @@ from .declare.function import Function
 from .declare.instance import AnyInstance, Host, Instance
 from .errors import (
     ConfigError,
+    EnvironmentFailure,
     InsufficientDevices,
+    InterpreterMismatch,
     LetifyError,
     ProtocolError,
     ProviderUnavailable,
@@ -63,9 +65,11 @@ __all__ = [
     "Blob",
     "ConfigError",
     "Env",
+    "EnvironmentFailure",
     "Function",
     "Instance",
     "InsufficientDevices",
+    "InterpreterMismatch",
     "Launcher",
     "LetifyError",
     "ProtocolError",

@@ -291,6 +291,23 @@ class Provider(abc.ABC):
 
     # -- sessions ------------------------------------------------------------
 
+    @property
+    def workspace_root(self) -> str:
+        """Where letify may write on the runtime, before ``~`` is expanded there.
+
+        Every remote path letify introduces, such as the project directory a sync runs in,
+        derives from this one value.
+        """
+        from ..runtime import bootstrap
+
+        return bootstrap.DEFAULT_WORKSPACE_ROOT
+
+    @property
+    def managed_python(self) -> str | None:
+        """The interpreter the account names with ``python``, which the user manages."""
+        value = self.config.option("python")
+        return str(value) if value else None
+
     @abc.abstractmethod
     def open_channel(self, runtime: Runtime) -> Channel:
         """Return the channel that talks to this runtime."""
@@ -320,6 +337,12 @@ class Provider(abc.ABC):
         from ..runtime.session import Runtime
 
         self.check_mode(instance)
+        if self.prepares_env and not self.managed_python:
+            from ..runtime.bootstrap import project_files
+
+            # A missing lock file or a Python that cannot match is refused before the
+            # provider allocates anything.
+            project_files(env)
         self.create_session(instance, name)
         runtime = Runtime(
             name=name,
