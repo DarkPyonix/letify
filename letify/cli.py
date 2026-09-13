@@ -78,6 +78,18 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_false",
         help="the key is already on the machine, so only confirm it",
     )
+    log_in.add_argument(
+        "--indices",
+        action="append",
+        metavar="NAME=SPEC",
+        help="GPU indices letify may use for one accelerator, such as A100=0-3; repeatable",
+    )
+    log_in.add_argument(
+        "--detect-devices",
+        dest="detect_devices",
+        action="store_true",
+        help="ask an already declared machine for its GPUs again and replace its devices table",
+    )
 
     log_out = sub.add_parser("logout", help="remove an account from this machine")
     log_out.add_argument("alias", help="provider alias to forget")
@@ -200,6 +212,8 @@ def main(argv: list[str] | None = None) -> int:
                 "endpoint": args.endpoint,
                 "account": args.account,
                 "workspace": args.workspace,
+                "indices": args.indices,
+                "detect_devices": args.detect_devices,
             },
             token=args.token,
             interactive=args.interactive,
