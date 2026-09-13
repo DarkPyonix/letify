@@ -155,6 +155,12 @@ For a `shell` or `tunnel` account, `letify login` writes this table from what th
 
 Which registered indices are free is read with `nvidia-smi` at reservation time, not cached, because the answer changes while a run is queued. A card is taken as busy when another process is computing on it. Nothing else on the machine is inspected, and letify never kills anything.
 
+The reading is taken on the machine that owns the cards. `Local` runs the queries itself. A `shell`, `tunnel` or `elice` account runs them over the account's link, one SSH command each: `nvidia-smi --query-gpu=index,uuid --format=csv,noheader,nounits` maps each uuid to its index, and `nvidia-smi --query-compute-apps=gpu_uuid,pid --format=csv,noheader,nounits` lists the compute processes.
+
+A compute process is excluded when it is a worker of a session this client process started on that provider. A runtime records its worker's process id from the worker's `stat` reply when its persistent channel starts, and gives it up at shutdown. The worker keeps that id when it moves to the project interpreter, because the move is an `execv`. A process started by any other client process, letify or not, counts as busy.
+
+A remote query that cannot run, because SSH failed or `nvidia-smi` exited non zero, raises `RuntimeFailure` naming the busy check. Treating the cards as free would put a run on a card someone else is computing on. When no registered index is free, the `InsufficientDevices` message names the indices another process is computing on.
+
 A reserved session sets `CUDA_VISIBLE_DEVICES` to its reserved physical indices and `CUDA_DEVICE_ORDER=PCI_BUS_ID` in its worker before any user code runs, and keeps both when the worker moves to the project interpreter. The training code sees its cards as 0 upward in `nvidia-smi` order and needs to know nothing about which physical indices it was given. A provider that assigns the device itself sets neither.
 
 ### Instances
