@@ -8,7 +8,7 @@
 
 > A declaration places three things and names no mechanism.
 
-The public surface is three names: `Launcher`, `Env` and the `function` decorator it carries. Everything else is reached through a provider object.
+The public surface is four names: `Launcher`, `Env`, the `function` decorator it carries, and `session_cache`, which a declared body uses to keep a value for the length of its session. Everything else is reached through a provider object.
 
 ```python
 import letify
@@ -25,7 +25,7 @@ def train(lr, bs):
 train(lr=1e-4, bs=32)
 ```
 
-The decorator takes `device`, `host`, `env`, `volumes`, `timeout`, `retries` and `keep_remote`. `timeout` has no default: a deadline letify invented would end a two hour training run at whatever hour it guessed, which is letify deciding how long the user's own work is allowed to take. It takes no transport, no mode and no width: the three placements below settle where the work runs, and how much can run at once is the provider's inventory rather than a number on the declaration.
+The decorator takes `device`, `host`, `env`, `volumes`, `timeout` and `retries`. Any other argument is refused by Python as unexpected. `timeout` has no default: a deadline letify invented would end a two hour training run at whatever hour it guessed, which is letify deciding how long the user's own work is allowed to take. It takes no transport, no mode and no width: the three placements below settle where the work runs, and how much can run at once is the provider's inventory rather than a number on the declaration.
 
 ### The two placements <!-- id: the-three-placements -->
 
@@ -217,7 +217,7 @@ Decoding fails at any useful latency. A decode step for 4-bit weights on an RTX 
 
 > A channel is how letify talks to a runtime, and which kind a provider offers decides what letify can do there.
 
-A **persistent channel** keeps one worker process alive behind a pipe. Requests are framed lines, so the object table, the blob table and anything written to disk all survive between calls.
+A **persistent channel** keeps one worker process alive behind a pipe. Requests are framed lines, so the worker process with its session cache, the blob table and anything written to disk all survive between calls.
 
 A **one-shot channel** can only run a command and collect its output. Every call starts a fresh process, so nothing persists. It exists because some transports offer nothing more, and it refuses the operations that need persistence rather than pretending.
 
@@ -235,15 +235,30 @@ On a one-shot channel the call travels inside a driver script that prints its ou
 
 An `async def` body is awaited on the remote side, so it runs to completion there and can use `await` internally.
 
-### Handles
+### Session cache <!-- id: handles -->
 
-> A value may stay in the runtime. The caller receives a reference scoped to that session.
+> `letify.session_cache(key, factory)` returns the value stored under `key` in the current session, building it with `factory()` on first use. A call always returns its value.
 
-A declaration with `keep_remote=True` registers its return value in the runtime's object table and returns a `Handle`. Passing a handle to a later call on the same runtime resolves it in place, so a model stays on the remote machine instead of being copied back and forth.
+```python
+@let.function(device=colab.G4, host=letify.remote)
+def generate(prompt):
+    model = letify.session_cache("model", load_model)
+    return model(prompt)
+```
 
-A handle names the live runtime that holds it, not the pool key, because two runtimes can share a key and an object lives in only one of them. Passing it to a call on another runtime raises `HandleScopeError` rather than materializing the object, since resolving it across that boundary would mean an unrequested transfer of everything it points at.
+Inside a declared function running in a runtime, `session_cache` looks `key` up in a store held by the runtime's worker process. On first use it calls the zero-argument `factory` and stores the result. The value lives until the session ends: the call ends it, or the enclosing `keep_alive` block ends it.
 
-`keep_remote=True` on a one-shot channel fails with its reason, because there is no process for the handle to point at once the call returns.
+Each session has its own cache. Concurrent sessions each build their own value, so no result depends on which session the pool picks for a call.
+
+The store lives in the `letify` module, which the worker imports by reference. A dict at module level in the user's script cannot do this job, because cloudpickle ships `__main__` globals by value with every call, so each call sees a fresh copy. letify is importable in the runtime because the user's environment, keyed by `uv.lock`, includes it. A worker that cannot import letify fails the call with `RemoteError` whose message says that letify is not installed in the runtime's environment and that `uv add letify` fixes it.
+
+Concurrent first use of one key builds once: the other callers wait for that build and receive its value. A factory that raises stores nothing, so the next use tries again.
+
+Outside a runtime, in the local process or in `Function.local()`, `session_cache` is a memo for the life of the process with the same semantics, so a body tested locally behaves the same.
+
+On a one-shot channel every call is a fresh process. `session_cache` works within that call and keeps nothing for the next one.
+
+A returned value always comes back to the caller. There is no declaration argument that returns a reference instead.
 
 ### Argument addressing
 
