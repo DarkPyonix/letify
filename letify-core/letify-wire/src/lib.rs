@@ -383,17 +383,30 @@ pub fn decode_reply(frame: &[u8]) -> io::Result<Reply> {
 
 // -- framing ------------------------------------------------------------------
 
+/// Size of the length prefix in front of every frame body.
+pub const FRAME_HEADER_BYTES: usize = 4;
+
+/// Encode the length prefix of a frame whose body is `length` bytes.
+pub fn encode_frame_header(length: u64) -> [u8; FRAME_HEADER_BYTES] {
+    (length as u32).to_le_bytes()
+}
+
+/// Decode the body length a frame header carries.
+pub fn decode_frame_header(header: [u8; FRAME_HEADER_BYTES]) -> u64 {
+    u32::from_le_bytes(header) as u64
+}
+
 /// Write one length-prefixed frame.
 pub fn write_frame<W: Write>(writer: &mut W, body: &[u8]) -> io::Result<()> {
-    writer.write_all(&(body.len() as u32).to_le_bytes())?;
+    writer.write_all(&encode_frame_header(body.len() as u64))?;
     writer.write_all(body)
 }
 
 /// Read one length-prefixed frame.
 pub fn read_frame<R: Read>(reader: &mut R) -> io::Result<Vec<u8>> {
-    let mut length = [0u8; 4];
-    reader.read_exact(&mut length)?;
-    let mut body = vec![0u8; u32::from_le_bytes(length) as usize];
+    let mut header = [0u8; FRAME_HEADER_BYTES];
+    reader.read_exact(&mut header)?;
+    let mut body = vec![0u8; decode_frame_header(header) as usize];
     reader.read_exact(&mut body)?;
     Ok(body)
 }
@@ -509,6 +522,21 @@ mod tests {
         write_frame(&mut buffer, &[1, 2, 3]).unwrap();
         let mut reader = buffer.as_slice();
         assert_eq!(read_frame(&mut reader).unwrap(), vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn a_frame_length_above_four_gib_survives_the_header() {
+        // A batch copied to the device can exceed 4 GiB. The header codec is tested
+        // directly so the test does not allocate the body.
+        for length in [u32::MAX as u64 + 1, 5 * (1u64 << 30), u64::MAX] {
+            assert_eq!(decode_frame_header(encode_frame_header(length)), length);
+        }
+    }
+
+    #[test]
+    fn the_protocol_version_names_the_64_bit_frame_layout() {
+        assert_eq!(PROTOCOL_VERSION, 2);
+        assert_eq!(FRAME_HEADER_BYTES, 8);
     }
 
     #[test]
