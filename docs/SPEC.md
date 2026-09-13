@@ -352,9 +352,15 @@ Extraction checks every member's path against the destination before unpacking, 
 
 ### Materializing into a runtime
 
-> A volume writes into a runtime through its channel, not by asking the runtime to reach the bucket.
+> The runtime pulls a volume straight from the backend, using a short-lived credential borrowed from the local machine. Bytes never pass through the local process on the way in.
 
-That works with every backend and needs no credentials on the far side, at the cost of the bytes passing through the local process. `Volume.resume()` puts the newest checkpoint for a name inside the runtime, which is what makes a preempted session cheap to restart. `Volume.absorb()` pulls one back out, and `cache_env_from()` packs an environment installed inside a runtime so the next session skips the installation.
+A volume holds a copy of the local project's environment and data, so its purpose is to make a new runtime start as if it were the local machine. That copy is only useful if it arrives fast, and the fast path is the backend's own network: a Colab runtime reading a Cloud Storage bucket is a transfer inside Google's infrastructure. Routing the bytes through the local process would cap every session start at the user's uplink.
+
+The local machine writes to the backend directly as well. It does not relay through a runtime, because that adds a hop that is still bounded by the same uplink and spends billed runtime time.
+
+No credential is stored on the remote side. For each materialization the local process derives a short-lived access token from its own login, scoped to reading the volume's prefix where the backend supports scoping, and sends it over the channel. The worker keeps it in memory only, never on disk or in the environment of user code, and drops it when the pull finishes. A backend that has no network path from the runtime, such as `filesystem` on a machine the local process can reach but the runtime cannot, falls back to writing through the channel.
+
+`Volume.resume()` puts the newest checkpoint for a name inside the runtime, which is what makes a preempted session cheap to restart. `Volume.absorb()` pulls one back out, and `cache_env_from()` packs an environment installed inside a runtime so the next session skips the installation.
 
 These take the declaration, not a session. A declaration already says which provider, which accelerator, which environment and which volumes, so which session is letify's answer to work out and not a value for the caller to carry. The alternative was tried and is worse: a caller holding a session has to have asked for it with the same instance the declaration uses, and the declaration folds the host placement into that instance, so asking with the bare one silently starts a second session that holds none of the first one's files. On one machine that still passes, because both sessions see the same disk. On a rented one it fails, which makes it the worst kind of defect: it works in the test and breaks where the money is.
 
