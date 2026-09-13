@@ -248,7 +248,7 @@ The protocol is one JSON object per line. letify sends `{"id": <int>, "op": <nam
 | Op | Fields | Value |
 |---|---|---|
 | `hello` | none | `{"modal": <installed Modal version>}` |
-| `create` | `app`, `args`, `packages`, `gpu`, `timeout` | `{"sandbox": <id>}`. Looks up or creates the app, builds `debian_slim` with `packages` installed, and starts `args` in a sandbox |
+| `create` | `app`, `args`, `packages`, `gpu`, `timeout` | `{"sandbox": <id>}`. Runs `app` as an ephemeral app on first use, builds `debian_slim` with `packages` installed, and starts `args` in a sandbox |
 | `write` | `sandbox`, `data` | `null`. Writes the text to the sandbox's standard input and drains it |
 | `read_until` | `sandbox`, `prefixes` | `{"lines": [...], "eof": <bool>}`. The sandbox's stdout lines up to and including the first that starts with one of `prefixes`, or every line left when the stream ends |
 | `terminate` | `sandbox` | `null` |
@@ -262,6 +262,8 @@ Every volume op creates the volume when it is missing, as version `version`.
 The persistent channel to a sandbox is that sandbox's standard input and output, carried by `write` and `read_until`. The sandbox runs the bootstrap stub `python3 -u -c BOOTSTRAP`, and the worker source goes out first as the length-prefixed base64 blob described above. A `read_until` that ends at end of stream without a reply raises `ProtocolError`.
 
 A missing uv raises `ProviderUnavailable` naming uv. A reply of kind `unavailable` raises `ProviderUnavailable` for `modal`. An adapter process that exits, or prints a line that is not the reply it was waiting for, raises `RuntimeFailure` carrying the adapter's standard error, because that is an infrastructure failure. A reply of kind `failure` raises `RuntimeFailure` with the adapter's message. One adapter process serves one provider or one backend and exits when its standard input closes.
+
+The adapter never deploys an app. `create` starts `modal.App(app).run()` the first time it sees an app name and holds that context for the adapter's lifetime. When standard input closes, the adapter terminates its remaining sandboxes and then leaves every app context, which stops the ephemeral app. An adapter that dies stops sending Modal's client heartbeat, and Modal stops the ephemeral app for it. So no app named `app` stays on the account after letify stops.
 
 ## Call protocol
 

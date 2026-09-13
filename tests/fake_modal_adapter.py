@@ -61,6 +61,16 @@ class Sandbox:
         self.process.wait()
 
 
+#: Apps started, in order. Each is stopped when the process's input closes, as the real
+#: adapter stops its ephemeral apps.
+APPS: list[str] = []
+
+
+def log_app(event: str, name: str) -> None:
+    with (STATE / "apps.jsonl").open("a", encoding="utf-8") as log:
+        log.write(json.dumps([event, name]) + "\n")
+
+
 def volume_file(volume: str, path: str) -> Path:
     return STATE / "volumes" / volume / path.lstrip("/")
 
@@ -70,6 +80,9 @@ def handle(request: dict, sandboxes: dict[str, Sandbox]) -> object:
     if op == "hello":
         return {"modal": "fake"}
     if op == "create":
+        if request["app"] not in APPS:
+            APPS.append(request["app"])
+            log_app("run_start", request["app"])
         sandbox_id = f"sb-{len(sandboxes) + 1}"
         sandboxes[sandbox_id] = Sandbox(list(request["args"]))
         return {"sandbox": sandbox_id}
@@ -136,6 +149,8 @@ def main() -> None:
         sys.stdout.flush()
     for sandbox in sandboxes.values():
         sandbox.terminate()
+    for name in APPS:
+        log_app("run_stop", name)
 
 
 if __name__ == "__main__":

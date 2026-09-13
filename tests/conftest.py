@@ -420,6 +420,13 @@ class FakeModalAdapter:
     def env(self) -> dict[str, str]:
         return json.loads((self.state / "env.json").read_text(encoding="utf-8"))
 
+    def app_events(self) -> list[list[str]]:
+        """``run_start`` and ``run_stop`` with the app name, in the order they happened."""
+        log = self.state / "apps.jsonl"
+        if not log.is_file():
+            return []
+        return [json.loads(line) for line in log.read_text(encoding="utf-8").splitlines()]
+
     def fail(self, *ops: str) -> None:
         self._monkeypatch.setenv("FAKE_MODAL_FAIL", ",".join(ops))
 

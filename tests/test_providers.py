@@ -1112,6 +1112,89 @@ def test_a_sibling_modal_module_does_not_shadow_the_modal_package(tmp_path: Path
         adapter.close()
 
 
+#: A stand-in ``modal`` package that logs how the adapter uses apps, so the real adapter
+#: file can be run with no Modal account and no resource created.
+STUB_MODAL = """
+import contextlib, json, os
+
+def _log(*event):
+    with open(os.environ["STUB_MODAL_LOG"], "a", encoding="utf-8") as out:
+        out.write(json.dumps(event) + "\\n")
+
+class App:
+    def __init__(self, name=None, **kwargs):
+        self.name = name
+    @classmethod
+    def lookup(cls, name, create_if_missing=False, **kwargs):
+        _log("lookup", name)
+        return cls(name)
+    @contextlib.contextmanager
+    def run(self, **kwargs):
+        _log("run_start", self.name)
+        try:
+            yield self
+        finally:
+            _log("run_stop", self.name)
+
+class Image:
+    @staticmethod
+    def debian_slim():
+        return Image()
+    def pip_install(self, *packages):
+        return self
+
+class _Sandbox:
+    object_id = None
+    stdout = ()
+    def terminate(self):
+        _log("terminate")
+
+class Sandbox:
+    @staticmethod
+    def create(*args, app=None, **kwargs):
+        _log("create", app.name)
+        return _Sandbox()
+"""
+
+
+def test_the_modal_adapter_runs_sandboxes_in_an_ephemeral_app_it_stops_on_exit(
+    tmp_path: Path,
+) -> None:
+    # Spec "Modal adapter": no deployed app is left on the account once letify stops.
+    import json
+    import os
+    import sys
+
+    site = tmp_path / "site" / "modal"
+    site.mkdir(parents=True)
+    (site / "__init__.py").write_text(STUB_MODAL, encoding="utf-8")
+    log = tmp_path / "modal.log"
+    script = Path(modal_module.__file__).with_name("modal_adapter.py")
+    env = {**os.environ, "PYTHONPATH": str(tmp_path / "site"), "STUB_MODAL_LOG": str(log)}
+    adapter = Adapter([sys.executable, "-P", str(script)], env=env, name="m")
+    fields = {"app": "study", "args": ["python3"], "packages": [], "gpu": None, "timeout": 60}
+    first = adapter.request("create", **fields)["sandbox"]
+    adapter.request("create", **fields)
+    adapter.request("terminate", sandbox=first)
+    adapter.close()
+
+    events = [tuple(json.loads(line)) for line in log.read_text("utf-8").splitlines()]
+    assert ("lookup", "study") not in events
+    assert events[0] == ("run_start", "study")
+    assert events[-1] == ("run_stop", "study")
+    assert [e for e in events if e[0] == "run_start"] == [("run_start", "study")]
+    assert events.count(("terminate",)) == 2
+
+
+def test_the_modal_app_stops_when_letify_closes_the_adapter(isolated_home, fake_modal) -> None:
+    provider = provider_of(Modal, "modal_lab", app="study")
+    runtime = modal_runtime(provider)
+    provider.open_channel(runtime)
+    provider.stop(runtime)
+    provider.adapter().close()
+    assert fake_modal.app_events() == [["run_start", "study"], ["run_stop", "study"]]
+
+
 def test_modal_offers_a_cpu_instance_under_the_name_local_uses(isolated_home) -> None:
     provider = provider_of(Modal, "modal_lab")
     assert provider.cpu is provider.CPU
