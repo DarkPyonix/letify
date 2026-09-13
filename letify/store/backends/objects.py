@@ -26,6 +26,9 @@ from .layout import BLOB_PREFIX, blob_key, ref_key
 #: The Cloud Storage JSON API.
 GCS_ENDPOINT = "https://storage.googleapis.com"
 
+#: Google's Security Token Service, which downscopes a token with a Credential Access Boundary.
+STS_ENDPOINT = "https://sts.googleapis.com/v1/token"
+
 
 class GCSBackend(Backend):
     """A Google Cloud Storage bucket.
@@ -44,12 +47,67 @@ class GCSBackend(Backend):
         bucket: str,
         prefix: str = "letify",
         endpoint: str = GCS_ENDPOINT,
+        sts_endpoint: str = STS_ENDPOINT,
         tokens: TokenSource | None = None,
     ):
         self.bucket = bucket
         self.prefix = prefix.strip("/")
         self.endpoint = endpoint.rstrip("/")
+        self.sts_endpoint = sts_endpoint
         self.tokens = tokens or TokenSource()
+
+    # -- the runtime's pull ------------------------------------------------------
+
+    def access_boundary(self) -> dict[str, object]:
+        """Read access to this bucket, narrowed to object names under the prefix."""
+        resource = f"projects/_/buckets/{self.bucket}"
+        rule: dict[str, object] = {
+            "availablePermissions": ["inRole:roles/storage.objectViewer"],
+            "availableResource": f"//storage.googleapis.com/{resource}",
+        }
+        if self.prefix:
+            rule["availabilityCondition"] = {
+                "expression": f"resource.name.startsWith('{resource}/objects/{self.prefix}/')"
+            }
+        return {"accessBoundary": {"accessBoundaryRules": [rule]}}
+
+    def read_token(self) -> str:
+        """Exchange the local login for a token that can only read this volume.
+
+        A failure raises rather than handing out the unscoped token, because that token can
+        do everything the user's login can.
+        """
+        form = urllib.parse.urlencode(
+            {
+                "grant_type": "urn:ietf:params:oauth:grant-type:token-exchange",
+                "subject_token_type": "urn:ietf:params:oauth:token-type:access_token",
+                "requested_token_type": "urn:ietf:params:oauth:token-type:access_token",
+                "subject_token": self.tokens.token(),
+                "options": json.dumps(self.access_boundary()),
+            }
+        ).encode()
+        request = urllib.request.Request(self.sts_endpoint, data=form, method="POST")
+        request.add_header("Content-Type", "application/x-www-form-urlencoded")
+        try:
+            with urllib.request.urlopen(request, timeout=60) as response:
+                return str(json.loads(response.read())["access_token"])
+        except urllib.error.HTTPError as exc:
+            detail = exc.read()[:500].decode(errors="replace")
+            raise RuntimeFailure(
+                f"downscoping the read token for gs://{self.bucket} returned {exc.code}: {detail}"
+            ) from exc
+        except (urllib.error.URLError, OSError, KeyError, ValueError) as exc:
+            raise RuntimeFailure(
+                f"downscoping the read token for gs://{self.bucket} failed: {exc}"
+            ) from exc
+
+    def pull_source(self, digest: str) -> dict[str, object] | None:
+        """A Colab runtime is a Compute Engine VM, so it reads the bucket over Google's network."""
+        name = self._key(blob_key(digest))
+        return {
+            "url": self.object_url(name, media=True),
+            "headers": {"Authorization": f"Bearer {self.read_token()}"},
+        }
 
     def _key(self, key: str) -> str:
         return f"{self.prefix}/{key}" if self.prefix else key

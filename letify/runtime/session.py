@@ -235,6 +235,33 @@ class Runtime:
             path=value["path"], digest=protocol.digest_of(payload), size=value["size"]
         )
 
+    def pull(
+        self,
+        source: dict[str, Any],
+        path: str,
+        *,
+        digest: str,
+        unpack: bool = False,
+        target: str | None = None,
+    ) -> protocol.RemoteFile:
+        """Have the runtime download a blob from its backend, optionally unpacking it.
+
+        ``source`` is what ``Backend.pull_source`` answered: a URL and headers carrying a
+        short-lived token. The worker drops both once the download finishes.
+        """
+        value = self.request(
+            {
+                "op": "pull",
+                "url": source["url"],
+                "headers": dict(source.get("headers") or {}),
+                "path": path,
+                "unpack": unpack,
+                "target": target,
+            },
+            timeout=3600,
+        )
+        return protocol.RemoteFile(path=value["path"], digest=digest, size=value["size"])
+
     def put_file(self, local: str | Path, path: str, **kwargs: Any) -> protocol.RemoteFile:
         return self.put_bytes(Path(local).read_bytes(), path, **kwargs)
 
@@ -269,12 +296,8 @@ class Runtime:
             digest = volume.cached_env(self.env)
             if not digest:
                 continue
-            payload = volume.store.get_bytes(digest)
-            self.put_bytes(
-                payload,
-                env_archive_path(volume.mount, digest),
-                unpack=True,
-                target=volume.mount,
+            volume.materialize(
+                self, digest, path=env_archive_path(volume.mount, digest), unpack=True
             )
             self.exec(f"import sys; sys.path.insert(0, {volume.mount!r})", timeout=120)
             return

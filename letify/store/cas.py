@@ -65,6 +65,15 @@ class Backend(abc.ABC):
     @abc.abstractmethod
     def write_ref(self, name: str, digest: str) -> None: ...
 
+    def pull_source(self, digest: str) -> dict[str, object] | None:
+        """A URL and request headers a runtime can read one blob with, or None.
+
+        None means the runtime has no network path to this backend, so a volume writes the
+        blob through the channel instead. A backend that answers includes a short-lived,
+        read-only credential in the headers; it is derived per call and never stored.
+        """
+        return None
+
     def missing(self, digests: list[str]) -> list[str]:
         """Which of these digests the store does not hold.
 

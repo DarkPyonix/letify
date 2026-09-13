@@ -10,10 +10,11 @@ hub, and 40 to 60 seconds from a bucket in the same infrastructure as the runtim
 of that time is billed as GPU time, which is why a cache tier is not optional for short
 sessions.
 
-Materializing goes through the runtime's channel rather than asking the runtime to
-reach the bucket itself. That works with every backend and needs no credentials on the
-far side, at the cost of the bytes passing through this process. A provider whose
-runtime can read the bucket directly should override that.
+Materializing has the runtime pull straight from the backend, with a short-lived read
+token this process derives from its own login and sends over the channel, so the bytes do
+not pass through this process. A backend the runtime has no network path to offers no
+pull, and then the bytes go through the channel. Writes from this process, such as
+``absorb`` and ``cache_env_from``, go to the backend directly.
 """
 
 from __future__ import annotations
@@ -165,10 +166,20 @@ class Volume:
         path: str | None = None,
         unpack: bool = False,
     ) -> RemoteFile:
-        """Write a blob into the runtime, optionally unpacking it at the mount."""
+        """Put a blob inside the runtime, optionally unpacking it at the mount.
+
+        The runtime pulls it from the backend itself when the backend offers a pull and the
+        channel keeps a worker alive to perform it. Otherwise the bytes go through the channel.
+        """
+        destination = path or f"{self.mount.rstrip('/')}/blobs/{digest[:2]}/{digest}"
+        if runtime.persistent_channel:
+            source = self.store.backend.pull_source(digest)
+            if source is not None:
+                return runtime.pull(
+                    source, destination, digest=digest, unpack=unpack, target=self.mount
+                )
         payload = self.store.get_bytes(digest)
-        target = path or f"{self.mount.rstrip('/')}/blobs/{digest[:2]}/{digest}"
-        return runtime.put_bytes(payload, target, unpack=unpack, target=self.mount)
+        return runtime.put_bytes(payload, destination, unpack=unpack, target=self.mount)
 
     def materialize_ref(
         self, runtime: Runtime, ref: str, *, unpack: bool = False

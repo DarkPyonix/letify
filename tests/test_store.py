@@ -15,6 +15,7 @@ import io
 import tarfile
 import types
 from pathlib import Path
+from urllib.parse import unquote
 
 import pytest
 
@@ -536,6 +537,141 @@ def test_an_environment_installed_inside_a_runtime_is_cached_for_the_next_sessio
     env = letify.Env(lock=str(tmp_path / "absent.lock"))
     digest = volume.cache_env_from(runtime, env, str(installed))
     assert volume.cached_env(env) == digest
+    let.pool.shutdown()
+
+
+# -- Spec: Materializing into a runtime, the runtime pulls from the backend -----
+
+
+@pytest.fixture
+def bucket_volume(let, fake_gcs, tmp_path):
+    """A gcs volume on the local provider, its bucket served on loopback."""
+    return let.providers.local.volume(
+        "bucket",
+        backend="gcs",
+        bucket=fake_gcs.bucket,
+        endpoint=fake_gcs.endpoint,
+        sts_endpoint=f"{fake_gcs.endpoint}/v1/token",
+        mount=str(tmp_path / "mount"),
+    )
+
+
+def test_a_runtime_pulls_a_blob_straight_from_the_bucket(
+    let, remote_cpu, bucket_volume, fake_gcs, tmp_path, live
+) -> None:
+    # Bytes never pass through the local process on the way in: the worker downloads them.
+    info = bucket_volume.store.put_bytes(b"model weights")
+    runtime = live(let, remote_cpu)
+    before = len(fake_gcs.downloads())
+
+    remote = bucket_volume.materialize(runtime, info.digest)
+
+    assert Path(remote.path).read_bytes() == b"model weights"
+    assert remote.size == len(b"model weights")
+    pulled = fake_gcs.downloads()[before:]
+    assert len(pulled) == 1
+    # Downscoped from the local login rather than the login itself.
+    assert pulled[0]["authorization"] == "Bearer down-token-1"
+    let.pool.shutdown()
+
+
+def test_the_read_token_is_bounded_to_the_volume_bucket_and_prefix(
+    let, remote_cpu, bucket_volume, fake_gcs, live
+) -> None:
+    import json
+
+    info = bucket_volume.store.put_bytes(b"epoch 1")
+    bucket_volume.materialize(live(let, remote_cpu), info.digest)
+
+    exchange = fake_gcs.exchanges[-1]
+    assert exchange["subject_token"] == "token-1"
+    boundary = json.loads(exchange["options"])["accessBoundary"]["accessBoundaryRules"][0]
+    assert boundary["availablePermissions"] == ["inRole:roles/storage.objectViewer"]
+    assert boundary["availableResource"].endswith(f"/buckets/{fake_gcs.bucket}")
+    assert "objects/letify/" in boundary["availabilityCondition"]["expression"]
+    let.pool.shutdown()
+
+
+def test_the_pull_token_is_kept_nowhere_once_the_pull_finishes(
+    let, remote_cpu, bucket_volume, fake_gcs, tmp_path, live
+) -> None:
+    info = bucket_volume.store.put_bytes(b"secret-free weights")
+    runtime = live(let, remote_cpu)
+    remote = bucket_volume.materialize(runtime, info.digest)
+
+    # Not on disk beside what was pulled.
+    for path in (tmp_path / "mount").rglob("*"):
+        if path.is_file():
+            assert b"down-token-1" not in path.read_bytes()
+    # Not in the worker's memory or environment. The token is assembled inside the check,
+    # so the exec request carrying it does not contain it.
+    runtime.exec(
+        "import gc, os\n"
+        "_needle = 'down-' + 'token-1'\n"
+        "assert not any(_needle in v for v in os.environ.values())\n"
+        "assert not any(isinstance(o, dict) and _needle in repr(o.get('headers'))"
+        " for o in gc.get_objects())\n"
+    )
+    assert Path(remote.path).is_file()
+    let.pool.shutdown()
+
+
+def test_a_cached_environment_is_pulled_and_unpacked_by_the_runtime(fake_gcs, tmp_path) -> None:
+    # The archive the local machine uploaded directly is what the next session pulls.
+    from conftest import PreparingLocal, provider_of
+
+    provider = provider_of(PreparingLocal, "lab")
+    env = letify.Env(lock=str(tmp_path / "absent.lock"))
+    installed = tmp_path / "site"
+    installed.mkdir()
+    (installed / "marker.txt").write_text("cached", encoding="utf-8")
+    mount = tmp_path / "mount"
+    volume = provider.volume(
+        "bucket",
+        backend="gcs",
+        bucket=fake_gcs.bucket,
+        endpoint=fake_gcs.endpoint,
+        sts_endpoint=f"{fake_gcs.endpoint}/v1/token",
+        mount=str(mount),
+    )
+    volume.cache_env(env, installed)
+    assert fake_gcs.downloads() == []
+
+    from letify.declare.instance import Instance
+
+    instance = Instance(provider, gpu=None)._placed("remote")
+    runtime = provider.start(instance, env, name="lab-1", volumes=(volume,))
+    try:
+        assert (mount / "site" / "marker.txt").read_text(encoding="utf-8") == "cached"
+        # The ref is read by this process with its own login; the blob is read by the
+        # runtime with the downscoped token.
+        blobs = [r for r in fake_gcs.downloads() if "/blobs/" in unquote(r["path"])]
+        assert [r["authorization"] for r in blobs] == ["Bearer down-token-1"]
+    finally:
+        runtime.shutdown()
+
+
+def test_a_backend_the_runtime_cannot_reach_offers_no_pull(tmp_path) -> None:
+    # So the filesystem backend writes through the channel instead.
+    assert FilesystemBackend(tmp_path / "store").pull_source("ab12") is None
+
+
+def test_a_refused_token_exchange_sends_no_token_at_all(
+    let, remote_cpu, fake_gcs, tmp_path, live
+) -> None:
+    volume = let.providers.local.volume(
+        "bucket",
+        backend="gcs",
+        bucket=fake_gcs.bucket,
+        endpoint=fake_gcs.endpoint,
+        sts_endpoint=f"{fake_gcs.endpoint}/no-such-exchange",
+        mount=str(tmp_path / "mount"),
+    )
+    info = volume.store.put_bytes(b"weights")
+    runtime = live(let, remote_cpu)
+    with pytest.raises(letify.RuntimeFailure, match="downscop"):
+        volume.materialize(runtime, info.digest)
+    assert fake_gcs.downloads() == []
     let.pool.shutdown()
 
 
