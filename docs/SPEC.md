@@ -151,6 +151,8 @@ A run can take more than one card. `device=lab.A100 * 2` asks for two, and on a 
 
 An entry with `indices` has a count: the number of indices. An entry with neither is one of that accelerator.
 
+For a `shell` or `tunnel` account, `letify login` writes this table from what the machine reports, as described under Logging in. An entry with no table is still usable: its accelerators are discovered on first access, as described under Instances.
+
 Which registered indices are free is read with `nvidia-smi` at reservation time, not cached, because the answer changes while a run is queued. A card is taken as busy when another process is computing on it. Nothing else on the machine is inspected, and letify never kills anything.
 
 A reserved session sets the visible devices for its own process, so the training code sees its cards as 0 upward and needs to know nothing about which physical indices it was given.
@@ -165,7 +167,7 @@ The device count is part of the pool key, because a session holding two cards is
 
 Because an instance carries its provider, `device=colab.G4` fixes provider, account and accelerator in one argument. `let.providers.any.G4` defers the provider choice to the first declared provider that registers a matching accelerator, in configuration order.
 
-Instance discovery is lazy and cached. A provider that must connect to enumerate its accelerators does so on first access, never at import time, and a configuration entry may list `gpus` to skip the connection. `refresh()` asks again.
+Instance discovery is lazy and cached. A provider that must connect to enumerate its accelerators does so on first access, never at import time, and a configuration entry may list `gpus` or a `devices` table to skip the connection. `refresh()` asks again. A `shell` or `tunnel` account gets its `devices` table at login, so the connection on first access is the fallback for an entry written without one: a login where `nvidia-smi` did not answer, a password account, or an entry written by hand.
 
 `Local` reads its accelerator names once per process, because asking `nvidia-smi` takes seconds on a laptop whose discrete GPU is asleep and the answer does not change while the process runs.
 
@@ -661,6 +663,23 @@ An account that is already in the home file is not asked for again. `letify logi
 
 Credentials never enter either `config.toml`. A token goes to a file in the account directory. An SSH password is never stored at all, which the next section explains.
 
+### Recording devices at login <!-- id: login-records-devices -->
+
+> `letify login shell` and `letify login tunnel` ask the machine for its GPUs once, right after the key is confirmed, and write the ones the user chose to `[<alias>.devices]` in `~/.letify/config.toml`.
+
+Detection happens at login and not at first use, for two reasons. The generated provider types read the `devices` table without a network call, so an editor completes the accelerator names only once the table exists. And on a shared machine the table is where the user says which cards are theirs, so asking at login is what makes the first session use those cards and no others.
+
+1. After the key is confirmed with `BatchMode=yes`, the same SSH connection options run `nvidia-smi --query-gpu=index,name,memory.total --format=csv,noheader` once. A password account has no BatchMode check to follow, so it is not detected.
+2. Each name is normalized with the accelerator name normalizer, and the cards are grouped by that name with their physical indices kept.
+3. With a terminal, each group is shown as one line, `A100: 4 cards, indices 0-3 (80 GB each)`, and the user is asked `Indices letify may use for A100 [0-3]: `. A blank answer takes every card found. An answer takes the forms the inventory takes, `0-3` or `0,1,6`. An answer naming an index that was not found, or that cannot be read, is refused with the reason and asked again.
+4. With `--no-input`, `--indices NAME=SPEC` chooses the indices for one name and may be repeated. A name without the option gets every card found. An option naming an accelerator that was not found, or an index that was not found, fails the login with nothing written.
+5. The result is written as `[<alias>.devices]` with one `NAME = { indices = "..." }` line per name, through the same textual writer as the account, so every other table and comment in the file stays as it was. A contiguous choice is written as a range, `"0-3"`, and any other choice as a list, `"0,1,6"`.
+6. When `nvidia-smi` is missing, exits non zero, or lists no GPU, the login still succeeds. Nothing is recorded, a note says why, and the accelerators are discovered on first access.
+7. An account already in the home file is not detected again. `--detect-devices` asks the machine again with the connection details the home file holds, shows what it found, and replaces the table after the user confirms with `y`. With `--no-input` the flag itself is the confirmation. When nothing is found, the existing table is left alone.
+8. After a table is written, the provider types are regenerated as `Launcher()` does, so completion picks up the names at once.
+
+`letify logout <alias>` removes `[<alias>.devices]` together with `[<alias>]`, because a devices table without its account would declare an account with no kind.
+
 ### SSH authentication
 
 > Key authentication, because the call path is non-interactive. A password is accepted once, to install the key, and then discarded.
@@ -673,6 +692,7 @@ So `letify login shell` sets up key authentication and treats the password as a 
 2. The public key is appended to the machine's `~/.ssh/authorized_keys`, over one interactive SSH connection that asks for the password in the terminal.
 3. The password is used by that one command and then dropped. It is not written to a file or to the environment.
 4. The connection is confirmed with `BatchMode=yes`, which proves the key works before the alias is declared rather than at the first call.
+5. The machine's GPUs are detected over that confirmed connection, as described under Recording devices at login.
 
 Two other approaches were considered and are not the default. Connection multiplexing with `ControlMaster` authenticates once and reuses the socket, but Windows OpenSSH does not implement it and a dropped socket ends a long run. `sshpass` feeds a stored password to each connection, which needs the password kept somewhere and exposes it in the process arguments of every call. `sshpass` is available as `auth = "password"` for a machine whose administrator forbids key authentication, reading the password from `~/.letify/accounts/<alias>/password`, and it refuses on Windows, where the tool does not exist.
 
@@ -682,7 +702,7 @@ Two other approaches were considered and are not the default. Connection multipl
 
 | Kind | Written to the home file | Credential |
 |---|---|---|
-| `shell`, `tunnel` | address, user, port, key path | an SSH key, installed by `login`; no password stored |
+| `shell`, `tunnel` | address, user, port, key path, and the `devices` table the machine reported | an SSH key, installed by `login`; no password stored |
 | `elice` | endpoint, zone, machine | access token in `~/.letify/accounts/<alias>/access_token` |
 | `colab` | account email | the `colab` CLI owns it; `login` checks the CLI is present and says which command authenticates it |
 | `modal` | workspace | the `modal` CLI owns it, in `~/.modal.toml`; `login` checks it is present |
