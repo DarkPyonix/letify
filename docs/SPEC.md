@@ -8,7 +8,7 @@
 
 > A declaration places three things and names no mechanism.
 
-The public surface is five names: `Launcher`, `Env`, the `function` decorator it carries, `grid` and `zip`. Everything else is reached through a provider object.
+The public surface is three names: `Launcher`, `Env` and the `function` decorator it carries. Everything else is reached through a provider object.
 
 ```python
 import letify
@@ -45,21 +45,19 @@ An instance carries no placement of its own. `colab.G4` says which card, and onl
 
 A declared function is called like any other. There is no second verb such as `.remote()`: a decorator that wraps a `def` and then needs another call to run it has moved the declaration out of the declaration.
 
-A plain `def` blocks and returns its value. An `async def` returns a coroutine when no space is passed, so the standard library accepts it wherever a coroutine is expected, and an awaitable that is also async-iterable when a space is passed.
+A plain `def` blocks and returns its value. An `async def` returns a plain coroutine, so the standard library accepts it wherever a coroutine is expected.
+
+A call takes the arguments the `def` declares and returns what the `def` returns. No argument value changes what a call means.
 
 `Function.local()` runs the body in the calling process. It exists for testing a body with no provider; the preferred way to run locally is a `Local` provider, which keeps the production code path.
 
-### Fan-out
+### Concurrency <!-- id: fan-out -->
 
-> Passing a space where a scalar is expected declares that the argument varies.
+> Many configurations run at once by calling the declared function concurrently. The inventory bounds how many run.
 
-`grid(**axes)` is the Cartesian product of its axes. `zip(**axes)` pairs them position by position and rejects axes of unequal length. Two spaces combine with `|`, which drops duplicate points. A scalar axis stays fixed across the space. `with_fixed(**kw)` adds arguments constant across every point.
+Running several configurations is repeated calls, one per configuration, inside `with let.keep_alive():` so the calls reuse warm sessions. Concurrent calls come from the language: `asyncio.gather` over calls to an `async def` declaration, or threads over a plain `def` one. letify adds no map call and no argument type for it.
 
-A space is consumed by the language's own protocols. `await` collects results in input order; `async for` yields them as they complete. A sync declaration returns a list in input order.
-
-Only one space may be passed per call. Two would make the point count the product of two arguments rather than something visible in one place.
-
-A space runs as wide as the provider has devices for, and no wider. Nothing on the declaration bounds it, because a bound there would be a second statement of the same fact: the inventory already says how many cards exist, and a point that cannot reserve one waits for a point that can to finish.
+Concurrent calls run as wide as the provider has devices for, and no wider. Nothing on the declaration bounds it, because a bound there would be a second statement of the same fact: the inventory already says how many cards exist, and a call that cannot reserve one waits for a call that holds one to finish, as described under Pooling.
 
 A declaration taking two cards halves the width on a four card machine, which is arithmetic rather than policy. That is also why a width knob could not work: with `device=lab.A100 * 2`, a number that says how many runtimes may exist says nothing about how many cards they need.
 
@@ -277,7 +275,7 @@ A runtime boots in four steps: open the channel, arm the lease, install the decl
 
 The pool key is the instance key joined with the environment key. Two declarations that agree on both share runtimes, which is why nothing has to be said for two functions on one device to reuse a session.
 
-How many sessions may exist is the provider's inventory and nothing else. Starting one reserves the devices its instance asks for. A call that cannot reserve them waits only while a session in this process that holds that accelerator is serving a call, because that session gives its devices back when the call finishes; a sweep wider than the inventory relies on exactly this. In every other case the devices cannot be allocated, and the call raises `InsufficientDevices` at once, naming what holds them: an idle session that a `keep_alive` block is keeping, a card another process is computing on, or a request for more devices than the account declares. Waiting there would never end, because nothing letify is running would free a device. `InsufficientDevices` is not retried, since a retry asks for the same devices from the same inventory. There is no ceiling on the launcher: a number there would be a guess about hardware the provider entry already describes, and when the two disagreed the smaller would win silently.
+How many sessions may exist is the provider's inventory and nothing else. Starting one reserves the devices its instance asks for. A call that cannot reserve them waits only while a session in this process that holds that accelerator is serving a call, because that session gives its devices back when the call finishes; more concurrent calls than the inventory has cards for rely on exactly this. In every other case the devices cannot be allocated, and the call raises `InsufficientDevices` at once, naming what holds them: an idle session that a `keep_alive` block is keeping, a card another process is computing on, or a request for more devices than the account declares. Waiting there would never end, because nothing letify is running would free a device. `InsufficientDevices` is not retried, since a retry asks for the same devices from the same inventory. There is no ceiling on the launcher: a number there would be a guess about hardware the provider entry already describes, and when the two disagreed the smaller would win silently.
 
 A session is never a value the caller holds. Pooling, reuse and teardown are decided from the declaration and the `keep_alive` block around it, so there is no call that starts a session, none that returns one, and none that takes one. `Runtime` exists, and letify hands it to a provider and to a volume, but it does not appear in anything a user writes.
 
@@ -285,7 +283,7 @@ A session is never a value the caller holds. Pooling, reuse and teardown are dec
 
 > A session ends with the call that needed it. `with let.keep_alive():` keeps sessions for the length of a block. Nothing else decides.
 
-1. **The call.** A session ends when the call that started it finishes. A search space counts as one call, so a sweep starts its runtimes once and releases them once.
+1. **The call.** A session ends when the call that started it finishes. Calls that overlap in time share that span: a session released by one call while another is still running stays up for the next call that matches it, and ends when the last overlapping call finishes.
 2. **A `keep_alive` block.** Inside `with let.keep_alive():` a session is not ended when its call finishes, so the next call in the block that matches its instance and environment reuses it and pays no session start, which is minutes on Colab. When the block exits, every idle session ends; one still serving a call ends when that call finishes. Blocks nest, and only the outermost exit ends anything.
 3. **The lease.** The local process renews a deadline inside the session every 30 seconds, and the worker exits on its own if the deadline passes. The grace period is 300 seconds, so a brief network drop does not kill a training run.
 
@@ -317,7 +315,7 @@ There is no detached execution. A detached run whose remote side is preempted wo
 
 `Launcher.status()` answers three questions: how many sessions exist, how many are serving a call, and what each one is. `live` and `busy` are counts, and `devices` reports each provider's inventory against what is reserved, so a reader can see at a glance whether a call is waiting for a card. `runtimes` describes each session: its name, provider, accelerator, the device indices it holds, placement, whether it is busy and how long it has been idle.
 
-Nothing internal is reported. The pool holds a guard so that one invocation does not restart a session between the points of a sweep, and whether that guard is currently open is a fact about the pool's implementation rather than about what is running. A field among counts that looks like a count and is actually a boolean is worse than no field, because it is read as a count.
+Nothing internal is reported. The pool holds a guard so that a session released by one call is not ended while an overlapping call is still running, and whether that guard is currently open is a fact about the pool's implementation rather than about what is running. A field among counts that looks like a count and is actually a boolean is worse than no field, because it is read as a count.
 
 `status()` describes this process only. A session started by a different process is not in it, since the pool lives in the process that owns it. What a machine itself is doing is a different question, answered by `letify utilization`.
 
