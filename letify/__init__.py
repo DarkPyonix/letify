@@ -18,8 +18,8 @@ and the account with it. ``host`` says where the host code runs: ``local``, the 
 keeps Python here and forwards only CUDA calls, and ``remote`` ships the function to the
 machine that holds the device.
 
-A session ends with the call that needed it. ``lifetime="process"`` keeps it, so a run of
-separate calls does not pay session start each time. Nothing has to be torn down by hand.
+A session ends with the call that needed it. ``with let.keep_alive():`` keeps sessions for the
+length of a block, so a run of separate calls does not pay session start each time.
 
 Nothing here imports a provider's optional dependency, so ``import letify`` works with
 the base install and a provider whose package is missing reports itself unavailable.
@@ -29,7 +29,7 @@ from __future__ import annotations
 
 from .declare.env import Env
 from .declare.function import Function
-from .declare.instance import AnyInstance, Host, Instance, Lifetime
+from .declare.instance import AnyInstance, Host, Instance
 from .declare.sweep import Sweep, grid
 from .declare.sweep import zip_ as zip
 from .errors import (
@@ -70,7 +70,6 @@ __all__ = [
     "Instance",
     "Launcher",
     "LetifyError",
-    "Lifetime",
     "ProtocolError",
     "ProviderUnavailable",
     "Providers",

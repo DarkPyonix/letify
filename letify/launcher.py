@@ -11,18 +11,15 @@ pool. It is the thing that does the letting, so the conventional variable name i
 
     train(lr=1e-4, bs=32)
 
-There is no scope to open. A runtime lives for the invocation that needed it and is
-released when that finishes, which is why a call needs no ceremony around it.
+A call needs no scope around it. A runtime lives for the invocation that needed it and is
+released when that finishes.
 
-How long a session lives is declared, not commanded. ``lifetime="call"`` is the default
-and ends the session with the call. ``lifetime="process"`` keeps it, because starting one
-costs provider boot plus environment installation, which is minutes on Colab and worth
-avoiding across a run of separate calls. Two declarations that agree on device and
-environment share a session either way, since the pool keys by those rather than by which
-function asked.
+How long a session lives is scoped, not commanded. A session ends with the call that started
+it, and ``with let.keep_alive():`` keeps sessions until the block ends, so a run of separate
+calls reuses one session and nothing outlives the code that asked for it.
 
-Nothing is torn down by hand. A call ends its own session, one left over is reaped once it
-has been idle past the timeout, and everything goes at process exit.
+Nothing is torn down by hand and nothing on a timer. A call ends its own session, a
+``keep_alive`` block ends the sessions it kept, and anything left goes at process exit.
 
 Providers are reached by attribute on ``let.providers``. Three names there are
 reserved: ``any`` for a request that does not name a provider, ``devices`` for the
@@ -43,12 +40,16 @@ from . import providers as provider_registry
 from .config import Config, load
 from .declare.env import Env
 from .declare.function import Function
-from .declare.instance import AnyInstance, Host, Instance, Lifetime
+from .declare.instance import AnyInstance, Host, Instance
 from .declare.sweep import grid, zip_
 from .errors import LetifyError, UnknownInstance, UnknownProvider
 from .runtime.pool import RuntimePool
 
 if TYPE_CHECKING:
+    # A generated per project stub replaces this type with one naming the project's aliases.
+    # letify ships a plain fallback, so a project that never generated one keeps these types.
+    from letify_providers import ProvidersView
+
     from .providers.base import Provider
     from .store.volume import Volume
 
@@ -143,12 +144,16 @@ class Launcher:
         self.name = name or self.config.defaults.get("name") or _project_name()
         self.stream_logs = stream_logs
         self.announce = announce
-        self.providers = Providers(self)
+        self.providers: ProvidersView = Providers(self)  # type: ignore[assignment]
         self.functions: list[Function] = []
         self.pool = RuntimePool(on_start=self._announce_start)
         self._cache: dict[str, Provider] = {}
         self._guard = threading.Lock()
         self._at_exit_registered = False
+
+        from . import stubs
+
+        stubs.refresh(self)
 
     # -- providers -----------------------------------------------------------
 
@@ -180,7 +185,7 @@ class Launcher:
                 instance = self.provider(alias).device(request.accelerator)
             except Exception:
                 continue
-            instance = instance.on_host(request.host)
+            instance = instance._placed(request.host)
             return instance
         raise UnknownInstance(
             f"no declared provider offers {request.accelerator!r}. Checked: "
@@ -195,7 +200,6 @@ class Launcher:
         device: Instance | AnyInstance,
         env: Env | None = None,
         host: Host | str | None = None,
-        lifetime: Lifetime | str | None = None,
         volumes: Sequence[Volume] = (),
         timeout: float | None = None,
         retries: int = 1,
@@ -207,10 +211,6 @@ class Launcher:
         count and memory come with it rather than being asked for. ``host`` says where the
         host code runs: ``"local"``, the default, keeps Python here and forwards only CUDA
         calls, and ``"remote"`` ships this function to the machine with the GPU.
-
-        ``lifetime`` says how long the session lives. ``"call"``, the default, ends it
-        with the call. ``"process"`` keeps it so the next call skips session start, at the
-        cost of an unused session billing until the process exits.
 
         There is no width argument. A space runs as wide as the provider has devices for,
         which the provider entry already says.
@@ -226,7 +226,6 @@ class Launcher:
                 device=device,
                 env=env or Env(),
                 host=host,
-                lifetime=lifetime,
                 volumes=volumes,
                 timeout=timeout,
                 retries=retries,
@@ -242,7 +241,24 @@ class Launcher:
     grid = staticmethod(grid)
     zip = staticmethod(zip_)
 
-    # -- lifetime ------------------------------------------------------------
+    # -- keeping sessions ---------------------------------------------------
+
+    @contextmanager
+    def keep_alive(self) -> Iterator[Launcher]:
+        """Keep sessions for the length of the block, so calls inside it reuse them.
+
+        A session normally ends with the call that started it. Inside this block it stays up,
+        and the next call with the same instance and environment reuses it instead of paying
+        session start again. When the block exits, however it exits, every idle session ends,
+        and a session still serving a call ends when that call finishes. Blocks nest, and only
+        the outermost exit ends anything.
+        """
+        self._register_at_exit()
+        self.pool.hold()
+        try:
+            yield self
+        finally:
+            self.pool.unhold()
 
     @contextmanager
     def invocation(self) -> Iterator[Launcher]:
@@ -357,7 +373,6 @@ class Launcher:
                     "devices": list(runtime.held_devices) or runtime.instance.devices,
                     "placement": str(runtime.instance.placement),
                     "busy": runtime.busy,
-                    "lifetime": str(runtime.lifetime),
                     "persistent_channel": runtime.persistent_channel,
                     "idle_seconds": round(runtime.idle_for, 1),
                 }

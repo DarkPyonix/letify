@@ -28,6 +28,7 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("providers", help="list declared providers and their storage")
     sub.add_parser("devices", help="list the accelerators each provider offers")
     sub.add_parser("status", help="show live runtimes and what they are costing")
+    sub.add_parser("stubs", help="write the provider types an editor completes")
 
     usage = sub.add_parser("usage", help="show what each account has left")
     usage.add_argument("alias", nargs="?", help="one provider instead of all of them")
@@ -189,6 +190,16 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     let = Launcher(args.config, announce=False)
+
+    if args.command == "stubs":
+        from . import stubs
+
+        written = stubs.write(let)
+        if written is None:
+            print("generation is turned off by [tool.letify] typings = false", file=sys.stderr)
+            return 1
+        print(written)
+        return 0
 
     if args.command == "providers":
         for alias in let.config.order:

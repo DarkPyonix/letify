@@ -25,19 +25,19 @@ def train(lr, bs):
 train(lr=1e-4, bs=32)
 ```
 
-The decorator takes `device`, `host`, `lifetime`, `env`, `volumes`, `timeout`, `retries` and `keep_remote`. `timeout` has no default: a deadline letify invented would end a two hour training run at whatever hour it guessed, which is letify deciding how long the user's own work is allowed to take. It takes no transport, no mode and no width: the three placements below settle where the work runs, and how much can run at once is the provider's inventory rather than a number on the declaration.
+The decorator takes `device`, `host`, `env`, `volumes`, `timeout`, `retries` and `keep_remote`. `timeout` has no default: a deadline letify invented would end a two hour training run at whatever hour it guessed, which is letify deciding how long the user's own work is allowed to take. It takes no transport, no mode and no width: the three placements below settle where the work runs, and how much can run at once is the provider's inventory rather than a number on the declaration.
 
-### The three placements
+### The two placements <!-- id: the-three-placements -->
 
-> `device` says where the accelerator is, `host` says where the host code runs, `lifetime` says how long the session lives.
+> `device` says where the accelerator is and `host` says where the host code runs. Both are said in the declaration and nowhere else.
 
 `device` carries the provider, the account, the accelerator and how many of it one session takes, because those are one decision. `colab.G4` is such a value, and so is `lab.A100 * 2` for a run that trains across two cards. Core count and memory are not arguments: they arrive with the shape the provider registered, and a provider that offers several sizes registers them as separate shapes.
 
 `host` is the CUDA word for the CPU side, paired with the device the declaration already placed. `"local"`, the default, keeps Python and the libraries in this process and forwards only CUDA calls. `"remote"` ships the declared function to the machine that holds the device.
 
-`lifetime` is how long the session lives. `"call"`, the default, ends it when the call finishes. `"process"` keeps it, so a run of separate calls does not pay session start each time.
+`host` takes `letify.local` or `letify.remote`, which are the two members of a string enum defined next to `Instance`. The enum class itself is not part of the public surface: two named values say everything a declaration needs, and a class at the top of the package was one more name to learn for the same two choices. Because the members are strings, `host="remote"` is the same value. An unrecognized value raises at declaration time with both options named.
 
-`host` takes `letify.local` or `letify.remote`, which are the two members of a string enum defined next to `Instance`. The enum class itself is not part of the public surface: two named values say everything a declaration needs, and a class at the top of the package was one more name to learn for the same two choices. Because the members are strings, `host="remote"` is the same value. `lifetime` takes `"call"` or `"process"`. An unrecognized value raises at declaration time with both options named.
+An instance carries no placement of its own. `colab.G4` says which card, and only the declaration's `host` says where the host code runs, so there is one place to read to know where a function runs. How long a session lives is not a declaration argument either: it is the `keep_alive` block around the calls, described under Lifetime.
 
 ### Invocation
 
@@ -161,7 +161,7 @@ A reserved session sets the visible devices for its own process, so the training
 
 > An `Instance` is one accelerator shape on one provider account.
 
-`colab.G4` is an `Instance`. It holds the provider, the accelerator name, the host placement, how many devices one session takes, and the core count, memory and VRAM the provider reported. `on_host()` returns a copy in a different mode, and `n * instance` a copy taking `n` devices.
+`colab.G4` is an `Instance`. It holds the provider, the accelerator name, the host placement, how many devices one session takes, and the core count, memory and VRAM the provider reported. `n * instance` returns a copy taking `n` devices. An instance has no method that changes where the host code runs, because that is the declaration's `host`.
 
 The device count is part of the pool key, because a session holding two cards is not interchangeable with one holding one.
 
@@ -279,17 +279,19 @@ The pool key is the instance key joined with the environment key. Two declaratio
 
 How many sessions may exist is the provider's inventory and nothing else. Starting one reserves the devices its instance asks for, and a call that cannot reserve them waits for a session to release some rather than asking the provider for a machine it would refuse. There is no ceiling on the launcher: a number there would be a guess about hardware the provider entry already describes, and when the two disagreed the smaller would win silently.
 
-A session is never a value the caller holds. Pooling, reuse, lifetime and teardown are all decided from the declaration, so there is no call that starts a session, none that returns one, and none that takes one. `Runtime` exists, and letify hands it to a provider and to a volume, but it does not appear in anything a user writes.
+A session is never a value the caller holds. Pooling, reuse and teardown are decided from the declaration and the `keep_alive` block around it, so there is no call that starts a session, none that returns one, and none that takes one. `Runtime` exists, and letify hands it to a provider and to a volume, but it does not appear in anything a user writes.
 
 ### Lifetime
 
-> A session ends with the call that needed it. Keeping one is declared. Nothing else decides.
+> A session ends with the call that needed it. `with let.keep_alive():` keeps sessions for the length of a block. Nothing else decides.
 
-1. **The call.** `lifetime="call"` ends the session when the call finishes. A search space counts as one call, so a sweep starts its runtimes once and releases them once.
-2. **The declaration.** `lifetime="process"` keeps the session past the call, because starting one costs provider boot plus environment installation, which is minutes on Colab.
+1. **The call.** A session ends when the call that started it finishes. A search space counts as one call, so a sweep starts its runtimes once and releases them once.
+2. **A `keep_alive` block.** Inside `with let.keep_alive():` a session is not ended when its call finishes, so the next call in the block that matches its instance and environment reuses it and pays no session start, which is minutes on Colab. When the block exits, every idle session ends; one still serving a call ends when that call finishes. Blocks nest, and only the outermost exit ends anything.
 3. **The lease.** The local process renews a deadline inside the session every 30 seconds, and the worker exits on its own if the deadline passes. The grace period is 300 seconds, so a brief network drop does not kill a training run.
 
-Nothing is torn down by hand, and nothing is torn down on a timer either. An idle reaper was tried and removed: `"process"` declares that the session lives for the process, and a thread ending it after ten idle minutes overrules the declaration it was given. The same reasoning that rules out keeping a session alive on the chance a call arrives rules out killing one the declaration asked to keep. There is no release call and no shutdown call on the public surface, and everything goes at process exit.
+Keeping is a block rather than a declaration argument because it describes a stretch of the caller's program, not a property of one function: the same function is kept in one script and not in another. A block also has a visible end, so no session outlives the code that asked for it.
+
+Nothing is torn down by hand and nothing is torn down on a timer. There is no release call and no shutdown call on the public surface, and everything left goes at process exit.
 
 The lease is the one exception, and it is not a timer on the work: it covers the moment a process is killed outright, which is the one moment nothing can be told to anybody. `SIGKILL`, the out of memory killer and a power cut all run no code at all, so a session that only ends when asked would never be asked.
 
@@ -313,7 +315,7 @@ There is no detached execution. A detached run whose remote side is preempted wo
 
 > What is running, counted rather than described, with no internal bookkeeping in it.
 
-`Launcher.status()` answers three questions: how many sessions exist, how many are serving a call, and what each one is. `live` and `busy` are counts, and `devices` reports each provider's inventory against what is reserved, so a reader can see at a glance whether a call is waiting for a card. `runtimes` describes each session: its name, provider, accelerator, the device indices it holds, placement, lifetime, whether it is busy and how long it has been idle.
+`Launcher.status()` answers three questions: how many sessions exist, how many are serving a call, and what each one is. `live` and `busy` are counts, and `devices` reports each provider's inventory against what is reserved, so a reader can see at a glance whether a call is waiting for a card. `runtimes` describes each session: its name, provider, accelerator, the device indices it holds, placement, whether it is busy and how long it has been idle.
 
 Nothing internal is reported. The pool holds a guard so that one invocation does not restart a session between the points of a sweep, and whether that guard is currently open is a fact about the pool's implementation rather than about what is running. A field among counts that looks like a count and is actually a boolean is worse than no field, because it is read as a count.
 
@@ -357,6 +359,8 @@ That works with every backend and needs no credentials on the far side, at the c
 These take the declaration, not a session. A declaration already says which provider, which accelerator, which environment and which volumes, so which session is letify's answer to work out and not a value for the caller to carry. The alternative was tried and is worse: a caller holding a session has to have asked for it with the same instance the declaration uses, and the declaration folds the host placement into that instance, so asking with the bare one silently starts a second session that holds none of the first one's files. On one machine that still passes, because both sessions see the same disk. On a rented one it fails, which makes it the worst kind of defect: it works in the test and breaks where the money is.
 
 So nothing hands a session to the caller. There is no call that returns one, no argument that takes one, and no way to hold the wrong one.
+
+Moving a file through a session only works while that session exists, so `absorb`, `resume` and `cache_env_from` are called inside `with let.keep_alive():`. Outside one they raise `UnsupportedMode`, because the session they would use ends as soon as they return and a resumed checkpoint would vanish before the call that needs it.
 
 ### Backends
 
@@ -452,6 +456,20 @@ access_token_env = "ELICE_ACCESS_TOKEN"
 ```
 
 The older `gpus = ["A100", "H100"]` list still works and means one of each, with letify choosing no indices. `devices` is what an entry uses once a count or an index range matters.
+
+### Generated provider types
+
+> Loading the configuration writes a type stub that names this project's accounts and their accelerators, so an editor completes `let.providers.colab_pro.G4` and flags a misspelled alias.
+
+Aliases live in `.letify`, not in code, so a type checker cannot know them. `Launcher()` therefore writes `letify_providers.pyi` describing the accounts this project can use under the two file rule above. `Launcher.providers` is typed as `letify_providers.ProvidersView`, and letify ships a `letify_providers` module whose `ProvidersView` is the plain `Providers`, so a project with no generated file keeps exactly today's types.
+
+Each alias becomes a class named after it in CamelCase, `colab_pro` as `ColabPro` and `lab_a100` as `LabA100`, subclassing the provider class of its kind. A name that is a Python keyword gets `Provider` appended, and a name two aliases would share gets a number appended in declaration order. The class declares one `Instance` attribute per accelerator the account offers, and `ProvidersView` declares one attribute per alias. Where the accelerators are known, the class declares no fallback attribute lookup, so a misspelled accelerator is a type error; where they are not, attribute access stays typed as `Instance`.
+
+Accelerators are taken from what can be known without a network call: the entry's `devices` table or `gpus` list, or the provider's fixed list for Colab and Modal, or this machine's own cards for `local`. Writing the stub never connects to a machine or an API. An alias whose provider cannot be built is typed as the plain `Provider`.
+
+The file goes in a `typings` directory at the project root, which is Pyright's and Pylance's default stub path. The project root is the nearest directory upward from the working directory that holds a `pyproject.toml`, or the working directory when there is none. `[tool.letify] typings = "<path>"` in that `pyproject.toml` moves it, relative to the root, and the type checker's stub path has to point at the same place. `typings = false` turns generation off, and so does the environment variable `LETIFY_STUBS=0`.
+
+The file is rewritten only when its content would change, so loading the configuration does not touch it on every run. `letify stubs` writes it on demand. It reflects one machine's `~/.letify`, so it belongs in the project's `.gitignore`.
 
 ### Logging in
 

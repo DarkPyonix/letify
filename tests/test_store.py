@@ -49,7 +49,7 @@ def volume(let: letify.Launcher, tmp_path: Path) -> Volume:
 
 @pytest.fixture
 def remote_cpu(let: letify.Launcher) -> letify.Instance:
-    return let.providers.local.CPU.on_host("remote")
+    return let.providers.local.CPU._placed("remote")
 
 
 # -- Spec: Content addressed layout --------------------------------------------
@@ -468,11 +468,11 @@ def test_an_environment_installed_inside_a_runtime_is_cached_for_the_next_sessio
 
 
 def test_a_checkpoint_is_taken_from_the_session_the_declaration_used(
-    let, remote_cpu, volume, tmp_path
+    let, cpu, volume, tmp_path
 ) -> None:
     # The caller names the declaration. Which session ran the call is letify's answer, and
     # it is the only one holding the file.
-    @let.function(device=remote_cpu, lifetime="process", volumes=[volume])
+    @let.function(device=cpu, host=letify.remote, volumes=[volume])
     def write_a_file(path: str) -> str:
         from pathlib import Path as P
 
@@ -480,15 +480,15 @@ def test_a_checkpoint_is_taken_from_the_session_the_declaration_used(
         P(path).write_bytes(b"weights")
         return path
 
-    written = write_a_file(path=str(tmp_path / "out" / "adapter.pt"))
-    digest = volume.absorb(write_a_file, written, "run-1")
+    with let.keep_alive():
+        written = write_a_file(path=str(tmp_path / "out" / "adapter.pt"))
+        digest = volume.absorb(write_a_file, written, "run-1")
     assert volume.latest_checkpoint("run-1") == digest
     assert volume.store.get_bytes(digest) == b"weights"
-    let.pool.shutdown()
 
 
 def test_a_checkpoint_is_put_back_into_the_session_the_declaration_will_use(
-    let, remote_cpu, volume, tmp_path
+    let, cpu, volume, tmp_path
 ) -> None:
     # Before the call rather than after, because the training function looks for it as an
     # ordinary path. The session it lands in has to be the one the call is handed.
@@ -497,33 +497,33 @@ def test_a_checkpoint_is_put_back_into_the_session_the_declaration_will_use(
     volume.put_checkpoint("run-2", source)
     target = str(tmp_path / "inside" / "resume.pt")
 
-    @let.function(device=remote_cpu, lifetime="process", volumes=[volume])
+    @let.function(device=cpu, host=letify.remote, volumes=[volume])
     def read_it_back(path: str) -> bytes:
         from pathlib import Path as P
 
         return P(path).read_bytes()
 
-    assert volume.resume(read_it_back, "run-2", target) is not None
-    assert read_it_back(path=target) == b"seed"
-    let.pool.shutdown()
+    with let.keep_alive():
+        assert volume.resume(read_it_back, "run-2", target) is not None
+        assert read_it_back(path=target) == b"seed"
 
 
 def test_resuming_a_name_nothing_was_stored_under_reports_nothing(
-    let, remote_cpu, volume, tmp_path
+    let, cpu, volume, tmp_path
 ) -> None:
     # Nothing to put back is an answer rather than a failure: a first run has no checkpoint.
-    @let.function(device=remote_cpu, lifetime="process", volumes=[volume])
+    @let.function(device=cpu, host=letify.remote, volumes=[volume])
     def anything() -> int:
         return 1
 
-    assert volume.resume(anything, "never-written", str(tmp_path / "x.pt")) is None
-    let.pool.shutdown()
+    with let.keep_alive():
+        assert volume.resume(anything, "never-written", str(tmp_path / "x.pt")) is None
 
 
-def test_a_declaration_asked_twice_is_given_one_session(let, remote_cpu, volume, tmp_path) -> None:
+def test_a_declaration_asked_twice_is_given_one_session(let, cpu, volume, tmp_path) -> None:
     # Otherwise moving a checkpoint in and then out would cross two sessions, and the second
     # would not hold the file the first wrote.
-    @let.function(device=remote_cpu, lifetime="process", volumes=[volume])
+    @let.function(device=cpu, host=letify.remote, volumes=[volume])
     def note(path: str) -> str:
         from pathlib import Path as P
 
@@ -531,8 +531,24 @@ def test_a_declaration_asked_twice_is_given_one_session(let, remote_cpu, volume,
         P(path).write_bytes(b"once")
         return path
 
-    written = note(path=str(tmp_path / "twice" / "a.pt"))
-    volume.absorb(note, written, "run-3")
-    volume.absorb(note, written, "run-3")
-    assert let.status()["live"] == 1
-    let.pool.shutdown()
+    with let.keep_alive():
+        written = note(path=str(tmp_path / "twice" / "a.pt"))
+        volume.absorb(note, written, "run-3")
+        volume.absorb(note, written, "run-3")
+        assert let.status()["live"] == 1
+
+
+def test_moving_a_checkpoint_outside_keep_alive_is_refused(let, cpu, volume, tmp_path) -> None:
+    # The session would end as soon as the call returned, so a resumed checkpoint would vanish
+    # before the call that needs it.
+    source = tmp_path / "seed.pt"
+    source.write_bytes(b"seed")
+    volume.put_checkpoint("run-4", source)
+
+    @let.function(device=cpu, host=letify.remote, volumes=[volume])
+    def anything() -> int:
+        return 1
+
+    with pytest.raises(letify.UnsupportedMode, match="keep_alive"):
+        volume.resume(anything, "run-4", str(tmp_path / "x.pt"))
+    assert let.pool.live == []

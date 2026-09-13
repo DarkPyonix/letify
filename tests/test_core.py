@@ -10,7 +10,7 @@ test_protocol.py, channels and the pool in test_runtime.py, providers in
 test_providers.py, storage in test_store.py.
 
 Spec sections pinned here: "Invocation", "Fan-out", "Call protocol", "Handles",
-"Argument addressing", "Failure and retry", "Pooling" and "Lifetime".
+"Argument addressing", "Failure and retry", "Pooling" and "Lifetime", which covers keep_alive.
 """
 
 from __future__ import annotations
@@ -141,26 +141,26 @@ def test_an_async_space_can_be_iterated_as_it_completes(
 
 
 def test_a_kept_value_stays_in_the_runtime(let: letify.Launcher, cpu: letify.Instance) -> None:
-    @let.function(device=cpu, host="remote", keep_remote=True, lifetime="process")
+    @let.function(device=cpu, host=letify.remote, keep_remote=True)
     def build() -> dict[str, list[int]]:
         return {"weights": [1, 2, 3]}
 
-    @let.function(device=cpu, host="remote", lifetime="process")
+    @let.function(device=cpu, host=letify.remote)
     def total(model: dict[str, list[int]]) -> int:
         return sum(model["weights"])
 
-    handle = build()
-    assert isinstance(handle, letify.Handle)
-    assert handle.type_name == "dict"
-    # Resolving it in a later call is what the persistent worker exists for.
-    assert total(model=handle) == 6
-    let.pool.shutdown()
+    with let.keep_alive():
+        handle = build()
+        assert isinstance(handle, letify.Handle)
+        assert handle.type_name == "dict"
+        # Resolving it in a later call is what the persistent worker exists for.
+        assert total(model=handle) == 6
 
 
 def test_a_handle_from_another_runtime_is_refused(
     let: letify.Launcher, cpu: letify.Instance
 ) -> None:
-    @let.function(device=cpu, host="remote")
+    @let.function(device=cpu, host=letify.remote)
     def consume(value: object) -> object:
         return value
 
@@ -173,74 +173,73 @@ def test_a_handle_from_another_runtime_is_refused(
 
 
 def test_a_large_argument_is_sent_once(let: letify.Launcher, cpu: letify.Instance) -> None:
-    @let.function(device=cpu, host="remote", lifetime="process")
+    @let.function(device=cpu, host=letify.remote)
     def size(payload: bytes) -> int:
         return len(payload)
 
     big = b"x" * 200_000
-    assert size(payload=big) == 200_000
-    assert size(payload=big) == 200_000
-
-    stat = let.pool.live[0].stat()
+    with let.keep_alive():
+        assert size(payload=big) == 200_000
+        assert size(payload=big) == 200_000
+        stat = let.pool.live[0].stat()
     # One blob, not two, even though the argument was passed twice.
     assert stat["blobs"] == 1
     assert stat["blob_bytes"] > 200_000 - 1
-    let.pool.shutdown()
 
 
 def test_a_small_argument_travels_with_the_call(let: letify.Launcher, cpu: letify.Instance) -> None:
     # Below the inline limit there is nothing to gain from a second round trip.
-    @let.function(device=cpu, host="remote", lifetime="process")
+    @let.function(device=cpu, host=letify.remote)
     def size(payload: bytes) -> int:
         return len(payload)
 
-    assert size(payload=b"x" * 1024) == 1024
-    assert let.pool.live[0].stat()["blobs"] == 0
-    let.pool.shutdown()
+    with let.keep_alive():
+        assert size(payload=b"x" * 1024) == 1024
+        assert let.pool.live[0].stat()["blobs"] == 0
 
 
 # -- Spec: Channels, what one living process buys ------------------------------
 
 
 def test_the_worker_is_one_process_across_calls(let: letify.Launcher, cpu: letify.Instance) -> None:
-    @let.function(device=cpu, host="remote", lifetime="process")
+    @let.function(device=cpu, host=letify.remote)
     def noop() -> None:
         return None
 
-    noop()
-    first = let.pool.live[0].stat()["pid"]
-    noop()
-    assert let.pool.live[0].stat()["pid"] == first
-    let.pool.shutdown()
+    with let.keep_alive():
+        noop()
+        first = let.pool.live[0].stat()["pid"]
+        noop()
+        assert let.pool.live[0].stat()["pid"] == first
 
 
 def test_files_written_into_a_runtime_survive_between_calls(
     let: letify.Launcher, cpu: letify.Instance, tmp_path
 ) -> None:
-    @let.function(device=cpu, host="remote", lifetime="process")
+    @let.function(device=cpu, host=letify.remote)
     def read(path: str) -> str:
         with open(path, encoding="utf-8") as handle:
             return handle.read()
 
-    @let.function(device=cpu, host="remote", lifetime="process")
+    @let.function(device=cpu, host=letify.remote)
     def touch() -> None:
         return None
 
-    touch()
-    runtime = let.pool.live[0]
-    target = str(tmp_path / "materialized.txt")
-    runtime.put_bytes(b"from the store", target)
-    assert read(path=target) == "from the store"
-    payload, digest = runtime.get_bytes(target)
+    with let.keep_alive():
+        touch()
+        runtime = let.pool.live[0]
+        target = str(tmp_path / "materialized.txt")
+        runtime.put_bytes(b"from the store", target)
+        assert read(path=target) == "from the store"
+        payload, digest = runtime.get_bytes(target)
     assert payload == b"from the store"
     assert digest
-    let.pool.shutdown()
 
 
 def test_the_prints_a_body_made_reach_the_caller(let, cpu, capsys) -> None:
     # The user's own stdout comes back separately from the outcome, and letify passes it
     # through rather than swallowing it.
-    @let.function(device=cpu, host="remote")
+    @let.function(device=cpu, host=letify.remote)
     def train() -> int:
         print("epoch 1 loss 0.5")
         return 1
@@ -255,7 +254,7 @@ def test_the_prints_a_body_made_reach_the_caller(let, cpu, capsys) -> None:
 def test_a_remote_exception_arrives_with_its_traceback(
     let: letify.Launcher, cpu: letify.Instance
 ) -> None:
-    @let.function(device=cpu, host="remote", retries=0)
+    @let.function(device=cpu, host=letify.remote, retries=0)
     def boom() -> None:
         raise ValueError("intentional")
 
@@ -270,7 +269,7 @@ def test_a_remote_exception_arrives_with_its_traceback(
 
 
 def test_a_runtime_dies_when_its_call_finishes(let: letify.Launcher, cpu: letify.Instance) -> None:
-    @let.function(device=cpu, host="remote")
+    @let.function(device=cpu, host=letify.remote)
     def noop() -> None:
         return None
 
@@ -278,38 +277,68 @@ def test_a_runtime_dies_when_its_call_finishes(let: letify.Launcher, cpu: letify
     assert let.pool.live == []
 
 
-def test_a_process_lifetime_declaration_keeps_its_session(
+def test_keep_alive_keeps_sessions_until_the_block_ends(
     let: letify.Launcher, cpu: letify.Instance
 ) -> None:
-    @let.function(device=cpu, host="remote", lifetime="process")
+    @let.function(device=cpu, host=letify.remote)
     def noop() -> None:
         return None
 
-    noop()
-    assert len(let.pool.live) == 1
-    noop()
-    assert len(let.pool.live) == 1
-    assert let.pool.shutdown()
+    with let.keep_alive():
+        noop()
+        assert len(let.pool.live) == 1
+        noop()
+        # The second call reused the session instead of starting another.
+        assert len(let.pool.live) == 1
+    assert let.pool.live == []
+
+
+def test_only_the_outermost_keep_alive_ends_sessions(
+    let: letify.Launcher, cpu: letify.Instance
+) -> None:
+    @let.function(device=cpu, host=letify.remote)
+    def noop() -> None:
+        return None
+
+    with let.keep_alive():
+        with let.keep_alive():
+            noop()
+        assert len(let.pool.live) == 1
+    assert let.pool.live == []
+
+
+def test_keep_alive_ends_its_sessions_when_the_block_raises(
+    let: letify.Launcher, cpu: letify.Instance
+) -> None:
+    # A block has a visible end whichever way it is left, so nothing outlives the code that
+    # asked for it.
+    @let.function(device=cpu, host=letify.remote)
+    def noop() -> None:
+        return None
+
+    with pytest.raises(RuntimeError), let.keep_alive():
+        noop()
+        raise RuntimeError("user code failed")
     assert let.pool.live == []
 
 
 def test_two_declarations_on_one_device_share_a_session(
     let: letify.Launcher, cpu: letify.Instance
 ) -> None:
-    @let.function(device=cpu, host="remote", lifetime="process")
+    @let.function(device=cpu, host=letify.remote)
     def first() -> int:
         return 1
 
-    @let.function(device=cpu, host="remote", lifetime="process")
+    @let.function(device=cpu, host=letify.remote)
     def second() -> int:
         return 2
 
-    first()
-    second()
-    # Pooling is by instance and environment, so two declarations share a session with
-    # nothing said about it.
-    assert len(let.pool.live) == 1
-    let.pool.shutdown()
+    with let.keep_alive():
+        first()
+        second()
+        # Pooling is by instance and environment, so two declarations share a session with
+        # nothing said about it.
+        assert len(let.pool.live) == 1
 
 
 def test_a_sweep_is_one_invocation(launcher_from) -> None:
@@ -318,7 +347,7 @@ def test_a_sweep_is_one_invocation(launcher_from) -> None:
     limited = launcher_from('[box]\nkind = "local"\n[box.devices]\nCPU = { count = 2 }\n')
     here = limited.provider("box").CPU
 
-    @limited.function(device=here, host="remote")
+    @limited.function(device=here, host=letify.remote)
     async def slow(n: int) -> int:
         import asyncio as remote_asyncio
 
@@ -338,13 +367,13 @@ def test_the_providers_holding_a_session_can_be_named(
     let: letify.Launcher, cpu: letify.Instance
 ) -> None:
     # The quickest answer to what is costing money.
-    @let.function(device=cpu, host="remote", lifetime="process")
+    @let.function(device=cpu, host=letify.remote)
     def noop() -> None:
         return None
 
-    noop()
-    assert let.providers.active["local"] == [let.pool.live[0].name]
-    let.pool.shutdown()
+    with let.keep_alive():
+        noop()
+        assert let.providers.active["local"] == [let.pool.live[0].name]
     assert let.providers.active == {}
 
 
@@ -359,12 +388,13 @@ def test_status_counts_the_sessions_against_the_ceiling(let, cpu) -> None:
     assert empty["busy"] == 0
     assert "max_runtimes" not in empty
 
-    @let.function(device=cpu, host="remote", lifetime="process")
+    @let.function(device=cpu, host=letify.remote)
     def answer() -> int:
         return 7
 
-    assert answer() == 7
-    running = let.status()
+    with let.keep_alive():
+        assert answer() == 7
+        running = let.status()
     assert running["live"] == 1
     assert running["busy"] == 0
     assert running["live"] == len(running["runtimes"])
@@ -380,16 +410,17 @@ def test_status_does_not_report_the_pools_own_bookkeeping(let, cpu) -> None:
 
 
 def test_a_reported_session_says_what_it_is(let, cpu) -> None:
-    @let.function(device=cpu, host="remote", lifetime="process")
+    @let.function(device=cpu, host=letify.remote)
     def answer() -> int:
         return 7
 
-    answer()
-    row = let.status()["runtimes"][0]
+    with let.keep_alive():
+        answer()
+        row = let.status()["runtimes"][0]
     assert row["provider"] == "local"
     assert row["accelerator"] == cpu.accelerator
     assert row["placement"] == "remote"
-    assert row["lifetime"] == "process"
+    assert "lifetime" not in row
     assert row["busy"] is False
     assert row["idle_seconds"] >= 0
 

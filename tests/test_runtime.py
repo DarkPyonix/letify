@@ -26,7 +26,7 @@ from conftest import (
 
 import letify
 from letify.declare.env import Env
-from letify.declare.instance import Instance, Lifetime
+from letify.declare.instance import Instance
 from letify.errors import RuntimeFailure
 from letify.protocol.worker import BOOTSTRAP
 from letify.runtime import bootstrap, telemetry
@@ -47,7 +47,7 @@ def channel():
 @pytest.fixture
 def remote_cpu(let: letify.Launcher) -> Instance:
     # host="remote" throughout, because forwarding needs letify-core built.
-    return let.providers.local.CPU.on_host("remote")
+    return let.providers.local.CPU._placed("remote")
 
 
 # -- Spec: Channels, the persistent channel ------------------------------------
@@ -298,7 +298,7 @@ def test_a_prebuilt_environment_archive_is_unpacked_instead_of_being_installed(
     volume.cache_env(env, installed)
     assert volume.cached_env(env)
 
-    instance = Instance(provider, gpu=None).on_host("remote")
+    instance = Instance(provider, gpu=None)._placed("remote")
     runtime = provider.start(instance, env, name="lab-1", volumes=(volume,))
     try:
         assert (mount / "site" / "marker.txt").read_text(encoding="utf-8") == "cached"
@@ -310,7 +310,7 @@ def test_a_runtime_boots_its_channel_then_arms_its_lease(tmp_path: Path) -> None
     # Spec "Sessions": open the channel, arm the lease, install the environment, attach
     # volumes. A session that could outlive this process gets the lease.
     provider = provider_of(LeasingLocal, "lab")
-    instance = Instance(provider, gpu=None).on_host("remote")
+    instance = Instance(provider, gpu=None)._placed("remote")
     runtime = provider.start(instance, Env(lock=str(tmp_path / "absent.lock")), name="lab-1")
     try:
         assert runtime.ready is True
@@ -343,7 +343,7 @@ def test_a_volume_with_no_cached_archive_is_passed_over(tmp_path: Path) -> None:
     )
     stocked.cache_env(env, installed)
 
-    instance = Instance(provider, gpu=None).on_host("remote")
+    instance = Instance(provider, gpu=None)._placed("remote")
     runtime = provider.start(instance, env, name="lab-1", volumes=(empty, stocked))
     try:
         assert (mount / "site" / "marker.txt").read_text(encoding="utf-8") == "cached"
@@ -509,19 +509,20 @@ def test_a_call_that_finds_every_card_taken_waits_for_one_to_come_free(
 def test_a_session_that_fails_to_start_gives_its_slot_back(launcher_from, tmp_path, live) -> None:
     # Otherwise one failed start would permanently shrink the ceiling.
     let = launcher_from('[broken]\nkind = "local"\npython = "letify-no-such-python"\n')
-    broken = let.providers.broken.CPU.on_host("remote")
+    broken = let.providers.broken.CPU._placed("remote")
     with pytest.raises(RuntimeFailure):
         live(let, broken)
     assert let.pool.live == []
     # The slot is free again, so a working session still starts.
-    working = let.providers.local.CPU.on_host("remote")
+    working = let.providers.local.CPU._placed("remote")
     assert live(let, working).ready is True
     let.pool.shutdown()
 
 
 def test_a_runtime_is_reused_while_it_is_free_and_not_while_it_is_busy(let, remote_cpu) -> None:
     pool = let.pool
-    first = pool.acquire(remote_cpu, Env(), lifetime=Lifetime.process)
+    pool.hold()
+    first = pool.acquire(remote_cpu, Env())
     pool.release(first)
     assert pool.acquire(remote_cpu, Env()) is first
     pool.shutdown()
@@ -554,10 +555,11 @@ def test_a_held_invocation_keeps_released_runtimes_until_the_last_hold_goes(
 
 
 def test_a_declared_session_is_not_ended_on_a_timer(let, remote_cpu) -> None:
-    # lifetime="process" declares that the session lives for the process. A thread ending it
-    # after some idle period overrules the declaration it was given, which is the same
-    # mistake as keeping one alive on the chance a call arrives.
-    runtime = let.pool.acquire(remote_cpu, Env(), lifetime=Lifetime.process)
+    # A keep_alive block says the session lives until the block ends. A thread ending it after
+    # some idle period overrules that, which is the same mistake as keeping one alive on the
+    # chance a call arrives.
+    let.pool.hold()
+    runtime = let.pool.acquire(remote_cpu, Env())
     let.pool.release(runtime)
     assert let.pool.live == [runtime]
 
@@ -576,7 +578,7 @@ def test_a_declared_session_is_not_ended_on_a_timer(let, remote_cpu) -> None:
 def test_a_session_started_early_is_the_one_the_first_call_uses(let, remote_cpu, live) -> None:
     started = live(let, remote_cpu)
 
-    @let.function(device=remote_cpu, host="remote", lifetime="process")
+    @let.function(device=let.providers.local.CPU, host=letify.remote)
     def noop() -> None:
         return None
 
@@ -584,20 +586,16 @@ def test_a_session_started_early_is_the_one_the_first_call_uses(let, remote_cpu,
     assert let.pool.live == [started]
 
 
-def test_a_process_lifetime_runtime_survives_a_release(launcher_from) -> None:
-    # Two CPU slots, because the kept runtime holds one for the rest of the process and the
-    # call lifetime runtime below has a different environment, so it needs a slot of its own.
-    let = launcher_from('[box]\nkind = "local"\n[box.devices]\nCPU = { count = 2 }\n')
-    instance = let.provider("box").CPU.on_host("remote")
+def test_leaving_the_keep_alive_block_ends_the_idle_sessions(let, remote_cpu) -> None:
+    # The pool side of let.keep_alive(): released runtimes stay while held and go when the
+    # last hold does.
     pool = let.pool
-    runtime = pool.acquire(instance, Env(), lifetime=Lifetime.process)
+    pool.hold()
+    runtime = pool.acquire(remote_cpu, Env())
     pool.release(runtime)
     assert pool.live == [runtime]
-    # A call lifetime runtime is the other half: its release is its end.
-    other = pool.acquire(instance, Env(lock="other.lock"))
-    pool.release(other)
-    assert pool.live == [runtime]
-    pool.shutdown()
+    pool.unhold()
+    assert pool.live == []
 
 
 def test_shutdown_takes_everything_including_a_runtime_still_marked_busy(let, remote_cpu) -> None:
@@ -655,16 +653,16 @@ def test_user_code_failure_is_never_retried(let, remote_cpu, tmp_path) -> None:
 def test_a_handle_scope_error_is_not_retried_either(let, remote_cpu) -> None:
     # It is a mistake in the call, not a misbehaving session, so the runtime it was
     # aimed at stays usable.
-    @let.function(device=remote_cpu, host="remote", retries=2, lifetime="process")
+    @let.function(device=let.providers.local.CPU, host=letify.remote, retries=2)
     def consume(value: object) -> object:
         return value
 
     stranger = letify.Handle(runtime="elsewhere", object_id="00", type_name="dict")
-    with pytest.raises(letify.HandleScopeError):
-        consume(value=stranger)
-    assert len(let.pool.live) == 1
-    assert consume(value=1) == 1
-    let.pool.shutdown()
+    with let.keep_alive():
+        with pytest.raises(letify.HandleScopeError):
+            consume(value=stranger)
+        assert len(let.pool.live) == 1
+        assert consume(value=1) == 1
 
 
 # -- Spec: GPU utilization -----------------------------------------------------
@@ -789,15 +787,14 @@ def test_a_call_waits_for_a_card_rather_than_asking_for_a_refusal(launcher_from)
     import threading
 
     let = launcher_from('[one]\nkind = "local"\n[one.devices]\nCPU = { count = 1 }\n')
-    instance = let.provider("one").CPU.on_host("remote")
 
     started = threading.Event()
 
-    @let.function(device=instance, lifetime="process")
+    @let.function(device=let.provider("one").CPU, host=letify.remote)
     def wait_a_moment() -> int:
         return 1
 
-    assert wait_a_moment() == 1
-    assert let.status()["live"] == 1
-    started.set()
-    let.pool.shutdown()
+    with let.keep_alive():
+        assert wait_a_moment() == 1
+        assert let.status()["live"] == 1
+        started.set()

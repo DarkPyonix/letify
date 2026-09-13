@@ -5,7 +5,7 @@ the environment are all descriptions; creating a runtime is when Colab or Modal 
 a cloud machine powers something on, and shutting it down is when the charge stops.
 
 A runtime ends when the call that needed it finishes. Keeping one longer is opt in,
-through ``lifetime="process"`` on the declaration, because idle time on a GPU is money for
+inside a ``let.keep_alive()`` block, because idle time on a GPU is money for
 nothing. The counter-argument is real and the reason that option exists: starting a session
 costs provider boot plus environment installation, which on Colab is minutes, so a run of
 several separate calls is cheaper with one session than with several.
@@ -24,7 +24,6 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from .. import protocol
-from ..declare.instance import Lifetime
 from ..errors import RuntimeFailure
 from .lease import Lease
 
@@ -61,7 +60,6 @@ class Runtime:
     busy: bool = False
 
     #: How long this session lives, from the declaration that started it.
-    lifetime: Lifetime = Lifetime.call
     lease: Lease | None = field(default=None, repr=False)
 
     #: Digests this runtime is known to hold, so an argument is sent once.

@@ -20,26 +20,6 @@ if TYPE_CHECKING:
     from ..providers.base import Provider
 
 
-class Lifetime(StrEnum):
-    """How long the runtime a declaration uses stays alive.
-
-    ``call`` is the default. The session ends when the call that needed it finishes, and a
-    search space counts as one call, so a sweep starts its sessions once and ends them
-    once. Nothing keeps billing after the work is done.
-
-    ``process`` keeps the session past the call, because starting one costs provider boot
-    plus environment installation, which is minutes on Colab and worth avoiding across a
-    run of separate calls. It then ends when the process exits. Nothing ends it sooner,
-    because a timer would overrule the declaration that asked to keep it.
-
-    A string enum, so ``lifetime="process"`` works wherever ``lifetime=Lifetime.process``
-    does.
-    """
-
-    call = "call"
-    process = "process"
-
-
 class Host(StrEnum):
     """Where the host code runs, relative to this process.
 
@@ -79,8 +59,13 @@ class Instance:
     #: travels with the value the declaration already carries.
     devices: int = 1
 
-    def on_host(self, host: Host | str | None) -> Instance:
-        """Return a copy whose host code runs in the given place."""
+    def _placed(self, host: Host | str | None) -> Instance:
+        """Return a copy whose host code runs in the given place.
+
+        Internal. A declaration folds its host into the instance it runs on, and the pool keys
+        sessions by the result. It is not public because where the host code runs is said in
+        the declaration and nowhere else.
+        """
         if host is None:
             return self
         return replace(self, host=Host(host))
@@ -139,7 +124,8 @@ class AnyInstance:
     accelerator: str
     host: Host | None = None
 
-    def on_host(self, host: Host | str | None) -> AnyInstance:
+    def _placed(self, host: Host | str | None) -> AnyInstance:
+        """Internal, for the same reason as ``Instance._placed``."""
         if host is None:
             return self
         return replace(self, host=Host(host))
@@ -148,4 +134,4 @@ class AnyInstance:
         return f"<AnyInstance {self.accelerator}>"
 
 
-__all__ = ["AnyInstance", "Host", "Instance", "Lifetime"]
+__all__ = ["AnyInstance", "Host", "Instance"]

@@ -1,29 +1,17 @@
 """The pool that hands out runtimes and decides when they die.
 
-The rule is that a runtime dies when the work that needed it is done. One
-invocation is the unit, and a search space counts as one invocation, so a sweep
-boots its runtimes once and releases them when the last point finishes. Nothing is
-kept alive on the chance that another call might come.
+The rule is that a runtime dies when the work that needed it is done. One invocation is the
+unit, and a search space counts as one invocation, so a sweep boots its runtimes once and
+releases them when the last point finishes. Nothing is kept alive on the chance that another
+call might come.
 
-Keeping one longer is declared, never assumed. A runtime acquired for a declaration
-made with ``lifetime="process"`` survives its release, because starting a session is not
-free: provider boot plus environment installation is minutes on Colab, so several separate
-calls in a row are cheaper with one session than with several.
+``hold`` is how a runtime outlives its release. ``Launcher.keep_alive()`` holds the pool for
+the length of a block, and one invocation holds it for its own length. Released runtimes stay
+while any hold is open and end when the last one closes.
 
-``hold`` is the other half of the rule, and it is internal. One invocation brackets
-itself with it so that a search space, which is many calls, starts its runtimes once and
-releases them when the last point finishes.
-
-Nothing ends a runtime on a timer. ``lifetime="process"`` declares that the session lives
-for the process, and a thread ending it after some idle period would overrule the
-declaration it was given, which is the same mistake as keeping one alive on the chance a
-call arrives. It goes at process exit.
-
-The one thing that is not a timer on the work is the lease: a killed process cannot say
-anything to anybody, so the worker holds a deadline and exits if this process stops pushing
-it forward. That releases the occupancy. Whether it also stops the billing depends on the
-provider, and the providers that charge for the machine rather than the process say so for
-themselves.
+Nothing ends a runtime on a timer. The lease is the one thing that ends one without being
+asked, and it is for a process killed outright: the worker holds a deadline and exits if this
+process stops pushing it forward.
 """
 
 from __future__ import annotations
@@ -34,7 +22,6 @@ import uuid
 from collections.abc import Sequence
 from typing import TYPE_CHECKING
 
-from ..declare.instance import Lifetime
 from ..errors import LetifyError
 
 if TYPE_CHECKING:
@@ -76,8 +63,8 @@ class RuntimePool:
     def hold(self) -> None:
         """Keep released runtimes alive until the matching ``unhold``.
 
-        Internal. One invocation uses this so a sweep does not restart a session between
-        its points.
+        Used by ``Launcher.keep_alive()`` for the length of a block, and by one invocation so a
+        sweep does not restart a session between its points.
         """
         with self._guard:
             self._hold_depth += 1
@@ -88,7 +75,7 @@ class RuntimePool:
             self._hold_depth = max(0, self._hold_depth - 1)
             closing = self._hold_depth == 0
         if closing:
-            self.release_call_lifetimes()
+            self.release_idle()
 
     # -- acquisition ---------------------------------------------------------
 
@@ -97,13 +84,8 @@ class RuntimePool:
         instance: Instance,
         env: Env,
         volumes: Sequence[Volume] = (),
-        *,
-        lifetime: Lifetime = Lifetime.call,
     ) -> Runtime:
         """Return a runtime for this declaration, starting one if a slot is free.
-
-        ``lifetime`` comes from the declaration and decides whether the runtime survives
-        its release.
         """
         key = f"{instance.key}|{env.key}"
         while True:
@@ -111,8 +93,6 @@ class RuntimePool:
                 for runtime in self._runtimes.get(key, ()):
                     if not runtime.busy:
                         runtime.busy = True
-                        if lifetime is Lifetime.process:
-                            runtime.lifetime = lifetime
                         runtime.last_used = time.monotonic()
                         return runtime
 
@@ -121,7 +101,7 @@ class RuntimePool:
             held = instance.provider.reserve(instance)
             if held is not None:
                 try:
-                    return self._start(instance, env, volumes, key, lifetime=lifetime, held=held)
+                    return self._start(instance, env, volumes, key, held=held)
                 except BaseException:
                     instance.provider.unreserve(instance.accelerator, held, instance.devices)
                     with self._free:
@@ -134,11 +114,11 @@ class RuntimePool:
                 self._free.wait(timeout=POLL_INTERVAL)
 
     def release(self, runtime: Runtime) -> None:
-        """Give a runtime back. It ends here unless its lifetime says otherwise."""
+        """Give a runtime back. It ends here unless the pool is held."""
         with self._guard:
             runtime.busy = False
             runtime.last_used = time.monotonic()
-            keep = runtime.lifetime is Lifetime.process or self._hold_depth > 0
+            keep = self._hold_depth > 0
         if keep:
             with self._free:
                 self._free.notify_all()
@@ -170,8 +150,6 @@ class RuntimePool:
         volumes: Sequence[Volume],
         key: str,
         held: tuple[int, ...] = (),
-        *,
-        lifetime: Lifetime = Lifetime.call,
     ) -> Runtime:
         name = f"letify-{instance.accelerator.lower()}-{uuid.uuid4().hex[:6]}"
         if callable(self.on_start):
@@ -180,23 +158,23 @@ class RuntimePool:
             instance, env, name=name, volumes=tuple(volumes), held=held
         )
         runtime.busy = True
-        runtime.lifetime = lifetime
         with self._guard:
             self._runtimes.setdefault(key, []).append(runtime)
         return runtime
 
-    def release_call_lifetimes(self) -> list[str]:
-        """End the runtimes whose lifetime was the call, now that the invocation is over.
+    def release_idle(self) -> list[str]:
+        """End every runtime that is not serving a call, now that the last hold has closed.
 
-        A runtime declared for the process is left alone. This is not a timer: it runs when
-        the work that needed the session finishes, which is the moment the declaration named.
+        Not a timer: it runs when the block or the invocation that kept the sessions ends,
+        which is the moment the caller named. A runtime still serving a call ends when that
+        call releases it.
         """
         with self._guard:
             candidates = [
                 runtime
                 for bucket in self._runtimes.values()
                 for runtime in bucket
-                if not runtime.busy and runtime.lifetime is not Lifetime.process
+                if not runtime.busy
             ]
         stopped = []
         for runtime in candidates:

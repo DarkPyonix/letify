@@ -13,6 +13,7 @@ what a caller observes instead of on which method was called.
 from __future__ import annotations
 
 import base64
+import os
 import pickle
 import subprocess
 import sys
@@ -23,10 +24,14 @@ from typing import Any
 
 import pytest
 
+# Generated provider types are written by Launcher(); the suite must not write them into
+# the repository it runs from. Tests of the generator enable it explicitly.
+os.environ["LETIFY_STUBS"] = "0"
+
 import letify
 from letify.config.schema import ProviderConfig
 from letify.declare.env import Env
-from letify.declare.instance import Instance, Lifetime
+from letify.declare.instance import Instance
 from letify.providers.local import Local
 from letify.runtime import telemetry
 
@@ -271,15 +276,18 @@ def reserving(monkeypatch):
 
 
 @pytest.fixture
-def live():
+def live(request):
     """Start a session through the pool, for a test whose subject is the runtime itself.
 
     Nothing public hands out a session, and these tests are not the surface a user writes
-    against: they are about what a live runtime does.
+    against: they are about what a live runtime does. The pool is held for the rest of the
+    test, which is what let.keep_alive() does, so the session is still there to be used.
     """
 
     def start(let, instance, env: Any = None, volumes: Any = ()) -> Any:
-        runtime = let.pool.acquire(instance, env or Env(), volumes, lifetime=Lifetime.process)
+        let.pool.hold()
+        request.addfinalizer(let.pool.unhold)
+        runtime = let.pool.acquire(instance, env or Env(), volumes)
         let.pool.release(runtime)
         return runtime
 
@@ -291,7 +299,7 @@ def one_card_cpu(monkeypatch) -> letify.Instance:
     """A remote CPU shape on a provider whose inventory holds exactly one of it."""
     provider = provider_of(Local, "box", devices={"cpu": {"count": 1}})
     monkeypatch.setattr(telemetry, "busy_indices", lambda **kwargs: ())
-    return Instance(provider, gpu=None).on_host("remote")
+    return Instance(provider, gpu=None)._placed("remote")
 
 
 @pytest.fixture

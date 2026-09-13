@@ -14,10 +14,9 @@ scalar is expected says the argument varies, and the two useful orderings are
 already in the language: ``await`` gives input order, ``async for`` gives completion
 order.
 
-One invocation is also the lifetime of the runtimes it needed. They are released
-when the call finishes, including a sweep, which counts as one invocation. A
-declaration made with ``lifetime="process"`` keeps its session past that point, which is
-declarative way to say the next call should skip session start.
+One invocation is also how long the runtimes it needed live. They are released when the call
+finishes, including a sweep, which counts as one invocation. Inside a ``let.keep_alive()``
+block they are kept until the block ends instead.
 """
 
 from __future__ import annotations
@@ -29,8 +28,8 @@ from collections.abc import AsyncIterator, Callable, Iterator, Sequence
 from functools import update_wrapper
 from typing import TYPE_CHECKING, Any, Generic, TypeVar
 
-from ..errors import LetifyError, ProtocolError, RuntimeFailure, RuntimeLost
-from .instance import AnyInstance, Host, Instance, Lifetime
+from ..errors import LetifyError, ProtocolError, RuntimeFailure, RuntimeLost, UnsupportedMode
+from .instance import AnyInstance, Host, Instance
 from .sweep import Sweep
 
 if TYPE_CHECKING:
@@ -55,7 +54,6 @@ class Function(Generic[R]):
         volumes: Sequence[Volume] = (),
         timeout: float | None = None,
         retries: int = 1,
-        lifetime: Lifetime | str | None = None,
         keep_remote: bool = False,
     ):
         self.fn = fn
@@ -65,7 +63,6 @@ class Function(Generic[R]):
         self.volumes = tuple(volumes)
         self.timeout = timeout
         self.retries = retries
-        self.lifetime = _how_long(lifetime)
         self.keep_remote = keep_remote
         self.is_async = inspect.iscoroutinefunction(fn)
         self.device = self._place(device)
@@ -73,7 +70,7 @@ class Function(Generic[R]):
 
     def _place(self, device: Instance | AnyInstance) -> Instance | AnyInstance:
         """Fold the declared host placement into the instance it names."""
-        return device.on_host(self.host)
+        return device._placed(self.host)
 
     # -- invocation ----------------------------------------------------------
 
@@ -109,10 +106,16 @@ class Function(Generic[R]):
         runs in is the kind of defect that passes on one machine and fails on a rented one.
         """
         launcher = self.launcher
+        if not launcher.pool.holding:
+            # The session would end as soon as this returned, so a file moved into it would
+            # vanish before the call that needs it.
+            raise UnsupportedMode(
+                "moving a file through a session needs the session to outlive this call. "
+                "Do it inside 'with let.keep_alive():', which keeps the session until the "
+                "block ends."
+            )
         launcher._register_at_exit()
-        runtime = launcher.pool.acquire(
-            launcher.resolve(self.device), self.env, self.volumes, lifetime=self.lifetime
-        )
+        runtime = launcher.pool.acquire(launcher.resolve(self.device), self.env, self.volumes)
         # Handed straight back, because the point is for the next call to find it warm.
         launcher.pool.release(runtime)
         return runtime
@@ -134,7 +137,7 @@ class Function(Generic[R]):
 
         for attempt in range(self.retries + 1):
             runtime = launcher.pool.acquire(
-                instance, self.env, self.volumes, lifetime=self.lifetime
+                instance, self.env, self.volumes
             )
             try:
                 value, logs = runtime.call(
@@ -253,20 +256,6 @@ def _where(host: Host | str | None) -> Host:
             f"host={host!r} is not a host placement. Use host='local' to keep Python "
             f"here and forward CUDA calls, or host='remote' to ship the function to "
             f"the machine that holds the device."
-        ) from None
-
-
-def _how_long(lifetime: Lifetime | str | None) -> Lifetime:
-    """Validate the declared session lifetime, naming both options when it is wrong."""
-    if lifetime is None:
-        return Lifetime.call
-    try:
-        return Lifetime(lifetime)
-    except ValueError:
-        raise ValueError(
-            f"lifetime={lifetime!r} is not a session lifetime. Use lifetime='call' to end "
-            f"the session with the call, or lifetime='process' to keep it so the next "
-            f"call skips session start."
         ) from None
 
 

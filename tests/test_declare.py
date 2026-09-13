@@ -17,7 +17,7 @@ import pytest
 
 import letify
 from letify.declare.env import Env
-from letify.declare.instance import AnyInstance, Host, Instance, Lifetime
+from letify.declare.instance import AnyInstance, Host, Instance
 from letify.declare.sweep import Sweep, grid, zip_
 
 
@@ -118,26 +118,16 @@ def test_the_host_defaults_to_this_process(cpu: letify.Instance) -> None:
     assert cpu.host is None
 
 
-def test_on_host_returns_a_copy_rather_than_changing_the_registered_shape(
-    cpu: letify.Instance,
-) -> None:
-    # A provider registers one shape and every declaration that names it shares that
-    # object, so a placement has to be a new value.
-    remote = cpu.on_host("remote")
-    assert remote.placement is Host.remote
-    assert cpu.host is None
-    assert remote is not cpu
+def test_an_instance_has_no_placement_of_its_own() -> None:
+    # Where the host code runs is said by the declaration's host and nowhere else, so there is
+    # one place to read to know where a function runs.
+    assert not hasattr(Instance, "on_host")
+    assert not hasattr(AnyInstance, "on_host")
 
 
-def test_on_host_with_nothing_to_place_leaves_the_instance_alone(cpu: letify.Instance) -> None:
-    assert cpu.on_host(None) is cpu
-
-
-def test_host_and_lifetime_accept_the_plain_lowercase_string() -> None:
+def test_host_accepts_the_plain_lowercase_string() -> None:
     assert Host("remote") is Host.remote
     assert Host.local == "local"
-    assert Lifetime("process") is Lifetime.process
-    assert Lifetime.call == "call"
 
 
 def test_the_two_host_placements_are_named_values_on_the_package() -> None:
@@ -174,10 +164,10 @@ def test_the_pool_key_names_provider_accelerator_placement_and_purchase(
     # Spec "Pooling": the pool key is the instance key joined with the environment key,
     # so anything that makes two instances non-interchangeable belongs in it.
     provider = let.providers.local
-    on_demand = Instance(provider, gpu="H100").on_host("remote")
+    on_demand = Instance(provider, gpu="H100")._placed("remote")
     assert on_demand.key == "local:H100:remote:x1:ondemand"
-    assert Instance(provider, gpu="H100", spot=True).on_host("remote").key.endswith(":spot")
-    assert on_demand.key != Instance(provider, gpu="H100").on_host("local").key
+    assert Instance(provider, gpu="H100", spot=True)._placed("remote").key.endswith(":spot")
+    assert on_demand.key != Instance(provider, gpu="H100")._placed("local").key
 
 
 def test_the_core_count_comes_from_the_instance_not_the_declaration(cpu: letify.Instance) -> None:
@@ -196,8 +186,8 @@ def test_an_instance_names_itself_by_provider_accelerator_and_placement(
 
 def test_a_request_without_a_provider_carries_only_the_accelerator() -> None:
     request = AnyInstance(accelerator="G4")
-    assert request.on_host(None) is request
-    assert request.on_host("remote").host is Host.remote
+    assert request._placed(None) is request
+    assert request._placed("remote").host is Host.remote
     assert repr(request) == "<AnyInstance G4>"
 
 
@@ -279,12 +269,13 @@ def test_an_unrecognized_host_placement_names_both_options(
             return None
 
 
-def test_an_unrecognized_lifetime_names_both_options(
-    let: letify.Launcher, cpu: letify.Instance
-) -> None:
-    with pytest.raises(ValueError, match=r"lifetime='call'.*lifetime='process'"):
+def test_how_long_a_session_lives_is_not_a_declaration_argument(let, cpu) -> None:
+    # Keeping sessions is a with let.keep_alive() block around the calls, not a property of one
+    # function, so the declaration refuses the argument rather than ignoring it.
+    assert not hasattr(letify, "Lifetime")
+    with pytest.raises(TypeError):
 
-        @let.function(device=cpu, lifetime="forever")
+        @let.function(device=cpu, host=letify.remote, lifetime="process")
         def noop() -> None:
             return None
 

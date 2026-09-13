@@ -72,6 +72,11 @@ build-backend = "hatchling.build"
 [tool.hatch.build.targets.wheel]
 packages = ["letify"]
 
+# The fallback type for Launcher.providers. It is a top level module because a project's generated
+# stub replaces it by that name.
+[tool.hatch.build.targets.wheel.force-include]
+"letify_providers.py" = "letify_providers.py"
+
 [tool.ruff]
 line-length = 100
 target-version = "py311"
