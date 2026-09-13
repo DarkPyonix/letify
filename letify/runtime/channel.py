@@ -5,11 +5,11 @@ can do there.
 
 A ``PersistentChannel`` keeps one worker process alive behind a pipe. Requests are
 framed lines, so the worker process, the blob table and anything written to disk all
-survive between calls. That is what makes a handle resolvable, a large argument
+survive between calls. That is what keeps a session cache alive, a large argument
 sendable once, and a materialized volume readable by a later call.
 
 A ``OneShotChannel`` can only run a command and collect its output. Every call
-starts a fresh process, so nothing persists and a handle has nothing to point at.
+starts a fresh process, so nothing persists and a session cache lasts one call.
 It exists because some transports offer nothing more.
 
 Both hand back the user's own stdout separately from the outcome, because they

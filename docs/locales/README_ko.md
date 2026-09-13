@@ -371,27 +371,27 @@ def train(lr): ...
 
 ## 🔗 제자리에 남는 값
 
-세션은 살아 있는 프로세스 하나이므로, 값이 그 안에 남아 있을 수 있습니다.
+세션은 살아 있는 프로세스 하나이므로, 값이 그 안에 남아 있을 수 있습니다. `letify.session_cache`는 세션이 처음 요청할 때 값을 만들고, 그 세션의 이후 호출에는 같은 객체를 돌려줍니다.
 
 ```python
-@let.function(device=colab.G4, host=letify.remote, keep_remote=True)
-def build_model():
-    return load_model()          # 14 GB, 원격 머신에 남습니다
+def load_model():
+    return ...                   # 14 GB, 세션마다 한 번만 로드
 
 @let.function(device=colab.G4, host=letify.remote)
-def evaluate(model, batch):
-    return model(batch)          # 핸들이 그 자리에서 해소됩니다
+def evaluate(batch):
+    model = letify.session_cache("model", load_model)
+    return model(batch)
 
 with let.keep_alive():               # 세션이 호출보다 오래 삽니다
-    model = build_model()            # 14 GB가 아니라 Handle
-    evaluate(model=model, batch=...)
+    evaluate(batch=first)            # 모델을 로드
+    evaluate(batch=second)           # 그대로 재사용
 ```
 
-큰 인자도 내용 주소로 다룹니다. 같은 텐서를 열 번 넘겨도 네트워크는 한 번만 건넙니다. 런타임에게
-다이제스트로 이미 가지고 있는지 묻기 때문입니다.
+값은 그 세션이 끝날 때까지 삽니다. 세션마다 따로 가지므로 호출이 어느 세션에 떨어지든 상관없고, 카드 두 장에서 동시에 부른 호출은 각자 한 벌씩 로드합니다. 런타임 밖에서, 예를 들어 함수 본문을 로컬에서 테스트할 때는 같은 동작을 하는 평범한 프로세스 내 캐시입니다.
 
-핸들은 자기를 들고 있는 세션을 지목합니다. 다른 세션에 넘기면 조용히 복사하지 않고 예외를
-냅니다. 그것이 가리키는 전부를 요청하지 않은 채 전송하는 일이 되기 때문입니다.
+스크립트의 전역 딕셔너리로는 이렇게 되지 않습니다. 함수가 호출될 때마다 스크립트 전역 값의 복사본과 함께 런타임으로 보내지므로, 그런 캐시는 매번 빈 상태로 시작합니다.
+
+큰 인자는 내용 주소로 다룹니다. 같은 텐서를 열 번 넘겨도 네트워크는 한 번만 건넙니다. 런타임에게 다이제스트로 이미 가지고 있는지 묻기 때문입니다.
 
 ---
 
@@ -471,7 +471,7 @@ letify probe lab      # 호출 중계를 쓸 만큼 가까운가?
 알파이고, 그 점을 숨기지 않습니다. 지금 동작하는 것입니다.
 
 ✅ 선언, 동기와 비동기, 풀링, 세션 수명과 리스
-✅ 상주 세션: 핸들이 나중 호출에서 해소되고, 큰 인자는 한 번만 전송됩니다
+✅ 상주 세션: 세션 캐시가 호출 사이에 값을 유지하고, 큰 인자는 한 번만 전송됩니다
 ✅ 내용 주소 저장소, 설정과 비밀 관리
 ✅ `Local`과 `Colab` 프로바이더
 ✅ `letify-core`를 실제 GPU에서 확인: 에이전트가 드라이버를 열고, 로컬 드라이버가 할당과 양방향 복사를 중계하며 바이트가 일치합니다

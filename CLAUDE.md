@@ -125,7 +125,7 @@ letify/
   stubs.py          Provider type stubs for editor completion
   config/           .letify/config.toml loading, schema, login and credential files
   declare/          Env, Instance and the @let.function callable
-  protocol/         Codec, framing, handles, the remote worker and driver
+  protocol/         Codec, framing, reference types, the remote worker and driver
   runtime/          Channel, session, pool, lease, bootstrap and telemetry
   store/            Content addressed blob store, volumes and backends
   providers/        Provider base class and one module per provider

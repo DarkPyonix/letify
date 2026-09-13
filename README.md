@@ -377,25 +377,27 @@ All of that time is billed as GPU time. That is why an ephemeral provider with a
 
 ## 🔗 Values that stay put
 
-A session is one living process, so a value can stay in it.
+A session is one living process, so a value can stay in it. `letify.session_cache` builds a value the first time a session asks for it and hands back the same object on every later call in that session.
 
 ```python
-@let.function(device=colab.G4, host=letify.remote, keep_remote=True)
-def build_model():
-    return load_model()          # 14 GB, stays on the remote machine
+def load_model():
+    return ...                   # 14 GB, loaded once per session
 
 @let.function(device=colab.G4, host=letify.remote)
-def evaluate(model, batch):
-    return model(batch)          # the handle resolves in place
+def evaluate(batch):
+    model = letify.session_cache("model", load_model)
+    return model(batch)
 
 with let.keep_alive():               # the session outlives each call
-    model = build_model()            # a Handle, not 14 GB
-    evaluate(model=model, batch=...)
+    evaluate(batch=first)            # loads the model
+    evaluate(batch=second)           # reuses it
 ```
 
-Large arguments are content addressed too. Pass the same tensor to ten calls and it crosses the network once, because the runtime is asked by digest whether it already holds it.
+The value lives until its session ends. Every session keeps its own, so it does not matter which session a call lands on, and calls made at the same time on two cards each load one copy. Outside a runtime, for example when you test the body locally, it is an ordinary in-process cache with the same behaviour.
 
-A handle names the session that holds it. Passing one to a different session raises rather than quietly copying the object across, since that would be an unrequested transfer of everything it points at.
+A plain global dictionary in your script does not do this. The function is sent to the runtime with copies of the script's globals on every call, so such a cache starts empty each time.
+
+Large arguments are content addressed. Pass the same tensor to ten calls and it crosses the network once, because the runtime is asked by digest whether it already holds it.
 
 ---
 
@@ -471,7 +473,7 @@ letify efficiency 0.5 3 150   # the formula, from measured terms
 Alpha, and honest about it. What works today:
 
 ✅ Declarations, sync and async, pooling, session lifetimes and the lease
-✅ Persistent sessions: handles resolve in later calls, large arguments travel once
+✅ Persistent sessions: a session cache keeps values between calls, large arguments travel once
 ✅ Content addressed storage, configuration and secrets
 ✅ The `Local` and `Colab` providers
 ✅ `letify-core`, verified on a real GPU: the agent opens the driver, the local driver forwards an allocation and a copy in both directions, and the bytes match

@@ -51,7 +51,7 @@ One directory per concern, so the file you need is the one named after the thing
 |---|---|
 | `config/` | Reading `.letify/config.toml`, the schema, login, resolving credentials |
 | `declare/` | `Launcher`'s surface, `Function`, `Instance`, `Env` |
-| `protocol/` | Handles, the codec, framing, the remote worker, the one-shot driver |
+| `protocol/` | Reference types (`Blob`, `RemoteFile`), the codec, framing, the remote worker, the one-shot driver |
 | `runtime/` | The channel, the session, the pool, the lease, bootstrap source |
 | `providers/` | The base class, name normalization, and one module per provider |
 | `store/` | The content addressed store, volumes, and `backends/` |

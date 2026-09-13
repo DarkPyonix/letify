@@ -81,7 +81,7 @@ def kills_the_worker():
 
 
 def test_a_persistent_channel_keeps_one_process_across_requests(channel) -> None:
-    # This is what makes the object table, the blob table and files on disk survive
+    # This is what makes the session cache, the blob table and files on disk survive
     # between calls.
     channel.start()
     first, _logs = channel.call(returns_pid(), (), {})
