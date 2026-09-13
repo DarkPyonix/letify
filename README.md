@@ -378,6 +378,7 @@ letify efficiency 0.5 3 150   # the formula, from measured terms
 
 | | |
 |---|---|
+| 🧪 [examples/](examples/) | Working scenarios, starting with a LoRA sweep on a rented card |
 | 📖 [PROJECT.md](PROJECT.md) | The full feature set and API surface |
 | 🎯 [docs/INTENT.md](docs/INTENT.md) | Goals, claims, constraints, open questions |
 | 📐 [docs/SPEC.md](docs/SPEC.md) | The design as it stands, decision by decision |

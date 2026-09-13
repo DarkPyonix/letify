@@ -12,12 +12,16 @@ import base64
 import pickle
 import subprocess
 import sys
+from contextlib import contextmanager
+from importlib import import_module
+from pathlib import Path
 
 import cloudpickle
 import pytest
 
 import letify
 from letify import protocol
+from letify.declare.env import Env
 from letify.protocol import codec, driver, framing, guards
 from letify.protocol.handle import Blob, Handle, RemoteFile
 from letify.protocol.worker import BOOTSTRAP, READY, REPLY
@@ -292,3 +296,74 @@ def test_a_return_value_that_cannot_be_serialized_reports_that_rather_than_hangi
 def test_the_protocol_version_is_carried_in_the_driver_script() -> None:
     # Bumped when the request or reply shape changes in a breaking way.
     assert f"_VERSION = {protocol.PROTOCOL_VERSION}" in driver.build(len, ((),), {})
+
+
+# -- Spec: Module shipping -----------------------------------------------------
+
+
+@contextmanager
+def a_module_only_this_process_has(directory: Path, name: str):
+    """Import a module that exists nowhere else, then take every trace of it away.
+
+    Taking it away is the point: it puts this process in the position the machine on the
+    other end is in, which is the only way to tell a payload that carries the code from
+    one that carries a reference to it.
+    """
+    source = directory / f"{name}.py"
+    source.write_text("def score(x):\n    return x * 3\n", encoding="utf-8")
+    sys.path.insert(0, str(directory))
+    try:
+        yield import_module(name)
+    finally:
+        sys.path.remove(str(directory))
+        sys.modules.pop(name, None)
+        source.unlink(missing_ok=True)
+
+
+def test_a_shipped_module_travels_with_the_call(tmp_path) -> None:
+    # The machine on the other end has no copy of the project's own code, so a function
+    # imported from it has to be serialized by value.
+    with a_module_only_this_process_has(tmp_path, "shipped_recipe") as module:
+        codec.ship_by_value(("shipped_recipe",))
+        payload = codec.dumps_call(module.score, (2,), {})
+
+    function, args, kwargs = pickle.loads(payload)
+    assert function(*args, **kwargs) == 6
+
+
+def test_a_module_that_is_not_shipped_travels_by_name(tmp_path) -> None:
+    # The default, and the right one for anything the lock file installs: sending numpy by
+    # value would mean sending numpy over the network on every call.
+    with a_module_only_this_process_has(tmp_path, "named_recipe") as module:
+        payload = codec.dumps_call(module.score, (2,), {})
+
+    assert b"named_recipe" in payload
+    with pytest.raises((ImportError, ModuleNotFoundError)):
+        pickle.loads(payload)
+
+
+def test_shipping_a_module_that_is_not_there_says_which_one() -> None:
+    # A typo in ship() is found at the declaration rather than on the machine.
+    with pytest.raises(letify.ConfigError, match="no_such_recipe"):
+        codec.ship_by_value(("no_such_recipe",))
+
+
+def test_shipping_the_same_module_twice_is_not_an_error(tmp_path) -> None:
+    # Every call asks again, because the registration lives in cloudpickle rather than in
+    # the declaration.
+    with a_module_only_this_process_has(tmp_path, "twice_recipe"):
+        codec.ship_by_value(("twice_recipe",))
+        codec.ship_by_value(("twice_recipe",))
+
+
+def test_a_declaration_ships_what_its_environment_asked_for(let, cpu, tmp_path) -> None:
+    # Through the real path: a declared environment, a pooled local runtime, and a worker
+    # subprocess that never sees the module on disk because sys.path there does not have
+    # the directory it was written to.
+    with a_module_only_this_process_has(tmp_path, "declared_recipe") as module:
+
+        @let.function(device=cpu, host="remote", env=Env().ship("declared_recipe"))
+        def scored(x: int) -> int:
+            return module.score(x) + 1
+
+        assert scored(x=5) == 16

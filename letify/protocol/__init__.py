@@ -12,6 +12,7 @@ and collect its output.
 
 from __future__ import annotations
 
+from . import codec
 from .codec import (
     BEGIN,
     END,
@@ -20,6 +21,7 @@ from .codec import (
     digest_of,
     dumps_call,
     parse,
+    ship_by_value,
     split_output,
     unwrap,
 )
@@ -47,6 +49,7 @@ __all__ = [
     "Handle",
     "RemoteFile",
     "check_handles",
+    "codec",
     "decode_reply",
     "digest_of",
     "dumps_call",
@@ -54,6 +57,7 @@ __all__ = [
     "is_ready",
     "is_reply",
     "parse",
+    "ship_by_value",
     "split_output",
     "unwrap",
     "walk",

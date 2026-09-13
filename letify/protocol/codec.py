@@ -14,11 +14,13 @@ command and collect its output uses this.
 from __future__ import annotations
 
 import pickle
+from collections.abc import Sequence
+from importlib import import_module
 from typing import Any
 
 import cloudpickle
 
-from ..errors import ProtocolError, RemoteError
+from ..errors import ConfigError, ProtocolError, RemoteError
 from .handle import Handle
 
 #: Markers the one-shot driver writes around its outcome, so a result can be found
@@ -31,6 +33,29 @@ PROTOCOL_VERSION = 2
 
 #: Arguments larger than this are content addressed instead of inlined.
 INLINE_LIMIT = 64 * 1024
+
+
+def ship_by_value(modules: Sequence[str]) -> None:
+    """Make these modules travel inside the payload instead of by name.
+
+    cloudpickle sends a function defined in the running script by value and one imported
+    from a module by reference, which is right for anything the lock file installs: sending
+    numpy by value would mean sending numpy over the network on every call. It is wrong for
+    the project's own code, which the machine on the other end does not have, so that has
+    to be named here.
+
+    Registration is global to cloudpickle rather than held by the declaration, so this is
+    called again on every call and is cheap to repeat.
+    """
+    for name in modules:
+        try:
+            module = import_module(name)
+        except ImportError as exc:
+            raise ConfigError(
+                f"cannot ship {name!r}, because it does not import here: {exc}. "
+                f"ship() names a module this process can import, not a file path."
+            ) from exc
+        cloudpickle.register_pickle_by_value(module)
 
 
 def dumps_call(fn: Any, args: tuple, kwargs: dict) -> bytes:

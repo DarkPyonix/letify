@@ -142,6 +142,10 @@ class Runtime:
         # A handle names the live runtime that holds the object, not the pool key,
         # because two runtimes can share a key and an object lives in only one of them.
         protocol.check_handles(self.name, args, kwargs)
+        # Done here rather than at declaration time, because the registration lives in
+        # cloudpickle and a process can hold declarations with different environments.
+        if self.env.ship_modules:
+            protocol.codec.ship_by_value(self.env.ship_modules)
         if self.persistent_channel:
             args, kwargs = self._externalize(args, kwargs)
         self.last_used = time.monotonic()

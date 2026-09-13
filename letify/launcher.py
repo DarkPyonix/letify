@@ -213,9 +213,9 @@ class Launcher:
         """Declare where a function runs.
 
         ``device`` carries the provider, the account and the accelerator, and the core
-        count and memory come with it rather than being asked for. ``cpu`` picks the
-        execution mode: ``"local"``, the default, keeps Python here and forwards only
-        CUDA calls, and ``"remote"`` ships this function to the machine with the GPU.
+        count and memory come with it rather than being asked for. ``host`` says where the
+        host code runs: ``"local"``, the default, keeps Python here and forwards only CUDA
+        calls, and ``"remote"`` ships this function to the machine with the GPU.
         ``concurrency`` is how many runtimes this declaration may use at once.
 
         ``lifetime`` says how long the session lives. ``"call"``, the default, ends it
@@ -401,7 +401,7 @@ class Launcher:
 
         print(
             f"letify: starting {name} on {instance.provider.alias} "
-            f"{instance.accelerator} (cpu={instance.placement})",
+            f"{instance.accelerator} (host={instance.placement})",
             file=sys.stderr,
         )
 

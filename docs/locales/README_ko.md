@@ -357,6 +357,7 @@ letify probe lab      # 호출 중계를 쓸 만큼 가까운가?
 
 | | |
 |---|---|
+| 🧪 [examples/](../../examples/) | 동작하는 시나리오, 빌린 카드에서의 LoRA 스윕부터 |
 | 📖 [PROJECT.md](../../PROJECT.md) | 전체 기능과 API |
 | 🎯 [docs/INTENT.md](../INTENT.md) | 목표, 주장, 제약, 열린 질문 |
 | 📐 [docs/SPEC.md](../SPEC.md) | 현재 설계, 결정 단위로 |

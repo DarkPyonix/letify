@@ -239,10 +239,10 @@ class Provider(abc.ABC):
         round_trip = self.expected_round_trip_ms
         detail = f"about {round_trip:.0f} ms" if round_trip else "long enough to matter"
         warnings.warn(
-            f"{self.alias} has a round trip of {detail}, so cpu='local' pays that once "
+            f"{self.alias} has a round trip of {detail}, so host='local' pays that once "
             f"per host synchronization. Expect roughly half the throughput of a direct "
             f"run for fine-tuning and a handful of tokens per second for decoding. "
-            f"cpu='remote' avoids it by running the loop on the machine.",
+            f"host='remote' avoids it by running the loop on the machine.",
             stacklevel=3,
         )
 

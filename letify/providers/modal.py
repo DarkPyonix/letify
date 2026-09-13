@@ -101,9 +101,9 @@ class Modal(Provider):
     def check_mode(self, instance: Instance) -> None:
         if instance.placement is Host.local:
             raise UnsupportedMode(
-                "Modal cannot serve cpu='local'. It exposes function calls into a "
+                "Modal cannot serve host='local'. It exposes function calls into a "
                 "container, so there is no device to forward CUDA calls to. This is a "
-                "limit of the service, not a speed judgement. Use cpu='remote'."
+                "limit of the service, not a speed judgement. Use host='remote'."
             )
 
     def open_channel(self, runtime: Runtime) -> Channel:

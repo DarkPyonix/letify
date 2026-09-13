@@ -87,6 +87,6 @@ class HandleScopeError(LetifyError):
 class UnsupportedMode(LetifyError):
     """The requested execution mode cannot work on this provider.
 
-    Raised, for example, when ``cpu="local"`` is asked for on a provider with no
+    Raised, for example, when ``host="local"`` is asked for on a provider with no
     low-latency data path. letify never downgrades silently.
     """
