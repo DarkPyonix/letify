@@ -246,7 +246,11 @@ def test_naming_a_host_makes_the_probe_measure_it(patch_run, patch_which) -> Non
     assert capability.agent is True
 
 
-def test_a_host_with_no_agent_on_it_cannot_serve_forwarding(patch_run, patch_which) -> None:
+def test_a_host_with_no_agent_on_it_cannot_serve_forwarding(
+    patch_run, patch_which, monkeypatch, tmp_path
+) -> None:
+    # A letify-core build on the developer's machine must not decide this answer.
+    monkeypatch.setattr(probe_module, "LIB_DIR", tmp_path)
     patch_which(probe_module, present=False)
     patch_run(probe_module, result=FakeCompleted(stdout=LINUX_PING))
     assert probe("gpu.lab.example.edu").agent is False

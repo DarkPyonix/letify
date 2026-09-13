@@ -1050,7 +1050,14 @@ def test_a_provider_without_a_fast_path_warns_with_its_round_trip_and_then_tries
         provider.check_mode(provider.G4._placed("local"))
 
 
-def test_a_provider_with_a_fast_path_does_not_warn(patch_run, recwarn) -> None:
+def test_a_provider_with_a_fast_path_does_not_warn(
+    patch_run, recwarn, monkeypatch, tmp_path
+) -> None:
+    # A letify-core build on the developer's machine must not decide this answer.
+    from letify.remoting import probe as probe_module
+
+    monkeypatch.setattr(probe_module, "LIB_DIR", tmp_path)
+    monkeypatch.delenv("LETIFY_CORE_PATH", raising=False)
     patch_run(shell_module)
     provider = provider_of(Shell, "lab", address="gpu.example.edu", gpus=["A100"])
     with pytest.raises(letify.UnsupportedMode, match="letify-core"):
