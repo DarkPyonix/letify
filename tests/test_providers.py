@@ -400,6 +400,37 @@ def test_creating_a_colab_session_for_a_tpu_asks_for_a_tpu(
     assert recorder.command == [*COLAB_CLI, "new", "-s", "letify-v5e1-1", "--tpu", "v5e1"]
 
 
+def test_colab_offers_a_cpu_instance_under_the_name_local_uses(isolated_home) -> None:
+    provider = provider_of(Colab, "colab_a")
+    assert provider.cpu is provider.CPU
+    assert provider.CPU.gpu is None and provider.CPU.tpu is None
+    assert provider.devices_of(provider.cpu.accelerator).accelerator == "cpu"
+
+
+def test_creating_a_colab_session_for_the_cpu_asks_for_no_accelerator(
+    isolated_home, patch_which, patch_run
+) -> None:
+    patch_which(tools_module, present=True)
+    recorder = patch_run(colab_module)
+    provider = provider_of(Colab, "colab_a")
+    provider.create_session(provider.cpu, "letify-cpu-1")
+    assert recorder.command == [*COLAB_CLI, "new", "-s", "letify-cpu-1"]
+
+
+def test_a_failing_cli_command_names_the_command_and_the_end_of_its_stderr(
+    isolated_home, patch_which, patch_run
+) -> None:
+    patch_which(tools_module, present=True)
+    stderr = "".join(f"line {n}\n" for n in range(100)) + "not entitled\n"
+    patch_run(colab_module, result=FakeCompleted(returncode=2, stderr=stderr))
+    with pytest.raises(letify.RuntimeFailure) as caught:
+        provider_of(Colab, "colab_a").sessions()
+    message = str(caught.value)
+    assert "colab sessions" in message
+    assert "not entitled" in message and "line 99" in message
+    assert "line 60\n" not in message
+
+
 def test_the_declared_account_reaches_the_cli(isolated_home, patch_which, patch_run) -> None:
     patch_which(tools_module, present=True)
     recorder = patch_run(colab_module)

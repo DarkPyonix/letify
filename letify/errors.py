@@ -40,13 +40,29 @@ class NotRunning(LetifyError):
     """A declared function was invoked outside a ``with let.run():`` scope."""
 
 
+#: How many trailing stderr lines a RuntimeFailure message carries.
+STDERR_TAIL_LINES = 40
+
+
+def _with_cause(message: str, command: str, stderr: str) -> str:
+    """Append the command and the last lines of its stderr, unless already present."""
+    if command and command not in message:
+        message = f"{message}\ncommand: {command}"
+    lines = stderr.strip().splitlines()
+    if lines:
+        message = f"{message}\nstderr (last {STDERR_TAIL_LINES} lines):\n" + "\n".join(
+            lines[-STDERR_TAIL_LINES:]
+        )
+    return message
+
+
 class RuntimeFailure(LetifyError):
     """The remote session failed. Retryable on a fresh runtime."""
 
     def __init__(self, message: str, *, command: str = "", stderr: str = ""):
         self.command = command
         self.stderr = stderr
-        super().__init__(message)
+        super().__init__(_with_cause(message, command, stderr))
 
 
 class RuntimeLost(RuntimeFailure):

@@ -302,6 +302,8 @@ class ProviderFallback(Strategy):
     """The provider's own path, such as ``colab exec``. Last, because it is the slowest."""
 
     name = "fallback"
+    #: The fallback cannot carry the probe, so it does not start the grace period.
+    probed = False
 
     def __init__(self, rank: int = 4):
         self.rank = rank

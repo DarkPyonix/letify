@@ -171,6 +171,8 @@ Instance discovery is lazy and cached. A provider that must connect to enumerate
 
 Accelerator names are normalized so they can be attributes. `NVIDIA RTX PRO 6000 Blackwell` becomes `RTX_PRO_6000`. Colab calls the same card `G4`, which is what its CLI accepts, and accepts `RTX_PRO_6000` as an alias for it.
 
+Every provider that can start a session without an accelerator registers it as `CPU`, as `Local` and `Colab` do, and `cpu` finds it too. `Colab` creates such a session with `colab new` and no `--gpu` or `--tpu`.
+
 ### GPU utilization
 
 > How hard each declared instance's accelerator is working right now, read from the machine that owns it.
@@ -273,6 +275,8 @@ Hashing is not a bottleneck at any link speed involved: blake3 runs at gigabytes
 > Infrastructure failure may be retried. User code failure never is. Neither falls back to a slower path.
 
 `RuntimeFailure` and `ProtocolError` mean the session misbehaved, so the runtime is discarded and the call is retried on a fresh one up to `retries` times. `RemoteError` means the shipped function raised, and it propagates with the remote traceback attached.
+
+A `RuntimeFailure` raised for a failed command carries `command` and `stderr`, and its message names the command and the last 40 lines of stderr. The `RuntimeLost` raised after the last retry keeps the last failure's message, `command` and `stderr`.
 
 letify never falls back to local execution or to a slower mode when the declared one is unavailable. A silent downgrade turns a four times slowdown into a mystery.
 
@@ -481,7 +485,9 @@ A `Shell` subclass differs from its parent only in its `Rendezvous` and its stra
 
 > All applicable strategies start together. Among those that connect and pass the probe, the lowest rank is chosen, unless it is far slower than the fastest.
 
-Strategies are raced rather than tried in turn, so a strategy that times out does not delay the others. Once the first strategy connects, the pipeline waits a grace period of 2 s for lower ranked strategies before choosing.
+Strategies are raced rather than tried in turn, so a strategy that times out does not delay the others. Once the first strategy that can carry the probe connects, the pipeline waits a grace period of 2 s for lower ranked strategies before choosing.
+
+A strategy that cannot carry the probe, such as the provider fallback, does not start the grace period when it connects. It is held back until every strategy that can carry the probe has failed, or until the race timeout of 60 s passes with none of them connected. A rendezvous that takes seconds, such as `colab exec` before a TCP punch, therefore runs inside its strategy's own attempt time, not inside the grace period.
 
 Every connected strategy is probed: 30 round trips, then 2 s of transfer in each direction. A strategy whose throughput in either direction is below 25% of the fastest connected strategy in that direction is rejected. The lowest ranked strategy that remains is chosen. When only one strategy connects, it is chosen without comparison.
 
