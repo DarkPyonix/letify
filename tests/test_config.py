@@ -466,5 +466,5 @@ def test_a_project_file_that_sets_a_workspace_is_refused(home_file, config_file)
     # A repository cannot know the write rules of every machine its users reach.
     home_file('[lab]\nkind = "shell"\naddress = "gpu.example.edu"\n')
     project = config_file('[lab]\nworkspace = "/workspace/me"\n')
-    with pytest.raises(letify.ConfigError, match="workspace.*home"):
+    with pytest.raises(letify.ConfigError, match=r"workspace.*home"):
         load(project)

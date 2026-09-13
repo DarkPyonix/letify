@@ -182,10 +182,19 @@ def join_source(path: str, parts: list[str], *, unpack: bool, target: str | None
 class ColabFiles:
     """Serves the file requests a one-shot Colab channel cannot run as a program."""
 
-    def __init__(self, alias: str, session: str, runner: Callable[[str, float | None], str]):
+    def __init__(
+        self,
+        alias: str,
+        session: str,
+        runner: Callable[[str, float | None], str],
+        *,
+        workspace: str,
+    ):
         self.alias = alias
         self.session = session
         self.runner = runner
+        #: The workspace root, before ``~`` is expanded on the VM. Temporary files go under it.
+        self.workspace = workspace
 
     def transfer(self) -> ContentsTransfer:
         # Read per request, because the CLI writes the state when the session is created.
@@ -225,14 +234,23 @@ class ColabFiles:
         }
 
     def pack_dir(self, path: str, timeout: float | None) -> dict[str, Any]:
-        archive = f"/tmp/letify-pack-{uuid.uuid4().hex}.tar.gz"
-        self.runner(
+        name = f"letify-pack-{uuid.uuid4().hex}.tar.gz"
+        output = self.runner(
             "import os, tarfile\n"
             f"root = {path!r}\n"
-            f"with tarfile.open({archive!r}, 'w:gz') as archive:\n"
-            "    archive.add(root, arcname=os.path.basename(root.rstrip('/')), recursive=True)\n",
+            f"folder = os.path.join(os.path.expanduser({self.workspace!r}), 'tmp')\n"
+            "os.makedirs(folder, exist_ok=True)\n"
+            f"packed = os.path.join(folder, {name!r})\n"
+            "with tarfile.open(packed, 'w:gz') as archive:\n"
+            "    archive.add(root, arcname=os.path.basename(root.rstrip('/')), recursive=True)\n"
+            "print(packed)\n",
             timeout,
         )
+        # The VM expands the root, so the path it printed is the one to read back.
+        lines = [line.strip() for line in (output or "").splitlines() if line.strip()]
+        if not lines:
+            raise RuntimeFailure(f"packing {path} on the Colab VM printed no archive path")
+        archive = lines[-1]
         try:
             return self.get_file(archive)
         finally:

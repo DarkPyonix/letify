@@ -214,6 +214,68 @@ def confirm_key(*, address: str, user: str | None, port: int, key_path: str) -> 
         )
 
 
+# -- the workspace root --------------------------------------------------------
+
+
+def valid_workspace(alias: str, value: str) -> str:
+    """Return the root when it is an absolute path or starts with ``~``, and refuse it otherwise."""
+    if not value.startswith(("/", "~")):
+        raise LoginError(
+            f"{alias}: workspace must be an absolute path or start with ~, not {value!r}"
+        )
+    return value
+
+
+def choose_workspace(answers: Answers, address: str | None) -> tuple[str, str]:
+    """The root a shell or tunnel account writes under, and the default it was offered.
+
+    ``--workspace`` decides it. Otherwise a terminal is asked with the default in brackets,
+    and a script or a blank answer takes the default.
+    """
+    from ..runtime.bootstrap import DEFAULT_WORKSPACE_ROOT
+
+    default = DEFAULT_WORKSPACE_ROOT
+    given = answers.get("workspace")
+    if isinstance(given, str) and given:
+        chosen = given
+    elif answers.interactive:
+        chosen = read_line(f"Workspace root on {address} [{default}]: ") or default
+    else:
+        chosen = default
+    return valid_workspace(answers.alias, chosen), default
+
+
+def check_workspace(
+    *, address: str, user: str | None, port: int, key_path: str, workspace: str
+) -> None:
+    """Prove the root can be created and written as the account's own user, over BatchMode."""
+    from ..runtime.bootstrap import workspace_check
+
+    target = f"{user}@{address}" if user else address
+    command = batch_ssh(
+        address=address, user=user, port=port, key_path=key_path, remote=workspace_check(workspace)
+    )
+    try:
+        result = subprocess.run(command, capture_output=True, text=True, timeout=120)
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise LoginError(
+            f"the workspace {workspace} could not be checked on {target}: {exc}"
+        ) from exc
+    if result.returncode != 0:
+        detail = result.stderr.strip() or result.stdout.strip() or f"exit {result.returncode}"
+        raise LoginError(
+            f"the workspace {workspace} cannot be created and written on {target} without "
+            f"root, so nothing was written: {detail}"
+        )
+
+
+def record_workspace(answers: Answers, options: dict[str, Any]) -> None:
+    """Write ``--workspace`` to an account whose kind has no machine to check it on."""
+    given = answers.get("workspace")
+    if isinstance(given, str) and given:
+        options["workspace"] = valid_workspace(answers.alias, given)
+
+
 # -- GPUs found at login -------------------------------------------------------
 
 #: The one query run at login. ``index`` is the physical position the inventory names.
@@ -399,6 +461,10 @@ def shell_account(answers: Answers) -> dict[str, Any]:
 
     if auth == "password":
         options["auth"] = "password"
+        # No BatchMode connection exists to check the root with, so it is only recorded.
+        workspace, default = choose_workspace(answers, address)
+        if workspace != default:
+            options["workspace"] = workspace
         password = answers.token or (
             read_password(f"Password for {address}: ") if answers.interactive else None
         )
@@ -412,6 +478,10 @@ def shell_account(answers: Answers) -> dict[str, Any]:
         ensure_key(key_path)
         install_key(address=address, user=user, port=port, key_path=key_path)
     confirm_key(address=address, user=user, port=port, key_path=key_path)
+    workspace, default = choose_workspace(answers, address)
+    check_workspace(address=address, user=user, port=port, key_path=key_path, workspace=workspace)
+    if workspace != default:
+        options["workspace"] = workspace
     devices = record_devices(answers, address=address, user=user, port=port, key_path=key_path)
     if devices:
         # Written by log_in as its own [<alias>.devices] table, not as a field of the account.
@@ -437,6 +507,7 @@ def elice_account(answers: Answers) -> dict[str, Any]:
     endpoint = answers.get("endpoint")
     if isinstance(endpoint, str) and endpoint:
         options["endpoint"] = endpoint
+    record_workspace(answers, options)
     return options
 
 
@@ -455,13 +526,17 @@ def modal_account(answers: Answers) -> dict[str, Any]:
     if uv is None:
         raise LoginError(tools.missing_uv_message())
     options: dict[str, Any] = {"kind": answers.kind}
-    workspace = ask(
-        answers, "workspace", "Modal workspace (blank for the default): ", required=False
+    record_workspace(answers, options)
+    profile = ask(
+        answers,
+        "profile",
+        "Modal profile, naming the Modal workspace (blank for the default): ",
+        required=False,
     )
     arguments = ["token", "new"]
-    if workspace:
-        options["workspace"] = workspace
-        arguments += ["--profile", workspace]
+    if profile:
+        options["profile"] = profile
+        arguments += ["--profile", profile]
     env = tools.modal_environment(answers.alias)
     token = Path(env["MODAL_CONFIG_PATH"])
     existed = token.exists()
@@ -497,6 +572,7 @@ def colab_account(answers: Answers) -> dict[str, Any]:
     account = ask(answers, "account", "Google account email: ", required=False)
     if account:
         options["account"] = account
+    record_workspace(answers, options)
     result = subprocess.run(
         [*tools.command(tools.COLAB, uv), "sessions"],
         env=tools.environment(answers.alias),
@@ -576,8 +652,11 @@ def log_in(answers: Answers, *, project: str | Path | None = None) -> tuple[bool
         options = FLOWS[answers.kind](answers)
         devices = options.pop("devices", None)
         writer.update(home, answers.alias, options, private=True)
-    elif answers.get("detect_devices"):
-        devices = detect_again(answers, existing, home)
+    else:
+        if answers.get("workspace"):
+            change_workspace(answers, existing, home)
+        if answers.get("detect_devices"):
+            devices = detect_again(answers, existing, home)
     if devices:
         writer.update(home, devices_table(answers.alias), devices, private=True)
 
@@ -595,6 +674,29 @@ def log_in(answers: Answers, *, project: str | Path | None = None) -> tuple[bool
 
 def devices_table(alias: str) -> str:
     return f"{alias}.devices"
+
+
+def change_workspace(answers: Answers, text: str, home: Path) -> None:
+    """Check a new root for an already declared account and write it once it passes.
+
+    A shell or tunnel account with a key and address is checked over SSH. Any other account
+    has no machine to reach at login, so the root is recorded as given.
+    """
+    entry = tomllib.loads(text).get(answers.alias, {})
+    workspace = valid_workspace(answers.alias, str(answers.get("workspace")))
+    kind = entry.get("kind", answers.kind)
+    if kind in ("shell", "tunnel") and entry.get("auth") != "password" and entry.get("address"):
+        check_workspace(
+            address=str(entry["address"]),
+            user=entry.get("user"),
+            port=int(entry.get("port") or 22),
+            key_path=str(entry.get("key") or DEFAULT_KEY),
+            workspace=workspace,
+        )
+    # The devices table is its own [<alias>.devices] block, which this write leaves alone.
+    body = {key: value for key, value in entry.items() if key != "devices"}
+    body["workspace"] = workspace
+    writer.update(home, answers.alias, body, private=True)
 
 
 def detect_again(answers: Answers, text: str, home: Path) -> dict[str, dict[str, str]] | None:

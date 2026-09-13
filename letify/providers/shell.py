@@ -33,6 +33,11 @@ if TYPE_CHECKING:
     from ..transport.strategies import Strategy, Target
 
 
+#: Markers the check command prints for the workspace probe, replaced by a readable line.
+WORKSPACE_OK = "letify-workspace-ok"
+WORKSPACE_FAILED = "letify-workspace-failed"
+
+
 class Shell(Provider):
     """A remote machine reached through the connection pipeline."""
 
@@ -183,6 +188,7 @@ class Shell(Provider):
             fallback=self.fallback(runtime),
             stun=stun,
             tailcat=self.tailcat_binary,
+            workspace=self.workspace_root,
         )
 
     def _link_key(self, runtime: Runtime | None) -> str:
@@ -216,10 +222,18 @@ class Shell(Provider):
         self.link()
 
     def check(self) -> str:
-        """Run one command to confirm the machine answers."""
+        """Run one command to confirm the machine answers and its workspace root is writable."""
+        from ..runtime.bootstrap import workspace_check
+
+        root = self.workspace_root
+        remote = (
+            "uname -a; nvidia-smi --query-gpu=name --format=csv,noheader; "
+            f"if letify_out=$({workspace_check(root)} 2>&1); then echo {WORKSPACE_OK}; "
+            f'else echo "{WORKSPACE_FAILED}: $letify_out"; fi'
+        )
         link = self.link()
         result = subprocess.run(
-            link.ssh_command("uname -a; nvidia-smi --query-gpu=name --format=csv,noheader"),
+            link.ssh_command(remote),
             capture_output=True,
             text=True,
             timeout=120,
@@ -230,7 +244,16 @@ class Shell(Provider):
                 command=" ".join(link.ssh_command("...")),
                 stderr=result.stderr.strip(),
             )
-        return result.stdout
+        lines = []
+        for line in result.stdout.splitlines():
+            if line.strip() == WORKSPACE_OK:
+                lines.append(f"workspace {root}: writable")
+            elif line.startswith(f"{WORKSPACE_FAILED}:"):
+                reason = line[len(WORKSPACE_FAILED) + 1 :].strip()
+                lines.append(f"workspace {root}: not writable: {reason}")
+            else:
+                lines.append(line)
+        return "\n".join(lines) + "\n"
 
     # -- instances -----------------------------------------------------------
 

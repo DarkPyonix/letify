@@ -83,6 +83,9 @@ class Colab(Shell):
     usage_unit = "compute units"
     usage_source = "the Colab CLI has no balance command; the figure is in the web console"
 
+    #: The VM is discarded with the session, so the root sits beside Colab's own files.
+    default_workspace = "/content/letify"
+
     @property
     def account(self) -> str | None:
         value = self.config.option("account")
@@ -202,7 +205,8 @@ class Colab(Shell):
         def run(source: str, timeout: float | None) -> str:
             return self._exec(name, source, timeout)
 
-        return lambda: OneShotLink("fallback", 4, run, files=ColabFiles(self.alias, name, run))
+        files = ColabFiles(self.alias, name, run, workspace=self.workspace_root)
+        return lambda: OneShotLink("fallback", 4, run, files=files)
 
     def target(self, runtime: Runtime | None = None) -> Target:
         target = super().target(runtime)
@@ -249,7 +253,8 @@ class Colab(Shell):
             def run(source: str, timeout: float | None) -> str:
                 return self._exec(name, source, timeout)
 
-            return OneShotChannel(run, name=name, files=ColabFiles(self.alias, name, run))
+            files = ColabFiles(self.alias, name, run, workspace=self.workspace_root)
+            return OneShotChannel(run, name=name, files=files)
         return super().open_channel(runtime)
 
 

@@ -47,6 +47,8 @@ class Target:
     stun: tuple[str, int] = nat.DEFAULT_STUN
     tailcat: str = "tailcat"
     host_key_alias: str | None = None
+    #: The account's workspace root on the machine, before ``~`` is expanded there.
+    workspace: str = "~/.letify-runtime"
 
     def _options(self) -> list[str]:
         known_hosts = account_directory(self.alias) / "known_hosts"
@@ -280,7 +282,9 @@ class ReverseSSH(Strategy):
                     "port": int(spec.get("port", 22)),
                     "user": spec["user"],
                     "private_key": private.read_text(),
-                    "key_directory": f"/tmp/letify-{secrets.token_hex(8)}",
+                    "key_directory": (
+                        f"{target.workspace.rstrip('/')}/tmp/letify-{secrets.token_hex(8)}"
+                    ),
                     "ssh_port": target.ssh_port,
                 },
                 CONNECT_TIMEOUT,

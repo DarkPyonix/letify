@@ -475,7 +475,7 @@ def test_a_workspace_that_is_not_an_absolute_or_home_path_is_refused() -> None:
     from letify.providers.shell import Shell
 
     provider = provider_of(Shell, "lab", address="gpu.example", workspace="lab-team")
-    with pytest.raises(letify.ConfigError, match="lab.*workspace"):
+    with pytest.raises(letify.ConfigError, match=r"lab.*workspace"):
         provider.workspace_root  # noqa: B018
 
 
@@ -508,7 +508,7 @@ def test_no_remote_path_is_hard_coded_outside_the_workspace_defaults() -> None:
     assert offenders == []
 
 
-class WorkspaceLocal(PreparingLocal):
+class WorkspaceLocal(LeasingLocal):
     """A local provider that prepares a workspace root the way a remote runtime does."""
 
     prepares_workspace = True

@@ -531,11 +531,13 @@ def local_exec(source: str, timeout: float | None = None) -> str:
     return result.stdout
 
 
-def colab_exec_channel(fake_jupyter, name: str = "letify-g4-1"):
+def colab_exec_channel(fake_jupyter, name: str = "letify-g4-1", workspace: Path | None = None):
     from conftest import write_colab_session
 
     write_colab_session("colab_a", name, fake_jupyter.url, fake_jupyter.token)
-    provider = provider_of(Colab, "colab_a", channel="exec")
+    # The VM here is this machine, so a root under the test's directory stands in for it.
+    options = {"workspace": str(workspace)} if workspace is not None else {}
+    provider = provider_of(Colab, "colab_a", channel="exec", **options)
     provider._exec = lambda session, source, timeout: local_exec(source, timeout)
     runtime = type("R", (), {"name": name})()
     return provider.open_channel(runtime)
@@ -652,7 +654,7 @@ def test_a_directory_is_packed_on_the_vm_and_then_downloaded(
     site = tmp_path / "site"
     site.mkdir()
     (site / "a.txt").write_text("a", encoding="utf-8")
-    channel = colab_exec_channel(fake_jupyter)
+    channel = colab_exec_channel(fake_jupyter, workspace=tmp_path / "ws")
 
     value, _ = channel.request({"op": "pack_dir", "path": str(site)})
 

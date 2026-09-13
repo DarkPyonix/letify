@@ -62,7 +62,12 @@ def build_parser() -> argparse.ArgumentParser:
     log_in.add_argument("--machine-id", dest="machine_id", help="Elice machine id")
     log_in.add_argument("--endpoint", help="API endpoint, where it is not the default")
     log_in.add_argument("--account", help="account email, for Colab")
-    log_in.add_argument("--workspace", help="workspace name, for Modal")
+    log_in.add_argument(
+        "--workspace",
+        metavar="PATH",
+        help="the one directory letify writes under on the machine; checked for shell and tunnel",
+    )
+    log_in.add_argument("--profile", help="Modal profile, naming the Modal workspace to sign in to")
     log_in.add_argument(
         "--token", help="credential to keep in ~/.letify/accounts/<alias>/, never in a config file"
     )
@@ -212,6 +217,7 @@ def main(argv: list[str] | None = None) -> int:
                 "endpoint": args.endpoint,
                 "account": args.account,
                 "workspace": args.workspace,
+                "profile": args.profile,
                 "indices": args.indices,
                 "detect_devices": args.detect_devices,
             },

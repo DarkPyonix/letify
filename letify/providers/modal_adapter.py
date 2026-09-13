@@ -104,6 +104,10 @@ class Adapter:
             image=image,
             gpu=request.get("gpu") or None,
             timeout=int(request["timeout"]),
+            volumes={
+                str(path): modal.Volume.from_name(str(name), create_if_missing=True)
+                for path, name in (request.get("volumes") or {}).items()
+            },
         )
         sandbox_id = str(getattr(sandbox, "object_id", "") or f"sandbox-{len(self.sandboxes) + 1}")
         self.sandboxes[sandbox_id] = SandboxStream(sandbox)
