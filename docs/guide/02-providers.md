@@ -126,6 +126,24 @@ Declaring `gpus` avoids an SSH connection at import time:
 gpus = ["A100", "A100", "A100", "A100"]
 ```
 
+`letify login shell` writes the devices table for you. Right after the key works, it runs `nvidia-smi` on the machine once, shows what it found and asks which cards letify may use. A blank answer takes them all.
+
+```
+$ letify login shell lab_a100 --address gpu.lab.example.edu
+A100: 4 cards, indices 0-3 (80 GB each)
+RTX_PRO_6000: 2 cards, indices 4-5 (96 GB each)
+Indices letify may use for A100 [0-3]: 0,1
+Indices letify may use for RTX_PRO_6000 [4-5]:
+```
+
+```toml
+[lab_a100.devices]
+A100 = { indices = "0-1" }
+RTX_PRO_6000 = { indices = "4-5" }
+```
+
+In a script, `--no-input` records every card, and `--indices A100=0-1` (repeatable) narrows one name. When `nvidia-smi` is missing or finds no GPU, the login still succeeds, nothing is recorded, and letify asks the machine at first use. An account that is already declared is not asked again; `letify login shell lab_a100 --detect-devices` asks the machine again and replaces the table once you confirm. The table is ordinary TOML, so you can also edit it by hand.
+
 ## 🕳️ Tunnel, for a machine behind NAT
 
 For a machine that cannot accept an inbound connection. The tunnel builds the path; SSH still does the work.
