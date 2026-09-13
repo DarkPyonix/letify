@@ -387,8 +387,8 @@ def test_status_counts_the_sessions_against_the_ceiling(let, cpu) -> None:
 
 def test_status_does_not_report_the_pools_own_bookkeeping(let, cpu) -> None:
     # The pool holds a guard so a session released by one call is not ended while an
-    # overlapping call is still running. Whether that guard is open is a fact about the pool rather than
-    # about what is running, and a boolean sitting among counts gets read as a count.
+    # overlapping call is still running. Whether that guard is open is a fact about the pool
+    # rather than about what is running, and a boolean sitting among counts gets read as a count.
     report = let.status()
     assert "holding" not in report
     assert all(isinstance(report[field], int) for field in ("live", "busy"))

@@ -9,13 +9,11 @@ returns its value; an ``async def`` returns an awaitable, so ``await`` and
 ``asyncio.gather`` behave as they do for any coroutine and letify contributes no
 future type of its own.
 
-Fan-out is a declared space rather than a map call. Passing a ``Sweep`` where a
-scalar is expected says the argument varies, and the two useful orderings are
-already in the language: ``await`` gives input order, ``async for`` gives completion
-order.
+Running many configurations is many calls. ``asyncio.gather`` over an async
+declaration runs them at once, as wide as the provider's inventory allows.
 
 One invocation is also how long the runtimes it needed live. They are released when the call
-finishes, including a sweep, which counts as one invocation. Inside a ``let.keep_alive()``
+finishes, or when the last call overlapping it finishes. Inside a ``let.keep_alive()``
 block they are kept until the block ends instead.
 """
 
@@ -24,13 +22,12 @@ from __future__ import annotations
 import asyncio
 import inspect
 import sys
-from collections.abc import AsyncIterator, Callable, Iterator, Sequence
+from collections.abc import Callable, Sequence
 from functools import update_wrapper
 from typing import TYPE_CHECKING, Any, Generic, TypeVar
 
-from ..errors import LetifyError, ProtocolError, RuntimeFailure, RuntimeLost, UnsupportedMode
+from ..errors import ProtocolError, RuntimeFailure, RuntimeLost, UnsupportedMode
 from .instance import AnyInstance, Host, Instance
-from .sweep import Sweep
 
 if TYPE_CHECKING:
     from ..launcher import Launcher
@@ -77,23 +74,13 @@ class Function(Generic[R]):
     def __call__(self, *args: Any, **kwargs: Any) -> Any:
         """Run the function at its declared site.
 
-        A sync declaration returns its value, or a list of values when a space was
-        passed. An async declaration returns an awaitable that is also
-        async-iterable, so ``await`` collects in order and ``async for`` yields by
-        completion.
+        A sync declaration returns its value. An async declaration returns a plain
+        coroutine, so ``await`` and ``asyncio.gather`` accept it directly.
         """
-        space = _space_in(args, kwargs)
         if self.is_async:
-            if space is None:
-                # A plain coroutine, so asyncio.run and asyncio.gather accept it
-                # directly. Only the fan-out form needs a type of its own, because
-                # that is what async for iterates.
-                return self._call_one(args, kwargs)
-            return AsyncCall(self, args, kwargs, space)
+            return self._call_one(args, kwargs)
         with self.launcher.invocation():
-            if space is None:
-                return self._run(args, kwargs)
-            return [self._run(a, k) for a, k in _expand(args, kwargs, space)]
+            return self._run(args, kwargs)
 
     def session(self) -> Any:
         """The live session this declaration uses, started if it is not up yet.
@@ -180,69 +167,6 @@ class Function(Generic[R]):
         return f"<Function {self.__name__} {mode} on {self.device!r}>"
 
 
-class AsyncCall:
-    """What an async declaration returns when a search space was passed.
-
-    Awaiting it collects every result in input order. Iterating it with ``async for``
-    yields results as they complete, which is what a long sweep wants so early results
-    can be logged while the rest is still running.
-
-    A call with no space returns a plain coroutine instead, so the standard library
-    accepts it wherever a coroutine is expected.
-    """
-
-    def __init__(self, function: Function, args: tuple, kwargs: dict, space: Sweep):
-        self._function = function
-        self._args = args
-        self._kwargs = kwargs
-        self._space = space
-
-    def __await__(self) -> Any:
-        return self._gather().__await__()
-
-    async def _gather(self) -> Any:
-        function = self._function
-        with function.launcher.invocation():
-            return list(await asyncio.gather(*self._tasks()))
-
-    async def __aiter__(self) -> AsyncIterator[Any]:
-        function = self._function
-        with function.launcher.invocation():
-            for finished in asyncio.as_completed(self._tasks()):
-                yield await finished
-
-    def _tasks(self) -> list[asyncio.Task]:
-        function = self._function
-        semaphore = asyncio.Semaphore(_width(function))
-
-        async def one(args: tuple, kwargs: dict) -> Any:
-            async with semaphore:
-                return await function._run_async(args, kwargs)
-
-        return [
-            asyncio.create_task(one(a, k))
-            for a, k in _expand(self._args, self._kwargs, self._space)
-        ]
-
-
-def _width(function: Function) -> int:
-    """How many points of a space may be in flight at once.
-
-    The provider's inventory and nothing else. A declaration taking two cards halves the
-    width on a four card machine, which is arithmetic rather than policy, and is also why a
-    number on the declaration could not express it.
-
-    At least one, always. A provider whose inventory cannot be read yet is not a reason to
-    run nothing: the pool is what waits when a card is not there.
-    """
-    instance = function.launcher.resolve(function.device)
-    try:
-        capacity = instance.provider.capacity(instance.accelerator)
-    except LetifyError:
-        return 1
-    return max(1, capacity // max(1, instance.devices))
-
-
 def _where(host: Host | str | None) -> Host:
     """Validate the declared host placement, naming both options when it is wrong."""
     if host is None:
@@ -257,30 +181,4 @@ def _where(host: Host | str | None) -> Host:
         ) from None
 
 
-def _space_in(args: tuple, kwargs: dict) -> Sweep | None:
-    """Find the declared space in a call, if the caller passed one."""
-    spaces = [v for v in (*args, *kwargs.values()) if isinstance(v, Sweep)]
-    if not spaces:
-        return None
-    if len(spaces) > 1:
-        raise TypeError(
-            "only one search space may be passed per call. Combine them with "
-            "let.grid(...) or the | operator instead."
-        )
-    return spaces[0]
-
-
-def _expand(args: tuple, kwargs: dict, space: Sweep) -> Iterator[tuple[tuple, dict]]:
-    """Turn one call carrying a space into one call per point.
-
-    A space names the arguments it varies, so wherever it appeared it is removed and
-    its point is merged into the keyword arguments. That keeps ``train(space)`` and
-    ``train(over=space)`` meaning the same thing.
-    """
-    kept_args = tuple(v for v in args if not isinstance(v, Sweep))
-    kept_kwargs = {k: v for k, v in kwargs.items() if not isinstance(v, Sweep)}
-    for point in space:
-        yield kept_args, {**kept_kwargs, **point}
-
-
-__all__ = ["AsyncCall", "Function"]
+__all__ = ["Function"]

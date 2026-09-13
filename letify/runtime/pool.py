@@ -1,9 +1,9 @@
 """The pool that hands out runtimes and decides when they die.
 
 The rule is that a runtime dies when the work that needed it is done. One invocation is the
-unit, and a search space counts as one invocation, so a sweep boots its runtimes once and
-releases them when the last point finishes. Nothing is kept alive on the chance that another
-call might come.
+unit, and invocations that overlap in time share one span, so concurrent calls reuse the
+runtimes they release until the last of them finishes. Nothing is kept alive on the chance
+that another call might come.
 
 ``hold`` is how a runtime outlives its release. ``Launcher.keep_alive()`` holds the pool for
 the length of a block, and one invocation holds it for its own length. Released runtimes stay
@@ -67,8 +67,8 @@ class RuntimePool:
     def hold(self) -> None:
         """Keep released runtimes alive until the matching ``unhold``.
 
-        Used by ``Launcher.keep_alive()`` for the length of a block, and by one invocation so a
-        sweep does not restart a session between its points.
+        Used by ``Launcher.keep_alive()`` for the length of a block, and by one invocation so
+        an overlapping call can reuse a session another call released.
         """
         with self._guard:
             self._hold_depth += 1
