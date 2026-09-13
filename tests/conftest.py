@@ -754,3 +754,68 @@ class LoopbackRendezvous:
         answer, continuation = nat.begin({**request, **self.overrides})
         threading.Thread(target=continuation, daemon=True).start()
         return answer
+
+
+class CannedRendezvous:
+    """A rendezvous that answers every request with the same reply, for strategies whose
+    remote half needs a live tool such as ssh or tailcat."""
+
+    lead_seconds = 0.0
+
+    def __init__(self, answer: dict[str, Any] | None = None, unavailable: str | None = None):
+        self.answer = answer or {}
+        self.requests: list[dict[str, Any]] = []
+        self._unavailable = unavailable
+
+    def unavailable(self) -> str | None:
+        return self._unavailable
+
+    def exchange(self, request: dict[str, Any], timeout: float) -> dict[str, Any]:
+        self.requests.append(request)
+        return dict(self.answer)
+
+    def tailcat_endpoint(self, ssh_port: int, timeout: float) -> tuple[str, int]:
+        answer = self.exchange({"kind": "tailcat", "ssh_port": ssh_port}, timeout)
+        return answer["address"], ssh_port
+
+
+class FakeProcess:
+    """A Popen stand-in whose output is the lines a real tool prints."""
+
+    def __init__(self, command: list[str], lines: list[str], **kwargs: Any):
+        import io
+
+        self.command = command
+        self.kwargs = kwargs
+        self.stdout = io.StringIO("".join(lines))
+        self.stderr = io.StringIO("".join(lines))
+        self.stdin = io.StringIO()
+        self.written: list[bytes] = []
+        self.terminated = False
+
+    def wait(self, timeout: float | None = None) -> int:
+        return 0
+
+    def terminate(self) -> None:
+        self.terminated = True
+
+    def poll(self) -> int | None:
+        return None
+
+
+@pytest.fixture
+def patch_popen(monkeypatch):
+    """Replace subprocess.Popen inside one module with processes that print given lines."""
+
+    def patch(module: Any, lines: list[str]) -> list[FakeProcess]:
+        started: list[FakeProcess] = []
+
+        def popen(command: list[str], **kwargs: Any) -> FakeProcess:
+            process = FakeProcess(list(command), lines, **kwargs)
+            started.append(process)
+            return process
+
+        monkeypatch.setattr(module.subprocess, "Popen", popen)
+        return started
+
+    return patch

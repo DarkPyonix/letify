@@ -95,7 +95,44 @@ def build_parser() -> argparse.ArgumentParser:
     efficiency.add_argument("syncs", type=int, help="host synchronizations per step")
     efficiency.add_argument("round_trip_ms", type=float, help="network round trip")
 
+    client = sub.add_parser("client", help="run letify's side on a remote machine")
+    client_sub = client.add_subparsers(dest="client_command", required=True)
+    client_shell = client_sub.add_parser("shell", help="a plain machine with no provider API")
+    shell_sub = client_shell.add_subparsers(dest="shell_command", required=True)
+    connect = shell_sub.add_parser(
+        "connect", help="start the remote agent behind tailcat serve and print its address"
+    )
+    connect.add_argument(
+        "--ssh-port", dest="ssh_port", type=int, default=22, help="this machine's SSH server"
+    )
+    connect.add_argument("--tailcat", default="tailcat", help="the tailcat command")
+
     return parser
+
+
+def _client_shell_connect(args: argparse.Namespace) -> int:
+    """Run the remote agent until interrupted."""
+    from .transport.agent import Agent
+
+    agent = Agent(ssh=("127.0.0.1", args.ssh_port), tailcat=args.tailcat)
+    port = agent.bind()
+    try:
+        address = agent.start_tailcat()
+    except (OSError, RuntimeError) as exc:
+        agent.close()
+        print(exc, file=sys.stderr)
+        return 1
+    print("Add these lines to this machine's account in ~/.letify/config.toml on your own machine:")
+    print(f'tailcat = "{address}"')
+    print(f"tailcat_port = {port}")
+    sys.stdout.flush()
+    try:
+        agent.serve_forever()
+    except KeyboardInterrupt:  # pragma: no cover - interactive
+        pass
+    finally:
+        agent.close()
+    return 0
 
 
 def _describe_usage(row: dict) -> str:
@@ -141,6 +178,10 @@ def main(argv: list[str] | None = None) -> int:
         share = compute(args.step_seconds, args.syncs, args.round_trip_ms)
         print(f"{share * 100:.1f}% of a direct run")
         return 0
+
+    if args.command == "client":
+        # Runs on the remote machine, which has no accounts, so no Launcher is built.
+        return _client_shell_connect(args)
 
     if args.command == "login":
         alias = args.alias or args.kind
