@@ -195,7 +195,6 @@ class SandboxChannel:
         args: tuple,
         kwargs: dict,
         *,
-        keep_remote: bool = False,
         timeout: float | None = None,
     ) -> tuple[Any, str]:
         import base64
@@ -206,7 +205,6 @@ class SandboxChannel:
             {
                 "op": "call",
                 "payload": base64.b64encode(protocol.dumps_call(fn, args, kwargs)).decode(),
-                "keep_remote": keep_remote,
             },
             timeout=timeout,
         )

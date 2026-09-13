@@ -650,21 +650,6 @@ def test_user_code_failure_is_never_retried(let, remote_cpu, tmp_path) -> None:
     assert let.pool.live == []
 
 
-def test_a_handle_scope_error_is_not_retried_either(let, remote_cpu) -> None:
-    # It is a mistake in the call, not a misbehaving session, so the runtime it was
-    # aimed at stays usable.
-    @let.function(device=let.providers.local.CPU, host=letify.remote, retries=2)
-    def consume(value: object) -> object:
-        return value
-
-    stranger = letify.Handle(runtime="elsewhere", object_id="00", type_name="dict")
-    with let.keep_alive():
-        with pytest.raises(letify.HandleScopeError):
-            consume(value=stranger)
-        assert len(let.pool.live) == 1
-        assert consume(value=1) == 1
-
-
 # -- Spec: GPU utilization -----------------------------------------------------
 
 

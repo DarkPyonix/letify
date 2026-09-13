@@ -9,7 +9,7 @@ Narrower tests live beside this file: declaration values in test_declare.py, the
 test_protocol.py, channels and the pool in test_runtime.py, providers in
 test_providers.py, storage in test_store.py.
 
-Spec sections pinned here: "Invocation", "Concurrency", "Call protocol", "Handles",
+Spec sections pinned here: "Invocation", "Concurrency", "Call protocol", "Session cache",
 "Argument addressing", "Failure and retry", "Pooling" and "Lifetime", which covers keep_alive.
 """
 
@@ -91,36 +91,151 @@ def test_gathered_calls_return_their_values_in_the_order_they_were_made(
     assert asyncio.run(run()) == [1, 2, 3]
 
 
-# -- Spec: Handles -------------------------------------------------------------
+# -- Spec: Session cache -------------------------------------------------------
 
 
-def test_a_kept_value_stays_in_the_runtime(let: letify.Launcher, cpu: letify.Instance) -> None:
-    @let.function(device=cpu, host=letify.remote, keep_remote=True)
-    def build() -> dict[str, list[int]]:
-        return {"weights": [1, 2, 3]}
+def _builds(ledger) -> list[str]:
+    """The lines a factory appended, one per build, each naming the building process."""
+    return ledger.read_text(encoding="utf-8").split() if ledger.exists() else []
+
+
+def test_two_calls_inside_keep_alive_share_one_build(let, cpu, tmp_path) -> None:
+    ledger = str(tmp_path / "builds")
 
     @let.function(device=cpu, host=letify.remote)
-    def total(model: dict[str, list[int]]) -> int:
-        return sum(model["weights"])
+    def use() -> int:
+        import os
+
+        def load() -> int:
+            with open(ledger, "a", encoding="utf-8") as handle:
+                handle.write(f"{os.getpid()}\n")
+            return os.getpid()
+
+        return letify.session_cache("model", load)
 
     with let.keep_alive():
-        handle = build()
-        assert isinstance(handle, letify.Handle)
-        assert handle.type_name == "dict"
-        # Resolving it in a later call is what the persistent worker exists for.
-        assert total(model=handle) == 6
+        first = use()
+        second = use()
+
+    assert first == second
+    assert len(_builds(tmp_path / "builds")) == 1
 
 
-def test_a_handle_from_another_runtime_is_refused(
-    let: letify.Launcher, cpu: letify.Instance
-) -> None:
+def test_concurrent_sessions_each_build_their_own_value(launcher_from, tmp_path) -> None:
+    # Nothing may depend on which session the pool picks, so each builds its own.
+    limited = launcher_from('[box]\nkind = "local"\n[box.devices]\nCPU = { count = 2 }\n')
+    here = limited.provider("box").CPU
+    ledger = str(tmp_path / "builds")
+
+    @limited.function(device=here, host=letify.remote)
+    async def use() -> tuple[int, int]:
+        import asyncio as remote_asyncio
+        import os
+
+        def load() -> int:
+            with open(ledger, "a", encoding="utf-8") as handle:
+                handle.write(f"{os.getpid()}\n")
+            return os.getpid()
+
+        value = letify.session_cache("model", load)
+        await remote_asyncio.sleep(0.5)
+        return value, os.getpid()
+
+    async def run() -> list[tuple[int, int]]:
+        with limited.keep_alive():
+            return list(await asyncio.gather(use(), use()))
+
+    results = asyncio.run(run())
+    assert all(value == pid for value, pid in results)
+    assert len({pid for _, pid in results}) == 2
+    assert sorted(_builds(tmp_path / "builds")) == sorted(str(pid) for _, pid in results)
+
+
+def test_a_new_session_after_keep_alive_ends_builds_again(let, cpu, tmp_path) -> None:
+    ledger = str(tmp_path / "builds")
+
     @let.function(device=cpu, host=letify.remote)
-    def consume(value: object) -> object:
-        return value
+    def use() -> int:
+        def load() -> int:
+            with open(ledger, "a", encoding="utf-8") as handle:
+                handle.write("built\n")
+            return 1
 
-    stranger = letify.Handle(runtime="elsewhere", object_id="00", type_name="dict")
-    with pytest.raises(letify.HandleScopeError, match="belongs to runtime"):
-        consume(value=stranger)
+        return letify.session_cache("model", load)
+
+    with let.keep_alive():
+        use()
+    with let.keep_alive():
+        use()
+
+    assert len(_builds(tmp_path / "builds")) == 2
+
+
+def test_concurrent_first_use_of_one_key_builds_once(let, cpu) -> None:
+    @let.function(device=cpu, host=letify.remote)
+    def race() -> tuple[int, list[object]]:
+        import threading
+        import time
+
+        builds = []
+
+        def load() -> object:
+            builds.append(1)
+            time.sleep(0.2)
+            return object()
+
+        seen: list[object] = []
+        threads = [
+            threading.Thread(target=lambda: seen.append(letify.session_cache("race", load)))
+            for _ in range(8)
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        return len(builds), [id(value) for value in seen]
+
+    builds, identities = race()
+    assert builds == 1
+    assert len(identities) == 8 and len(set(identities)) == 1
+
+
+def test_a_body_run_locally_memoizes_in_this_process(let, cpu) -> None:
+    import uuid
+
+    key = f"local-{uuid.uuid4().hex}"
+    builds: list[int] = []
+
+    @let.function(device=cpu, host=letify.remote)
+    def use() -> int:
+        return letify.session_cache(key, lambda: builds.append(1) or len(builds))
+
+    assert use.local() == 1
+    assert use.local() == 1
+    assert builds == [1]
+
+
+def test_a_factory_that_raises_stores_nothing(let, cpu) -> None:
+    import uuid
+
+    key = f"failing-{uuid.uuid4().hex}"
+    attempts: list[int] = []
+
+    def load() -> int:
+        attempts.append(1)
+        if len(attempts) == 1:
+            raise ValueError("first build fails")
+        return 5
+
+    with pytest.raises(ValueError, match="first build fails"):
+        letify.session_cache(key, load)
+    assert letify.session_cache(key, load) == 5
+    assert len(attempts) == 2
+
+
+def test_keep_remote_is_refused_as_an_unknown_argument(let, cpu) -> None:
+    with pytest.raises(TypeError, match="keep_remote"):
+        let.function(device=cpu, host=letify.remote, keep_remote=True)  # type: ignore[call-arg]
 
 
 # -- Spec: Argument addressing -------------------------------------------------

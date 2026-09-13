@@ -7,9 +7,10 @@ request over the same pipe.
 
 Keeping one process alive is what makes three features work.
 
-An object table persists, so a value kept with ``keep_remote=True`` can be
-referenced by a later call. Without a living process there is nothing for a handle
-to point at.
+The process persists, so a value a declared body stored with ``letify.session_cache``
+is still there for a later call. The store lives in the letify module, which the
+declared function imports by reference, so the runtime's environment has to include
+letify.
 
 A blob table persists, so a large argument is sent once and reused by name. The
 worker answers which digests it already holds before the caller sends anything.
@@ -43,12 +44,11 @@ BOOTSTRAP = (
 REPLY = "__LETIFY_REPLY__"
 
 SOURCE = r'''
-import base64, hashlib, io, os, pickle, sys, tarfile, traceback, uuid
+import base64, hashlib, io, os, pickle, sys, tarfile, traceback
 
 _READY = "__LETIFY_WORKER_READY__"
 _REPLY = "__LETIFY_REPLY__"
 
-_OBJECTS = {}
 _BLOBS = {}
 
 try:
@@ -68,16 +68,8 @@ def _digest(payload):
 
 
 def _resolve(value):
-    """Replace handles and blobs with what they point at, recursively."""
+    """Replace blob references with the payloads they name, recursively."""
     kind = getattr(value, "__letify_kind__", None)
-    if kind == "handle":
-        try:
-            return _OBJECTS[value.object_id]
-        except KeyError:
-            raise KeyError(
-                "handle %s is not in this runtime's object table. The runtime was "
-                "probably restarted after the handle was created." % value.object_id
-            ) from None
     if kind == "blob":
         try:
             return pickle.loads(_BLOBS[value.digest])
@@ -90,14 +82,20 @@ def _resolve(value):
     return value
 
 
-def _keep(value):
-    object_id = uuid.uuid4().hex
-    _OBJECTS[object_id] = value
-    return {
-        "object_id": object_id,
-        "type_name": type(value).__name__,
-        "summary": repr(value)[:200],
-    }
+_NO_LETIFY = (
+    "letify is not installed in this runtime's environment, so the call, which refers "
+    "to letify (for example through letify.session_cache), cannot be loaded. Add it to "
+    "the project with 'uv add letify' so uv.lock carries it into the runtime."
+)
+
+
+def _load_call(payload):
+    try:
+        return cloudpickle.loads(base64.b64decode(payload))
+    except ModuleNotFoundError as exc:
+        if (exc.name or "").split(".")[0] == "letify":
+            raise ModuleNotFoundError(_NO_LETIFY, name=exc.name) from exc
+        raise
 
 
 def _reply(payload):
@@ -108,7 +106,7 @@ def _reply(payload):
 
 
 def _op_call(request):
-    fn, args, kwargs = cloudpickle.loads(base64.b64decode(request["payload"]))
+    fn, args, kwargs = _load_call(request["payload"])
     args = _resolve(args)
     kwargs = _resolve(kwargs)
     value = fn(*args, **kwargs)
@@ -117,8 +115,6 @@ def _op_call(request):
         # completion here, and awaiting it here is what lets it use await inside.
         import asyncio
         value = asyncio.run(value)
-    if request.get("keep_remote"):
-        return {"ok": True, "handle": _keep(value)}
     return {"ok": True, "value": value}
 
 
@@ -194,9 +190,7 @@ def _op_exec(request):
 
 
 def _op_release(request):
-    """Drop objects or blobs the caller no longer needs."""
-    for object_id in request.get("objects", ()):
-        _OBJECTS.pop(object_id, None)
+    """Drop blobs the caller no longer needs."""
     for digest in request.get("blobs", ()):
         _BLOBS.pop(digest, None)
     return {"ok": True, "value": None}
@@ -206,7 +200,6 @@ def _op_stat(request):
     return {
         "ok": True,
         "value": {
-            "objects": len(_OBJECTS),
             "blobs": len(_BLOBS),
             "blob_bytes": sum(len(b) for b in _BLOBS.values()),
             "pid": os.getpid(),
