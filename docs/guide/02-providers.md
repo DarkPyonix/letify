@@ -161,11 +161,19 @@ Try the simpler paths first. A direct address, then a jump host, then this. Camp
 kind = "modal"
 ```
 
-Reads its credentials the way the Modal client does. Storage is persistent because a Modal volume is mounted from outside the container, so function shipping is the default and no separate cache tier is needed.
+Sign in once per account:
+
+```bash
+letify login modal modal_lab
+```
+
+letify asks for an optional workspace name, then runs Modal's own `modal token new` through uv. It prints a link; approve it in the browser. The token is written to `~/.letify/accounts/modal_lab/modal.toml`, so two Modal accounts can live on one machine. You never install `modal` yourself, on `PATH` or in your project's `.venv`. uv is the only requirement.
+
+Storage is persistent because a Modal volume is mounted from outside the container, so function shipping is the default and no separate cache tier is needed.
 
 `host="local"` raises. Modal exposes function calls into a container, not a device to forward calls at.
 
-The Modal package is imported lazily. Without it, this provider reports itself unavailable and every other provider keeps working.
+Modal's client runs in its own uv environment, with Modal pinned to `>=1.0,<2`, in a small adapter process that letify starts on the first call. The first start downloads Modal into uv's cache. A token in `MODAL_TOKEN_ID` or `MODAL_TOKEN_SECRET` in your shell is ignored, because the account's `modal.toml` decides which account acts.
 
 ## 🇰🇷 Elice
 

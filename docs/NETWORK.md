@@ -111,6 +111,8 @@ Two product lines exist and only one is automatable. Elice Cloud Infrastructure 
 
 There is nothing to tunnel to and no device to forward calls at, so `Modal.has_fast_path` is false and `host="local"` raises. Its volume is mounted from outside the container and sits in the same data centre as the GPU, which is why a persistent provider needs no separate cache tier.
 
+The local path is a pipe to the Modal adapter, a process letify starts with `uv run --no-project --with "modal>=1.0,<2"`. Modal's client inside it reaches Modal's API over HTTPS. Every worker request crosses that adapter twice, once as a `write` and once as a `read_until`, as spec "Modal adapter" describes. The round trip of that path has not been measured.
+
 ## Connection pipeline measurements
 
 > The evidence for the strategy order and the rules in the spec's Transport section. Measured on 2026-09-13.

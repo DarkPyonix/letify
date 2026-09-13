@@ -88,7 +88,7 @@ Four class attributes drive every default, and none is a user-facing switch.
 ```
 Provider
 ├── Local      persistent, no environment install, no lease
-├── Modal      persistent, a sandbox with framed pipes
+├── Modal      persistent, a sandbox with framed pipes, reached through the Modal adapter
 └── Shell      ephemeral by default, SSH transport
     ├── Colab  Colab CLI for sessions, its SSH bridge or exec for the channel
     ├── Tunnel Tailscale or frp first, then SSH
