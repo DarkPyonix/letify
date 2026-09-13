@@ -85,7 +85,7 @@ There is no release call, no shutdown call and no detached mode. Durability come
 
 A volume is a blob store where contents are named by their hash and mutable names live in a separate namespace of refs. Concurrent sessions cannot overwrite each other, a transfer that already happened is skipped by name, and a tree of small files is packed into one archive so that thousands of round trips become one.
 
-Backends are `filesystem`, `gcs`, `s3` and `modal`, chosen by the provider rather than stated in the declaration.
+Backends are `filesystem`, `gcs` and `modal`, chosen by the provider rather than stated in the declaration.
 
 ### Declared search spaces
 
@@ -289,16 +289,10 @@ Provider types for editor completion are written to `typings/letify_providers.py
 ## Installation
 
 ```bash
-uv add letify                # core only
-uv add "letify[colab]"       # Google Colab
-uv add "letify[modal]"       # Modal
-uv add "letify[shell]"       # SSH, tunnel and Elice
-uv add "letify[gcs]"         # Google Cloud Storage blob store
-uv add "letify[s3]"          # S3 compatible blob store
-uv add "letify[all]"         # everything
+uv add letify
 ```
 
-`letify` alone installs cloudpickle and blake3. The provider extras are declared but currently commented out in `pyproject.toml`, so they install nothing extra yet. No provider dependency is imported at package import time, so a provider whose package is absent reports itself unavailable and everything else keeps working.
+That is the only install. `letify` installs cloudpickle and blake3 and nothing else. Provider tools run out of process through uv, never in the user's `.venv`, so uv must be installed. letify finds it from the `UV` environment variable, then `PATH`, and raises a clear error if it is absent.
 
 `host="local"` additionally needs [letify-core](letify-core/) built with `python letify-core/build.py`, which requires a Rust toolchain.
 

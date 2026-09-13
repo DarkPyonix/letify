@@ -108,9 +108,8 @@ Chosen by the provider, so your declaration does not mention one.
 
 | Backend | Used by | Why |
 |---|---|---|
-| `filesystem` | `Local`, `Shell` | A directory. Your machine can be the origin others pull from. |
+| `filesystem` | `Local`, `Shell`, `Elice` | A directory. Your machine can be the origin others pull from. On Elice it is the machine's own disk. |
 | `gcs` | `Colab` | A Colab runtime is a Compute Engine virtual machine, so this is an internal transfer. |
-| `s3` | `Elice`, anything S3 compatible | Elice Data Hub speaks S3. |
 | `modal` | `Modal` | A Modal volume, mounted beside the container. |
 
 > 🌏 **For Colab, use a multi-region bucket such as `US`.** You cannot choose where a Colab runtime lands, and a multi-region bucket avoids a cross-region charge on every read. Set a billing alert while you are there.

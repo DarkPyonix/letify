@@ -1,4 +1,4 @@
-"""Object store backends: Google Cloud Storage, S3 compatible, and Modal volumes.
+"""Object store backends: Google Cloud Storage and Modal volumes.
 
 Each client library is imported lazily, so importing letify never pulls in a cloud SDK.
 
@@ -10,9 +10,7 @@ that is the whole point of diffing against a manifest.
 from __future__ import annotations
 
 import io
-import os
 from collections.abc import Iterator
-from typing import Any
 
 from ...errors import ProviderUnavailable
 from ..cas import Backend
@@ -73,81 +71,6 @@ class GCSBackend(Backend):
         self._bucket.blob(self._key(ref_key(name))).upload_from_string(digest)
 
 
-class S3Backend(Backend):
-    """Any S3 compatible object store.
-
-    This covers Elice Data Hub as well as Amazon S3 and most other providers, because
-    the S3 API is what object stores agree on.
-    """
-
-    name = "s3"
-
-    def __init__(
-        self,
-        bucket: str,
-        prefix: str = "letify",
-        *,
-        endpoint_url: str | None = None,
-        region: str | None = None,
-    ):
-        try:
-            import boto3
-        except ImportError as exc:
-            raise ProviderUnavailable("s3", "the boto3 package is not installed", "s3") from exc
-        self.bucket = bucket
-        self.prefix = prefix.strip("/")
-        self._client: Any = boto3.client(
-            "s3",
-            endpoint_url=endpoint_url or os.environ.get("LETIFY_S3_ENDPOINT"),
-            region_name=region,
-        )
-
-    def _key(self, key: str) -> str:
-        return f"{self.prefix}/{key}" if self.prefix else key
-
-    def has(self, digest: str) -> bool:
-        from botocore.exceptions import ClientError
-
-        try:
-            self._client.head_object(Bucket=self.bucket, Key=self._key(blob_key(digest)))
-        except ClientError:
-            return False
-        return True
-
-    def put(self, digest: str, payload: bytes) -> None:
-        self._client.put_object(Bucket=self.bucket, Key=self._key(blob_key(digest)), Body=payload)
-
-    def get(self, digest: str) -> bytes:
-        response = self._client.get_object(Bucket=self.bucket, Key=self._key(blob_key(digest)))
-        return response["Body"].read()
-
-    def list_digests(self, prefix: str = "") -> Iterator[str]:
-        paginator = self._client.get_paginator("list_objects_v2")
-        for page in paginator.paginate(Bucket=self.bucket, Prefix=self._key(BLOB_PREFIX)):
-            for item in page.get("Contents", []):
-                name = item["Key"].rsplit("/", 1)[-1]
-                if name.startswith(prefix):
-                    yield name
-
-    def missing(self, digests: list[str]) -> list[str]:
-        held = set(self.list_digests())
-        return [digest for digest in digests if digest not in held]
-
-    def read_ref(self, name: str) -> str | None:
-        from botocore.exceptions import ClientError
-
-        try:
-            response = self._client.get_object(Bucket=self.bucket, Key=self._key(ref_key(name)))
-        except ClientError:
-            return None
-        return response["Body"].read().decode("utf-8").strip()
-
-    def write_ref(self, name: str, digest: str) -> None:
-        self._client.put_object(
-            Bucket=self.bucket, Key=self._key(ref_key(name)), Body=digest.encode()
-        )
-
-
 class ModalBackend(Backend):
     """A Modal volume, mounted from outside the container.
 
@@ -206,4 +129,4 @@ class ModalBackend(Backend):
             batch.put_file(io.BytesIO(digest.encode()), self._key(ref_key(name)))
 
 
-__all__ = ["GCSBackend", "ModalBackend", "S3Backend"]
+__all__ = ["GCSBackend", "ModalBackend"]

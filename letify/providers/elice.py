@@ -150,9 +150,9 @@ class Elice(Shell):
         return table
 
     def store_backend(self) -> str:
-        """Data Hub, which speaks the S3 API."""
+        """The machine's own disk, reached over the same SSH session as a shell machine."""
         backend = self.config.option("store")
-        return str(backend) if isinstance(backend, str) else "s3"
+        return str(backend) if isinstance(backend, str) else "shell"
 
     def pricing(self) -> list[dict[str, Any]]:
         """The zone's price list, including any preemptible option."""

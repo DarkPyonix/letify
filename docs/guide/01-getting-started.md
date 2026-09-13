@@ -9,10 +9,10 @@
 ## Install
 
 ```bash
-uv add "letify[colab]"
+uv add letify
 ```
 
-Pick the extra that matches where you want to run. `colab`, `modal`, `shell` for SSH machines, or `all`.
+This one install covers every provider. You also need [uv](https://docs.astral.sh/uv/) installed, because letify runs provider tools such as the Colab CLI through uv, outside your `.venv`.
 
 You do not need a provider at all to follow this guide. The `local` provider always exists, so you can try the whole flow on your own machine first.
 

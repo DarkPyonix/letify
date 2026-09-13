@@ -100,7 +100,7 @@ A provider is built from one entry in the configuration file and reached by attr
 | `Colab` | ephemeral | no | persistent, or one-shot by configuration | `gcs` |
 | `Shell` | ephemeral, overridable | yes | persistent | `filesystem` |
 | `Tunnel` | ephemeral, overridable | yes | persistent | `filesystem` |
-| `Elice` | persistent | yes | persistent | `s3` |
+| `Elice` | persistent | yes | persistent | `filesystem` |
 
 `Shell` and its subclasses default to ephemeral because a machine's disk policy is not knowable in advance. Assuming ephemeral costs time, since letify rebuilds the environment each runtime and the work still succeeds; assuming persistent fails outright when the disk turns out to be wiped. A configuration entry overrides it with `persistent = true`.
 
@@ -366,9 +366,8 @@ Moving a file through a session only works while that session exists, so `absorb
 
 | Backend | Used by | Note |
 |---|---|---|
-| `filesystem` | `Local`, `Shell` | A directory. The local machine can be the origin others pull from. |
-| `gcs` | `Colab` | A Colab runtime is a Compute Engine virtual machine, so this is an internal transfer. Use a multi-region bucket, because runtime placement is not selectable. |
-| `s3` | `Elice` and anything S3 compatible | Elice Data Hub speaks the S3 API. |
+| `filesystem` | `Local`, `Shell`, `Elice` | A directory. The local machine can be the origin others pull from. On Elice it sits on the machine's own disk. |
+| `gcs` | `Colab` | A Colab runtime is a Compute Engine virtual machine, so this is an internal transfer. Use a multi-region bucket, because runtime placement is not selectable. The client is the standard library HTTP client against the Cloud Storage JSON API. |
 | `modal` | `Modal` | A Modal volume, mounted beside the container. |
 
 Every backend answers "which of these digests are missing" with one listing rather than one request per digest, because object level requests are billed and add latency.
@@ -397,7 +396,7 @@ Order of preference: a direct SSH address, then a jump host, then a tunnel. Camp
 
 MTU is held at 1280 to 1400. Every mesh VPN in this class shows the same failure above that: the connection works, small commands work, and bulk transfers stall silently.
 
-Colab is reached through the Colab CLI: `colab new` and `colab stop` for the session, `colab ssh --proxy-mode` as an OpenSSH ProxyCommand bridge for the persistent channel, and `colab exec` as the one-shot fallback. That is an official path, so it carries no terms risk and needs no tunnel. Network details and the measurements behind these choices are in [NETWORK.md](NETWORK.md).
+Colab is reached through the Colab CLI, run as `uv tool run --from google-colab-cli colab`: `colab new` and `colab stop` for the session, `colab ssh --proxy-mode` as an OpenSSH ProxyCommand bridge for the persistent channel, and `colab exec` as the one-shot fallback. That is an official path, so it carries no terms risk and needs no tunnel. Network details and the measurements behind these choices are in [NETWORK.md](NETWORK.md).
 
 ## Configuration
 
@@ -578,9 +577,13 @@ Unified memory is the one exception that no amount of implementation removes. Ma
 
 ## Packaging
 
-> The base install carries no provider dependency. Each provider is an extra.
+> One install, `uv add letify`, with no extras. It installs cloudpickle and blake3 and nothing else.
 
-`letify` alone installs cloudpickle and blake3. `letify[colab]`, `letify[modal]`, `letify[shell]`, `letify[gcs]`, `letify[s3]`, and `letify[all]` add what a provider needs. No provider dependency is imported at package import time, so a provider whose package is absent reports itself unavailable and everything else keeps working.
+letify is a dependency inside a research repository, so it adds as little as possible to that repository's environment.
+
+Provider tools run out of process and never in the user's `.venv`. Colab runs through `uv tool run --from google-colab-cli colab`. Modal runs in a separate uv environment that letify manages. Elice uses the standard library HTTP client. The `gcs` blob store uses a standard library client too.
+
+uv must be installed. letify finds it from the `UV` environment variable, then from `PATH`. If neither has it, letify raises an error that says uv is required.
 
 ## Known gaps
 

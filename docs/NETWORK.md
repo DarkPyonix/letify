@@ -99,7 +99,7 @@ DELETE /user/resource/compute/virtual_machine_allocation/{id}  power off
 
 An allocation is exactly a letify session, so a session's span, one call or one `keep_alive` block, maps onto Elice's. letify allocates and releases, and does not create the machine; declare that once in the console or with Terraform and put its id in the configuration.
 
-Costs. Compute bills by the second while allocated. Block storage keeps billing while the machine is stopped, and it disappears when the machine is deleted, so a forgotten machine still costs money with no allocation running. Object storage is Data Hub, which speaks S3 and is what letify uses as the blob store backend there.
+Costs. Compute bills by the second while allocated. Block storage keeps billing while the machine is stopped, and it disappears when the machine is deleted, so a forgotten machine still costs money with no allocation running. letify keeps the blob store on the machine's own disk there, with the `filesystem` backend.
 
 Two product lines exist and only one is automatable. Elice Cloud Infrastructure has the API, the Terraform provider and a CLI. Run Box, the container product, is driven from the web console, and its SSH access is a tunnel host with an allocated port rather than a public address. letify's `Elice` provider targets Elice Cloud Infrastructure; a Run Box machine can still be used by declaring it as a plain `Shell` with the tunnel address and port.
 

@@ -34,7 +34,7 @@ Launcher (let)
 │   └── Provider            one account on one infrastructure
 │       ├── Instance        accelerator shape
 │       ├── Volume          content addressed store
-│       │   └── Store ── Backend    filesystem, gcs, s3, modal
+│       │   └── Store ── Backend    filesystem, gcs, modal
 │       └── Runtime         one live session
 │           ├── Channel     persistent, or one-shot
 │           └── Lease       the deadline that outlives nothing
@@ -155,7 +155,7 @@ Three layers with one job each.
 
 `Backend` is where bytes live. All backends keep the same layout, so a blob written by one is readable by another pointed at the same bucket.
 
-The layering exists so that provider and storage vary independently. Colab reads from Google Cloud Storage because a Colab session is a Compute Engine virtual machine, Elice reads from an S3 compatible store because Data Hub speaks S3, and neither fact is visible in the declaration.
+The layering exists so that provider and storage vary independently. Colab reads from Google Cloud Storage because a Colab session is a Compute Engine virtual machine, Elice reads from the machine's own disk, and neither fact is visible in the declaration.
 
 ## Sweep
 

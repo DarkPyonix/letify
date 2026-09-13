@@ -143,16 +143,10 @@ Conventions:
 
 ## Dependencies
 
-The base install depends on cloudpickle and blake3 only. Providers are extras, currently commented out in `pyproject.toml`:
+There is one install and no extras:
 
 ```
-uv add letify              # core only
-uv add "letify[colab]"     # Google Colab
-uv add "letify[modal]"     # Modal
-uv add "letify[shell]"     # SSH, tunnel and Elice
-uv add "letify[gcs]"       # Google Cloud Storage blob store backend
-uv add "letify[s3]"        # S3 compatible blob store backend
-uv add "letify[all]"       # everything
+uv add letify
 ```
 
-Keep the core dependency list minimal. A dependency that only one provider needs belongs in that provider's extra.
+letify installs cloudpickle and blake3 only, because it lives inside researchers' repositories. Provider tools run out of process through uv, never in the user's `.venv`: Colab through `uv tool run --from google-colab-cli colab`, Modal through a separate uv environment. Elice and the GCS blob store use the standard library HTTP client. Do not add a dependency to `pyproject.toml`.

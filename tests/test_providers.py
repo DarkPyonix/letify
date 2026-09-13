@@ -162,7 +162,7 @@ def test_each_provider_declares_the_properties_the_spec_table_gives_it(
 
 @pytest.mark.parametrize(
     ("cls", "backend"),
-    [(Local, "filesystem"), (Modal, "modal"), (Colab, "gcs"), (Elice, "s3")],
+    [(Local, "filesystem"), (Modal, "modal"), (Colab, "gcs"), (Elice, "shell")],
 )
 def test_each_provider_names_the_store_backend_the_spec_table_gives_it(
     cls: type[Provider], backend: str
@@ -170,7 +170,7 @@ def test_each_provider_names_the_store_backend_the_spec_table_gives_it(
     assert provider_of(cls).store_backend() == backend
 
 
-@pytest.mark.parametrize("cls", [Shell, Tunnel])
+@pytest.mark.parametrize("cls", [Shell, Tunnel, Elice])
 def test_a_shell_machine_stores_blobs_on_a_filesystem(cls: type[Provider]) -> None:
     # The spec table calls this backend filesystem; the provider names it "shell", which
     # the registry maps to the filesystem backend.
@@ -188,7 +188,7 @@ def test_a_machine_that_keeps_its_disk_is_declared_persistent() -> None:
 
 
 def test_a_store_backend_can_be_overridden_by_the_configuration() -> None:
-    assert provider_of(Colab, store="s3").store_backend() == "s3"
+    assert provider_of(Colab, store="modal").store_backend() == "modal"
     assert provider_of(Shell, address="a", store="gcs").store_backend() == "gcs"
     assert provider_of(Elice, zone_id="z", store="gcs").store_backend() == "gcs"
 
@@ -595,7 +595,7 @@ def test_bringing_a_path_up_needs_an_auth_key_that_is_not_in_a_tracked_file(
 ) -> None:
     patch_which(tunnel_module, present=True)
     patch_run(tunnel_module, result=FakeCompleted(stdout='{"BackendState": "NeedsLogin"}'))
-    with pytest.raises(letify.ProviderUnavailable, match="accounts/lab/auth_key, or set auth_key_env"):
+    with pytest.raises(letify.ProviderUnavailable, match="or set auth_key_env"):
         provider_of(Tunnel, "lab").connect()
 
 

@@ -20,7 +20,7 @@ import letify
 from letify.store import backends
 from letify.store.backends import layout
 from letify.store.backends.filesystem import FilesystemBackend
-from letify.store.backends.objects import GCSBackend, ModalBackend, S3Backend
+from letify.store.backends.objects import GCSBackend, ModalBackend
 from letify.store.cas import Backend, BlobInfo, Store
 from letify.store.volume import CHECKPOINT_REF, DEFAULT_MOUNT, ENV_REF, Volume
 
@@ -195,7 +195,6 @@ def test_an_unknown_backend_lists_the_ones_that_exist() -> None:
         ("shell", "root"),
         ("modal", "volume_name"),
         ("gcs", "bucket"),
-        ("s3", "bucket"),
     ],
 )
 def test_each_backend_has_a_default_location(backend: str, option: str) -> None:
@@ -227,7 +226,7 @@ def test_a_filesystem_ref_survives_a_rewrite(tmp_path: Path) -> None:
 
 
 def test_every_backend_answers_the_missing_question_with_one_listing() -> None:
-    for cls in (FilesystemBackend, GCSBackend, S3Backend, ModalBackend):
+    for cls in (FilesystemBackend, GCSBackend, ModalBackend):
         assert cls.missing is not Backend.missing, cls.__name__
 
 
@@ -260,31 +259,6 @@ def test_a_bucket_backend_can_be_used_without_a_prefix(fake_gcs) -> None:
     assert "blobs/ab/ab12" in fake_gcs
 
 
-def test_an_s3_backend_keeps_the_documented_layout(fake_boto3) -> None:
-    # This covers Elice Data Hub as well as Amazon S3, because the S3 API is what object
-    # stores agree on.
-    backend = S3Backend("study-bucket", endpoint_url="https://datahub.example")
-    backend.put("ab12", b"payload")
-    assert "letify/blobs/ab/ab12" in fake_boto3.store
-    assert backend.has("ab12") is True
-    assert backend.has("absent") is False
-    assert backend.get("ab12") == b"payload"
-    assert list(backend.list_digests()) == ["ab12"]
-    assert backend.missing(["ab12", "absent"]) == ["absent"]
-    backend.write_ref("ckpt/run", "ab12")
-    assert backend.read_ref("ckpt/run") == "ab12"
-    assert backend.read_ref("ckpt/absent") is None
-    assert fake_boto3.clients[0].options["endpoint_url"] == "https://datahub.example"
-
-
-def test_an_s3_endpoint_can_come_from_the_environment(fake_boto3, monkeypatch) -> None:
-    # An S3 compatible provider is reached by endpoint, and that belongs outside the
-    # tracked configuration.
-    monkeypatch.setenv("LETIFY_S3_ENDPOINT", "https://from-the-environment")
-    S3Backend("study-bucket")
-    assert fake_boto3.clients[0].options["endpoint_url"] == "https://from-the-environment"
-
-
 def test_a_modal_volume_backend_keeps_the_documented_layout(fake_modal) -> None:
     fake_modal()
     backend = ModalBackend("letify-study")
@@ -306,7 +280,6 @@ def test_a_modal_volume_backend_keeps_the_documented_layout(fake_modal) -> None:
     ("cls", "argument", "module", "extra"),
     [
         (GCSBackend, "bucket", "google.cloud", "gcs"),
-        (S3Backend, "bucket", "boto3", "s3"),
         (ModalBackend, "volume", "modal", "modal"),
     ],
 )
@@ -552,3 +525,8 @@ def test_moving_a_checkpoint_outside_keep_alive_is_refused(let, cpu, volume, tmp
     with pytest.raises(letify.UnsupportedMode, match="keep_alive"):
         volume.resume(anything, "run-4", str(tmp_path / "x.pt"))
     assert let.pool.live == []
+
+
+def test_there_is_no_s3_backend() -> None:
+    # Not a requested feature, and boto3 is a dependency letify does not take.
+    assert "s3" not in backends.BACKENDS

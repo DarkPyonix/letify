@@ -135,16 +135,10 @@ train(lr=1e-4, bs=32)
 ## 📦 설치
 
 ```bash
-uv add letify                 # 코어만, 프로바이더 의존성 없음
-uv add "letify[colab]"        # Google Colab
-uv add "letify[modal]"        # Modal
-uv add "letify[shell]"        # SSH, 터널, 엘리스 클라우드
-uv add "letify[gcs]"          # Google Cloud Storage 캐시
-uv add "letify[s3]"           # S3 호환 캐시
-uv add "letify[all]"          # 전부
+uv add letify
 ```
 
-순수 Python입니다. 컴파일 확장도, 빌드할 휠도, 툴체인도 없습니다. 패키지가 없는 프로바이더는 스스로 사용 불가라고 알리고, 나머지는 그대로 동작합니다.
+모든 프로바이더에 이것 하나면 됩니다. letify는 cloudpickle과 blake3만 설치합니다. 머신에 [uv](https://docs.astral.sh/uv/)가 있어야 합니다. Colab CLI와 Modal 클라이언트 같은 프로바이더 도구는 여러분의 `.venv`가 아니라 uv로 별도 환경에서 실행되기 때문입니다.
 
 ---
 

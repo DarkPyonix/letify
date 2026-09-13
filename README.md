@@ -141,16 +141,10 @@ train(lr=1e-4, bs=32)
 ## 📦 Installation
 
 ```bash
-uv add letify                 # core, no provider dependencies
-uv add "letify[colab]"        # Google Colab
-uv add "letify[modal]"        # Modal
-uv add "letify[shell]"        # SSH, tunnels, Elice Cloud
-uv add "letify[gcs]"          # Google Cloud Storage cache
-uv add "letify[s3]"           # S3 compatible cache
-uv add "letify[all]"          # everything
+uv add letify
 ```
 
-The Python package is pure Python. A provider whose package is missing simply reports itself unavailable, and the rest keeps working.
+That is the whole install, for every provider. letify installs only cloudpickle and blake3. It needs [uv](https://docs.astral.sh/uv/) on the machine, because provider tools such as the Colab CLI and the Modal client run through uv in their own environments, not in your `.venv`.
 
 One optional piece is native. `host=letify.local` needs [letify-core](letify-core/), a Rust workspace that stands in for the CUDA driver, built with `python letify-core/build.py`. If you only ship functions to remote machines you never need it.
 

@@ -33,11 +33,11 @@ session on purpose.
 ## `ProviderUnavailable`
 
 ```
-provider 'modal' is unavailable: the modal package is not installed.
-Install it with: uv add "letify[modal]"
+provider 'modal' is unavailable: uv was not found.
+Install uv, or set the UV environment variable to its path.
 ```
 
-The message names the extra to install. If it names a missing setting instead, add that field to the configuration.
+letify runs provider tools through uv. It looks in `UV` first, then `PATH`. If the message names a missing setting instead, add that field to the configuration.
 
 ```
 provider 'elice' is unavailable: elice_a100 needs an access token. Run 'letify login
