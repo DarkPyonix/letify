@@ -1050,8 +1050,41 @@ def test_a_modal_sandbox_keeps_a_process_alive_for_framed_requests(fake_modal) -
     assert fake.looked_up == ["study"]
     assert fake.created["gpu"] == "H100"
     assert fake.created["timeout"] == 1800
-    assert fake.created["args"] == ["python3", "-u", "-"]
+    # Spec "Channels": not `python -`, which reads standard input to the end before running
+    # anything, so the requests that follow would be compiled as source.
+    from letify.protocol.worker import BOOTSTRAP
+
+    assert fake.created["args"] == ["python3", "-u", "-c", BOOTSTRAP]
     assert fake.created["image"].packages == ("cloudpickle", "blake3")
+
+
+def test_a_sandbox_started_the_way_modal_starts_it_answers_requests(fake_modal) -> None:
+    # The sandbox command and the bytes the channel writes, run with a real Python: the
+    # worker has to come up and answer a framed request on the same pipe.
+    import subprocess
+    import sys
+
+    from letify import protocol
+    from letify.protocol.worker import READY
+
+    fake = fake_modal()
+    provider = provider_of(Modal, "m")
+    runtime = type("R", (), {"name": "letify-h100-1", "instance": provider.H100})()
+    channel = provider.open_channel(runtime)
+    channel.start()
+    stdin = fake.sandbox.text + protocol.encode_request({"op": "stat"}) + "\n"
+    stdin += protocol.SHUTDOWN + "\n"
+
+    result = subprocess.run(
+        [sys.executable, *fake.created["args"][1:]],
+        input=stdin,
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+
+    assert READY in result.stdout, result.stderr
+    assert protocol.REPLY in result.stdout, result.stderr
 
 
 def test_a_sandbox_channel_sends_the_worker_once_and_then_framed_requests() -> None:
@@ -1062,8 +1095,14 @@ def test_a_sandbox_channel_sends_the_worker_once_and_then_framed_requests() -> N
     value, logs = channel.request({"op": "stat"})
     assert value == 42
     assert logs == "epoch 1\n"
-    # The worker source went out exactly once.
-    assert sandbox.text.count("_READY = ") == 1
+    # The worker source went out exactly once, length prefixed and base64 encoded for the
+    # bootstrap stub.
+    import base64
+
+    from letify.protocol.worker import SOURCE
+
+    encoded = base64.b64encode(SOURCE.encode()).decode()
+    assert sandbox.text.count(f"{len(encoded)}\n{encoded}") == 1
 
 
 def test_a_sandbox_call_carries_the_pickled_function(fake_modal) -> None:
