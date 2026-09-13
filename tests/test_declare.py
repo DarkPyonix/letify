@@ -1,9 +1,8 @@
 """The declaration surface: what a function needs and where it belongs.
 
 These tests pin the parts of a declaration that are decided before anything runs: the
-environment key, the placement of device and host and lifetime, and the shape of a
-declared search space. Anything that needs a live session is in test_runtime.py or
-test_core.py instead.
+environment key and the placement of device and host and lifetime. Anything that needs a
+live session is in test_runtime.py or test_core.py instead.
 
 Spec sections pinned here: "Declaration surface", "The three placements", "Invocation",
 "Concurrency", "Environment" and "Module shipping".

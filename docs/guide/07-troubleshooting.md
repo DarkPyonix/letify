@@ -273,7 +273,7 @@ let.providers.home_box.diagnose()
 
 If it is relayed and UDP is blocked on your network, switch to `transport = "frp"` on TLS port 443. See [docs/NETWORK.md](../NETWORK.md).
 
-### A sweep is not running in parallel
+### Gathered calls are not running in parallel
 
 Check two things. What the provider entry declares it has, and how many sessions actually came up:
 
@@ -281,7 +281,7 @@ Check two things. What the provider entry declares it has, and how many sessions
 print(len(let.pool.live))
 ```
 
-If fewer came up than you asked for, the provider refused them. For Colab that limit is undocumented and moves with tier, credit balance and demand. Find it with cheap `L4` sessions. See [Sweeps](05-sweeps.md).
+If fewer came up than you asked for, the provider refused them. For Colab that limit is undocumented and moves with tier, credit balance and demand. Find it with cheap `L4` sessions. See [Concurrency and capacity](05-concurrency.md).
 
 ---
 

@@ -1,66 +1,50 @@
-# 5️⃣ Sweeps and capacity
+# 5️⃣ Concurrency and capacity
 
-> Running many configurations, in parallel, without a map call.
+> Running many configurations at once: repeated calls inside `keep_alive`, gathered.
 
 [← Environments and data](04-environments-and-data.md) · [Guides](README.md) · [Next: Cost control →](06-cost.md)
 
 ---
 
-## Declare the space, not the loop
+## Many configurations are many calls
 
-A sweep is a value. Passing it where a scalar is expected declares that the argument varies.
-
-```python
-space = letify.grid(lr=[1e-4, 3e-4, 1e-3], bs=[16, 32])   # 6 points
-pairs = letify.zip(lr=[1e-4, 3e-4], bs=[16, 32])          # 2 points
-```
-
-| Builder | Does | Use for |
-|---|---|---|
-| `grid` | Cartesian product of the axes | hyperparameter search |
-| `zip` | pairs the axes position by position | a prepared list of configurations |
-| `a | b` | union, dropping duplicate points | combining two searches |
-| `space.with_fixed(**kw)` | adds arguments constant across every point | epochs, seed, output path |
-
-A scalar axis stays fixed, so `grid(lr=[1e-4, 3e-4], bs=32)` is two points.
-
-`zip` rejects axes of unequal length rather than silently truncating:
+A declared function takes the arguments its `def` declares and returns what the `def` returns. To run six configurations, call it six times. Build the list of configurations with plain Python:
 
 ```python
-letify.zip(lr=[1e-4, 3e-4, 1e-3], bs=[16, 32])
-# ValueError: zip axes must have equal length, got lr=3, bs=2
-```
+import asyncio
+import itertools
 
-## Consuming a space
-
-The two orderings you might want are already in the language.
-
-```python
 @let.function(device=colab.G4, host="remote")
 async def train(lr, bs):
     ...
     return {"lr": lr, "bs": bs, "loss": loss}
 
-results = await train(space)          # list, in input order
+configs = [dict(lr=lr, bs=bs) for lr, bs in itertools.product([1e-4, 3e-4, 1e-3], [16, 32])]
 
-async for result in train(space):     # as each finishes
-    print(result)
+async def main():
+    with let.keep_alive():
+        return await asyncio.gather(*(train(**c) for c in configs))
+
+rows = asyncio.run(main())   # list, in the order of configs
 ```
 
-`await` collects in input order, which is what you want for a results table. `async for` yields by completion, which is what you want when a sweep takes an hour and you would rather see the early results than wait.
-
-A sync declaration returns a list in input order:
+`asyncio.gather` returns results in the order the calls were made, which is what a results table wants. `asyncio.as_completed` yields them as they finish, which is what an hour long search wants when you would rather see early results than wait:
 
 ```python
-@let.function(device=colab.G4, host="remote")
-def train(lr, bs): ...
-
-rows = train(space)     # list
+    with let.keep_alive():
+        for finished in asyncio.as_completed([train(**c) for c in configs]):
+            print(await finished)
 ```
+
+## Why `keep_alive`
+
+A call ends its session when it finishes. Inside `with let.keep_alive():` a finished call leaves its session up, so the next call with the same instance and environment reuses it and pays no session start, which is minutes on Colab. Without the block, calls that overlap in time still share sessions, but a call made after the others finished starts a fresh one.
+
+A plain `def` declaration blocks, so concurrency there comes from threads, for example `concurrent.futures.ThreadPoolExecutor`. An `async def` declaration is the simpler route.
 
 ## Width comes from the inventory
 
-Nothing on the declaration says how wide a sweep runs. A provider entry declares what the
+Nothing on the declaration says how many calls run at once. A provider entry declares what the
 account has, and that is the answer:
 
 ```toml
@@ -71,7 +55,7 @@ G4 = { count = 2 }            # two concurrent sessions on this account
 A100 = { indices = "0-3" }    # four cards in a shared box are ours
 ```
 
-Six points on four cards finish in roughly a quarter of the wall clock time. Credits spent
+Six calls on four cards finish in roughly a quarter of the wall clock time. Credits spent
 are the same either way, since four GPUs for 15 minutes costs what one GPU costs for an
 hour.
 
@@ -80,7 +64,7 @@ hour.
 > unchanged.
 
 There is no second number. A width on the declaration and a ceiling on the launcher were
-two statements of one decision, and when they disagreed the smaller won silently: a sweep
+two statements of one decision, and when they disagreed the smaller won silently: a search
 was slow and neither number said why.
 
 ## A run that takes more than one card
@@ -126,8 +110,8 @@ print(let.status()["live"])      # sessions that exist right now
 letify status
 ```
 
-If a sweep is narrower than you expected, the inventory is the only place to look. A point
-that cannot reserve its cards waits for a running point to finish, rather than asking the
+If fewer calls run at once than you expected, the inventory is the only place to look. A call
+that cannot reserve its cards waits for a running call to finish, rather than asking the
 provider for a machine it would refuse. When nothing running would free a card, it raises
 `letify.InsufficientDevices` instead of waiting forever.
 
@@ -150,10 +134,11 @@ Confirm the final candidate on the bigger card.
 
 ## Practical patterns
 
-**Run a space, collect a table.**
+**Run the configurations, collect a table.**
 
 ```python
-rows = await train(letify.grid(lr=[1e-4, 3e-4, 1e-3], bs=[16, 32]))
+with let.keep_alive():
+    rows = await asyncio.gather(*(train(**c) for c in configs))
 
 best = min(rows, key=lambda r: r["loss"])
 print(best)
@@ -162,8 +147,9 @@ print(best)
 **Log as results arrive.**
 
 ```python
-async for row in train(space):
-    wandb.log(row)
+with let.keep_alive():
+    for finished in asyncio.as_completed([train(**c) for c in configs]):
+        wandb.log(await finished)
 ```
 
 **Train and evaluate at the same time, on different providers.**
@@ -181,16 +167,6 @@ await asyncio.gather(train(lr=1e-4), evaluate(ckpt="run-1"))
 Because each declaration names its own instance, one runs on Colab and the other on your lab server with no extra machinery.
 
 **Evaluation batching matters more than a second GPU.** For a speech model at 12.5 frames per second, a 10 second utterance is 125 frames. At batch 1 with a 20 ms frame, 100 utterances take 250 seconds. At batch 64, the same evaluation is 5 to 10 seconds. If you evaluate every 500 training steps, that is the difference between 100% overhead and 3%.
-
-## Only one space per call
-
-```python
-train(letify.grid(lr=[1e-4]), letify.grid(bs=[16]))
-# TypeError: only one search space may be passed per call.
-#            Combine them with let.grid(...) or the | operator instead.
-```
-
-Combine axes into one space instead. That keeps the number of points visible in one place rather than being the product of two arguments.
 
 ---
 

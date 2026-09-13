@@ -87,9 +87,9 @@ A volume is a blob store where contents are named by their hash and mutable name
 
 Backends are `filesystem`, `gcs` and `modal`, chosen by the provider rather than stated in the declaration.
 
-### Declared search spaces
+### Concurrency from repeated calls
 
-`grid` and `zip` build a space; passing one where a scalar is expected declares that the argument varies. Results are consumed with the language's own protocols: `await` gives input order, `async for` gives completion order.
+Many configurations are many calls. Inside `with let.keep_alive():`, `asyncio.gather` over an `async def` declaration runs them at once and returns results in call order, and `asyncio.as_completed` yields them as they finish. The inventory bounds how many run; a call beyond it waits for a card.
 
 ### Environment from a uv lock file
 
@@ -125,7 +125,6 @@ Launcher(
 | `let.provider(alias)` | Same as attribute access, for a computed alias |
 | `let.function(...)` | Declare a function, returning a decorator |
 | `with let.keep_alive():` | Keep sessions alive between calls for the length of the block |
-| `let.grid`, `let.zip` | Build a search space |
 | `let.status()` | How many sessions are live and busy against the ceiling, and what each one is |
 | `let.usage(alias=None)` | What is left on each account, or why it is not reported |
 | `let.utilization(alias=None)` | How busy each instance's accelerator is right now |
@@ -145,15 +144,13 @@ Launcher(
 def train(lr, bs): ...
 ```
 
-Sync or async is taken from the `def`. A plain `def` blocks; an `async def` returns a coroutine, or an awaitable that is also async-iterable when a space is passed.
+Sync or async is taken from the `def`. A plain `def` blocks; an `async def` returns a plain coroutine.
 
 | Call form | Returns |
 |---|---|
 | `train(lr=1e-4)` on a `def` | the value |
-| `train(space)` on a `def` | a list, in input order |
 | `await train(lr=1e-4)` on an `async def` | the value |
-| `await train(space)` | a list, in input order |
-| `async for r in train(space)` | results as they complete |
+| `await asyncio.gather(*(train(lr=x) for x in lrs))` | a list, in call order |
 | `train.local(lr=1e-4)` | runs the body in this process |
 
 ### `letify.Env`
@@ -194,15 +191,6 @@ cache.fetch_checkpoint("run-1", target)
 cache.resume(runtime, "run-1", path)   # put the newest one inside a session
 ```
 
-### Spaces
-
-```python
-letify.grid(lr=[1e-4, 3e-4], bs=[16, 32])   # 4 points
-letify.zip(lr=[1e-4, 3e-4], bs=[16, 32])    # 2 points
-letify.grid(lr=[1e-4]) | letify.grid(lr=[3e-4])
-space.with_fixed(epochs=3)
-```
-
 ### Types
 
 | Name | Is |
@@ -211,7 +199,6 @@ space.with_fixed(epochs=3)
 | `Instance`, `AnyInstance` | an accelerator shape, and a deferred one |
 | `local`, `remote` | the two values `host` takes |
 | `Env` | an environment declaration |
-| `Sweep` | a declared search space |
 | `Volume` | a content addressed store on a provider |
 | `Handle`, `Blob`, `RemoteFile` | references to something that lives in a session |
 | `Function` | what the decorator returns |
