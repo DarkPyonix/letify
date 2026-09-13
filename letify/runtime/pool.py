@@ -169,9 +169,11 @@ class RuntimePool:
                 f"environment. Nothing running would free a card. Make the call outside the "
                 f"block, or give {provider.alias} more {name} in its devices table."
             )
+        busy = ", ".join(str(index) for index in provider.last_busy) or "none"
         return (
             f"no {name} on {provider.alias} can be allocated: the cards it may use are taken by "
-            f"another process, and letify cannot know when that process ends."
+            f"another process (indices another process is computing on: {busy}), and letify "
+            f"cannot know when that process ends."
         )
 
     def release(self, runtime: Runtime) -> None:

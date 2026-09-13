@@ -78,6 +78,11 @@ class Provider(abc.ABC):
         self._reserved: dict[str, list[int]] = {}
         self._taken: dict[str, int] = {}
         self._devices_guard = threading.RLock()
+        #: Process ids of the workers this client process started here. Their compute
+        #: processes are this client's own and do not make a card busy.
+        self._worker_pids: set[int] = set()
+        #: The busy indices the most recent reservation read, for the refusal message.
+        self.last_busy: tuple[int, ...] = ()
 
     # -- inventory -----------------------------------------------------------
 
@@ -135,7 +140,9 @@ class Provider(abc.ABC):
             return ()
         with self._devices_guard:
             held = set(self._reserved.get(entry.accelerator, ()))
-        return tuple(index for index in entry.indices if index not in held | set(self.busy()))
+        busy = tuple(self.busy())
+        self.last_busy = busy
+        return tuple(index for index in entry.indices if index not in held | set(busy))
 
     def busy(self) -> tuple[int, ...]:
         """Device indices another process holds. Nothing for a provider letify cannot ask.
@@ -144,6 +151,21 @@ class Provider(abc.ABC):
         right for a provider that assigns the device itself.
         """
         return ()
+
+    def add_worker_pid(self, pid: int) -> None:
+        """Record a worker this client process started here, so its card is not read as busy."""
+        with self._devices_guard:
+            self._worker_pids.add(pid)
+
+    def remove_worker_pid(self, pid: int) -> None:
+        """Forget a worker that has shut down."""
+        with self._devices_guard:
+            self._worker_pids.discard(pid)
+
+    def worker_pids(self) -> set[int]:
+        """Process ids of the live workers this client process started here."""
+        with self._devices_guard:
+            return set(self._worker_pids)
 
     def reserve(self, instance: Instance) -> tuple[int, ...] | None:
         """Take the devices this instance asks for, or None when they are not there.

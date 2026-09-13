@@ -296,6 +296,32 @@ class Shell(Provider):
             table[label] = Instance(self, gpu=label, vram_gb=gib_from_mib(memory))
         return table
 
+    def busy(self) -> tuple[int, ...]:
+        """Ask the machine over its link which cards another process is computing on.
+
+        Read at every reservation, never cached. A query that cannot run raises rather than
+        reading as free, because free would put a run on a card someone else is using.
+        """
+        from ..runtime import telemetry
+
+        link = self.link()
+
+        def run(command: tuple[str, ...]) -> str:
+            remote = shlex.join(command)
+            result = subprocess.run(
+                link.ssh_command(remote), capture_output=True, text=True, timeout=120
+            )
+            if result.returncode != 0:
+                raise RuntimeFailure(
+                    f"{self.alias}: the busy check could not run, so which cards are free "
+                    f"is unknown and nothing was reserved",
+                    command=remote,
+                    stderr=result.stderr.strip(),
+                )
+            return result.stdout
+
+        return telemetry.busy_indices(exclude_pids=self.worker_pids(), run=run)
+
     def store_backend(self) -> str:
         backend = self.config.option("store")
         return str(backend) if isinstance(backend, str) else "shell"

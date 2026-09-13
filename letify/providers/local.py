@@ -96,7 +96,7 @@ class Local(Provider):
 
         from ..runtime import telemetry
 
-        return telemetry.busy_indices(exclude_pids={os.getpid()})
+        return telemetry.busy_indices(exclude_pids={os.getpid(), *self.worker_pids()})
 
     def store_backend(self) -> str:
         return "filesystem"

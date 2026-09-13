@@ -1670,3 +1670,87 @@ def test_a_check_reports_a_workspace_that_cannot_be_written(patch_run) -> None:
     provider = provider_of(Shell, "lab", address="gpu.example.edu", workspace="/srv/x")
     report = provider.check()
     assert "workspace /srv/x: not writable: mkdir: cannot create directory" in report
+
+
+# -- Spec: Provider model, Inventory: busy cards on a remote machine ----------------
+
+REMOTE_UUIDS = "0, GPU-aaa\n1, GPU-bbb\n2, GPU-ccc\n3, GPU-ddd\n"
+
+
+def remote_smi(apps: str, *, uuids: str = REMOTE_UUIDS, returncode: int = 0):
+    """Answer the two nvidia-smi queries a busy check sends over SSH."""
+
+    def answer(command: list[str]) -> FakeCompleted:
+        remote = command[-1]
+        if "--query-gpu=index,uuid" in remote:
+            return FakeCompleted(returncode=returncode, stdout=uuids, stderr="nvidia-smi failed")
+        if "--query-compute-apps=gpu_uuid,pid" in remote:
+            return FakeCompleted(returncode=returncode, stdout=apps, stderr="nvidia-smi failed")
+        return FakeCompleted(returncode=1, stderr=f"unexpected command {remote}")
+
+    return answer
+
+
+def indexed_shell(**table):
+    return provider_of(Shell, "lab", address="gpu.example.edu", devices=dict(table))
+
+
+def test_a_remote_card_with_another_users_process_is_skipped(patch_run) -> None:
+    recorder = patch_run(shell_module, result=remote_smi("GPU-aaa, 4100\nGPU-bbb, 4200\n"))
+    provider = indexed_shell(P100={"indices": "0-3"})
+    assert provider.busy() == (0, 1)
+    assert provider.reserve(provider.P100) == (2,)
+    remote = [command[-1] for command in recorder.commands]
+    assert any("--query-compute-apps=gpu_uuid,pid" in command for command in remote)
+    assert all(command[0] == "ssh" for command in recorder.commands)
+
+
+def test_a_remote_busy_reading_is_taken_again_at_every_reservation(patch_run) -> None:
+    readings = iter(["", "GPU-aaa, 4100\n"])
+
+    def answer(command: list[str]) -> FakeCompleted:
+        if "--query-compute-apps" in command[-1]:
+            return FakeCompleted(stdout=next(readings))
+        return FakeCompleted(stdout=REMOTE_UUIDS)
+
+    patch_run(shell_module, result=answer)
+    provider = indexed_shell(P100={"indices": "0-1"})
+    assert provider.free("P100") == (0, 1)
+    assert provider.free("P100") == (1,)
+
+
+def test_a_remote_worker_of_this_client_does_not_make_its_card_busy(patch_run) -> None:
+    patch_run(shell_module, result=remote_smi("GPU-aaa, 777\nGPU-bbb, 4200\n"))
+    provider = indexed_shell(P100={"indices": "0-3"})
+    provider.add_worker_pid(777)
+    assert provider.busy() == (1,)
+    provider.remove_worker_pid(777)
+    assert provider.busy() == (0, 1)
+
+
+def test_a_remote_busy_check_that_cannot_run_is_refused_rather_than_read_as_free(
+    patch_run,
+) -> None:
+    patch_run(shell_module, result=remote_smi("", returncode=255))
+    provider = indexed_shell(P100={"indices": "0-3"})
+    with pytest.raises(letify.RuntimeFailure, match="busy check"):
+        provider.reserve(provider.P100)
+
+
+def test_a_remote_machine_whose_registered_cards_are_all_busy_reserves_nothing(
+    patch_run,
+) -> None:
+    apps = "GPU-aaa, 1\nGPU-bbb, 2\nGPU-ccc, 3\nGPU-ddd, 4\n"
+    patch_run(shell_module, result=remote_smi(apps))
+    provider = indexed_shell(P100={"indices": "0-3"})
+    assert provider.reserve(provider.P100) is None
+    assert provider.last_busy == (0, 1, 2, 3)
+
+
+@pytest.mark.parametrize("cls", [Tunnel, Elice])
+def test_every_shell_kind_reads_busy_cards_on_its_machine(cls, patch_run, monkeypatch) -> None:
+    patch_run(shell_module, result=remote_smi("GPU-ccc, 9\n"))
+    provider = provider_of(cls, "lab", address="gpu.example.edu")
+    link = type("L", (), {"ssh_command": lambda self, remote=None: ["ssh", "h", remote]})()
+    monkeypatch.setattr(provider, "link", lambda runtime=None: link)
+    assert provider.busy() == (2,)

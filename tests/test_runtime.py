@@ -1278,6 +1278,51 @@ def test_cards_another_process_is_using_cannot_be_allocated(reserving, patch_smi
     assert pool.live == []
 
 
+def test_the_refusal_names_the_cards_another_process_is_computing_on(reserving, patch_smi) -> None:
+    provider = reserving(A100={"indices": "0-2"})
+    patch_smi(busy=[0, 2])
+    provider.reserve(provider.A100)
+    pool = RuntimePool()
+    with pytest.raises(letify.InsufficientDevices, match=r"0, 2"):
+        pool.acquire((provider.A100 * 2)._placed("remote"), Env())
+
+
+def test_a_reservation_takes_the_first_free_index_and_the_session_is_given_it(
+    reserving, patch_smi
+) -> None:
+    provider = reserving(A100={"indices": "0-3"})
+    patch_smi(busy=[0, 1, 3])
+    runtime = started_with_reservation(provider, provider.A100._placed("remote"))
+    try:
+        assert runtime.held_devices == (2,)
+        assert list(runtime.eval(VISIBLE_SOURCE)) == ["2", "PCI_BUS_ID"]
+    finally:
+        runtime.shutdown()
+
+
+def test_a_session_records_its_worker_process_so_its_card_is_not_read_as_busy(
+    reserving, monkeypatch
+) -> None:
+    provider = reserving(A100={"indices": "0-1"})
+    asked: list[set[int]] = []
+
+    def busy_indices(exclude_pids=None, **kwargs):
+        asked.append(set(exclude_pids or ()))
+        return ()
+
+    monkeypatch.setattr(telemetry, "busy_indices", busy_indices)
+    runtime = started_with_reservation(provider, provider.A100._placed("remote"))
+    try:
+        pid = runtime.stat()["pid"]
+        assert runtime.worker_pid == pid
+        provider.free("A100")
+        assert pid in asked[-1]
+    finally:
+        runtime.shutdown()
+    provider.free("A100")
+    assert pid not in asked[-1]
+
+
 def test_devices_that_cannot_be_allocated_are_not_an_infrastructure_failure() -> None:
     # A retry asks for the same devices from the same inventory, so it is never retried.
     assert issubclass(letify.InsufficientDevices, letify.LetifyError)
