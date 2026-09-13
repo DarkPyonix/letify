@@ -8,7 +8,7 @@
 //! That is why the efficiency of forwarding is `T / (T + k * RTT)` rather than
 //! `T / (T + calls * RTT)`. `k` counts the synchronizing calls, not all of them.
 //!
-//! Framing is a four byte little-endian length followed by that many bytes of payload.
+//! Framing is an eight byte little-endian length followed by that many bytes of payload.
 //! The payload is a tag byte and then fixed-width fields, hand encoded rather than
 //! going through a serialization crate, because this sits on the hot path and the shapes
 //! are small and fixed.
@@ -16,7 +16,7 @@
 use std::io::{self, Read, Write};
 
 /// Bumped when a request or reply layout changes in a breaking way.
-pub const PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 2;
 
 /// What the agent is being asked to do.
 ///
@@ -384,16 +384,19 @@ pub fn decode_reply(frame: &[u8]) -> io::Result<Reply> {
 // -- framing ------------------------------------------------------------------
 
 /// Size of the length prefix in front of every frame body.
-pub const FRAME_HEADER_BYTES: usize = 4;
+///
+/// Eight bytes, because a single copy to the device may exceed 4 GiB and a 32 bit
+/// length would wrap without an error.
+pub const FRAME_HEADER_BYTES: usize = 8;
 
 /// Encode the length prefix of a frame whose body is `length` bytes.
 pub fn encode_frame_header(length: u64) -> [u8; FRAME_HEADER_BYTES] {
-    (length as u32).to_le_bytes()
+    length.to_le_bytes()
 }
 
 /// Decode the body length a frame header carries.
 pub fn decode_frame_header(header: [u8; FRAME_HEADER_BYTES]) -> u64 {
-    u32::from_le_bytes(header) as u64
+    u64::from_le_bytes(header)
 }
 
 /// Write one length-prefixed frame.
