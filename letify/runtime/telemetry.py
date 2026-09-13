@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import shutil
 import subprocess
+from collections.abc import Callable
 from dataclasses import dataclass
 
 #: What is asked of nvidia-smi, in this order. Kept to readings every driver reports.
@@ -151,7 +152,10 @@ APPS_COMMAND = (
 UUID_COMMAND = ("nvidia-smi", "--query-gpu=index,uuid", "--format=csv,noheader,nounits")
 
 
-def busy_indices(exclude_pids: set[int] | None = None) -> tuple[int, ...]:
+def busy_indices(
+    exclude_pids: set[int] | None = None,
+    run: Callable[[tuple[str, ...]], str] | None = None,
+) -> tuple[int, ...]:
     """Device indices another process is currently computing on.
 
     Registered is permission, not availability: a card a colleague is training on is not
@@ -159,14 +163,35 @@ def busy_indices(exclude_pids: set[int] | None = None) -> tuple[int, ...]:
     card between steps reads as idle and is not.
 
     ``exclude_pids`` leaves out processes letify itself started, so a session asking for a
-    second card does not see its own as taken.
+    second card does not see its own as taken. ``run`` answers one nvidia-smi query with
+    its output, and defaults to running it on this machine. A remote provider passes a
+    runner that asks its own machine and raises when the query cannot run.
     """
-    mine = exclude_pids or set()
-    uuids = _uuid_to_index()
+    runner = run or _run
+    uuids = parse_uuids(runner(UUID_COMMAND))
     if not uuids:
         return ()
+    return parse_busy(runner(APPS_COMMAND), uuids, exclude_pids)
+
+
+def parse_uuids(output: str) -> dict[str, int]:
+    """Map each card's uuid to its index, because compute apps are reported by uuid."""
+    table: dict[str, int] = {}
+    for line in output.splitlines():
+        fields = [part.strip() for part in line.split(",")]
+        if len(fields) < 2 or not fields[0].isdigit():
+            continue
+        table[fields[1]] = int(fields[0])
+    return table
+
+
+def parse_busy(
+    output: str, uuids: dict[str, int], exclude_pids: set[int] | None = None
+) -> tuple[int, ...]:
+    """The indices the compute apps listing shows a process on, leaving out ``exclude_pids``."""
+    mine = exclude_pids or set()
     taken: set[int] = set()
-    for line in _run(APPS_COMMAND).splitlines():
+    for line in output.splitlines():
         fields = [part.strip() for part in line.split(",")]
         if len(fields) < 2 or fields[0] not in uuids:
             continue
@@ -177,17 +202,6 @@ def busy_indices(exclude_pids: set[int] | None = None) -> tuple[int, ...]:
         if pid not in mine:
             taken.add(uuids[fields[0]])
     return tuple(sorted(taken))
-
-
-def _uuid_to_index() -> dict[str, int]:
-    """Map each card's uuid to its index, because compute apps are reported by uuid."""
-    table: dict[str, int] = {}
-    for line in _run(UUID_COMMAND).splitlines():
-        fields = [part.strip() for part in line.split(",")]
-        if len(fields) < 2 or not fields[0].isdigit():
-            continue
-        table[fields[1]] = int(fields[0])
-    return table
 
 
 def _run(command: tuple[str, ...]) -> str:
@@ -215,6 +229,8 @@ __all__ = [
     "DeviceLoad",
     "busy_indices",
     "local_load",
+    "parse_busy",
     "parse_smi",
+    "parse_uuids",
     "read_smi",
 ]

@@ -54,6 +54,10 @@ class Runtime:
     #: Provider side identifier, such as an Elice allocation id.
     external_id: str | None = None
 
+    #: The worker's process id on its machine, recorded when a persistent channel starts so
+    #: the provider does not read this session's own card as busy. None on a one shot channel.
+    worker_pid: int | None = None
+
     started: float = field(default_factory=time.monotonic)
     last_used: float = field(default_factory=time.monotonic)
     ready: bool = False
@@ -97,6 +101,10 @@ class Runtime:
         if self.channel is None:
             self.channel = self.provider.open_channel(self)
         self.channel.start()
+        if self.channel.persistent:
+            # os.execv keeps the process id, so it holds after the interpreter move too.
+            self.worker_pid = int(self.stat()["pid"])
+            self.provider.add_worker_pid(self.worker_pid)
         self.restrict_devices()
         if self.provider.needs_lease:
             self.lease = Lease(self)
@@ -119,6 +127,9 @@ class Runtime:
     def shutdown(self) -> None:
         """Stop everything that bills for this runtime."""
         self.ready = False
+        if self.worker_pid is not None:
+            self.provider.remove_worker_pid(self.worker_pid)
+            self.worker_pid = None
         if self.lease is not None:
             self.lease.release()
             self.lease = None

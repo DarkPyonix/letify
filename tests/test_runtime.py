@@ -1278,9 +1278,7 @@ def test_cards_another_process_is_using_cannot_be_allocated(reserving, patch_smi
     assert pool.live == []
 
 
-def test_the_refusal_names_the_cards_another_process_is_computing_on(
-    reserving, patch_smi
-) -> None:
+def test_the_refusal_names_the_cards_another_process_is_computing_on(reserving, patch_smi) -> None:
     provider = reserving(A100={"indices": "0-2"})
     patch_smi(busy=[0, 2])
     provider.reserve(provider.A100)
