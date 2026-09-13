@@ -447,13 +447,109 @@ def test_the_sync_is_frozen_skips_the_project_and_always_names_the_local_python(
     ]
 
 
-def test_the_workspace_root_is_a_per_user_directory_that_needs_no_root() -> None:
+def test_the_workspace_root_defaults_to_what_each_kind_of_machine_allows() -> None:
+    # Spec "Workspace root": per kind, when the account sets no workspace.
     from letify.providers.colab import Colab
+    from letify.providers.elice import Elice
     from letify.providers.modal import Modal
     from letify.providers.shell import Shell
+    from letify.providers.tunnel import Tunnel
 
-    for kind in (Shell, Colab, Modal):
-        assert provider_of(kind, "lab", address="gpu.example").workspace_root == "~/.letify"
+    for kind in (Shell, Tunnel, Elice):
+        provider = provider_of(kind, "lab", address="gpu.example")
+        assert provider.workspace_root == "~/.letify-runtime"
+    assert provider_of(Colab, "lab").workspace_root == "/content/letify"
+    assert provider_of(Modal, "lab").workspace_root == "/letify"
+
+
+def test_an_account_workspace_replaces_the_default_root() -> None:
+    from letify.providers.colab import Colab
+    from letify.providers.shell import Shell
+
+    shell = provider_of(Shell, "lab", address="gpu.example", workspace="/workspace/me/letify")
+    assert shell.workspace_root == "/workspace/me/letify"
+    assert provider_of(Colab, "lab", workspace="~/scratch").workspace_root == "~/scratch"
+
+
+def test_a_workspace_that_is_not_an_absolute_or_home_path_is_refused() -> None:
+    from letify.providers.shell import Shell
+
+    provider = provider_of(Shell, "lab", address="gpu.example", workspace="lab-team")
+    with pytest.raises(letify.ConfigError, match="lab.*workspace"):
+        provider.workspace_root  # noqa: B018
+
+
+def test_a_volume_lives_under_the_workspace_root_unless_it_names_a_mount() -> None:
+    # Spec "Materializing into a runtime": <workspace root>/volumes/<volume name>.
+    from letify.providers.shell import Shell
+
+    provider = provider_of(Shell, "lab", address="gpu.example", workspace="/workspace/me")
+    assert Volume(provider, "cache").mount == "/workspace/me/volumes/cache"
+    assert Volume(provider, "cache", {"mount": "/mnt/study"}).mount == "/mnt/study"
+
+
+def test_no_remote_path_is_hard_coded_outside_the_workspace_defaults() -> None:
+    # Spec "Workspace root": every remote path derives from the root. The Colab default is
+    # the one place /content may appear, and nothing may write under /opt or /tmp.
+    import re
+
+    package = Path(letify.__file__).parent
+    offenders = []
+    for source in package.rglob("*.py"):
+        if "_vendor" in source.parts:
+            continue
+        for number, line in enumerate(source.read_text(encoding="utf-8").splitlines(), 1):
+            if line.lstrip().startswith("#"):
+                continue
+            for literal in re.findall(r"[\"'](/(?:opt|tmp|content)(?:/[^\"']*)?)[\"']", line):
+                if source.name == "colab.py" and literal == "/content/letify":
+                    continue
+                offenders.append(f"{source.relative_to(package)}:{number}: {literal}")
+    assert offenders == []
+
+
+class WorkspaceLocal(PreparingLocal):
+    """A local provider that prepares a workspace root the way a remote runtime does."""
+
+    prepares_workspace = True
+
+    @property
+    def workspace_root(self) -> str:
+        return str(self.config.option("workspace"))
+
+
+def test_a_booted_worker_works_inside_its_workspace_root(tmp_path: Path) -> None:
+    # Spec "Sessions", step 3: expand, create, change into it, and TMPDIR under the root.
+    root = tmp_path / "ws"
+    provider = provider_of(WorkspaceLocal, "lab", python=sys.executable, workspace=str(root))
+    instance = Instance(provider, gpu=None)._placed("remote")
+    runtime = provider.start(instance, Env(lock=str(tmp_path / "absent.lock")), name="lab-1")
+    try:
+        assert runtime.workspace == str(root)
+        runtime.exec(
+            "import os, tempfile\n"
+            f"assert os.getcwd() == {str(root)!r}, os.getcwd()\n"
+            f"assert tempfile.gettempdir() == {str(root / 'tmp')!r}, tempfile.gettempdir()\n"
+        )
+    finally:
+        runtime.shutdown()
+
+
+def test_a_volume_materializes_under_the_expanded_workspace_root(tmp_path: Path) -> None:
+    root = tmp_path / "ws"
+    provider = provider_of(WorkspaceLocal, "lab", python=sys.executable, workspace=str(root))
+    volume = provider.volume("cache", backend="filesystem", root=str(tmp_path / "store"))
+    info = volume.store.put_bytes(b"weights")
+    instance = Instance(provider, gpu=None)._placed("remote")
+    runtime = provider.start(
+        instance, Env(lock=str(tmp_path / "absent.lock")), name="lab-1", volumes=(volume,)
+    )
+    try:
+        remote = volume.materialize(runtime, info.digest)
+        assert Path(remote.path).parent.parent == root / "volumes" / "cache" / "blobs"
+        assert Path(remote.path).read_bytes() == b"weights"
+    finally:
+        runtime.shutdown()
 
 
 def test_modal_builds_the_project_environment_like_every_remote_runtime() -> None:

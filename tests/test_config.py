@@ -451,3 +451,20 @@ def test_the_older_gpu_list_still_means_one_of_each(launcher_from) -> None:
     lab = let.provider("lab")
     assert lab.inventory["A100"].count == 1
     assert lab.inventory["A100"].chooses_indices is False
+
+
+# -- Spec: Workspace root ------------------------------------------------------
+
+
+def test_a_workspace_is_read_from_the_home_file(home_file, config_file) -> None:
+    home_file('[lab]\nkind = "shell"\naddress = "gpu.example.edu"\nworkspace = "/workspace/me"\n')
+    project = config_file("[lab]\n")
+    assert load(project).providers["lab"].option("workspace") == "/workspace/me"
+
+
+def test_a_project_file_that_sets_a_workspace_is_refused(home_file, config_file) -> None:
+    # A repository cannot know the write rules of every machine its users reach.
+    home_file('[lab]\nkind = "shell"\naddress = "gpu.example.edu"\n')
+    project = config_file('[lab]\nworkspace = "/workspace/me"\n')
+    with pytest.raises(letify.ConfigError, match="workspace.*home"):
+        load(project)

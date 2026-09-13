@@ -600,7 +600,7 @@ def test_logging_in_to_modal_runs_its_token_flow_into_the_account_directory(
 
     patch_which(tools, present=True)
     calls = modal_sign_in(monkeypatch)
-    assert main(["login", "modal", "modal_lab", "--workspace", "lab-team", "--no-input"]) == 0
+    assert main(["login", "modal", "modal_lab", "--profile", "lab-team", "--no-input"]) == 0
 
     [call] = calls
     assert call["command"][:3] == ["/usr/bin/uv", "tool", "run"]
@@ -613,12 +613,13 @@ def test_logging_in_to_modal_runs_its_token_flow_into_the_account_directory(
     assert "capture_output" not in call and "stdout" not in call
 
     home_file = (Path.home() / ".letify" / "config.toml").read_text(encoding="utf-8")
-    assert 'workspace = "lab-team"' in home_file
+    assert 'profile = "lab-team"' in home_file
+    assert "workspace" not in home_file
     assert "token" not in home_file
     assert token.is_file()
 
 
-def test_a_modal_login_without_a_workspace_uses_the_profile_modal_picks(
+def test_a_modal_login_without_a_profile_uses_the_profile_modal_picks(
     isolated_home, patch_which, monkeypatch, capsys
 ) -> None:
     from letify import tools
@@ -627,7 +628,7 @@ def test_a_modal_login_without_a_workspace_uses_the_profile_modal_picks(
     calls = modal_sign_in(monkeypatch)
     assert main(["login", "modal", "modal_lab", "--no-input"]) == 0
     assert calls[0]["command"][-3:] == ["modal", "token", "new"]
-    assert "workspace" not in (Path.home() / ".letify" / "config.toml").read_text("utf-8")
+    assert "profile" not in (Path.home() / ".letify" / "config.toml").read_text("utf-8")
 
 
 def test_a_modal_login_that_fails_writes_nothing(
@@ -969,3 +970,123 @@ def test_logging_out_removes_the_devices_table_with_the_account(isolated_home) -
     (Path.home() / ".letify" / "config.toml").write_text(EXISTING_HOME, encoding="utf-8")
     assert main(["logout", "lab"]) == 0
     assert home_config() == {"other": {"kind": "shell", "address": "o.example.edu"}}
+
+
+# -- Spec: Logging in, the workspace root --------------------------------------
+
+
+def workspace_machine(*, fails: str | None = None):
+    """Answer the workspace probe, failing with ``fails`` when given, and the rest as usual."""
+
+    def answer(command: list[str]) -> FakeCompleted:
+        if ".letify-probe" in command[-1]:
+            return FakeCompleted(returncode=1, stderr=fails) if fails else FakeCompleted()
+        return machine()(command)
+
+    return answer
+
+
+def probes(recorder) -> list[list[str]]:
+    return [call["command"] for call in recorder.calls if ".letify-probe" in call["command"][-1]]
+
+
+def test_a_shell_login_asks_for_the_workspace_with_the_default_and_checks_it(
+    isolated_home, patch_run, monkeypatch
+) -> None:
+    recorder = patch_run(login, result=workspace_machine())
+    asked = answer_prompts(monkeypatch, {"Workspace root": ["/workspace/me/letify"]})
+    assert main(SHELL_LOGIN) == 0
+    assert "Workspace root on gpu.example.edu [~/.letify-runtime]: " in asked
+    (probe,) = probes(recorder)
+    assert "BatchMode=yes" in probe
+    assert probe[-1].startswith("mkdir -p /workspace/me/letify")
+    assert home_config()["lab"]["workspace"] == "/workspace/me/letify"
+
+
+def test_a_blank_workspace_answer_takes_the_default_and_writes_no_field(
+    isolated_home, patch_run, monkeypatch
+) -> None:
+    recorder = patch_run(login, result=workspace_machine())
+    answer_prompts(monkeypatch, {})
+    assert main(SHELL_LOGIN) == 0
+    (probe,) = probes(recorder)
+    assert probe[-1].startswith('mkdir -p "$HOME"/.letify-runtime')
+    assert "workspace" not in home_config()["lab"]
+
+
+def test_the_workspace_flag_answers_the_prompt_for_a_script(isolated_home, patch_run) -> None:
+    recorder = patch_run(login, result=workspace_machine())
+    assert main([*SHELL_LOGIN, "--no-input", "--workspace", "~/scratch/letify"]) == 0
+    (probe,) = probes(recorder)
+    assert probe[-1].startswith('mkdir -p "$HOME"/scratch/letify')
+    assert home_config()["lab"]["workspace"] == "~/scratch/letify"
+
+
+def test_a_workspace_that_cannot_be_written_fails_the_login_with_nothing_written(
+    isolated_home, patch_run, capsys
+) -> None:
+    patch_run(login, result=workspace_machine(fails="mkdir: cannot create: Permission denied"))
+    assert main([*SHELL_LOGIN, "--no-input", "--workspace", "/srv/letify"]) == 1
+    err = capsys.readouterr().err
+    assert "/srv/letify" in err
+    assert "gpu.example.edu" in err
+    assert "Permission denied" in err
+    assert not (Path.home() / ".letify" / "config.toml").exists()
+
+
+def test_a_relative_workspace_is_refused_at_login(isolated_home, patch_run, capsys) -> None:
+    patch_run(login, result=workspace_machine())
+    assert main([*SHELL_LOGIN, "--no-input", "--workspace", "letify"]) == 1
+    assert "workspace" in capsys.readouterr().err
+    assert not (Path.home() / ".letify" / "config.toml").exists()
+
+
+def test_an_existing_alias_is_checked_again_only_when_a_workspace_is_given(
+    isolated_home, patch_run
+) -> None:
+    (Path.home() / ".letify" / "config.toml").write_text(
+        '[lab]\nkind = "shell"\naddress = "gpu.example.edu"\nkey = "~/.ssh/id_letify"\n',
+        encoding="utf-8",
+    )
+    recorder = patch_run(login, result=workspace_machine())
+    assert main([*SHELL_LOGIN, "--no-input"]) == 0
+    assert probes(recorder) == []
+
+    assert main([*SHELL_LOGIN, "--no-input", "--workspace", "/workspace/me"]) == 0
+    assert len(probes(recorder)) == 1
+    assert home_config()["lab"]["workspace"] == "/workspace/me"
+    assert home_config()["lab"]["address"] == "gpu.example.edu"
+
+
+def test_an_existing_alias_whose_new_workspace_fails_keeps_its_entry(
+    isolated_home, patch_run
+) -> None:
+    text = '[lab]\nkind = "shell"\naddress = "gpu.example.edu"\n'
+    (Path.home() / ".letify" / "config.toml").write_text(text, encoding="utf-8")
+    patch_run(login, result=workspace_machine(fails="Permission denied"))
+    assert main([*SHELL_LOGIN, "--no-input", "--workspace", "/srv/letify"]) == 1
+    assert (Path.home() / ".letify" / "config.toml").read_text(encoding="utf-8") == text
+
+
+def test_a_colab_login_records_the_workspace_without_a_remote_check(
+    isolated_home, patch_which, patch_run
+) -> None:
+    from letify import tools
+
+    patch_which(tools, present=True)
+    recorder = patch_run(login, result=FakeCompleted())
+    assert main(["login", "colab", "colab_a", "--no-input", "--workspace", "/content/me"]) == 0
+    assert probes(recorder) == []
+    assert home_config()["colab_a"]["workspace"] == "/content/me"
+
+
+def test_a_modal_login_records_the_workspace_without_a_remote_check(
+    isolated_home, patch_which, monkeypatch
+) -> None:
+    from letify import tools
+
+    patch_which(tools, present=True)
+    calls = modal_sign_in(monkeypatch)
+    assert main(["login", "modal", "modal_lab", "--no-input", "--workspace", "/data"]) == 0
+    assert len(calls) == 1
+    assert home_config()["modal_lab"]["workspace"] == "/data"

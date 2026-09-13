@@ -1459,3 +1459,85 @@ def test_a_colab_account_directory_is_readable_by_its_owner_only(isolated_home) 
     directory = Path.home() / ".letify" / "accounts" / "colab_a"
     if sys.platform != "win32":
         assert directory.stat().st_mode & 0o777 == 0o700
+
+
+# -- Spec: Workspace root ------------------------------------------------------
+
+
+def test_a_modal_sandbox_mounts_the_workspace_volume_at_the_workspace_root(
+    isolated_home, fake_modal
+) -> None:
+    provider = provider_of(Modal, "m", app="study")
+    runtime = modal_runtime(provider)
+    provider.open_channel(runtime)
+    try:
+        [created] = fake_modal.requests("create")
+        assert created["volumes"] == {"/letify": "study-workspace"}
+    finally:
+        provider.stop(runtime)
+
+
+def test_a_modal_workspace_moves_the_volume_mount(isolated_home, fake_modal) -> None:
+    provider = provider_of(Modal, "m", workspace="/data/letify")
+    runtime = modal_runtime(provider)
+    provider.open_channel(runtime)
+    try:
+        [created] = fake_modal.requests("create")
+        assert created["volumes"] == {"/data/letify": "letify-workspace"}
+    finally:
+        provider.stop(runtime)
+
+
+def test_a_colab_directory_is_packed_under_the_workspace_tmp(
+    isolated_home, fake_jupyter, small_parts, tmp_path, monkeypatch
+) -> None:
+    import base64 as b64
+    import io
+    import tarfile
+
+    root = tmp_path / "ws"
+    monkeypatch.setattr(Colab, "workspace_root", property(lambda self: str(root)))
+    site = tmp_path / "site"
+    site.mkdir()
+    (site / "a.txt").write_text("a", encoding="utf-8")
+    channel = colab_exec_channel(fake_jupyter)
+    seen: list[str] = []
+    original = channel.files.get_file
+
+    def record(path: str):
+        seen.append(path)
+        return original(path)
+
+    channel.files.get_file = record
+
+    value, _ = channel.request({"op": "pack_dir", "path": str(site)})
+
+    assert Path(seen[0]).parent == root / "tmp"
+    assert not Path(seen[0]).exists()
+    with tarfile.open(fileobj=io.BytesIO(b64.b64decode(value["payload"])), mode="r:gz") as archive:
+        assert "site/a.txt" in archive.getnames()
+
+
+def test_a_check_reports_that_the_workspace_is_writable(patch_run) -> None:
+    recorder = patch_run(
+        shell_module,
+        result=FakeCompleted(stdout="Linux gpu 6.8.0\nNVIDIA L4\nletify-workspace-ok\n"),
+    )
+    provider = provider_of(Shell, "lab", address="gpu.example.edu", workspace="/workspace/me")
+    report = provider.check()
+    assert "mkdir -p /workspace/me" in recorder.command[-1]
+    assert "workspace /workspace/me: writable" in report
+    assert "letify-workspace-ok" not in report
+
+
+def test_a_check_reports_a_workspace_that_cannot_be_written(patch_run) -> None:
+    patch_run(
+        shell_module,
+        result=FakeCompleted(
+            stdout="Linux gpu\nletify-workspace-failed: mkdir: cannot create directory "
+            "'/srv/x': Permission denied\n"
+        ),
+    )
+    provider = provider_of(Shell, "lab", address="gpu.example.edu", workspace="/srv/x")
+    report = provider.check()
+    assert "workspace /srv/x: not writable: mkdir: cannot create directory" in report
