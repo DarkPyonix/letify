@@ -22,22 +22,24 @@ dependencies = [
     "blake3>=0.4",
 ]
 
-[project.optional-dependencies]
-colab = ["google-colab-cli>=0.1"]
-modal = ["modal>=0.64"]
-shell = ["paramiko>=3.4", "httpx>=0.27"]
-gcs = ["google-cloud-storage>=2.14"]
-s3 = ["boto3>=1.34"]
-keyring = ["keyring>=24.0"]
-all = [
-    "google-colab-cli>=0.1",
-    "modal>=0.64",
-    "paramiko>=3.4",
-    "httpx>=0.27",
-    "google-cloud-storage>=2.14",
-    "boto3>=1.34",
-    "keyring>=24.0",
-]
+# Disabled for the first release. google-colab-cli has no release that supports Python 3.11, so
+# declaring it made the whole project unresolvable on 3.11, which letify supports.
+# [project.optional-dependencies]
+# colab = ["google-colab-cli>=0.1"]
+# modal = ["modal>=0.64"]
+# shell = ["paramiko>=3.4", "httpx>=0.27"]
+# gcs = ["google-cloud-storage>=2.14"]
+# s3 = ["boto3>=1.34"]
+# keyring = ["keyring>=24.0"]
+# all = [
+#     "google-colab-cli>=0.1",
+#     "modal>=0.64",
+#     "paramiko>=3.4",
+#     "httpx>=0.27",
+#     "google-cloud-storage>=2.14",
+#     "boto3>=1.34",
+#     "keyring>=24.0",
+# ]
 
 [project.urls]
 Homepage = "https://github.com/DarkPyonix/letify"
