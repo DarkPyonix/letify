@@ -237,6 +237,8 @@ The worker source cannot be sent on standard input as a script, because `python 
 
 The worker announces itself with one line, `__LETIFY_WORKER_READY__ <major>.<minor>`, naming the version of the interpreter it runs on. A worker asked to move to another interpreter replies, then replaces its process with `os.execv(<interpreter>, [<interpreter>, "-u", "-c", <bootstrap stub>])` on the same pipes, and the channel sends the worker source again and waits for the new ready line.
 
+The worker never installs anything into the interpreter it starts on. Everything it runs before it moves to the project interpreter uses only the standard library: the ready line, workspace preparation, the environment build and the move itself. The worker imports cloudpickle only when it loads a call, so a system Python that lacks cloudpickle and refuses `pip install`, as an externally managed Python under PEP 668 does, still starts the worker. blake3 and letify are likewise imported only after the move, and blake3 falls back to blake2b where it is absent.
+
 ### Modal adapter <!-- id: modal-adapter -->
 
 > The letify process never imports `modal`. A small adapter runs in its own uv environment and letify talks to it in JSON lines over its standard input and output.
@@ -342,7 +344,7 @@ A runtime boots in seven steps:
 6. Check the worker's interpreter version against the local one.
 7. Attach volumes.
 
-Step 3 is skipped on the local provider, whose worker keeps the working directory of the process that started it. Steps 4 to 6 are skipped on the local provider, which already runs in the project's environment. Steps 4 and 5 are skipped when the account sets `python`, which means the user manages the interpreter on that machine. Step 6 still runs then.
+Step 3 is skipped on the local provider, whose worker keeps the working directory of the process that started it. Steps 4 to 6 are skipped on the local provider, which already runs in the project's environment. Steps 1 to 5 run on the bootstrap interpreter and use only the standard library, as Channels describes. Steps 4 and 5 are skipped when the account sets `python`, which means the user manages the interpreter on that machine. In their place the worker checks that the interpreter can import cloudpickle, and one that cannot raises `ConfigError` naming the interpreter and the missing module. Step 6 still runs then.
 
 ### Pooling
 
@@ -876,7 +878,7 @@ For `colab` and `modal`, letify runs the vendor's sign in through uv and does no
 
 > `python` on an account names the interpreter the worker runs with. Setting it means the user manages that interpreter, so letify does not build the environment there.
 
-Without `python`, a `shell`, `tunnel`, `colab` or `elice` account starts its bootstrap worker with `python3` and then runs the worker from the project `.venv`, as Building the environment on a runtime describes. With `python = "/path/to/python"`, the worker is started with that interpreter and stays on it: no project files are sent, no uv runs and no environment archive is read or written. The interpreter check still applies. On `local`, `python` names the interpreter of the worker subprocess, which defaults to the interpreter running letify.
+Without `python`, a `shell`, `tunnel`, `colab` or `elice` account starts its bootstrap worker with `python3` and then runs the worker from the project `.venv`, as Building the environment on a runtime describes. With `python = "/path/to/python"`, the worker is started with that interpreter and stays on it: no project files are sent, no uv runs and no environment archive is read or written. That interpreter has to provide cloudpickle: letify installs nothing into it, and a session start on one that lacks it raises `ConfigError` naming the interpreter and `cloudpickle`. `ConfigError` is not retried, because a fresh runtime has the same interpreter. The interpreter check still applies. On `local`, `python` names the interpreter of the worker subprocess, which defaults to the interpreter running letify.
 
 ## letify-core
 

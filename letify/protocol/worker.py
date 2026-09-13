@@ -51,14 +51,6 @@ _REPLY = "__LETIFY_REPLY__"
 
 _BLOBS = {}
 
-try:
-    import cloudpickle
-except ImportError:
-    import subprocess
-    subprocess.run([sys.executable, "-m", "pip", "install", "-q", "cloudpickle"], check=True)
-    import cloudpickle
-
-
 def _digest(payload):
     try:
         import blake3
@@ -90,6 +82,9 @@ _NO_LETIFY = (
 
 
 def _load_call(payload):
+    # Imported here, not at start, so the bootstrap interpreter needs only the standard
+    # library until the worker moves into the project .venv.
+    import cloudpickle
     try:
         return cloudpickle.loads(base64.b64decode(payload))
     except ModuleNotFoundError as exc:
