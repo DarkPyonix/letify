@@ -73,9 +73,13 @@ else:
             import asyncio
             value = asyncio.run(value)
     except BaseException as exc:
+        _missing = (
+            isinstance(exc, ModuleNotFoundError)
+            and (exc.name or "").split(".")[0] == "letify"
+        )
         _emit({{
             "ok": False,
-            "error": "{{}}: {{}}".format(type(exc).__name__, exc),
+            "error": _NO_LETIFY if _missing else "{{}}: {{}}".format(type(exc).__name__, exc),
             "traceback": traceback.format_exc(),
         }})
     else:

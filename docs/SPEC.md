@@ -173,7 +173,7 @@ Instance discovery is lazy and cached. A provider that must connect to enumerate
 
 Accelerator names are normalized so they can be attributes. `NVIDIA RTX PRO 6000 Blackwell` becomes `RTX_PRO_6000`. Colab calls the same card `G4`, which is what its CLI accepts, and accepts `RTX_PRO_6000` as an alias for it.
 
-Every provider that can start a session without an accelerator registers it as `CPU`, as `Local` and `Colab` do, and `cpu` finds it too. `Colab` creates such a session with `colab new` and no `--gpu` or `--tpu`.
+Every provider that can start a session without an accelerator registers it as `CPU`, as `Local`, `Colab` and `Modal` do, and `cpu` finds it too. `Colab` creates such a session with `colab new` and no `--gpu` or `--tpu`. `Modal` creates such a sandbox with `gpu` null.
 
 ### GPU utilization
 
@@ -236,8 +236,10 @@ The worker source cannot be sent on standard input as a script, because `python 
 The adapter is `letify/providers/modal_adapter.py`. It imports only the standard library and `modal`, so it runs by file path and needs none of letify's own dependencies. letify starts it with:
 
 ```
-uv run --no-project --python 3.12 --with "modal>=1.0,<2" python <path to modal_adapter.py>
+uv run --no-project --python 3.12 --with "modal>=1.0,<2" python -P <path to modal_adapter.py>
 ```
+
+`-P` keeps the adapter's directory off `sys.path`, so `import modal` finds the Modal package and not `letify/providers/modal.py` beside it.
 
 The Modal version range is pinned in `tools.MODAL`. The adapter runs with `MODAL_CONFIG_PATH` set to `~/.letify/accounts/<alias>/modal.toml`, and with any inherited `MODAL_TOKEN_ID`, `MODAL_TOKEN_SECRET` and `MODAL_PROFILE` removed. The profile Modal uses is the one the sign in activated in that file. So the account file alone decides which Modal account acts, and two accounts coexist on one machine.
 
@@ -250,9 +252,12 @@ The protocol is one JSON object per line. letify sends `{"id": <int>, "op": <nam
 | `write` | `sandbox`, `data` | `null`. Writes the text to the sandbox's standard input and drains it |
 | `read_until` | `sandbox`, `prefixes` | `{"lines": [...], "eof": <bool>}`. The sandbox's stdout lines up to and including the first that starts with one of `prefixes`, or every line left when the stream ends |
 | `terminate` | `sandbox` | `null` |
-| `volume_put` | `volume`, `path`, `data` | `null`. `data` is base64. The volume is created when missing |
-| `volume_get` | `volume`, `path` | base64 of the file |
-| `volume_list` | `volume`, `path` | the paths under `path`, recursively |
+| `volume_put` | `volume`, `version`, `path`, `data` | `null`. `data` is base64 |
+| `volume_get` | `volume`, `version`, `path` | base64 of the file |
+| `volume_list` | `volume`, `version`, `path` | the paths under `path`, recursively |
+| `volume_delete` | `volume`, `version`, `path` | `null`. Removes the file or directory at `path`. A missing path is not an error |
+
+Every volume op creates the volume when it is missing, as version `version`.
 
 The persistent channel to a sandbox is that sandbox's standard input and output, carried by `write` and `read_until`. The sandbox runs the bootstrap stub `python3 -u -c BOOTSTRAP`, and the worker source goes out first as the length-prefixed base64 blob described above. A `read_until` that ends at end of stream without a reply raises `ProtocolError`.
 
@@ -283,7 +288,7 @@ Inside a declared function running in a runtime, `session_cache` looks `key` up 
 
 Each session has its own cache. Concurrent sessions each build their own value, so no result depends on which session the pool picks for a call.
 
-The store lives in the `letify` module, which the worker imports by reference. A dict at module level in the user's script cannot do this job, because cloudpickle ships `__main__` globals by value with every call, so each call sees a fresh copy. letify is importable in the runtime because the user's environment, keyed by `uv.lock`, includes it. A worker that cannot import letify fails the call with `RemoteError` whose message says that letify is not installed in the runtime's environment and that `uv add letify` fixes it.
+The store lives in the `letify` module, which the worker imports by reference. A dict at module level in the user's script cannot do this job, because cloudpickle ships `__main__` globals by value with every call, so each call sees a fresh copy. letify is importable in the runtime because the user's environment, keyed by `uv.lock`, includes it. A worker that cannot import letify, whether the call refers to letify when it is loaded or the body imports letify while it runs, fails the call with `RemoteError` whose message says that letify is not installed in the runtime's environment and that `uv add letify` fixes it.
 
 Concurrent first use of one key builds once: the other callers wait for that build and receive its value. A factory that raises stores nothing, so the next use tries again.
 
@@ -445,6 +450,8 @@ Detection costs one `stat` per path per call, and packing is skipped when the ma
 | `filesystem` | `Local`, `Shell`, `Elice` | A directory. The local machine can be the origin others pull from. On Elice it sits on the machine's own disk. |
 | `gcs` | `Colab` | A Colab runtime is a Compute Engine virtual machine, so this is an internal transfer. Use a multi-region bucket, because runtime placement is not selectable. The client is the standard library HTTP client against the Cloud Storage JSON API. |
 | `modal` | `Modal` | A Modal volume, mounted beside the container. Reached through the Modal adapter, never through a `modal` import in the letify process. |
+
+The `modal` backend uses Modal volume version 2, and sends `version` 2 on every volume op. A version 1 volume accepts a file above Modal's 4 MiB large-file limit and then fails to read it back. `ModalBackend.delete` removes a blob, and a blob already absent is not an error.
 
 The `modal` backend acts as one Modal account. A volume option `account` names its alias, and a volume on a `Modal` provider defaults it to that provider's alias. A volume on another provider that names the `modal` backend without `account` raises `ConfigError`, because there is no account to act as.
 

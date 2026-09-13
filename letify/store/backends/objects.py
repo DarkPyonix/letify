@@ -18,6 +18,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from collections.abc import Iterator
+from typing import Any
 
 from ...errors import ConfigError, ProviderUnavailable, RuntimeFailure
 from ..cas import Backend
@@ -26,6 +27,10 @@ from .layout import BLOB_PREFIX, blob_key, ref_key
 
 #: The Cloud Storage JSON API.
 GCS_ENDPOINT = "https://storage.googleapis.com"
+
+#: The Modal volume version a missing volume is created as. Version 1 cannot read back a
+#: file above 4 MiB.
+MODAL_VOLUME_VERSION = 2
 
 #: Google's Security Token Service, which downscopes a token with a Credential Access Boundary.
 STS_ENDPOINT = "https://sts.googleapis.com/v1/token"
@@ -225,15 +230,21 @@ class ModalBackend(Backend):
     def _key(self, key: str) -> str:
         return f"/{self.prefix}/{key}" if self.prefix else f"/{key}"
 
+    def _request(self, op: str, **fields: Any) -> Any:
+        """Send one volume op, naming the volume and the version it is created as."""
+        return self._adapter.request(
+            op, volume=self.volume_name, version=MODAL_VOLUME_VERSION, **fields
+        )
+
     def _put(self, path: str, payload: bytes) -> None:
         data = base64.b64encode(payload).decode()
-        self._adapter.request("volume_put", volume=self.volume_name, path=path, data=data)
+        self._request("volume_put", path=path, data=data)
 
     def _get(self, path: str) -> bytes | None:
         from ...providers.modal import VolumePathMissing
 
         try:
-            data = self._adapter.request("volume_get", volume=self.volume_name, path=path)
+            data = self._request("volume_get", path=path)
         except VolumePathMissing:
             return None
         return base64.b64decode(str(data))
@@ -242,10 +253,14 @@ class ModalBackend(Backend):
         from ...providers.modal import VolumePathMissing
 
         try:
-            found = self._adapter.request("volume_list", volume=self.volume_name, path=path)
+            found = self._request("volume_list", path=path)
         except VolumePathMissing:
             return []
         return [str(entry) for entry in found]
+
+    def delete(self, digest: str) -> None:
+        """Remove a blob. A blob that is already absent is not an error."""
+        self._request("volume_delete", path=self._key(blob_key(digest)))
 
     def has(self, digest: str) -> bool:
         return bool(self._list(self._key(blob_key(digest))))

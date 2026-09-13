@@ -141,6 +141,78 @@ def test_a_runtime_that_cannot_import_letify_names_the_reason(tmp_path: Path) ->
         codec.parse(stdout, runtime_key="one-shot")
 
 
+def test_a_body_that_imports_letify_while_running_names_the_reason(tmp_path: Path) -> None:
+    # The call loads without letify, and only the body's own import needs it.
+    blocker = tmp_path / "letify"
+    blocker.mkdir()
+    (blocker / "__init__.py").write_text(
+        "raise ModuleNotFoundError(\"No module named 'letify'\", name='letify')\n",
+        encoding="utf-8",
+    )
+
+    def work() -> int:
+        import letify as inside
+
+        return inside.session_cache("value", lambda: 1)
+
+    import os
+
+    env = {**os.environ, "PYTHONPATH": str(tmp_path)}
+    stdout = subprocess.run(
+        [sys.executable, "-c", driver.build(work, (), {})],
+        capture_output=True,
+        text=True,
+        timeout=120,
+        env=env,
+        cwd=tmp_path,
+    ).stdout
+    with pytest.raises(letify.RemoteError, match=r"letify is not installed.*uv add letify"):
+        codec.parse(stdout, runtime_key="one-shot")
+
+
+def test_a_worker_call_whose_body_imports_letify_while_running_names_the_reason(
+    tmp_path: Path,
+) -> None:
+    # The persistent worker's call op, loaded by path in a process where letify cannot
+    # be imported, as in a runtime whose environment lacks it.
+    blocker = tmp_path / "letify"
+    blocker.mkdir()
+    (blocker / "__init__.py").write_text(
+        "raise ModuleNotFoundError(\"No module named 'letify'\", name='letify')\n",
+        encoding="utf-8",
+    )
+
+    def work() -> int:
+        import letify as inside
+
+        return inside.session_cache("value", lambda: 1)
+
+    from letify.protocol.worker import SOURCE
+
+    payload = base64.b64encode(cloudpickle.dumps((work, (), {}))).decode()
+    source = base64.b64encode(SOURCE.encode()).decode()
+    stdin = (
+        f"{len(source)}\n{source}"
+        + framing.encode_request({"op": "call", "payload": payload})
+        + "\n__LETIFY_SHUTDOWN__\n"
+    )
+    import os
+
+    env = {**os.environ, "PYTHONPATH": str(tmp_path)}
+    stdout = subprocess.run(
+        [sys.executable, "-u", "-c", BOOTSTRAP],
+        input=stdin,
+        capture_output=True,
+        text=True,
+        timeout=120,
+        env=env,
+        cwd=tmp_path,
+    ).stdout
+    [reply] = [framing.decode_reply(line) for line in stdout.splitlines() if framing.is_reply(line)]
+    assert reply["ok"] is False
+    assert "letify is not installed" in reply["error"] and "uv add letify" in reply["error"]
+
+
 def test_a_reference_names_what_it_points_at() -> None:
     assert repr(Blob("0123456789abcdef", 2048)) == "<Blob 01234567 2048 bytes>"
     assert repr(RemoteFile("/opt/letify/x.bin", "abc", 10)) == (

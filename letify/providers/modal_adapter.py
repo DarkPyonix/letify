@@ -146,8 +146,22 @@ class Adapter:
         modal = load_modal()
         name = str(request["volume"])
         if name not in self.volumes:
-            self.volumes[name] = modal.Volume.from_name(name, create_if_missing=True)
+            # A version 1 volume cannot read back a file above 4 MiB, so a missing volume
+            # is created as version 2.
+            version = int(request.get("version") or 2)
+            self.volumes[name] = modal.Volume.from_name(
+                name, create_if_missing=True, version=version
+            )
         return modal, self.volumes[name]
+
+    def op_volume_delete(self, request: dict[str, Any]) -> Any:
+        modal, volume = self._volume(request)
+        path = str(request["path"])
+        try:
+            volume.remove_file(path, recursive=True)
+        except not_found_errors(modal):
+            pass
+        return None
 
     def op_volume_put(self, request: dict[str, Any]) -> Any:
         _, volume = self._volume(request)

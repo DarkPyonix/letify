@@ -18,6 +18,7 @@ from __future__ import annotations
 import base64
 import json
 import os
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -90,6 +91,13 @@ def handle(request: dict, sandboxes: dict[str, Sandbox]) -> object:
         if not target.is_file():
             raise NotFound(request["path"])
         return base64.b64encode(target.read_bytes()).decode()
+    if op == "volume_delete":
+        target = volume_file(request["volume"], request["path"])
+        if target.is_dir():
+            shutil.rmtree(target)
+        elif target.exists():
+            target.unlink()
+        return None
     if op == "volume_list":
         root = STATE / "volumes" / request["volume"]
         target = volume_file(request["volume"], request["path"])

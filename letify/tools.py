@@ -117,9 +117,23 @@ def environment(alias: str) -> dict[str, str]:
 
 
 def script_command(tool: Tool, uv: str, script: Path) -> list[str]:
-    """The argument list that runs a Python file in a throwaway uv environment with ``tool``."""
+    """The argument list that runs a Python file in a throwaway uv environment with ``tool``.
+
+    ``-P`` keeps the script's directory off ``sys.path``. Without it a file beside the
+    script, such as ``letify/providers/modal.py``, shadows the package the script imports.
+    """
     pinned = [part for pin in tool.pins for part in ("--with", pin)]
-    return [uv, "run", "--no-project", "--python", tool.python, *pinned, "python", str(script)]
+    return [
+        uv,
+        "run",
+        "--no-project",
+        "--python",
+        tool.python,
+        *pinned,
+        "python",
+        "-P",
+        str(script),
+    ]
 
 
 def modal_adapter_command(uv: str) -> list[str]:
