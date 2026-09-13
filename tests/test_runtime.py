@@ -10,6 +10,7 @@ Spec sections pinned here: "Channels", "Call protocol", "Failure and retry", "Se
 
 from __future__ import annotations
 
+import base64
 import shutil
 import subprocess
 import sys
@@ -611,6 +612,122 @@ def test_a_project_without_a_lock_file_is_refused_before_a_session_starts(
     provider = provider_of(PreparingLocal, "lab")
     with pytest.raises(letify.ConfigError, match="uv lock"):
         provider.start(remote_instance(provider), Env(), name="lab-1")
+
+
+# -- Spec: Channels and Sessions, the bootstrap interpreter --------------------
+
+
+def without_cloudpickle_or_pip(tmp_path: Path) -> tuple[Path, Path, Path]:
+    """Stand-ins that make importing cloudpickle fail and any pip use fail loudly.
+
+    Returns the directory to put first on PYTHONPATH, the directory to put first on PATH,
+    and the file a pip stand-in writes when anything runs it.
+    """
+    modules = tmp_path / "standins"
+    marker = tmp_path / "pip-was-run"
+    for name in ("cloudpickle", "pip"):
+        (modules / name).mkdir(parents=True)
+    (modules / "cloudpickle" / "__init__.py").write_text(
+        "raise ImportError(\"No module named 'cloudpickle'\", name='cloudpickle')\n",
+        encoding="utf-8",
+    )
+    (modules / "pip" / "__init__.py").write_text(
+        f"open({str(marker)!r}, 'w').close()\nraise SystemExit('pip must not run')\n",
+        encoding="utf-8",
+    )
+    (modules / "pip" / "__main__.py").write_text("import pip\n", encoding="utf-8")
+    binaries = tmp_path / "standin-bin"
+    binaries.mkdir()
+    for name in ("pip", "pip3"):
+        script = binaries / name
+        script.write_text(f"#!/bin/sh\n: > {marker}\nexit 9\n", encoding="utf-8")
+        script.chmod(0o755)
+    return modules, binaries, marker
+
+
+def test_the_worker_reaches_the_project_interpreter_without_cloudpickle_or_pip(
+    uv_project: Path, tmp_path: Path
+) -> None:
+    # The lab_docker case: a system Python with no cloudpickle that refuses pip install.
+    # Ready line, workspace, environment build and the move all run on the standard library.
+    from letify.protocol import framing
+    from letify.protocol.worker import SOURCE
+
+    modules, binaries, marker = without_cloudpickle_or_pip(tmp_path)
+    uv = binaries / "uv"
+    uv.write_text(
+        f"#!/bin/sh\nmkdir -p .venv/bin && ln -sf {sys.executable} .venv/bin/python\n",
+        encoding="utf-8",
+    )
+    uv.chmod(0o755)
+    import os
+
+    env = {
+        **os.environ,
+        "PYTHONPATH": str(modules),
+        "PATH": f"{binaries}{os.pathsep}{os.environ['PATH']}",
+    }
+    worker = subprocess.Popen(
+        [sys.executable, "-u", "-c", BOOTSTRAP],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        env=env,
+    )
+    assert worker.stdin is not None and worker.stdout is not None
+
+    def send_source() -> str:
+        encoded = base64.b64encode(SOURCE.encode()).decode()
+        worker.stdin.write(f"{len(encoded)}\n{encoded}")
+        worker.stdin.flush()
+        return worker.stdout.readline()
+
+    def request(message: dict) -> dict:
+        worker.stdin.write(framing.encode_request(message) + "\n")
+        worker.stdin.flush()
+        while True:
+            line = worker.stdout.readline()
+            assert line, worker.stderr.read() if worker.poll() is not None else "no reply"
+            if framing.is_reply(line):
+                return framing.decode_reply(line)
+
+    try:
+        assert framing.is_ready(send_source())
+        workspace = tmp_path / "workspace"
+        reply = request({"op": "eval", "source": bootstrap.workspace_source(str(workspace))})
+        assert reply["ok"], reply
+        env_ = Env()
+        root = str(workspace / "project" / env_.key)
+        files = bootstrap.project_files(env_)
+        reply = request({"op": "eval", "source": bootstrap.sync_source(env_, files, root=root)})
+        assert reply["ok"], reply
+        python = reply["value"]["python"]
+        reply = request({"op": "reexec", "python": python, "bootstrap": BOOTSTRAP})
+        assert reply["ok"], reply
+        assert framing.is_ready(send_source())
+        assert request({"op": "stat"})["ok"]
+    finally:
+        worker.kill()
+        _, stderr = worker.communicate(timeout=60)
+    assert not marker.exists()
+    assert "pip" not in stderr
+
+
+def test_an_account_python_without_cloudpickle_is_refused_by_name(
+    tmp_path: Path, monkeypatch
+) -> None:
+    # The user manages that interpreter, so letify installs nothing into it and says why.
+    modules, binaries, marker = without_cloudpickle_or_pip(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("PYTHONPATH", str(modules))
+    monkeypatch.setenv("PATH", f"{binaries}:{__import__('os').environ['PATH']}")
+    provider = provider_of(PreparingLocal, "lab", python=sys.executable)
+    with pytest.raises(letify.ConfigError) as caught:
+        provider.start(remote_instance(provider), Env(), name="lab-1")
+    assert sys.executable in str(caught.value)
+    assert "cloudpickle" in str(caught.value)
+    assert not marker.exists()
 
 
 # -- Spec: uv on the runtime ---------------------------------------------------
