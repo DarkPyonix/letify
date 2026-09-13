@@ -640,6 +640,131 @@ def fake_gcs(monkeypatch):
     server.close()
 
 
+# -- the Colab runtime proxy's Jupyter file API --------------------------------
+
+
+class FakeJupyterServer:
+    """The Jupyter contents API and ``/files`` handler a Colab runtime proxy exposes.
+
+    A real HTTP server on loopback whose contents root is ``/`` of this machine, as it is on
+    a Colab VM, so a test names absolute paths inside its temporary directory. Chunked
+    uploads follow Jupyter's large file manager: chunk ``1`` creates, any other appends.
+    """
+
+    def __init__(self, token: str = "proxy-token-1"):
+        import http.server
+        import threading
+
+        self.token = token
+        self.requests: list[dict[str, Any]] = []
+        self._lock = threading.Lock()
+        owner = self
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def log_message(self, *args: Any) -> None:
+                return None
+
+            def do_GET(self) -> None:
+                owner._handle(self, "GET")
+
+            def do_PUT(self) -> None:
+                owner._handle(self, "PUT")
+
+        self._server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self._server.daemon_threads = True
+        self.url = f"http://127.0.0.1:{self._server.server_address[1]}"
+        threading.Thread(target=self._server.serve_forever, daemon=True).start()
+
+    def close(self) -> None:
+        self._server.shutdown()
+        self._server.server_close()
+
+    def _handle(self, handler: Any, method: str) -> None:
+        import json
+        import urllib.parse
+
+        parsed = urllib.parse.urlsplit(handler.path)
+        query = dict(urllib.parse.parse_qsl(parsed.query))
+        length = int(handler.headers.get("Content-Length") or 0)
+        body = handler.rfile.read(length) if length else b""
+        with self._lock:
+            self.requests.append(
+                {
+                    "method": method,
+                    "path": urllib.parse.unquote(parsed.path),
+                    "query": query,
+                    "range": handler.headers.get("Range"),
+                    "header_token": handler.headers.get("X-Colab-Runtime-Proxy-Token"),
+                }
+            )
+
+        def answer(status: int, payload: bytes = b"", extra: dict[str, str] | None = None) -> None:
+            handler.send_response(status)
+            for key, value in (extra or {}).items():
+                handler.send_header(key, value)
+            handler.send_header("Content-Length", str(len(payload)))
+            handler.end_headers()
+            handler.wfile.write(payload)
+
+        if query.get("colab-runtime-proxy-token") != self.token or query.get("authuser") != "0":
+            return answer(403, b'{"message": "forbidden"}')
+
+        path = urllib.parse.unquote(parsed.path)
+        if path.startswith("/api/contents/"):
+            local = Path("/") / path[len("/api/contents/") :]
+            if method == "PUT":
+                model = json.loads(body)
+                content = base64.b64decode(model["content"])
+                chunk = model.get("chunk")
+                mode = "ab" if chunk not in (None, 1) else "wb"
+                with open(local, mode) as handle:
+                    handle.write(content)
+                return answer(200, json.dumps({"path": str(local), "type": "file"}).encode())
+            if not local.is_file():
+                return answer(404, b'{"message": "no such file"}')
+            model = {"path": str(local), "type": "file", "size": local.stat().st_size}
+            return answer(200, json.dumps(model).encode())
+        if path.startswith("/files/") and method == "GET":
+            local = Path("/") / path[len("/files/") :]
+            if not local.is_file():
+                return answer(404, b"no such file")
+            data = local.read_bytes()
+            wanted = handler.headers.get("Range")
+            if wanted:
+                first, _, last = wanted.removeprefix("bytes=").partition("-")
+                start, end = int(first), min(int(last), len(data) - 1)
+                piece = data[start : end + 1]
+                return answer(206, piece, {"Content-Range": f"bytes {start}-{end}/{len(data)}"})
+            return answer(200, data)
+        return answer(400, b'{"message": "unexpected request"}')
+
+    def puts(self) -> list[dict[str, Any]]:
+        return [r for r in self.requests if r["method"] == "PUT"]
+
+    def ranges(self) -> list[str]:
+        return [r["range"] for r in self.requests if r["path"].startswith("/files/")]
+
+
+@pytest.fixture
+def fake_jupyter():
+    server = FakeJupyterServer()
+    yield server
+    server.close()
+
+
+def write_colab_session(alias: str, name: str, url: str, token: str) -> Path:
+    """Record a session the way ``colab new`` does, in the account's CLI state file."""
+    import json
+
+    from letify.config.secrets import account_directory
+
+    path = account_directory(alias) / ".config" / "colab-cli" / "sessions.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    state = {name: {"name": name, "token": token, "url": url, "endpoint": "e-1"}}
+    path.write_text(json.dumps(state), encoding="utf-8")
+    return path
+
+
 # -- a one-shot channel that really runs the driver ----------------------------
 
 

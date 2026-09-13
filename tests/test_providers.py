@@ -468,6 +468,180 @@ def test_the_exec_fallback_keeps_nothing_between_calls(
     assert recorder.calls[-1]["input"] == "print('hello')"
 
 
+# -- Spec: Transport, Colab bulk transfer through the Jupyter file API ---------
+
+
+@pytest.fixture
+def small_parts(monkeypatch):
+    """Parts and chunks a few bytes long, so a short payload crosses every boundary."""
+    from letify.providers import colab_files
+
+    monkeypatch.setattr(colab_files, "PART_BYTES", 16)
+    monkeypatch.setattr(colab_files, "CHUNK_BYTES", 6)
+    return colab_files
+
+
+def local_exec(source: str, timeout: float | None = None) -> str:
+    """What `colab exec` does, on this machine: run a program and return its output."""
+    import subprocess
+    import sys
+
+    result = subprocess.run(
+        [sys.executable, "-c", source], capture_output=True, text=True, timeout=timeout or 120
+    )
+    if result.returncode != 0:
+        raise letify.RuntimeFailure("exec failed", stderr=result.stderr)
+    return result.stdout
+
+
+def colab_exec_channel(fake_jupyter, name: str = "letify-g4-1"):
+    from conftest import write_colab_session
+
+    write_colab_session("colab_a", name, fake_jupyter.url, fake_jupyter.token)
+    provider = provider_of(Colab, "colab_a", channel="exec")
+    provider._exec = lambda session, source, timeout: local_exec(source, timeout)
+    runtime = type("R", (), {"name": name})()
+    return provider.open_channel(runtime)
+
+
+def test_the_proxy_address_comes_from_the_colab_cli_session_state(isolated_home) -> None:
+    from conftest import write_colab_session
+
+    from letify.providers.colab_files import session_endpoint
+
+    write_colab_session("colab_a", "letify-g4-1", "https://proxy.example/", "proxy-token-1")
+    assert session_endpoint("colab_a", "letify-g4-1") == (
+        "https://proxy.example",
+        "proxy-token-1",
+    )
+    with pytest.raises(letify.RuntimeFailure, match=r"sessions\.json"):
+        session_endpoint("colab_a", "letify-t4-9")
+
+
+def test_an_upload_is_sent_in_parallel_parts_of_chunked_puts_and_joined(
+    isolated_home, fake_jupyter, small_parts, tmp_path
+) -> None:
+    import base64 as b64
+
+    channel = colab_exec_channel(fake_jupyter)
+    payload = bytes(range(40))
+    target = tmp_path / "vm" / "weights.bin"
+    target.parent.mkdir()
+
+    value, _ = channel.request(
+        {"op": "put_file", "path": str(target), "payload": b64.b64encode(payload).decode()}
+    )
+
+    assert target.read_bytes() == payload
+    assert value == {"path": str(target), "size": 40}
+    # 40 bytes in parts of 16 is three parts; the joined file leaves no part behind.
+    assert list(target.parent.iterdir()) == [target]
+    parts = sorted({r["path"] for r in fake_jupyter.puts()})
+    assert parts == [f"/api/contents{target}.letify-part-{n}" for n in range(3)]
+    assert all(
+        r["query"]["colab-runtime-proxy-token"] == "proxy-token-1" for r in fake_jupyter.puts()
+    )
+    assert all(r["header_token"] == "proxy-token-1" for r in fake_jupyter.puts())
+
+
+def test_each_part_is_numbered_the_way_the_large_file_manager_expects(
+    isolated_home, fake_jupyter, small_parts, tmp_path, monkeypatch
+) -> None:
+    from letify.providers.colab_files import ContentsTransfer
+
+    sent: list[tuple[str, object]] = []
+    original = ContentsTransfer._put_chunk
+
+    def record(self, remote: str, piece: bytes, chunk: int) -> None:
+        sent.append((remote.rsplit("-", 1)[-1], chunk))
+        original(self, remote, piece, chunk)
+
+    monkeypatch.setattr(ContentsTransfer, "_put_chunk", record)
+    target = tmp_path / "vm.bin"
+    ContentsTransfer(fake_jupyter.url, fake_jupyter.token).upload(bytes(20), str(target))
+    # Parts of 16 and 4 bytes, in chunks of 6.
+    assert sorted(sent) == [("0", -1), ("0", 1), ("0", 2), ("1", 1)]
+
+
+def test_an_uploaded_archive_is_unpacked_by_the_join_program(
+    isolated_home, fake_jupyter, small_parts, tmp_path
+) -> None:
+    import base64 as b64
+    import io
+    import tarfile
+
+    buffer = io.BytesIO()
+    with tarfile.open(fileobj=buffer, mode="w:gz") as archive:
+        info = tarfile.TarInfo("site/marker.txt")
+        info.size = 6
+        archive.addfile(info, io.BytesIO(b"cached"))
+    mount = tmp_path / "mount"
+    channel = colab_exec_channel(fake_jupyter)
+    channel.request(
+        {
+            "op": "put_file",
+            "path": str(mount / "blobs" / "env.tar.gz"),
+            "payload": b64.b64encode(buffer.getvalue()).decode(),
+            "unpack": True,
+            "target": str(mount),
+        }
+    )
+    assert (mount / "site" / "marker.txt").read_text(encoding="utf-8") == "cached"
+
+
+def test_a_download_reads_the_file_in_parallel_ranges(
+    isolated_home, fake_jupyter, small_parts, tmp_path
+) -> None:
+    import base64 as b64
+
+    source = tmp_path / "checkpoint.pt"
+    source.write_bytes(bytes(range(35)))
+    channel = colab_exec_channel(fake_jupyter)
+
+    value, _ = channel.request({"op": "get_file", "path": str(source)})
+
+    assert b64.b64decode(value["payload"]) == bytes(range(35))
+    assert value["size"] == 35
+    assert sorted(fake_jupyter.ranges()) == ["bytes=0-15", "bytes=16-31", "bytes=32-34"]
+
+
+def test_a_directory_is_packed_on_the_vm_and_then_downloaded(
+    isolated_home, fake_jupyter, small_parts, tmp_path
+) -> None:
+    import base64 as b64
+    import io
+    import tarfile
+
+    site = tmp_path / "site"
+    site.mkdir()
+    (site / "a.txt").write_text("a", encoding="utf-8")
+    channel = colab_exec_channel(fake_jupyter)
+
+    value, _ = channel.request({"op": "pack_dir", "path": str(site)})
+
+    with tarfile.open(fileobj=io.BytesIO(b64.b64decode(value["payload"])), mode="r:gz") as archive:
+        assert "site/a.txt" in archive.getnames()
+
+
+def test_the_pipeline_fallback_link_carries_bulk_transfer(isolated_home, fake_jupyter) -> None:
+    from conftest import write_colab_session
+
+    write_colab_session("colab_a", "letify-g4-1", fake_jupyter.url, fake_jupyter.token)
+    provider = provider_of(Colab, "colab_a")
+    runtime = type("R", (), {"name": "letify-g4-1"})()
+    link = provider.fallback(runtime)()
+    assert link.files is not None
+
+
+def test_a_refused_proxy_request_names_the_path_and_the_status(
+    isolated_home, fake_jupyter, tmp_path
+) -> None:
+    from letify.providers.colab_files import ContentsTransfer
+
+    with pytest.raises(letify.RuntimeFailure, match="403"):
+        ContentsTransfer(fake_jupyter.url, "wrong").download(str(tmp_path / "x.bin"))
+
+
 # -- Spec: Transport, a machine reached over SSH -------------------------------
 
 

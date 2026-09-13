@@ -192,11 +192,14 @@ class Colab(Shell):
         if runtime is None:
             return None
         from ..transport.link import OneShotLink
+        from .colab_files import ColabFiles
 
         name = runtime.name
-        return lambda: OneShotLink(
-            "fallback", 4, lambda source, timeout: self._exec(name, source, timeout)
-        )
+
+        def run(source: str, timeout: float | None) -> str:
+            return self._exec(name, source, timeout)
+
+        return lambda: OneShotLink("fallback", 4, run, files=ColabFiles(self.alias, name, run))
 
     def target(self, runtime: Runtime | None = None) -> Target:
         target = super().target(runtime)
@@ -235,6 +238,7 @@ class Colab(Shell):
 
     def open_channel(self, runtime: Runtime) -> Channel:
         from ..runtime.channel import OneShotChannel
+        from .colab_files import ColabFiles
 
         if self.channel_kind == "exec":
             name = runtime.name
@@ -242,7 +246,7 @@ class Colab(Shell):
             def run(source: str, timeout: float | None) -> str:
                 return self._exec(name, source, timeout)
 
-            return OneShotChannel(run, name=runtime.name)
+            return OneShotChannel(run, name=name, files=ColabFiles(self.alias, name, run))
         return super().open_channel(runtime)
 
 

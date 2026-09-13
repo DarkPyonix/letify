@@ -174,9 +174,18 @@ class OneShotLink(Link):
 
     persistent = False
 
-    def __init__(self, strategy: str, rank: int, runner: Callable[[str, float | None], str]):
+    def __init__(
+        self,
+        strategy: str,
+        rank: int,
+        runner: Callable[[str, float | None], str],
+        *,
+        files: object | None = None,
+    ):
         super().__init__(strategy, rank)
         self.runner = runner
+        #: The provider's bulk transfer path, when it has one beside the command path.
+        self.files = files
 
 
 __all__ = ["Link", "OneShotLink", "ProcessStream", "PunchedLink", "SSHLink", "probe_source"]
