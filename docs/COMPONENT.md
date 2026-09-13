@@ -19,7 +19,7 @@ Read this table first. Most confusion about letify is one of these words meaning
 | **Channel** | How letify talks to a session: persistent, or one-shot. |
 | **Env** | A declaration of the remote environment, keyed by a uv lock file. Not a container image. |
 | **Volume** | A named content addressed blob store on a provider's storage. Not a mounted filesystem. |
-| **Handle** | A reference to an object that lives in a session. |
+| **session cache** | Values a declared body built with `letify.session_cache`, kept in the session's worker process until the session ends. |
 | **Blob** | A large argument named by the hash of its contents. |
 | **persistence** | Whether a provider's storage outlives a session: `persistent` or `ephemeral`. |
 | **letify-core** | The Rust workspace behind `host="local"`. Its crates are `letify-wire`, `letify-driver` and `letify-agent`. |
@@ -113,7 +113,7 @@ An instance carries no placement; `host=letify.local` or `letify.remote` on the 
 
 How letify talks to a session, and the reason some providers can do more than others.
 
-`PersistentChannel` keeps one worker process alive behind a pipe. Requests are framed lines, so the object table, the blob table and anything written to disk survive between calls. That is what makes a handle resolvable and a large argument sendable once.
+`PersistentChannel` keeps one worker process alive behind a pipe. Requests are framed lines, so the worker process with its session cache, the blob table and anything written to disk survive between calls. That is what makes a handle resolvable and a large argument sendable once.
 
 `OneShotChannel` can only run a command and collect its output. Every call starts a fresh process, so nothing persists, and it refuses the operations that need persistence rather than pretending.
 
@@ -155,15 +155,15 @@ Three layers with one job each.
 
 The layering exists so that provider and storage vary independently. Colab reads from Google Cloud Storage because a Colab session is a Compute Engine virtual machine, Elice reads from the machine's own disk, and neither fact is visible in the declaration.
 
-## Handle, Blob and the call protocol
+## Session cache, Blob and the call protocol <!-- id: handle-blob-and-the-call-protocol -->
 
 `protocol` owns the wire: serialize a call, frame it, run it, decode the outcome.
 
-A `Handle` is a reference to an object registered in a session's object table. It carries the name of the live session, not the pool key, because two sessions can share a key and an object lives in only one of them. Passing one to a call on a different session raises rather than materializing the object.
+`session_cache`, in `letify/declare/cache.py`, owns a key to value store and the lock that makes first use of a key build once. The store lives in the process that imports letify, so in a runtime it is the worker process and ends with the session, and locally it lasts as long as this process. It is a letify module rather than a dict in the user's script because cloudpickle ships `__main__` globals by value on every call. A call always returns its value.
 
 A `Blob` is a large argument named by the hash of its contents. The runtime is asked which digests it already holds before anything is sent, so a value passed repeatedly crosses the network once.
 
-Three protocol rules exist for performance rather than tidiness. Large arguments are content addressed. Values may stay remote. And a failure never falls back to a slower path, because a silent downgrade turns a four times difference into a mystery.
+Three protocol rules exist for performance rather than tidiness. Large arguments are content addressed. A value built once stays in its session. And a failure never falls back to a slower path, because a silent downgrade turns a four times difference into a mystery.
 
 ## remoting
 

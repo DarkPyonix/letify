@@ -65,7 +65,7 @@ Multiple accounts are supported for every provider. Each configuration entry is 
 
 A session is one worker process kept alive behind a framed pipe, which is what makes three things work.
 
-A value declared with `keep_remote=True` stays in the session and resolves in a later call, so a model is not copied back and forth. A large argument is hashed and offered by digest, so the same tensor passed to ten calls crosses the network once. Files written into a session survive between calls, so a volume can materialize an environment archive or a checkpoint.
+A value a declared body stores with `letify.session_cache("model", load_model)` stays in the session's worker process, so a later call in the same session gets it without building it again. Each session has its own cache, and a one-shot channel keeps nothing between calls. A large argument is hashed and offered by digest, so the same tensor passed to ten calls crosses the network once. Files written into a session survive between calls, so a volume can materialize an environment archive or a checkpoint.
 
 ### Session pooling
 
@@ -139,7 +139,6 @@ Launcher(
     volumes=[cache],       # volumes to attach
     timeout=None,          # seconds one call may take; no default deadline
     retries=1,             # retries on infrastructure failure, never on user code failure
-    keep_remote=False,     # return a Handle instead of the value
 )
 def train(lr, bs): ...
 ```
@@ -200,7 +199,8 @@ cache.resume(runtime, "run-1", path)   # put the newest one inside a session
 | `local`, `remote` | the two values `host` takes |
 | `Env` | an environment declaration |
 | `Volume` | a content addressed store on a provider |
-| `Handle`, `Blob`, `RemoteFile` | references to something that lives in a session |
+| `session_cache` | a value built once per session, keyed by name |
+| `Blob`, `RemoteFile` | references to something that lives in a session |
 | `Function` | what the decorator returns |
 
 ### Errors
@@ -213,7 +213,6 @@ cache.resume(runtime, "run-1", path)   # put the newest one inside a session
 | `RuntimeFailure`, `RuntimeLost` | The session misbehaved | yes |
 | `ProtocolError` | The remote process died before producing a result | yes |
 | `RemoteError` | The shipped function raised; carries the remote traceback | no |
-| `HandleScopeError` | A handle from one session was passed to another | no |
 | `UnsupportedMode` | The requested mode cannot work here | no |
 | `InsufficientDevices` | The devices a call asks for cannot be allocated; names what holds them | no |
 

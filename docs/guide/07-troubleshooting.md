@@ -14,7 +14,7 @@ letify distinguishes two kinds of failure, and the distinction decides whether a
 |---|---|---|
 | The infrastructure misbehaved | `RuntimeFailure`, `RuntimeLost`, `ProtocolError` | yes, on a fresh runtime |
 | Your code raised | `RemoteError` | no, a retry reproduces it |
-| You asked for something impossible | `ConfigError`, `UnsupportedMode`, `HandleScopeError`, `UnknownProvider`, `UnknownInstance`, `InsufficientDevices` | no |
+| You asked for something impossible | `ConfigError`, `UnsupportedMode`, `UnknownProvider`, `UnknownInstance`, `InsufficientDevices` | no |
 | Missing dependency or setting | `ProviderUnavailable` | no |
 
 ---
@@ -207,19 +207,18 @@ except letify.RuntimeFailure as exc:
 
 ---
 
-## `HandleScopeError`
+## `letify is not installed in this runtime's environment`
 
 ```
-<Handle dict a1b2c3 on colab_a:G4...> belongs to runtime 'X' but the call targets
-'Y'. Route the call to the owning runtime, or return the value to this process
-before passing it on.
+RemoteError: letify is not installed in this runtime's environment, so the call, which
+refers to letify (for example through letify.session_cache), cannot be loaded.
 ```
 
-A handle is a pointer into one process and one CUDA context. letify refuses to resolve one across runtimes rather than copying the whole object over the network without being asked.
+The declared body refers to letify, most often through `letify.session_cache`, and the runtime's environment does not include it. Run `uv add letify` so `uv.lock` carries it into the runtime.
 
-Send the call to the runtime that owns the object, or have the first call return the value instead of a handle.
+## A session cache builds again on every call
 
-> 🚧 Handles are returned today, but resolving one in a later call needs the persistent session process, which is not implemented yet. See the known gaps at the end of [docs/SPEC.md](../SPEC.md).
+`letify.session_cache` keeps a value until the session ends. Outside `with let.keep_alive():` every call ends its session, so wrap the calls in the block. On a one-shot channel, such as Colab `channel = "exec"`, every call is a fresh process and nothing is kept between calls. Concurrent calls running on different sessions each build their own value, which is expected.
 
 ---
 
