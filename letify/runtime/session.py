@@ -128,7 +128,7 @@ class Runtime:
         self.request({"op": "exec", "source": source}, timeout=timeout)
 
     def stat(self) -> dict[str, Any]:
-        """What the worker is holding: objects, blobs, bytes, process id."""
+        """What the worker is holding: blobs, bytes, process id."""
         return self.request({"op": "stat"}, timeout=60)
 
     def call(
@@ -137,20 +137,15 @@ class Runtime:
         args: tuple,
         kwargs: dict,
         *,
-        keep_remote: bool = False,
         timeout: float | None = None,
     ) -> tuple[Any, str]:
         """Run one declared function inside this runtime.
 
-        Handles belonging to another runtime are rejected before anything is sent,
-        and large arguments are replaced by content addressed references so the
-        same payload is not sent twice.
+        Large arguments are replaced by content addressed references so the same
+        payload is not sent twice.
         """
         if self.channel is None:
             raise RuntimeFailure(f"{self.name}: the channel is not open")
-        # A handle names the live runtime that holds the object, not the pool key,
-        # because two runtimes can share a key and an object lives in only one of them.
-        protocol.check_handles(self.name, args, kwargs)
         # Done here rather than at declaration time, because the registration lives in
         # cloudpickle and a process can hold declarations with different environments.
         if self.env.ship_modules:
@@ -158,7 +153,7 @@ class Runtime:
         if self.persistent_channel:
             args, kwargs = self._externalize(args, kwargs)
         self.last_used = time.monotonic()
-        return self.channel.call(fn, args, kwargs, keep_remote=keep_remote, timeout=timeout)
+        return self.channel.call(fn, args, kwargs, timeout=timeout)
 
     # -- content addressed arguments -----------------------------------------
 
@@ -175,7 +170,7 @@ class Runtime:
         plan: dict[str, bytes] = {}
 
         def convert(value: Any) -> Any:
-            if isinstance(value, (protocol.Handle, protocol.Blob)):
+            if isinstance(value, protocol.Blob):
                 return value
             try:
                 payload = pickle.dumps(value, protocol=5)

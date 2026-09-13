@@ -1,9 +1,9 @@
 """The wire between this process and a runtime.
 
-Spec sections pinned here: "Channels", "Call protocol", "Handles" and "Argument
-addressing". The one-shot driver is exercised by really running the script it builds in
-a fresh interpreter, because that is what a provider such as ``colab exec`` does with
-it, and the markers and the decoder are then the real ones.
+Spec sections pinned here: "Channels", "Call protocol", "Session cache" and
+"Argument addressing". The one-shot driver is exercised by really running the script it
+builds in a fresh interpreter, because that is what a provider such as ``colab exec``
+does with it, and the markers and the decoder are then the real ones.
 """
 
 from __future__ import annotations
@@ -22,8 +22,8 @@ import pytest
 import letify
 from letify import protocol
 from letify.declare.env import Env
-from letify.protocol import codec, driver, framing, guards
-from letify.protocol.handle import Blob, Handle, RemoteFile
+from letify.protocol import codec, driver, framing
+from letify.protocol.handle import Blob, RemoteFile
 from letify.protocol.worker import BOOTSTRAP, READY, REPLY
 
 
@@ -95,61 +95,61 @@ def test_an_unrecognized_payload_is_a_protocol_error(payload: object) -> None:
         codec.unwrap(payload, runtime_key="r")  # type: ignore[arg-type]
 
 
-# -- Spec: Handles -------------------------------------------------------------
+# -- Spec: Session cache -------------------------------------------------------
 
 
-def test_a_kept_value_comes_back_as_a_handle_scoped_to_its_runtime() -> None:
-    value = codec.unwrap(
-        {
-            "ok": True,
-            "handle": {"object_id": "abc123", "type_name": "Module", "summary": "Module(...)"},
-        },
-        runtime_key="letify-cpu-1",
+def test_a_session_cache_works_within_one_one_shot_call() -> None:
+    # A one-shot process keeps nothing for the next call, but inside the call the cache holds.
+    def work() -> int:
+        builds = []
+
+        def load() -> int:
+            builds.append(1)
+            return 3
+
+        first = letify.session_cache("value", load)
+        second = letify.session_cache("value", load)
+        return first + second + len(builds)
+
+    stdout = run_script(driver.build(work, (), {}))
+    assert codec.parse(stdout, runtime_key="one-shot")[1] == 7
+
+
+def test_a_runtime_that_cannot_import_letify_names_the_reason(tmp_path: Path) -> None:
+    blocker = tmp_path / "letify"
+    blocker.mkdir()
+    (blocker / "__init__.py").write_text(
+        "raise ModuleNotFoundError(\"No module named 'letify'\", name='letify')\n",
+        encoding="utf-8",
     )
-    assert isinstance(value, Handle)
-    # The handle names the live runtime, not the pool key, because two runtimes can
-    # share a key and the object lives in only one of them.
-    assert value.runtime == "letify-cpu-1"
-    assert value.type_name == "Module"
-    assert value.summary == "Module(...)"
 
+    def work() -> int:
+        return letify.session_cache("value", lambda: 1)
 
-def test_a_handle_belonging_to_another_runtime_is_refused_before_anything_is_sent() -> None:
-    stranger = Handle(runtime="elsewhere", object_id="00", type_name="dict")
-    with pytest.raises(letify.HandleScopeError, match="belongs to runtime 'elsewhere'"):
-        guards.check_handles("here", (), {"model": stranger})
+    import os
 
-
-def test_a_handle_is_found_however_deeply_it_is_nested() -> None:
-    # Catching this locally is the point: otherwise the payload crosses the network
-    # before the far side discovers it cannot resolve the handle.
-    stranger = Handle(runtime="elsewhere", object_id="00", type_name="dict")
-    with pytest.raises(letify.HandleScopeError):
-        guards.check_handles("here", ([{"models": (stranger,)}],), {})
-
-
-def test_a_handle_from_the_target_runtime_passes_the_check() -> None:
-    own = Handle(runtime="here", object_id="00", type_name="dict")
-    assert guards.check_handles("here", (own,), {"also": own}) is None
-
-
-def test_every_leaf_of_a_nested_structure_is_inspected() -> None:
-    assert sorted(guards.walk([1, (2, 3), {"a": 4}, {5}])) == [1, 2, 3, 4, 5]
+    env = {**os.environ, "PYTHONPATH": str(tmp_path)}
+    stdout = subprocess.run(
+        [sys.executable, "-c", driver.build(work, (), {})],
+        capture_output=True,
+        text=True,
+        timeout=120,
+        env=env,
+        cwd=tmp_path,
+    ).stdout
+    with pytest.raises(letify.RemoteError, match=r"letify is not installed.*uv add letify"):
+        codec.parse(stdout, runtime_key="one-shot")
 
 
 def test_a_reference_names_what_it_points_at() -> None:
-    # These strings are what a user sees when a kept value is printed.
-    assert repr(Handle("rt", "0123456789abcdef", "Module")) == "<Handle Module 01234567 on rt>"
     assert repr(Blob("0123456789abcdef", 2048)) == "<Blob 01234567 2048 bytes>"
     assert repr(RemoteFile("/opt/letify/x.bin", "abc", 10)) == (
         "<RemoteFile /opt/letify/x.bin 10 bytes>"
     )
 
 
-def test_the_worker_recognizes_a_reference_without_importing_letify() -> None:
-    # The worker runs where letify is not installed, so it reads a marker by attribute
-    # rather than doing an isinstance check.
-    assert Handle.__letify_kind__ == "handle"
+def test_the_worker_recognizes_a_blob_by_marker() -> None:
+    # The worker source reads a marker by attribute rather than doing an isinstance check.
     assert Blob.__letify_kind__ == "blob"
 
 
@@ -269,17 +269,6 @@ def test_an_async_body_is_awaited_on_the_far_side() -> None:
 
     stdout = run_script(driver.build(work, (), {}))
     assert codec.parse(stdout, runtime_key="one-shot")[1] == 7
-
-
-def test_keeping_a_value_is_refused_where_no_process_survives_the_call() -> None:
-    # There is nothing for a handle to point at once a one-shot command returns, so this
-    # fails with its reason rather than returning a handle that cannot be resolved.
-    def build() -> dict[str, int]:
-        return {"weights": 1}
-
-    stdout = run_script(driver.build(build, (), {}, keep_remote=True))
-    with pytest.raises(letify.RemoteError, match="keep_remote needs a persistent session"):
-        codec.parse(stdout, runtime_key="one-shot")
 
 
 def test_a_return_value_that_cannot_be_serialized_reports_that_rather_than_hanging() -> None:

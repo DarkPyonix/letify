@@ -1,40 +1,16 @@
 """References to things that live in a runtime.
 
-A ``Handle`` points at an object in a runtime's object table and a ``Blob`` names
-a payload by the hash of its contents. Both exist so that data stops travelling
-more than once: a model stays where it was built, and the same tensor passed to
-ten calls is sent on the first one only.
+A ``Blob`` names a payload by the hash of its contents, so the same tensor passed
+to ten calls is sent on the first one only. A ``RemoteFile`` names a file that
+exists inside a runtime.
 
-Both types are deliberately plain. The remote side has to recognize them without
-importing letify, so each carries a ``__letify_kind__`` marker that the worker
-reads by attribute.
+``Blob`` is deliberately plain. The worker source recognizes it by a
+``__letify_kind__`` marker read by attribute rather than by an isinstance check.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-
-
-@dataclass(frozen=True, slots=True)
-class Handle:
-    """A reference to an object that lives in a runtime.
-
-    The handle carries the key of the runtime that owns it. Passing it to a call
-    on a different runtime raises ``HandleScopeError`` rather than silently
-    copying the object across the network, because a handle is a pointer into one
-    process and one CUDA context.
-    """
-
-    runtime: str
-    object_id: str
-    type_name: str
-    summary: str = ""
-
-    #: Read by the remote worker to recognize a handle without importing letify.
-    __letify_kind__ = "handle"
-
-    def __repr__(self) -> str:
-        return f"<Handle {self.type_name} {self.object_id[:8]} on {self.runtime}>"
 
 
 @dataclass(frozen=True, slots=True)

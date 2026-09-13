@@ -2,8 +2,8 @@
 
 Five pieces, each with one job.
 
-``handle`` holds the reference types, so a value can stay in a runtime and a large
-argument can be named rather than resent. ``codec`` serializes a call and reads an
+``handle`` holds the reference types, so a large argument can be named rather than
+resent and a file inside a runtime can be pointed at. ``codec`` serializes a call and reads an
 outcome back. ``framing`` wraps a message as one line, which is what survives SSH
 and WebSocket channels. ``worker`` is the source of the process that lives inside
 a runtime. ``driver`` is the fallback for a channel that can only run a command
@@ -34,8 +34,7 @@ from .framing import (
     is_ready,
     is_reply,
 )
-from .guards import check_handles, walk
-from .handle import Blob, Handle, RemoteFile
+from .handle import Blob, RemoteFile
 
 __all__ = [
     "BEGIN",
@@ -46,9 +45,7 @@ __all__ = [
     "REPLY",
     "SHUTDOWN",
     "Blob",
-    "Handle",
     "RemoteFile",
-    "check_handles",
     "codec",
     "decode_reply",
     "digest_of",
@@ -60,5 +57,4 @@ __all__ = [
     "ship_by_value",
     "split_output",
     "unwrap",
-    "walk",
 ]

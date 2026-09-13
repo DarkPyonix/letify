@@ -21,7 +21,6 @@ from typing import Any
 import cloudpickle
 
 from ..errors import ConfigError, ProtocolError, RemoteError
-from .handle import Handle
 
 #: Markers the one-shot driver writes around its outcome, so a result can be found
 #: in a stream that also carries the user's prints.
@@ -88,14 +87,6 @@ def unwrap(outcome: dict[str, Any], *, runtime_key: str) -> Any:
         raise RemoteError(
             outcome.get("error", "the remote call failed"),
             outcome.get("traceback", ""),
-        )
-    if "handle" in outcome:
-        spec = outcome["handle"]
-        return Handle(
-            runtime=runtime_key,
-            object_id=spec["object_id"],
-            type_name=spec["type_name"],
-            summary=spec.get("summary", ""),
         )
     return outcome.get("value")
 

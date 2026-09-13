@@ -202,7 +202,6 @@ class Launcher:
         volumes: Sequence[Volume] = (),
         timeout: float | None = None,
         retries: int = 1,
-        keep_remote: bool = False,
     ) -> Callable[[Callable[..., R]], Function[R]]:
         """Declare where a function runs.
 
@@ -214,8 +213,8 @@ class Launcher:
         There is no width argument. Concurrent calls run as wide as the provider has devices
         for, which the provider entry already says.
 
-        ``keep_remote`` returns a handle instead of the value, so a model stays in the
-        runtime and later calls refer to it without copying it back.
+        A call returns its value. A body that should build something once per session,
+        such as a model, uses ``letify.session_cache``.
         """
 
         def decorate(fn: Callable[..., R]) -> Function[R]:
@@ -228,7 +227,6 @@ class Launcher:
                 volumes=volumes,
                 timeout=timeout,
                 retries=retries,
-                keep_remote=keep_remote,
             )
             self.functions.append(declared)
             return declared

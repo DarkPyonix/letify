@@ -6,8 +6,8 @@ outcome is printed between two markers so it can be found in a stream that also
 carries the user's prints.
 
 What this path cannot do is the reason the persistent worker exists. With no
-living process there is no object table, so a handle has nothing to point at, and
-no blob table, so every large argument travels again on every call.
+living process nothing a session cache stored survives to the next call, and there
+is no blob table, so every large argument travels again on every call.
 """
 
 from __future__ import annotations
@@ -22,7 +22,11 @@ import base64, pickle, sys, traceback
 _PAYLOAD = "{payload}"
 _BEGIN, _END = "{begin}", "{end}"
 _VERSION = {version}
-_KEEP = {keep}
+_NO_LETIFY = (
+    "letify is not installed in this runtime's environment, so the call, which refers "
+    "to letify (for example through letify.session_cache), cannot be loaded. Add it to "
+    "the project with 'uv add letify' so uv.lock carries it into the runtime."
+)
 
 def _emit(obj):
     try:
@@ -49,6 +53,13 @@ except ImportError:
 
 try:
     fn, args, kwargs = cloudpickle.loads(base64.b64decode(_PAYLOAD))
+except ModuleNotFoundError as exc:
+    _missing = (exc.name or "").split(".")[0] == "letify"
+    _emit({{
+        "ok": False,
+        "error": _NO_LETIFY if _missing else "the call could not be deserialized",
+        "traceback": traceback.format_exc(),
+    }})
 except Exception:
     _emit({{
         "ok": False,
@@ -68,22 +79,11 @@ else:
             "traceback": traceback.format_exc(),
         }})
     else:
-        if _KEEP:
-            _emit({{
-                "ok": False,
-                "error": (
-                    "keep_remote needs a persistent session, and this provider is "
-                    "running one-shot commands. There is no process for the handle "
-                    "to point at once the call returns."
-                ),
-                "traceback": "",
-            }})
-        else:
-            _emit({{"ok": True, "value": value}})
+        _emit({{"ok": True, "value": value}})
 """
 
 
-def build(fn: Any, args: tuple, kwargs: dict, *, keep_remote: bool = False) -> str:
+def build(fn: Any, args: tuple, kwargs: dict) -> str:
     """Return the script that runs one call and prints its outcome."""
     payload = base64.b64encode(dumps_call(fn, args, kwargs)).decode()
     return _TEMPLATE.format(
@@ -91,7 +91,6 @@ def build(fn: Any, args: tuple, kwargs: dict, *, keep_remote: bool = False) -> s
         begin=BEGIN,
         end=END,
         version=PROTOCOL_VERSION,
-        keep=bool(keep_remote),
     )
 
 

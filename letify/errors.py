@@ -75,15 +75,6 @@ class ProtocolError(LetifyError):
     """
 
 
-class HandleScopeError(LetifyError):
-    """A handle from one runtime was passed to a call on another runtime.
-
-    Handles are pointers into one process and one CUDA context, so they cannot
-    cross that boundary. Materialize the value or route the call to the runtime
-    that owns it.
-    """
-
-
 class InsufficientDevices(LetifyError):
     """The devices a call needs cannot be allocated, and nothing running would free them.
 

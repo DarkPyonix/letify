@@ -4,7 +4,7 @@ Two kinds of channel exist, and which one a provider offers decides what letify
 can do there.
 
 A ``PersistentChannel`` keeps one worker process alive behind a pipe. Requests are
-framed lines, so the object table, the blob table and anything written to disk all
+framed lines, so the worker process, the blob table and anything written to disk all
 survive between calls. That is what makes a handle resolvable, a large argument
 sendable once, and a materialized volume readable by a later call.
 
@@ -56,7 +56,6 @@ class Channel(abc.ABC):
         args: tuple,
         kwargs: dict,
         *,
-        keep_remote: bool = False,
         timeout: float | None = None,
     ) -> tuple[Any, str]:
         """Run one function call inside the runtime."""
@@ -65,7 +64,6 @@ class Channel(abc.ABC):
         payload = {
             "op": "call",
             "payload": base64.b64encode(protocol.dumps_call(fn, args, kwargs)).decode(),
-            "keep_remote": keep_remote,
         }
         return self.request(payload, timeout=timeout)
 
@@ -286,7 +284,7 @@ class OneShotChannel(Channel):
             return None, ""
         raise RuntimeFailure(
             f"{self.name}: this provider runs one-shot commands, so it cannot serve "
-            f"{op!r}. Persistent state, handles and blob reuse need a channel that "
+            f"{op!r}. Persistent state and blob reuse need a channel that "
             f"keeps a process alive."
         )
 
@@ -296,12 +294,11 @@ class OneShotChannel(Channel):
         args: tuple,
         kwargs: dict,
         *,
-        keep_remote: bool = False,
         timeout: float | None = None,
     ) -> tuple[Any, str]:
         from ..protocol import driver
 
-        source = driver.build(fn, args, kwargs, keep_remote=keep_remote)
+        source = driver.build(fn, args, kwargs)
         stdout = self.runner(source, timeout)
         logs, value = protocol.parse(stdout, runtime_key=self.name)
         return value, logs

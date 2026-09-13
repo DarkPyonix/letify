@@ -27,12 +27,12 @@ the base install and a provider whose package is missing reports itself unavaila
 
 from __future__ import annotations
 
+from .declare.cache import session_cache
 from .declare.env import Env
 from .declare.function import Function
 from .declare.instance import AnyInstance, Host, Instance
 from .errors import (
     ConfigError,
-    HandleScopeError,
     InsufficientDevices,
     LetifyError,
     ProtocolError,
@@ -45,7 +45,7 @@ from .errors import (
     UnsupportedMode,
 )
 from .launcher import Launcher, Providers
-from .protocol.handle import Blob, Handle, RemoteFile
+from .protocol.handle import Blob, RemoteFile
 from .store.volume import Volume
 
 #: Where a declaration's host code runs. Two named values rather than the enum class that holds
@@ -64,8 +64,6 @@ __all__ = [
     "ConfigError",
     "Env",
     "Function",
-    "Handle",
-    "HandleScopeError",
     "Instance",
     "InsufficientDevices",
     "Launcher",
@@ -84,4 +82,5 @@ __all__ = [
     "__version__",
     "local",
     "remote",
+    "session_cache",
 ]

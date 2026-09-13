@@ -51,7 +51,6 @@ class Function(Generic[R]):
         volumes: Sequence[Volume] = (),
         timeout: float | None = None,
         retries: int = 1,
-        keep_remote: bool = False,
     ):
         self.fn = fn
         self.launcher = launcher
@@ -60,7 +59,6 @@ class Function(Generic[R]):
         self.volumes = tuple(volumes)
         self.timeout = timeout
         self.retries = retries
-        self.keep_remote = keep_remote
         self.is_async = inspect.iscoroutinefunction(fn)
         self.device = self._place(device)
         update_wrapper(self, fn)
@@ -129,7 +127,6 @@ class Function(Generic[R]):
                     self.fn,
                     args,
                     kwargs,
-                    keep_remote=self.keep_remote,
                     timeout=self.timeout,
                 )
             except (RuntimeFailure, ProtocolError) as exc:
