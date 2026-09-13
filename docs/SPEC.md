@@ -366,6 +366,51 @@ machine_id = "00000000-0000-0000-0000-000000000000"
 access_token_env = "ELICE_ACCESS_TOKEN"
 ```
 
+### Logging in
+
+> One command writes the account to the home file and a reference to it in the project file, so a repository names the accounts it needs without holding any of them.
+
+`letify login <kind> [alias]` declares one account. It writes two entries in two files, because the two files answer different questions.
+
+`~/.letify` gets the account: the address, the user, the key path, the zone, whatever that kind of provider needs to connect. This file belongs to the machine and is never in a repository, so it is where a connection detail may live. It is created with owner-only permissions where the platform has them.
+
+The project's `.letify` gets a reference: the alias, its kind, and `from_home = true`. Nothing else, because everything else is either a secret or a detail of one person's machine. The reference is what makes the repository self describing: a teammate who clones it can run `letify login` for the aliases it names and nothing else has to be explained. A reference to an alias the home file does not declare is a configuration error naming the command that fixes it.
+
+An account that is already in the home file is not asked for again. `letify login lab` in a second repository writes only the reference, which is the common case: the account was set up once and every project since then just needs to name it.
+
+`letify logout <alias>` removes the account from the home file and any credential it put in the keyring. It leaves the project reference alone, because the repository still needs that account; what changed is only that this machine no longer has it.
+
+Credentials never enter either file. A token goes to the OS keyring and the file records `<name>_keyring`. An SSH password is never stored at all, which the next section explains.
+
+### SSH authentication
+
+> Key authentication, because the call path is non-interactive. A password is accepted once, to install the key, and then discarded.
+
+letify opens sessions with `ssh -o BatchMode=yes`. That is not a preference: a session is started by the pool, in the background, possibly long after the call that needed it, so there is nobody present to answer a password prompt. A transport that requires interaction cannot carry a pooled session.
+
+So `letify login shell` sets up key authentication and treats the password as a one-time input:
+
+1. If the configured key does not exist, an ed25519 key is generated at `~/.ssh/id_letify` with no passphrase, because a passphrase would put the prompt back.
+2. The public key is appended to the machine's `~/.ssh/authorized_keys`, over one interactive SSH connection that asks for the password in the terminal.
+3. The password is used by that one command and then dropped. It is not written to the file, the keyring or the environment.
+4. The connection is confirmed with `BatchMode=yes`, which proves the key works before the alias is declared rather than at the first call.
+
+Two other approaches were considered and are not the default. Connection multiplexing with `ControlMaster` authenticates once and reuses the socket, but Windows OpenSSH does not implement it and a dropped socket ends a long run. `sshpass` feeds a stored password to each connection, which needs the password kept somewhere and exposes it in the process arguments of every call. `sshpass` is available as `auth = "password"` for a machine whose administrator forbids key authentication, reading the password from the keyring, and it refuses on Windows, where the tool does not exist.
+
+### What each kind asks for
+
+> Where a vendor owns the credential, letify records the account and leaves the credential to the vendor.
+
+| Kind | Written to the home file | Credential |
+|---|---|---|
+| `shell`, `tunnel` | address, user, port, key path | an SSH key, installed by `login`; no password stored |
+| `elice` | endpoint, zone, machine | access token in the OS keyring, recorded as `access_token_keyring` |
+| `colab` | account email | the `colab` CLI owns it; `login` checks the CLI is present and says which command authenticates it |
+| `modal` | workspace | the `modal` CLI owns it, in `~/.modal.toml`; `login` checks it is present |
+| `local` | nothing | none; this machine needs no declaration |
+
+For `colab` and `modal`, letify does not touch the vendor's credential store. Wrapping another tool's login would mean owning a token letify has no way to refresh, and the vendor's own command already works.
+
 ## letify-core
 
 > The native component behind `host="local"`. A Rust workspace, built separately, needed only by whoever forwards CUDA calls.

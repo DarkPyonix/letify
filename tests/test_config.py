@@ -8,13 +8,19 @@ where the value lives rather than holding it.
 
 from __future__ import annotations
 
+import sys
 from pathlib import Path
 
 import pytest
 
 import letify
-from letify.config import CONFIG_NAME, load
+from letify.config import CONFIG_NAME, load, writer
 from letify.config.secrets import from_keyring, resolve_secret
+
+try:
+    import tomllib
+except ModuleNotFoundError:  # pragma: no cover - Python 3.10 and older
+    import tomli as tomllib
 
 
 @pytest.fixture
@@ -187,3 +193,123 @@ def test_a_provider_entry_resolves_its_own_credentials(launcher_from, monkeypatc
         '[lab]\nkind = "shell"\naddress = "h"\naccess_token_env = "LETIFY_TEST_TOKEN"\n'
     )
     assert let.config.providers["lab"].secret("access_token") == "secret-value"
+
+
+# -- Spec: Logging in ----------------------------------------------------------
+
+#: A file with comments, a defaults table and two accounts, which is what a user who has
+#: edited this by hand actually has.
+ORIGINAL_FILE = """# my machines
+[defaults]
+name = "nvfp4"
+
+[lab]
+kind = "shell"
+address = "old.example.edu"
+
+# the fast one
+[other]
+kind = "modal"
+"""
+
+
+def test_an_alias_block_is_replaced_without_disturbing_the_rest_of_the_file() -> None:
+    # Comments and unrelated accounts survive, because a user edits this file by hand.
+    text = ORIGINAL_FILE
+    updated = writer.write_block(text, "lab", {"kind": "shell", "address": "new.example.edu"})
+    assert "# my machines" in updated
+    assert "# the fast one" in updated
+    assert "[other]" in updated
+    assert 'name = "nvfp4"' in updated
+    assert "new.example.edu" in updated
+    assert "old.example.edu" not in updated
+    assert updated.count("[lab]") == 1
+
+
+def test_a_new_alias_block_is_appended_and_the_file_stays_parseable() -> None:
+    updated = writer.write_block("", "lab", {"kind": "shell", "port": 2222, "persistent": True})
+    parsed = tomllib.loads(updated)
+    assert parsed["lab"] == {"kind": "shell", "port": 2222, "persistent": True}
+
+
+def test_removing_an_alias_leaves_the_other_accounts_alone() -> None:
+    text = writer.write_block(
+        writer.write_block("", "a", {"kind": "modal"}), "b", {"kind": "local"}
+    )
+    updated = writer.remove_block(text, "a")
+    parsed = tomllib.loads(updated)
+    assert "a" not in parsed
+    assert parsed["b"] == {"kind": "local"}
+
+
+def test_a_value_is_written_in_the_toml_type_it_came_in_as() -> None:
+    # A port written as a string would be a different value to whoever reads it back.
+    updated = writer.write_block(
+        "", "x", {"kind": "shell", "port": 22, "persistent": False, "gpus": ["A100", "H100"]}
+    )
+    parsed = tomllib.loads(updated)
+    assert parsed["x"]["port"] == 22
+    assert parsed["x"]["persistent"] is False
+    assert parsed["x"]["gpus"] == ["A100", "H100"]
+
+
+def test_a_project_reference_to_an_account_this_machine_does_not_have_says_what_to_run(
+    tmp_path,
+) -> None:
+    # The point of the reference is that a teammate can tell what to set up.
+    project = tmp_path / ".letify"
+    project.write_text('[lab]\nkind = "shell"\nfrom_home = true\n', encoding="utf-8")
+    with pytest.raises(letify.ConfigError, match="letify login shell lab"):
+        load(project, home=False)
+
+
+def test_a_reference_is_satisfied_by_the_home_file(tmp_path, monkeypatch) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    (home / ".letify").write_text(
+        '[lab]\nkind = "shell"\naddress = "gpu.example.edu"\n', encoding="utf-8"
+    )
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: home))
+    project = tmp_path / ".letify"
+    project.write_text('[lab]\nkind = "shell"\nfrom_home = true\n', encoding="utf-8")
+    config = load(project)
+    assert config.providers["lab"].option("address") == "gpu.example.edu"
+    # The marker is not a connection detail and must not reach the provider.
+    assert config.providers["lab"].option("from_home") is None
+
+
+def test_an_option_with_no_value_is_left_out_of_the_block() -> None:
+    # Writing key = "" would declare an empty key path rather than no key path.
+    updated = writer.write_block("", "x", {"kind": "shell", "user": None, "port": 22})
+    assert "user" not in updated
+    assert tomllib.loads(updated)["x"] == {"kind": "shell", "port": 22}
+
+
+def test_removing_an_alias_that_is_not_there_changes_nothing() -> None:
+    text = writer.write_block("", "a", {"kind": "modal"})
+    assert writer.remove_block(text, "b") == text
+    assert writer.drop(Path("nonexistent-file"), "a") is False
+
+
+def test_a_dropped_alias_is_reported_as_dropped_only_when_it_was_there(tmp_path) -> None:
+    file = tmp_path / ".letify"
+    writer.update(file, "a", {"kind": "modal"})
+    assert writer.drop(file, "b") is False
+    assert writer.drop(file, "a") is True
+    assert "[a]" not in file.read_text(encoding="utf-8")
+
+
+def test_the_home_file_is_owner_only_where_the_platform_has_the_concept(tmp_path) -> None:
+    # Windows permissions are access control lists, and chmod there sets the read only
+    # flag, which is not what this means. So nothing is claimed on that platform.
+    file = tmp_path / ".letify"
+    writer.update(file, "a", {"kind": "modal"}, private=True)
+    assert file.is_file()
+    if not sys.platform.startswith("win"):
+        assert file.stat().st_mode & 0o777 == writer.HOME_FILE_MODE
+
+
+def test_a_quote_inside_a_value_does_not_end_the_string() -> None:
+    # A path or a comment field with a quote in it must still parse.
+    updated = writer.write_block("", "x", {"kind": "shell", "user": 'od"d'})
+    assert tomllib.loads(updated)["x"]["user"] == 'od"d'

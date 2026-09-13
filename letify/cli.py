@@ -12,6 +12,8 @@ import json
 import sys
 
 from . import __version__
+from .config import login
+from .errors import LetifyError
 from .launcher import Launcher
 
 
@@ -36,6 +38,48 @@ def build_parser() -> argparse.ArgumentParser:
     )
     utilization.add_argument("alias", nargs="?", help="one provider instead of all of them")
     utilization.add_argument("--json", action="store_true", help="print the records unformatted")
+
+    log_in = sub.add_parser("login", help="declare an account and reference it here")
+    log_in.add_argument("kind", help="provider kind: shell, tunnel, colab, modal, elice")
+    log_in.add_argument("alias", nargs="?", help="name to reach it by; defaults to the kind")
+    log_in.add_argument("--address", help="machine address, for shell and tunnel")
+    log_in.add_argument("--user", help="SSH user")
+    log_in.add_argument("--port", type=int, help="SSH port")
+    log_in.add_argument("--key", help="SSH private key path")
+    log_in.add_argument(
+        "--auth",
+        choices=login.AUTH_METHODS,
+        help="how to authenticate; key is the default and the only one that works unattended",
+    )
+    log_in.add_argument(
+        "--persistent",
+        action="store_true",
+        default=None,
+        help="the machine keeps its disk between sessions",
+    )
+    log_in.add_argument("--zone-id", dest="zone_id", help="Elice zone id")
+    log_in.add_argument("--machine-id", dest="machine_id", help="Elice machine id")
+    log_in.add_argument("--endpoint", help="API endpoint, where it is not the default")
+    log_in.add_argument("--account", help="account email, for Colab")
+    log_in.add_argument("--workspace", help="workspace name, for Modal")
+    log_in.add_argument(
+        "--token", help="credential to file in the OS keyring rather than in any file"
+    )
+    log_in.add_argument(
+        "--no-input",
+        dest="interactive",
+        action="store_false",
+        help="fail rather than prompt, for a script",
+    )
+    log_in.add_argument(
+        "--skip-key-install",
+        dest="install_key",
+        action="store_false",
+        help="the key is already on the machine, so only confirm it",
+    )
+
+    log_out = sub.add_parser("logout", help="remove an account from this machine")
+    log_out.add_argument("alias", help="provider alias to forget")
 
     check = sub.add_parser("check", help="check that a provider answers")
     check.add_argument("alias", help="provider alias from the configuration")
@@ -95,6 +139,53 @@ def main(argv: list[str] | None = None) -> int:
 
         share = compute(args.step_seconds, args.syncs, args.round_trip_ms)
         print(f"{share * 100:.1f}% of a direct run")
+        return 0
+
+    if args.command == "login":
+        alias = args.alias or args.kind
+        answers = login.Answers(
+            alias=alias,
+            kind=args.kind,
+            values={
+                "address": args.address,
+                "user": args.user,
+                "port": args.port,
+                "key": args.key,
+                "auth": args.auth,
+                "persistent": args.persistent,
+                "zone_id": args.zone_id,
+                "machine_id": args.machine_id,
+                "endpoint": args.endpoint,
+                "account": args.account,
+                "workspace": args.workspace,
+            },
+            token=args.token,
+            interactive=args.interactive,
+            install_key=args.install_key,
+        )
+        try:
+            fresh, home, project = login.log_in(answers, project=args.config)
+        except LetifyError as exc:
+            print(exc, file=sys.stderr)
+            return 1
+        if fresh:
+            print(f"{alias} declared in {home}")
+        else:
+            print(f"{alias} was already declared in {home}, so nothing was asked for")
+        print(f"{alias} referenced in {project}, which is safe to commit")
+        return 0
+
+    if args.command == "logout":
+        removed, forgotten = login.log_out(args.alias)
+        if not removed:
+            print(
+                f"{args.alias} is not declared in {login.home_path()}",
+                file=sys.stderr,
+            )
+            return 1
+        detail = " and its keyring entry" if forgotten else ""
+        print(f"{args.alias} removed from {login.home_path()}{detail}")
+        print("The project reference is left alone, because this repository still needs it")
         return 0
 
     let = Launcher(args.config, announce=False)

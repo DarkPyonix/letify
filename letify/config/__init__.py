@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Any
 
 from ..errors import ConfigError
+from . import login, writer
 from .schema import RESERVED_ALIASES, Config, ProviderConfig
 from .secrets import from_keyring, resolve_secret
 
@@ -24,6 +25,11 @@ except ModuleNotFoundError:  # Python 3.10 and older
     import tomli as tomllib  # type: ignore[no-redef]
 
 CONFIG_NAME = ".letify"
+
+#: A project entry carrying this and nothing else is a reference to an account in the home
+#: file, written by ``letify login``. It is not a connection detail and never reaches a
+#: provider.
+REFERENCE_FIELD = "from_home"
 
 
 def load(path: str | Path | None = None, *, home: bool = True) -> Config:
@@ -39,6 +45,11 @@ def load(path: str | Path | None = None, *, home: bool = True) -> Config:
     files.append(Path(path) if path else Path.cwd() / CONFIG_NAME)
 
     counter = 0
+    # Aliases the project file expects to find in the home file, so a reference to an
+    # account this machine does not have can name the command that fixes it.
+    referenced: dict[str, tuple[str, Path]] = {}
+    declared: set[str] = set()
+    home_file = files[0] if home else None
     for file in files:
         if not file.is_file():
             continue
@@ -56,7 +67,13 @@ def load(path: str | Path | None = None, *, home: bool = True) -> Config:
             kind = body.get("kind")
             if not isinstance(kind, str):
                 raise ConfigError(f"{file}: provider {alias!r} has no 'kind' field")
-            options = {key: value for key, value in body.items() if key != "kind"}
+            options = {
+                key: value for key, value in body.items() if key not in ("kind", REFERENCE_FIELD)
+            }
+            if body.get(REFERENCE_FIELD) is True:
+                referenced.setdefault(alias, (kind, file))
+            if file == home_file:
+                declared.add(alias)
             existing = config.providers.get(alias)
             if existing is None:
                 config.providers[alias] = ProviderConfig(alias, kind, options, counter)
@@ -65,6 +82,14 @@ def load(path: str | Path | None = None, *, home: bool = True) -> Config:
                 # The project file refines what the home file declared.
                 existing.kind = kind
                 existing.options.update(options)
+
+    for alias, (kind, file) in referenced.items():
+        if alias in declared:
+            continue
+        raise ConfigError(
+            f"{file}: {alias!r} refers to an account in ~/.letify that is not there. "
+            f"Run 'letify login {kind} {alias}' to declare it on this machine."
+        )
 
     # The local machine is always available and needs no declaration.
     if "local" not in config.providers:
@@ -95,10 +120,13 @@ def _check_alias(alias: str, file: Path) -> None:
 
 __all__ = [
     "CONFIG_NAME",
+    "REFERENCE_FIELD",
     "RESERVED_ALIASES",
     "Config",
     "ProviderConfig",
     "from_keyring",
     "load",
+    "login",
     "resolve_secret",
+    "writer",
 ]

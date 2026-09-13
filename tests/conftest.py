@@ -193,15 +193,30 @@ def no_module(monkeypatch):
 
 
 class FakeKeyring:
-    """The one function letify asks the keyring package for."""
+    """The keyring functions letify asks the package for, reading and writing."""
 
     def __init__(self, entries: dict[tuple[str, str], str]):
         self.entries = entries
         self.asked: list[tuple[str, str]] = []
 
+    @property
+    def stored(self) -> dict[tuple[str, str], str]:
+        """What the store holds, for a test that wrote into it."""
+        return self.entries
+
     def get_password(self, service: str, user: str) -> str | None:
         self.asked.append((service, user))
         return self.entries.get((service, user))
+
+    def set_password(self, service: str, user: str, password: str) -> None:
+        self.entries[(service, user)] = password
+
+    def delete_password(self, service: str, user: str) -> None:
+        # The real package raises rather than returning quietly, and a caller that deletes
+        # an entry it did not put there should find that out.
+        if (service, user) not in self.entries:
+            raise KeyError(f"{service}/{user}")
+        del self.entries[(service, user)]
 
 
 @pytest.fixture
@@ -214,6 +229,14 @@ def fake_keyring(monkeypatch):
         return fake
 
     return install
+
+
+@pytest.fixture
+def keyring_store(monkeypatch):
+    """An empty keyring, installed, for a test that writes a credential into one."""
+    fake = FakeKeyring({})
+    monkeypatch.setitem(sys.modules, "keyring", fake)
+    return fake
 
 
 # -- the lease renewal loop ----------------------------------------------------

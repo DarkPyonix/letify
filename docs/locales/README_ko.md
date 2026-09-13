@@ -340,6 +340,8 @@ def test_train_returns_a_loss():
 ## 🛠️ CLI
 
 ```bash
+letify login shell lab # 계정을 등록하고, 이 저장소에서 참조
+letify logout lab     # 이 머신에서 계정 제거
 letify providers      # 선언된 프로바이더, 저장소 수명, 기본 배치
 letify devices           # 각자 제공하는 GPU
 letify status         # 지금 돌고 있는 것

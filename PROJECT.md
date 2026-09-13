@@ -223,6 +223,8 @@ space.with_fixed(epochs=3)
 ### Command line
 
 ```bash
+letify login <kind> [alias]   # declare an account at home, reference it here
+letify logout <alias>         # remove the account from this machine
 letify providers              # declared providers, storage, channel kind
 letify devices                # accelerators each provider offers
 letify status                 # live sessions and what they are costing
@@ -236,6 +238,10 @@ letify efficiency 0.5 3 150   # expected share of a direct run
 ## Configuration
 
 `~/.letify` holds accounts, the project's `.letify` holds defaults, and neither holds a secret.
+
+`letify login <kind> [alias]` writes both. The account goes to `~/.letify`, which belongs to the machine. The project file gets a reference to it, `kind` plus `from_home = true` and nothing else, which is safe to commit and tells a teammate which accounts the repository needs. An account already declared is not asked for again, so `letify login` in a second repository writes only the reference. A reference to an account this machine does not have is a configuration error naming the command that fixes it.
+
+SSH authenticates by key, because letify opens sessions with `ssh -o BatchMode=yes`: a session is started by the pool in the background, with nobody present to answer a password prompt. So `letify login shell` generates an ed25519 key if there is none, asks for the password once to install it, drops the password, and confirms the key works before declaring the alias. Nothing about the password is written to a file, the keyring or the environment. A machine whose administrator forbids key authentication can use `--auth password`, which keeps the password in the OS keyring and drives `sshpass`; it is refused on Windows, where that tool does not exist.
 
 ```toml
 [defaults]

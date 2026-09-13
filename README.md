@@ -360,6 +360,8 @@ def test_train_returns_a_loss():
 ## 🛠️ CLI
 
 ```bash
+letify login shell lab        # declare an account, and reference it here
+letify logout lab             # take the account off this machine
 letify providers              # who is declared, storage, channel kind
 letify devices                # what each one offers
 letify status                 # what is running right now
