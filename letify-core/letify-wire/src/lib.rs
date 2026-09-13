@@ -13,7 +13,7 @@
 //! going through a serialization crate, because this sits on the hot path and the shapes
 //! are small and fixed.
 
-use std::io::{self, Read, Write};
+use std::io::{self, IoSlice, Read, Write};
 
 /// Bumped when a request or reply layout changes in a breaking way.
 pub const PROTOCOL_VERSION: u32 = 2;
@@ -406,13 +406,36 @@ pub fn write_frame<W: Write>(writer: &mut W, body: &[u8]) -> io::Result<()> {
 }
 
 /// Read one length-prefixed frame.
+///
+/// The body grows as bytes arrive rather than being allocated from the header, so a
+/// corrupt length is a short read instead of an allocation failure.
 pub fn read_frame<R: Read>(reader: &mut R) -> io::Result<Vec<u8>> {
     let mut header = [0u8; FRAME_HEADER_BYTES];
     reader.read_exact(&mut header)?;
-    let mut body = vec![0u8; decode_frame_header(header) as usize];
-    reader.read_exact(&mut body)?;
+    let mut body = Vec::new();
+    read_body(reader, decode_frame_header(header), &mut body)?;
     Ok(body)
 }
+
+/// Append exactly `length` bytes from `reader` to `body`.
+fn read_body<R: Read>(reader: &mut R, length: u64, body: &mut Vec<u8>) -> io::Result<()> {
+    let before = body.len();
+    reader.by_ref().take(length).read_to_end(body)?;
+    if (body.len() - before) as u64 != length {
+        return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "frame is short"));
+    }
+    Ok(())
+}
+
+/// Tag byte of a `CopyToDevice` request.
+const TAG_COPY_TO_DEVICE: u8 = 6;
+
+/// Bytes of a `CopyToDevice` body before its payload: tag, handle, offset, length.
+const COPY_TO_DEVICE_FIXED_BYTES: usize = 1 + 8 + 8 + 8;
+
+/// How much the staging buffer grows by at a time, so a corrupt length cannot make the
+/// agent allocate more than it has actually received plus one step.
+const STAGING_STEP: usize = 64 * 1024 * 1024;
 
 /// What [`read_incoming`] took off the wire.
 #[derive(Debug, Clone, PartialEq)]
@@ -426,28 +449,90 @@ pub enum Incoming {
 
 /// Write a `CopyToDevice` frame for the caller's bytes.
 ///
-/// Produces the same bytes as `write_frame(encode_request(CopyToDevice { .. }))`.
+/// Produces the same bytes as `write_frame(encode_request(CopyToDevice { .. }))`, but
+/// the payload is handed to `write_vectored` as the caller's own slice. Behind a
+/// `BufWriter`, a payload larger than its buffer goes to the socket without being
+/// copied into it.
 pub fn write_copy_to_device<W: Write>(
     writer: &mut W,
     handle: u64,
     offset: u64,
     payload: &[u8],
 ) -> io::Result<()> {
-    let request = Request::CopyToDevice { handle, offset, payload: payload.to_vec() };
-    write_frame(writer, &encode_request(&request))
+    let length = payload.len() as u64;
+    let mut head = [0u8; FRAME_HEADER_BYTES + COPY_TO_DEVICE_FIXED_BYTES];
+    head[..8].copy_from_slice(&encode_frame_header(COPY_TO_DEVICE_FIXED_BYTES as u64 + length));
+    head[8] = TAG_COPY_TO_DEVICE;
+    head[9..17].copy_from_slice(&handle.to_le_bytes());
+    head[17..25].copy_from_slice(&offset.to_le_bytes());
+    head[25..33].copy_from_slice(&length.to_le_bytes());
+    write_all_vectored(writer, &mut [IoSlice::new(&head), IoSlice::new(payload)])
+}
+
+fn write_all_vectored<W: Write>(writer: &mut W, mut slices: &mut [IoSlice<'_>]) -> io::Result<()> {
+    IoSlice::advance_slices(&mut slices, 0);
+    while !slices.is_empty() {
+        match writer.write_vectored(slices) {
+            Ok(0) => {
+                return Err(io::Error::new(io::ErrorKind::WriteZero, "the frame was not written"));
+            }
+            Ok(written) => IoSlice::advance_slices(&mut slices, written),
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
 }
 
 /// Read one request, putting the payload of a copy to the device into `staging`.
+///
+/// The tag is read before the body, so a copy's payload is read with `read_exact`
+/// straight into `staging`, which the caller keeps across calls. `staging` only grows,
+/// so steady state copies neither allocate nor zero. Any other request is decoded
+/// whole. A body that does not decode is reported as `InvalidData` with the frame
+/// fully consumed, so the caller may answer and carry on. A copy whose length fields
+/// disagree is `InvalidInput`, after which the stream cannot be trusted.
 pub fn read_incoming<R: Read>(reader: &mut R, staging: &mut Vec<u8>) -> io::Result<Incoming> {
-    let frame = read_frame(reader)?;
-    match decode_request(&frame)? {
-        Request::CopyToDevice { handle, offset, payload } => {
-            staging.clear();
-            staging.extend_from_slice(&payload);
-            Ok(Incoming::CopyToDevice { handle, offset, bytes: payload.len() })
-        }
-        other => Ok(Incoming::Request(other)),
+    let mut header = [0u8; FRAME_HEADER_BYTES];
+    reader.read_exact(&mut header)?;
+    let length = decode_frame_header(header);
+    if length == 0 {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "empty frame"));
     }
+    let mut tag = [0u8; 1];
+    reader.read_exact(&mut tag)?;
+
+    if tag[0] == TAG_COPY_TO_DEVICE && length >= COPY_TO_DEVICE_FIXED_BYTES as u64 {
+        let mut fixed = [0u8; COPY_TO_DEVICE_FIXED_BYTES - 1];
+        reader.read_exact(&mut fixed)?;
+        let handle = u64::from_le_bytes(fixed[0..8].try_into().unwrap());
+        let offset = u64::from_le_bytes(fixed[8..16].try_into().unwrap());
+        let declared = u64::from_le_bytes(fixed[16..24].try_into().unwrap());
+        if declared != length - COPY_TO_DEVICE_FIXED_BYTES as u64 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "a copy to the device declares a payload that disagrees with its frame",
+            ));
+        }
+        let bytes = usize::try_from(declared)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "payload is too large"))?;
+        let mut filled = 0;
+        while filled < bytes {
+            let end = bytes.min(filled + STAGING_STEP);
+            if staging.len() < end {
+                staging.resize(end, 0);
+            }
+            reader.read_exact(&mut staging[filled..end])?;
+            filled = end;
+        }
+        return Ok(Incoming::CopyToDevice { handle, offset, bytes });
+    }
+
+    let mut frame = vec![tag[0]];
+    read_body(reader, length - 1, &mut frame)?;
+    decode_request(&frame)
+        .map(Incoming::Request)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))
 }
 
 /// Content address of a payload, used so the same module travels once.

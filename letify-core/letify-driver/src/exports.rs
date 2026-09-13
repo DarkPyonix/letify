@@ -183,13 +183,14 @@ pub extern "C" fn cuMemcpyHtoD_v2(
     if source.is_null() && bytes > 0 {
         return CUDA_ERROR_INVALID_VALUE;
     }
-    let payload = unsafe { std::slice::from_raw_parts(source as *const u8, bytes) }.to_vec();
+    // Borrowed, not copied: the bytes go from here to the socket.
+    let payload: &[u8] = if bytes == 0 {
+        &[]
+    } else {
+        unsafe { std::slice::from_raw_parts(source as *const u8, bytes) }
+    };
     with_client!(|connection| {
-        match connection.send(Request::CopyToDevice {
-            handle,
-            offset: offset_of(destination),
-            payload,
-        }) {
+        match connection.send_copy_to_device(handle, offset_of(destination), payload) {
             Ok(()) => CUDA_SUCCESS,
             Err(_) => CUDA_ERROR_UNKNOWN,
         }

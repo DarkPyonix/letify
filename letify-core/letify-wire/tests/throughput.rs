@@ -13,7 +13,10 @@ use std::net::{TcpListener, TcpStream};
 use std::thread;
 use std::time::Instant;
 
-use letify_wire::{Request, decode_request, encode_request, read_frame, write_frame};
+use letify_wire::{
+    Incoming, Request, decode_request, encode_request, read_frame, read_incoming,
+    write_copy_to_device, write_frame,
+};
 
 const PAYLOAD_BYTES: usize = 256 * 1024 * 1024;
 const RUNS: usize = 5;
@@ -67,4 +70,20 @@ fn a_256_mib_copy_to_the_device_through_an_encoded_frame() {
         },
     );
     println!("encoded frame: {rate:.0} MiB/s for a 256 MiB copy to the device");
+}
+
+#[test]
+#[ignore]
+fn a_256_mib_copy_to_the_device_streamed_into_staging() {
+    let rate = measure(
+        |writer, payload| write_copy_to_device(writer, 1, 0, payload).unwrap(),
+        |reader| {
+            let mut staging = Vec::new();
+            match read_incoming(reader, &mut staging).unwrap() {
+                Incoming::CopyToDevice { bytes, .. } => bytes,
+                other => panic!("unexpected {other:?}"),
+            }
+        },
+    );
+    println!("streamed: {rate:.0} MiB/s for a 256 MiB copy to the device");
 }

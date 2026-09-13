@@ -16,7 +16,9 @@ use std::net::TcpStream;
 use std::sync::Mutex;
 use std::time::Duration;
 
-use letify_wire::{Reply, Request, decode_reply, encode_request, read_frame, write_frame};
+use letify_wire::{
+    Reply, Request, decode_reply, encode_request, read_frame, write_copy_to_device, write_frame,
+};
 
 /// How many queued requests to hold before flushing anyway, so a long stretch of
 /// asynchronous work does not grow without bound.
@@ -74,9 +76,17 @@ impl Client {
         Ok(())
     }
 
-    /// Queue a copy to the device, taking the caller's bytes without owning them.
+    /// Queue a copy to the device, writing the caller's bytes without copying them.
+    ///
+    /// Counted and flushed exactly like [`Client::send`].
     pub fn send_copy_to_device(&mut self, handle: u64, offset: u64, payload: &[u8]) -> io::Result<()> {
-        self.send(Request::CopyToDevice { handle, offset, payload: payload.to_vec() })
+        write_copy_to_device(&mut self.writer, handle, offset, payload)?;
+        self.sent += 1;
+        self.queued += 1;
+        if self.queued >= QUEUE_LIMIT {
+            self.flush()?;
+        }
+        Ok(())
     }
 
     /// Push everything queued to the agent without waiting for a reply.
