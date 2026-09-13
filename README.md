@@ -232,7 +232,9 @@ Two words, and neither of them is a mechanism.
 
 **`device`** carries the provider, the account and the accelerator in one value, because those are one decision. Core count and memory come with the shape the provider registered, so there is nothing to ask for.
 
-**`host`** is the CUDA word for the CPU side. `"local"`, the default, keeps Python and the libraries in this process and forwards only CUDA calls. `"remote"` ships the function to the machine that holds the device.
+**`host`** is the CUDA word for the CPU side. `letify.local` keeps Python and the libraries in this process and forwards only CUDA calls. `letify.remote` ships the function to the machine that holds the device. The strings `"local"` and `"remote"` are the same values.
+
+Leave `host` out and you get `letify.local`. When the device is far away, forwarding every CUDA call is slow, so the call warns with the expected efficiency and then runs. For a remote GPU, `host=letify.remote` is usually what you want.
 
 How long a session lives is not a declaration argument. A call ends its session, counting a search space as one call. `with let.keep_alive():` keeps sessions for the length of a block, so a run of separate calls does not pay session start each time.
 
@@ -258,7 +260,7 @@ Measure your own `k` with `torch.cuda.set_sync_debug_mode("warn")` and your roun
 
 </details>
 
-> ⚠️ letify **never** silently changes the mode. Ask for something a provider cannot serve and you get an exception naming the reason. Ask for something slow and you get a warning with the numbers, and then it runs, because the choice is yours.
+> ⚠️ letify **never** silently changes the mode. `host` runs exactly as declared. Ask for something a provider cannot serve and you get an exception naming the reason. Ask for something slow and you get a warning with the numbers, and then it runs, because the choice is yours. The one thing letify does choose on its own is the network path to the machine, and it picks the fastest path that works.
 
 ---
 
