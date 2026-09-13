@@ -595,7 +595,7 @@ def test_bringing_a_path_up_needs_an_auth_key_that_is_not_in_a_tracked_file(
 ) -> None:
     patch_which(tunnel_module, present=True)
     patch_run(tunnel_module, result=FakeCompleted(stdout='{"BackendState": "NeedsLogin"}'))
-    with pytest.raises(letify.ProviderUnavailable, match="auth_key_env or auth_key_keyring"):
+    with pytest.raises(letify.ProviderUnavailable, match="accounts/lab/auth_key, or set auth_key_env"):
         provider_of(Tunnel, "lab").connect()
 
 

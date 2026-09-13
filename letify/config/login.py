@@ -7,7 +7,8 @@ detail of one person's machine. Naming the alias is what makes the account avail
 project, and it is what makes a repository self describing: a teammate who clones it can see
 which accounts it needs and run this command for them.
 
-No credential is written to either file. A token goes to the OS keyring. An SSH password is
+No credential is written to either config.toml. A token goes to a file in
+``~/.letify/accounts/<alias>/``, readable by its owner only. An SSH password is
 not stored at all: letify opens sessions with ``BatchMode=yes``, because a session is
 started by the pool in the background with nobody present to answer a prompt, so the
 password is accepted once, used to install a key, and dropped.
@@ -24,13 +25,13 @@ from pathlib import Path
 from typing import Any
 
 from ..errors import ConfigError
-from . import writer
+from . import secrets, writer
 from .schema import RESERVED_ALIASES
+from .secrets import CONFIG_DIRECTORY
 
-CONFIG_NAME = ".letify"
+#: The configuration file inside each ``.letify`` directory.
+CONFIG_FILE = "config.toml"
 
-#: Keyring service every letify credential is filed under, with the alias as the user.
-KEYRING_SERVICE = "letify"
 
 #: Where a key generated for letify goes. Its own name, so it is never confused with a key
 #: the user made for something else and never regenerated over one.
@@ -141,7 +142,7 @@ def install_key(*, address: str, user: str | None, port: int, key_path: str) -> 
     """Append the public key to the machine's authorized_keys, over one connection.
 
     The password is typed here and used by this one command. It is not written to a file,
-    the keyring or the environment, and it is not passed on the command line, where it
+    the account directory or the environment, and it is not passed on the command line, where it
     would be visible to anything that can list processes.
     """
     public = expand(key_path).with_suffix(".pub")
@@ -240,8 +241,7 @@ def shell_account(answers: Answers) -> dict[str, Any]:
         )
         if not password:
             raise LoginError(f"{answers.alias} needs a password to store for sshpass.")
-        store_secret(answers.alias, password)
-        options["password_keyring"] = f"{KEYRING_SERVICE}/{answers.alias}"
+        store_secret(answers.alias, "password", password)
         return options
 
     options["key"] = key_path
@@ -253,7 +253,7 @@ def shell_account(answers: Answers) -> dict[str, Any]:
 
 
 def elice_account(answers: Answers) -> dict[str, Any]:
-    """Record the zone and machine, and file the access token in the keyring."""
+    """Record the zone and machine, and keep the access token in the account directory."""
     zone = ask(answers, "zone_id", "Elice zone id: ")
     machine = ask(answers, "machine_id", "Elice machine id: ")
     token = answers.token or (
@@ -261,12 +261,11 @@ def elice_account(answers: Answers) -> dict[str, Any]:
     )
     if not token:
         raise LoginError(f"{answers.alias} needs an access token. Pass --token or drop --no-input.")
-    store_secret(answers.alias, token)
+    store_secret(answers.alias, "access_token", token)
     options: dict[str, Any] = {
         "kind": answers.kind,
         "zone_id": zone,
         "machine_id": machine,
-        "access_token_keyring": f"{KEYRING_SERVICE}/{answers.alias}",
     }
     endpoint = answers.get("endpoint")
     if isinstance(endpoint, str) and endpoint:
@@ -311,46 +310,31 @@ FLOWS = {
 }
 
 
-# -- the keyring ---------------------------------------------------------------
+# -- credentials ---------------------------------------------------------------
 
 
-def store_secret(alias: str, secret: str) -> None:
-    """Put a credential in the OS keyring, so no file ever holds it."""
-    try:
-        import keyring
-    except ImportError as exc:
-        raise LoginError(
-            "storing a credential needs the keyring package. Install the letify[keyring] "
-            "extra, or set the credential in an environment variable and name it with a "
-            "'_env' field instead."
-        ) from exc
-    keyring.set_password(KEYRING_SERVICE, alias, secret)
+def store_secret(alias: str, name: str, secret: str) -> None:
+    """Keep a credential in ``~/.letify/accounts/<alias>/<name>``, readable by its owner only."""
+    secrets.write_secret(alias, name, secret)
 
 
 def forget_secret(alias: str) -> bool:
-    """Remove a credential from the keyring. Returns whether one was there."""
-    try:
-        import keyring
-    except ImportError:
-        return False
-    try:
-        keyring.delete_password(KEYRING_SERVICE, alias)
-    except Exception:
-        # The package raises its own error type for an entry that is not there, and there
-        # is nothing to do about it either way: the credential is gone.
-        return False
-    return True
+    """Delete everything this machine holds for an account. Returns whether anything was there."""
+    return secrets.forget_account(alias)
 
 
 # -- what the command line calls ----------------------------------------------
 
 
 def home_path() -> Path:
-    return Path.home() / CONFIG_NAME
+    return Path.home() / CONFIG_DIRECTORY / CONFIG_FILE
 
 
 def project_path(path: str | Path | None = None) -> Path:
-    return Path(path) if path else Path.cwd() / CONFIG_NAME
+    if path is None:
+        return Path.cwd() / CONFIG_DIRECTORY / CONFIG_FILE
+    given = Path(path)
+    return given / CONFIG_FILE if given.is_dir() else given
 
 
 def check_alias(alias: str) -> None:
@@ -409,9 +393,7 @@ def log_out(alias: str) -> tuple[bool, bool]:
 
 __all__ = [
     "AUTH_METHODS",
-    "CONFIG_NAME",
     "DEFAULT_KEY",
-    "KEYRING_SERVICE",
     "VENDOR_COMMANDS",
     "Answers",
     "LoginError",

@@ -86,9 +86,9 @@ class Tunnel(Shell):
         if not auth_key:
             raise ProviderUnavailable(
                 self.kind,
-                f"{self.alias} needs a Tailscale auth key. Set auth_key_env or "
-                f"auth_key_keyring in the configuration and keep the key itself out "
-                f"of tracked files",
+                f"{self.alias} needs a Tailscale auth key. Put it in "
+                f"~/.letify/accounts/{self.alias}/auth_key, or set auth_key_env, and keep "
+                f"the key itself out of every config file",
             )
         command = [binary, "up", f"--auth-key={auth_key}"]
         login_server = self.config.option("login_server")

@@ -32,7 +32,7 @@ class ProviderConfig:
 
     def secret(self, name: str, default: str | None = None) -> str | None:
         """Resolve a credential without it ever living in a tracked file."""
-        return resolve_secret(self.options, name, default)
+        return resolve_secret(self.options, name, default, alias=self.alias)
 
 
 @dataclass(slots=True)

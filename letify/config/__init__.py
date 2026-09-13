@@ -1,12 +1,12 @@
-"""Reading ``.letify``.
+"""Reading the ``.letify`` configuration directories.
 
-Two files are merged. ``~/.letify`` holds accounts and connection details, which
-belong to the machine, and the project's ``.letify`` holds defaults that are safe to
-commit. The project file refines what the home file declared, so a repository can be
-cloned by someone else and run under their own accounts.
+letify keeps its state in two directories. ``~/.letify/`` belongs to the machine: its
+``config.toml`` lists every account, and ``accounts/<alias>/`` holds each account's
+credentials. ``<project>/.letify/config.toml`` belongs to the repository and names which of
+those accounts the project uses.
 
-Credentials are never read from the file itself. A field names an environment
-variable or a keyring entry, and the value is resolved when it is used.
+Credentials are never read from either ``config.toml``. A field names an environment variable,
+or the credential lives in the account directory, and the value is resolved when it is used.
 """
 
 from __future__ import annotations
@@ -18,9 +18,10 @@ from typing import Any
 from ..errors import ConfigError
 from . import inventory, login, writer
 from .schema import RESERVED_ALIASES, Config, ProviderConfig
-from .secrets import from_keyring, resolve_secret
+from .secrets import CONFIG_DIRECTORY, account_directory, resolve_secret
 
-CONFIG_NAME = ".letify"
+#: The configuration file inside each ``.letify`` directory.
+CONFIG_FILE = "config.toml"
 
 #: A home entry with this set to true is available in every project, including one with no
 #: ``.letify``. Read from the home file only, because a repository must not decide what every
@@ -39,12 +40,13 @@ def load(path: str | Path | None = None, *, home: bool = True) -> Config:
     ``global = true``, or when it is ``local``. A named alias takes every home setting,
     ``kind`` included, and the project's own fields override them one by one.
 
-    ``path`` overrides the project file. Set ``home`` to false to ignore ``~/.letify``,
+    ``path`` names another project ``.letify`` directory, or a ``config.toml`` directly.
+    Set ``home`` to false to ignore ``~/.letify``,
     which is what tests do to stay isolated from the developer's own accounts.
     """
     config = Config()
-    home_path = Path.home() / CONFIG_NAME
-    project_path = Path(path) if path else Path.cwd() / CONFIG_NAME
+    home_path = Path.home() / CONFIG_DIRECTORY / CONFIG_FILE
+    project_path = _project_file(path)
 
     home_entries = _read_entries(home_path, config, require_kind=True) if home else {}
     project_entries = _read_entries(project_path, config, require_kind=False)
@@ -61,7 +63,8 @@ def load(path: str | Path | None = None, *, home: bool = True) -> Config:
         kind = body.get("kind", base.get("kind"))
         if not isinstance(kind, str):
             raise ConfigError(
-                f"{project_path}: {alias!r} names an account that ~/.letify does not have. "
+                f"{project_path}: {alias!r} names an account that ~/.letify/config.toml does not "
+                f"have. "
                 f"Run 'letify login <kind> {alias}' to declare it on this machine, or give "
                 f"the table a 'kind' to declare it here."
             )
@@ -75,6 +78,14 @@ def load(path: str | Path | None = None, *, home: bool = True) -> Config:
     if "local" not in config.providers:
         add("local", "local", {})
     return config
+
+
+def _project_file(path: str | Path | None) -> Path:
+    """The project's ``config.toml``, from a ``.letify`` directory, a file, or the default."""
+    if path is None:
+        return Path.cwd() / CONFIG_DIRECTORY / CONFIG_FILE
+    given = Path(path)
+    return given / CONFIG_FILE if given.is_dir() else given
 
 
 def _read_entries(file: Path, config: Config, *, require_kind: bool) -> dict[str, dict[str, Any]]:
@@ -130,12 +141,13 @@ def _check_alias(alias: str, file: Path) -> None:
 
 
 __all__ = [
-    "CONFIG_NAME",
+    "CONFIG_DIRECTORY",
+    "CONFIG_FILE",
     "GLOBAL_FIELD",
     "RESERVED_ALIASES",
     "Config",
     "ProviderConfig",
-    "from_keyring",
+    "account_directory",
     "inventory",
     "load",
     "login",

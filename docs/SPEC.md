@@ -403,7 +403,15 @@ Colab is reached through the Colab CLI: `colab new` and `colab stop` for the ses
 
 > Accounts live in the home file, project defaults live in the repository file, secrets live in neither.
 
-`~/.letify` holds accounts and connection details, which belong to the machine. The project's `.letify` holds defaults that are safe to commit, and names which of those accounts the project uses.
+letify keeps its state in two `.letify` directories. `~/.letify/` belongs to the machine and is never in a repository. `<project>/.letify/` belongs to the repository and is committed.
+
+| Path | Holds |
+|---|---|
+| `~/.letify/config.toml` | Every account this machine has: kind and connection details, never a secret |
+| `~/.letify/accounts/<alias>/` | That account's credentials and provider state, one directory per alias, owner only |
+| `<project>/.letify/config.toml` | Project defaults, and the aliases of the accounts the project uses |
+
+The project directory is `.letify/` in the working directory. `Launcher(config=...)` and `--config` name another `.letify` directory, or a `config.toml` directly.
 
 ### The two files <!-- id: two-files -->
 
@@ -423,7 +431,9 @@ When the project file names an account, its fields override the home entry's fie
 
 An alias must be a Python identifier, because providers are reached by attribute access. `any`, `devices` and `active` are reserved. Declaration order sets the priority for `let.providers.any`.
 
-A credential field is never a literal in a tracked file. `<name>_env` names an environment variable and `<name>_keyring` names a keyring entry as `service/user`, tried in that order, with a literal accepted last.
+A credential never appears in either `config.toml`. A field such as `access_token` is resolved in this order: the environment variable named by `access_token_env`, then the file `access_token` in `~/.letify/accounts/<alias>/`, then a literal value, which is accepted only so a home entry can carry a non secret default. A credential file is created with owner only permissions where the platform has them. Provider tools that keep their own login, the Colab CLI and the Modal SDK, keep it in the same account directory rather than in their usual location, which is what lets two accounts of one provider exist on one machine.
+
+The OS keyring is not used. Reading it needs a package in the user's environment, and the provider tools that matter already store their tokens as files, so one mechanism covers every provider.
 
 ```toml
 [colab_a]
@@ -461,7 +471,7 @@ The older `gpus = ["A100", "H100"]` list still works and means one of each, with
 
 > Loading the configuration writes a type stub that names this project's accounts and their accelerators, so an editor completes `let.providers.colab_pro.G4` and flags a misspelled alias.
 
-Aliases live in `.letify`, not in code, so a type checker cannot know them. `Launcher()` therefore writes `letify_providers.pyi` describing the accounts this project can use under the two file rule above. `Launcher.providers` is typed as `letify_providers.ProvidersView`, and letify ships a `letify_providers` module whose `ProvidersView` is the plain `Providers`, so a project with no generated file keeps exactly today's types.
+Aliases live in `.letify/config.toml`, not in code, so a type checker cannot know them. `Launcher()` therefore writes `letify_providers.pyi` describing the accounts this project can use under the two file rule above. `Launcher.providers` is typed as `letify_providers.ProvidersView`, and letify ships a `letify_providers` module whose `ProvidersView` is the plain `Providers`, so a project with no generated file keeps exactly today's types.
 
 Each alias becomes a class named after it in CamelCase, `colab_pro` as `ColabPro` and `lab_a100` as `LabA100`, subclassing the provider class of its kind. A name that is a Python keyword gets `Provider` appended, and a name two aliases would share gets a number appended in declaration order. The class declares one `Instance` attribute per accelerator the account offers, and `ProvidersView` declares one attribute per alias. Where the accelerators are known, the class declares no fallback attribute lookup, so a misspelled accelerator is a type error; where they are not, attribute access stays typed as `Instance`.
 
@@ -469,7 +479,7 @@ Accelerators are taken from what can be known without a network call: the entry'
 
 The file goes in a `typings` directory at the project root, which is Pyright's and Pylance's default stub path. The project root is the nearest directory upward from the working directory that holds a `pyproject.toml`, or the working directory when there is none. `[tool.letify] typings = "<path>"` in that `pyproject.toml` moves it, relative to the root, and the type checker's stub path has to point at the same place. `typings = false` turns generation off, and so does the environment variable `LETIFY_STUBS=0`.
 
-The file is rewritten only when its content would change, so loading the configuration does not touch it on every run. `letify stubs` writes it on demand. It reflects one machine's `~/.letify`, so it belongs in the project's `.gitignore`.
+The file is rewritten only when its content would change, so loading the configuration does not touch it on every run. `letify stubs` writes it on demand. It reflects one machine's `~/.letify/`, so it belongs in the project's `.gitignore`.
 
 ### Logging in
 
@@ -477,15 +487,15 @@ The file is rewritten only when its content would change, so loading the configu
 
 `letify login <kind> [alias]` declares one account. It writes two entries in two files, because the two files answer different questions.
 
-`~/.letify` gets the account: the address, the user, the key path, the zone, whatever that kind of provider needs to connect. This file belongs to the machine and is never in a repository, so it is where a connection detail may live. It is created with owner-only permissions where the platform has them.
+`~/.letify/config.toml` gets the account: the address, the user, the key path, the zone, whatever that kind of provider needs to connect. It belongs to the machine and is never in a repository, so it is where a connection detail may live. A credential the login collects goes to `~/.letify/accounts/<alias>/`, created with owner only permissions where the platform has them.
 
-The project's `.letify` gets the alias as an empty table, `[colab_pro]`. Nothing else, because everything else is either a secret or a detail of one person's machine, and naming the alias is what makes the account available in the project. That table is what makes the repository self describing: a teammate who clones it can run `letify login` for the aliases it names and nothing else has to be explained. A named alias the home file does not declare is a configuration error naming the command that fixes it.
+The project's `.letify/config.toml` gets the alias as an empty table, `[colab_pro]`. Nothing else, because everything else is either a secret or a detail of one person's machine, and naming the alias is what makes the account available in the project. That table is what makes the repository self describing: a teammate who clones it can run `letify login` for the aliases it names and nothing else has to be explained. A named alias the home file does not declare is a configuration error naming the command that fixes it.
 
 An account that is already in the home file is not asked for again. `letify login lab` in a second repository writes only the reference, which is the common case: the account was set up once and every project since then just needs to name it.
 
-`letify logout <alias>` removes the account from the home file and any credential it put in the keyring. It leaves the project reference alone, because the repository still needs that account; what changed is only that this machine no longer has it.
+`letify logout <alias>` removes the account from `~/.letify/config.toml` and deletes `~/.letify/accounts/<alias>/` with everything in it. It leaves the project reference alone, because the repository still needs that account; what changed is only that this machine no longer has it.
 
-Credentials never enter either file. A token goes to the OS keyring and the file records `<name>_keyring`. An SSH password is never stored at all, which the next section explains.
+Credentials never enter either `config.toml`. A token goes to a file in the account directory. An SSH password is never stored at all, which the next section explains.
 
 ### SSH authentication
 
@@ -497,10 +507,10 @@ So `letify login shell` sets up key authentication and treats the password as a 
 
 1. If the configured key does not exist, an ed25519 key is generated at `~/.ssh/id_letify` with no passphrase, because a passphrase would put the prompt back.
 2. The public key is appended to the machine's `~/.ssh/authorized_keys`, over one interactive SSH connection that asks for the password in the terminal.
-3. The password is used by that one command and then dropped. It is not written to the file, the keyring or the environment.
+3. The password is used by that one command and then dropped. It is not written to a file or to the environment.
 4. The connection is confirmed with `BatchMode=yes`, which proves the key works before the alias is declared rather than at the first call.
 
-Two other approaches were considered and are not the default. Connection multiplexing with `ControlMaster` authenticates once and reuses the socket, but Windows OpenSSH does not implement it and a dropped socket ends a long run. `sshpass` feeds a stored password to each connection, which needs the password kept somewhere and exposes it in the process arguments of every call. `sshpass` is available as `auth = "password"` for a machine whose administrator forbids key authentication, reading the password from the keyring, and it refuses on Windows, where the tool does not exist.
+Two other approaches were considered and are not the default. Connection multiplexing with `ControlMaster` authenticates once and reuses the socket, but Windows OpenSSH does not implement it and a dropped socket ends a long run. `sshpass` feeds a stored password to each connection, which needs the password kept somewhere and exposes it in the process arguments of every call. `sshpass` is available as `auth = "password"` for a machine whose administrator forbids key authentication, reading the password from `~/.letify/accounts/<alias>/password`, and it refuses on Windows, where the tool does not exist.
 
 ### What each kind asks for
 
@@ -509,7 +519,7 @@ Two other approaches were considered and are not the default. Connection multipl
 | Kind | Written to the home file | Credential |
 |---|---|---|
 | `shell`, `tunnel` | address, user, port, key path | an SSH key, installed by `login`; no password stored |
-| `elice` | endpoint, zone, machine | access token in the OS keyring, recorded as `access_token_keyring` |
+| `elice` | endpoint, zone, machine | access token in `~/.letify/accounts/<alias>/access_token` |
 | `colab` | account email | the `colab` CLI owns it; `login` checks the CLI is present and says which command authenticates it |
 | `modal` | workspace | the `modal` CLI owns it, in `~/.modal.toml`; `login` checks it is present |
 | `local` | nothing | none; this machine needs no declaration |
@@ -570,7 +580,7 @@ Unified memory is the one exception that no amount of implementation removes. Ma
 
 > The base install carries no provider dependency. Each provider is an extra.
 
-`letify` alone installs cloudpickle and blake3. `letify[colab]`, `letify[modal]`, `letify[shell]`, `letify[gcs]`, `letify[s3]`, `letify[keyring]` and `letify[all]` add what a provider needs. No provider dependency is imported at package import time, so a provider whose package is absent reports itself unavailable and everything else keeps working.
+`letify` alone installs cloudpickle and blake3. `letify[colab]`, `letify[modal]`, `letify[shell]`, `letify[gcs]`, `letify[s3]`, and `letify[all]` add what a provider needs. No provider dependency is imported at package import time, so a provider whose package is absent reports itself unavailable and everything else keeps working.
 
 ## Known gaps
 

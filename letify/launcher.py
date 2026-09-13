@@ -166,7 +166,7 @@ class Launcher:
             known = ", ".join(self.config.order) or "none"
             raise UnknownProvider(
                 f"no provider is declared under {alias!r}. Declared: {known}. "
-                f"Add it to .letify, or to ~/.letify if it carries credentials."
+                f"Name it in .letify/config.toml, and declare the account in ~/.letify/config.toml."
             )
         provider = provider_registry.build(entry)
         self._cache[alias] = provider

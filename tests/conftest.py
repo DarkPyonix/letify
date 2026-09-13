@@ -5,7 +5,7 @@ subprocess behind the same framed protocol a remote runtime uses, so the protoco
 pool, the store and the release rule are all exercised rather than stubbed.
 
 A fake appears here only where the real thing needs something a test machine does not
-have: the Colab CLI, the Elice HTTP API, Modal's client, a cloud bucket, an OS keyring
+have: the Colab CLI, the Elice HTTP API, Modal's client, a cloud bucket
 and nvidia-smi. They are small objects rather than mocks, so a test still asserts on
 what a caller observes instead of on which method was called.
 """
@@ -51,12 +51,13 @@ def cpu(let: letify.Launcher) -> letify.Instance:
 
 @pytest.fixture
 def config_file(tmp_path: Path):
-    """Write a .letify file and return its path."""
+    """Write a project's .letify/config.toml and return the .letify directory."""
 
     def write(body: str, name: str = ".letify") -> Path:
-        path = tmp_path / name
-        path.write_text(body, encoding="utf-8")
-        return path
+        directory = tmp_path / name
+        directory.mkdir(exist_ok=True)
+        (directory / "config.toml").write_text(body, encoding="utf-8")
+        return directory
 
     return write
 
@@ -79,9 +80,9 @@ def isolated_home(monkeypatch, tmp_path: Path) -> Path:
     through it has to be moved off the developer's own files.
     """
     home = tmp_path / "home"
-    home.mkdir()
+    (home / ".letify").mkdir(parents=True)
     project = tmp_path / "project"
-    project.mkdir()
+    (project / ".letify").mkdir(parents=True)
     monkeypatch.setattr(Path, "home", classmethod(lambda cls: home))
     monkeypatch.chdir(project)
     return project
@@ -195,56 +196,6 @@ def no_module(monkeypatch):
             monkeypatch.setitem(sys.modules, name, None)
 
     return hide
-
-
-# -- the OS keyring ------------------------------------------------------------
-
-
-class FakeKeyring:
-    """The keyring functions letify asks the package for, reading and writing."""
-
-    def __init__(self, entries: dict[tuple[str, str], str]):
-        self.entries = entries
-        self.asked: list[tuple[str, str]] = []
-
-    @property
-    def stored(self) -> dict[tuple[str, str], str]:
-        """What the store holds, for a test that wrote into it."""
-        return self.entries
-
-    def get_password(self, service: str, user: str) -> str | None:
-        self.asked.append((service, user))
-        return self.entries.get((service, user))
-
-    def set_password(self, service: str, user: str, password: str) -> None:
-        self.entries[(service, user)] = password
-
-    def delete_password(self, service: str, user: str) -> None:
-        # The real package raises rather than returning quietly, and a caller that deletes
-        # an entry it did not put there should find that out.
-        if (service, user) not in self.entries:
-            raise KeyError(f"{service}/{user}")
-        del self.entries[(service, user)]
-
-
-@pytest.fixture
-def fake_keyring(monkeypatch):
-    """Install a keyring stand-in, because a real one needs an OS credential store."""
-
-    def install(entries: dict[tuple[str, str], str]) -> FakeKeyring:
-        fake = FakeKeyring(entries)
-        monkeypatch.setitem(sys.modules, "keyring", fake)
-        return fake
-
-    return install
-
-
-@pytest.fixture
-def keyring_store(monkeypatch):
-    """An empty keyring, installed, for a test that writes a credential into one."""
-    fake = FakeKeyring({})
-    monkeypatch.setitem(sys.modules, "keyring", fake)
-    return fake
 
 
 # -- device inventory ----------------------------------------------------------

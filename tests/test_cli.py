@@ -47,7 +47,7 @@ def test_the_efficiency_subcommand_needs_no_configuration(isolated_home, capsys)
 
 
 def test_the_declared_providers_are_listed_with_their_channel(isolated_home, capsys) -> None:
-    (isolated_home / ".letify").write_text(
+    (isolated_home / ".letify" / "config.toml").write_text(
         '[lab]\nkind = "shell"\naddress = "gpu.example.edu"\npersistent = true\n', encoding="utf-8"
     )
     assert main(["providers"]) == 0
@@ -63,7 +63,8 @@ def test_the_declared_providers_are_listed_with_their_channel(isolated_home, cap
 def test_a_provider_that_cannot_be_built_is_reported_without_hiding_the_rest(
     isolated_home, capsys
 ) -> None:
-    (isolated_home / ".letify").write_text('[odd]\nkind = "vastai"\n', encoding="utf-8")
+    config = isolated_home / ".letify" / "config.toml"
+    config.write_text('[odd]\nkind = "vastai"\n', encoding="utf-8")
     assert main(["providers"]) == 0
     out = capsys.readouterr().out
     assert "odd" in out
@@ -72,7 +73,7 @@ def test_a_provider_that_cannot_be_built_is_reported_without_hiding_the_rest(
 
 
 def test_the_accelerators_every_provider_offers_are_listed(isolated_home, capsys) -> None:
-    (isolated_home / ".letify").write_text(
+    (isolated_home / ".letify" / "config.toml").write_text(
         '[lab]\nkind = "shell"\naddress = "a"\ngpus = ["A100"]\n', encoding="utf-8"
     )
     assert main(["devices"]) == 0
@@ -143,7 +144,8 @@ def test_every_subcommand_is_reachable_from_the_parser() -> None:
 def test_the_usage_table_lists_every_declared_alias(isolated_home, capsys) -> None:
     # An account missing from the table reads as an account with nothing left on it, so a
     # provider that could not even be built is listed with its reason too.
-    (isolated_home / ".letify").write_text('[odd]\nkind = "vastai"\n', encoding="utf-8")
+    config = isolated_home / ".letify" / "config.toml"
+    config.write_text('[odd]\nkind = "vastai"\n', encoding="utf-8")
     assert main(["usage"]) == 0
     out = capsys.readouterr().out
     # This machine bills nobody, which is a different answer from an unknown balance.
@@ -153,7 +155,7 @@ def test_the_usage_table_lists_every_declared_alias(isolated_home, capsys) -> No
 
 
 def test_an_unreported_balance_says_where_it_would_have_come_from(isolated_home, capsys) -> None:
-    (isolated_home / ".letify").write_text(
+    (isolated_home / ".letify" / "config.toml").write_text(
         '[lab]\nkind = "shell"\naddress = "gpu.example.edu"\n', encoding="utf-8"
     )
     assert main(["usage", "lab"]) == 0
@@ -164,7 +166,7 @@ def test_an_unreported_balance_says_where_it_would_have_come_from(isolated_home,
 
 def test_a_configured_command_is_what_the_table_prints(isolated_home, capsys) -> None:
     # How a user supplies a figure letify has no endpoint for.
-    (isolated_home / ".letify").write_text(
+    (isolated_home / ".letify" / "config.toml").write_text(
         '[lab]\nkind = "shell"\naddress = "gpu.example.edu"\n'
         'usage_command = "echo 12.5"\nusage_unit = "hours"\nusage_limit = 40.0\n',
         encoding="utf-8",
@@ -181,7 +183,7 @@ def test_a_configured_command_is_what_the_table_prints(isolated_home, capsys) ->
 
 def test_an_instance_with_no_live_session_is_listed_with_its_reason(isolated_home, capsys) -> None:
     # Starting a session to measure its load would cost money and change the answer.
-    (isolated_home / ".letify").write_text(
+    (isolated_home / ".letify" / "config.toml").write_text(
         '[lab]\nkind = "shell"\naddress = "gpu.example.edu"\ngpus = ["A100"]\n',
         encoding="utf-8",
     )
@@ -244,11 +246,11 @@ def test_logging_in_writes_the_account_at_home_and_a_reference_in_the_project(
         ]
     )
     assert code == 0
-    home_file = (Path.home() / ".letify").read_text(encoding="utf-8")
+    home_file = (Path.home() / ".letify" / "config.toml").read_text(encoding="utf-8")
     assert "gpu.example.edu" in home_file
     assert "researcher" in home_file
 
-    project_file = (isolated_home / ".letify").read_text(encoding="utf-8")
+    project_file = (isolated_home / ".letify" / "config.toml").read_text(encoding="utf-8")
     # Naming the alias is what makes the account available here, so the table is empty.
     assert tomllib.loads(project_file) == {"lab": {}}
     assert "gpu.example.edu" not in project_file
@@ -257,29 +259,30 @@ def test_logging_in_writes_the_account_at_home_and_a_reference_in_the_project(
 
 def test_an_account_already_set_up_gets_only_the_reference(isolated_home, capsys) -> None:
     # The common case in a second repository: the account was declared once already.
-    (Path.home() / ".letify").write_text(
+    (Path.home() / ".letify" / "config.toml").write_text(
         '[lab]\nkind = "shell"\naddress = "gpu.example.edu"\n', encoding="utf-8"
     )
     assert main(["login", "shell", "lab", "--no-input"]) == 0
     out = capsys.readouterr().out
     assert "already" in out
-    assert tomllib.loads((isolated_home / ".letify").read_text(encoding="utf-8")) == {"lab": {}}
+    project = isolated_home / ".letify" / "config.toml"
+    assert tomllib.loads(project.read_text(encoding="utf-8")) == {"lab": {}}
 
 
 def test_declaring_an_account_with_nothing_to_connect_to_is_refused(isolated_home, capsys) -> None:
     # Refusing beats writing a half account that fails at the first call.
     assert main(["login", "shell", "lab", "--no-input"]) == 1
-    assert not (Path.home() / ".letify").exists()
+    assert not (Path.home() / ".letify" / "config.toml").exists()
     assert "address" in capsys.readouterr().err
 
 
 def test_a_reserved_alias_is_refused_before_anything_is_written(isolated_home, capsys) -> None:
     assert main(["login", "shell", "any", "--address", "h", "--no-input"]) == 1
-    assert not (Path.home() / ".letify").exists()
+    assert not (Path.home() / ".letify" / "config.toml").exists()
 
 
-def test_an_elice_token_goes_to_the_keyring_and_the_file_records_where(
-    isolated_home, keyring_store, capsys
+def test_an_elice_token_goes_to_the_account_directory_and_not_the_config(
+    isolated_home, capsys
 ) -> None:
     # A token in a file is a token in a backup, so the file gets the pointer only.
     code = main(
@@ -297,10 +300,13 @@ def test_an_elice_token_goes_to_the_keyring_and_the_file_records_where(
         ]
     )
     assert code == 0
-    home_file = (Path.home() / ".letify").read_text(encoding="utf-8")
+    home_file = (Path.home() / ".letify" / "config.toml").read_text(encoding="utf-8")
     assert "secret-token" not in home_file
-    assert 'access_token_keyring = "letify/elice_a100"' in home_file
-    assert keyring_store.stored[("letify", "elice_a100")] == "secret-token"
+    assert "keyring" not in home_file
+    token_file = Path.home() / ".letify" / "accounts" / "elice_a100" / "access_token"
+    assert token_file.read_text(encoding="utf-8").strip() == "secret-token"
+    if sys.platform != "win32":
+        assert token_file.stat().st_mode & 0o777 == 0o600
 
 
 def test_a_vendor_owned_credential_is_left_to_the_vendor(
@@ -311,7 +317,7 @@ def test_a_vendor_owned_credential_is_left_to_the_vendor(
     assert main(["login", "colab", "colab_a", "--account", "me@example.com", "--no-input"]) == 0
     out = capsys.readouterr().out
     assert "colab" in out
-    home_file = (Path.home() / ".letify").read_text(encoding="utf-8")
+    home_file = (Path.home() / ".letify" / "config.toml").read_text(encoding="utf-8")
     assert "me@example.com" in home_file
     assert "token" not in home_file
 
@@ -324,9 +330,7 @@ def test_logging_in_to_a_vendor_whose_cli_is_absent_says_what_to_install(
     assert "colab" in capsys.readouterr().err
 
 
-def test_logging_out_takes_the_account_and_its_keyring_entry(
-    isolated_home, keyring_store, capsys
-) -> None:
+def test_logging_out_takes_the_account_and_its_directory(isolated_home, capsys) -> None:
     # The repository still needs the account, so the reference stays; this machine is what
     # stopped having it.
     main(
@@ -344,9 +348,10 @@ def test_logging_out_takes_the_account_and_its_keyring_entry(
         ]
     )
     assert main(["logout", "e"]) == 0
-    assert "[e]" not in (Path.home() / ".letify").read_text(encoding="utf-8")
-    assert ("letify", "e") not in keyring_store.stored
-    assert "e" in tomllib.loads((isolated_home / ".letify").read_text(encoding="utf-8"))
+    assert "[e]" not in (Path.home() / ".letify" / "config.toml").read_text(encoding="utf-8")
+    assert not (Path.home() / ".letify" / "accounts" / "e").exists()
+    project = isolated_home / ".letify" / "config.toml"
+    assert "e" in tomllib.loads(project.read_text(encoding="utf-8"))
 
 
 def test_logging_out_of_an_account_this_machine_never_had_says_so(isolated_home, capsys) -> None:
@@ -411,7 +416,7 @@ def test_the_key_is_proven_to_work_before_the_alias_is_declared(
         ]
     )
     assert code == 1
-    assert not (Path.home() / ".letify").exists()
+    assert not (Path.home() / ".letify" / "config.toml").exists()
     assert "Permission denied" in capsys.readouterr().err
 
 
@@ -470,8 +475,8 @@ def test_an_unknown_authentication_method_is_refused(isolated_home, capsys) -> N
         login.shell_account(answers)
 
 
-def test_a_password_machine_keeps_the_password_in_the_keyring_off_windows(
-    isolated_home, keyring_store, monkeypatch
+def test_a_password_machine_keeps_the_password_in_the_account_directory_off_windows(
+    isolated_home, monkeypatch
 ) -> None:
     # The opt-in path for a machine whose administrator forbids key authentication. The
     # password has to be stored for sshpass to feed it, which is exactly why it is not the
@@ -485,8 +490,9 @@ def test_a_password_machine_keeps_the_password_in_the_keyring_off_windows(
         interactive=False,
     )
     options = login.shell_account(answers)
-    assert options["password_keyring"] == "letify/lab"
-    assert keyring_store.stored[("letify", "lab")] == "hunter2"
+    assert "password_keyring" not in options
+    password_file = Path.home() / ".letify" / "accounts" / "lab" / "password"
+    assert password_file.read_text(encoding="utf-8").strip() == "hunter2"
 
 
 def test_a_password_machine_with_no_password_is_refused(isolated_home, monkeypatch) -> None:
@@ -521,14 +527,12 @@ def test_the_optional_fields_reach_the_file_when_they_are_given(isolated_home, p
         )
         == 0
     )
-    home_file = (Path.home() / ".letify").read_text(encoding="utf-8")
+    home_file = (Path.home() / ".letify" / "config.toml").read_text(encoding="utf-8")
     assert "port = 2222" in home_file
     assert "persistent = true" in home_file
 
 
-def test_an_elice_endpoint_is_recorded_only_when_it_is_not_the_default(
-    isolated_home, keyring_store
-) -> None:
+def test_an_elice_endpoint_is_recorded_only_when_it_is_not_the_default(isolated_home) -> None:
     assert (
         main(
             [
@@ -548,7 +552,7 @@ def test_an_elice_endpoint_is_recorded_only_when_it_is_not_the_default(
         )
         == 0
     )
-    assert "portal.example" in (Path.home() / ".letify").read_text(encoding="utf-8")
+    assert "portal.example" in (Path.home() / ".letify" / "config.toml").read_text(encoding="utf-8")
 
 
 def test_a_modal_workspace_is_recorded_and_no_token_is_taken(
@@ -557,7 +561,7 @@ def test_a_modal_workspace_is_recorded_and_no_token_is_taken(
     # Modal keeps its own token in ~/.modal.toml, which letify has no way to refresh.
     patch_which(login, present=True)
     assert main(["login", "modal", "m", "--workspace", "lab-team", "--no-input"]) == 0
-    home_file = (Path.home() / ".letify").read_text(encoding="utf-8")
+    home_file = (Path.home() / ".letify" / "config.toml").read_text(encoding="utf-8")
     assert 'workspace = "lab-team"' in home_file
     assert "token" not in home_file
 
@@ -599,17 +603,6 @@ def test_installing_a_key_that_the_machine_refuses_is_reported(patch_run, tmp_pa
         login.install_key(address="h", user="u", port=22, key_path=str(key))
 
 
-def test_a_credential_cannot_be_stored_without_the_keyring_package(monkeypatch) -> None:
-    # Naming the extra beats a bare ImportError, and naming the env var alternative beats
-    # making the extra mandatory.
-    monkeypatch.setitem(sys.modules, "keyring", None)
-    with pytest.raises(letify.ConfigError, match=r"letify\[keyring\]"):
-        login.store_secret("lab", "secret")
-
-
-def test_forgetting_a_credential_without_the_keyring_package_is_not_an_error(
-    monkeypatch,
-) -> None:
-    # There is nothing to do either way: this machine holds no credential.
-    monkeypatch.setitem(sys.modules, "keyring", None)
-    assert login.forget_secret("lab") is False
+def test_forgetting_an_account_with_no_directory_is_not_an_error(isolated_home) -> None:
+    # There is nothing to do either way: this machine holds nothing for that account.
+    assert login.forget_secret("never-logged-in") is False

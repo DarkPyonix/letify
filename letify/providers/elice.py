@@ -85,8 +85,8 @@ class Elice(Shell):
         if not token:
             raise ProviderUnavailable(
                 self.kind,
-                f"{self.alias} needs an access token. Set access_token_env or "
-                f"access_token_keyring so the token stays out of tracked files",
+                f"{self.alias} needs an access token. Run 'letify login elice {self.alias}', "
+                f"which keeps it in ~/.letify/accounts/{self.alias}/, or set access_token_env",
             )
         return token
 

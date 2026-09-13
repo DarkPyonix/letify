@@ -15,19 +15,19 @@ from pathlib import Path
 import pytest
 
 import letify
-from letify.config import CONFIG_NAME, inventory, load, writer
-from letify.config.secrets import from_keyring, resolve_secret
+from letify.config import CONFIG_DIRECTORY, CONFIG_FILE, inventory, load, writer
+from letify.config.secrets import account_directory, resolve_secret
 
 
 @pytest.fixture
 def home_file(monkeypatch, tmp_path: Path):
-    """Write a ~/.letify and point Path.home at the directory holding it."""
+    """Write ~/.letify/config.toml and point Path.home at the directory holding it."""
     home = tmp_path / "home"
-    home.mkdir()
+    (home / CONFIG_DIRECTORY).mkdir(parents=True)
     monkeypatch.setattr(Path, "home", classmethod(lambda cls: home))
 
     def write(body: str) -> Path:
-        path = home / CONFIG_NAME
+        path = home / CONFIG_DIRECTORY / CONFIG_FILE
         path.write_text(body, encoding="utf-8")
         return path
 
@@ -142,6 +142,57 @@ def test_a_missing_configuration_file_is_not_an_error(tmp_path: Path) -> None:
 # -- Spec: Configuration, credential fields ------------------------------------
 
 
+def test_letify_state_is_a_directory_at_home_and_in_the_project(home_file, tmp_path) -> None:
+    # One directory per side, so a provider's credentials and state have somewhere to live
+    # next to the configuration instead of in a file of their own.
+    assert (CONFIG_DIRECTORY, CONFIG_FILE) == (".letify", "config.toml")
+    home_file('[lab]\nkind = "shell"\naddress = "gpu.example.edu"\n')
+    project = tmp_path / "project" / ".letify"
+    project.mkdir(parents=True)
+    (project / "config.toml").write_text("[lab]\n", encoding="utf-8")
+    config = load(project)
+    assert config.sources == [
+        Path.home() / ".letify" / "config.toml",
+        project / "config.toml",
+    ]
+    assert config.providers["lab"].option("address") == "gpu.example.edu"
+
+
+def test_a_configuration_may_be_named_by_its_directory_or_its_file(config_file) -> None:
+    directory = config_file('[box]\nkind = "local"\n')
+    assert "box" in load(directory, home=False).providers
+    assert "box" in load(directory / "config.toml", home=False).providers
+
+
+def test_a_credential_is_read_from_the_account_directory(home_file) -> None:
+    # The file is named after the field, in the alias's own directory, so a token never
+    # appears in either config.toml.
+    account = account_directory("elice_a100")
+    assert account == Path.home() / ".letify" / "accounts" / "elice_a100"
+    account.mkdir(parents=True)
+    (account / "access_token").write_text("from-the-file\n", encoding="utf-8")
+    assert resolve_secret({}, "access_token", alias="elice_a100") == "from-the-file"
+
+
+def test_an_environment_variable_wins_over_the_account_file(home_file, monkeypatch) -> None:
+    account = account_directory("elice_a100")
+    account.mkdir(parents=True)
+    (account / "access_token").write_text("from-the-file", encoding="utf-8")
+    monkeypatch.setenv("LETIFY_TEST_TOKEN", "from-the-environment")
+    options = {"access_token_env": "LETIFY_TEST_TOKEN"}
+    assert resolve_secret(options, "access_token", alias="elice_a100") == "from-the-environment"
+
+
+def test_a_provider_entry_resolves_its_own_account_directory(home_file, config_file) -> None:
+    # A provider asks for a field by name and never needs to know where credentials live.
+    account = account_directory("lab")
+    account.mkdir(parents=True)
+    (account / "auth_key").write_text("tskey", encoding="utf-8")
+    home_file('[lab]\nkind = "tunnel"\naddress = "h"\n')
+    entry = load(config_file("[lab]\n")).providers["lab"]
+    assert entry.secret("auth_key") == "tskey"
+
+
 def test_a_secret_is_read_from_the_environment_first(monkeypatch) -> None:
     monkeypatch.setenv("LETIFY_TEST_TOKEN", "from-the-environment")
     options = {
@@ -149,19 +200,6 @@ def test_a_secret_is_read_from_the_environment_first(monkeypatch) -> None:
         "access_token": "from-the-file",
     }
     assert resolve_secret(options, "access_token") == "from-the-environment"
-
-
-def test_a_secret_falls_back_to_the_keyring(fake_keyring, monkeypatch) -> None:
-    # The keyring is the second form, tried when the environment variable is unset.
-    monkeypatch.delenv("LETIFY_TEST_TOKEN", raising=False)
-    keyring = fake_keyring({("letify", "researcher"): "from-the-keyring"})
-    options = {
-        "access_token_env": "LETIFY_TEST_TOKEN",
-        "access_token_keyring": "letify/researcher",
-        "access_token": "from-the-file",
-    }
-    assert resolve_secret(options, "access_token") == "from-the-keyring"
-    assert keyring.asked == [("letify", "researcher")]
 
 
 def test_a_literal_secret_is_accepted_last(monkeypatch) -> None:
@@ -174,19 +212,6 @@ def test_a_literal_secret_is_accepted_last(monkeypatch) -> None:
 def test_a_credential_that_is_nowhere_returns_the_default() -> None:
     assert resolve_secret({}, "access_token") is None
     assert resolve_secret({}, "access_token", "fallback") == "fallback"
-
-
-def test_a_keyring_entry_names_a_service_and_a_user(fake_keyring) -> None:
-    fake_keyring({("letify", "researcher"): "value"})
-    # Without the user half there is nothing to look up, so this is not a lookup miss.
-    assert from_keyring("letify") is None
-
-
-def test_the_keyring_package_is_optional(no_module) -> None:
-    # keyring is an extra, so a missing install has to leave the other two forms working
-    # rather than raising.
-    no_module("keyring")
-    assert from_keyring("letify/researcher") is None
 
 
 def test_a_provider_entry_resolves_its_own_credentials(launcher_from, monkeypatch) -> None:

@@ -14,7 +14,7 @@ class LetifyError(Exception):
 
 
 class ConfigError(LetifyError):
-    """The .letify file is missing, malformed, or names an unknown provider kind."""
+    """A .letify config.toml is malformed, or names an unknown provider kind."""
 
 
 class ProviderUnavailable(LetifyError):

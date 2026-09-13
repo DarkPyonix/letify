@@ -44,11 +44,12 @@ def project(tmp_path, monkeypatch):
     (root / "pyproject.toml").write_text('[project]\nname = "study"\n', encoding="utf-8")
     monkeypatch.chdir(root)
     home = tmp_path / "home"
-    home.mkdir()
+    (home / ".letify").mkdir(parents=True)
     monkeypatch.setattr(Path, "home", classmethod(lambda cls: home))
 
     def declare(body: str) -> Path:
-        (root / ".letify").write_text(body, encoding="utf-8")
+        (root / ".letify").mkdir(exist_ok=True)
+        (root / ".letify" / "config.toml").write_text(body, encoding="utf-8")
         return root
 
     return declare
@@ -108,7 +109,7 @@ def test_an_alias_named_after_its_kind_does_not_shadow_the_base_class(project) -
 
 
 def test_only_the_accounts_this_project_can_use_are_named(project, tmp_path) -> None:
-    (Path.home() / ".letify").write_text(
+    (Path.home() / ".letify" / "config.toml").write_text(
         '[lab]\nkind = "shell"\naddress = "h"\n[colab_pro]\nkind = "colab"\nglobal = true\n',
         encoding="utf-8",
     )

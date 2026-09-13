@@ -22,7 +22,7 @@ def build_parser() -> argparse.ArgumentParser:
         prog="letify", description="Declarations that become infrastructure."
     )
     parser.add_argument("--version", action="version", version=f"letify {__version__}")
-    parser.add_argument("--config", help="path to a .letify file")
+    parser.add_argument("--config", help="a project .letify directory, or its config.toml")
     sub = parser.add_subparsers(dest="command", required=True)
 
     sub.add_parser("providers", help="list declared providers and their storage")
@@ -64,7 +64,7 @@ def build_parser() -> argparse.ArgumentParser:
     log_in.add_argument("--account", help="account email, for Colab")
     log_in.add_argument("--workspace", help="workspace name, for Modal")
     log_in.add_argument(
-        "--token", help="credential to file in the OS keyring rather than in any file"
+        "--token", help="credential to keep in ~/.letify/accounts/<alias>/, never in a config file"
     )
     log_in.add_argument(
         "--no-input",
@@ -184,7 +184,7 @@ def main(argv: list[str] | None = None) -> int:
                 file=sys.stderr,
             )
             return 1
-        detail = " and its keyring entry" if forgotten else ""
+        detail = " and its account directory" if forgotten else ""
         print(f"{args.alias} removed from {login.home_path()}{detail}")
         print("The project reference is left alone, because this repository still needs it")
         return 0
