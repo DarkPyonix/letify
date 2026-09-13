@@ -233,7 +233,7 @@ If it is relayed and UDP is blocked on your network, switch to `transport = "frp
 
 ### A sweep is not running in parallel
 
-Check three things. `concurrency` on the declaration, `max_runtimes` on the launcher, and how many runtimes actually came up:
+Check two things. What the provider entry declares it has, and how many sessions actually came up:
 
 ```python
 print(len(let.pool.live))

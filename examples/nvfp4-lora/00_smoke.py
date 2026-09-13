@@ -6,7 +6,7 @@ and the result comes back. It costs seconds. Finding the same failure twenty min
 sweep costs the sweep.
 
     python 00_smoke.py --provider local
-    python 00_smoke.py --provider colab_a --device G4
+    python 00_smoke.py --provider colab_pro --device G4
 """
 
 from __future__ import annotations

@@ -42,7 +42,6 @@ The project file refines what the home file declared, so someone else can clone 
 # .letify in the project, committed
 [defaults]
 name = "nvfp4"
-max_runtimes = 3
 idle_timeout = 900
 ```
 

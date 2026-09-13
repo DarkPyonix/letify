@@ -1,4 +1,4 @@
-# 5️⃣ Sweeps and concurrency
+# 5️⃣ Sweeps and capacity
 
 > Running many configurations, in parallel, without a map call.
 
@@ -36,7 +36,7 @@ letify.zip(lr=[1e-4, 3e-4, 1e-3], bs=[16, 32])
 The two orderings you might want are already in the language.
 
 ```python
-@let.function(device=colab.G4, host="remote", concurrency=3)
+@let.function(device=colab.G4, host="remote")
 async def train(lr, bs):
     ...
     return {"lr": lr, "bs": bs, "loss": loss}
@@ -52,55 +52,85 @@ async for result in train(space):     # as each finishes
 A sync declaration returns a list in input order:
 
 ```python
-@let.function(device=colab.G4, host="remote", concurrency=3)
+@let.function(device=colab.G4, host="remote")
 def train(lr, bs): ...
 
 rows = train(space)     # list
 ```
 
-## Concurrency belongs to the declaration
+## Width comes from the inventory
 
-```python
-@let.function(device=colab.G4, host="remote", concurrency=3)
-```
-
-This is how many runtimes the declaration may occupy at once, not a property of any single call. It is part of the declaration because it describes the infrastructure that declaration is allowed to use.
-
-Six points across three runtimes finish in roughly a third of the wall clock time. Credits spent are the same either way, since three GPUs for 30 minutes costs what one GPU costs for 90.
-
-> ⏱️ **Wall clock time is worth paying for in research.** Seeing results three times sooner changes how fast you can design the next experiment, even though the credit total is unchanged.
-
-## How many runtimes can you actually get
-
-Two limits apply and they are different.
-
-`concurrency` on the declaration is what that declaration may use. `max_runtimes` on the launcher is the ceiling for the whole process.
-
-```python
-let = letify.Launcher(max_runtimes=4)
-```
+Nothing on the declaration says how wide a sweep runs. A provider entry declares what the
+account has, and that is the answer:
 
 ```toml
-[defaults]
-max_runtimes = 4
+[colab_pro.devices]
+G4 = { count = 2 }            # two concurrent sessions on this account
+
+[lab_a100.devices]
+A100 = { indices = "0-3" }    # four cards in a shared box are ours
 ```
 
-The provider has its own limit, which for Colab is undocumented and moves with your tier, credit balance and current demand. The default of 3 is a guess. Measure it:
+Six points on four cards finish in roughly a quarter of the wall clock time. Credits spent
+are the same either way, since four GPUs for 15 minutes costs what one GPU costs for an
+hour.
+
+> ⏱️ **Wall clock time is worth paying for in research.** Seeing results four times sooner
+> changes how fast you can design the next experiment, even though the credit total is
+> unchanged.
+
+There is no second number. A width on the declaration and a ceiling on the launcher were
+two statements of one decision, and when they disagreed the smaller won silently: a sweep
+was slow and neither number said why.
+
+## A run that takes more than one card
+
+Multiply the instance:
 
 ```python
-let = letify.Launcher(max_runtimes=6)
-
-@let.function(device=colab.L4, host="remote", concurrency=6)
-async def probe(n):
-    return n
-
-await probe(letify.grid(n=list(range(6))))
-print(len(let.pool.live))        # how many actually came up
+@let.function(device=lab.A100 * 2, host="remote")
+def train(lr):
+    ...
 ```
 
-Use `L4` for this. It is the cheapest accelerator, so finding the limit costs almost nothing.
+On the four card box above, that is two concurrent sessions rather than four. This is the
+plain reason a width knob could not work: a number saying how many sessions may exist says
+nothing about how many cards each one needs.
 
-More accounts is the other way to raise the ceiling, since the limit is per account. See [Providers and accounts](02-providers.md).
+The session sets its own visible devices, so the code inside sees its cards as `cuda:0` and
+`cuda:1` and needs to know nothing about which physical indices it was given.
+
+## Sharing a machine with other people
+
+On a department box the usable indices move with whoever else is logged in. Register the
+ones that are yours, and letify takes only those that are actually free when a session
+starts:
+
+```toml
+[lab_a100.devices]
+A100 = { indices = "0-3" }
+```
+
+A card a colleague is computing on is skipped, not fought over. Compute processes are what
+is read, rather than utilization, because a card between steps reads as idle and is not.
+letify never kills anything and never touches an index you did not register.
+
+## What actually came up
+
+```python
+print(let.status()["devices"])   # inventory against what is reserved
+print(let.status()["live"])      # sessions that exist right now
+```
+
+```bash
+letify status
+```
+
+If a sweep is narrower than you expected, the inventory is the only place to look. A point
+that cannot reserve its cards waits for one that can to finish, rather than asking the
+provider for a machine it would refuse.
+
+More accounts is how to get more cards, since an inventory belongs to one account. See [Providers and accounts](02-providers.md).
 
 ## Cheaper accelerators, more of them
 
@@ -138,10 +168,10 @@ async for row in train(space):
 **Train and evaluate at the same time, on different providers.**
 
 ```python
-@let.function(device=colab.G4, host="remote", concurrency=1)
+@let.function(device=colab.G4, host="remote")
 async def train(lr): ...
 
-@let.function(device=lab.A100, host="remote", concurrency=1)
+@let.function(device=lab.A100, host="remote")
 async def evaluate(ckpt): ...
 
 await asyncio.gather(train(lr=1e-4), evaluate(ckpt="run-1"))

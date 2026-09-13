@@ -23,7 +23,7 @@ import letify
 let = letify.Launcher()
 colab = let.providers.colab_pro_plus
 
-@let.function(device=colab.G4, host="remote", concurrency=3)
+@let.function(device=colab.G4, host="remote")
 def train(lr, bs):
     import torch
     ...
@@ -143,7 +143,7 @@ env = letify.Env()                      # uv.lock을 읽습니다
 colab = let.providers.colab_pro_plus
 cache = colab.volume("hf-cache")        # 세션보다 오래 살아남습니다
 
-@let.function(device=colab.G4, host="remote", env=env, volumes=[cache], concurrency=3)
+@let.function(device=colab.G4, host="remote", env=env, volumes=[cache])
 def train(lr, bs):
     ...
     return {"loss": loss}
@@ -256,7 +256,7 @@ both  = letify.grid(lr=[1e-4]) | letify.grid(lr=[1e-3])   # 합집합
 소비하는 방법은 이미 알고 있는 파이썬 문법입니다. 🐍
 
 ```python
-@let.function(device=colab.G4, host="remote", concurrency=3)
+@let.function(device=colab.G4, host="remote")
 async def train(lr, bs):
     ...
 

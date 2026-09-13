@@ -12,7 +12,7 @@ import letify
 let = letify.Launcher()
 colab = let.providers.colab_a
 
-@let.function(device=colab.G4, host="remote", concurrency=3)
+@let.function(device=colab.G4, host="remote")
 def train(lr, bs):
     ...
 
@@ -27,11 +27,23 @@ A declaration says where the accelerator is, where the host code runs, and how l
 
 | Argument | Says | Default |
 |---|---|---|
-| `device` | which provider, account and accelerator | required |
+| `device` | which provider, account, accelerator and how many of it | required |
 | `host` | where the host code runs: `"local"` or `"remote"` | `"local"` |
 | `lifetime` | how long the session lives: `"call"` or `"process"` | `"call"` |
 
-Core count and memory are not arguments. They arrive with the shape the provider registered, and a provider offering several sizes registers them as separate shapes.
+Core count and memory are not arguments. They arrive with the shape the provider registered, and a provider offering several sizes registers them as separate shapes. `lab.A100 * 2` is the same shape taking two cards.
+
+There is no width argument and no session ceiling. A provider entry declares what the account has, and that inventory is the only thing bounding how much runs at once:
+
+```toml
+[lab_a100.devices]
+A100 = { indices = "0-3" }   # four cards in a shared box are ours
+
+[colab_pro.devices]
+G4 = { count = 2 }           # two concurrent sessions on this account
+```
+
+`indices` is for a machine letify shares with other people: it takes only those registered indices that are actually free when a session starts, and sets the session's visible devices so the code inside sees its cards as 0 upward. `count` is for a provider that assigns the device itself.
 
 ### Providers
 
@@ -94,7 +106,6 @@ Everything a user needs is on `letify` itself.
 Launcher(
     config=None,        # path to a .letify file; defaults to the project and home files
     name=None,          # session and app name; defaults to the pyproject project name
-    max_runtimes=3,     # how many sessions may exist at once
     idle_timeout=600,   # seconds a session may sit unused before the reaper takes it
     stream_logs=True,   # print remote stdout to stderr
     announce=True,      # say when a session starts, because that is when money starts
@@ -111,7 +122,6 @@ Launcher(
 | `let.providers.aliases` | Declared aliases, in configuration order |
 | `let.provider(alias)` | Same as attribute access, for a computed alias |
 | `let.function(...)` | Declare a function, returning a decorator |
-| `let.runtime(instance, env)` | Start one session now instead of on the first call |
 | `let.reap_idle()` | Take idle sessions now instead of waiting for the reaper |
 | `let.grid`, `let.zip` | Build a search space |
 | `let.status()` | How many sessions are live and busy against the ceiling, and what each one is |
@@ -127,7 +137,6 @@ Launcher(
     lifetime="process",    # "call" ends with the call, "process" keeps the session
     env=env,               # an Env; defaults to Env()
     volumes=[cache],       # volumes to attach
-    concurrency=3,         # sessions this declaration may occupy at once
     timeout=3600,          # seconds one call may take
     retries=1,             # retries on infrastructure failure, never on user code failure
     keep_remote=False,     # return a Handle instead of the value
@@ -246,7 +255,6 @@ SSH authenticates by key, because letify opens sessions with `ssh -o BatchMode=y
 ```toml
 [defaults]
 name = "nvfp4"
-max_runtimes = 3
 idle_timeout = 900
 
 [colab_a]

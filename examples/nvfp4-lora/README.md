@@ -26,9 +26,9 @@ python 03_watch.py --provider local
 Then point the same scripts at a rented card by declaring one account and changing one flag:
 
 ```bash
-letify login colab colab_a --account you@example.com
-python 00_smoke.py  --provider colab_a --device G4
-python 01_sweep.py  --provider colab_a --device G4 --concurrency 2
+letify login colab colab_pro --account you@example.com
+python 00_smoke.py  --provider colab_pro --device G4
+python 01_sweep.py  --provider colab_pro --device G4
 ```
 
 The scripts are numbered in the order they are worth running, not as chapters of a tutorial.
@@ -57,13 +57,22 @@ install and the first transfer are all billed as GPU time. With the default `"ca
 the six points would pay that again, and on a short run the setup costs more than the
 training.
 
-**`concurrency` is how many sessions the declaration may occupy**, not how many threads it
-uses. On an account with two Colab sessions available, `--concurrency 2` halves the wall
-clock of the sweep at the same total GPU cost.
+**How wide the sweep runs is the provider's inventory**, not an argument. Declare what the
+account has and that is the width:
+
+```toml
+[colab_pro.devices]
+G4 = { count = 2 }
+```
+
+Two cards halves the wall clock of the sweep at the same total GPU cost. A run that needs two
+cards at once asks with `device=lab.A100 * 2`, and on a four card box that is two concurrent
+sessions rather than four, which is why a number on the declaration could not have said it.
 
 **A volume is a content addressed store, not a mounted disk.** `absorb` pulls a file out of
 a session and files it under a name; `resume` puts whatever a name points at back into a
-session. Blobs are immutable and a name is a few dozen bytes, so two sessions writing at once
+session. Both take the declaration rather than a session, because which session ran the calls
+is letify's answer and naming a different one would read from a session holding no files. Blobs are immutable and a name is a few dozen bytes, so two sessions writing at once
 cannot lose each other's work: one name wins and both checkpoints remain.
 
 **There is nothing to release.** A call ends its own session, `lifetime="process"` keeps it

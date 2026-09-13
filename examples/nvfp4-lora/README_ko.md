@@ -23,9 +23,9 @@ python 03_watch.py --provider local
 그다음 계정 하나를 등록하고 플래그 하나만 바꾸면 같은 스크립트가 빌린 카드를 향합니다.
 
 ```bash
-letify login colab colab_a --account you@example.com
-python 00_smoke.py  --provider colab_a --device G4
-python 01_sweep.py  --provider colab_a --device G4 --concurrency 2
+letify login colab colab_pro --account you@example.com
+python 00_smoke.py  --provider colab_pro --device G4
+python 01_sweep.py  --provider colab_pro --device G4
 ```
 
 번호는 튜토리얼의 장 번호가 아니라 실행할 가치가 있는 순서입니다.
@@ -52,11 +52,22 @@ python 01_sweep.py  --provider colab_a --device G4 --concurrency 2
 시간으로 청구됩니다. 기본값 `"call"`이면 여섯 지점이 그 비용을 각각 다시 냅니다. 짧은 실행에서는
 준비 비용이 학습 비용보다 큽니다.
 
-**`concurrency`는 이 선언이 동시에 점유할 세션 수**이고 스레드 수가 아닙니다. Colab 세션 두 개를
-쓸 수 있는 계정에서 `--concurrency 2`는 총 GPU 비용은 그대로 두고 벽시계 시간을 절반으로 줄입니다.
+**스윕이 얼마나 넓게 도는지는 프로바이더의 인벤토리**이고 인자가 아닙니다. 계정이 가진 것을 선언하면
+그것이 폭입니다.
+
+```toml
+[colab_pro.devices]
+G4 = { count = 2 }
+```
+
+카드 두 장이면 총 GPU 비용은 그대로 두고 벽시계 시간이 절반이 됩니다. 카드를 두 장 동시에 쓰는 실행은
+`device=lab.A100 * 2`로 요청하고, 네 장짜리 머신에서는 세션 네 개가 아니라 두 개입니다. 선언에 적는
+숫자로는 이것을 말할 수 없습니다.
 
 **볼륨은 마운트된 디스크가 아니라 내용 주소 저장소입니다.** `absorb`는 세션에서 파일을 꺼내 이름
-아래 보관하고, `resume`은 이름이 가리키는 것을 세션 안에 되돌려 놓습니다. 블롭은 불변이고 이름은
+아래 보관하고, `resume`은 이름이 가리키는 것을 세션 안에 되돌려 놓습니다. 둘 다 세션이 아니라 선언을
+받습니다. 어느 세션에서 호출이 돌았는지는 letify가 아는 것이고, 다른 세션을 지목하면 파일이 없는 세션을
+읽게 됩니다. 블롭은 불변이고 이름은
 수십 바이트라서 두 세션이 동시에 써도 서로의 결과를 잃지 않습니다. 이름 하나가 이기고 체크포인트는
 둘 다 남습니다.
 

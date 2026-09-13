@@ -133,7 +133,7 @@ A twenty gigabyte model cache takes 27 minutes from a lab server over a 100 Mbit
 ## Run several configurations
 
 ```python
-@let.function(device=colab.G4, host="remote", env=env, concurrency=3)
+@let.function(device=colab.G4, host="remote", env=env)
 async def train(lr, bs):
     ...
     return {"lr": lr, "bs": bs, "loss": loss}
@@ -145,7 +145,7 @@ async def main():
 asyncio.run(main())
 ```
 
-`concurrency=3` means this declaration may hold three runtimes at once. Six points across three runtimes means the sweep finishes in roughly a third of the wall clock time. See [Sweeps and concurrency](05-sweeps.md).
+Six points run as wide as the account has cards for, which the provider entry declares and nothing on the declaration repeats. Three cards means the sweep finishes in roughly a third of the wall clock time. See [Sweeps and capacity](05-sweeps.md).
 
 ## What to know before going further
 

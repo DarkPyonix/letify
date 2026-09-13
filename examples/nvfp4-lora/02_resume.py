@@ -49,12 +49,10 @@ def main() -> int:
         timeout=3600,
     )(recipe.train)
 
-    # Asked for with train.device, which carries the host placement the declaration
-    # folded in, so this is the same session the call below is handed. The checkpoint has
-    # to be inside the runtime before the training function looks for it.
-    session = let.runtime(train.device, env=common.ENV, volumes=[cache])
-    digest = cache.resume(session, name, RESUME_PATH)
-    print(f"put {name} ({digest[:12]}) inside {session.name} at {RESUME_PATH}")
+    # The declaration is named, not a session, so the checkpoint lands in the session the
+    # call below is handed. It has to be there before the training function looks for it.
+    digest = cache.resume(train, name, RESUME_PATH)
+    print(f"put {name} ({digest[:12]}) inside the session at {RESUME_PATH}")
 
     result = train(
         lr=arguments.lr,
@@ -70,7 +68,7 @@ def main() -> int:
     # The name moves to the new blob and the old one stays where it is. Blobs are immutable
     # and a name is a few dozen bytes, so two sessions writing at once cannot lose each
     # other's work: one name wins and both checkpoints remain.
-    moved = cache.absorb(session, result["adapter"], name)
+    moved = cache.absorb(train, result["adapter"], name)
     print(f"{name} now points at {moved[:12]}, and {digest[:12]} is still there")
     return 0
 

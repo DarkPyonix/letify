@@ -6,7 +6,6 @@
 
 [defaults]
 name = "nvfp4-lora"
-max_runtimes = 2
 idle_timeout = 900
 
 # A reference, which is what `letify login` writes here. The address, the user and the key

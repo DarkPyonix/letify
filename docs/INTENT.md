@@ -70,7 +70,7 @@ Forwarding is viable only if a step that issues thousands of driver calls pays a
 
 Each of these would change a claim or a default. Answering one is a good first experiment.
 
-1. **How many concurrent sessions does one Colab account allow?** Undocumented, and it moves with tier, credit balance and demand. `max_runtimes` is a guess until this is measured.
+1. **How many concurrent sessions does one Colab account allow?** Undocumented, and it moves with tier, credit balance and demand. Until it is measured, a `devices` count in the provider entry is where the answer goes, so a user who has measured their own account is not overruled by a number letify guessed.
 2. **What is the real host synchronization count per step, `k`, for the target workload?** Measurable with `torch.cuda.set_sync_debug_mode("warn")`. This sets whether call forwarding is worth implementing at all.
 3. **Does `colab ssh --proxy-mode` support port forwarding with `ssh -L`?** The CLI documents the ProxyCommand bridge but not forwarding. This decides whether a data channel separate from `colab exec` is available.
 4. **Is NVFP4 reachable in a stock Colab runtime?** Needs the CUDA version, the compute capability and whether the quantization stack installs.
