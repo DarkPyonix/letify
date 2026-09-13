@@ -908,6 +908,12 @@ The body is a tag byte and then fixed-width fields. The length is 64 bits becaus
 
 On the driver, `cuMemcpyHtoD_v2` writes the frame header and the fixed fields, then hands the caller's slice to `write_vectored`. A payload larger than the 8 KiB write buffer goes to the socket without being copied into it. On the agent, a `CopyToDevice` frame is recognised by its tag before its body is read, and the payload is read with `read_exact` into a staging buffer the session keeps and reuses, which is then passed to the real driver. Batching and `TCP_NODELAY` are the same as for every other request. Measured throughput is in [NETWORK.md](NETWORK.md#letify-core-copy-throughput).
 
+### Copies to the host
+
+> The bytes of a copy to the host are copied from the device into the agent's staging buffer, written from there, and read into the host buffer the caller passed, with no copy in between.
+
+On the agent, `CopyToHost` copies device memory into a second staging buffer the session keeps and reuses, then writes the frame header and the fixed fields of `Reply::Payload` and hands the staged slice to `write_vectored`. On the driver, `cuMemcpyDtoH_v2` reads the reply tag before its body. A `Payload` whose length equals the requested byte count is read with `read_exact` straight into the caller's destination pointer. A `Payload` of any other length is read and discarded without being stored, so the stream stays in step, and the call returns `CUDA_ERROR_INVALID_VALUE`. The destination is never sized from a length on the wire, so a corrupt length cannot cause a large allocation. Any other reply, such as `Failed`, is decoded whole. A copy to the host is still a round trip: it flushes the queue first, as every request that needs a reply does. Measured throughput is in [NETWORK.md](NETWORK.md#letify-core-copy-throughput).
+
 ### Virtual pointers
 
 > An allocation returns a pointer immediately, and memory accounting stays local so that running out still fails at the call.
