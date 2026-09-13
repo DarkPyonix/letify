@@ -171,6 +171,8 @@ Instance discovery is lazy and cached. A provider that must connect to enumerate
 
 Accelerator names are normalized so they can be attributes. `NVIDIA RTX PRO 6000 Blackwell` becomes `RTX_PRO_6000`. Colab calls the same card `G4`, which is what its CLI accepts, and accepts `RTX_PRO_6000` as an alias for it.
 
+Every provider that can start a session without an accelerator registers it as `CPU`, as `Local` and `Colab` do, and `cpu` finds it too. `Colab` creates such a session with `colab new` and no `--gpu` or `--tpu`.
+
 ### GPU utilization
 
 > How hard each declared instance's accelerator is working right now, read from the machine that owns it.

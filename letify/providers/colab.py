@@ -110,15 +110,18 @@ class Colab(Shell):
     # -- instances -----------------------------------------------------------
 
     def discover(self) -> Mapping[str, Instance]:
-        """Return the fixed Colab accelerator list.
+        """Return the fixed Colab accelerator list, plus a CPU instance with no accelerator.
 
         No connection is needed. Whether an accelerator is free right now is decided
         when a runtime starts, because Colab does not promise availability.
         """
-        table = {
-            name: Instance(self, gpu=name, vram_gb=spec.get("vram_gb"))
-            for name, spec in GPUS.items()
-        }
+        table: dict[str, Instance] = {"CPU": Instance(self, gpu=None)}
+        table.update(
+            {
+                name: Instance(self, gpu=name, vram_gb=spec.get("vram_gb"))
+                for name, spec in GPUS.items()
+            }
+        )
         table.update({name: Instance(self, tpu=name) for name in TPUS})
         for alias, target in ALIASES.items():
             table[alias] = table[target]
