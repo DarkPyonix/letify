@@ -21,17 +21,12 @@ letify distinguishes two kinds of failure, and the distinction decides whether a
 
 ## `NotRunning`
 
-```
-NotRunning: train was called outside a run scope. Wrap the call in
-`with let.run():` so letify knows when to start and stop paying for a session.
-```
+This error no longer exists. Sessions need no scope: a call starts one and ends it, so there
+is nothing to be outside of.
 
-Sessions exist only inside the scope. This is deliberate: the point where money starts and stops should be visible in the code.
-
-```python
-with let.run():
-    train(lr=1e-4)
-```
+If you are reading an older example that wraps calls in `with let.run():`, delete the wrapper
+and dedent the body. Declare `lifetime="process"` if those calls were sharing a session on
+purpose.
 
 ---
 
@@ -86,20 +81,20 @@ Add it to .letify, or to ~/.letify if it carries credentials.
 colab_a does not offer 'B200'. Available: A100, G4, H100, L4, T4, v5e1, v6e1
 ```
 
-Both messages list what exists. `letify providers` and `letify gpus` show the same thing from the shell.
+Both messages list what exists. `letify providers` and `letify devices` show the same thing from the shell.
 
 ---
 
 ## `UnsupportedMode`
 
 ```
-Colab does not support cpu='local'. Forwarding CUDA calls over the Colab control
+Colab does not support host='local'. Forwarding CUDA calls over the Colab control
 path costs one round trip of about 150 ms per host synchronization, which leaves
 roughly half the throughput for fine-tuning and a few percent for token by token
-decoding. Use cpu='remote' so the loop runs inside the runtime.
+decoding. Use host='remote' so the loop runs inside the runtime.
 ```
 
-This is letify refusing to take a slower path silently. Use `cpu="remote"`, or move that work to a provider with a fast path, which is `Shell`, `Tunnel` or `Elice`. See [Execution modes](03-execution-modes.md).
+This is letify refusing to take a slower path silently. Use `host="remote"`, or move that work to a provider with a fast path, which is `Shell`, `Tunnel` or `Elice`. See [Execution modes](03-execution-modes.md).
 
 ---
 
@@ -151,7 +146,7 @@ letify discards the runtime and retries once by default, because the session is 
 ## `RuntimeFailure` and `RuntimeLost`
 
 ```
-train failed after 2 attempt(s) on <Instance colab_a:G4 cpu=remote>: ...
+train failed after 2 attempt(s) on <Instance colab_a:G4 host=remote>: ...
 ```
 
 The session could not be reached or a command failed. `RuntimeFailure` carries the command and the remote stderr:
@@ -195,7 +190,7 @@ You have no volume attached. Add one.
 ```python
 cache = colab.volume("hf-cache")
 
-@let.function(gpu=colab.G4, volumes=[cache])
+@let.function(device=colab.G4, host="remote", volumes=[cache])
 def train(lr): ...
 ```
 
@@ -203,7 +198,7 @@ Pulling 20 GB from a bucket next to the runtime is 40 to 60 seconds against 27 m
 
 ### Training is much slower than the same code run directly
 
-If `cpu="local"`, you are forwarding CUDA calls and paying a round trip per host synchronization. Measure both terms:
+If `host="local"`, you are forwarding CUDA calls and paying a round trip per host synchronization. Measure both terms:
 
 ```bash
 letify probe gpu.lab.example.edu
@@ -214,9 +209,9 @@ import torch
 torch.cuda.set_sync_debug_mode("warn")     # count warnings in one step
 ```
 
-Then `efficiency = T / (T + k × RTT)`. If the answer is poor, switch to `cpu="remote"` or reduce `k`. See [Execution modes](03-execution-modes.md).
+Then `efficiency = T / (T + k × RTT)`. If the answer is poor, switch to `host="remote"` or reduce `k`. See [Execution modes](03-execution-modes.md).
 
-If `cpu="remote"` and it is still slow, the loop itself is slow. It is running on the remote machine with no letify overhead per step, so profile it as you would locally.
+If `host="remote"` and it is still slow, the loop itself is slow. It is running on the remote machine with no letify overhead per step, so profile it as you would locally.
 
 ### Bulk transfers stall on a tunnel, while small commands work
 
@@ -252,7 +247,7 @@ If fewer came up than you asked for, the provider refused them. For Colab that l
 
 **`import letify` works with no providers installed.** That is the design. A provider whose package is missing reports itself unavailable and the rest keeps working.
 
-**`let.providers.gpus` shows `unavailable: ...` for one provider.** Also the design. One broken entry should not hide the others.
+**`let.providers.devices` shows `unavailable: ...` for one provider.** Also the design. One broken entry should not hide the others.
 
 **A GPU name is normalized.** `NVIDIA RTX PRO 6000 Blackwell` becomes `RTX_PRO_6000` so it can be an attribute. On Colab the same card is `G4`, which is what the CLI calls it, and `RTX_PRO_6000` is accepted as an alias.
 
@@ -267,7 +262,7 @@ Include the output of:
 ```bash
 letify --version
 letify providers
-letify gpus
+letify devices
 ```
 
 Plus the full traceback. For a `RemoteError`, include `exc.remote_traceback`; for a `RuntimeFailure`, include `exc.command` and `exc.stderr`. Redact account names and addresses, and never paste a token.

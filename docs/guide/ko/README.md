@@ -32,19 +32,18 @@ import letify
 let = letify.Launcher()
 colab = let.providers.colab_a
 
-@let.function(gpu=colab.G4)
+@let.function(device=colab.G4, host="remote")
 def train(lr, bs):
     ...
     return {"loss": loss}
 
-with let.run():
-    print(train(lr=1e-4, bs=32))
+print(train(lr=1e-4, bs=32))
 ```
 
 다른 걸 읽기 전에 세 가지만 알면 됩니다.
 
 1. **함수를 호출하면 실행됩니다.** `.remote()` 같은 건 없습니다. 동기냐 비동기냐는 `def`로 썼는지 `async def`로 썼는지가 결정합니다.
-2. **`with let.run():`이 돈이 시작되고 끝나는 지점입니다.** 그 밖에서 호출하면 예외가 납니다.
+2. **호출이 자기 세션을 시작하고 끝냅니다.** 열 스코프도 내릴 것도 없습니다. 여러 호출이 세션을 공유해야 하면 `lifetime="process"`를 선언합니다.
 3. **letify는 조용히 느린 쪽으로 넘어가지 않습니다.** 쓸 수 없는 방식을 요청하면 이유를 설명하는 예외를 받습니다.
 
 ---

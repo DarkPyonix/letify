@@ -21,7 +21,7 @@ here  = let.providers.local        # always exists, needs no declaration
 An accelerator is then an attribute of the provider, and that value carries everything a declaration needs.
 
 ```python
-@let.function(gpu=colab.G4)
+@let.function(device=colab.G4, host="remote")
 def train(lr): ...
 ```
 
@@ -81,7 +81,7 @@ Uses the official Colab CLI, so there is no tunnel and no terms risk. Sessions a
 
 Two things to know. Accelerators require a Pro or Pro plus entitlement, and the remote control features are permitted while the compute unit balance stays positive. An exhausted balance reverts the account to the free tier policy, which disallows them.
 
-`cpu="local"` raises here. The control path crosses a Google frontend, so the round trip is 150 ms to 200 ms from Korea, which leaves about half the throughput for fine-tuning and a few percent for decoding. The message says exactly that.
+`host="local"` raises here. The control path crosses a Google frontend, so the round trip is 150 ms to 200 ms from Korea, which leaves about half the throughput for fine-tuning and a few percent for decoding. The message says exactly that.
 
 ## 🐚 Shell, for a lab or university server
 
@@ -150,7 +150,7 @@ kind = "modal"
 
 Reads its credentials the way the Modal client does. Storage is persistent because a Modal volume is mounted from outside the container, so function shipping is the default and no separate cache tier is needed.
 
-`cpu="local"` raises. Modal exposes function calls into a container, not a device to forward calls at.
+`host="local"` raises. Modal exposes function calls into a container, not a device to forward calls at.
 
 The Modal package is imported lazily. Without it, this provider reports itself unavailable and every other provider keeps working.
 
@@ -167,7 +167,7 @@ key = "~/.ssh/elice.pem"
 access_token_env = "ELICE_ACCESS_TOKEN"
 ```
 
-Targets Elice Cloud Infrastructure, which has a published REST API. letify powers the machine on and off by creating and deleting an allocation, which maps exactly onto a runtime, so `with let.run():` follows Elice's own lifecycle.
+Targets Elice Cloud Infrastructure, which has a published REST API. letify powers the machine on and off by creating and deleting an allocation, which maps exactly onto a session, so a call's own lifetime follows Elice's.
 
 **letify does not create the machine.** Declare the virtual machine once in the console or with Terraform and put its id in `machine_id`. letify allocates and releases it.
 
@@ -205,10 +205,10 @@ account = "second@example.com"
 a = let.providers.colab_a
 b = let.providers.colab_b
 
-@let.function(gpu=a.G4)
+@let.function(device=a.G4, host="remote")
 def train(lr): ...
 
-@let.function(gpu=b.L4)
+@let.function(device=b.L4, host="remote")
 def evaluate(ckpt): ...
 ```
 
@@ -217,7 +217,7 @@ Training on one account while evaluation runs on another is a common arrangement
 ## 🎲 Not choosing a provider
 
 ```python
-@let.function(gpu=let.providers.any.A100)
+@let.function(device=let.providers.any.A100, host="remote")
 def train(lr): ...
 ```
 
@@ -227,7 +227,7 @@ Picks the first declared provider that registered an `A100`. Priority is the ord
 
 ```python
 let.providers.aliases          # ['colab_a', 'lab_a100', 'local']
-let.providers.gpus             # accelerators per provider
+let.providers.devices             # accelerators per provider
 let.providers.active           # providers currently holding a runtime
 let.providers.colab_a.instances
 let.providers.lab_a100.refresh()   # ask the machine again
@@ -237,7 +237,7 @@ let.providers.lab_a100.refresh()   # ask the machine again
 
 ```bash
 letify providers
-letify gpus
+letify devices
 letify status
 letify check lab_a100
 ```

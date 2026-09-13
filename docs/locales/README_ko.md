@@ -23,14 +23,13 @@ import letify
 let = letify.Launcher()
 colab = let.providers.colab_a
 
-@let.function(gpu=colab.G4, concurrency=3)
+@let.function(device=colab.G4, host="remote", concurrency=3)
 def train(lr, bs):
     import torch
     ...
     return {"loss": loss}
 
-with let.run():
-    print(train(lr=1e-4, bs=32))
+print(train(lr=1e-4, bs=32))
 ```
 
 세션을 만들 필요도, 환경을 설치할 필요도, 파일을 올릴 필요도 없습니다. 노트북을 닫아도 GPU가 혼자 돌아가지 않습니다. 🎉
@@ -69,12 +68,11 @@ with let.run():
 </td><td>
 
 ```python
-@let.function(gpu=colab.G4, volumes=[cache])
+@let.function(device=colab.G4, host="remote", volumes=[cache])
 def train(lr, bs):
     ...
 
-with let.run():
-    train(lr=1e-4, bs=32)
+train(lr=1e-4, bs=32)
 ```
 
 </td></tr>
@@ -123,11 +121,11 @@ persistent = true
 
 ```bash
 $ letify providers
-colab_a   colab   ephemeral   cpu=remote
-lab_a100  shell   persistent  cpu=remote
-local     local   persistent  cpu=local
+colab_a   colab   ephemeral   host=remote
+lab_a100  shell   persistent  host=remote
+local     local   persistent  host=local
 
-$ letify gpus
+$ letify devices
 {
   "colab_a":  ["A100", "G4", "H100", "L4", "T4", "v5e1", "v6e1"],
   "lab_a100": ["A100"],
@@ -145,13 +143,12 @@ env = letify.Env()                      # uv.lock을 읽습니다
 colab = let.providers.colab_a
 cache = colab.volume("hf-cache")        # 세션보다 오래 살아남습니다
 
-@let.function(gpu=colab.G4, env=env, volumes=[cache], concurrency=3)
+@let.function(device=colab.G4, host="remote", env=env, volumes=[cache], concurrency=3)
 def train(lr, bs):
     ...
     return {"loss": loss}
 
-with let.run():
-    print(train(lr=1e-4, bs=32))
+print(train(lr=1e-4, bs=32))
 ```
 
 프로그램 전체가 이게 끝입니다. 🍰
@@ -174,8 +171,8 @@ with let.run():
 둘 중 어느 것도 직접 고르지 않습니다. CPU 쪽 작업이 어디서 도는지만 말하면 됩니다.
 
 ```python
-@let.function(gpu=colab.G4)                   # 기본값: 루프가 원격에서 돕니다
-@let.function(gpu=lab.A100(cpu="local"))      # Python은 여기, CUDA 호출만 저쪽으로
+@let.function(device=colab.G4, host="remote")                   # 기본값: 루프가 원격에서 돕니다
+@let.function(device=lab.A100, host="remote", host="local")      # Python은 여기, CUDA 호출만 저쪽으로
 ```
 
 그리고 기본값은 프로바이더에서 나옵니다. **저장소가 결정합니다.** 프로바이더의 디스크가 세션보다 오래 살면 데이터가 이미 거기 있으니 루프를 보내는 게 자연스럽습니다. 그렇지 않으면 상태를 로컬에 두는 편이 낫지만, 회선이 감당할 때만 그렇습니다.
@@ -230,17 +227,17 @@ Provider
 a = let.providers.colab_a
 b = let.providers.colab_b
 
-@let.function(gpu=a.G4)
+@let.function(device=a.G4, host="remote")
 def train(lr): ...
 
-@let.function(gpu=b.L4)      # 다른 계정, 같은 프로그램
+@let.function(device=b.L4, host="remote")      # 다른 계정, 같은 프로그램
 def evaluate(ckpt): ...
 ```
 
 **아예 고르지 않아도 됩니다.**
 
 ```python
-@let.function(gpu=let.providers.any.A100)   # A100이 있는 첫 프로바이더
+@let.function(device=let.providers.any.A100, host="remote")   # A100이 있는 첫 프로바이더
 def train(lr): ...
 ```
 
@@ -259,15 +256,14 @@ both  = letify.grid(lr=[1e-4]) | letify.grid(lr=[1e-3])   # 합집합
 소비하는 방법은 이미 알고 있는 파이썬 문법입니다. 🐍
 
 ```python
-@let.function(gpu=colab.G4, concurrency=3)
+@let.function(device=colab.G4, host="remote", concurrency=3)
 async def train(lr, bs):
     ...
 
-with let.run():
-    results = await train(space)              # 입력 순서대로 리스트
+results = await train(space)              # 입력 순서대로 리스트
 
-    async for r in train(space):              # 끝나는 대로 하나씩
-        print(r)
+async for r in train(space):              # 끝나는 대로 하나씩
+    print(r)
 ```
 
 > 🧵 **동기와 비동기는 호출이 아니라 `def` 자리에서 선언합니다.** 평범한 `def`는 블로킹이고, `async def`는 코루틴을 주니 `await`와 `asyncio.gather`가 평소와 똑같이 동작합니다. letify가 자체 future 타입을 만들지 않고, 외울 `.remote()`나 `.spawn()`, `.map()`도 없습니다.
@@ -281,7 +277,7 @@ with let.run():
 ```python
 cache = colab.volume("hf-cache")
 
-@let.function(gpu=colab.G4, volumes=[cache])
+@let.function(device=colab.G4, host="remote", volumes=[cache])
 def train(lr): ...
 ```
 
@@ -307,18 +303,20 @@ def train(lr): ...
 
 ## 💸 청구서가 폭주할 수 없습니다
 
-세 겹인데, 사용자는 첫 번째만 생각하면 됩니다.
+손으로 내릴 것이 없습니다.
 
-```python
-with let.run():          # 1️⃣ 이걸 벗어나면 모든 세션이 정리됩니다
-    train(lr=1e-4)
-```
+**호출이 자기 세션을 끝냅니다.** 이게 기본이고, 스윕도 호출 하나로 세니 6개 조합이 세션을 한 번
+열고 한 번 닫습니다.
 
-2️⃣ **유휴 타임아웃.** 스코프가 열려 있어도 아무도 안 쓰는 세션은 내려갑니다.
+**`lifetime="process"`가 선택 사항입니다.** 이어지는 호출들이 매번 세션 시작 비용을 내야 하는
+경우를 위한 것이고, 더 쓰이지 않으면 유휴 정리가 가져갑니다.
 
-3️⃣ **하트비트 리스.** 세션이 기한을 들고 있고, 이 프로세스가 계속 갱신합니다. 스크립트를 죽이든, 노트북을 잃든, 커널이 터지든 GPU가 스스로 종료합니다. 유예 시간이 넉넉해서 회선이 잠깐 끊기는 것으로 학습이 죽지는 않습니다.
+**리스가 안전장치입니다.** 세션이 기한을 들고 있고 이 프로세스가 계속 갱신합니다. 스크립트를
+죽이든, 노트북을 잃든, 커널이 터지든 GPU가 스스로 종료합니다. 유예 시간이 넉넉해서 회선이
+불안정한 것만으로 학습이 죽지는 않습니다.
 
-> 🚫 **분리 실행은 일부러 넣지 않았습니다.** 분리해서 돌리다가 원격이 선점되면 결과까지 잃습니다. 대신 로컬 프로세스가 소유자로 남고, 저장소의 체크포인트가 지속성을 담당합니다.
+> 🚫 **분리 실행은 일부러 넣지 않았습니다.** 분리해서 돌리다가 원격이 선점되면 결과까지 잃습니다.
+> 대신 로컬 프로세스가 소유자로 남고, 저장소의 체크포인트가 지속성을 담당합니다.
 
 ---
 
@@ -330,12 +328,11 @@ with let.run():          # 1️⃣ 이걸 벗어나면 모든 세션이 정리�
 def test_train_returns_a_loss():
     let = letify.Launcher(home=False)
 
-    @let.function(gpu=let.providers.local.CPU)
+    @let.function(device=let.providers.local.CPU, host="remote")
     def train(lr):
         return {"loss": 1.0 / lr}
 
-    with let.run():
-        assert train(lr=2.0)["loss"] == 0.5
+    assert train(lr=2.0)["loss"] == 0.5
 ```
 
 ---
@@ -344,7 +341,7 @@ def test_train_returns_a_loss():
 
 ```bash
 letify providers      # 선언된 프로바이더, 저장소 수명, 기본 배치
-letify gpus           # 각자 제공하는 GPU
+letify devices           # 각자 제공하는 GPU
 letify status         # 지금 돌고 있는 것
 letify check lab      # 이 머신이 응답하나?
 letify probe lab      # 호출 중계를 쓸 만큼 가까운가?

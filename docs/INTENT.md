@@ -38,18 +38,24 @@ Reusing a session across calls with the same instance and environment reduces th
 
 For an environment or a model cache, packing a tree into one hash-named blob transfers faster than synchronizing files individually, and immutable naming removes the write conflicts that a two way synchronization has between concurrent sessions.
 
-### N5. Storage persistence, not the provider's identity, decides the right execution mode
+### N5. A declaration should state the execution mode rather than have it derived
 
-Whether a provider's storage outlives a runtime determines whether shipping the function or forwarding calls is the better default, and a cache tier attached to an ephemeral provider is enough to move it into the persistent case.
+Two modes that differ by a factor of two in throughput and by a factor of fifty for decoding are too far apart to be chosen implicitly. A reader of the declaration should be able to see which one it uses, and nothing should infer it from storage or link properties.
 
-### N6. One declarative surface can cover every provider without a user-visible mode switch
+### N6. Three placements are enough to cover every provider without naming a mechanism
 
-A user can express their intent as resources, that is which accelerator and where the CPU side runs, and never name a transport mechanism, with letify choosing the mechanism from the provider's properties.
+A declaration that says where the accelerator is, where the host code runs and how long the session lives is enough to place any supported workload, and a user never has to name a transport, a channel kind or a storage backend.
+
+### N7. Batching driver calls makes the round trip count the synchronization count
+
+Forwarding is viable only if a step that issues thousands of driver calls pays a handful of round trips. Queueing every call whose result the host does not read achieves that, so the efficiency model is `T / (T + k * RTT)` with `k` counting host synchronizations rather than calls.
 
 ## Constraints
 
-- **Python only.** No compiled extension in the package. A wheel that has to be built for each platform is a maintenance cost this project will not carry, and hashing and transfer are not CPU bound at the link speeds involved.
+- **The Python package is pure Python.** No compiled extension in `letify/`. A wheel that has to be built for each platform is a maintenance cost this project will not carry, and hashing and transfer are not CPU bound at the link speeds involved.
+- **One native component, built separately.** Standing in for the CUDA driver cannot be done from Python, so that job lives in `letify-core/` as a Rust workspace. Only whoever uses `host="local"` builds it, and the Python package works without it.
 - **The local process stays alive for the duration of a run.** letify does not offer detached execution. A detached run whose remote side is evicted loses its results, so the local process stays the owner and the durable artifacts are checkpoints in the store.
+- **Nothing is torn down by hand.** No release call and no shutdown call on the public surface. A call ends its own session, an idle one is reaped, and the lease covers a crash.
 - **No credential in a tracked file.** Accounts and keys live in `~/.letify` or in the environment or the OS keyring.
 - **Colab accelerators require a paid entitlement.** The remote control features letify uses are permitted on paid plans while the compute unit balance is positive.
 
@@ -70,3 +76,4 @@ Each of these would change a claim or a default. Answering one is a good first e
 4. **Is NVFP4 reachable in a stock Colab runtime?** Needs the CUDA version, the compute capability and whether the quantization stack installs.
 5. **Is the Elice SSH port stable across a restart?** If it is not, the configuration needs a command that resolves the current port.
 6. **What does Elice spot pricing cost?** The API exposes a pricing id, which suggests preemptible instances are available. This is a direct cost lever.
+7. **Which driver entry points does a real NVFP4 fine-tune actually reach?** `letify-driver` implements what a PyTorch process needs to start up and run one kernel, and names anything else it is asked for. One real run produces the list of what to implement next, which is the only honest way to size the remaining work.

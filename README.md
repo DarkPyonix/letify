@@ -9,7 +9,7 @@
 [![Python](https://img.shields.io/badge/python-3.11%2B-3776AB?logo=python&logoColor=white)](https://www.python.org/)
 [![License](https://img.shields.io/badge/license-MIT-black)](LICENSE)
 [![Providers](https://img.shields.io/badge/providers-Colab%20%7C%20Modal%20%7C%20SSH%20%7C%20Local-6C5CE7)](#-providers)
-[![Pure Python](https://img.shields.io/badge/pure-python-2ECC71)](pyproject.toml)
+[![letify-core](https://img.shields.io/badge/letify--core-rust-DEA584?logo=rust&logoColor=white)](letify-core/)
 
 [Quickstart](#-quickstart) · [Why](#-why-this-exists) · [Providers](#-providers) · [Sweeps](#-sweeps) · [Docs](docs/) · [한국어](docs/locales/README_ko.md)
 
@@ -23,17 +23,16 @@ import letify
 let = letify.Launcher()
 colab = let.providers.colab_a
 
-@let.function(gpu=colab.G4, concurrency=3)
+@let.function(device=colab.G4, host="remote", concurrency=3)
 def train(lr, bs):
     import torch
     ...
     return {"loss": loss}
 
-with let.run():
-    print(train(lr=1e-4, bs=32))
+print(train(lr=1e-4, bs=32))
 ```
 
-No session to create. No environment to install. No files to upload. No machine left running when you close the lid. 🎉
+No session to create. No environment to install. No files to upload. No scope to open, and no machine left running when you close the lid. 🎉
 
 ---
 
@@ -69,12 +68,12 @@ The catch is that the cheap door is a notebook: no persistent disk, eviction at 
 </td><td>
 
 ```python
-@let.function(gpu=colab.G4, volumes=[cache])
+@let.function(device=colab.G4, host="remote",
+              volumes=[cache])
 def train(lr, bs):
     ...
 
-with let.run():
-    train(lr=1e-4, bs=32)
+train(lr=1e-4, bs=32)
 ```
 
 </td></tr>
@@ -94,7 +93,9 @@ uv add "letify[s3]"           # S3 compatible cache
 uv add "letify[all]"          # everything
 ```
 
-Pure Python. No compiled extension, no wheel to build, no toolchain. A provider whose package is missing simply reports itself unavailable, and the rest keeps working.
+The Python package is pure Python. A provider whose package is missing simply reports itself unavailable, and the rest keeps working.
+
+One optional piece is native. `host="local"` needs [letify-core](letify-core/), a Rust workspace that stands in for the CUDA driver, built with `python letify-core/build.py`. If you only ship functions to remote machines you never need it.
 
 ---
 
@@ -123,11 +124,11 @@ persistent = true
 
 ```bash
 $ letify providers
-colab_a   colab   ephemeral   cpu=remote
-lab_a100  shell   persistent  cpu=remote
-local     local   persistent  cpu=local
+colab_a   colab   ephemeral   channel=persistent
+lab_a100  shell   persistent  channel=persistent
+local     local   persistent  channel=persistent
 
-$ letify gpus
+$ letify devices
 {
   "colab_a":  ["A100", "G4", "H100", "L4", "T4", "v5e1", "v6e1"],
   "lab_a100": ["A100"],
@@ -145,61 +146,59 @@ env = letify.Env()                      # reads uv.lock
 colab = let.providers.colab_a
 cache = colab.volume("hf-cache")        # survives the session
 
-@let.function(gpu=colab.G4, env=env, volumes=[cache], concurrency=3)
+@let.function(device=colab.G4, host="remote", env=env, volumes=[cache], concurrency=3)
 def train(lr, bs):
     ...
     return {"loss": loss}
 
-with let.run():
-    print(train(lr=1e-4, bs=32))
+print(train(lr=1e-4, bs=32))
 ```
 
 That is the whole program. 🍰
 
 ---
 
-## 🧭 The one idea
+## 🧭 What a declaration says
 
-**You declare resources. letify picks the mechanism.**
-
-There are two ways to use a remote GPU, and they have wildly different performance depending on where you and the GPU are.
-
-| | 📦 Function shipping | 🔌 CUDA call forwarding |
-|---|---|---|
-| What moves | your whole loop, once | every CUDA call, always |
-| Cost | one transfer | one round trip per host sync |
-| Fine-tuning at 150 ms | **~99%** | 50 to 57% |
-| Decoding at 150 ms | **hundreds of tok/s** | 2 to 7 tok/s |
-
-You never name either one. You say where the CPU side of the work lives:
+Three words, and none of them is a mechanism.
 
 ```python
-@let.function(gpu=colab.G4)                   # default: loop runs remotely
-@let.function(gpu=lab.A100(cpu="local"))      # Python stays here, CUDA calls go there
+@let.function(
+    device=colab.G4,       # where the accelerator is, with provider and account
+    host="remote",         # where the host code runs
+    lifetime="call",       # how long the session lives
+)
 ```
 
-And the default comes from your provider, because **storage decides**. If a provider's disk outlives a session, your data is already there and shipping the loop is natural. If it does not, keeping state local makes more sense, but only when the link is fast enough to afford it.
+**`device`** carries the provider, the account and the accelerator in one value, because those are one decision. Core count and memory come with the shape the provider registered, so there is nothing to ask for.
 
-> ⚠️ letify **never** silently falls back to the slower mode. Ask for something a provider cannot serve and you get an exception with the arithmetic in the message, not a run that mysteriously takes four times as long.
+**`host`** is the CUDA word for the CPU side. `"local"`, the default, keeps Python and the libraries in this process and forwards only CUDA calls. `"remote"` ships the function to the machine that holds the device.
+
+**`lifetime`** is how long the session lives. `"call"`, the default, ends it with the call, counting a search space as one call. `"process"` keeps it so a run of separate calls does not pay session start each time.
 
 <details>
-<summary><b>📐 The formula, if you like formulas</b></summary>
+<summary><b>📐 Which host to pick, with the arithmetic</b></summary>
 
-Efficiency against running directly on the machine is:
+| | 📦 `host="remote"` | 🔌 `host="local"` |
+|---|---|---|
+| What moves | your whole loop, once | every CUDA call |
+| Cost | one transfer | one round trip per host synchronization |
+| Fine-tuning at 150 ms | **~99%** | 53% default, ~96% tuned |
+| Decoding at 150 ms | **hundreds of tok/s** | 2 to 7 tok/s |
 
-```
-efficiency = T / (T + k × RTT)
-```
+Efficiency against a direct run is `T / (T + k × RTT)`, where `T` is GPU time per step and `k` is how many times per step the host reads a value back from the device.
 
-where `T` is GPU time per step and `k` is how many times per step the host reads a value back from the device.
-
-A default Hugging Face training step has `k ≈ 3`: the trainer's NaN filter, the attention mask check, and logging. With a 0.5 s NVFP4 micro step at 150 ms round trip, that is 53%.
+A default Hugging Face training step has `k ≈ 3`: the trainer's NaN filter, the SDPA attention mask check, and logging. With a 0.5 s NVFP4 micro step at 150 ms that is 53%. Turn the NaN filter off, remove the mask check with fixed length packing, and log at the gradient accumulation boundary, and it is about 96%.
 
 Counter-intuitive consequence: **a faster GPU makes forwarding worse**, because `T` shrinks and `RTT` does not. The same step on an L4 takes 1.8 s and reaches 80%.
 
-Measure your own `k` with `torch.cuda.set_sync_debug_mode("warn")`. See [docs/NETWORK.md](docs/NETWORK.md).
+Decoding is the case that stays bad. Throughput is bounded near `1000 / (k × RTT)` tokens per second, so the card stops mattering. Ship the whole `generate` call instead.
+
+Measure your own `k` with `torch.cuda.set_sync_debug_mode("warn")` and your round trip with `letify probe`. See [docs/NETWORK.md](docs/NETWORK.md).
 
 </details>
+
+> ⚠️ letify **never** silently changes the mode. Ask for something a provider cannot serve and you get an exception naming the reason. Ask for something slow and you get a warning with the numbers, and then it runs, because the choice is yours.
 
 ---
 
@@ -230,17 +229,17 @@ Provider
 a = let.providers.colab_a
 b = let.providers.colab_b
 
-@let.function(gpu=a.G4)
+@let.function(device=a.G4, host="remote")
 def train(lr): ...
 
-@let.function(gpu=b.L4)      # different account, same program
+@let.function(device=b.L4, host="remote")      # different account, same program
 def evaluate(ckpt): ...
 ```
 
 **Or do not pick at all:**
 
 ```python
-@let.function(gpu=let.providers.any.A100)   # first declared provider that has one
+@let.function(device=let.providers.any.A100, host="remote")
 def train(lr): ...
 ```
 
@@ -259,15 +258,14 @@ both  = letify.grid(lr=[1e-4]) | letify.grid(lr=[1e-3])   # union
 Then consume it with the language you already know. 🐍
 
 ```python
-@let.function(gpu=colab.G4, concurrency=3)
+@let.function(device=colab.G4, host="remote", concurrency=3)
 async def train(lr, bs):
     ...
 
-with let.run():
-    results = await train(space)              # list, in input order
+results = await train(space)              # list, in input order
 
-    async for r in train(space):              # streamed, as each finishes
-        print(r)
+async for r in train(space):              # streamed, as each finishes
+    print(r)
 ```
 
 > 🧵 **Sync or async is declared at the `def`, not at the call.** A plain `def` blocks. An `async def` gives you a coroutine, so `await` and `asyncio.gather` work exactly as they always do. letify adds no future type of its own, and there is no `.remote()`, `.spawn()` or `.map()` to remember.
@@ -281,7 +279,7 @@ A **volume** is a content addressed blob store. Contents are named by their hash
 ```python
 cache = colab.volume("hf-cache")
 
-@let.function(gpu=colab.G4, volumes=[cache])
+@let.function(device=colab.G4, host="remote", volumes=[cache])
 def train(lr): ...
 ```
 
@@ -305,18 +303,38 @@ All of that time is billed as GPU time. That is why an ephemeral provider with a
 
 ---
 
-## 💸 Your bill cannot run away
+## 🔗 Values that stay put
 
-Three layers, and you only have to think about the first.
+A session is one living process, so a value can stay in it.
 
 ```python
-with let.run():          # 1️⃣ leaving this tears every session down
-    train(lr=1e-4)
+@let.function(device=colab.G4, host="remote", lifetime="process", keep_remote=True)
+def build_model():
+    return load_model()          # 14 GB, stays on the remote machine
+
+@let.function(device=colab.G4, host="remote", lifetime="process")
+def evaluate(model, batch):
+    return model(batch)          # the handle resolves in place
+
+model = build_model()            # a Handle, not 14 GB
+evaluate(model=model, batch=...)
 ```
 
-2️⃣ **Idle timeout.** A session nobody uses inside an open scope is torn down anyway.
+Large arguments are content addressed too. Pass the same tensor to ten calls and it crosses the network once, because the runtime is asked by digest whether it already holds it.
 
-3️⃣ **Heartbeat lease.** The session holds a deadline that this process keeps renewing. Kill your script, lose your laptop, crash your kernel: the GPU shuts itself down. The grace period is long enough that a flaky connection does not kill a training run.
+A handle names the session that holds it. Passing one to a different session raises rather than quietly copying the object across, since that would be an unrequested transfer of everything it points at.
+
+---
+
+## 💸 Your bill cannot run away
+
+Nothing has to be torn down by hand.
+
+**A call ends its own session.** That is the default, and a sweep counts as one call, so six points start one set of sessions and end them once.
+
+**`lifetime="process"` is the opt in**, for a run of separate calls that would otherwise pay session start each time. The idle reaper takes it once it stops being used.
+
+**The lease is the backstop.** The session holds a deadline that this process keeps renewing. Kill your script, lose your laptop, crash your kernel: the GPU shuts itself down. The grace period is long enough that a flaky connection does not kill a training run.
 
 > 🚫 There is deliberately **no detached mode**. A detached run whose remote side gets preempted loses its results. Instead, the local process stays the owner, and durability comes from checkpoints in the store.
 
@@ -324,18 +342,17 @@ with let.run():          # 1️⃣ leaving this tears every session down
 
 ## 🧪 Test without a GPU, without mocks
 
-The `local` provider runs the same serialized call through the same driver script a remote runtime would. Your tests exercise the real path.
+The `local` provider starts the same worker behind the same framed protocol a remote runtime would. Your tests exercise the real path.
 
 ```python
 def test_train_returns_a_loss():
     let = letify.Launcher(home=False)
 
-    @let.function(gpu=let.providers.local.CPU)
+    @let.function(device=let.providers.local.CPU, host="remote")
     def train(lr):
         return {"loss": 1.0 / lr}
 
-    with let.run():
-        assert train(lr=2.0)["loss"] == 0.5
+    assert train(lr=2.0)["loss"] == 0.5
 ```
 
 ---
@@ -343,11 +360,12 @@ def test_train_returns_a_loss():
 ## 🛠️ CLI
 
 ```bash
-letify providers      # who is declared, persistence, default placement
-letify gpus           # what each one offers
-letify status         # what is running right now
-letify check lab      # does this machine answer?
-letify probe lab      # is it close enough for call forwarding?
+letify providers              # who is declared, storage, channel kind
+letify devices                # what each one offers
+letify status                 # what is running right now
+letify check lab              # does this machine answer?
+letify probe lab              # is host="local" worth using here?
+letify efficiency 0.5 3 150   # the formula, from measured terms
 ```
 
 ---
@@ -361,6 +379,7 @@ letify probe lab      # is it close enough for call forwarding?
 | 📐 [docs/SPEC.md](docs/SPEC.md) | The design as it stands, decision by decision |
 | 🧩 [docs/COMPONENT.md](docs/COMPONENT.md) | Every class, and the vocabulary |
 | 🌐 [docs/NETWORK.md](docs/NETWORK.md) | Transports, latency measurements, tunnel choices |
+| 🦀 [letify-core/](letify-core/) | The Rust workspace behind `host="local"` |
 | 🧭 [docs/guide/](docs/guide/) | Task-oriented guides |
 | 🇰🇷 [docs/locales/README_ko.md](docs/locales/README_ko.md) | 한국어 |
 
@@ -370,15 +389,17 @@ letify probe lab      # is it close enough for call forwarding?
 
 Alpha, and honest about it. What works today:
 
-✅ Declarations, sync and async, sweeps, pooling, scopes and the lease
-✅ The call protocol, content addressed storage, configuration and secrets
-✅ The `Local` and `Colab` providers, with 31 tests over the real code path
+✅ Declarations, sync and async, sweeps, pooling, session lifetimes and the lease
+✅ Persistent sessions: handles resolve in later calls, large arguments travel once
+✅ Content addressed storage, configuration and secrets
+✅ The `Local` and `Colab` providers
+✅ `letify-core`, verified on a real GPU: the agent opens the driver, the local driver forwards an allocation and a copy in both directions, and the bytes match
 
 Not finished yet:
 
-🚧 The persistent session process, so a `Handle` cannot yet be resolved by a later call
-🚧 CUDA call forwarding, which is currently a capability probe rather than a client
-🚧 `Modal` and `Elice`, written to each published interface but not yet run live
+🚧 `letify-driver` covers the entry points a PyTorch process needs to start up and run one kernel. Anything else names itself and returns `CUDA_ERROR_NOT_SUPPORTED`, so a real run prints the list of what to build next
+🚧 `Modal` and `Elice` follow each published interface but have not been run against the live services
+🚧 Unified memory cannot be forwarded at all, so a paged optimizer needs `host="remote"`
 
 The full list is at the end of [docs/SPEC.md](docs/SPEC.md).
 
@@ -386,7 +407,7 @@ The full list is at the end of [docs/SPEC.md](docs/SPEC.md).
 
 ## 🤝 Contributing
 
-Performance work in this repository uses [ResearchTree](https://darkpyonix.github.io/researchtree/): one branch is one experiment, one pull request is its lab note. Read [CLAUDE.md](CLAUDE.md) before opening one.
+Spec driven and test driven: settle [docs/SPEC.md](docs/SPEC.md), write the failing test, then write the code. Performance work uses [ResearchTree](https://darkpyonix.github.io/researchtree/), where one branch is one experiment and one pull request is its lab note. Read [CLAUDE.md](CLAUDE.md) before opening one.
 
 ---
 

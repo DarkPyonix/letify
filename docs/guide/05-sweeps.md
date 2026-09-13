@@ -36,16 +36,15 @@ letify.zip(lr=[1e-4, 3e-4, 1e-3], bs=[16, 32])
 The two orderings you might want are already in the language.
 
 ```python
-@let.function(gpu=colab.G4, concurrency=3)
+@let.function(device=colab.G4, host="remote", concurrency=3)
 async def train(lr, bs):
     ...
     return {"lr": lr, "bs": bs, "loss": loss}
 
-with let.run():
-    results = await train(space)          # list, in input order
+results = await train(space)          # list, in input order
 
-    async for result in train(space):     # as each finishes
-        print(result)
+async for result in train(space):     # as each finishes
+    print(result)
 ```
 
 `await` collects in input order, which is what you want for a results table. `async for` yields by completion, which is what you want when a sweep takes an hour and you would rather see the early results than wait.
@@ -53,17 +52,16 @@ with let.run():
 A sync declaration returns a list in input order:
 
 ```python
-@let.function(gpu=colab.G4, concurrency=3)
+@let.function(device=colab.G4, host="remote", concurrency=3)
 def train(lr, bs): ...
 
-with let.run():
-    rows = train(space)     # list
+rows = train(space)     # list
 ```
 
 ## Concurrency belongs to the declaration
 
 ```python
-@let.function(gpu=colab.G4, concurrency=3)
+@let.function(device=colab.G4, host="remote", concurrency=3)
 ```
 
 This is how many runtimes the declaration may occupy at once, not a property of any single call. It is part of the declaration because it describes the infrastructure that declaration is allowed to use.
@@ -92,13 +90,12 @@ The provider has its own limit, which for Colab is undocumented and moves with y
 ```python
 let = letify.Launcher(max_runtimes=6)
 
-@let.function(gpu=colab.L4, concurrency=6)
+@let.function(device=colab.L4, host="remote", concurrency=6)
 async def probe(n):
     return n
 
-with let.run():
-    await probe(letify.grid(n=list(range(6))))
-    print(len(let.pool.live))        # how many actually came up
+await probe(letify.grid(n=list(range(6))))
+print(len(let.pool.live))        # how many actually came up
 ```
 
 Use `L4` for this. It is the cheapest accelerator, so finding the limit costs almost nothing.
@@ -125,8 +122,7 @@ Confirm the final candidate on the bigger card.
 **Run a space, collect a table.**
 
 ```python
-with let.run():
-    rows = await train(letify.grid(lr=[1e-4, 3e-4, 1e-3], bs=[16, 32]))
+rows = await train(letify.grid(lr=[1e-4, 3e-4, 1e-3], bs=[16, 32]))
 
 best = min(rows, key=lambda r: r["loss"])
 print(best)
@@ -135,22 +131,20 @@ print(best)
 **Log as results arrive.**
 
 ```python
-with let.run():
-    async for row in train(space):
-        wandb.log(row)
+async for row in train(space):
+    wandb.log(row)
 ```
 
 **Train and evaluate at the same time, on different providers.**
 
 ```python
-@let.function(gpu=colab.G4, concurrency=1)
+@let.function(device=colab.G4, host="remote", concurrency=1)
 async def train(lr): ...
 
-@let.function(gpu=lab.A100, concurrency=1)
+@let.function(device=lab.A100, host="remote", concurrency=1)
 async def evaluate(ckpt): ...
 
-with let.run():
-    await asyncio.gather(train(lr=1e-4), evaluate(ckpt="run-1"))
+await asyncio.gather(train(lr=1e-4), evaluate(ckpt="run-1"))
 ```
 
 Because each declaration names its own instance, one runs on Colab and the other on your lab server with no extra machinery.

@@ -23,12 +23,11 @@ import letify
 
 let = letify.Launcher()
 
-@let.function(gpu=let.providers.local.CPU)
+@let.function(device=let.providers.local.CPU, host="remote")
 def add(a, b):
     return a + b
 
-with let.run():
-    print(add(a=2, b=3))      # 5
+print(add(a=2, b=3))      # 5
 ```
 
 That already went through the real path: the function was serialized, sent to a separate process, executed under the driver script, and its result decoded. Only the distance was missing.
@@ -61,11 +60,11 @@ The alias, `colab_a` here, has to be a Python identifier, because you reach prov
 
 ```bash
 $ letify providers
-colab_a   colab   ephemeral   cpu=remote
-lab_a100  shell   ephemeral   cpu=local
-local     local   persistent  cpu=local
+colab_a   colab   ephemeral   host=remote
+lab_a100  shell   ephemeral   host=local
+local     local   persistent  host=local
 
-$ letify gpus
+$ letify devices
 {
   "colab_a": ["A100", "G4", "H100", "L4", "T4", "v5e1", "v6e1"],
   "lab_a100": ["A100"],
@@ -89,7 +88,7 @@ import letify
 let = letify.Launcher()
 colab = let.providers.colab_a
 
-@let.function(gpu=colab.G4)
+@let.function(device=colab.G4, host="remote")
 def check():
     import torch
 
@@ -100,8 +99,7 @@ def check():
         "capability": torch.cuda.get_device_capability(0),
     }
 
-with let.run():
-    print(check())
+print(check())
 ```
 
 If `capability` comes back as `(12, 0)`, you have a Blackwell card, which is what `G4` is. That is the check to run before assuming NVFP4 will work.
@@ -115,7 +113,7 @@ env = letify.Env()                        # uv.lock
 env = env.pip_install("flash-attn")       # things the lock file does not carry
 env = env.vars(HF_HOME="/opt/cache")      # environment variables in the runtime
 
-@let.function(gpu=colab.G4, env=env)
+@let.function(device=colab.G4, host="remote", env=env)
 def train(lr, bs): ...
 ```
 
@@ -126,7 +124,7 @@ This is the single change that makes a short session usable.
 ```python
 cache = colab.volume("hf-cache")
 
-@let.function(gpu=colab.G4, env=env, volumes=[cache])
+@let.function(device=colab.G4, host="remote", env=env, volumes=[cache])
 def train(lr, bs): ...
 ```
 
@@ -135,15 +133,14 @@ A twenty gigabyte model cache takes 27 minutes from a lab server over a 100 Mbit
 ## Run several configurations
 
 ```python
-@let.function(gpu=colab.G4, env=env, concurrency=3)
+@let.function(device=colab.G4, host="remote", env=env, concurrency=3)
 async def train(lr, bs):
     ...
     return {"lr": lr, "bs": bs, "loss": loss}
 
 async def main():
-    with let.run():
-        async for result in train(letify.grid(lr=[1e-4, 3e-4, 1e-3], bs=[16, 32])):
-            print(result)
+    async for result in train(letify.grid(lr=[1e-4, 3e-4, 1e-3], bs=[16, 32])):
+        print(result)
 
 asyncio.run(main())
 ```
@@ -152,7 +149,7 @@ asyncio.run(main())
 
 ## What to know before going further
 
-**A call outside the scope raises.** `with let.run():` is where sessions may exist. That is deliberate, so the point where money starts and stops is visible in the code.
+**A call needs nothing around it.** The session starts on the call and ends when the call finishes, so there is no scope to open and nothing to tear down. Declare `lifetime="process"` when a run of separate calls should share one session.
 
 **Your script has to stay alive.** There is no detached mode. If the local process exits, the remote session shuts itself down within the lease grace period. For a long run, write checkpoints to a volume so a restart resumes. See [Cost control](06-cost.md).
 

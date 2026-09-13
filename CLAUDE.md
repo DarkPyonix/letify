@@ -12,6 +12,63 @@ These are not preferences. Breaking one means the change gets reverted.
 4. **Commit subjects use a capitalized type prefix followed by a colon.** For example `Feat: Add the Colab provider`, `Fix: Release the session lock when exec raises`, `Docs: Describe the blob store layout`. Use the imperative mood and name the thing that changed. Allowed prefixes: `Feat`, `Fix`, `Docs`, `Refactor`, `Test`, `Perf`, `Chore`, `Build`.
 5. **Never commit secrets.** Access tokens, SSH private keys and account credentials belong in the environment or the OS keyring, never in tracked files. `.letify` at the repository root holds project defaults only; credentials live in `~/.letify`.
 
+## How this project is built
+
+Spec driven and test driven, in that order. The sequence for any change that is not a
+typo fix is: settle the spec, write the test that would prove it, then write the code.
+
+### Spec first
+
+`docs/SPEC.md` is the single source of truth for what the system does. Code follows it,
+not the other way round.
+
+1. **Change the spec before the code.** If a change alters behaviour, edit the section of
+   `docs/SPEC.md` that describes it first. If no section describes it, add one. A change
+   with no spec entry has nowhere to be checked against.
+2. **A spec change is a hypothesis, not a settled requirement.** In research, whether a
+   design is right is decided by the experiment. So a design changing experiment edits the
+   spec on its own branch, and the verdict on the pull request, adopted or rejected, is
+   what decides whether that spec change reaches `develop`.
+3. **The spec records decisions only.** What the system does, the formula it uses, the
+   value chosen. Derivations, measurement tables and comparisons go in the pull request
+   body, and the spec links to it.
+4. **`docs/INTENT.md` sits above the spec.** It holds the claims the design is meant to
+   prove, with stable ids (`N1`, `N2`, ...). An experiment lists the claim it tests. When
+   evidence contradicts a claim, say so and propose the edit rather than leaving it
+   standing.
+
+### Test driven
+
+A test is written to state the expected behaviour before the code that satisfies it
+exists. The cycle is red, then green, then tidy.
+
+1. **Write the failing test first.** It names the behaviour, so the name reads as a
+   sentence: `test_a_handle_from_another_runtime_is_refused`. Run it and watch it fail for
+   the reason you expect, because a test that passes before the code is written is testing
+   nothing.
+2. **Write the smallest code that makes it pass.** Then clean up with the test as the net.
+3. **Every test traces to a spec section.** If you cannot say which section a test is
+   pinning, either the spec is missing an entry or the test is asserting an accident of the
+   implementation. Both are worth fixing.
+4. **A bug gets a failing test before a fix.** That is how it is shown to be real, and how
+   it stays fixed.
+5. **Exercise the real code path.** The `Local` provider starts the same worker behind the
+   same framed protocol a remote runtime uses, so anything testable through it should be.
+   A fake belongs only where the real thing needs a live account, a network or a GPU, and
+   it goes in `tests/conftest.py` rather than being written twice.
+6. **Coverage is a smoke detector, not a goal.** A line with no test is a question to ask.
+   Chasing a percentage with tests that assert nothing makes the suite worse, and a line
+   that genuinely needs a live service is marked `# pragma: no cover` with the reason.
+
+### What this rules out
+
+- Writing the implementation first and the tests afterwards to match whatever it happened
+  to do. That blesses accidents as behaviour.
+- Changing behaviour without touching the spec. The next reader then has two sources of
+  truth that disagree.
+- Deleting or loosening a test to make a change pass. If the test was wrong, say why in
+  the commit; if the behaviour changed on purpose, the spec changes with it.
+
 ## Writing style
 
 Everything written here is read by people first. Documentation, pull request bodies and commit messages follow the same rules.

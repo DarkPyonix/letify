@@ -8,24 +8,47 @@
 
 ## The three layers
 
+Nothing has to be torn down by hand. Four things end a session, and you only declare one of
+them.
+
+**1. The call.** A session ends when the call that needed it finishes. A search space counts
+as one call, so a sweep of six points starts one set of sessions and ends them once.
+
 ```python
-with let.run():          # 1️⃣ leaving this tears every session down
-    train(lr=1e-4)
+@let.function(device=colab.G4, host="remote")
+def train(lr): ...
+
+train(lr=1e-4)        # the session starts here and ends here
 ```
 
-**1. The scope.** Sessions exist only inside `with let.run():`. A call outside it raises `NotRunning` rather than quietly starting one. Nested scopes are allowed and only the outermost tears down, so a helper can open a scope without ending its caller's session.
+**2. The declaration.** `lifetime="process"` keeps the session past the call, for a run of
+separate calls that would otherwise pay session start each time. On Colab that start is
+provider boot plus environment installation, which is minutes.
 
-**2. The idle timeout.** A runtime nobody has used for longer than `idle_timeout` inside an open scope is torn down. Default 600 seconds.
+```python
+@let.function(device=colab.G4, host="remote", lifetime="process")
+def train(lr): ...
+
+train(lr=1e-4)        # starts a session
+train(lr=3e-4)        # reuses it
+```
+
+Two declarations that agree on device and environment share a session either way, because
+the pool keys by those rather than by which function asked.
+
+**3. The idle reaper.** A background thread ends any session unused for longer than
+`idle_timeout`, default 600 seconds. That is the backstop for a process-lifetime session
+nobody uses any more.
 
 ```python
 let = letify.Launcher(idle_timeout=300)
 ```
 
-**3. The heartbeat lease.** This is the one that matters. The session holds a deadline that your process renews every 30 seconds. If renewal stops for longer than the 300 second grace period, the session terminates itself.
-
-Kill your script, close your laptop, lose power: the GPU shuts down. The grace period is long enough that a flaky connection does not kill a training run.
-
-Without this layer, a crashed script leaves a session billing until the provider's own timeout, which on Colab can be 12 or 24 hours.
+**4. The lease.** The session holds a deadline that your process renews every 30 seconds,
+and it terminates itself if the deadline passes. The grace period is 300 seconds, so a
+flaky connection does not kill a training run while a crashed script cannot leave a GPU
+billing. Without this layer, a killed script leaves a session billing until the provider's
+own timeout, which on Colab can be 12 or 24 hours.
 
 ## Why there is no detached mode
 
@@ -42,7 +65,7 @@ Write checkpoints to a volume on a time interval rather than a step count. Then 
 ```python
 cache = colab.volume("hf-cache")
 
-@let.function(gpu=colab.G4, env=env, volumes=[cache])
+@let.function(device=colab.G4, host="remote", env=env, volumes=[cache])
 def train(lr, run="run-1"):
     # resume from the newest checkpoint under this name, if there is one
     # save every N minutes, not every N steps
@@ -109,13 +132,13 @@ Colab figures assume the 600 credit pack at 49.99 USD, which is about 0.083 USD 
 ```bash
 letify probe gpu.lab.example.edu     # round trip, and whether forwarding is viable
 letify check lab_a100                # does the machine answer at all?
-letify gpus                          # what each provider offers
+letify devices                          # what each provider offers
 ```
 
 For a new provider, run one trivial function first. A `check` declaration that returns the torch version and device name costs seconds and confirms the whole path before you commit a long run to it.
 
 ```python
-@let.function(gpu=colab.G4)
+@let.function(device=colab.G4, host="remote")
 def check():
     import torch
 

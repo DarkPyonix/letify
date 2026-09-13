@@ -32,19 +32,18 @@ import letify
 let = letify.Launcher()
 colab = let.providers.colab_a
 
-@let.function(gpu=colab.G4)
+@let.function(device=colab.G4, host="remote")
 def train(lr, bs):
     ...
     return {"loss": loss}
 
-with let.run():
-    print(train(lr=1e-4, bs=32))
+print(train(lr=1e-4, bs=32))
 ```
 
 Three things to know before you read anything else:
 
 1. **Calling the function runs it.** There is no `.remote()`. Sync or async is decided by whether you wrote `def` or `async def`.
-2. **`with let.run():` is where money starts and stops.** Outside it, a call raises.
+2. **A call starts and ends its own session.** There is no scope to open and nothing to tear down. `lifetime="process"` keeps one across several calls.
 3. **letify never silently takes a slower path.** If a mode is unavailable you get an exception explaining why.
 
 ---

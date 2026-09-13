@@ -55,7 +55,7 @@ A volume is a content addressed blob store on whatever storage your provider has
 ```python
 cache = colab.volume("hf-cache")
 
-@let.function(gpu=colab.G4, env=env, volumes=[cache])
+@let.function(device=colab.G4, host="remote", env=env, volumes=[cache])
 def train(lr): ...
 ```
 
@@ -140,7 +140,7 @@ Arithmetic for the streaming case: a 224 by 224 JPEG at 100 KB, an A100 processi
 Write them to a volume, not to the runtime's disk, because the runtime can be preempted.
 
 ```python
-@let.function(gpu=colab.G4, env=env, volumes=[cache])
+@let.function(device=colab.G4, host="remote", env=env, volumes=[cache])
 def train(lr, resume="run-1"):
     ...
     # inside the shipped function, checkpoint on a time interval so that

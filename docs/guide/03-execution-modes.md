@@ -10,7 +10,7 @@
 
 | | 📦 Function shipping | 🔌 Call forwarding |
 |---|---|---|
-| Written as | `cpu="remote"` | `cpu="local"` |
+| Written as | `host="remote"` | `host="local"` |
 | Where Python runs | on the remote machine | in your process |
 | Where data has to be | on the remote machine | on your machine |
 | What crosses the network | the function, once | every CUDA call |
@@ -19,9 +19,9 @@
 Neither name appears in your code. You say where the CPU side of the work lives, and letify picks the mechanism.
 
 ```python
-@let.function(gpu=colab.G4)                    # provider default
-@let.function(gpu=lab.A100(cpu="remote"))      # ship the loop
-@let.function(gpu=lab.A100(cpu="local"))       # forward CUDA calls
+@let.function(device=colab.G4, host="remote")                    # provider default
+@let.function(device=lab.A100, host="remote")      # ship the loop
+@let.function(device=lab.A100, host="remote", host="local")       # forward CUDA calls
 ```
 
 ## The formula
@@ -96,39 +96,37 @@ This is tuning on your training code, which is why letify does not do it for you
 
 ## How the default is chosen
 
-**Storage decides first, then the link.**
+It is not chosen. `host` defaults to `"local"`, and nothing derives it from the provider.
 
-| Provider state | Default | Mode |
+That default is the least surprising one: your code and your data are already on this
+machine, so borrowing a GPU should not require moving them. Shipping the function is the
+optimization a heavy loop opts into.
+
+What a provider does decide is whether it can serve a mode at all, and what it costs there.
+
+| Provider | `host="local"` | Why |
 |---|---|---|
-| persistent | `remote` | shipping |
-| ephemeral, volume attached | `remote` | shipping |
-| ephemeral, no volume, fast link | `local` | forwarding |
-| ephemeral, no volume, slow link | `remote` | shipping |
+| `Local` | not applicable | the device is already here, nothing crosses a network |
+| `Colab` | allowed, with a warning | the control path crosses a Google frontend, so about 175 ms |
+| `Modal` | refused | it exposes function calls into a container, with no device to forward at |
+| `Shell`, `Tunnel` | allowed | a machine reached directly has a short round trip |
+| `Elice` | allowed | same |
 
-The reasoning: if storage outlives the runtime, your data and environment are already there, so shipping the loop is natural. If nothing survives, keeping state on your machine avoids rebuilding it every session, and forwarding needs only a driver and a daemon on the remote side, which is the least setup a brand new machine can require.
-
-In practice:
-
-| Provider | Default | Can forward? |
-|---|---|---|
-| `Local` | local | not applicable, nothing crosses a network |
-| `Colab` | remote | ❌ no, the round trip is too long |
-| `Modal` | remote | ❌ no, it exposes function calls, not a device |
-| `Shell`, `Tunnel` | local unless persistent or volume | ✅ yes |
-| `Elice` | remote | ✅ yes |
+The warning carries the expected round trip, so you see what the choice costs before the
+run rather than after it.
 
 ## No silent fallback
 
 ```python
-@let.function(gpu=colab.G4(cpu="local"))
+@let.function(device=colab.G4, host="remote", host="local")
 def train(lr): ...
 ```
 
 ```
-UnsupportedMode: Colab does not support cpu='local'. Forwarding CUDA calls over
+UnsupportedMode: Colab does not support host='local'. Forwarding CUDA calls over
 the Colab control path costs one round trip of about 150 ms per host
 synchronization, which leaves roughly half the throughput for fine-tuning and a
-few percent for token by token decoding. Use cpu='remote' so the loop runs
+few percent for token by token decoding. Use host='remote' so the loop runs
 inside the runtime.
 ```
 
@@ -144,7 +142,7 @@ letify raises rather than taking the slower path. A silent downgrade turns a fou
 
 ## A note on what is implemented
 
-Function shipping works today. Call forwarding is currently a capability probe: `letify.remoting.probe()` reports whether a layer 3 tunnel is possible, whether the driver shim is present and what the round trip is, and `require()` raises when forwarding would not pay off. The forwarding client itself is not written. See the known gaps at the end of [docs/SPEC.md](../SPEC.md).
+Function shipping works today. Call forwarding is currently a capability probe: `letify.remoting.probe()` reports whether a layer 3 tunnel is possible, whether the letify-core is present and what the round trip is, and `require()` raises when forwarding would not pay off. The forwarding client itself is not written. See the known gaps at the end of [docs/SPEC.md](../SPEC.md).
 
 ---
 

@@ -1,10 +1,12 @@
 # Specification
 
 > The current design of letify. Decisions only. Derivations and measurements live in the experiment pull requests, which each section links to when one exists.
+>
+> This file is the source of truth. Code follows it, and every test traces to a section here. See "How this project is built" in [CLAUDE.md](../CLAUDE.md).
 
 ## Declaration surface
 
-> A user declares resources and lets letify choose the mechanism.
+> A declaration places three things and names no mechanism.
 
 The public surface is five names: `Launcher`, `Env`, the `function` decorator it carries, `grid` and `zip`. Everything else is reached through a provider object.
 
@@ -16,39 +18,52 @@ env = letify.Env()
 
 colab = let.providers.colab_a
 
-@let.function(gpu=colab.G4, env=env, concurrency=3)
+@let.function(device=colab.G4, host="remote", env=env, concurrency=3)
 def train(lr, bs):
     ...
 
-with let.run():
-    train(lr=1e-4, bs=32)
+train(lr=1e-4, bs=32)
 ```
 
-The decorator takes `gpu`, `env`, `volumes`, `concurrency`, `timeout`, `retries` and `keep_remote`. It does not take a transport, a mode or a provider, because `gpu` already carries all three.
+The decorator takes `device`, `host`, `lifetime`, `env`, `volumes`, `concurrency`, `timeout`, `retries` and `keep_remote`. It takes no transport and no mode, because the three placements below already settle them.
+
+### The three placements
+
+> `device` says where the accelerator is, `host` says where the host code runs, `lifetime` says how long the session lives.
+
+`device` carries the provider, the account and the accelerator in one value, because those are one decision. `colab.G4` is such a value. Core count and memory are not arguments: they arrive with the shape the provider registered, and a provider that offers several sizes registers them as separate shapes.
+
+`host` is the CUDA word for the CPU side, paired with the device the declaration already placed. `"local"`, the default, keeps Python and the libraries in this process and forwards only CUDA calls. `"remote"` ships the declared function to the machine that holds the device.
+
+`lifetime` is how long the session lives. `"call"`, the default, ends it when the call finishes. `"process"` keeps it, so a run of separate calls does not pay session start each time.
+
+All three accept the plain lowercase string. `Host` and `Lifetime` are string enums, so `host=letify.Host.remote` and `host="remote"` are the same thing. An unrecognized value raises at declaration time with both options named.
 
 ### Invocation
 
 > Calling a declared function runs it. Blocking behaviour is declared at the `def` site.
 
-A declared function is called like any other function. There is no second verb such as `.remote()`: a decorator that wraps a `def` and then needs another call to run it has moved the declaration out of the declaration.
+A declared function is called like any other. There is no second verb such as `.remote()`: a decorator that wraps a `def` and then needs another call to run it has moved the declaration out of the declaration.
 
-A plain `def` blocks and returns its value. An `async def` returns an awaitable, so `await` and `asyncio.gather` work as they do for any coroutine and letify contributes no future type of its own.
+A plain `def` blocks and returns its value. An `async def` returns a coroutine when no space is passed, so the standard library accepts it wherever a coroutine is expected, and an awaitable that is also async-iterable when a space is passed.
 
-`Function.local()` runs the body in the calling process. It exists for testing a body without any provider; the preferred way to run locally is a `Local` provider, which keeps the production code path.
+`Function.local()` runs the body in the calling process. It exists for testing a body with no provider; the preferred way to run locally is a `Local` provider, which keeps the production code path.
 
 ### Fan-out
 
 > Passing a space where a scalar is expected declares that the argument varies.
 
-`grid(**axes)` is the Cartesian product of its axes. `zip(**axes)` pairs them position by position and rejects axes of unequal length. Two spaces combine with `|`, which drops duplicate points. A scalar axis stays fixed across the space.
+`grid(**axes)` is the Cartesian product of its axes. `zip(**axes)` pairs them position by position and rejects axes of unequal length. Two spaces combine with `|`, which drops duplicate points. A scalar axis stays fixed across the space. `with_fixed(**kw)` adds arguments constant across every point.
 
-A space is consumed by the language's own protocols. `await` on an async declaration collects results in input order; `async for` yields them as they complete. A sync declaration returns a list in input order.
+A space is consumed by the language's own protocols. `await` collects results in input order; `async for` yields them as they complete. A sync declaration returns a list in input order.
 
-`concurrency` on the declaration bounds how many runtimes one declaration may occupy at once. It belongs to the declaration rather than to a call, because it describes the infrastructure the declaration is allowed to use.
+Only one space may be passed per call. Two would make the point count the product of two arguments rather than something visible in one place.
+
+`concurrency` bounds how many runtimes one declaration may occupy at once. It belongs to the declaration rather than to a call, because it describes the infrastructure that declaration is allowed to use.
 
 ## Provider model
 
-> A provider object is one account on one kind of infrastructure. It registers the instances it offers, owns storage, and creates runtimes.
+> A provider object is one account on one kind of infrastructure. It registers the instances it offers, owns storage, opens the channel, and starts and stops the session.
 
 ```
 Provider (abstract)
@@ -62,55 +77,54 @@ Provider (abstract)
 
 `Shell` is named for the shared ability, which is running a command on a remote machine, rather than for SSH, which is only its default transport.
 
-A provider is built from one entry in the configuration file and reached by attribute on `let.providers`. Three attribute names there are reserved: `any` for a request that does not name a provider, `gpus` for the registered accelerators of every provider, and `active` for the providers that currently hold a runtime.
+A provider is built from one entry in the configuration file and reached by attribute on `let.providers`. Three attribute names there are reserved: `any` for a request that does not name a provider, `devices` for the registered accelerators of every provider, and `active` for the providers that currently hold a runtime.
 
-### Persistence
+### Provider properties
 
-> Persistence means storage outlives a runtime. It is a property of the provider object, not of its class.
+> Four class attributes set every behaviour that differs between providers, and none of them is a user-facing switch.
 
-| Provider | Default | Reason |
-|---|---|---|
-| `Local` | persistent | The machine's own disk. |
-| `Modal` | persistent | A volume is mounted from outside the container. |
-| `Colab` | ephemeral | A runtime change gives a new virtual machine with an empty disk. |
-| `Shell` and subclasses | ephemeral | A machine's disk policy is not knowable in advance. |
+`persistence` says whether storage outlives a runtime.
 
-A configuration entry overrides the default with `persistent = true`. The default for an unknown machine is the pessimistic one: assuming ephemeral costs time, because letify rebuilds the environment each runtime and the work still succeeds, while assuming persistent fails outright when the disk turns out to be wiped.
+`has_fast_path` says whether the machine is close enough for CUDA call forwarding to pay off. It does not gate the mode: a declaration that asks for forwarding over a long link gets a warning carrying the arithmetic and then runs.
 
-letify may detect persistence by writing a marker file and looking for it in a later runtime, but detection only advises. It never changes the execution mode on its own, because that would change the performance characteristics of a run without the user asking.
+`persistent_channel` says whether a worker process can be kept alive behind a pipe.
+
+`needs_lease` says whether a session can outlive this process and keep billing.
+
+| Provider | Persistence | Fast path | Channel | Store backend |
+|---|---|---|---|---|
+| `Local` | persistent | yes | persistent | `filesystem` |
+| `Modal` | persistent | no | persistent | `modal` |
+| `Colab` | ephemeral | no | persistent, or one-shot by configuration | `gcs` |
+| `Shell` | ephemeral, overridable | yes | persistent | `filesystem` |
+| `Tunnel` | ephemeral, overridable | yes | persistent | `filesystem` |
+| `Elice` | persistent | yes | persistent | `s3` |
+
+`Shell` and its subclasses default to ephemeral because a machine's disk policy is not knowable in advance. Assuming ephemeral costs time, since letify rebuilds the environment each runtime and the work still succeeds; assuming persistent fails outright when the disk turns out to be wiped. A configuration entry overrides it with `persistent = true`.
 
 ### Instances
 
-> An `Instance` is one accelerator shape on one provider account, carrying the CPU placement with it.
+> An `Instance` is one accelerator shape on one provider account.
 
-`colab.G4` is an `Instance`. It holds the provider, the accelerator name, where the Python side runs, the core count and whether the instance is preemptible. Calling it refines it: `colab.G4(cpu="local", cpus=8)`.
+`colab.G4` is an `Instance`. It holds the provider, the accelerator name, the host placement, and the core count, memory and VRAM the provider reported. `on_host()` returns a copy in a different mode.
 
-Because an instance carries its provider, `gpu=colab.G4` fixes provider, account, accelerator and placement in one argument. `let.providers.any.G4` defers the provider choice to the first declared provider that registers a matching accelerator, in configuration order.
+Because an instance carries its provider, `device=colab.G4` fixes provider, account and accelerator in one argument. `let.providers.any.G4` defers the provider choice to the first declared provider that registers a matching accelerator, in configuration order.
 
-Instance discovery is lazy and cached. A provider that must connect to enumerate its GPUs does so on first access, never at import time, and a configuration entry may list `gpus` to skip the connection entirely.
+Instance discovery is lazy and cached. A provider that must connect to enumerate its accelerators does so on first access, never at import time, and a configuration entry may list `gpus` to skip the connection. `refresh()` asks again.
+
+`Local` reads its accelerator names once per process, because asking `nvidia-smi` takes seconds on a laptop whose discrete GPU is asleep and the answer does not change while the process runs.
+
+Accelerator names are normalized so they can be attributes. `NVIDIA RTX PRO 6000 Blackwell` becomes `RTX_PRO_6000`. Colab calls the same card `G4`, which is what its CLI accepts, and accepts `RTX_PRO_6000` as an alias for it.
 
 ## Execution modes
 
-> Two modes exist. The user names resources; letify picks the mode.
+> Two modes exist. `host` picks between them and nothing derives it.
 
-**Function shipping** (`cpu="remote"`) serializes the declared function with cloudpickle and runs it inside the runtime. The whole loop executes there, so the loop's host synchronizations never cross the network.
+**Function shipping** (`host="remote"`) serializes the declared function with cloudpickle and runs it inside the runtime. The whole loop executes there, so its host synchronizations never cross the network.
 
-**Call forwarding** (`cpu="local"`) keeps Python and the libraries in the local process and forwards only CUDA driver calls. Local data and the local environment stay in place, at the cost of one network round trip at every point where the host reads a value back from the device.
+**Call forwarding** (`host="local"`) keeps Python and the libraries in the local process and forwards only CUDA driver calls. Local data and the local environment stay in place, at the cost of one network round trip at every point where the host reads a value back from the device.
 
-### Mode selection
-
-> Storage decides first, then whether a low-latency path exists.
-
-| Provider state | Default placement | Mode |
-|---|---|---|
-| persistent | `remote` | function shipping |
-| ephemeral with a volume attached | `remote` | function shipping |
-| ephemeral, no volume, fast path available | `local` | call forwarding |
-| ephemeral, no volume, no fast path | `remote` | function shipping |
-
-An ephemeral provider with no volume has nothing on it that survives, so keeping state local is the cheaper arrangement where the link allows it. Forwarding also needs only a driver and a daemon on the remote side, which is the least setup a brand new machine can require.
-
-`Colab` sets `has_fast_path = False`, so it never selects forwarding. Asking for `cpu="local"` there raises `UnsupportedMode` with the arithmetic in the message rather than running slowly.
+A provider refuses a mode only when it cannot serve it. `Modal` refuses `host="local"` because it exposes function calls into a container and there is no device to forward at. A provider without a fast path warns with its expected round trip and then runs, because the choice belongs to whoever wrote the declaration.
 
 ### Efficiency model
 
@@ -118,45 +132,59 @@ An ephemeral provider with no volume has nothing on it that survives, so keeping
 
 Numbers for an RTX PRO 6000 with NVFP4, a 0.5 s micro step, at a 150 ms round trip:
 
-| Workload | Function shipping | Call forwarding, default settings | Call forwarding, tuned |
+| Workload | Function shipping | Forwarding, default settings | Forwarding, tuned |
 |---|---|---|---|
-| LoRA fine-tuning | about 99 percent | 50 to 57 percent | about 96 percent |
+| LoRA fine-tuning | about 99 percent | 53 percent | about 96 percent |
 | Decode, batch 1 | hundreds of tokens per second | 2 to 7 tokens per second | unchanged |
 | Evaluation, teacher forcing | about 99 percent | about 99 percent | about 99 percent |
 
-`k` is about three for a default Hugging Face training step: the trainer's NaN filter every step, the attention mask check every forward, and logging or the gradient scaler. Tuning means turning the NaN filter off, removing the mask check with fixed length packing, and moving logging to the gradient accumulation boundary, which leaves about one synchronization per optimizer step.
+`k` is about three for a default Hugging Face training step: the trainer's NaN filter every step, the SDPA attention mask check every forward, and logging or the gradient scaler. Tuning means turning the NaN filter off, removing the mask check with fixed length packing, and moving logging to the gradient accumulation boundary, which leaves about one synchronization per optimizer step.
 
 A faster GPU makes forwarding worse, because `T` shrinks while `RTT` does not. The same step on an L4 in bf16 takes 1.8 s and reaches about 80 percent where the RTX PRO 6000 reaches 53 percent.
 
 Decoding fails at any useful latency. A decode step for 4-bit weights on an RTX PRO 6000 is 2 ms to 3 ms and synchronizes once or twice per token, so throughput is bounded near `1000 / (k * RTT)` tokens per second regardless of the card.
 
+`letify.remoting.efficiency(step_seconds, syncs, round_trip_ms)` computes this, and `letify efficiency` exposes it on the command line.
+
+## Channels
+
+> A channel is how letify talks to a runtime, and which kind a provider offers decides what letify can do there.
+
+A **persistent channel** keeps one worker process alive behind a pipe. Requests are framed lines, so the object table, the blob table and anything written to disk all survive between calls.
+
+A **one-shot channel** can only run a command and collect its output. Every call starts a fresh process, so nothing persists. It exists because some transports offer nothing more, and it refuses the operations that need persistence rather than pretending.
+
+Both hand back the user's own stdout separately from the outcome, because they share one stream.
+
+The worker source cannot be sent on standard input as a script, because `python -` reads to end of file before compiling anything and the pipe has to stay open for requests. A small bootstrap stub passed with `-c` reads a length-prefixed base64 blob, executes it, and leaves standard input where it was.
+
 ## Call protocol
 
-> A call is a serialized function plus arguments, executed by a driver script that prints its outcome between two markers.
+> A call is a serialized function plus arguments, and the outcome comes back on the same channel.
 
-The local side pickles `(function, args, kwargs, keep_remote)` with cloudpickle, base64 encodes it, and embeds it in a driver script. The driver deserializes, resolves handles, runs the call, and writes the outcome as base64 between `__LETIFY_RESULT_BEGIN__` and `__LETIFY_RESULT_END__`, so a result can be found in a stream that also carries the user's prints.
+The local side pickles `(function, args, kwargs)` with cloudpickle and sends it as a framed request. Framing is one base64 line per message, which survives an SSH channel, a WebSocket bridge and a plain pipe without any of them mangling it.
 
-Absence of the marker is not a protocol quirk, it means the remote process died. letify reports that as `ProtocolError` naming the likely causes: an out of memory kill, a preempted session, or a crash below Python.
+On a one-shot channel the call travels inside a driver script that prints its outcome between `__LETIFY_RESULT_BEGIN__` and `__LETIFY_RESULT_END__`, so it can be found in a stream that also carries the user's prints. Absence of the marker is not a protocol quirk: it means the remote process died, and letify reports that as `ProtocolError` naming the likely causes.
+
+An `async def` body is awaited on the remote side, so it runs to completion there and can use `await` internally.
 
 ### Handles
 
-> A value may stay in the runtime. The caller receives a reference scoped to that runtime.
+> A value may stay in the runtime. The caller receives a reference scoped to that session.
 
 A declaration with `keep_remote=True` registers its return value in the runtime's object table and returns a `Handle`. Passing a handle to a later call on the same runtime resolves it in place, so a model stays on the remote machine instead of being copied back and forth.
 
-A handle carries the key of the runtime that owns it. Passing it to a call on another runtime raises `HandleScopeError` rather than materializing the object, because a handle is a pointer into one process and one CUDA context and resolving it across that boundary would mean an unrequested transfer of the whole object.
+A handle names the live runtime that holds it, not the pool key, because two runtimes can share a key and an object lives in only one of them. Passing it to a call on another runtime raises `HandleScopeError` rather than materializing the object, since resolving it across that boundary would mean an unrequested transfer of everything it points at.
+
+`keep_remote=True` on a one-shot channel fails with its reason, because there is no process for the handle to point at once the call returns.
 
 ### Argument addressing
 
 > Large arguments are named by the hash of their contents, so the same value travels once.
 
-An argument above the inline limit is hashed and sent only when the runtime does not already hold that digest. Hashing is not a bottleneck at any link speed involved: blake3 runs at gigabytes per second where a home uplink runs at megabytes per second.
+An argument above 64 KB is pickled and hashed, the runtime is asked which digests it already holds, and only the rest is sent. A later call carrying the same value sends a `Blob` reference instead of the bytes.
 
-### Callbacks
-
-> A side effect reported to the local process is one way.
-
-A streamer, a logger or a progress callback in shipped code sends to the local process without waiting for a reply. Waiting would put one round trip inside the token loop, which is the worst thing available to this design.
+Hashing is not a bottleneck at any link speed involved: blake3 runs at gigabytes per second where a home uplink runs at megabytes per second. blake2b from the standard library is the fallback.
 
 ### Failure and retry
 
@@ -164,31 +192,34 @@ A streamer, a logger or a progress callback in shipped code sends to the local p
 
 `RuntimeFailure` and `ProtocolError` mean the session misbehaved, so the runtime is discarded and the call is retried on a fresh one up to `retries` times. `RemoteError` means the shipped function raised, and it propagates with the remote traceback attached.
 
-letify never falls back to local execution or to a slower mode when the declared one is unavailable. A silent downgrade turns a four times slowdown into a mystery, so the failure is explicit.
+letify never falls back to local execution or to a slower mode when the declared one is unavailable. A silent downgrade turns a four times slowdown into a mystery.
 
-## Runtimes
+## Sessions
 
 > A runtime is one live session and the only object that costs money.
 
-Everything above a runtime is declaration. Creating one is when a provider actually powers something on; destroying one is when the charge stops.
+Everything above a runtime is declaration. Creating one is when a provider actually powers something on; shutting it down is when the charge stops.
 
-A runtime boots in three steps: install the declared environment, attach volumes, and start the lease. Installation is skipped where the machine already runs in the environment, which is the local provider.
+A runtime boots in four steps: open the channel, arm the lease, install the declared environment, attach volumes. Installation is skipped where the machine already runs in the environment, which is the local provider.
 
 ### Pooling
 
 > Runtimes are pooled by instance and environment, so the second call through a declaration pays nothing for setup.
 
-The pool key is the instance key joined with the environment key. Two declarations that agree on both share runtimes. A pool holds at most `max_runtimes` runtimes; a call that finds every slot taken waits for one of its own key to free rather than starting a new session.
+The pool key is the instance key joined with the environment key. Two declarations that agree on both share runtimes, which is why nothing has to be said for two functions on one device to reuse a session. A pool holds at most `max_runtimes` runtimes; a call that finds every slot taken waits for one to come free rather than asking the provider for a session it would refuse.
 
 `max_runtimes` defaults to 3 and is a placeholder. The concurrent session limit of a Colab account is undocumented and moves with tier, credit balance and demand.
 
 ### Lifetime
 
-> Three layers, and the middle one protects the bill.
+> A session ends with the call that needed it. Keeping one is declared. Two backstops cover what is left.
 
-1. **Scope.** Leaving `with let.run():` tears every runtime down. Nested scopes are allowed and only the outermost tears down.
-2. **Idle timeout.** A runtime unused for longer than `idle_timeout` inside an open scope is torn down.
-3. **Heartbeat lease.** The local process renews a deadline inside the session every 30 s, and the session terminates itself if the deadline passes. The grace period is 300 s, so a brief network drop does not kill a training run, while a crashed or killed local process cannot leave a GPU billing.
+1. **The call.** `lifetime="call"` ends the session when the call finishes. A search space counts as one call, so a sweep starts its runtimes once and releases them once.
+2. **The declaration.** `lifetime="process"` keeps the session past the call, because starting one costs provider boot plus environment installation, which is minutes on Colab.
+3. **The idle reaper.** A background thread tears down any runtime unused for longer than `idle_timeout`, default 600 seconds.
+4. **The lease.** The local process renews a deadline inside the session every 30 seconds, and the session terminates itself if the deadline passes. The grace period is 300 seconds, so a brief network drop does not kill a training run while a crashed local process cannot leave a GPU billing.
+
+Nothing is torn down by hand. There is no release call and no shutdown call on the public surface, and everything goes at process exit.
 
 There is no detached execution. A detached run whose remote side is preempted would lose its results, so the local process stays the owner and durability comes from checkpoints in the store.
 
@@ -217,7 +248,15 @@ Refs carry the mutable part, in the way Git keeps branch names apart from object
 
 A model shard is already large, so one file is one blob. An environment is tens of thousands of small files, so the whole tree is packed into one archive keyed by the hash of its lock file. That is where the speedup is: tens of thousands of round trips become one.
 
-A content addressed store does not by itself reduce the bytes of a first transfer. What it improves is the metadata exchange, which becomes a single manifest read instead of one request per file, and repeat transfers, which are skipped by name. Neither it nor a synchronization tool sends deltas within a changed file.
+A content addressed store does not by itself reduce the bytes of a first transfer. What it improves is the metadata exchange, which becomes a single manifest read instead of one request per file, and every repeat transfer, which is skipped by name. Neither it nor a synchronization tool sends deltas within a changed file.
+
+Extraction checks every member's path against the destination before unpacking, so an archive cannot write outside it.
+
+### Materializing into a runtime
+
+> A volume writes into a runtime through its channel, not by asking the runtime to reach the bucket.
+
+That works with every backend and needs no credentials on the far side, at the cost of the bytes passing through the local process. `Volume.resume()` puts the newest checkpoint for a name inside the runtime, which is what makes a preempted session cheap to restart. `Volume.absorb()` pulls one back out, and `cache_env_from()` packs an environment installed inside a runtime so the next session skips the installation.
 
 ### Backends
 
@@ -227,6 +266,8 @@ A content addressed store does not by itself reduce the bytes of a first transfe
 | `gcs` | `Colab` | A Colab runtime is a Compute Engine virtual machine, so this is an internal transfer. Use a multi-region bucket, because runtime placement is not selectable. |
 | `s3` | `Elice` and anything S3 compatible | Elice Data Hub speaks the S3 API. |
 | `modal` | `Modal` | A Modal volume, mounted beside the container. |
+
+Every backend answers "which of these digests are missing" with one listing rather than one request per digest, because object level requests are billed and add latency.
 
 ## Environment
 
@@ -240,7 +281,7 @@ A uv lock file resolves for every platform uv supports, so one lock file drives 
 
 > Modules in the lock file are installed remotely by name. Modules that are not travel with the call.
 
-A package the lock file names is installed in the runtime and referenced by name. A package it does not name, such as the project's own code or an editable install, has to be sent by value, because the remote side either lacks it or holds an older copy. letify infers the split from the lock file; `Env.ship()` overrides the inference.
+A package the lock file names is installed in the runtime and referenced by name. A package it does not name, such as the project's own code or an editable install, has to be sent by value, because the remote side either lacks it or holds an older copy. `Env.ship()` overrides the inference.
 
 ## Transport
 
@@ -252,7 +293,7 @@ Order of preference: a direct SSH address, then a jump host, then a tunnel. Camp
 
 MTU is held at 1280 to 1400. Every mesh VPN in this class shows the same failure above that: the connection works, small commands work, and bulk transfers stall silently.
 
-Colab is reached through the Colab CLI: `colab new` and `colab stop` for the session, `colab exec` for commands, and `colab ssh --proxy-mode` as an OpenSSH ProxyCommand bridge. That is an official path, so it carries no terms risk, and it needs no tunnel. Network details and the measurements behind these choices are in [NETWORK.md](NETWORK.md).
+Colab is reached through the Colab CLI: `colab new` and `colab stop` for the session, `colab ssh --proxy-mode` as an OpenSSH ProxyCommand bridge for the persistent channel, and `colab exec` as the one-shot fallback. That is an official path, so it carries no terms risk and needs no tunnel. Network details and the measurements behind these choices are in [NETWORK.md](NETWORK.md).
 
 ## Configuration
 
@@ -260,9 +301,9 @@ Colab is reached through the Colab CLI: `colab new` and `colab stop` for the ses
 
 `~/.letify` holds accounts and connection details, which belong to the machine. The project's `.letify` holds defaults that are safe to commit. The project file refines what the home file declared, so a repository can be cloned by someone else and run under their own accounts.
 
-An alias must be a Python identifier, because providers are reached by attribute access. `any`, `gpus` and `active` are reserved. Declaration order sets the priority for `let.providers.any`.
+An alias must be a Python identifier, because providers are reached by attribute access. `any`, `devices` and `active` are reserved. Declaration order sets the priority for `let.providers.any`.
 
-A credential field is never a literal in a tracked file. `<name>_env` names an environment variable and `<name>_keyring` names a keyring entry as `service/user`, both resolved when used.
+A credential field is never a literal in a tracked file. `<name>_env` names an environment variable and `<name>_keyring` names a keyring entry as `service/user`, tried in that order, with a literal accepted last.
 
 ```toml
 [colab_a]
@@ -283,18 +324,67 @@ machine_id = "00000000-0000-0000-0000-000000000000"
 access_token_env = "ELICE_ACCESS_TOKEN"
 ```
 
+## letify-core
+
+> The native component behind `host="local"`. A Rust workspace, built separately, needed only by whoever forwards CUDA calls.
+
+The Python package is pure Python. Standing in for the CUDA driver cannot be done from Python, so that job lives in `letify-core/` as three crates.
+
+| Crate | Holds |
+|---|---|
+| `letify-wire` | The protocol. Each request declares whether it needs a reply. |
+| `letify-driver` | A cdylib that stands in for the driver and forwards its calls. |
+| `letify-agent` | Holds the real device and executes what arrives. |
+
+`python letify-core/build.py` builds them and installs the library under the name of the one it replaces: `nvcuda.dll` on Windows, `libcuda.so.1` on Linux and WSL2. Being found before the real driver is the whole mechanism.
+
+### Batching
+
+> Only a call whose result the host reads waits for an answer.
+
+A launch, a copy to the device and an allocation change device state and return immediately, so they are queued. A copy back to the host, a stream synchronization and an elapsed time query cannot be, and each one is a round trip. That is why the round trip count is the number of host synchronizations rather than the number of calls, which is what makes the efficiency model hold for a step that issues thousands of calls.
+
+### Virtual pointers
+
+> An allocation returns a pointer immediately, and memory accounting stays local so that running out still fails at the call.
+
+The local driver hands out pointers from a range no real device address falls in, records what they stand for, and lets the agent reconcile them in the background. Waiting for the agent would put a round trip in front of every allocation, and a caching allocator makes many.
+
+The cost is honest failure. A caching allocator learns the device is full when the allocation call fails, frees its cache and retries. With a virtual pointer there is nothing to fail yet, so the local driver keeps its own accounting of device memory and refuses once the budget is gone, with a reserve held back for the driver's own context, library workspaces and fragmentation.
+
+### Module identity
+
+> A compiled module is named by its contents, so a fatbin the agent already holds is not sent again.
+
+PyTorch loads the same modules on every process start and they are large. The agent keeps a table keyed by digest and answers with the handle it already has.
+
+### Loading
+
+> On Windows letify does the injection, because it has to happen before the first CUDA library is loaded.
+
+`letify.remoting.inject()` calls `os.add_dll_directory` on the library's directory, which puts it at the front of the loader's search order. It must be called before `import torch`, and it says so when torch is already imported.
+
+On Linux the equivalent is `LD_PRELOAD`, which cannot be set from inside a running process for libraries already resolved. So `inject()` reports the command to run rather than pretending it succeeded, because a silently ineffective injection would look like forwarding while the real driver was being used all along.
+
+### Unimplemented entry points
+
+> A missing entry point names itself and returns `CUDA_ERROR_NOT_SUPPORTED`.
+
+The implemented set is what a PyTorch process touches to start up and run one kernel: initialization, device queries, allocation and copies, module loading, launches, streams and events. Everything else reports its own name, so the way to find out what a real workload needs is to run one and read the list.
+
+Unified memory is the one exception that no amount of implementation removes. Managed memory works by letting the device fault into host pages, which needs one address space, and there is no such thing across a network. A paged optimizer cannot run under forwarding.
+
 ## Packaging
 
 > The base install carries no provider dependency. Each provider is an extra.
 
-`letify` alone installs cloudpickle and blake3. `letify[colab]`, `letify[modal]`, `letify[shell]`, `letify[gcs]`, `letify[s3]` and `letify[all]` add what a provider needs. No provider dependency is imported at package import time, so a provider whose package is absent reports itself unavailable and everything else keeps working.
+`letify` alone installs cloudpickle and blake3. `letify[colab]`, `letify[modal]`, `letify[shell]`, `letify[gcs]`, `letify[s3]`, `letify[keyring]` and `letify[all]` add what a provider needs. No provider dependency is imported at package import time, so a provider whose package is absent reports itself unavailable and everything else keeps working.
 
 ## Known gaps
 
 > Implemented and unimplemented, stated plainly so nobody builds on a promise.
 
-- **A persistent session process is not implemented.** Each call currently runs in a fresh remote process, so the object table that backs handles does not survive between calls. `keep_remote=True` returns a handle, and resolving one in a later call needs the session daemon.
-- **Call forwarding is a capability probe, not a client.** `letify.remoting` reports what forwarding would need and refuses when it is missing. The driver shim itself is not written.
-- **Modal and Elice runtimes are not exercised against the live services.** Their provider code follows each service's published interface, and the Elice paths come from Elice's own Terraform provider, but neither has been run end to end.
+- **`letify-driver` covers one milestone.** The entry points a PyTorch process needs to start up and run one kernel are forwarded and verified against a real GPU. Kernel argument marshalling reads the pointer list without knowing the kernel's signature, and fatbin size comes from a conservative window rather than the image header. Both need a real workload to shape them.
+- **`Modal` and `Elice` are not exercised against the live services.** Their code follows each service's published interface, and the Elice paths come from Elice's own Terraform provider, but neither has been run end to end.
 - **The Colab data channel is unverified.** Whether `ssh -L` works over `colab ssh --proxy-mode` is an open decision in [INTENT.md](INTENT.md).
-- **Volume materialization inside a runtime is a stub.** A volume's mount point is created and a cached environment archive is unpacked when one exists, but the blob store is not yet mounted or mirrored into the runtime.
+- **Persistence detection is not implemented.** Deciding a machine's disk policy by writing a marker file and looking for it in a later runtime is a decision recorded here, not yet code.

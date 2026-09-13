@@ -30,7 +30,7 @@ The CLI creates and destroys sessions with `colab new` and `colab stop`, runs co
 
 **Storage does not survive.** Changing the accelerator type produces a new virtual machine with an empty disk, which was checked by writing a marker file and looking for it after the switch. This is why `Colab` is ephemeral and why a volume matters so much there.
 
-**No fast path.** The control path crosses a Google frontend, so the round trip from Korea is on the order of 150 ms to 200 ms. `Colab.has_fast_path` is therefore false and asking for `cpu="local"` raises.
+**No fast path.** The control path crosses a Google frontend, so the round trip from Korea is on the order of 150 ms to 200 ms. `Colab.has_fast_path` is therefore false and asking for `host="local"` raises.
 
 **Open question.** Whether `ssh -L` port forwarding works over `colab ssh --proxy-mode` is not documented. Since the bridge hands off to a standard OpenSSH client, forwarding should follow, but it has not been verified. A verified answer would give letify a data channel independent of `colab exec`.
 
@@ -97,7 +97,7 @@ POST   /user/resource/compute/virtual_machine_allocation  power on
 DELETE /user/resource/compute/virtual_machine_allocation/{id}  power off
 ```
 
-An allocation is exactly a letify runtime, so `with let.run():` maps onto Elice's own lifecycle. letify allocates and releases, and does not create the machine; declare that once in the console or with Terraform and put its id in the configuration.
+An allocation is exactly a letify session, so a call's own lifetime maps onto Elice's. letify allocates and releases, and does not create the machine; declare that once in the console or with Terraform and put its id in the configuration.
 
 Costs. Compute bills by the second while allocated. Block storage keeps billing while the machine is stopped, and it disappears when the machine is deleted, so a forgotten machine still costs money with no allocation running. Object storage is Data Hub, which speaks S3 and is what letify uses as the blob store backend there.
 
@@ -109,7 +109,7 @@ Two product lines exist and only one is automatable. Elice Cloud Infrastructure 
 
 > Not a network path at all. Modal exposes function calls into a container.
 
-There is nothing to tunnel to and no device to forward calls at, so `Modal.has_fast_path` is false and `cpu="local"` raises. Its volume is mounted from outside the container and sits in the same data centre as the GPU, which is why a persistent provider needs no separate cache tier.
+There is nothing to tunnel to and no device to forward calls at, so `Modal.has_fast_path` is false and `host="local"` raises. Its volume is mounted from outside the container and sits in the same data centre as the GPU, which is why a persistent provider needs no separate cache tier.
 
 ## Measuring your own numbers
 
