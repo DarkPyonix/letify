@@ -283,7 +283,11 @@ class Shell(Provider):
 
         link = self.link(runtime)
         if not link.persistent:
-            return OneShotChannel(link.runner, name=runtime.name)  # type: ignore[attr-defined]
+            return OneShotChannel(
+                link.runner,  # type: ignore[attr-defined]
+                name=runtime.name,
+                files=getattr(link, "files", None),
+            )
         return PersistentChannel(
             link.ssh_command(f"{self.remote_python} -u -c {shlex.quote(BOOTSTRAP)}"),
             name=runtime.name,

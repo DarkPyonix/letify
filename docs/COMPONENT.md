@@ -147,7 +147,7 @@ It is called `Env` rather than `Image` because there is no image: no container i
 
 Three layers with one job each.
 
-`Volume` is the user-facing name on a provider. It knows the mount point, the reserved refs for environments and checkpoints, and how to materialize a blob into a session through its channel.
+`Volume` is the user-facing name on a provider. It knows the mount point, the reserved refs for environments and checkpoints, and how to materialize a blob into a session: the session pulls it from the backend with a borrowed short-lived token when the backend offers a pull, and otherwise the blob goes through the channel.
 
 `Store` is the content addressed logic: put and get blobs, pack and unpack trees, read and write refs, and plan which of a list of files still needs uploading.
 

@@ -108,14 +108,19 @@ class Modal(Provider):
 
     def open_channel(self, runtime: Runtime) -> Channel:
         """A Modal sandbox running one Python that reads framed requests."""
+        from ..protocol.worker import BOOTSTRAP
+
         modal = self.client()
         app_name = str(self.config.option("app", "letify"))
         app = modal.App.lookup(app_name, create_if_missing=True)
         image = modal.Image.debian_slim().pip_install("cloudpickle", "blake3")
+        # Not `python3 -`: that reads standard input to the end before running anything, so
+        # the requests that follow the source would be compiled as source too.
         sandbox = modal.Sandbox.create(
             "python3",
             "-u",
-            "-",
+            "-c",
+            BOOTSTRAP,
             app=app,
             image=image,
             gpu=self.wire_name(runtime.instance) or None,
@@ -150,11 +155,15 @@ class SandboxChannel:
         self._started = False
 
     def start(self) -> None:
+        """Hand the worker source to the bootstrap stub as a length-prefixed base64 blob."""
+        import base64
+
         from ..protocol.worker import SOURCE
 
         if self._started:
             return
-        self._write(SOURCE + "\n")
+        payload = base64.b64encode(SOURCE.replace("\r\n", "\n").encode()).decode()
+        self._write(f"{len(payload)}\n{payload}")
         self._started = True
 
     def close(self) -> None:

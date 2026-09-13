@@ -142,14 +142,50 @@ def _op_put_file(request):
     with open(path, "wb") as handle:
         handle.write(payload)
     if request.get("unpack"):
-        target = request.get("target") or os.path.dirname(path)
-        os.makedirs(target, exist_ok=True)
-        with tarfile.open(path, "r:gz") as archive:
-            try:
-                archive.extractall(target, filter="data")
-            except TypeError:
-                archive.extractall(target)
+        _unpack(path, request.get("target") or os.path.dirname(path))
     return {"ok": True, "value": {"path": path, "size": len(payload)}}
+
+
+def _unpack(path, target):
+    os.makedirs(target, exist_ok=True)
+    with tarfile.open(path, "r:gz") as archive:
+        try:
+            archive.extractall(target, filter="data")
+        except TypeError:
+            archive.extractall(target)
+
+
+def _op_pull(request):
+    """Download a blob from the backend with a borrowed token, then forget the token.
+
+    The headers are taken out of the request before anything can fail, and the request
+    object is the only place they lived, so nothing holds them once this returns.
+    """
+    import urllib.request
+
+    headers = request.pop("headers", None) or {}
+    fetch = urllib.request.Request(request.pop("url"), headers=headers)
+    headers = None
+    path = request["path"]
+    directory = os.path.dirname(path)
+    if directory:
+        os.makedirs(directory, exist_ok=True)
+    partial = path + ".partial"
+    size = 0
+    try:
+        with urllib.request.urlopen(fetch, timeout=3600) as response, open(partial, "wb") as out:
+            while True:
+                chunk = response.read(1 << 20)
+                if not chunk:
+                    break
+                out.write(chunk)
+                size += len(chunk)
+    finally:
+        fetch = None
+    os.replace(partial, path)
+    if request.get("unpack"):
+        _unpack(path, request.get("target") or os.path.dirname(path))
+    return {"ok": True, "value": {"path": path, "size": size}}
 
 
 def _op_get_file(request):
@@ -236,6 +272,7 @@ _OPS = {
     "have": _op_have,
     "put_blob": _op_put_blob,
     "put_file": _op_put_file,
+    "pull": _op_pull,
     "get_file": _op_get_file,
     "pack_dir": _op_pack_dir,
     "exec": _op_exec,
@@ -255,7 +292,9 @@ def _serve():
         if line == "__LETIFY_SHUTDOWN__":
             return
         try:
-            request = pickle.loads(base64.b64decode(line))
+            # The line is dropped once decoded, so a pull token it carried lives only in
+            # the request, and the request is dropped once answered.
+            request, line = pickle.loads(base64.b64decode(line)), None
         except Exception:
             _reply({
                 "ok": False,
@@ -275,6 +314,7 @@ def _serve():
                 "error": "%s: %s" % (type(exc).__name__, exc),
                 "traceback": traceback.format_exc(),
             })
+        request = None
 
 
 _serve()

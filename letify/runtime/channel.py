@@ -261,9 +261,12 @@ class OneShotChannel(Channel):
 
     persistent = False
 
-    def __init__(self, runner: Any, *, name: str = "runtime"):
+    def __init__(self, runner: Any, *, name: str = "runtime", files: Any = None):
         self.runner = runner
         self.name = name
+        #: A provider's own file transfer, which serves ``put_file``, ``get_file`` and
+        #: ``pack_dir`` where a program per call cannot carry the bytes.
+        self.files = files
 
     def start(self) -> None:
         return None
@@ -282,6 +285,8 @@ class OneShotChannel(Channel):
         if op == "lease":
             self.runner(_lease_source(payload["grace"]), timeout)
             return None, ""
+        if self.files is not None and op in ("put_file", "get_file", "pack_dir"):
+            return self.files.serve(payload, timeout), ""
         raise RuntimeFailure(
             f"{self.name}: this provider runs one-shot commands, so it cannot serve "
             f"{op!r}. Persistent state and blob reuse need a channel that "

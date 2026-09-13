@@ -373,6 +373,10 @@ The local machine writes to the backend directly as well. It does not relay thro
 
 No credential is stored on the remote side. For each materialization the local process derives a short-lived access token from its own login, scoped to reading the volume's prefix where the backend supports scoping, and sends it over the channel. The worker keeps it in memory only, never on disk or in the environment of user code, and drops it when the pull finishes. A backend that has no network path from the runtime, such as `filesystem` on a machine the local process can reach but the runtime cannot, falls back to writing through the channel.
 
+A backend offers a pull by answering with a URL and the request headers that read one blob. The local process sends them in one `pull` request naming the destination path and whether to unpack at the mount. The worker streams the response to the path, unpacks it when asked, and discards the request, headers included, before it reads the next one. `gcs` offers a pull. `filesystem` and `modal` do not, so they write through the channel. A one-shot channel has no worker to pull, so it writes through the channel as well.
+
+The `gcs` read token is downscoped with a Credential Access Boundary: the local token is exchanged at `https://sts.googleapis.com/v1/token` for one that holds `roles/storage.objectViewer` on the volume's bucket only, with an availability condition restricting it to object names under the volume's prefix. A volume option `sts_endpoint` points the exchange elsewhere. A failed exchange raises `RuntimeFailure` rather than sending the unscoped token.
+
 `Volume.resume()` puts the newest checkpoint for a name inside the runtime, which is what makes a preempted session cheap to restart. `Volume.absorb()` pulls one back out, and `cache_env_from()` packs an environment installed inside a runtime so the next session skips the installation.
 
 These take the declaration, not a session. A declaration already says which provider, which accelerator, which environment and which volumes, so which session is letify's answer to work out and not a value for the caller to carry. The alternative was tried and is worse: a caller holding a session has to have asked for it with the same instance the declaration uses, and the declaration folds the host placement into that instance, so asking with the bare one silently starts a second session that holds none of the first one's files. On one machine that still passes, because both sessions see the same disk. On a rented one it fails, which makes it the worst kind of defect: it works in the test and breaks where the money is.
@@ -390,6 +394,20 @@ Moving a file through a session only works while that session exists, so `absorb
 | `modal` | `Modal` | A Modal volume, mounted beside the container. |
 
 Every backend answers "which of these digests are missing" with one listing rather than one request per digest, because object level requests are billed and add latency.
+
+### Google login for gcs <!-- id: gcs-login -->
+
+> The `gcs` backend borrows the user's existing Google login. It stores no credential and adds no dependency.
+
+The client calls the Cloud Storage JSON API at `https://storage.googleapis.com`: a listing with `prefix` and `pageToken` for `missing`, a media upload for `put` and `write_ref`, and a media download for `get` and `read_ref`. A volume option `endpoint` points it elsewhere. A request that answers 404 means the object is absent; any other status that is not 2xx raises `RuntimeFailure` naming the status and the object.
+
+The access token is looked up in this order, the first that answers wins:
+
+1. The `GOOGLE_OAUTH_ACCESS_TOKEN` environment variable, used as it is.
+2. Application Default Credentials: the file named by `GOOGLE_APPLICATION_CREDENTIALS`, or `application_default_credentials.json` in the gcloud configuration directory (`~/.config/gcloud/` on Linux and macOS, `%APPDATA%\gcloud\` on Windows). A file of type `authorized_user`, which `gcloud auth application-default login` writes, is exchanged for an access token by posting its refresh token to its `token_uri`, `https://oauth2.googleapis.com/token` by default, with the standard library HTTP client.
+3. `gcloud auth print-access-token`, when `gcloud` is on `PATH`.
+
+A token is reused until 60 s before it expires. A service account key file is refused with its reason, because exchanging one needs an RSA signature the standard library cannot make; `gcloud auth activate-service-account` followed by rule 3 covers that case. When no rule answers, the backend raises `ProviderUnavailable` for `gcs` saying that no Google login was found and naming `gcloud auth application-default login` and `GOOGLE_OAUTH_ACCESS_TOKEN`.
 
 ## Environment
 
@@ -520,6 +538,10 @@ Colab limits outbound UDP to roughly 200 packets per second, so rank 3 is expect
 A `channel = "exec"` entry skips the pipeline and uses the fallback directly. A Colab VM has no SSH server by default, so the rendezvous request asks the remote half to install `openssh-server` and start `sshd` first. The request carries the account's public key, `key` with `.pub` appended, which the remote side adds to `authorized_keys`. SSH over a punched or Tailcat link logs in as `root` unless `user` says otherwise.
 
 The fallback sends calls with `colab exec` and bulk data through the Jupyter contents API that the Colab runtime proxy exposes: uploads are split into parts sent in parallel, each part in chunked `PUT` requests, and downloads read `/files/<path>` in parallel parts. The contents API root is `/` on the VM, not `/content`.
+
+The proxy URL and token are the session's `url` and `token` in `.config/colab-cli/sessions.json` under the account directory, where the Colab CLI records them when `colab new` creates the session. A session that file does not name raises `RuntimeFailure` naming the file. Every request carries the token as the `colab-runtime-proxy-token` query parameter and the `X-Colab-Runtime-Proxy-Token` header, with `authuser=0`, as the CLI does.
+
+An upload of a file to `<path>` sends parts of 32 MiB, eight at a time, each to `<path>.letify-part-<n>`. Eight is the most parallel parts [measured](NETWORK.md#colabs-own-paths), and it was the fastest in both directions. A part is sent as base64 chunks of 8 MiB: chunk `1` creates the file, later chunks append, and the last chunk of a part of more than one chunk is numbered `-1`. One `colab exec` program then joins the parts into `<path>` in order, removes them, and unpacks the archive when the request asks for it. A download reads the file's size from the contents model with `content=0`, then reads `/files/<path>` with `Range` requests of 32 MiB, eight at a time. `put_file`, `get_file` and `pack_dir` on the fallback channel use this path; `pack_dir` packs into a temporary file with `colab exec` first. Any other status than 2xx raises `RuntimeFailure` naming the path and the status.
 
 ## Configuration
 
@@ -733,7 +755,6 @@ Linux wheels are built inside the `manylinux_2_28` containers, so the binaries n
 - **`Modal` and `Elice` are not exercised against the live services.** Their code follows each service's published interface, and the Elice paths come from Elice's own Terraform provider, but neither has been run end to end.
 - **The connection pipeline is not exercised against live networks.** `Rendezvous`, `Strategy`, `Link`, `Probe`, `Pipeline`, `LinkCache` and the remote agent are implemented and tested over loopback sockets and faked commands. Installing and starting `sshd` on a Colab VM over `colab exec` is not yet checked against a live runtime.
 - **The Elice API runs no command on a machine.** The paths letify uses (virtual machine, allocation, instance type, pricing) create and power machines only, so Elice's remote half runs over forward SSH to the allocated machine, and the punch and Tailcat strategies need that SSH to succeed first.
-- **The Colab file API is not part of the fallback link.** The fallback carries calls over `colab exec`; bulk transfer through the Jupyter contents API is not implemented.
 - **Orphan reconciliation is not implemented.** A session whose controlling machine was killed outright is released by the lease on the providers where the process is the cost. Where the platform bills for the machine and takes no deadline, nothing ends it: an Elice allocation bills until a delete is issued. The intended answer is that the next letify process asks the provider what is running under this project's name and ends what nothing is watching, with a command to do it on demand. Neither exists yet.
 - **Whether the Elice allocation API takes a deadline is unverified.** If it does, that is where the guarantee belongs, because the platform outlives the caller.
 - **Persistence detection is not implemented.** Deciding a machine's disk policy by writing a marker file and looking for it in a later runtime is a decision recorded here, not yet code.

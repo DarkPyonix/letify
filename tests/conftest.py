@@ -306,61 +306,96 @@ def renewal_recorder() -> RenewalRecorder:
 # -- the Elice HTTP API --------------------------------------------------------
 
 
+@dataclass
 class FakeResponse:
-    """One HTTP response, with a body that may refuse to decode."""
+    """One canned answer: a status, and a body sent as JSON unless ``text`` is given."""
 
-    def __init__(self, status_code: int = 200, body: Any = None, text: str = ""):
-        self.status_code = status_code
-        self._body = body
-        self.text = text
-
-    def json(self) -> Any:
-        if self._body is None:
-            raise ValueError("the body is not JSON")
-        return self._body
+    status_code: int = 200
+    body: Any = None
+    text: str = ""
 
 
-class FakeHttpx:
-    """The parts of httpx the Elice provider uses, with no network behind them."""
+class FakeEliceServer:
+    """The Elice Cloud API on loopback, answering what a test tells it to.
+
+    A real HTTP server, so the standard library client the provider uses is the one under
+    test. The API lives under ``/api`` as it does on the portal. Each request is recorded
+    with its method, path below ``/api``, query parameters (None when there are none),
+    JSON body and Authorization header.
+    """
 
     def __init__(self) -> None:
-        self.clients: list[dict[str, Any]] = []
+        import http.server
+        import threading
+
         self.requests: list[dict[str, Any]] = []
         self.responses: dict[tuple[str, str], FakeResponse] = {}
         self.default = FakeResponse(200, {})
+        owner = self
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def log_message(self, *args: Any) -> None:
+                return None
+
+            def do_GET(self) -> None:
+                owner._handle(self, "GET")
+
+            def do_POST(self) -> None:
+                owner._handle(self, "POST")
+
+            def do_DELETE(self) -> None:
+                owner._handle(self, "DELETE")
+
+        self._server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self._server.daemon_threads = True
+        self.endpoint = f"http://127.0.0.1:{self._server.server_address[1]}/api"
+        threading.Thread(target=self._server.serve_forever, daemon=True).start()
+
+    def close(self) -> None:
+        self._server.shutdown()
+        self._server.server_close()
 
     def answer(self, method: str, path: str, response: FakeResponse) -> None:
         self.responses[(method, path)] = response
-
-    def Client(self, **kwargs: Any) -> FakeHttpxClient:
-        self.clients.append(kwargs)
-        return FakeHttpxClient(self)
 
     @property
     def last(self) -> dict[str, Any]:
         return self.requests[-1]
 
+    def _handle(self, handler: Any, method: str) -> None:
+        import json
+        import urllib.parse
 
-class FakeHttpxClient:
-    def __init__(self, owner: FakeHttpx):
-        self.owner = owner
-
-    def __enter__(self) -> FakeHttpxClient:
-        return self
-
-    def __exit__(self, *exc: object) -> bool:
-        return False
-
-    def request(self, method: str, path: str, **kwargs: Any) -> FakeResponse:
-        self.owner.requests.append({"method": method, "path": path, **kwargs})
-        return self.owner.responses.get((method, path), self.owner.default)
+        parsed = urllib.parse.urlsplit(handler.path)
+        path = parsed.path.removeprefix("/api")
+        length = int(handler.headers.get("Content-Length") or 0)
+        body = handler.rfile.read(length) if length else b""
+        self.requests.append(
+            {
+                "method": method,
+                "path": path,
+                "params": dict(urllib.parse.parse_qsl(parsed.query)) or None,
+                "json": json.loads(body) if body else None,
+                "authorization": handler.headers.get("Authorization"),
+            }
+        )
+        response = self.responses.get((method, path), self.default)
+        if response.text:
+            payload, kind = response.text.encode(), "text/html"
+        else:
+            payload, kind = json.dumps(response.body).encode(), "application/json"
+        handler.send_response(response.status_code)
+        handler.send_header("Content-Type", kind)
+        handler.send_header("Content-Length", str(len(payload)))
+        handler.end_headers()
+        handler.wfile.write(payload)
 
 
 @pytest.fixture
-def fake_httpx(monkeypatch):
-    fake = FakeHttpx()
-    monkeypatch.setitem(sys.modules, "httpx", fake)
-    return fake
+def fake_elice():
+    server = FakeEliceServer()
+    yield server
+    server.close()
 
 
 # -- Modal ---------------------------------------------------------------------
@@ -517,59 +552,252 @@ def fake_modal(monkeypatch):
 # -- cloud object stores -------------------------------------------------------
 
 
-class FakeGCSBlob:
-    def __init__(self, store: dict[str, bytes], key: str):
-        self._store = store
-        self.name = key
+class FakeGCSServer:
+    """The parts of the Cloud Storage JSON API and Google's token endpoints letify uses.
 
-    def exists(self) -> bool:
-        return self.name in self._store
+    A real HTTP server on loopback, so the standard library client letify ships is the one
+    under test, from this process and from a worker process alike. Objects live in
+    ``objects`` keyed by object name; every request is appended to ``requests``.
+    """
 
-    def upload_from_string(self, payload: Any) -> None:
-        self._store[self.name] = payload if isinstance(payload, bytes) else str(payload).encode()
+    #: Listing pages are this short so pagination is exercised with a handful of objects.
+    PAGE_SIZE = 2
 
-    def download_as_bytes(self) -> bytes:
-        return self._store[self.name]
+    def __init__(self, token: str = "token-1"):
+        import http.server
+        import threading
 
-    def download_as_text(self) -> str:
-        return self._store[self.name].decode()
+        self.token = token
+        self.bucket = "study-bucket"
+        self.objects: dict[str, bytes] = {}
+        self.requests: list[dict[str, Any]] = []
+        self.refresh_grants: list[dict[str, str]] = []
+        self.exchanges: list[dict[str, str]] = []
+        owner = self
 
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def log_message(self, *args: Any) -> None:
+                return None
 
-class FakeGCSBucket:
-    def __init__(self, name: str, store: dict[str, bytes]):
-        self.name = name
-        self._store = store
+            def do_GET(self) -> None:
+                owner._handle(self, "GET")
 
-    def blob(self, key: str) -> FakeGCSBlob:
-        return FakeGCSBlob(self._store, key)
+            def do_POST(self) -> None:
+                owner._handle(self, "POST")
 
+        self._server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self._server.daemon_threads = True
+        self.endpoint = f"http://127.0.0.1:{self._server.server_address[1]}"
+        threading.Thread(target=self._server.serve_forever, daemon=True).start()
 
-class FakeGCSClient:
-    def __init__(self, store: dict[str, bytes]):
-        self._store = store
+    def close(self) -> None:
+        self._server.shutdown()
+        self._server.server_close()
 
-    def bucket(self, name: str) -> FakeGCSBucket:
-        return FakeGCSBucket(name, self._store)
+    def accepts(self, authorization: str | None) -> bool:
+        return authorization in (f"Bearer {self.token}", f"Bearer down-{self.token}")
 
-    def list_blobs(self, bucket: FakeGCSBucket, prefix: str = ""):
-        return [
-            types.SimpleNamespace(name=key) for key in sorted(self._store) if key.startswith(prefix)
-        ]
+    def _handle(self, handler: Any, method: str) -> None:
+        import json
+        import urllib.parse
+
+        parsed = urllib.parse.urlsplit(handler.path)
+        query = dict(urllib.parse.parse_qsl(parsed.query))
+        length = int(handler.headers.get("Content-Length") or 0)
+        body = handler.rfile.read(length) if length else b""
+        authorization = handler.headers.get("Authorization")
+        self.requests.append(
+            {
+                "method": method,
+                "path": parsed.path,
+                "query": query,
+                "authorization": authorization,
+            }
+        )
+
+        def answer(status: int, payload: bytes = b"", kind: str = "application/json") -> None:
+            handler.send_response(status)
+            handler.send_header("Content-Type", kind)
+            handler.send_header("Content-Length", str(len(payload)))
+            handler.end_headers()
+            handler.wfile.write(payload)
+
+        if parsed.path == "/token" and method == "POST":
+            form = dict(urllib.parse.parse_qsl(body.decode()))
+            self.refresh_grants.append(form)
+            reply = {"access_token": self.token, "expires_in": 3599, "token_type": "Bearer"}
+            return answer(200, json.dumps(reply).encode())
+        if parsed.path == "/v1/token" and method == "POST":
+            form = dict(urllib.parse.parse_qsl(body.decode()))
+            self.exchanges.append(form)
+            reply = {"access_token": f"down-{form.get('subject_token')}", "expires_in": 3599}
+            return answer(200, json.dumps(reply).encode())
+
+        if not self.accepts(authorization):
+            return answer(401, b'{"error": {"message": "unauthenticated"}}')
+
+        listing = f"/storage/v1/b/{self.bucket}/o"
+        upload = f"/upload/storage/v1/b/{self.bucket}/o"
+        if method == "POST" and parsed.path == upload:
+            self.objects[query["name"]] = body
+            return answer(200, json.dumps({"name": query["name"]}).encode())
+        if method == "GET" and parsed.path == listing:
+            names = sorted(k for k in self.objects if k.startswith(query.get("prefix", "")))
+            start = int(query.get("pageToken") or 0)
+            page = names[start : start + self.PAGE_SIZE]
+            reply: dict[str, Any] = {"items": [{"name": name} for name in page]}
+            if start + self.PAGE_SIZE < len(names):
+                reply["nextPageToken"] = str(start + self.PAGE_SIZE)
+            return answer(200, json.dumps(reply).encode())
+        if method == "GET" and parsed.path.startswith(listing + "/"):
+            name = urllib.parse.unquote(parsed.path[len(listing) + 1 :])
+            if name not in self.objects:
+                return answer(404, b'{"error": {"message": "not found"}}')
+            if query.get("alt") == "media":
+                return answer(200, self.objects[name], "application/octet-stream")
+            return answer(200, json.dumps({"name": name}).encode())
+        return answer(400, b'{"error": {"message": "unexpected request"}}')
+
+    def downloads(self) -> list[dict[str, Any]]:
+        return [r for r in self.requests if r["query"].get("alt") == "media"]
 
 
 @pytest.fixture
 def fake_gcs(monkeypatch):
-    """Install a google.cloud.storage stand-in, since a real bucket needs an account."""
-    store: dict[str, bytes] = {}
-    storage = types.SimpleNamespace(Client=lambda: FakeGCSClient(store))
-    cloud = types.ModuleType("google.cloud")
-    cloud.storage = storage  # type: ignore[attr-defined]
-    google = types.ModuleType("google")
-    google.cloud = cloud  # type: ignore[attr-defined]
-    monkeypatch.setitem(sys.modules, "google", google)
-    monkeypatch.setitem(sys.modules, "google.cloud", cloud)
-    monkeypatch.setitem(sys.modules, "google.cloud.storage", storage)
-    return store
+    """A Cloud Storage endpoint on loopback, since a real bucket needs an account.
+
+    ``GOOGLE_OAUTH_ACCESS_TOKEN`` carries the token it accepts, which is the first rule of
+    the login lookup, so a test that is not about the lookup needs no login.
+    """
+    server = FakeGCSServer()
+    monkeypatch.setenv("GOOGLE_OAUTH_ACCESS_TOKEN", server.token)
+    yield server
+    server.close()
+
+
+# -- the Colab runtime proxy's Jupyter file API --------------------------------
+
+
+class FakeJupyterServer:
+    """The Jupyter contents API and ``/files`` handler a Colab runtime proxy exposes.
+
+    A real HTTP server on loopback whose contents root is ``/`` of this machine, as it is on
+    a Colab VM, so a test names absolute paths inside its temporary directory. Chunked
+    uploads follow Jupyter's large file manager: chunk ``1`` creates, any other appends.
+    """
+
+    def __init__(self, token: str = "proxy-token-1"):
+        import http.server
+        import threading
+
+        self.token = token
+        self.requests: list[dict[str, Any]] = []
+        self._lock = threading.Lock()
+        owner = self
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def log_message(self, *args: Any) -> None:
+                return None
+
+            def do_GET(self) -> None:
+                owner._handle(self, "GET")
+
+            def do_PUT(self) -> None:
+                owner._handle(self, "PUT")
+
+        self._server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self._server.daemon_threads = True
+        self.url = f"http://127.0.0.1:{self._server.server_address[1]}"
+        threading.Thread(target=self._server.serve_forever, daemon=True).start()
+
+    def close(self) -> None:
+        self._server.shutdown()
+        self._server.server_close()
+
+    def _handle(self, handler: Any, method: str) -> None:
+        import json
+        import urllib.parse
+
+        parsed = urllib.parse.urlsplit(handler.path)
+        query = dict(urllib.parse.parse_qsl(parsed.query))
+        length = int(handler.headers.get("Content-Length") or 0)
+        body = handler.rfile.read(length) if length else b""
+        with self._lock:
+            self.requests.append(
+                {
+                    "method": method,
+                    "path": urllib.parse.unquote(parsed.path),
+                    "query": query,
+                    "range": handler.headers.get("Range"),
+                    "header_token": handler.headers.get("X-Colab-Runtime-Proxy-Token"),
+                }
+            )
+
+        def answer(status: int, payload: bytes = b"", extra: dict[str, str] | None = None) -> None:
+            handler.send_response(status)
+            for key, value in (extra or {}).items():
+                handler.send_header(key, value)
+            handler.send_header("Content-Length", str(len(payload)))
+            handler.end_headers()
+            handler.wfile.write(payload)
+
+        if query.get("colab-runtime-proxy-token") != self.token or query.get("authuser") != "0":
+            return answer(403, b'{"message": "forbidden"}')
+
+        path = urllib.parse.unquote(parsed.path)
+        if path.startswith("/api/contents/"):
+            local = Path("/") / path[len("/api/contents/") :]
+            if method == "PUT":
+                model = json.loads(body)
+                content = base64.b64decode(model["content"])
+                chunk = model.get("chunk")
+                mode = "ab" if chunk not in (None, 1) else "wb"
+                with open(local, mode) as handle:
+                    handle.write(content)
+                return answer(200, json.dumps({"path": str(local), "type": "file"}).encode())
+            if not local.is_file():
+                return answer(404, b'{"message": "no such file"}')
+            model = {"path": str(local), "type": "file", "size": local.stat().st_size}
+            return answer(200, json.dumps(model).encode())
+        if path.startswith("/files/") and method == "GET":
+            local = Path("/") / path[len("/files/") :]
+            if not local.is_file():
+                return answer(404, b"no such file")
+            data = local.read_bytes()
+            wanted = handler.headers.get("Range")
+            if wanted:
+                first, _, last = wanted.removeprefix("bytes=").partition("-")
+                start, end = int(first), min(int(last), len(data) - 1)
+                piece = data[start : end + 1]
+                return answer(206, piece, {"Content-Range": f"bytes {start}-{end}/{len(data)}"})
+            return answer(200, data)
+        return answer(400, b'{"message": "unexpected request"}')
+
+    def puts(self) -> list[dict[str, Any]]:
+        return [r for r in self.requests if r["method"] == "PUT"]
+
+    def ranges(self) -> list[str]:
+        return [r["range"] for r in self.requests if r["path"].startswith("/files/")]
+
+
+@pytest.fixture
+def fake_jupyter():
+    server = FakeJupyterServer()
+    yield server
+    server.close()
+
+
+def write_colab_session(alias: str, name: str, url: str, token: str) -> Path:
+    """Record a session the way ``colab new`` does, in the account's CLI state file."""
+    import json
+
+    from letify.config.secrets import account_directory
+
+    path = account_directory(alias) / ".config" / "colab-cli" / "sessions.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    state = {name: {"name": name, "token": token, "url": url, "endpoint": "e-1"}}
+    path.write_text(json.dumps(state), encoding="utf-8")
+    return path
 
 
 # -- a one-shot channel that really runs the driver ----------------------------

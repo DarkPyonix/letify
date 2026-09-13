@@ -57,10 +57,11 @@ def fresh_device_names():
 
 
 @pytest.fixture
-def elice(fake_httpx):
+def elice(fake_elice):
     return provider_of(
         Elice,
         "elice_a100",
+        endpoint=fake_elice.endpoint,
         zone_id="zone-1",
         machine_id="machine-1",
         access_token="token-1",
@@ -468,6 +469,180 @@ def test_the_exec_fallback_keeps_nothing_between_calls(
     assert recorder.calls[-1]["input"] == "print('hello')"
 
 
+# -- Spec: Transport, Colab bulk transfer through the Jupyter file API ---------
+
+
+@pytest.fixture
+def small_parts(monkeypatch):
+    """Parts and chunks a few bytes long, so a short payload crosses every boundary."""
+    from letify.providers import colab_files
+
+    monkeypatch.setattr(colab_files, "PART_BYTES", 16)
+    monkeypatch.setattr(colab_files, "CHUNK_BYTES", 6)
+    return colab_files
+
+
+def local_exec(source: str, timeout: float | None = None) -> str:
+    """What `colab exec` does, on this machine: run a program and return its output."""
+    import subprocess
+    import sys
+
+    result = subprocess.run(
+        [sys.executable, "-c", source], capture_output=True, text=True, timeout=timeout or 120
+    )
+    if result.returncode != 0:
+        raise letify.RuntimeFailure("exec failed", stderr=result.stderr)
+    return result.stdout
+
+
+def colab_exec_channel(fake_jupyter, name: str = "letify-g4-1"):
+    from conftest import write_colab_session
+
+    write_colab_session("colab_a", name, fake_jupyter.url, fake_jupyter.token)
+    provider = provider_of(Colab, "colab_a", channel="exec")
+    provider._exec = lambda session, source, timeout: local_exec(source, timeout)
+    runtime = type("R", (), {"name": name})()
+    return provider.open_channel(runtime)
+
+
+def test_the_proxy_address_comes_from_the_colab_cli_session_state(isolated_home) -> None:
+    from conftest import write_colab_session
+
+    from letify.providers.colab_files import session_endpoint
+
+    write_colab_session("colab_a", "letify-g4-1", "https://proxy.example/", "proxy-token-1")
+    assert session_endpoint("colab_a", "letify-g4-1") == (
+        "https://proxy.example",
+        "proxy-token-1",
+    )
+    with pytest.raises(letify.RuntimeFailure, match=r"sessions\.json"):
+        session_endpoint("colab_a", "letify-t4-9")
+
+
+def test_an_upload_is_sent_in_parallel_parts_of_chunked_puts_and_joined(
+    isolated_home, fake_jupyter, small_parts, tmp_path
+) -> None:
+    import base64 as b64
+
+    channel = colab_exec_channel(fake_jupyter)
+    payload = bytes(range(40))
+    target = tmp_path / "vm" / "weights.bin"
+    target.parent.mkdir()
+
+    value, _ = channel.request(
+        {"op": "put_file", "path": str(target), "payload": b64.b64encode(payload).decode()}
+    )
+
+    assert target.read_bytes() == payload
+    assert value == {"path": str(target), "size": 40}
+    # 40 bytes in parts of 16 is three parts; the joined file leaves no part behind.
+    assert list(target.parent.iterdir()) == [target]
+    parts = sorted({r["path"] for r in fake_jupyter.puts()})
+    assert parts == [f"/api/contents{target}.letify-part-{n}" for n in range(3)]
+    assert all(
+        r["query"]["colab-runtime-proxy-token"] == "proxy-token-1" for r in fake_jupyter.puts()
+    )
+    assert all(r["header_token"] == "proxy-token-1" for r in fake_jupyter.puts())
+
+
+def test_each_part_is_numbered_the_way_the_large_file_manager_expects(
+    isolated_home, fake_jupyter, small_parts, tmp_path, monkeypatch
+) -> None:
+    from letify.providers.colab_files import ContentsTransfer
+
+    sent: list[tuple[str, object]] = []
+    original = ContentsTransfer._put_chunk
+
+    def record(self, remote: str, piece: bytes, chunk: int) -> None:
+        sent.append((remote.rsplit("-", 1)[-1], chunk))
+        original(self, remote, piece, chunk)
+
+    monkeypatch.setattr(ContentsTransfer, "_put_chunk", record)
+    target = tmp_path / "vm.bin"
+    ContentsTransfer(fake_jupyter.url, fake_jupyter.token).upload(bytes(20), str(target))
+    # Parts of 16 and 4 bytes, in chunks of 6.
+    assert sorted(sent) == [("0", -1), ("0", 1), ("0", 2), ("1", 1)]
+
+
+def test_an_uploaded_archive_is_unpacked_by_the_join_program(
+    isolated_home, fake_jupyter, small_parts, tmp_path
+) -> None:
+    import base64 as b64
+    import io
+    import tarfile
+
+    buffer = io.BytesIO()
+    with tarfile.open(fileobj=buffer, mode="w:gz") as archive:
+        info = tarfile.TarInfo("site/marker.txt")
+        info.size = 6
+        archive.addfile(info, io.BytesIO(b"cached"))
+    mount = tmp_path / "mount"
+    channel = colab_exec_channel(fake_jupyter)
+    channel.request(
+        {
+            "op": "put_file",
+            "path": str(mount / "blobs" / "env.tar.gz"),
+            "payload": b64.b64encode(buffer.getvalue()).decode(),
+            "unpack": True,
+            "target": str(mount),
+        }
+    )
+    assert (mount / "site" / "marker.txt").read_text(encoding="utf-8") == "cached"
+
+
+def test_a_download_reads_the_file_in_parallel_ranges(
+    isolated_home, fake_jupyter, small_parts, tmp_path
+) -> None:
+    import base64 as b64
+
+    source = tmp_path / "checkpoint.pt"
+    source.write_bytes(bytes(range(35)))
+    channel = colab_exec_channel(fake_jupyter)
+
+    value, _ = channel.request({"op": "get_file", "path": str(source)})
+
+    assert b64.b64decode(value["payload"]) == bytes(range(35))
+    assert value["size"] == 35
+    assert sorted(fake_jupyter.ranges()) == ["bytes=0-15", "bytes=16-31", "bytes=32-34"]
+
+
+def test_a_directory_is_packed_on_the_vm_and_then_downloaded(
+    isolated_home, fake_jupyter, small_parts, tmp_path
+) -> None:
+    import base64 as b64
+    import io
+    import tarfile
+
+    site = tmp_path / "site"
+    site.mkdir()
+    (site / "a.txt").write_text("a", encoding="utf-8")
+    channel = colab_exec_channel(fake_jupyter)
+
+    value, _ = channel.request({"op": "pack_dir", "path": str(site)})
+
+    with tarfile.open(fileobj=io.BytesIO(b64.b64decode(value["payload"])), mode="r:gz") as archive:
+        assert "site/a.txt" in archive.getnames()
+
+
+def test_the_pipeline_fallback_link_carries_bulk_transfer(isolated_home, fake_jupyter) -> None:
+    from conftest import write_colab_session
+
+    write_colab_session("colab_a", "letify-g4-1", fake_jupyter.url, fake_jupyter.token)
+    provider = provider_of(Colab, "colab_a")
+    runtime = type("R", (), {"name": "letify-g4-1"})()
+    link = provider.fallback(runtime)()
+    assert link.files is not None
+
+
+def test_a_refused_proxy_request_names_the_path_and_the_status(
+    isolated_home, fake_jupyter, tmp_path
+) -> None:
+    from letify.providers.colab_files import ContentsTransfer
+
+    with pytest.raises(letify.RuntimeFailure, match="403"):
+        ContentsTransfer(fake_jupyter.url, "wrong").download(str(tmp_path / "x.bin"))
+
+
 # -- Spec: Transport, a machine reached over SSH -------------------------------
 
 
@@ -660,7 +835,7 @@ def test_elice_runs_its_remote_half_over_forward_ssh_to_the_allocated_machine() 
 # -- Spec: Provider model, Elice -----------------------------------------------
 
 
-def test_elice_needs_a_zone_a_machine_and_a_token(fake_httpx) -> None:
+def test_elice_needs_a_zone_a_machine_and_a_token() -> None:
     # letify allocates and releases a declared machine; it does not create one.
     with pytest.raises(letify.ProviderUnavailable, match="no 'zone_id' field"):
         provider_of(Elice, "elice_a100").zone_id  # noqa: B018
@@ -677,39 +852,42 @@ def test_the_elice_endpoint_can_be_pointed_elsewhere() -> None:
     assert provider_of(Elice, "e").endpoint.startswith("https://")
 
 
-def test_elice_cannot_be_reached_without_httpx(no_module) -> None:
-    no_module("httpx")
-    with pytest.raises(letify.ProviderUnavailable, match=r"letify\[shell\]"):
-        provider_of(Elice, "e", zone_id="z", access_token="t").machines()
+def test_elice_is_reached_with_the_standard_library_alone(no_module, fake_elice) -> None:
+    # Spec "Packaging": Elice uses the standard library HTTP client, so no HTTP package
+    # has to be installed.
+    no_module("httpx", "requests")
+    fake_elice.answer("GET", VM_PATH, FakeResponse(200, []))
+    provider = provider_of(Elice, "e", endpoint=fake_elice.endpoint, zone_id="z", access_token="t")
+    assert provider.machines() == []
 
 
-def test_an_elice_request_carries_the_token_and_the_zone(elice, fake_httpx) -> None:
-    fake_httpx.answer("GET", VM_PATH, FakeResponse(200, {"items": [{"id": "machine-1"}]}))
+def test_an_elice_request_carries_the_token_and_the_zone(elice, fake_elice) -> None:
+    fake_elice.answer("GET", VM_PATH, FakeResponse(200, {"items": [{"id": "machine-1"}]}))
     assert elice.machines() == [{"id": "machine-1"}]
-    assert fake_httpx.clients[0]["headers"]["Authorization"] == "Bearer token-1"
-    assert fake_httpx.last["params"] == {"zone_id": "zone-1"}
+    assert fake_elice.last["authorization"] == "Bearer token-1"
+    assert fake_elice.last["params"] == {"zone_id": "zone-1"}
 
 
-def test_anything_other_than_a_two_hundred_is_a_failure(elice, fake_httpx) -> None:
+def test_anything_other_than_a_two_hundred_is_a_failure(elice, fake_elice) -> None:
     # This API answers 200 for every success.
-    fake_httpx.answer("GET", VM_PATH, FakeResponse(403, {"message": "quota exceeded"}))
+    fake_elice.answer("GET", VM_PATH, FakeResponse(403, {"message": "quota exceeded"}))
     with pytest.raises(letify.RuntimeFailure, match="returned 403: quota exceeded"):
         elice.machines()
 
 
-def test_a_failure_with_no_json_body_carries_the_text(elice, fake_httpx) -> None:
-    fake_httpx.answer("GET", VM_PATH, FakeResponse(502, None, text="<html>bad gateway</html>"))
+def test_a_failure_with_no_json_body_carries_the_text(elice, fake_elice) -> None:
+    fake_elice.answer("GET", VM_PATH, FakeResponse(502, None, text="<html>bad gateway</html>"))
     with pytest.raises(letify.RuntimeFailure, match="bad gateway"):
         elice.machines()
 
 
-def test_a_response_may_be_a_bare_list_or_an_items_table(elice, fake_httpx) -> None:
-    fake_httpx.answer("GET", VM_PATH, FakeResponse(200, [{"id": "machine-1"}]))
+def test_a_response_may_be_a_bare_list_or_an_items_table(elice, fake_elice) -> None:
+    fake_elice.answer("GET", VM_PATH, FakeResponse(200, [{"id": "machine-1"}]))
     assert elice.machines() == [{"id": "machine-1"}]
 
 
-def test_the_instance_types_a_zone_offers_are_normalized(elice, fake_httpx) -> None:
-    fake_httpx.answer(
+def test_the_instance_types_a_zone_offers_are_normalized(elice, fake_elice) -> None:
+    fake_elice.answer(
         "GET",
         INSTANCE_TYPE_PATH,
         FakeResponse(
@@ -735,71 +913,77 @@ def test_the_instance_types_a_zone_offers_are_normalized(elice, fake_httpx) -> N
     assert table["A100"].vram_gb == 80
 
 
-def test_an_allocation_is_what_powers_a_declared_machine_on(elice, fake_httpx) -> None:
+def test_an_allocation_is_what_powers_a_declared_machine_on(elice, fake_elice) -> None:
     # The virtual machine is the instance and the allocation is the runtime.
-    fake_httpx.answer("POST", ALLOCATION_PATH, FakeResponse(200, {"id": "alloc-1"}))
+    fake_elice.answer("POST", ALLOCATION_PATH, FakeResponse(200, {"id": "alloc-1"}))
     elice.create_session(Instance(elice, gpu="A100"), "letify-a100-1")
     assert elice._pending_allocation == "alloc-1"
-    assert fake_httpx.last["json"] == {"zone_id": "zone-1", "machine_id": "machine-1"}
+    assert fake_elice.last["json"] == {"zone_id": "zone-1", "machine_id": "machine-1"}
 
 
-def test_an_organization_is_named_in_the_allocation_when_declared(fake_httpx) -> None:
+def test_an_organization_is_named_in_the_allocation_when_declared(fake_elice) -> None:
     provider = provider_of(
-        Elice, "e", zone_id="z", machine_id="m", access_token="t", organization_id="org-1"
+        Elice,
+        "e",
+        endpoint=fake_elice.endpoint,
+        zone_id="z",
+        machine_id="m",
+        access_token="t",
+        organization_id="org-1",
     )
-    fake_httpx.answer("POST", ALLOCATION_PATH, FakeResponse(200, {"allocation_id": "alloc-2"}))
+    fake_elice.answer("POST", ALLOCATION_PATH, FakeResponse(200, {"allocation_id": "alloc-2"}))
     assert provider.allocate("m") == "alloc-2"
-    assert fake_httpx.last["json"]["organization_id"] == "org-1"
+    assert fake_elice.last["json"]["organization_id"] == "org-1"
 
 
-def test_an_allocation_with_no_id_is_a_failure(elice, fake_httpx) -> None:
-    fake_httpx.answer("POST", ALLOCATION_PATH, FakeResponse(200, {"state": "pending"}))
+def test_an_allocation_with_no_id_is_a_failure(elice, fake_elice) -> None:
+    fake_elice.answer("POST", ALLOCATION_PATH, FakeResponse(200, {"state": "pending"}))
     with pytest.raises(letify.RuntimeFailure, match="did not return an allocation id"):
         elice.allocate("machine-1")
 
 
-def test_releasing_an_allocation_stops_compute_billing(elice, fake_httpx) -> None:
+def test_releasing_an_allocation_stops_compute_billing(elice, fake_elice) -> None:
     elice.release("alloc-1")
-    assert fake_httpx.last["method"] == "DELETE"
-    assert fake_httpx.last["path"] == f"{ALLOCATION_PATH}/alloc-1"
+    assert fake_elice.last["method"] == "DELETE"
+    assert fake_elice.last["path"] == f"{ALLOCATION_PATH}/alloc-1"
 
 
-def test_releasing_an_allocation_that_is_already_gone_is_not_an_error(elice, fake_httpx) -> None:
-    fake_httpx.answer(
+def test_releasing_an_allocation_that_is_already_gone_is_not_an_error(elice, fake_elice) -> None:
+    fake_elice.answer(
         "DELETE", f"{ALLOCATION_PATH}/alloc-1", FakeResponse(404, {"message": "gone"})
     )
     assert elice.release("alloc-1") is None
 
 
-def test_stopping_an_elice_runtime_releases_its_allocation(elice, fake_httpx) -> None:
+def test_stopping_an_elice_runtime_releases_its_allocation(elice, fake_elice) -> None:
     runtime = type("R", (), {"external_id": "alloc-1", "name": "letify-a100-1"})()
     elice.stop(runtime)
-    assert fake_httpx.last["path"].endswith("alloc-1")
+    assert fake_elice.last["path"].endswith("alloc-1")
 
 
-def test_a_runtime_with_no_allocation_has_nothing_to_release(elice, fake_httpx) -> None:
+def test_a_runtime_with_no_allocation_has_nothing_to_release(elice, fake_elice) -> None:
     runtime = type("R", (), {"external_id": None, "name": "letify-a100-1"})()
     assert elice.stop(runtime) is None
-    assert fake_httpx.requests == []
+    assert fake_elice.requests == []
 
 
-def test_the_zone_price_list_includes_any_preemptible_option(elice, fake_httpx) -> None:
-    fake_httpx.answer("GET", "/user/pricing", FakeResponse(200, [{"id": "p1", "spot": True}]))
+def test_the_zone_price_list_includes_any_preemptible_option(elice, fake_elice) -> None:
+    fake_elice.answer("GET", "/user/pricing", FakeResponse(200, [{"id": "p1", "spot": True}]))
     assert elice.pricing() == [{"id": "p1", "spot": True}]
 
 
-def test_the_allocations_of_one_machine_can_be_listed(elice, fake_httpx) -> None:
-    fake_httpx.answer("GET", ALLOCATION_PATH, FakeResponse(200, {"items": []}))
+def test_the_allocations_of_one_machine_can_be_listed(elice, fake_elice) -> None:
+    fake_elice.answer("GET", ALLOCATION_PATH, FakeResponse(200, {"items": []}))
     assert elice.allocations("machine-1") == []
-    assert fake_httpx.last["params"] == {"filter_machine_id": "machine-1"}
+    assert fake_elice.last["params"] == {"filter_machine_id": "machine-1"}
     assert elice.allocations() == []
-    assert fake_httpx.last["params"] is None
+    assert fake_elice.last["params"] is None
 
 
-def test_an_elice_gpu_list_may_be_declared_instead_of_asked_for(fake_httpx) -> None:
+def test_an_elice_gpu_list_may_be_declared_instead_of_asked_for(fake_elice) -> None:
     provider = provider_of(Elice, "e", zone_id="z", access_token="t", gpus=["A100", "H100"])
     assert sorted(provider.instances) == ["A100", "H100"]
-    assert fake_httpx.requests == []
+    assert fake_elice.requests == []
 
 
 # -- Spec: Execution modes -----------------------------------------------------
@@ -866,8 +1050,41 @@ def test_a_modal_sandbox_keeps_a_process_alive_for_framed_requests(fake_modal) -
     assert fake.looked_up == ["study"]
     assert fake.created["gpu"] == "H100"
     assert fake.created["timeout"] == 1800
-    assert fake.created["args"] == ["python3", "-u", "-"]
+    # Spec "Channels": not `python -`, which reads standard input to the end before running
+    # anything, so the requests that follow would be compiled as source.
+    from letify.protocol.worker import BOOTSTRAP
+
+    assert fake.created["args"] == ["python3", "-u", "-c", BOOTSTRAP]
     assert fake.created["image"].packages == ("cloudpickle", "blake3")
+
+
+def test_a_sandbox_started_the_way_modal_starts_it_answers_requests(fake_modal) -> None:
+    # The sandbox command and the bytes the channel writes, run with a real Python: the
+    # worker has to come up and answer a framed request on the same pipe.
+    import subprocess
+    import sys
+
+    from letify import protocol
+    from letify.protocol.worker import READY
+
+    fake = fake_modal()
+    provider = provider_of(Modal, "m")
+    runtime = type("R", (), {"name": "letify-h100-1", "instance": provider.H100})()
+    channel = provider.open_channel(runtime)
+    channel.start()
+    stdin = fake.sandbox.text + protocol.encode_request({"op": "stat"}) + "\n"
+    stdin += protocol.SHUTDOWN + "\n"
+
+    result = subprocess.run(
+        [sys.executable, *fake.created["args"][1:]],
+        input=stdin,
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+
+    assert READY in result.stdout, result.stderr
+    assert protocol.REPLY in result.stdout, result.stderr
 
 
 def test_a_sandbox_channel_sends_the_worker_once_and_then_framed_requests() -> None:
@@ -878,8 +1095,14 @@ def test_a_sandbox_channel_sends_the_worker_once_and_then_framed_requests() -> N
     value, logs = channel.request({"op": "stat"})
     assert value == 42
     assert logs == "epoch 1\n"
-    # The worker source went out exactly once.
-    assert sandbox.text.count("_READY = ") == 1
+    # The worker source went out exactly once, length prefixed and base64 encoded for the
+    # bootstrap stub.
+    import base64
+
+    from letify.protocol.worker import SOURCE
+
+    encoded = base64.b64encode(SOURCE.encode()).decode()
+    assert sandbox.text.count(f"{len(encoded)}\n{encoded}") == 1
 
 
 def test_a_sandbox_call_carries_the_pickled_function(fake_modal) -> None:
@@ -1070,15 +1293,15 @@ def test_a_usage_command_that_fails_does_not_take_the_table_down_with_it(
     assert "exit 1" in usage.note
 
 
-def test_elice_prices_what_is_running_now_from_the_zones_own_price_list(elice, fake_httpx) -> None:
+def test_elice_prices_what_is_running_now_from_the_zones_own_price_list(elice, fake_elice) -> None:
     # Elice publishes no balance, so what it can answer honestly is the burn rate of the
     # allocations that exist and what they have cost so far.
-    fake_httpx.answer(
+    fake_elice.answer(
         "GET",
         ALLOCATION_PATH,
         FakeResponse(200, {"items": [{"id": "alloc-1", "instance_type_id": "it-1"}]}),
     )
-    fake_httpx.answer(
+    fake_elice.answer(
         "GET",
         PRICING_PATH,
         FakeResponse(200, {"items": [{"instance_type_id": "it-1", "price_per_hour": 975.0}]}),
@@ -1090,10 +1313,10 @@ def test_elice_prices_what_is_running_now_from_the_zones_own_price_list(elice, f
     assert "price list" in usage.source
 
 
-def test_elice_reports_a_zero_rate_when_nothing_is_allocated(elice, fake_httpx) -> None:
+def test_elice_reports_a_zero_rate_when_nothing_is_allocated(elice, fake_elice) -> None:
     # Nothing powered on costs nothing per hour, which is a number rather than a gap.
-    fake_httpx.answer("GET", ALLOCATION_PATH, FakeResponse(200, {"items": []}))
-    fake_httpx.answer("GET", PRICING_PATH, FakeResponse(200, {"items": []}))
+    fake_elice.answer("GET", ALLOCATION_PATH, FakeResponse(200, {"items": []}))
+    fake_elice.answer("GET", PRICING_PATH, FakeResponse(200, {"items": []}))
     assert elice.usage().rate_per_hour == 0.0
 
 
