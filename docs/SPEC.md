@@ -376,6 +376,20 @@ Moving a file through a session only works while that session exists, so `absorb
 
 Every backend answers "which of these digests are missing" with one listing rather than one request per digest, because object level requests are billed and add latency.
 
+### Google login for gcs <!-- id: gcs-login -->
+
+> The `gcs` backend borrows the user's existing Google login. It stores no credential and adds no dependency.
+
+The client calls the Cloud Storage JSON API at `https://storage.googleapis.com`: a listing with `prefix` and `pageToken` for `missing`, a media upload for `put` and `write_ref`, and a media download for `get` and `read_ref`. A volume option `endpoint` points it elsewhere. A request that answers 404 means the object is absent; any other status that is not 2xx raises `RuntimeFailure` naming the status and the object.
+
+The access token is looked up in this order, the first that answers wins:
+
+1. The `GOOGLE_OAUTH_ACCESS_TOKEN` environment variable, used as it is.
+2. Application Default Credentials: the file named by `GOOGLE_APPLICATION_CREDENTIALS`, or `application_default_credentials.json` in the gcloud configuration directory (`~/.config/gcloud/` on Linux and macOS, `%APPDATA%\gcloud\` on Windows). A file of type `authorized_user`, which `gcloud auth application-default login` writes, is exchanged for an access token by posting its refresh token to its `token_uri`, `https://oauth2.googleapis.com/token` by default, with the standard library HTTP client.
+3. `gcloud auth print-access-token`, when `gcloud` is on `PATH`.
+
+A token is reused until 60 s before it expires. A service account key file is refused with its reason, because exchanging one needs an RSA signature the standard library cannot make; `gcloud auth activate-service-account` followed by rule 3 covers that case. When no rule answers, the backend raises `ProviderUnavailable` for `gcs` saying that no Google login was found and naming `gcloud auth application-default login` and `GOOGLE_OAUTH_ACCESS_TOKEN`.
+
 ## Environment
 
 > An `Env` is a declaration keyed by the hash of a uv lock file, not a built image.

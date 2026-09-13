@@ -3,15 +3,17 @@
 Spec sections pinned here: "Storage", "Content addressed layout", "Blob granularity",
 "Materializing into a runtime" and "Backends".
 
-The filesystem backend is the real one throughout. The three cloud backends are driven
-through in-memory stand-ins from conftest, because a bucket needs an account; what is
-still real there is the key layout and the operations letify performs.
+The filesystem backend is the real one throughout. The gcs backend talks HTTP to a Cloud
+Storage endpoint served on loopback by conftest, and the Modal volume backend is driven
+through an in-memory stand-in, because a bucket needs an account; what is still real there
+is the key layout, the HTTP client and the operations letify performs.
 """
 
 from __future__ import annotations
 
 import io
 import tarfile
+import types
 from pathlib import Path
 
 import pytest
@@ -241,9 +243,9 @@ def test_the_default_missing_answer_asks_once_per_digest(tmp_path: Path) -> None
 
 
 def test_a_bucket_backend_keeps_the_documented_layout_under_its_prefix(fake_gcs) -> None:
-    backend = GCSBackend("study-bucket", prefix="letify")
+    backend = GCSBackend("study-bucket", prefix="letify", endpoint=fake_gcs.endpoint)
     backend.put("ab12", b"payload")
-    assert "letify/blobs/ab/ab12" in fake_gcs
+    assert fake_gcs.objects["letify/blobs/ab/ab12"] == b"payload"
     assert backend.has("ab12") is True
     assert backend.has("nope") is False
     assert backend.get("ab12") == b"payload"
@@ -255,8 +257,111 @@ def test_a_bucket_backend_keeps_the_documented_layout_under_its_prefix(fake_gcs)
 
 
 def test_a_bucket_backend_can_be_used_without_a_prefix(fake_gcs) -> None:
-    GCSBackend("study-bucket", prefix="").put("ab12", b"payload")
-    assert "blobs/ab/ab12" in fake_gcs
+    GCSBackend("study-bucket", prefix="", endpoint=fake_gcs.endpoint).put("ab12", b"payload")
+    assert "blobs/ab/ab12" in fake_gcs.objects
+
+
+def test_a_bucket_listing_follows_every_page(fake_gcs) -> None:
+    # Spec "Google login for gcs": missing() is one listing, and a listing is paged.
+    backend = GCSBackend("study-bucket", endpoint=fake_gcs.endpoint)
+    held = [f"{n:02x}{'0' * 30}" for n in range(5)]
+    for digest in held:
+        backend.put(digest, digest.encode())
+    before = len(fake_gcs.requests)
+    assert backend.missing([*held, "ff" + "0" * 30]) == ["ff" + "0" * 30]
+    pages = [r for r in fake_gcs.requests[before:] if r["path"].endswith("/o")]
+    assert len(pages) == 3
+    assert all(r["query"]["prefix"] == "letify/blobs/" for r in pages)
+
+
+def test_a_bucket_request_carries_the_borrowed_token(fake_gcs) -> None:
+    GCSBackend("study-bucket", endpoint=fake_gcs.endpoint).has("ab12")
+    assert fake_gcs.requests[-1]["authorization"] == "Bearer token-1"
+
+
+def test_a_bucket_that_refuses_the_token_is_a_runtime_failure(fake_gcs, monkeypatch) -> None:
+    monkeypatch.setenv("GOOGLE_OAUTH_ACCESS_TOKEN", "stale")
+    backend = GCSBackend("study-bucket", endpoint=fake_gcs.endpoint)
+    with pytest.raises(letify.RuntimeFailure, match="401"):
+        backend.get("ab12")
+
+
+# -- Spec: Google login for gcs ------------------------------------------------
+
+
+@pytest.fixture
+def no_google_login(monkeypatch, tmp_path: Path) -> Path:
+    """No token variable, no credentials file and no gcloud: a machine with no login."""
+    from letify.store.backends import google_auth
+
+    monkeypatch.delenv("GOOGLE_OAUTH_ACCESS_TOKEN", raising=False)
+    monkeypatch.delenv("GOOGLE_APPLICATION_CREDENTIALS", raising=False)
+    monkeypatch.setenv("CLOUDSDK_CONFIG", str(tmp_path / "gcloud"))
+    monkeypatch.setattr(google_auth.shutil, "which", lambda name: None)
+    return tmp_path / "gcloud"
+
+
+def test_no_google_login_names_the_command_that_makes_one(no_google_login) -> None:
+    from letify.store.backends.google_auth import TokenSource
+
+    with pytest.raises(letify.ProviderUnavailable, match="application-default login"):
+        TokenSource().token()
+
+
+def test_application_default_credentials_are_refreshed_over_http(
+    fake_gcs, no_google_login, monkeypatch
+) -> None:
+    import json
+
+    from letify.store.backends.google_auth import TokenSource
+
+    no_google_login.mkdir()
+    (no_google_login / "application_default_credentials.json").write_text(
+        json.dumps(
+            {
+                "type": "authorized_user",
+                "client_id": "client-1",
+                "client_secret": "secret-1",
+                "refresh_token": "refresh-1",
+                "token_uri": f"{fake_gcs.endpoint}/token",
+            }
+        ),
+        encoding="utf-8",
+    )
+    source = TokenSource()
+    assert source.token() == "token-1"
+    # Reused until shortly before it expires, so a second request asks for nothing.
+    assert source.token() == "token-1"
+    assert len(fake_gcs.refresh_grants) == 1
+    assert fake_gcs.refresh_grants[0]["grant_type"] == "refresh_token"
+    assert fake_gcs.refresh_grants[0]["refresh_token"] == "refresh-1"
+
+
+def test_a_service_account_key_file_is_refused_with_its_reason(
+    no_google_login, tmp_path, monkeypatch
+) -> None:
+    from letify.store.backends.google_auth import TokenSource
+
+    key = tmp_path / "key.json"
+    key.write_text('{"type": "service_account"}', encoding="utf-8")
+    monkeypatch.setenv("GOOGLE_APPLICATION_CREDENTIALS", str(key))
+    with pytest.raises(letify.ProviderUnavailable, match="activate-service-account"):
+        TokenSource().token()
+
+
+def test_gcloud_is_asked_when_nothing_else_answers(no_google_login, monkeypatch) -> None:
+    from letify.store.backends import google_auth
+
+    asked: list[list[str]] = []
+
+    def run(command, **kwargs):
+        asked.append(command)
+        return types.SimpleNamespace(returncode=0, stdout="token-from-gcloud\n", stderr="")
+
+    monkeypatch.setattr(google_auth.shutil, "which", lambda name: "/usr/bin/gcloud")
+    monkeypatch.setattr(google_auth.subprocess, "run", run)
+    assert google_auth.TokenSource().token() == "token-from-gcloud"
+    assert asked == [["/usr/bin/gcloud", "auth", "print-access-token"]]
 
 
 def test_a_modal_volume_backend_keeps_the_documented_layout(fake_modal) -> None:
@@ -278,10 +383,7 @@ def test_a_modal_volume_backend_keeps_the_documented_layout(fake_modal) -> None:
 
 @pytest.mark.parametrize(
     ("cls", "argument", "module", "extra"),
-    [
-        (GCSBackend, "bucket", "google.cloud", "gcs"),
-        (ModalBackend, "volume", "modal", "modal"),
-    ],
+    [(ModalBackend, "volume", "modal", "modal")],
 )
 def test_a_backend_whose_package_is_absent_says_how_to_install_it(
     cls, argument: str, module: str, extra: str, no_module
@@ -525,6 +627,12 @@ def test_moving_a_checkpoint_outside_keep_alive_is_refused(let, cpu, volume, tmp
     with pytest.raises(letify.UnsupportedMode, match="keep_alive"):
         volume.resume(anything, "run-4", str(tmp_path / "x.pt"))
     assert let.pool.live == []
+
+
+def test_the_gcs_backend_imports_no_cloud_sdk(no_module, fake_gcs) -> None:
+    # Spec "Packaging": the gcs blob store uses a standard library client.
+    no_module("google", "google.cloud", "google.cloud.storage")
+    assert GCSBackend("study-bucket", endpoint=fake_gcs.endpoint).has("ab12") is False
 
 
 def test_there_is_no_s3_backend() -> None:
