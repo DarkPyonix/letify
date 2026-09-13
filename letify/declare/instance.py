@@ -20,6 +20,26 @@ if TYPE_CHECKING:
     from ..providers.base import Provider
 
 
+class Lifetime(StrEnum):
+    """How long the runtime a declaration uses stays alive.
+
+    ``call`` is the default. The session ends when the call that needed it finishes, and a
+    search space counts as one call, so a sweep starts its sessions once and ends them
+    once. Nothing keeps billing after the work is done.
+
+    ``process`` keeps the session past the call, because starting one costs provider boot
+    plus environment installation, which is minutes on Colab and worth avoiding across a
+    run of separate calls. It then ends when the idle reaper takes it or the process
+    exits, whichever comes first.
+
+    A string enum, so ``lifetime="process"`` works wherever ``lifetime=Lifetime.process``
+    does.
+    """
+
+    call = "call"
+    process = "process"
+
+
 class Host(StrEnum):
     """Where the host code runs, relative to this process.
 
@@ -106,4 +126,4 @@ class AnyInstance:
         return f"<AnyInstance {self.accelerator}>"
 
 
-__all__ = ["AnyInstance", "Host", "Instance"]
+__all__ = ["AnyInstance", "Host", "Instance", "Lifetime"]

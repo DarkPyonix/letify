@@ -10,7 +10,7 @@
 /// The driver's own result type.
 pub type CUresult = i32;
 
-// The full set is mirrored even where the shim does not return one yet, because these
+// The full set is mirrored even where the local driver does not return one yet, because these
 // are the driver's numbers and a caller may compare against any of them.
 pub const CUDA_SUCCESS: CUresult = 0;
 pub const CUDA_ERROR_INVALID_VALUE: CUresult = 1;
@@ -23,24 +23,24 @@ pub const CUDA_ERROR_NOT_FOUND: CUresult = 500;
 pub const CUDA_ERROR_NOT_SUPPORTED: CUresult = 801;
 pub const CUDA_ERROR_UNKNOWN: CUresult = 999;
 
-/// Write a line to the shim log.
+/// Write a line to the driver log.
 ///
-/// Off unless `LETIFY_SHIM_LOG` is set, because this sits on the path of every driver
+/// Off unless `LETIFY_DRIVER_LOG` is set, because this sits on the path of every driver
 /// call and a process can make millions of them.
 pub fn log(message: &str) {
-    if std::env::var_os("LETIFY_SHIM_LOG").is_none() {
+    if std::env::var_os("LETIFY_DRIVER_LOG").is_none() {
         return;
     }
-    eprintln!("letify-shim: {message}");
+    eprintln!("letify-driver: {message}");
 }
 
 /// Record that an entry point was reached before it was implemented.
 ///
-/// Always logged, even without `LETIFY_SHIM_LOG`, because a missing symbol is the reason
+/// Always logged, even without `LETIFY_DRIVER_LOG`, because a missing symbol is the reason
 /// a run failed and the name of it is the next thing to build.
 pub fn unimplemented(symbol: &str) -> CUresult {
     eprintln!(
-        "letify-shim: {symbol} is not implemented yet, so this call returns \
+        "letify-driver: {symbol} is not implemented yet, so this call returns \
          CUDA_ERROR_NOT_SUPPORTED. Report the symbol name; the driver surface is being \
          filled in from what real workloads actually reach for."
     );

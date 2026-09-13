@@ -1,4 +1,4 @@
-//! letify-shim, the stand-in for the CUDA driver.
+//! letify-driver, the stand-in for the real CUDA driver.
 //!
 //! This library stands in for the CUDA driver on the machine that runs the Python code.
 //! Every call an application makes is forwarded to an agent on the machine that has the
@@ -12,7 +12,7 @@
 //! `LD_PRELOAD`.
 //!
 //! On Windows it is built as `nvcuda.dll`. There is no `LD_PRELOAD`, so letify calls
-//! `os.add_dll_directory` on the shim's directory before importing torch, which puts it
+//! `os.add_dll_directory` on this driver's directory before importing torch, which puts it
 //! first in the loader's search order. That is why the Python side owns the injection:
 //! it has to happen before the first CUDA library is loaded.
 //!
@@ -69,7 +69,7 @@ pub fn attach() -> CUresult {
     }
 }
 
-/// Report what the shim has done, for the Python side to read back.
+/// Report what the local driver has done, for the Python side to read back.
 ///
 /// The ratio of calls to round trips is the number that says whether batching is working:
 /// a training step issues thousands of calls and should only pay a handful of round trips.

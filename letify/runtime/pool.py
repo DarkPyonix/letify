@@ -6,15 +6,15 @@ boots its runtimes once and releases them when the last point finishes. Nothing 
 kept alive on the chance that another call might come.
 
 Keeping one longer is declared, never assumed. A runtime acquired for a declaration
-made with ``warm=True`` is marked warm and survives its release, because starting a
-session is not free: provider boot plus environment installation is minutes on Colab, so
-several separate calls in a row are cheaper warm than cold.
+made with ``lifetime="process"`` survives its release, because starting a session is not
+free: provider boot plus environment installation is minutes on Colab, so several separate
+calls in a row are cheaper with one session than with several.
 
 ``hold`` is the other half of the rule, and it is internal. One invocation brackets
 itself with it so that a search space, which is many calls, starts its runtimes once and
 releases them when the last point finishes.
 
-Two backstops cover a warm runtime nobody uses any more. A reaper thread tears down
+Two backstops cover a process-lifetime runtime nobody uses any more. A reaper thread tears down
 runtimes idle past the timeout, and each runtime's lease makes the remote worker exit if
 this process stops renewing.
 """
@@ -27,6 +27,7 @@ import uuid
 from collections.abc import Sequence
 from typing import TYPE_CHECKING
 
+from ..declare.instance import Lifetime
 from ..errors import LetifyError
 
 if TYPE_CHECKING:
@@ -100,12 +101,12 @@ class RuntimePool:
         env: Env,
         volumes: Sequence[Volume] = (),
         *,
-        warm: bool = False,
+        lifetime: Lifetime = Lifetime.call,
     ) -> Runtime:
         """Return a runtime for this declaration, starting one if a slot is free.
 
-        ``warm`` marks the runtime as worth surviving its release, which is what a
-        declaration made with ``warm=True`` asks for.
+        ``lifetime`` comes from the declaration and decides whether the runtime survives
+        its release.
         """
         key = f"{instance.key}|{env.key}"
         while True:
@@ -113,7 +114,8 @@ class RuntimePool:
                 for runtime in self._runtimes.get(key, ()):
                     if not runtime.busy:
                         runtime.busy = True
-                        runtime.warm = runtime.warm or warm
+                        if lifetime is Lifetime.process:
+                            runtime.lifetime = lifetime
                         runtime.last_used = time.monotonic()
                         return runtime
                 may_start = self._count < self.max_runtimes
@@ -122,7 +124,7 @@ class RuntimePool:
 
             if may_start:
                 try:
-                    return self._start(instance, env, volumes, key, warm=warm)
+                    return self._start(instance, env, volumes, key, lifetime=lifetime)
                 except BaseException:
                     with self._guard:
                         self._count -= 1
@@ -135,11 +137,11 @@ class RuntimePool:
                 self._free.wait(timeout=REAP_INTERVAL)
 
     def release(self, runtime: Runtime) -> None:
-        """Give a runtime back. It dies here unless it was declared warm."""
+        """Give a runtime back. It ends here unless its lifetime says otherwise."""
         with self._guard:
             runtime.busy = False
             runtime.last_used = time.monotonic()
-            keep = runtime.warm or self._hold_depth > 0
+            keep = runtime.lifetime is Lifetime.process or self._hold_depth > 0
         if keep:
             with self._free:
                 self._free.notify_all()
@@ -167,14 +169,14 @@ class RuntimePool:
         volumes: Sequence[Volume],
         key: str,
         *,
-        warm: bool = False,
+        lifetime: Lifetime = Lifetime.call,
     ) -> Runtime:
         name = f"letify-{instance.accelerator.lower()}-{uuid.uuid4().hex[:6]}"
         if callable(self.on_start):
             self.on_start(instance, name)
         runtime = instance.provider.start(instance, env, name=name, volumes=tuple(volumes))
         runtime.busy = True
-        runtime.warm = warm
+        runtime.lifetime = lifetime
         with self._guard:
             self._runtimes.setdefault(key, []).append(runtime)
         self._ensure_reaper()
@@ -212,18 +214,17 @@ class RuntimePool:
             stopped.append(runtime.name)
         return stopped
 
-    def shutdown_idle(self, *, include_warm: bool = False) -> list[str]:
+    def shutdown_idle(self, *, every: bool = False) -> list[str]:
         """Shut down runtimes that are not running a call.
 
-        A runtime declared warm is left alone unless ``include_warm`` is set, which is
-        what an explicit release does.
+        A runtime whose lifetime is the process is left alone unless ``every`` is set.
         """
         with self._guard:
             candidates = [
                 runtime
                 for bucket in self._runtimes.values()
                 for runtime in bucket
-                if not runtime.busy and (include_warm or not runtime.warm)
+                if not runtime.busy and (every or runtime.lifetime is not Lifetime.process)
             ]
         stopped = []
         for runtime in candidates:

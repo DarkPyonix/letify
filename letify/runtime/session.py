@@ -4,15 +4,14 @@ This is the only object in letify that costs money. The provider, the instance a
 the environment are all descriptions; creating a runtime is when Colab or Modal or
 a cloud machine powers something on, and shutting it down is when the charge stops.
 
-A runtime is released when the call that needed it finishes. Holding one longer is
-opt in, through ``let.keep()``, because idle time on a GPU is money for nothing.
-The counter-argument is real and the reason ``keep`` exists: starting a session
-costs provider boot plus environment installation, which on Colab is minutes, so a
-run of several separate calls is cheaper warm than cold.
+A runtime ends when the call that needed it finishes. Keeping one longer is opt in,
+through ``lifetime="process"`` on the declaration, because idle time on a GPU is money for
+nothing. The counter-argument is real and the reason that option exists: starting a session
+costs provider boot plus environment installation, which on Colab is minutes, so a run of
+several separate calls is cheaper with one session than with several.
 
-Two backstops cover the case where nobody released it. The idle timeout tears down
-a runtime that has been unused too long, and the lease makes the worker exit if
-this process stops renewing.
+Two backstops cover a session nobody uses any more. The idle reaper tears down one that has
+been unused too long, and the lease makes the worker exit if this process stops renewing.
 """
 
 from __future__ import annotations
@@ -23,6 +22,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from .. import protocol
+from ..declare.instance import Lifetime
 from ..errors import RuntimeFailure
 from .lease import Lease
 
@@ -53,8 +53,8 @@ class Runtime:
     ready: bool = False
     busy: bool = False
 
-    #: Set when a declaration asked for its runtime to survive between calls.
-    warm: bool = False
+    #: How long this session lives, from the declaration that started it.
+    lifetime: Lifetime = Lifetime.call
     lease: Lease | None = field(default=None, repr=False)
 
     #: Digests this runtime is known to hold, so an argument is sent once.

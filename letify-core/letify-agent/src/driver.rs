@@ -5,8 +5,8 @@
 //! tested and packaged anywhere. And the same binary runs against whatever driver
 //! version the machine happens to have, instead of being pinned at build time.
 //!
-//! Only the entry points the shim actually forwards are looked up. A missing symbol is
-//! reported by name, which is the same discipline the shim follows.
+//! Only the entry points the local driver actually forwards are looked up. A missing symbol is
+//! reported by name, which is the same discipline the local driver follows.
 
 use std::ffi::{CString, c_char, c_void};
 

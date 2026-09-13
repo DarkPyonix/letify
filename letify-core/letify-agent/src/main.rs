@@ -1,11 +1,11 @@
 //! The agent that holds the real device.
 //!
 //! It listens on a TCP port, accepts one core at a time, and executes the driver calls
-//! that arrive. letify starts it on the machine with the GPU and tells the shim where to
+//! that arrive. letify starts it on the machine with the GPU and tells the local driver where to
 //! find it.
 //!
-//! Two tables live here. Allocations map the shim's handles onto real device pointers, so
-//! the shim can hand out a pointer before this side has allocated anything. Modules are
+//! Two tables live here. Allocations map this driver's handles onto real device pointers, so
+//! the local driver can hand out a pointer before this side has allocated anything. Modules are
 //! keyed by content, so a fatbin that arrived once is not sent again.
 //!
 //! Requests arrive in order and are executed in order. A batch of queued launches is
@@ -66,13 +66,13 @@ fn main() {
     }
 }
 
-/// State that belongs to one shim connection.
+/// State that belongs to one client connection.
 struct Session {
-    /// the shim's handle to the real device pointer behind it.
+    /// this driver's handle to the real device pointer behind it.
     allocations: HashMap<u64, u64>,
     /// Content address to the module handle, so a fatbin travels once.
     modules: HashMap<[u8; 16], u64>,
-    /// the shim's event handle to the real one.
+    /// this driver's event handle to the real one.
     events: HashMap<u64, u64>,
 }
 
@@ -150,7 +150,7 @@ fn handle(request: &Request, driver: &Driver, session: &mut Session) -> Result<R
         Request::Hello { version } => {
             if *version != PROTOCOL_VERSION {
                 eprintln!(
-                    "letify-agent: the shim speaks protocol {version} and this agent speaks \
+                    "letify-agent: the local driver speaks protocol {version} and this agent speaks \
                      {PROTOCOL_VERSION}"
                 );
             }
@@ -203,7 +203,7 @@ fn handle(request: &Request, driver: &Driver, session: &mut Session) -> Result<R
             Ok(Reply::Handle { handle: driver.function(*module, name)? })
         }
         Request::LaunchKernel { function, grid, block, shared_bytes, stream, params } => {
-            // the shim sends the pointer list it was given. Each entry is an address in
+            // the local driver sends the pointer list it was given. Each entry is an address in
             // the caller's own space, so it is translated here through the allocation
             // table before the launch.
             let mut translated: Vec<*mut c_void> = params

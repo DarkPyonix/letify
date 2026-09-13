@@ -150,11 +150,11 @@ def test_local_runs_the_body_in_this_process(let: letify.Launcher, cpu: letify.I
 
 
 def test_a_kept_value_stays_in_the_runtime(let: letify.Launcher, cpu: letify.Instance) -> None:
-    @let.function(device=cpu, host="remote", keep_remote=True, warm=True)
+    @let.function(device=cpu, host="remote", keep_remote=True, lifetime="process")
     def build() -> dict[str, list[int]]:
         return {"weights": [1, 2, 3]}
 
-    @let.function(device=cpu, host="remote", warm=True)
+    @let.function(device=cpu, host="remote", lifetime="process")
     def total(model: dict[str, list[int]]) -> int:
         return sum(model["weights"])
 
@@ -162,11 +162,11 @@ def test_a_kept_value_stays_in_the_runtime(let: letify.Launcher, cpu: letify.Ins
     assert isinstance(handle, letify.Handle)
     # Resolving it in a later call is what the persistent worker exists for.
     assert total(model=handle) == 6
-    let.shutdown()
+    let.pool.shutdown()
 
 
 def test_a_large_argument_is_sent_once(let: letify.Launcher, cpu: letify.Instance) -> None:
-    @let.function(device=cpu, host="remote", warm=True)
+    @let.function(device=cpu, host="remote", lifetime="process")
     def size(payload: bytes) -> int:
         return len(payload)
 
@@ -178,11 +178,11 @@ def test_a_large_argument_is_sent_once(let: letify.Launcher, cpu: letify.Instanc
     stat = runtime.stat()
     # One blob, not two, even though the argument was passed twice.
     assert stat["blobs"] == 1
-    let.shutdown()
+    let.pool.shutdown()
 
 
 def test_the_worker_is_one_process_across_calls(let: letify.Launcher, cpu: letify.Instance) -> None:
-    @let.function(device=cpu, host="remote", warm=True)
+    @let.function(device=cpu, host="remote", lifetime="process")
     def noop() -> None:
         return None
 
@@ -190,18 +190,18 @@ def test_the_worker_is_one_process_across_calls(let: letify.Launcher, cpu: letif
     first = let.pool.live[0].stat()["pid"]
     noop()
     assert let.pool.live[0].stat()["pid"] == first
-    let.shutdown()
+    let.pool.shutdown()
 
 
 def test_files_written_into_a_runtime_survive_between_calls(
     let: letify.Launcher, cpu: letify.Instance, tmp_path
 ) -> None:
-    @let.function(device=cpu, host="remote", warm=True)
+    @let.function(device=cpu, host="remote", lifetime="process")
     def read(path: str) -> str:
         with open(path, encoding="utf-8") as handle:
             return handle.read()
 
-    @let.function(device=cpu, host="remote", warm=True)
+    @let.function(device=cpu, host="remote", lifetime="process")
     def touch() -> None:
         return None
 
@@ -213,7 +213,7 @@ def test_files_written_into_a_runtime_survive_between_calls(
     payload, digest = runtime.get_bytes(target)
     assert payload == b"from the store"
     assert digest
-    let.shutdown()
+    let.pool.shutdown()
 
 
 # -- failure -------------------------------------------------------------------
@@ -266,8 +266,10 @@ def test_a_runtime_dies_when_its_call_finishes(let: letify.Launcher, cpu: letify
     assert let.pool.live == []
 
 
-def test_a_warm_declaration_keeps_its_runtime(let: letify.Launcher, cpu: letify.Instance) -> None:
-    @let.function(device=cpu, host="remote", warm=True)
+def test_a_process_lifetime_declaration_keeps_its_session(
+    let: letify.Launcher, cpu: letify.Instance
+) -> None:
+    @let.function(device=cpu, host="remote", lifetime="process")
     def noop() -> None:
         return None
 
@@ -275,30 +277,30 @@ def test_a_warm_declaration_keeps_its_runtime(let: letify.Launcher, cpu: letify.
     assert len(let.pool.live) == 1
     noop()
     assert len(let.pool.live) == 1
-    assert let.shutdown()
+    assert let.pool.shutdown()
     assert let.pool.live == []
 
 
-def test_warm_declarations_on_one_device_share_a_runtime(
+def test_two_declarations_on_one_device_share_a_session(
     let: letify.Launcher, cpu: letify.Instance
 ) -> None:
-    @let.function(device=cpu, host="remote", warm=True)
+    @let.function(device=cpu, host="remote", lifetime="process")
     def first() -> int:
         return 1
 
-    @let.function(device=cpu, host="remote", warm=True)
+    @let.function(device=cpu, host="remote", lifetime="process")
     def second() -> int:
         return 2
 
     first()
     second()
-    # Pooling is by instance and environment, so two declarations need no block to
-    # share a session.
+    # Pooling is by instance and environment, so two declarations share a session with
+    # nothing said about it.
     assert len(let.pool.live) == 1
-    let.shutdown()
+    let.pool.shutdown()
 
 
-def test_a_sweep_holds_one_set_of_runtimes(let: letify.Launcher, cpu: letify.Instance) -> None:
+def test_a_sweep_is_one_invocation(let: letify.Launcher, cpu: letify.Instance) -> None:
     limited = letify.Launcher(home=False, announce=False, max_runtimes=2)
     here = limited.providers.local.CPU
 

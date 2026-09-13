@@ -4,13 +4,13 @@
 //! would put a round trip in front of every `cuMemAlloc`, and PyTorch's caching
 //! allocator calls that often enough for it to matter.
 //!
-//! So the shim hands out its own pointers from a range that cannot be confused with a
+//! So the local driver hands out its own pointers from a range that cannot be confused with a
 //! real address, records what they stand for, and lets the agent reconcile them in the
 //! background. A later call that names one carries the handle, not the address.
 //!
 //! The one thing this costs is honest failure. The caching allocator normally learns that
 //! the device is full when `cuMemAlloc` returns an error, frees its cache and retries.
-//! With a virtual pointer there is nothing to fail yet, so the shim keeps its own
+//! With a virtual pointer there is nothing to fail yet, so the local driver keeps its own
 //! accounting of device memory and refuses locally once the budget is gone. That keeps
 //! the retry path working instead of turning an out of memory condition into a crash at
 //! the next synchronization.
@@ -29,7 +29,7 @@ pub struct Allocation {
     pub bytes: u64,
 }
 
-/// Every handle the shim has issued, plus its memory accounting.
+/// Every handle the local driver has issued, plus its memory accounting.
 #[derive(Debug)]
 pub struct Table {
     next: u64,

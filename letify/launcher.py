@@ -14,15 +14,15 @@ pool. It is the thing that does the letting, so the conventional variable name i
 There is no scope to open. A runtime lives for the invocation that needed it and is
 released when that finishes, which is why a call needs no ceremony around it.
 
-Keeping a session alive between calls is declared, not commanded. A declaration made
-with ``warm=True`` holds its runtime after the call returns, because starting a session
+How long a session lives is declared, not commanded. ``lifetime="call"`` is the default
+and ends the session with the call. ``lifetime="process"`` keeps it, because starting one
 costs provider boot plus environment installation, which is minutes on Colab and worth
-avoiding across a run of separate calls. Two warm declarations on the same device and
-environment share one session, since the pool keys by those rather than by which
+avoiding across a run of separate calls. Two declarations that agree on device and
+environment share a session either way, since the pool keys by those rather than by which
 function asked.
 
-Nothing is released by hand. A call releases its own runtime, a warm one is torn down by
-the idle reaper once it stops being used, and everything goes at process exit.
+Nothing is torn down by hand. A call ends its own session, one left over is reaped once it
+has been idle past the timeout, and everything goes at process exit.
 
 Providers are reached by attribute on ``let.providers``. Three names there are
 reserved: ``any`` for a request that does not name a provider, ``devices`` for the
@@ -43,7 +43,7 @@ from . import providers as provider_registry
 from .config import Config, load
 from .declare.env import Env
 from .declare.function import Function
-from .declare.instance import AnyInstance, Host, Instance
+from .declare.instance import AnyInstance, Host, Instance, Lifetime
 from .declare.sweep import grid, zip_
 from .errors import UnknownInstance, UnknownProvider
 from .runtime.pool import DEFAULT_IDLE_TIMEOUT, RuntimePool
@@ -203,11 +203,11 @@ class Launcher:
         device: Instance | AnyInstance,
         env: Env | None = None,
         host: Host | str | None = None,
+        lifetime: Lifetime | str | None = None,
         volumes: Sequence[Volume] = (),
         concurrency: int = 1,
         timeout: float | None = 3600,
         retries: int = 1,
-        warm: bool = False,
         keep_remote: bool = False,
     ) -> Callable[[Callable[..., R]], Function[R]]:
         """Declare where a function runs.
@@ -218,9 +218,9 @@ class Launcher:
         CUDA calls, and ``"remote"`` ships this function to the machine with the GPU.
         ``concurrency`` is how many runtimes this declaration may use at once.
 
-        ``warm`` keeps this declaration's runtime alive after a call returns, so the
-        next call skips session start. The cost is that an unused session keeps
-        billing until the idle timeout, which is why it is off by default.
+        ``lifetime`` says how long the session lives. ``"call"``, the default, ends it
+        with the call. ``"process"`` keeps it so the next call skips session start, at the
+        cost of an unused session billing until the idle reaper takes it.
 
         ``keep_remote`` returns a handle instead of the value, so a model stays in the
         runtime and later calls refer to it without copying it back.
@@ -233,11 +233,11 @@ class Launcher:
                 device=device,
                 env=env or Env(),
                 host=host,
+                lifetime=lifetime,
                 volumes=volumes,
                 concurrency=concurrency,
                 timeout=timeout,
                 retries=retries,
-                warm=warm,
                 keep_remote=keep_remote,
             )
             self.functions.append(declared)
@@ -266,10 +266,6 @@ class Launcher:
         finally:
             self.pool.unhold()
 
-    def shutdown(self) -> list[str]:
-        """Stop everything, including runtimes still running a call."""
-        return self.pool.shutdown()
-
     def runtime(
         self,
         instance: Instance | AnyInstance,
@@ -280,11 +276,13 @@ class Launcher:
         """Start one runtime now instead of on the first call.
 
         Useful when a session takes a while to come up and there is local work to do
-        meanwhile, such as preparing data. It is marked warm, so it survives until the
-        idle timeout or process exit.
+        meanwhile, such as preparing data. It lives for the process, so the idle reaper or
+        process exit is what ends it.
         """
         self._register_at_exit()
-        return self.pool.acquire(self.resolve(instance), env or Env(), volumes, warm=True)
+        return self.pool.acquire(
+            self.resolve(instance), env or Env(), volumes, lifetime=Lifetime.process
+        )
 
     def reap_idle(self) -> list[str]:
         """Shut down runtimes idle past the timeout, without waiting for the reaper."""
@@ -305,6 +303,7 @@ class Launcher:
                     "accelerator": runtime.instance.accelerator,
                     "placement": str(runtime.instance.placement),
                     "busy": runtime.busy,
+                    "lifetime": str(runtime.lifetime),
                     "persistent_channel": runtime.persistent_channel,
                     "idle_seconds": round(runtime.idle_for, 1),
                 }

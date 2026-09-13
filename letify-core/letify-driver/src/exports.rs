@@ -410,7 +410,7 @@ pub extern "C" fn cuEventElapsedTime(
 #[unsafe(no_mangle)]
 pub extern "C" fn cuMemAllocManaged(_pointer: *mut u64, _bytes: usize, _flags: u32) -> CUresult {
     eprintln!(
-        "letify-shim: cuMemAllocManaged cannot be forwarded. Unified memory relies on the \
+        "letify-driver: cuMemAllocManaged cannot be forwarded. Unified memory relies on the \
          device faulting into host pages, which needs one address space, and there is no \
          such thing across a network. A paged optimizer such as bitsandbytes PagedAdamW \
          uses this. Use host='remote' to ship the function instead."

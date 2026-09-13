@@ -1,5 +1,5 @@
 [package]
-name = "letify-shim"
+name = "letify-driver"
 description = "Stands in for the CUDA driver and forwards its calls to a remote agent."
 version.workspace = true
 edition.workspace = true
@@ -11,7 +11,7 @@ repository.workspace = true
 # being found first in the loader's search order is the whole mechanism. Linux and WSL2
 # want libcuda.so.1, reached with LD_PRELOAD; Windows wants nvcuda.dll, reached by
 # putting this directory ahead of the real one. core/build.py does the renaming.
-name = "letify_shim"
+name = "letify_driver"
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]

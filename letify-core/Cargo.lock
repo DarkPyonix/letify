@@ -17,7 +17,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "letify-shim"
+name = "letify-driver"
 version = "0.1.0"
 dependencies = [
  "letify-wire",

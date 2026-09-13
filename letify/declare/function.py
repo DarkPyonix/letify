@@ -16,7 +16,7 @@ order.
 
 One invocation is also the lifetime of the runtimes it needed. They are released
 when the call finishes, including a sweep, which counts as one invocation. A
-declaration made with ``warm=True`` keeps its runtime past that point, which is the
+declaration made with ``lifetime="process"`` keeps its session past that point, which is
 declarative way to say the next call should skip session start.
 """
 
@@ -30,7 +30,7 @@ from functools import update_wrapper
 from typing import TYPE_CHECKING, Any, Generic, TypeVar
 
 from ..errors import ProtocolError, RuntimeFailure, RuntimeLost
-from .instance import AnyInstance, Host, Instance
+from .instance import AnyInstance, Host, Instance, Lifetime
 from .sweep import Sweep
 
 if TYPE_CHECKING:
@@ -56,7 +56,7 @@ class Function(Generic[R]):
         concurrency: int = 1,
         timeout: float | None = 3600,
         retries: int = 1,
-        warm: bool = False,
+        lifetime: Lifetime | str | None = None,
         keep_remote: bool = False,
     ):
         self.fn = fn
@@ -67,7 +67,7 @@ class Function(Generic[R]):
         self.concurrency = max(1, concurrency)
         self.timeout = timeout
         self.retries = retries
-        self.warm = warm
+        self.lifetime = _how_long(lifetime)
         self.keep_remote = keep_remote
         self.is_async = inspect.iscoroutinefunction(fn)
         self.device = self._place(device)
@@ -116,7 +116,9 @@ class Function(Generic[R]):
         last: Exception | None = None
 
         for attempt in range(self.retries + 1):
-            runtime = launcher.pool.acquire(instance, self.env, self.volumes, warm=self.warm)
+            runtime = launcher.pool.acquire(
+                instance, self.env, self.volumes, lifetime=self.lifetime
+            )
             try:
                 value, logs = runtime.call(
                     self.fn,
@@ -216,6 +218,20 @@ def _where(host: Host | str | None) -> Host:
             f"host={host!r} is not a host placement. Use host='local' to keep Python "
             f"here and forward CUDA calls, or host='remote' to ship the function to "
             f"the machine that holds the device."
+        ) from None
+
+
+def _how_long(lifetime: Lifetime | str | None) -> Lifetime:
+    """Validate the declared session lifetime, naming both options when it is wrong."""
+    if lifetime is None:
+        return Lifetime.call
+    try:
+        return Lifetime(lifetime)
+    except ValueError:
+        raise ValueError(
+            f"lifetime={lifetime!r} is not a session lifetime. Use lifetime='call' to end "
+            f"the session with the call, or lifetime='process' to keep it so the next "
+            f"call skips session start."
         ) from None
 
 

@@ -28,9 +28,9 @@ ROOT = HERE.parent
 
 #: What the library must be called on each platform, and what cargo produces.
 ARTIFACTS = {
-    "Windows": ("letify_shim.dll", "nvcuda.dll"),
-    "Linux": ("libletify_shim.so", "libcuda.so.1"),
-    "Darwin": ("libletify_shim.dylib", "libletify_shim.dylib"),
+    "Windows": ("letify_driver.dll", "nvcuda.dll"),
+    "Linux": ("libletify_driver.so", "libcuda.so.1"),
+    "Darwin": ("libletify_driver.dylib", "libletify_driver.dylib"),
 }
 
 AGENTS = {

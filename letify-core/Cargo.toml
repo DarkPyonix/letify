@@ -5,7 +5,7 @@
 # ships functions to remote machines never needs any of this.
 [workspace]
 resolver = "3"
-members = ["letify-wire", "letify-shim", "letify-agent"]
+members = ["letify-wire", "letify-driver", "letify-agent"]
 
 [workspace.package]
 version = "0.1.0"

@@ -1,7 +1,7 @@
 //! The connection to the agent, and the batching that makes forwarding viable.
 //!
 //! Most driver calls do not need an answer. A launch, a copy to the device or an
-//! allocation changes state and returns immediately, so the shim queues it and moves on.
+//! allocation changes state and returns immediately, so the local driver queues it and moves on.
 //! A call whose result the host reads has to wait, and when one arrives the queue is
 //! flushed first so the agent sees everything in order.
 //!
