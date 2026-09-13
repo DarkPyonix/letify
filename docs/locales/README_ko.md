@@ -285,7 +285,7 @@ Provider
 3. [Tailcat](https://github.com/tailscale/tailcat)으로 UDP 홀펀칭한 뒤 그 위로 SSH
 4. 프로바이더 자체 경로, 예를 들어 `colab exec`와 Colab 파일 API
 
-번호가 낮은 방법이 이깁니다. 다만 연결된 방법 중 가장 빠른 것보다 훨씬 느리면 탈락합니다. 이긴 방법은 계정과 네트워크별로 기억해 두고, 다음 연결에서 먼저 시도합니다. NAT 뒤에 있고 프로바이더 API도 없는 머신은 letify를 설치한 뒤 그 머신에서 `letify client shell connect`를 한 번 실행해야 합니다. Colab과 Elice는 이 단계를 자동으로 합니다. Modal은 자체 API로 연결하므로 여기에 해당하지 않습니다.
+번호가 낮은 방법이 이깁니다. 다만 연결된 방법 중 가장 빠른 것보다 훨씬 느리면 탈락합니다. 이긴 방법은 계정과 네트워크별로 기억해 두고, 다음 연결에서 먼저 시도합니다. NAT 뒤에 있는 일반 머신은 letify를 설치한 뒤 그 머신에서 `letify client shell connect`를 한 번 실행해야 letify가 접속할 수 있습니다. Colab과 Elice는 이 단계가 아예 필요 없습니다. 프로바이더 계층이 각 서비스의 API로 머신을 만들고 여는 과정이 `letify client shell connect`를 대신하기 때문입니다. Modal은 자체 API로 연결하므로 여기에 해당하지 않습니다.
 
 **여러 계정을 정식으로 지원합니다.** 설정 항목 하나가 계정 하나이고, 같은 종류를 여러 개 둘 수 있습니다. Colab 계정이 두 개면 동시 세션도 두 배가 됩니다.
 

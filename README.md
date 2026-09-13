@@ -291,7 +291,7 @@ Provider
 3. UDP hole punching with [Tailcat](https://github.com/tailscale/tailcat), then SSH over it
 4. The provider's own path, such as `colab exec` and the Colab file API
 
-A lower number wins unless it is far slower than the fastest one that connected. The winner is remembered per account and per network, so the next connection starts with it. A machine that is behind NAT and has no provider API needs letify installed and `letify client shell connect` run on it once. Colab and Elice do that part automatically. Modal is reached through its own API and is not part of this.
+A lower number wins unless it is far slower than the fastest one that connected. The winner is remembered per account and per network, so the next connection starts with it. A plain machine behind NAT needs letify installed and `letify client shell connect` run on it once, so letify can reach it. Colab and Elice never need that step: their provider layer creates and opens the machine through the provider's own API, so that layer takes the place of `letify client shell connect`. Modal is reached through its own API and is not part of this.
 
 **Multiple accounts are first class.** Each configuration entry is one account, and entries of the same kind coexist. Two Colab accounts means twice the concurrent sessions.
 
@@ -309,7 +309,7 @@ def evaluate(ckpt): ...
 **Or do not pick at all:**
 
 ```python
-@let.function(device=let.providers.any.A100, host=letify.remote)
+@let.function(device=let.providers.any.A100, host=letify.remote)   # the first declared provider with an A100
 def train(lr): ...
 ```
 
