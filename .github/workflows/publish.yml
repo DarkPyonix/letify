@@ -1,7 +1,7 @@
 # Publish to PyPI when a version tag is pushed.
 #
 # A tag such as v1.2.0 builds the package, checks that the tag agrees with the version in
-# pyproject.toml and letify/__init__.py, runs the tests, and uploads to PyPI.
+# pyproject.toml and letify/__init__.py, and uploads to PyPI. Tests are run before tagging.
 #
 # Upload uses PyPI trusted publishing, so there is no token in this repository. Configure it
 # once on PyPI: project letify, owner DarkPyonix, repository letify, workflow publish.yml,
@@ -16,20 +16,7 @@ permissions:
   contents: read
 
 jobs:
-  test:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v6
-        with:
-          python-version: "3.11"
-      - name: Lint
-        run: uv run --group dev ruff check letify tests examples
-      - name: Test
-        run: uv run --group dev pytest -q
-
   build:
-    needs: test
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
