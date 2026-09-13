@@ -15,6 +15,7 @@ from __future__ import annotations
 import base64
 from typing import Any
 
+from . import vendored
 from .codec import BEGIN, END, PROTOCOL_VERSION, dumps_call
 
 _TEMPLATE = """
@@ -39,13 +40,6 @@ def _emit(obj):
     sys.stdout.flush()
     sys.stdout.write("\\n" + _BEGIN + base64.b64encode(blob).decode() + _END + "\\n")
     sys.stdout.flush()
-
-try:
-    import cloudpickle
-except ImportError:
-    import subprocess
-    subprocess.run([sys.executable, "-m", "pip", "install", "-q", "cloudpickle"], check=True)
-    import cloudpickle
 
 try:
     fn, args, kwargs = cloudpickle.loads(base64.b64decode(_PAYLOAD))
@@ -86,7 +80,7 @@ else:
 def build(fn: Any, args: tuple, kwargs: dict, *, keep_remote: bool = False) -> str:
     """Return the script that runs one call and prints its outcome."""
     payload = base64.b64encode(dumps_call(fn, args, kwargs)).decode()
-    return _TEMPLATE.format(
+    return vendored.prelude() + _TEMPLATE.format(
         payload=payload,
         begin=BEGIN,
         end=END,

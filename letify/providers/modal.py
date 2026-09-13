@@ -111,7 +111,8 @@ class Modal(Provider):
         modal = self.client()
         app_name = str(self.config.option("app", "letify"))
         app = modal.App.lookup(app_name, create_if_missing=True)
-        image = modal.Image.debian_slim().pip_install("cloudpickle", "blake3")
+        # The worker carries the vendored cloudpickle, so the image needs nothing added.
+        image = modal.Image.debian_slim()
         sandbox = modal.Sandbox.create(
             "python3",
             "-u",

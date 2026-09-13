@@ -16,11 +16,11 @@ from contextlib import contextmanager
 from importlib import import_module
 from pathlib import Path
 
-import cloudpickle
 import pytest
 
 import letify
 from letify import protocol
+from letify._vendor import cloudpickle
 from letify.declare.env import Env
 from letify.protocol import codec, driver, framing, guards
 from letify.protocol.handle import Blob, Handle, RemoteFile
@@ -54,15 +54,6 @@ def test_a_payload_is_addressed_by_the_hash_of_its_contents() -> None:
     assert first == codec.digest_of(b"same contents")
     assert first != codec.digest_of(b"other contents")
     assert len(first) == 32
-
-
-def test_content_addressing_falls_back_to_the_standard_library(no_module) -> None:
-    # blake3 is preferred for speed, but it is a wheel, so blake2b has to carry the same
-    # guarantee when it is absent.
-    no_module("blake3")
-    digest = codec.digest_of(b"same contents")
-    assert len(digest) == 32
-    assert digest == codec.digest_of(b"same contents")
 
 
 def test_an_outcome_carrying_a_value_returns_it() -> None:

@@ -24,6 +24,8 @@ binary framing does not.
 
 from __future__ import annotations
 
+from . import vendored
+
 #: Written by the worker on the line before it starts reading requests.
 READY = "__LETIFY_WORKER_READY__"
 
@@ -42,7 +44,7 @@ BOOTSTRAP = (
 #: Prefix of every response line. Anything without it is the user's own output.
 REPLY = "__LETIFY_REPLY__"
 
-SOURCE = r'''
+_BODY = r'''
 import base64, hashlib, io, os, pickle, sys, tarfile, traceback, uuid
 
 _READY = "__LETIFY_WORKER_READY__"
@@ -51,20 +53,8 @@ _REPLY = "__LETIFY_REPLY__"
 _OBJECTS = {}
 _BLOBS = {}
 
-try:
-    import cloudpickle
-except ImportError:
-    import subprocess
-    subprocess.run([sys.executable, "-m", "pip", "install", "-q", "cloudpickle"], check=True)
-    import cloudpickle
-
-
 def _digest(payload):
-    try:
-        import blake3
-        return blake3.blake3(payload).hexdigest(length=16)
-    except ImportError:
-        return hashlib.blake2b(payload, digest_size=16).hexdigest()
+    return hashlib.blake2b(payload, digest_size=16).hexdigest()
 
 
 def _resolve(value):
@@ -286,3 +276,7 @@ def _serve():
 
 _serve()
 '''
+
+#: What a channel sends: the vendored cloudpickle prelude, then the worker itself. The prelude
+#: binds ``cloudpickle`` for the body, so the far side needs nothing installed.
+SOURCE = vendored.prelude() + _BODY

@@ -18,8 +18,7 @@ from collections.abc import Sequence
 from importlib import import_module
 from typing import Any
 
-import cloudpickle
-
+from .._vendor import cloudpickle
 from ..errors import ConfigError, ProtocolError, RemoteError
 from .handle import Handle
 
@@ -64,20 +63,15 @@ def dumps_call(fn: Any, args: tuple, kwargs: dict) -> bytes:
 
 
 def digest_of(payload: bytes) -> str:
-    """Content address of a payload.
+    """Content address of a payload: BLAKE2b from the standard library, 16 bytes as hex.
 
-    blake3 is preferred because it hashes at several gigabytes per second, which
-    keeps hashing orders of magnitude away from being the bottleneck on any real
-    network link. blake2b from the standard library is the fallback.
+    The standard library rather than a faster wheel, because letify installs nothing else and
+    the worker on the far side computes the same address with nothing installed either.
+    Hashing still runs at hundreds of megabytes per second, far above any uplink.
     """
-    try:
-        import blake3
+    import hashlib
 
-        return blake3.blake3(payload).hexdigest(length=16)
-    except ImportError:
-        import hashlib
-
-        return hashlib.blake2b(payload, digest_size=16).hexdigest()
+    return hashlib.blake2b(payload, digest_size=16).hexdigest()
 
 
 def unwrap(outcome: dict[str, Any], *, runtime_key: str) -> Any:

@@ -924,7 +924,8 @@ def test_a_modal_sandbox_keeps_a_process_alive_for_framed_requests(fake_modal) -
     assert fake.created["gpu"] == "H100"
     assert fake.created["timeout"] == 1800
     assert fake.created["args"] == ["python3", "-u", "-"]
-    assert fake.created["image"].packages == ("cloudpickle", "blake3")
+    # The worker carries the vendored cloudpickle, so the image installs nothing for letify.
+    assert fake.created["image"].packages == ()
 
 
 def test_a_sandbox_channel_sends_the_worker_once_and_then_framed_requests() -> None:

@@ -17,10 +17,7 @@ classifiers = [
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
     "Topic :: System :: Distributed Computing",
 ]
-dependencies = [
-    "cloudpickle>=3.0",
-    "blake3>=0.4",
-]
+dependencies = []
 
 # Disabled for the first release. google-colab-cli has no release that supports Python 3.11, so
 # declaring it made the whole project unresolvable on 3.11, which letify supports.
@@ -80,6 +77,8 @@ packages = ["letify"]
 [tool.ruff]
 line-length = 100
 target-version = "py311"
+# Third party code is kept byte for byte as released, so it is not held to this project's style.
+extend-exclude = ["letify/_vendor"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B", "SIM", "RUF"]
