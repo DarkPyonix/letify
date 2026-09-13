@@ -39,9 +39,12 @@ from letify.runtime import telemetry
 
 
 @pytest.fixture
-def let() -> letify.Launcher:
-    # home=False keeps the developer's own accounts out of the test run.
-    return letify.Launcher(home=False, announce=False)
+def let(tmp_path: Path) -> letify.Launcher:
+    # home=False keeps the developer's own accounts out of the test run, and an empty project
+    # directory keeps out the .letify/config.toml of the repository the suite runs from.
+    project = tmp_path / "empty-project" / ".letify"
+    project.mkdir(parents=True)
+    return letify.Launcher(project, home=False, announce=False)
 
 
 @pytest.fixture

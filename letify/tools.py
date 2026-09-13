@@ -70,6 +70,10 @@ def environment(alias: str) -> dict[str, str]:
         env.setdefault("UV_TOOL_DIR", str(data / "uv" / "tools"))
     home = account_directory(alias)
     home.mkdir(parents=True, exist_ok=True)
+    if sys.platform != "win32":
+        # The tool writes its token here with its own permissions, so the directory is
+        # what keeps other users out.
+        home.chmod(0o700)
     env["HOME"] = str(home)
     env["USERPROFILE"] = str(home)
     return env
