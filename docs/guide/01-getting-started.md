@@ -153,14 +153,17 @@ async def train(lr, bs):
     ...
     return {"lr": lr, "bs": bs, "loss": loss}
 
+configs = [dict(lr=lr, bs=bs) for lr in (1e-4, 3e-4, 1e-3) for bs in (16, 32)]
+
 async def main():
-    async for result in train(letify.grid(lr=[1e-4, 3e-4, 1e-3], bs=[16, 32])):
-        print(result)
+    with let.keep_alive():
+        for finished in asyncio.as_completed([train(**c) for c in configs]):
+            print(await finished)
 
 asyncio.run(main())
 ```
 
-Six points run as wide as the account has cards for, which the provider entry declares and nothing on the declaration repeats. Three cards means the sweep finishes in roughly a third of the wall clock time. See [Sweeps and capacity](05-sweeps.md).
+Each configuration is one call. The six calls run as wide as the account has cards for, which the provider entry declares and nothing on the declaration repeats, and `keep_alive` lets later calls reuse the sessions earlier ones started. Three cards means the six finish in roughly a third of the wall clock time. See [Concurrency and capacity](05-concurrency.md).
 
 ## What to know before going further
 

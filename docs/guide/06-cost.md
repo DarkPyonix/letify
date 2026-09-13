@@ -2,7 +2,7 @@
 
 > How letify keeps a session from outliving you, and what you still have to do.
 
-[← Sweeps](05-sweeps.md) · [Guides](README.md) · [Next: Troubleshooting →](07-troubleshooting.md)
+[← Concurrency](05-concurrency.md) · [Guides](README.md) · [Next: Troubleshooting →](07-troubleshooting.md)
 
 ---
 
@@ -11,8 +11,9 @@
 Nothing has to be torn down by hand. Four things end a session, and you only declare one of
 them.
 
-**1. The call.** A session ends when the call that needed it finishes. A search space counts
-as one call, so a sweep of six points starts one set of sessions and ends them once.
+**1. The call.** A session ends when the call that needed it finishes. Calls that overlap in
+time share that span, so six calls gathered at once start their sessions once and end them
+when the last one finishes.
 
 ```python
 @let.function(device=colab.G4, host="remote")
@@ -167,4 +168,4 @@ def check():
 
 ---
 
-[← Sweeps](05-sweeps.md) · [Guides](README.md) · [Next: Troubleshooting →](07-troubleshooting.md)
+[← Concurrency](05-concurrency.md) · [Guides](README.md) · [Next: Troubleshooting →](07-troubleshooting.md)

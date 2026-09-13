@@ -30,8 +30,6 @@ from __future__ import annotations
 from .declare.env import Env
 from .declare.function import Function
 from .declare.instance import AnyInstance, Host, Instance
-from .declare.sweep import Sweep, grid
-from .declare.sweep import zip_ as zip
 from .errors import (
     ConfigError,
     HandleScopeError,
@@ -79,14 +77,11 @@ __all__ = [
     "RemoteFile",
     "RuntimeFailure",
     "RuntimeLost",
-    "Sweep",
     "UnknownInstance",
     "UnknownProvider",
     "UnsupportedMode",
     "Volume",
     "__version__",
-    "grid",
     "local",
     "remote",
-    "zip",
 ]

@@ -2,7 +2,7 @@
 
 > Why session start is slow, and the one change that fixes it.
 
-[← Execution modes](03-execution-modes.md) · [Guides](README.md) · [Next: Sweeps →](05-sweeps.md)
+[← Execution modes](03-execution-modes.md) · [Guides](README.md) · [Next: Concurrency →](05-concurrency.md)
 
 ---
 
@@ -152,4 +152,4 @@ Save on a time interval rather than a step count. Then whatever happens, you los
 
 ---
 
-[← Execution modes](03-execution-modes.md) · [Guides](README.md) · [Next: Sweeps →](05-sweeps.md)
+[← Execution modes](03-execution-modes.md) · [Guides](README.md) · [Next: Concurrency →](05-concurrency.md)

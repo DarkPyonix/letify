@@ -19,7 +19,6 @@ Read this table first. Most confusion about letify is one of these words meaning
 | **Channel** | How letify talks to a session: persistent, or one-shot. |
 | **Env** | A declaration of the remote environment, keyed by a uv lock file. Not a container image. |
 | **Volume** | A named content addressed blob store on a provider's storage. Not a mounted filesystem. |
-| **Sweep** | A declared search space, produced by `grid` or `zip`. |
 | **Handle** | A reference to an object that lives in a session. |
 | **Blob** | A large argument named by the hash of its contents. |
 | **persistence** | Whether a provider's storage outlives a session: `persistent` or `ephemeral`. |
@@ -39,11 +38,10 @@ Launcher (let)
 │           ├── Channel     persistent, or one-shot
 │           └── Lease       the deadline that outlives nothing
 ├── RuntimePool             sessions keyed by (Instance, Env)
-├── Function                one declaration, created by @let.function
-└── Sweep                   a declared space, passed into a call
+└── Function                one declaration, created by @let.function
 ```
 
-Declaration flows down and cost appears at exactly one point. `Launcher`, `Provider`, `Instance`, `Env`, `Volume`, `Function` and `Sweep` are all descriptions. `Runtime` is the only thing that powers hardware on.
+Declaration flows down and cost appears at exactly one point. `Launcher`, `Provider`, `Instance`, `Env`, `Volume` and `Function` are all descriptions. `Runtime` is the only thing that powers hardware on.
 
 ## Package layout
 
@@ -52,7 +50,7 @@ One directory per concern, so the file you need is the one named after the thing
 | Package | Owns |
 |---|---|
 | `config/` | Reading `.letify/config.toml`, the schema, login, resolving credentials |
-| `declare/` | `Launcher`'s surface, `Function`, `Instance`, `Env`, `Sweep` |
+| `declare/` | `Launcher`'s surface, `Function`, `Instance`, `Env` |
 | `protocol/` | Handles, the codec, framing, the remote worker, the one-shot driver |
 | `runtime/` | The channel, the session, the pool, the lease, bootstrap source |
 | `providers/` | The base class, name normalization, and one module per provider |
@@ -75,7 +73,7 @@ It exists as an object rather than as module-level state because it holds the po
 - `devices` returns the accelerators each provider offers, reporting a reason instead of raising for one that cannot be reached.
 - `active` returns the providers that currently hold a session, which is the quickest answer to what is costing money.
 
-There is nothing to tear down. `keep_alive()` is the one scope, and it only keeps sessions. `invocation()` is internal: one call brackets itself with it so a sweep, which is many calls, starts its sessions once.
+There is nothing to tear down. `keep_alive()` is the one scope, and it only keeps sessions. `invocation()` is internal: one call brackets itself with it so calls that overlap in time reuse the sessions they release until the last of them finishes.
 
 ## Provider
 
@@ -129,13 +127,13 @@ Booting one opens the channel, arms the lease, installs the environment and atta
 
 `RuntimePool` keys sessions by instance and environment, which is the whole economic argument for the library. Starting a session per call would pay provider boot, environment installation and the first transfer every time, and all of it is billed as GPU time.
 
-The pool also enforces the release rule. A session ends when it is released, unless a `keep_alive` block holds the pool; idle sessions end when the outermost block exits. An internal hold brackets a single invocation so a sweep does not restart a session between its points. A call whose devices cannot be allocated raises `InsufficientDevices` instead of waiting.
+The pool also enforces the release rule. A session ends when it is released, unless a `keep_alive` block holds the pool; idle sessions end when the outermost block exits. An internal hold brackets a single invocation so an overlapping call can reuse a session another call released. A session still starting counts as serving a call, so a call that finds every card reserved by this process waits for one. A call whose devices cannot be allocated raises `InsufficientDevices` instead of waiting.
 
 ## Function
 
 What `@let.function` returns. Holds the declaration and the launcher, and decides nothing at call time except which session to use.
 
-`is_async` is read from the wrapped `def`, which is what makes blocking behaviour a property of the declaration. A sync declaration returns its value. An async one returns a plain coroutine when no space is passed, so the standard library accepts it, and an `AsyncCall` when a space is passed, because that is what `async for` iterates.
+`is_async` is read from the wrapped `def`, which is what makes blocking behaviour a property of the declaration. A sync declaration returns its value. An async one returns a plain coroutine, so `await`, `asyncio.gather` and `asyncio.as_completed` accept it, and concurrency comes from those rather than from a type letify adds.
 
 Retry policy lives here. `RuntimeFailure` and `ProtocolError` discard the session and retry, because the session is at fault. `RemoteError` propagates, because the user's code is at fault and a retry reproduces it.
 
@@ -156,12 +154,6 @@ Three layers with one job each.
 `Backend` is where bytes live. All backends keep the same layout, so a blob written by one is readable by another pointed at the same bucket.
 
 The layering exists so that provider and storage vary independently. Colab reads from Google Cloud Storage because a Colab session is a Compute Engine virtual machine, Elice reads from the machine's own disk, and neither fact is visible in the declaration.
-
-## Sweep
-
-A finite set of keyword argument combinations. `grid` is the product, `zip` is the pairing, `|` is the union.
-
-It is a value rather than a method on a function because the space is data. The same space can be declared once and passed to several functions, stored in a configuration file, or built by code, none of which works when the iteration is a method call.
 
 ## Handle, Blob and the call protocol
 

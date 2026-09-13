@@ -41,7 +41,6 @@ from .config import Config, load
 from .declare.env import Env
 from .declare.function import Function
 from .declare.instance import AnyInstance, Host, Instance
-from .declare.sweep import grid, zip_
 from .errors import LetifyError, UnknownInstance, UnknownProvider
 from .runtime.pool import RuntimePool
 
@@ -212,8 +211,8 @@ class Launcher:
         host code runs: ``"local"``, the default, keeps Python here and forwards only CUDA
         calls, and ``"remote"`` ships this function to the machine with the GPU.
 
-        There is no width argument. A space runs as wide as the provider has devices for,
-        which the provider entry already says.
+        There is no width argument. Concurrent calls run as wide as the provider has devices
+        for, which the provider entry already says.
 
         ``keep_remote`` returns a handle instead of the value, so a model stays in the
         runtime and later calls refer to it without copying it back.
@@ -235,11 +234,6 @@ class Launcher:
             return declared
 
         return decorate
-
-    # -- search spaces -------------------------------------------------------
-
-    grid = staticmethod(grid)
-    zip = staticmethod(zip_)
 
     # -- keeping sessions ---------------------------------------------------
 
@@ -264,8 +258,8 @@ class Launcher:
     def invocation(self) -> Iterator[Launcher]:
         """Bracket one top-level call, so its runtimes are released at the end.
 
-        Used by the declaration machinery rather than by hand. A sweep is one
-        invocation, so its runtimes start once and stop once.
+        Used by the declaration machinery rather than by hand. Calls whose invocations
+        overlap share one span, so a session one of them releases is reused by the next.
         """
         self._register_at_exit()
         self.pool.hold()

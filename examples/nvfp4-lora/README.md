@@ -36,7 +36,7 @@ The scripts are numbered in the order they are worth running, not as chapters of
 | Script | What it is for | What it proves |
 |---|---|---|
 | [00_smoke.py](00_smoke.py) | One trivial call before spending anything | The provider answers, the environment installed, this project's code arrived, and the card is the one that was paid for |
-| [01_sweep.py](01_sweep.py) | Six configurations across pooled sessions | A declared search space, one warm session per slot, and the best adapter kept in the store |
+| [01_sweep.py](01_sweep.py) | Six configurations across pooled sessions | Six gathered calls inside `keep_alive`, one warm session per card, and the best adapter kept in the store |
 | [02_resume.py](02_resume.py) | Continue after a preemption | A checkpoint put back inside a fresh session, and immutable blobs behind a moving name |
 | [03_watch.py](03_watch.py) | Watch the money while it runs | Remaining account usage, and whether the card is actually busy |
 
@@ -57,7 +57,7 @@ install and the first transfer are all billed as GPU time. The block keeps the s
 calls, so the best adapter can still be pulled out after the sweep. Without it each separate
 call would pay setup again, and on a short run the setup costs more than the training.
 
-**How wide the sweep runs is the provider's inventory**, not an argument. Declare what the
+**How many calls run at once is the provider's inventory**, not an argument. Declare what the
 account has and that is the width:
 
 ```toml

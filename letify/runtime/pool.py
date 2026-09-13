@@ -1,9 +1,9 @@
 """The pool that hands out runtimes and decides when they die.
 
 The rule is that a runtime dies when the work that needed it is done. One invocation is the
-unit, and a search space counts as one invocation, so a sweep boots its runtimes once and
-releases them when the last point finishes. Nothing is kept alive on the chance that another
-call might come.
+unit, and invocations that overlap in time share one span, so concurrent calls reuse the
+runtimes they release until the last of them finishes. Nothing is kept alive on the chance
+that another call might come.
 
 ``hold`` is how a runtime outlives its release. ``Launcher.keep_alive()`` holds the pool for
 the length of a block, and one invocation holds it for its own length. Released runtimes stay
@@ -52,6 +52,10 @@ class RuntimePool:
         self._guard = threading.RLock()
         self._free = threading.Condition(self._guard)
         self._hold_depth = 0
+        # Sessions being started by this process, per provider and accelerator. A start holds
+        # its cards before the runtime is registered, so without this count a concurrent call
+        # would take those cards for another process's and refuse instead of waiting.
+        self._starting: dict[tuple[int, str], int] = {}
 
     # -- holding -------------------------------------------------------------
 
@@ -63,8 +67,8 @@ class RuntimePool:
     def hold(self) -> None:
         """Keep released runtimes alive until the matching ``unhold``.
 
-        Used by ``Launcher.keep_alive()`` for the length of a block, and by one invocation so a
-        sweep does not restart a session between its points.
+        Used by ``Launcher.keep_alive()`` for the length of a block, and by one invocation so
+        an overlapping call can reuse a session another call released.
         """
         with self._guard:
             self._hold_depth += 1
@@ -97,15 +101,23 @@ class RuntimePool:
 
             # No free session, so this needs cards. Taking them outside the pool guard,
             # because the provider may have to ask the machine who else is on them.
-            held = instance.provider.reserve(instance)
-            if held is not None:
-                try:
-                    return self._start(instance, env, volumes, key, held=held)
-                except BaseException:
-                    instance.provider.unreserve(instance.accelerator, held, instance.devices)
-                    with self._free:
-                        self._free.notify_all()
-                    raise
+            starting = (id(instance.provider), instance.accelerator.casefold())
+            with self._guard:
+                self._starting[starting] = self._starting.get(starting, 0) + 1
+            try:
+                held = instance.provider.reserve(instance)
+                if held is not None:
+                    try:
+                        return self._start(instance, env, volumes, key, held=held)
+                    except BaseException:
+                        instance.provider.unreserve(instance.accelerator, held, instance.devices)
+                        raise
+            finally:
+                with self._free:
+                    self._starting[starting] -= 1
+                    if not self._starting[starting]:
+                        del self._starting[starting]
+                    self._free.notify_all()
 
             # Every card this instance could use is taken. That is worth waiting for only while a
             # session here is serving a call on one, because it gives the card back when the call
@@ -145,6 +157,9 @@ class RuntimePool:
             and runtime.instance.accelerator.casefold() == name.casefold()
         ]
         if any(runtime.busy for runtime in holders):
+            return None
+        if self._starting.get((id(provider), name.casefold())):
+            # A session this process is still starting holds a card and will serve a call.
             return None
         if holders:
             names = ", ".join(runtime.name for runtime in holders)

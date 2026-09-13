@@ -18,7 +18,7 @@
 | 2️⃣ | **[Providers and accounts](02-providers.md)** | You are adding Colab, a lab server, Modal or Elice, or juggling several accounts |
 | 3️⃣ | **[Choosing the execution mode](03-execution-modes.md)** | You want to know whether to ship the loop or forward CUDA calls, with the arithmetic |
 | 4️⃣ | **[Environments and data](04-environments-and-data.md)** | Session start is slow and you want the cache to fix it |
-| 5️⃣ | **[Sweeps and capacity](05-sweeps.md)** | You are running many configurations and want them in parallel |
+| 5️⃣ | **[Concurrency and capacity](05-concurrency.md)** | You are running many configurations and want them in parallel |
 | 6️⃣ | **[Cost control](06-cost.md)** | You are paying for this yourself and want no surprises |
 | 7️⃣ | **[Troubleshooting](07-troubleshooting.md)** | Something failed and you want the specific cause |
 
