@@ -224,15 +224,19 @@ class Modal(Provider):
         return self._adapter
 
     def discover(self) -> Mapping[str, Instance]:
-        """Return Modal's published GPU list.
+        """Return Modal's published GPU list, plus a CPU instance with no GPU.
 
         The list is static, so no call to Modal is made here. Asking for a GPU the
         workspace cannot get fails when a runtime starts, not now.
         """
-        return {
-            name: Instance(self, gpu=name, vram_gb=spec.get("vram_gb"))
-            for name, spec in GPUS.items()
-        }
+        table: dict[str, Instance] = {"CPU": Instance(self, gpu=None)}
+        table.update(
+            {
+                name: Instance(self, gpu=name, vram_gb=spec.get("vram_gb"))
+                for name, spec in GPUS.items()
+            }
+        )
+        return table
 
     def store_backend(self) -> str:
         return "modal"

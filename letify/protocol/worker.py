@@ -109,12 +109,19 @@ def _op_call(request):
     fn, args, kwargs = _load_call(request["payload"])
     args = _resolve(args)
     kwargs = _resolve(kwargs)
-    value = fn(*args, **kwargs)
-    if hasattr(value, "__await__"):
-        # An async declaration is awaitable locally. The body still has to run to
-        # completion here, and awaiting it here is what lets it use await inside.
-        import asyncio
-        value = asyncio.run(value)
+    try:
+        value = fn(*args, **kwargs)
+        if hasattr(value, "__await__"):
+            # An async declaration is awaitable locally. The body still has to run to
+            # completion here, and awaiting it here is what lets it use await inside.
+            import asyncio
+            value = asyncio.run(value)
+    except ModuleNotFoundError as exc:
+        # A body that imports letify while running needs it as much as a call that
+        # refers to it when loaded, so the same explanation applies.
+        if (exc.name or "").split(".")[0] == "letify":
+            raise ModuleNotFoundError(_NO_LETIFY, name=exc.name) from exc
+        raise
     return {"ok": True, "value": value}
 
 

@@ -386,6 +386,35 @@ def test_a_modal_volume_backend_keeps_the_documented_layout(isolated_home, fake_
     assert {r["volume"] for r in fake_modal.requests("volume_put")} == {"letify-study"}
 
 
+def test_a_modal_volume_is_asked_for_as_version_2(isolated_home, fake_modal) -> None:
+    # Spec "Backends": a v1 volume loses files above 4 MiB on read, so every volume op
+    # names version 2, which is what the adapter creates a missing volume as.
+    backend = ModalBackend("letify-study", account="modal_lab")
+    try:
+        backend.put("ab12", b"payload")
+        backend.get("ab12")
+        backend.has("ab12")
+        backend.delete("ab12")
+    finally:
+        backend.close()
+    volume_ops = [r for r in fake_modal.requests() if r["op"].startswith("volume_")]
+    assert volume_ops
+    assert {r["version"] for r in volume_ops} == {2}
+
+
+def test_a_modal_backend_removes_what_it_wrote(isolated_home, fake_modal) -> None:
+    backend = ModalBackend("letify-study", account="modal_lab")
+    try:
+        backend.put("ab12", b"payload")
+        backend.delete("ab12")
+        assert backend.has("ab12") is False
+        # Removing what is already gone is not an error.
+        backend.delete("ab12")
+    finally:
+        backend.close()
+    assert len(fake_modal.requests("volume_delete")) == 2
+
+
 def test_reading_a_modal_blob_that_is_absent_is_a_runtime_failure(
     isolated_home, fake_modal
 ) -> None:

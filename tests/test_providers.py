@@ -1081,8 +1081,135 @@ def test_the_modal_adapter_runs_in_its_own_uv_environment_with_a_pinned_modal() 
     command = tools_module.modal_adapter_command("/usr/bin/uv")
     assert command[:6] == ["/usr/bin/uv", "run", "--no-project", "--python", "3.12", "--with"]
     assert command[6] == "modal>=1.0,<2"
-    assert command[7] == "python"
-    assert Path(command[8]) == Path(modal_module.__file__).with_name("modal_adapter.py")
+    assert command[7:9] == ["python", "-P"]
+    assert Path(command[9]) == Path(modal_module.__file__).with_name("modal_adapter.py")
+
+
+def test_a_sibling_modal_module_does_not_shadow_the_modal_package(tmp_path: Path) -> None:
+    # The adapter sits next to letify/providers/modal.py. Run by path without -P, Python
+    # puts that directory first on sys.path, so `import modal` would load the sibling.
+    import os
+    import shutil
+    import sys
+
+    providers = tmp_path / "providers"
+    providers.mkdir()
+    script = providers / "modal_adapter.py"
+    shutil.copy(Path(modal_module.__file__).with_name("modal_adapter.py"), script)
+    (providers / "modal.py").write_text("from . import nothing\n", encoding="utf-8")
+    site = tmp_path / "site" / "modal"
+    site.mkdir(parents=True)
+    (site / "__init__.py").write_text("__version__ = 'the-real-package'\n", encoding="utf-8")
+
+    command = tools_module.modal_adapter_command("/usr/bin/uv")
+    command = command[command.index("python") :]
+    command[0], command[-1] = sys.executable, str(script)
+    env = {**os.environ, "PYTHONPATH": str(tmp_path / "site")}
+    adapter = Adapter(command, env=env, name="m")
+    try:
+        assert adapter.request("hello") == {"modal": "the-real-package"}
+    finally:
+        adapter.close()
+
+
+#: A stand-in ``modal`` package that logs how the adapter uses apps, so the real adapter
+#: file can be run with no Modal account and no resource created.
+STUB_MODAL = """
+import contextlib, json, os
+
+def _log(*event):
+    with open(os.environ["STUB_MODAL_LOG"], "a", encoding="utf-8") as out:
+        out.write(json.dumps(event) + "\\n")
+
+class App:
+    def __init__(self, name=None, **kwargs):
+        self.name = name
+    @classmethod
+    def lookup(cls, name, create_if_missing=False, **kwargs):
+        _log("lookup", name)
+        return cls(name)
+    @contextlib.contextmanager
+    def run(self, **kwargs):
+        _log("run_start", self.name)
+        try:
+            yield self
+        finally:
+            _log("run_stop", self.name)
+
+class Image:
+    @staticmethod
+    def debian_slim():
+        return Image()
+    def pip_install(self, *packages):
+        return self
+
+class _Sandbox:
+    object_id = None
+    stdout = ()
+    def terminate(self):
+        _log("terminate")
+
+class Sandbox:
+    @staticmethod
+    def create(*args, app=None, **kwargs):
+        _log("create", app.name)
+        return _Sandbox()
+"""
+
+
+def test_the_modal_adapter_runs_sandboxes_in_an_ephemeral_app_it_stops_on_exit(
+    tmp_path: Path,
+) -> None:
+    # Spec "Modal adapter": no deployed app is left on the account once letify stops.
+    import json
+    import os
+    import sys
+
+    site = tmp_path / "site" / "modal"
+    site.mkdir(parents=True)
+    (site / "__init__.py").write_text(STUB_MODAL, encoding="utf-8")
+    log = tmp_path / "modal.log"
+    script = Path(modal_module.__file__).with_name("modal_adapter.py")
+    env = {**os.environ, "PYTHONPATH": str(tmp_path / "site"), "STUB_MODAL_LOG": str(log)}
+    adapter = Adapter([sys.executable, "-P", str(script)], env=env, name="m")
+    fields = {"app": "study", "args": ["python3"], "packages": [], "gpu": None, "timeout": 60}
+    first = adapter.request("create", **fields)["sandbox"]
+    adapter.request("create", **fields)
+    adapter.request("terminate", sandbox=first)
+    adapter.close()
+
+    events = [tuple(json.loads(line)) for line in log.read_text("utf-8").splitlines()]
+    assert ("lookup", "study") not in events
+    assert events[0] == ("run_start", "study")
+    assert events[-1] == ("run_stop", "study")
+    assert [e for e in events if e[0] == "run_start"] == [("run_start", "study")]
+    assert events.count(("terminate",)) == 2
+
+
+def test_the_modal_app_stops_when_letify_closes_the_adapter(isolated_home, fake_modal) -> None:
+    provider = provider_of(Modal, "modal_lab", app="study")
+    runtime = modal_runtime(provider)
+    provider.open_channel(runtime)
+    provider.stop(runtime)
+    provider.adapter().close()
+    assert fake_modal.app_events() == [["run_start", "study"], ["run_stop", "study"]]
+
+
+def test_modal_offers_a_cpu_instance_under_the_name_local_uses(isolated_home) -> None:
+    provider = provider_of(Modal, "modal_lab")
+    assert provider.cpu is provider.CPU
+    assert provider.CPU.gpu is None
+
+
+def test_creating_a_modal_sandbox_for_the_cpu_asks_for_no_gpu(isolated_home, fake_modal) -> None:
+    provider = provider_of(Modal, "modal_lab")
+    runtime = type("R", (), {"name": "letify-cpu-1", "instance": provider.CPU})()
+    provider.open_channel(runtime)
+    try:
+        [created] = fake_modal.requests("create")
+        assert created["gpu"] is None
+    finally:
+        provider.stop(runtime)
 
 
 def test_the_modal_adapter_imports_nothing_outside_the_standard_library_at_load() -> None:

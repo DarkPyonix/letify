@@ -1,6 +1,6 @@
 """The Modal adapter: Modal's client, run outside the letify process.
 
-letify starts this file with ``uv run --no-project --with modal python modal_adapter.py``
+letify starts this file with ``uv run --no-project --with modal python -P modal_adapter.py``
 and talks to it in JSON lines, one request and one reply per line, as spec "Modal adapter"
 describes. It owns every call into ``modal``. It does not own the worker protocol that runs
 inside a sandbox, which it carries as opaque text.
@@ -16,6 +16,7 @@ included, is sent to standard error.
 from __future__ import annotations
 
 import base64
+import contextlib
 import io
 import json
 import sys
@@ -75,6 +76,9 @@ class Adapter:
     """The state one adapter process keeps: its sandboxes and the volumes it opened."""
 
     def __init__(self) -> None:
+        #: Ephemeral apps by name, each running until ``close``.
+        self.apps: dict[str, Any] = {}
+        self._running = contextlib.ExitStack()
         self.sandboxes: dict[str, SandboxStream] = {}
         self.volumes: dict[str, Any] = {}
 
@@ -93,7 +97,7 @@ class Adapter:
 
     def op_create(self, request: dict[str, Any]) -> Any:
         modal = load_modal()
-        app = modal.App.lookup(str(request["app"]), create_if_missing=True)
+        app = self._app(modal, str(request["app"]))
         image = modal.Image.debian_slim()
         packages = [str(name) for name in request.get("packages") or []]
         if packages:
@@ -108,6 +112,33 @@ class Adapter:
         sandbox_id = str(getattr(sandbox, "object_id", "") or f"sandbox-{len(self.sandboxes) + 1}")
         self.sandboxes[sandbox_id] = SandboxStream(sandbox)
         return {"sandbox": sandbox_id}
+
+    def _app(self, modal: Any, name: str) -> Any:
+        """An ephemeral app, started on first use and held until ``close``.
+
+        A deployed app from ``App.lookup`` would stay on the account after letify stops.
+        An ephemeral app is stopped when its ``run`` context exits, and Modal also stops it
+        when the adapter's heartbeat ends because the process died.
+        """
+        if name not in self.apps:
+            app = modal.App(name)
+            self._running.enter_context(app.run())
+            self.apps[name] = app
+        return self.apps[name]
+
+    def close(self) -> None:
+        """Terminate every sandbox left, then stop every app this adapter started."""
+        for stream in self.sandboxes.values():
+            try:
+                stream.sandbox.terminate()
+            except Exception:
+                traceback.print_exc(file=sys.stderr)
+        self.sandboxes.clear()
+        try:
+            self._running.close()
+        except Exception:
+            traceback.print_exc(file=sys.stderr)
+        self.apps.clear()
 
     def _stream(self, request: dict[str, Any]) -> SandboxStream:
         sandbox_id = str(request["sandbox"])
@@ -146,8 +177,22 @@ class Adapter:
         modal = load_modal()
         name = str(request["volume"])
         if name not in self.volumes:
-            self.volumes[name] = modal.Volume.from_name(name, create_if_missing=True)
+            # A version 1 volume cannot read back a file above 4 MiB, so a missing volume
+            # is created as version 2.
+            version = int(request.get("version") or 2)
+            self.volumes[name] = modal.Volume.from_name(
+                name, create_if_missing=True, version=version
+            )
         return modal, self.volumes[name]
+
+    def op_volume_delete(self, request: dict[str, Any]) -> Any:
+        modal, volume = self._volume(request)
+        path = str(request["path"])
+        try:
+            volume.remove_file(path, recursive=True)
+        except not_found_errors(modal):
+            pass
+        return None
 
     def op_volume_put(self, request: dict[str, Any]) -> Any:
         _, volume = self._volume(request)
@@ -200,11 +245,7 @@ def serve(stdin: Any, stdout: Any) -> None:
             }
         stdout.write(json.dumps(reply) + "\n")
         stdout.flush()
-    for stream in adapter.sandboxes.values():
-        try:
-            stream.sandbox.terminate()
-        except Exception:
-            traceback.print_exc(file=sys.stderr)
+    adapter.close()
 
 
 def main() -> None:
