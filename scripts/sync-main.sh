@@ -5,11 +5,11 @@
 # and the task guides, and nothing that only matters while the project is being built. A
 # markdown file survives on main only if it is:
 #
-#   README.md        at the repository root
+#   README*.md       a README anywhere, such as README.md, examples/README.md or README_ko.md
 #   docs/<dir>/...   anywhere below a subdirectory of docs, such as docs/guide or docs/locales
 #
-# Every other markdown file is dropped: CLAUDE.md, PROJECT.md, docs/SPEC.md and the other files
-# directly inside docs, and the READMEs under examples.
+# Every other markdown file is dropped: CLAUDE.md, PROJECT.md, and docs/SPEC.md and the other
+# files directly inside docs.
 #
 # The new main commit is built from develop's tree with git plumbing rather than by merging.
 # A merge would conflict on every run, because main deletes files that develop keeps editing.
@@ -73,8 +73,11 @@ fi
 
 # True for a markdown path that main keeps.
 keeps() {
+    local name="${1##*/}"
+    case "${name,,}" in
+        readme*.md) return 0 ;;
+    esac
     case "$1" in
-        README.md) return 0 ;;
         docs/*/*) return 0 ;;
         *) return 1 ;;
     esac
