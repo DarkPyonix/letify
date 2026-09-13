@@ -570,11 +570,7 @@ Unified memory is the one exception that no amount of implementation removes. Ma
 
 > The base install carries no provider dependency. Each provider is an extra.
 
-`letify` installs nothing else. It lives in a researcher's own repository as a dependency, so every package it pulled in would become part of that repository's environment and could conflict with what the research code pins.
-
-cloudpickle, which serializes a declared function, is vendored as `letify._vendor.cloudpickle` with its BSD license alongside. A payload pickled by the vendored copy names that module path, so the worker cannot rely on anything installed on the far side: the worker source carries the vendored module with it and registers it under the same name before the first call, unless the machine can already import it. Content addresses use BLAKE2b from the standard library.
-
-No provider dependency is imported at package import time, so a provider whose tool is absent reports itself unavailable and everything else keeps working. How provider tools are provided without entering the user's environment is recorded under Known gaps.
+`letify` alone installs cloudpickle and blake3. `letify[colab]`, `letify[modal]`, `letify[shell]`, `letify[gcs]`, `letify[s3]`, `letify[keyring]` and `letify[all]` add what a provider needs. No provider dependency is imported at package import time, so a provider whose package is absent reports itself unavailable and everything else keeps working.
 
 ## Known gaps
 

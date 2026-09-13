@@ -165,8 +165,8 @@ class Runtime:
     def _externalize(self, args: tuple, kwargs: dict) -> tuple[tuple, dict]:
         """Replace large arguments with blob references, uploading what is missing.
 
-        Hashing is effectively free next to the network: BLAKE2b runs at hundreds of
-        megabytes per second where an uplink runs at megabytes per second. So every large
+        Hashing is effectively free next to the network: blake3 runs at gigabytes
+        per second where an uplink runs at megabytes per second. So every large
         argument is hashed, the runtime is asked which digests it already holds,
         and only the rest is sent.
         """
