@@ -356,13 +356,21 @@ def test_client_shell_connect_is_a_three_level_command() -> None:
 def test_client_shell_connect_prints_what_the_account_needs(
     isolated_home, patch_popen, patch_which, monkeypatch, capsys
 ) -> None:
+    # Spec "Rendezvous": the account details reach the user's machine as one login command.
+    from letify.transport import setup
+
     patch_which(agent_module, present=True)
     patch_popen(agent_module, ["Server listening with new address: tcHome\n"])
     monkeypatch.setattr(agent_module.Agent, "serve_forever", lambda self: None)
-    assert main(["client", "shell", "connect"]) == 0
+    # The banner check has its own tests over a loopback socket.
+    monkeypatch.setattr(setup, "ssh_answers", lambda port: True)
+    assert main(["client", "shell", "connect", "--name", "home_box"]) == 0
     out = capsys.readouterr().out
-    assert 'tailcat = "tcHome"' in out
-    assert "tailcat_port = " in out
+    prefix = "letify login tunnel home_box --connect "
+    (line,) = [line.strip() for line in out.splitlines() if prefix in line]
+    fields = setup.decode_token(line[len(prefix) :])
+    assert fields["tailcat"] == "tcHome"
+    assert fields["tailcat_port"] > 0
 
 
 def test_client_shell_connect_without_tailcat_says_so(isolated_home, patch_which, capsys) -> None:
