@@ -138,7 +138,9 @@ def ensure_key(key_path: str) -> Path:
     return private
 
 
-def install_key(*, address: str, user: str | None, port: int, key_path: str) -> None:
+def install_key(
+    *, address: str, user: str | None, port: int, key_path: str, proxy: str | None = None
+) -> None:
     """Append the public key to the machine's authorized_keys, over one connection.
 
     The password is typed here and used by this one command. It is not written to a file,
@@ -161,7 +163,16 @@ def install_key(*, address: str, user: str | None, port: int, key_path: str) -> 
         'printf "%s\\n" "$key" >> ~/.ssh/authorized_keys'
     )
     result = subprocess.run(
-        ["ssh", "-p", str(port), "-o", "StrictHostKeyChecking=accept-new", target, remote],
+        [
+            "ssh",
+            "-p",
+            str(port),
+            "-o",
+            "StrictHostKeyChecking=accept-new",
+            *proxy_options(proxy),
+            target,
+            remote,
+        ],
         input=material,
         capture_output=True,
         text=True,
@@ -175,9 +186,18 @@ def install_key(*, address: str, user: str | None, port: int, key_path: str) -> 
 
 
 def batch_ssh(
-    *, address: str, user: str | None, port: int, key_path: str, remote: str
+    *,
+    address: str,
+    user: str | None,
+    port: int,
+    key_path: str,
+    remote: str,
+    proxy: str | None = None,
 ) -> list[str]:
-    """The SSH command a pooled session would run, with no way to prompt."""
+    """The SSH command a pooled session would run, with no way to prompt.
+
+    ``proxy`` is a ProxyCommand, such as ``tailcat <address> <port>`` for a tunnel account.
+    """
     target = f"{user}@{address}" if user else address
     return [
         "ssh",
@@ -189,12 +209,19 @@ def batch_ssh(
         "BatchMode=yes",
         "-o",
         "StrictHostKeyChecking=accept-new",
+        *proxy_options(proxy),
         target,
         remote,
     ]
 
 
-def confirm_key(*, address: str, user: str | None, port: int, key_path: str) -> None:
+def proxy_options(proxy: str | None) -> list[str]:
+    return ["-o", f"ProxyCommand={proxy}"] if proxy else []
+
+
+def confirm_key(
+    *, address: str, user: str | None, port: int, key_path: str, proxy: str | None = None
+) -> None:
     """Prove the key works before the alias is declared.
 
     With BatchMode, so what is proven is exactly what a pooled session will do. Failing
@@ -202,7 +229,14 @@ def confirm_key(*, address: str, user: str | None, port: int, key_path: str) -> 
     """
     target = f"{user}@{address}" if user else address
     result = subprocess.run(
-        batch_ssh(address=address, user=user, port=port, key_path=key_path, remote="echo letify"),
+        batch_ssh(
+            address=address,
+            user=user,
+            port=port,
+            key_path=key_path,
+            remote="echo letify",
+            proxy=proxy,
+        ),
         capture_output=True,
         text=True,
         timeout=120,
@@ -246,14 +280,25 @@ def choose_workspace(answers: Answers, address: str | None) -> tuple[str, str]:
 
 
 def check_workspace(
-    *, address: str, user: str | None, port: int, key_path: str, workspace: str
+    *,
+    address: str,
+    user: str | None,
+    port: int,
+    key_path: str,
+    workspace: str,
+    proxy: str | None = None,
 ) -> None:
     """Prove the root can be created and written as the account's own user, over BatchMode."""
     from ..runtime.bootstrap import workspace_check
 
     target = f"{user}@{address}" if user else address
     command = batch_ssh(
-        address=address, user=user, port=port, key_path=key_path, remote=workspace_check(workspace)
+        address=address,
+        user=user,
+        port=port,
+        key_path=key_path,
+        remote=workspace_check(workspace),
+        proxy=proxy,
     )
     try:
         result = subprocess.run(command, capture_output=True, text=True, timeout=120)
@@ -337,7 +382,7 @@ def group_devices(output: str) -> list[FoundDevices]:
 
 
 def detect_devices(
-    *, address: str, user: str | None, port: int, key_path: str
+    *, address: str, user: str | None, port: int, key_path: str, proxy: str | None = None
 ) -> tuple[list[FoundDevices], str | None]:
     """Ask the machine for its GPUs once. Returns the groups, or none and the reason.
 
@@ -345,7 +390,7 @@ def detect_devices(
     """
     target = f"{user}@{address}" if user else address
     command = batch_ssh(
-        address=address, user=user, port=port, key_path=key_path, remote=DEVICE_QUERY
+        address=address, user=user, port=port, key_path=key_path, remote=DEVICE_QUERY, proxy=proxy
     )
     try:
         result = subprocess.run(command, capture_output=True, text=True, timeout=120)
@@ -422,10 +467,18 @@ def _ask_indices(group: FoundDevices) -> tuple[int, ...]:
 
 
 def record_devices(
-    answers: Answers, *, address: str, user: str | None, port: int, key_path: str
+    answers: Answers,
+    *,
+    address: str,
+    user: str | None,
+    port: int,
+    key_path: str,
+    proxy: str | None = None,
 ) -> dict[str, dict[str, str]] | None:
     """Detect the machine's GPUs and return the chosen table, or ``None`` with a note."""
-    groups, reason = detect_devices(address=address, user=user, port=port, key_path=key_path)
+    groups, reason = detect_devices(
+        address=address, user=user, port=port, key_path=key_path, proxy=proxy
+    )
     if not groups:
         print(f"{reason}. {FALLBACK_NOTE}")
         return None
@@ -583,9 +636,80 @@ def colab_account(answers: Answers) -> dict[str, Any]:
     return options
 
 
+#: The prompt for the token when ``--connect`` is not given.
+TOKEN_PROMPT = "Token printed by 'letify client shell connect': "
+
+
+def tunnel_account(answers: Answers) -> dict[str, Any]:
+    """Set up a machine behind NAT from the token ``letify client shell connect`` printed.
+
+    Every SSH command runs with ``ProxyCommand=tailcat <address> <agent port>``, and the
+    account is written with no address. A failure at any step names the step.
+    """
+    from ..transport import setup
+
+    def failed(step: str, reason: object) -> LoginError:
+        return LoginError(f"tunnel login failed at {step}: {reason}")
+
+    if not setup.tailcat_on_path():
+        raise failed("tailcat", setup.tailcat_install_instructions())
+
+    token = answers.get("connect")
+    if not (isinstance(token, str) and token):
+        if not answers.interactive:
+            raise failed(
+                "token",
+                f"{answers.alias} needs the token. Pass --connect <token> or drop --no-input.",
+            )
+        token = read_line(TOKEN_PROMPT)
+    try:
+        fields = setup.decode_token(token)
+    except ValueError as exc:
+        raise failed("token", exc) from None
+
+    address = str(fields["tailcat"])
+    agent_port = int(fields["tailcat_port"])
+    proxy = f"tailcat {address} {agent_port}"
+    user = fields.get("user") or answers.get("user")
+    port = int(fields.get("port") or answers.get("port") or 22)
+    key_path = str(answers.get("key") or DEFAULT_KEY)
+    options: dict[str, Any] = {
+        "kind": "tunnel",
+        "tailcat": address,
+        "tailcat_port": agent_port,
+    }
+    if user:
+        options["user"] = user
+    options["port"] = port
+    options["key"] = key_path
+    if answers.get("persistent") is not None:
+        options["persistent"] = bool(answers.get("persistent"))
+    ssh = {"address": address, "user": user, "port": port, "key_path": key_path, "proxy": proxy}
+
+    step = "key install"
+    try:
+        if answers.install_key:
+            ensure_key(key_path)
+            install_key(**ssh)
+        step = "key confirmation"
+        confirm_key(**ssh)
+        step = "workspace"
+        workspace, default = choose_workspace(answers, address)
+        check_workspace(**ssh, workspace=workspace)
+        if workspace != default:
+            options["workspace"] = workspace
+        step = "devices"
+        devices = record_devices(answers, **ssh)
+    except LoginError as exc:
+        raise failed(step, exc) from None
+    if devices:
+        options["devices"] = devices
+    return options
+
+
 FLOWS = {
     "shell": shell_account,
-    "tunnel": shell_account,
+    "tunnel": tunnel_account,
     "elice": elice_account,
     "colab": colab_account,
     "modal": modal_account,

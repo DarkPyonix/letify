@@ -58,11 +58,14 @@ class Shell(Provider):
     # -- connection ----------------------------------------------------------
 
     @property
-    def address(self) -> str:
+    def address(self) -> str | None:
+        """The address forward SSH uses. An account naming ``tailcat`` needs none."""
         value = self.config.option("address")
-        if not isinstance(value, str):
-            raise ProviderUnavailable(self.kind, f"{self.alias} has no 'address' field")
-        return value
+        if isinstance(value, str) and value:
+            return value
+        if isinstance(self.config.option("tailcat"), str):
+            return None
+        raise ProviderUnavailable(self.kind, f"{self.alias} has no 'address' field")
 
     @property
     def user(self) -> str | None:

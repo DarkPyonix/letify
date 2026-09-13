@@ -72,6 +72,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--token", help="credential to keep in ~/.letify/accounts/<alias>/, never in a config file"
     )
     log_in.add_argument(
+        "--connect",
+        metavar="TOKEN",
+        help="the token 'letify client shell connect' printed, for tunnel",
+    )
+    log_in.add_argument(
         "--no-input",
         dest="interactive",
         action="store_false",
@@ -123,13 +128,24 @@ def build_parser() -> argparse.ArgumentParser:
         "--ssh-port", dest="ssh_port", type=int, default=22, help="this machine's SSH server"
     )
     connect.add_argument("--tailcat", default="tailcat", help="the tailcat command")
+    connect.add_argument(
+        "--name", help="the alias the printed login command names; defaults to the host name"
+    )
 
     return parser
 
 
 def _client_shell_connect(args: argparse.Namespace) -> int:
-    """Run the remote agent until interrupted."""
+    """Check tailcat and the SSH server, run the remote agent, and print the login command."""
+    from .transport import setup
     from .transport.agent import Agent
+
+    if not setup.tailcat_on_path(args.tailcat):
+        print(setup.tailcat_install_instructions(), file=sys.stderr)
+        return 1
+    if not setup.ssh_answers(args.ssh_port):
+        print(setup.sshd_missing_message(args.ssh_port), file=sys.stderr)
+        return 1
 
     agent = Agent(ssh=("127.0.0.1", args.ssh_port), tailcat=args.tailcat)
     port = agent.bind()
@@ -139,9 +155,24 @@ def _client_shell_connect(args: argparse.Namespace) -> int:
         agent.close()
         print(exc, file=sys.stderr)
         return 1
-    print("Add these lines to this machine's account in ~/.letify/config.toml on your own machine:")
-    print(f'tailcat = "{address}"')
-    print(f"tailcat_port = {port}")
+    token = setup.encode_token(
+        {
+            "tailcat": address,
+            "tailcat_port": port,
+            "user": setup.local_user(),
+            "port": args.ssh_port,
+        }
+    )
+    alias = args.name or setup.default_alias()
+    print("On your own machine, run:")
+    print()
+    print(f"  letify login tunnel {alias} --connect {token}")
+    print()
+    print("Keep this agent running: every connection to this machine goes through it.")
+    print("To keep it running after you log out, start it inside tmux or with nohup:")
+    print("  tmux new -s letify 'letify client shell connect'")
+    print("  nohup letify client shell connect > letify-agent.log 2>&1 &")
+    print("A restart gets a new address, so run the login again with the new token it prints.")
     sys.stdout.flush()
     try:
         agent.serve_forever()
@@ -218,6 +249,7 @@ def main(argv: list[str] | None = None) -> int:
                 "account": args.account,
                 "workspace": args.workspace,
                 "profile": args.profile,
+                "connect": args.connect,
                 "indices": args.indices,
                 "detect_devices": args.detect_devices,
             },
