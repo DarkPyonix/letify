@@ -630,6 +630,10 @@ Both sides learn their public mapping from STUN servers reached over TCP on port
 
 Every socket in a punch is bound with `SO_REUSEADDR`, and with `SO_REUSEPORT` where the platform has it, so the STUN connection, the listener and the connecting socket share one port. Both sides may complete a connection in each direction. The user's side takes the first connection that completes and writes a hello carrying a 16 byte token the two sides agreed on through the rendezvous. The remote side keeps the connection on which that hello arrives and closes the others.
 
+The remote side's punch window is 15 s, or the request's `window` in seconds when it sets one. A punch that does not connect within it, or fails with a refused or unreachable connection, is expected, because the Tailcat link is already carrying the session. The agent then writes one line to stderr, `letify agent: TCP punch with <host>:<port> did not connect within <window> s; the Tailcat link is used instead`, or for a refused or unreachable peer `letify agent: TCP punch with <host>:<port> failed (<reason>); the Tailcat link is used instead`, and no traceback. Any other exception in the punch or the splice keeps its traceback.
+
+Every SSH command letify builds sets `HostKeyAlias=letify-<alias>`, `StrictHostKeyChecking=accept-new` and `UserKnownHostsFile=~/.letify/accounts/<alias>/known_hosts`. Building the command creates that account directory with mode 0700 when it is missing, because `ssh` creates only `~/.ssh` and otherwise cannot record the key: it prints `Failed to add the host to the list of known hosts` on every connection and never pins the key. A host key that differs from the recorded one still fails the connection.
+
 A punched connection first answers the probe, then on request is spliced to the remote machine's SSH server, and SSH runs over a local forwarding port. A second SSH connection over the same link punches again.
 
 A local port that letify binds for forwarding is chosen by the operating system, never fixed, because Windows reserves port ranges that vary by machine. The remote end of a reverse forward is chosen the same way, with `ssh -R 0:`.
