@@ -25,7 +25,7 @@ def train(lr, bs):
 train(lr=1e-4, bs=32)
 ```
 
-The decorator takes `device`, `host`, `env`, `volumes`, `timeout` and `retries`. Any other argument is refused by Python as unexpected. `timeout` has no default: a deadline letify invented would end a two hour training run at whatever hour it guessed, which is letify deciding how long the user's own work is allowed to take. It takes no transport, no mode and no width: the three placements below settle where the work runs, and how much can run at once is the provider's inventory rather than a number on the declaration.
+The decorator takes `device`, `host`, `env`, `timeout` and `retries`. Any other argument is refused by Python as unexpected. `timeout` has no default: a deadline letify invented would end a two hour training run at whatever hour it guessed, which is letify deciding how long the user's own work is allowed to take. It takes no transport, no mode and no width: the three placements below settle where the work runs, and how much can run at once is the provider's inventory rather than a number on the declaration.
 
 ### The two placements <!-- id: the-three-placements -->
 
@@ -336,7 +336,7 @@ Nothing internal is reported. The pool holds a guard so that a session released 
 
 ## Storage
 
-> A volume is a content addressed blob store on whichever backend a provider has. It is what makes an ephemeral provider behave like a persistent one.
+> A volume is a content addressed blob store on whichever backend a provider has. Each provider holds one volume per project, filled automatically from what a call uses, so a declaration never names one.
 
 Attaching a volume to an ephemeral provider moves the environment archive and the model cache into storage that outlives the runtime. A twenty gigabyte cache takes about 27 minutes to pull from a lab server over a 100 Mbit/s link, three to five minutes from the Hugging Face hub, and 40 to 60 seconds from a bucket inside the same infrastructure as the runtime. That difference is billed as GPU time.
 
@@ -351,7 +351,7 @@ refs/<name>
 
 Immutability buys two things. Concurrent writers cannot conflict, because different contents get different names, where a two way synchronization loses one writer's changes to the other. And nothing is verified twice, because holding a digest is proof of holding the contents.
 
-Refs carry the mutable part, in the way Git keeps branch names apart from objects. A ref is a few dozen bytes, so a last writer wins race on one is harmless and both blobs survive it. letify reserves `env/<env key>` and `ckpt/<name>`; the rest of the namespace belongs to the user.
+Refs carry the mutable part, in the way Git keeps branch names apart from objects. A ref is a few dozen bytes, so a last writer wins race on one is harmless and both blobs survive it. letify reserves `env/<env key>` for environment archives and `path/<path key>` for project data; nothing else is written there.
 
 ### Blob granularity
 
@@ -377,13 +377,31 @@ A backend offers a pull by answering with a URL and the request headers that rea
 
 The `gcs` read token is downscoped with a Credential Access Boundary: the local token is exchanged at `https://sts.googleapis.com/v1/token` for one that holds `roles/storage.objectViewer` on the volume's bucket only, with an availability condition restricting it to object names under the volume's prefix. A volume option `sts_endpoint` points the exchange elsewhere. A failed exchange raises `RuntimeFailure` rather than sending the unscoped token.
 
-`Volume.resume()` puts the newest checkpoint for a name inside the runtime, which is what makes a preempted session cheap to restart. `Volume.absorb()` pulls one back out, and `cache_env_from()` packs an environment installed inside a runtime so the next session skips the installation.
+The environment archive is automatic. The first session that installs a declared environment packs it into the volume under `env/<env key>`, and every later session on the provider pulls that archive instead of installing. Nothing in the public surface names this step.
 
-These take the declaration, not a session. A declaration already says which provider, which accelerator, which environment and which volumes, so which session is letify's answer to work out and not a value for the caller to carry. The alternative was tried and is worse: a caller holding a session has to have asked for it with the same instance the declaration uses, and the declaration folds the host placement into that instance, so asking with the bare one silently starts a second session that holds none of the first one's files. On one machine that still passes, because both sessions see the same disk. On a rented one it fails, which makes it the worst kind of defect: it works in the test and breaks where the money is.
+Nothing hands a session to the caller. There is no call that returns one, no argument that takes one, and no way to hold the wrong one, because which session serves a call is the pool's answer to work out from the declaration.
 
-So nothing hands a session to the caller. There is no call that returns one, no argument that takes one, and no way to hold the wrong one.
+### Project data <!-- id: project-data -->
 
-Moving a file through a session only works while that session exists, so `absorb`, `resume` and `cache_env_from` are called inside `with let.keep_alive():`. Outside one they raise `UnsupportedMode`, because the session they would use ends as soon as they return and a resumed checkpoint would vanish before the call that needs it.
+> A call's data is found in the call itself. Every `pathlib.Path` the function reaches travels with it: the local contents go up to the provider's volume, the runtime sees the same path already filled, and what the call changes under it comes back when the call ends.
+
+The declared function is sent with cloudpickle, which serializes its closure variables, the globals it references, its default arguments and the call's arguments. letify's pickler intercepts every `pathlib.Path` among them through `reducer_override`. Nothing is declared: the function's own references are the declaration, which is what makes the decorator behave as a closure over the data it uses.
+
+A path is project data when it exists on the local machine at call time, as a file or a directory. For each one:
+
+1. The local contents are packed into content addressed blobs, large files as their own blobs and trees of small files as one archive, and only the digests the volume is missing are uploaded, directly to the backend.
+2. The ref `path/<path key>` records the manifest, where the path key is the digest of the path resolved against the project root.
+3. In the pickled call, the path is replaced by the path the runtime materializes it at, under the mount, so the function body uses it unchanged.
+4. Before the call runs, the runtime pulls the manifest's blobs straight from the backend, as Materializing into a runtime describes.
+
+A path that does not exist locally is an output location. It is created empty in the runtime and replaced the same way.
+
+When the call returns, the runtime compares each replaced path with the manifest it started from. Files that are new or changed are stored as blobs in the volume, and the local process writes them back to the local path. So a checkpoint written under a referenced `Path` is on the local disk when the call returns, and the next session receives it as input with no separate resume step.
+
+Only `pathlib.Path` objects are detected. A string that happens to name a local file is left alone, because no rule can tell a path from any other string, and uploading on a guess would send data the user did not mean to send.
+
+Detection costs one `stat` per path per call, and packing is skipped when the manifest ref already matches the local tree's modification times and sizes.
+
 
 ### Backends
 
