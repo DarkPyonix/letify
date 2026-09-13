@@ -21,24 +21,29 @@ def train(lr): ...
 train(lr=1e-4)        # the session starts here and ends here
 ```
 
-**2. The declaration.** `lifetime="process"` keeps the session past the call, for a run of
-separate calls that would otherwise pay session start each time. On Colab that start is
-provider boot plus environment installation, which is minutes.
+**2. A `keep_alive` block.** `with let.keep_alive():` keeps sessions past their calls until
+the block ends, for a run of separate calls that would otherwise pay session start each time.
+On Colab that start is provider boot plus environment installation, which is minutes.
 
 ```python
-@let.function(device=colab.G4, host="remote", lifetime="process")
+@let.function(device=colab.G4, host="remote")
 def train(lr): ...
 
-train(lr=1e-4)        # starts a session
-train(lr=3e-4)        # reuses it
+with let.keep_alive():
+    train(lr=1e-4)    # starts a session
+    train(lr=3e-4)    # reuses it
+# the block ends here, and so does the idle session
 ```
 
 Two declarations that agree on device and environment share a session either way, because
 the pool keys by those rather than by which function asked.
 
-Nothing ends a session on a timer. `lifetime="process"` says it lives for the process,
-and a thread ending it after some idle period would overrule what you declared. It goes when
-your process does.
+Nothing ends a session on a timer. The block has a visible end, and that end is what closes
+the sessions it kept. Blocks nest, and only the outermost exit ends anything.
+
+A kept idle session still holds its card. A call in the block that needs that card with a
+different environment raises `letify.InsufficientDevices` instead of waiting. See
+[Troubleshooting](07-troubleshooting.md).
 
 **3. The lease.** The session holds a deadline that your process renews every 30 seconds,
 and the worker exits on its own if the deadline passes. The grace period is 300 seconds, so a

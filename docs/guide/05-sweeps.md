@@ -127,8 +127,9 @@ letify status
 ```
 
 If a sweep is narrower than you expected, the inventory is the only place to look. A point
-that cannot reserve its cards waits for one that can to finish, rather than asking the
-provider for a machine it would refuse.
+that cannot reserve its cards waits for a running point to finish, rather than asking the
+provider for a machine it would refuse. When nothing running would free a card, it raises
+`letify.InsufficientDevices` instead of waiting forever.
 
 More accounts is how to get more cards, since an inventory belongs to one account. See [Providers and accounts](02-providers.md).
 

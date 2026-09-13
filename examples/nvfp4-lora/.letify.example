@@ -1,18 +1,19 @@
-# Copy this to .letify in your own project, or run `letify login` and let it write the file.
+# Copy this to .letify/config.toml in your own project, or run `letify login` and let it write
+# the file.
 #
 # This file is the project half of the configuration. It may be committed, because it holds
 # no credential and no detail of one person's machine: an entry here either sets a default
-# or references an account that lives in ~/.letify.
+# or names an account that lives in ~/.letify/config.toml.
 
 [defaults]
 name = "nvfp4-lora"
-idle_timeout = 900
 
-# Naming an alias is what makes an account from ~/.letify available in this project, and an
-# empty table is enough; `letify login` writes exactly that. The address, the user and the key
-# stay in ~/.letify, where they belong. An account marked `global = true` there needs no line
-# here. An alias named here that ~/.letify does not have is a configuration error naming the
-# command that fixes it.
+# Naming an alias is what makes an account from ~/.letify/config.toml available in this
+# project, and an empty table is enough; `letify login` writes exactly that. The address, the
+# user and the key stay in ~/.letify/config.toml. Credentials stay in
+# ~/.letify/accounts/<alias>/. An account marked `global = true` in the home file needs no
+# line here. An alias named here that the home file does not have is a configuration error
+# naming the command that fixes it.
 #
 # [lab_a100]
 #

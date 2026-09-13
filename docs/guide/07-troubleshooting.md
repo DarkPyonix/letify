@@ -14,7 +14,7 @@ letify distinguishes two kinds of failure, and the distinction decides whether a
 |---|---|---|
 | The infrastructure misbehaved | `RuntimeFailure`, `RuntimeLost`, `ProtocolError` | yes, on a fresh runtime |
 | Your code raised | `RemoteError` | no, a retry reproduces it |
-| You asked for something impossible | `ConfigError`, `UnsupportedMode`, `HandleScopeError`, `UnknownProvider`, `UnknownInstance` | no |
+| You asked for something impossible | `ConfigError`, `UnsupportedMode`, `HandleScopeError`, `UnknownProvider`, `UnknownInstance`, `InsufficientDevices` | no |
 | Missing dependency or setting | `ProviderUnavailable` | no |
 
 ---
@@ -25,8 +25,8 @@ This error no longer exists. Sessions need no scope: a call starts one and ends 
 is nothing to be outside of.
 
 If you are reading an older example that wraps calls in `with let.run():`, delete the wrapper
-and dedent the body. Declare `lifetime="process"` if those calls were sharing a session on
-purpose.
+and dedent the body. Wrap them in `with let.keep_alive():` if those calls were sharing a
+session on purpose.
 
 ---
 
@@ -40,8 +40,8 @@ Install it with: uv add "letify[modal]"
 The message names the extra to install. If it names a missing setting instead, add that field to the configuration.
 
 ```
-provider 'elice' is unavailable: elice_a100 needs an access token. Set
-access_token_env or access_token_keyring so the token stays out of tracked files
+provider 'elice' is unavailable: elice_a100 needs an access token. Run 'letify login
+elice elice_a100', which keeps it in ~/.letify/accounts/elice_a100/, or set access_token_env
 ```
 
 ---
@@ -51,8 +51,8 @@ access_token_env or access_token_keyring so the token stays out of tracked files
 **An alias with a hyphen.**
 
 ```
-.letify: alias 'colab-a' is not a Python identifier, so let.providers.colab-a
-cannot work. Try 'colab_a'.
+.letify/config.toml: alias 'colab-a' is not a Python identifier, so
+let.providers.colab-a cannot work. Try 'colab_a'.
 ```
 
 Providers are reached by attribute, so an alias has to be a valid identifier.
@@ -60,11 +60,21 @@ Providers are reached by attribute, so an alias has to be a valid identifier.
 **A reserved alias.**
 
 ```
-.letify: 'any' is reserved. Pick another alias, because let.providers.any
+.letify/config.toml: 'any' is reserved. Pick another alias, because let.providers.any
 already means something else.
 ```
 
-`any`, `gpus` and `active` are taken.
+`any`, `devices` and `active` are taken.
+
+**A project alias this machine does not have.**
+
+```
+.letify/config.toml: 'lab_a100' names an account that ~/.letify/config.toml does not
+have. Run 'letify login <kind> lab_a100' to declare it on this machine, or give the
+table a 'kind' to declare it here.
+```
+
+The repository names an account you have not logged in to. Run the command it names.
 
 **A missing kind.** Every entry needs `kind`. Valid values are `local`, `colab`, `modal`, `shell`, `ssh`, `tunnel`, `elice`.
 
@@ -74,8 +84,10 @@ already means something else.
 
 ```
 no provider is declared under 'colab_b'. Declared: colab_a, lab_a100, local.
-Add it to .letify, or to ~/.letify if it carries credentials.
+Name it in .letify/config.toml, and declare the account in ~/.letify/config.toml.
 ```
+
+An account in `~/.letify/config.toml` exists in a project only if the project's `.letify/config.toml` names it, or its home entry sets `global = true`.
 
 ```
 colab_a does not offer 'B200'. Available: A100, G4, H100, L4, T4, v5e1, v6e1
@@ -95,6 +107,36 @@ decoding. Use host='remote' so the loop runs inside the runtime.
 ```
 
 This is letify refusing to take a slower path silently. Use `host="remote"`, or move that work to a provider with a fast path, which is `Shell`, `Tunnel` or `Elice`. See [Execution modes](03-execution-modes.md).
+
+---
+
+## `InsufficientDevices`
+
+letify raises this instead of waiting when the cards a call needs cannot be allocated and nothing running would free them. It is not retried, because a retry asks the same inventory for the same cards.
+
+**More cards than the account declares.**
+
+```
+<Instance lab_a100:A100 host=remote> asks for 8 A100 but lab_a100 declares 4, so it
+can never be allocated. Ask for fewer, or declare more in the account's devices table.
+```
+
+**Cards held by idle sessions in a `keep_alive` block.**
+
+```
+every G4 on colab_a is held by a session that is idle but kept by let.keep_alive() (...),
+and this call needs a session with a different environment. Nothing running would free
+a card. Make the call outside the block, or give colab_a more G4 in its devices table.
+```
+
+**Cards taken by another process.**
+
+```
+no A100 on lab_a100 can be allocated: the cards it may use are taken by another process,
+and letify cannot know when that process ends.
+```
+
+On a shared machine this usually means a colleague is computing on those cards. Check with `letify utilization`, then retry later or narrow `indices` in the devices table.
 
 ---
 

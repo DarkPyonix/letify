@@ -29,35 +29,50 @@ def train(lr): ...
 
 ## Where configuration lives
 
-Two files, merged, with different jobs.
+letify keeps its state in two `.letify` directories with different jobs.
 
-| File | Holds | Tracked by Git? |
+| Path | Holds | Tracked by Git? |
 |---|---|---|
-| `~/.letify` | Accounts, addresses, keys, tokens | No, it is outside the repository |
-| `.letify` in the project | Defaults that are safe to share | Yes |
+| `~/.letify/config.toml` | Every account this machine has: kind and connection details, never a secret | No, it is outside the repository |
+| `~/.letify/accounts/<alias>/` | That account's credentials, owner only | No |
+| `<project>/.letify/config.toml` | Project defaults, and the aliases of the accounts the project uses | Yes |
 
-The project file refines what the home file declared, so someone else can clone your repository and run it under their own accounts.
+The home file is the set of accounts on this machine. The project file chooses from it. An account is available in a project only when one of these holds:
+
+1. The project file names it. An empty table is enough.
+2. The home entry sets `global = true`.
+3. It is `local`, which is always available.
 
 ```toml
-# .letify in the project, committed
-[defaults]
-name = "nvfp4"
+# .letify/config.toml in the project, committed
+[colab_a]         # use the home account colab_a with all of its settings
+[lab_a100]
 ```
+
+A field set in the project table overrides the home entry's field. Someone else can clone your repository and run `letify login` for the aliases it names.
 
 ## Secrets
 
-A credential is referenced, never written.
+A credential never appears in either `config.toml`. `letify login` asks for it and stores it.
+
+```bash
+letify login elice elice_a100      # writes ~/.letify/accounts/elice_a100/access_token
+letify logout elice_a100           # removes the account and deletes its directory
+```
+
+A field such as `access_token` is resolved in this order:
+
+1. The environment variable named by `access_token_env`.
+2. The file `~/.letify/accounts/<alias>/access_token`, created with mode 0600.
+3. A literal value in the home entry, meant only for non secret defaults.
 
 ```toml
 [elice_a100]
 kind = "elice"
-access_token_env = "ELICE_ACCESS_TOKEN"        # an environment variable
-# access_token_keyring = "elice/researcher"    # or an OS keyring entry
+access_token_env = "ELICE_ACCESS_TOKEN"        # optional, overrides the stored file
 ```
 
-Resolution order is the environment variable, then the keyring, then a literal value. A literal is only appropriate in `~/.letify`, which is not tracked.
-
-For the keyring, install the extra: `uv add "letify[keyring]"`.
+The OS keyring is not used.
 
 ## 📓 Colab
 

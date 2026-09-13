@@ -44,7 +44,7 @@ Two modes that differ by a factor of two in throughput and by a factor of fifty 
 
 ### N6. Three placements are enough to cover every provider without naming a mechanism
 
-A declaration that says where the accelerator is, where the host code runs and how long the session lives is enough to place any supported workload, and a user never has to name a transport, a channel kind or a storage backend.
+A declaration that says where the accelerator is and where the host code runs, plus a `keep_alive` block for sessions to keep, is enough to place any supported workload, and a user never has to name a transport, a channel kind or a storage backend.
 
 ### N7. Batching driver calls makes the round trip count the synchronization count
 
@@ -56,7 +56,7 @@ Forwarding is viable only if a step that issues thousands of driver calls pays a
 - **One native component, built separately.** Standing in for the CUDA driver cannot be done from Python, so that job lives in `letify-core/` as a Rust workspace. Only whoever uses `host="local"` builds it, and the Python package works without it.
 - **The local process stays alive for the duration of a run.** letify does not offer detached execution. A detached run whose remote side is evicted loses its results, so the local process stays the owner and the durable artifacts are checkpoints in the store.
 - **Nothing is torn down by hand.** No release call and no shutdown call on the public surface. A call ends its own session, an idle one is reaped, and the lease covers a crash.
-- **No credential in a tracked file.** Accounts and keys live in `~/.letify` or in the environment or the OS keyring.
+- **No credential in a tracked file.** Accounts live in `~/.letify/config.toml`, and credentials live in the environment or in `~/.letify/accounts`.
 - **Colab accelerators require a paid entitlement.** The remote control features letify uses are permitted on paid plans while the compute unit balance is positive.
 
 ## Non-goals

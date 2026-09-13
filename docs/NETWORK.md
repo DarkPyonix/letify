@@ -97,7 +97,7 @@ POST   /user/resource/compute/virtual_machine_allocation  power on
 DELETE /user/resource/compute/virtual_machine_allocation/{id}  power off
 ```
 
-An allocation is exactly a letify session, so a call's own lifetime maps onto Elice's. letify allocates and releases, and does not create the machine; declare that once in the console or with Terraform and put its id in the configuration.
+An allocation is exactly a letify session, so a session's span, one call or one `keep_alive` block, maps onto Elice's. letify allocates and releases, and does not create the machine; declare that once in the console or with Terraform and put its id in the configuration.
 
 Costs. Compute bills by the second while allocated. Block storage keeps billing while the machine is stopped, and it disappears when the machine is deleted, so a forgotten machine still costs money with no allocation running. Object storage is Data Hub, which speaks S3 and is what letify uses as the blob store backend there.
 

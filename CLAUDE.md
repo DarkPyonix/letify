@@ -10,7 +10,7 @@ These are not preferences. Breaking one means the change gets reverted.
 2. **Never use an em-dash.** Not in code, comments, docstrings, documentation, commit messages or pull request bodies. Use a hyphen, a comma, a colon or a second sentence instead. This applies to the en-dash used as punctuation as well.
 3. **Code comments and docstrings are English only.** No exceptions, including in files whose documentation is Korean. Identifiers, log messages and error strings are English too.
 4. **Commit subjects use a capitalized type prefix followed by a colon.** For example `Feat: Add the Colab provider`, `Fix: Release the session lock when exec raises`, `Docs: Describe the blob store layout`. Use the imperative mood and name the thing that changed. Allowed prefixes: `Feat`, `Fix`, `Docs`, `Refactor`, `Test`, `Perf`, `Chore`, `Build`.
-5. **Never commit secrets.** Access tokens, SSH private keys and account credentials belong in the environment or the OS keyring, never in tracked files. `.letify` at the repository root holds project defaults only; credentials live in `~/.letify`.
+5. **Never commit secrets.** Access tokens, SSH private keys and account credentials belong in the environment or in `~/.letify/accounts`, never in tracked files. The project's `.letify/` holds project defaults only.
 
 ## How this project is built
 
@@ -121,16 +121,16 @@ letify/
   __init__.py       Public surface. Everything a user needs is re-exported here
   errors.py         Exception hierarchy
   launcher.py       Launcher, the public entry point
-  config.py         .letify loading and credential resolution
-  env.py            Env, the uv.lock based environment declaration
-  instance.py       Instance, a GPU plus CPU placement
-  sweep.py          Sweep, grid and zip, the declared search space
-  function.py       The @let.function decorator and the callable it returns
-  runtime.py        Runtime, one live session, and the session pool
-  wire.py           Serialization, the call protocol and result decoding
-  store/            Content addressed blob store and its backends
+  cli.py            The letify command line
+  stubs.py          Provider type stubs for editor completion
+  config/           .letify/config.toml loading, schema, login and credential files
+  declare/          Env, Instance, Sweep and the @let.function callable
+  protocol/         Codec, framing, handles, the remote worker and driver
+  runtime/          Channel, session, pool, lease, bootstrap and telemetry
+  store/            Content addressed blob store, volumes and backends
   providers/        Provider base class and one module per provider
   remoting/         CUDA API forwarding, used only where a low-latency path exists
+  _vendor/          Vendored third party code
 ```
 
 Conventions:
@@ -143,7 +143,7 @@ Conventions:
 
 ## Dependencies
 
-The base install has no provider dependencies. Providers are extras:
+The base install depends on cloudpickle and blake3 only. Providers are extras, currently commented out in `pyproject.toml`:
 
 ```
 uv add letify              # core only

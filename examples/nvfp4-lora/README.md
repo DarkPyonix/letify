@@ -52,10 +52,10 @@ names and has no copy of this project, so a function imported from `recipe.py` h
 inside the call. Anything the lock file does install goes by name, because sending torch over
 the network on every call would be absurd.
 
-**`lifetime="process"` is what makes a sweep affordable.** Session start, environment
-install and the first transfer are all billed as GPU time. With the default `"call"` each of
-the six points would pay that again, and on a short run the setup costs more than the
-training.
+**`with let.keep_alive():` is what makes a sweep affordable.** Session start, environment
+install and the first transfer are all billed as GPU time. The block keeps the session between
+calls, so the best adapter can still be pulled out after the sweep. Without it each separate
+call would pay setup again, and on a short run the setup costs more than the training.
 
 **How wide the sweep runs is the provider's inventory**, not an argument. Declare what the
 account has and that is the width:
@@ -75,8 +75,8 @@ session. Both take the declaration rather than a session, because which session 
 is letify's answer and naming a different one would read from a session holding no files. Blobs are immutable and a name is a few dozen bytes, so two sessions writing at once
 cannot lose each other's work: one name wins and both checkpoints remain.
 
-**There is nothing to release.** A call ends its own session and `lifetime="process"` keeps
-it until the process exits. Nothing ends one on a timer. A heartbeat lease covers a process
+**There is nothing to release.** A call ends its own session, and leaving the `keep_alive`
+block ends the sessions it kept. Nothing ends one on a timer. A heartbeat lease covers a process
 killed outright, which frees the card; whether it also stops the billing depends on the
 provider, and [docs/guide/06-cost.md](../../docs/guide/06-cost.md) says which. Durability is
 the checkpoint in the store, not a session that outlives you.

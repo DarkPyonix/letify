@@ -23,7 +23,7 @@ import letify
 let = letify.Launcher()
 colab = let.providers.colab_pro_plus
 
-@let.function(device=colab.G4, host="remote")
+@let.function(device=colab.G4, host=letify.remote)
 def train(lr, bs):
     import torch
     ...
@@ -54,7 +54,7 @@ GPU를 빌린다는 것은 보통 그 GPU에게 찾아가는 일입니다. 노�
 갈라지지 않습니다. 맞춰줄 것도 없고, 세션이 끊기기 전에 되가져올 것도 없습니다.
 
 ```python
-@let.function(device=colab.G4, host="remote")
+@let.function(device=colab.G4, host=letify.remote)
 def train(lr, bs):
     ...
 
@@ -120,7 +120,7 @@ A100 = { indices = "0-3" }    # 공용 머신의 네 장이 우리 것
 </td><td>
 
 ```python
-@let.function(device=colab.G4, host="remote", volumes=[cache])
+@let.function(device=colab.G4, host=letify.remote, volumes=[cache])
 def train(lr, bs):
     ...
 
@@ -152,7 +152,7 @@ uv add "letify[all]"          # 전부
 
 ### 1. 계정을 한 번 선언합니다
 
-계정은 `~/.letify`에 둡니다. 머신에 속하는 정보이고, 저장소에는 들어가지 않습니다.
+계정은 `~/.letify/config.toml`에 둡니다. 머신에 속하는 정보이고, 저장소에는 들어가지 않습니다.
 
 ```toml
 [colab_pro_plus]
@@ -167,7 +167,9 @@ key = "~/.ssh/id_ed25519"
 persistent = true
 ```
 
-> 🔐 비밀은 참조만 합니다. `access_token_env = "MY_TOKEN"`이나 `access_token_keyring = "service/user"`를 쓰세요.
+프로젝트는 쓰는 계정을 자기 `.letify/config.toml`에 이름으로 적습니다. `[lab_a100]` 같은 빈 테이블이면 충분합니다. 홈 파일에서 `global = true`인 계정과 `local`은 적지 않아도 됩니다.
+
+> 🔐 비밀은 `config.toml`에 넣지 않습니다. `access_token` 같은 필드는 `access_token_env`가 가리키는 환경 변수, 또는 `letify login`이 소유자 전용 권한으로 쓰는 `~/.letify/accounts/<alias>/access_token` 파일에서 읽습니다.
 
 ### 2. 뭐가 있는지 봅니다
 
@@ -195,7 +197,7 @@ env = letify.Env()                      # uv.lock을 읽습니다
 colab = let.providers.colab_pro_plus
 cache = colab.volume("hf-cache")        # 세션보다 오래 살아남습니다
 
-@let.function(device=colab.G4, host="remote", env=env, volumes=[cache])
+@let.function(device=colab.G4, host=letify.remote, env=env, volumes=[cache])
 def train(lr, bs):
     ...
     return {"loss": loss}
@@ -223,8 +225,8 @@ print(train(lr=1e-4, bs=32))
 둘 중 어느 것도 직접 고르지 않습니다. CPU 쪽 작업이 어디서 도는지만 말하면 됩니다.
 
 ```python
-@let.function(device=colab.G4, host="remote")                   # 기본값: 루프가 원격에서 돕니다
-@let.function(device=lab.A100, host="remote", host="local")      # Python은 여기, CUDA 호출만 저쪽으로
+@let.function(device=colab.G4, host=letify.remote)   # 루프가 원격에서 돕니다
+@let.function(device=lab.A100, host=letify.local)    # Python은 여기, CUDA 호출만 저쪽으로
 ```
 
 그리고 기본값은 프로바이더에서 나옵니다. **저장소가 결정합니다.** 프로바이더의 디스크가 세션보다 오래 살면 데이터가 이미 거기 있으니 루프를 보내는 게 자연스럽습니다. 그렇지 않으면 상태를 로컬에 두는 편이 낫지만, 회선이 감당할 때만 그렇습니다.
@@ -279,17 +281,17 @@ Provider
 a = let.providers.colab_pro_plus
 b = let.providers.colab_pro
 
-@let.function(device=a.G4, host="remote")
+@let.function(device=a.G4, host=letify.remote)
 def train(lr): ...
 
-@let.function(device=b.L4, host="remote")      # 다른 계정, 같은 프로그램
+@let.function(device=b.L4, host=letify.remote)      # 다른 계정, 같은 프로그램
 def evaluate(ckpt): ...
 ```
 
 **아예 고르지 않아도 됩니다.**
 
 ```python
-@let.function(device=let.providers.any.A100, host="remote")   # A100이 있는 첫 프로바이더
+@let.function(device=let.providers.any.A100, host=letify.remote)   # A100이 있는 첫 프로바이더
 def train(lr): ...
 ```
 
@@ -308,7 +310,7 @@ both  = letify.grid(lr=[1e-4]) | letify.grid(lr=[1e-3])   # 합집합
 소비하는 방법은 이미 알고 있는 파이썬 문법입니다. 🐍
 
 ```python
-@let.function(device=colab.G4, host="remote")
+@let.function(device=colab.G4, host=letify.remote)
 async def train(lr, bs):
     ...
 
@@ -329,7 +331,7 @@ async for r in train(space):              # 끝나는 대로 하나씩
 ```python
 cache = colab.volume("hf-cache")
 
-@let.function(device=colab.G4, host="remote", volumes=[cache])
+@let.function(device=colab.G4, host=letify.remote, volumes=[cache])
 def train(lr): ...
 ```
 
@@ -358,16 +360,17 @@ def train(lr): ...
 세션은 살아 있는 프로세스 하나이므로, 값이 그 안에 남아 있을 수 있습니다.
 
 ```python
-@let.function(device=colab.G4, host="remote", lifetime="process", keep_remote=True)
+@let.function(device=colab.G4, host=letify.remote, keep_remote=True)
 def build_model():
     return load_model()          # 14 GB, 원격 머신에 남습니다
 
-@let.function(device=colab.G4, host="remote", lifetime="process")
+@let.function(device=colab.G4, host=letify.remote)
 def evaluate(model, batch):
     return model(batch)          # 핸들이 그 자리에서 해소됩니다
 
-model = build_model()            # 14 GB가 아니라 Handle
-evaluate(model=model, batch=...)
+with let.keep_alive():               # 세션이 호출보다 오래 삽니다
+    model = build_model()            # 14 GB가 아니라 Handle
+    evaluate(model=model, batch=...)
 ```
 
 큰 인자도 내용 주소로 다룹니다. 같은 텐서를 열 번 넘겨도 네트워크는 한 번만 건넙니다. 런타임에게
@@ -385,9 +388,11 @@ evaluate(model=model, batch=...)
 **호출이 자기 세션을 끝냅니다.** 이게 기본이고, 스윕도 호출 하나로 세니 6개 조합이 세션을 한 번
 열고 한 번 닫습니다.
 
-**`lifetime="process"`가 선택 사항입니다.** 이어지는 호출들이 매번 세션 시작 비용을 내야 하는
-경우를 위한 것이고, 내 프로세스가 끝날 때 끝납니다. 타이머로 더 먼저 끄면 선언을 무시하는 것이
-됩니다.
+**`with let.keep_alive():`가 선택 사항입니다.** 이어지는 호출들이 매번 세션 시작 비용을 내야 하는
+경우를 위한 것입니다. 블록을 나가면 쉬고 있는 세션이 모두 끝납니다. 타이머로 끝내는 것은 없습니다.
+
+**할당할 수 없는 장치는 예외를 냅니다.** 유지 중인 유휴 세션이나 다른 프로세스가 잡고 있는 카드, 또는
+계정이 선언한 것보다 많은 카드를 요청하면 기다리지 않고 바로 `letify.InsufficientDevices`를 냅니다.
 
 **리스가 안전장치입니다.** 세션이 기한을 들고 있고 이 프로세스가 계속 갱신합니다. 강제 종료된
 프로세스는 아무에게도 아무 말을 할 수 없으므로, 워커가 스스로 나가면서 카드 점유를 풉니다. 유예
@@ -407,7 +412,7 @@ evaluate(model=model, batch=...)
 def test_train_returns_a_loss():
     let = letify.Launcher(home=False)
 
-    @let.function(device=let.providers.local.CPU, host="remote")
+    @let.function(device=let.providers.local.CPU, host=letify.remote)
     def train(lr):
         return {"loss": 1.0 / lr}
 
@@ -461,7 +466,7 @@ letify probe lab      # 호출 중계를 쓸 만큼 가까운가?
 
 🚧 `letify-driver`는 PyTorch 프로세스가 시작해서 커널 하나를 돌리는 데 필요한 진입점까지만 덮습니다. 그 밖의 것은 자기 이름을 출력하고 `CUDA_ERROR_NOT_SUPPORTED`를 반환하므로, 실제 실행이 다음에 만들어야 할 목록을 알려줍니다
 🚧 `Modal`과 `Elice`는 공개된 인터페이스대로 작성했지만 실제 서비스에서 돌려보지 않았습니다
-🚧 통합 메모리는 중계가 불가능하므로, 페이지드 옵티마이저는 `host="remote"`가 필요합니다
+🚧 통합 메모리는 중계가 불가능하므로, 페이지드 옵티마이저는 `host=letify.remote`가 필요합니다
 
 전체 목록은 [docs/SPEC.md](../SPEC.md) 끝에 있습니다.
 

@@ -23,7 +23,7 @@ import letify
 let = letify.Launcher()
 colab = let.providers.colab_pro_plus
 
-@let.function(device=colab.G4, host="remote")
+@let.function(device=colab.G4, host=letify.remote)
 def train(lr, bs):
     import torch
     ...
@@ -32,7 +32,7 @@ def train(lr, bs):
 print(train(lr=1e-4, bs=32))
 ```
 
-No session to create. No environment to install. No files to upload. No scope to open, and no machine left running when you close the lid. 🎉
+No session to create. No environment to install. No files to upload. Nothing to tear down, and no machine left running when you close the lid. 🎉
 
 ---
 
@@ -57,7 +57,7 @@ a different Python and no working directory. There is nothing to keep in sync an
 copy back before the session dies.
 
 ```python
-@let.function(device=colab.G4, host="remote")
+@let.function(device=colab.G4, host=letify.remote)
 def train(lr, bs):
     ...
 
@@ -125,7 +125,7 @@ is what makes that door usable, so the cheapest option stops being the inconveni
 </td><td>
 
 ```python
-@let.function(device=colab.G4, host="remote",
+@let.function(device=colab.G4, host=letify.remote,
               volumes=[cache])
 def train(lr, bs):
     ...
@@ -152,7 +152,7 @@ uv add "letify[all]"          # everything
 
 The Python package is pure Python. A provider whose package is missing simply reports itself unavailable, and the rest keeps working.
 
-One optional piece is native. `host="local"` needs [letify-core](letify-core/), a Rust workspace that stands in for the CUDA driver, built with `python letify-core/build.py`. If you only ship functions to remote machines you never need it.
+One optional piece is native. `host=letify.local` needs [letify-core](letify-core/), a Rust workspace that stands in for the CUDA driver, built with `python letify-core/build.py`. If you only ship functions to remote machines you never need it.
 
 ---
 
@@ -160,7 +160,7 @@ One optional piece is native. `host="local"` needs [letify-core](letify-core/), 
 
 ### 1. Declare your accounts once
 
-Put accounts in `~/.letify`, so they belong to your machine and never to the repository.
+Put accounts in `~/.letify/config.toml`, so they belong to your machine and never to the repository.
 
 ```toml
 [colab_pro_plus]
@@ -175,7 +175,9 @@ key = "~/.ssh/id_ed25519"
 persistent = true
 ```
 
-> 🔐 Secrets are referenced, never written. Use `access_token_env = "MY_TOKEN"` or `access_token_keyring = "service/user"`.
+A project names the accounts it uses in its own `.letify/config.toml`. An empty table such as `[lab_a100]` is enough. An account with `global = true` in the home file needs no line, and neither does `local`.
+
+> 🔐 Secrets never go in `config.toml`. A field such as `access_token` comes from the environment variable named by `access_token_env`, or from the file `~/.letify/accounts/<alias>/access_token` that `letify login` writes with owner only permissions.
 
 ### 2. Look around
 
@@ -203,7 +205,7 @@ env = letify.Env()                      # reads uv.lock
 colab = let.providers.colab_pro_plus
 cache = colab.volume("hf-cache")        # survives the session
 
-@let.function(device=colab.G4, host="remote", env=env, volumes=[cache])
+@let.function(device=colab.G4, host=letify.remote, env=env, volumes=[cache])
 def train(lr, bs):
     ...
     return {"loss": loss}
@@ -217,13 +219,12 @@ That is the whole program. 🍰
 
 ## 🧭 What a declaration says
 
-Three words, and none of them is a mechanism.
+Two words, and neither of them is a mechanism.
 
 ```python
 @let.function(
     device=colab.G4,       # where the accelerator is, with provider and account
-    host="remote",         # where the host code runs
-    lifetime="call",       # how long the session lives
+    host=letify.remote,    # where the host code runs
 )
 ```
 
@@ -231,12 +232,12 @@ Three words, and none of them is a mechanism.
 
 **`host`** is the CUDA word for the CPU side. `"local"`, the default, keeps Python and the libraries in this process and forwards only CUDA calls. `"remote"` ships the function to the machine that holds the device.
 
-**`lifetime`** is how long the session lives. `"call"`, the default, ends it with the call, counting a search space as one call. `"process"` keeps it so a run of separate calls does not pay session start each time.
+How long a session lives is not a declaration argument. A call ends its session, counting a search space as one call. `with let.keep_alive():` keeps sessions for the length of a block, so a run of separate calls does not pay session start each time.
 
 <details>
 <summary><b>📐 Which host to pick, with the arithmetic</b></summary>
 
-| | 📦 `host="remote"` | 🔌 `host="local"` |
+| | 📦 `host=letify.remote` | 🔌 `host=letify.local` |
 |---|---|---|
 | What moves | your whole loop, once | every CUDA call |
 | Cost | one transfer | one round trip per host synchronization |
@@ -286,17 +287,17 @@ Provider
 a = let.providers.colab_pro_plus
 b = let.providers.colab_pro
 
-@let.function(device=a.G4, host="remote")
+@let.function(device=a.G4, host=letify.remote)
 def train(lr): ...
 
-@let.function(device=b.L4, host="remote")      # different account, same program
+@let.function(device=b.L4, host=letify.remote)      # different account, same program
 def evaluate(ckpt): ...
 ```
 
 **Or do not pick at all:**
 
 ```python
-@let.function(device=let.providers.any.A100, host="remote")
+@let.function(device=let.providers.any.A100, host=letify.remote)
 def train(lr): ...
 ```
 
@@ -315,7 +316,7 @@ both  = letify.grid(lr=[1e-4]) | letify.grid(lr=[1e-3])   # union
 Then consume it with the language you already know. 🐍
 
 ```python
-@let.function(device=colab.G4, host="remote")
+@let.function(device=colab.G4, host=letify.remote)
 async def train(lr, bs):
     ...
 
@@ -336,7 +337,7 @@ A **volume** is a content addressed blob store. Contents are named by their hash
 ```python
 cache = colab.volume("hf-cache")
 
-@let.function(device=colab.G4, host="remote", volumes=[cache])
+@let.function(device=colab.G4, host=letify.remote, volumes=[cache])
 def train(lr): ...
 ```
 
@@ -365,16 +366,17 @@ All of that time is billed as GPU time. That is why an ephemeral provider with a
 A session is one living process, so a value can stay in it.
 
 ```python
-@let.function(device=colab.G4, host="remote", lifetime="process", keep_remote=True)
+@let.function(device=colab.G4, host=letify.remote, keep_remote=True)
 def build_model():
     return load_model()          # 14 GB, stays on the remote machine
 
-@let.function(device=colab.G4, host="remote", lifetime="process")
+@let.function(device=colab.G4, host=letify.remote)
 def evaluate(model, batch):
     return model(batch)          # the handle resolves in place
 
-model = build_model()            # a Handle, not 14 GB
-evaluate(model=model, batch=...)
+with let.keep_alive():               # the session outlives each call
+    model = build_model()            # a Handle, not 14 GB
+    evaluate(model=model, batch=...)
 ```
 
 Large arguments are content addressed too. Pass the same tensor to ten calls and it crosses the network once, because the runtime is asked by digest whether it already holds it.
@@ -389,7 +391,9 @@ Nothing has to be torn down by hand.
 
 **A call ends its own session.** That is the default, and a sweep counts as one call, so six points start one set of sessions and end them once.
 
-**`lifetime="process"` is the opt in**, for a run of separate calls that would otherwise pay session start each time. It ends when your process does, because a timer that ended it sooner would overrule what you declared.
+**`with let.keep_alive():` is the opt in**, for a run of separate calls that would otherwise pay session start each time. Leaving the block ends every idle session. Nothing ends one on a timer.
+
+**Devices that cannot be allocated raise.** A call that asks for cards held by an idle kept session, by another process or beyond what the account declares raises `letify.InsufficientDevices` at once, instead of waiting for a device nothing will free.
 
 **The lease is the backstop.** The session holds a deadline that this process keeps renewing. Kill your script, lose your laptop, crash your kernel, and the worker exits on its own, which frees the card. The grace period is long enough that a flaky connection does not kill a training run. Whether it also stops the billing depends on what the provider charges for: [docs/guide/06-cost.md](docs/guide/06-cost.md) says which providers are covered and which are not.
 
@@ -405,7 +409,7 @@ The `local` provider starts the same worker behind the same framed protocol a re
 def test_train_returns_a_loss():
     let = letify.Launcher(home=False)
 
-    @let.function(device=let.providers.local.CPU, host="remote")
+    @let.function(device=let.providers.local.CPU, host=letify.remote)
     def train(lr):
         return {"loss": 1.0 / lr}
 
@@ -425,7 +429,7 @@ letify status                 # what is running right now
 letify usage                  # what is left on each account
 letify utilization            # how busy each instance's GPU is
 letify check lab              # does this machine answer?
-letify probe lab              # is host="local" worth using here?
+letify probe lab              # is host=letify.local worth using here?
 letify efficiency 0.5 3 150   # the formula, from measured terms
 ```
 
@@ -441,7 +445,7 @@ letify efficiency 0.5 3 150   # the formula, from measured terms
 | 📐 [docs/SPEC.md](docs/SPEC.md) | The design as it stands, decision by decision |
 | 🧩 [docs/COMPONENT.md](docs/COMPONENT.md) | Every class, and the vocabulary |
 | 🌐 [docs/NETWORK.md](docs/NETWORK.md) | Transports, latency measurements, tunnel choices |
-| 🦀 [letify-core/](letify-core/) | The Rust workspace behind `host="local"` |
+| 🦀 [letify-core/](letify-core/) | The Rust workspace behind `host=letify.local` |
 | 🧭 [docs/guide/](docs/guide/) | Task-oriented guides |
 | 🇰🇷 [docs/locales/README_ko.md](docs/locales/README_ko.md) | 한국어 |
 
@@ -461,7 +465,7 @@ Not finished yet:
 
 🚧 `letify-driver` covers the entry points a PyTorch process needs to start up and run one kernel. Anything else names itself and returns `CUDA_ERROR_NOT_SUPPORTED`, so a real run prints the list of what to build next
 🚧 `Modal` and `Elice` follow each published interface but have not been run against the live services
-🚧 Unified memory cannot be forwarded at all, so a paged optimizer needs `host="remote"`
+🚧 Unified memory cannot be forwarded at all, so a paged optimizer needs `host=letify.remote`
 
 The full list is at the end of [docs/SPEC.md](docs/SPEC.md).
 

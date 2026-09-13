@@ -21,15 +21,14 @@ train(lr=1e-4, bs=32)
 
 ## Features
 
-### Three placements, no mechanisms
+### Placements, no mechanisms
 
-A declaration says where the accelerator is, where the host code runs, and how long the session lives. It never names a transport or a mode.
+A declaration says where the accelerator is and where the host code runs. It never names a transport or a mode. How long a session lives is the `keep_alive` block around the calls.
 
 | Argument | Says | Default |
 |---|---|---|
 | `device` | which provider, account, accelerator and how many of it | required |
 | `host` | where the host code runs: `"local"` or `"remote"` | `"local"` |
-| `lifetime` | how long the session lives: `"call"` or `"process"` | `"call"` |
 
 Core count and memory are not arguments. They arrive with the shape the provider registered, and a provider offering several sizes registers them as separate shapes. `lab.A100 * 2` is the same shape taking two cards.
 
@@ -74,7 +73,9 @@ Runtimes are pooled by instance and environment, so two declarations that agree 
 
 ### Teardown with nothing to call
 
-A call ends its own session. `lifetime="process"` keeps it for a run of separate calls, until the process exits. Nothing ends a session on a timer, because a timer would overrule the declaration that asked to keep it.
+A call ends its own session. `with let.keep_alive():` keeps sessions for the length of a block, and they end when the outermost block exits. Nothing ends a session on a timer, because a timer would overrule the block that asked to keep it.
+
+A call whose devices cannot be allocated raises `letify.InsufficientDevices` at once instead of waiting. It waits only while a session in this process that holds that accelerator is serving a call.
 
 A heartbeat lease covers the one case nothing else can: a process killed outright says nothing to anybody. The worker exits on its own, which frees the card. Whether that also stops the billing depends on what the provider charges for, and letify states that per provider rather than implying a guarantee it cannot make. See [docs/SPEC.md](docs/SPEC.md).
 
@@ -106,11 +107,11 @@ Everything a user needs is on `letify` itself.
 
 ```python
 Launcher(
-    config=None,        # path to a .letify file; defaults to the project and home files
+    config=None,        # a .letify directory or its config.toml; defaults to the project and home ones
     name=None,          # session and app name; defaults to the pyproject project name
     stream_logs=True,   # print remote stdout to stderr
     announce=True,      # say when a session starts, because that is when money starts
-    home=True,          # read ~/.letify
+    home=True,          # read ~/.letify/config.toml
 )
 ```
 
@@ -123,6 +124,7 @@ Launcher(
 | `let.providers.aliases` | Declared aliases, in configuration order |
 | `let.provider(alias)` | Same as attribute access, for a computed alias |
 | `let.function(...)` | Declare a function, returning a decorator |
+| `with let.keep_alive():` | Keep sessions alive between calls for the length of the block |
 | `let.grid`, `let.zip` | Build a search space |
 | `let.status()` | How many sessions are live and busy against the ceiling, and what each one is |
 | `let.usage(alias=None)` | What is left on each account, or why it is not reported |
@@ -133,8 +135,7 @@ Launcher(
 ```python
 @let.function(
     device=colab.G4,       # an Instance, carrying provider, account and accelerator
-    host="remote",         # "local" forwards CUDA calls, "remote" ships the function
-    lifetime="process",    # "call" ends with the call, "process" keeps the session
+    host="remote",         # letify.local forwards CUDA calls, letify.remote ships the function
     env=env,               # an Env; defaults to Env()
     volumes=[cache],       # volumes to attach
     timeout=None,          # seconds one call may take; no default deadline
@@ -170,7 +171,6 @@ env = env.ship("mypkg")                  # send this module by value, overriding
 
 ```python
 colab.G4                          # registered shape
-colab.G4.on_host("remote")        # the same shape in the other mode
 colab.device("G4")                # same, for a computed name
 colab.instances                   # everything this account offers
 colab.refresh()                   # ask the provider again
@@ -210,7 +210,6 @@ space.with_fixed(epochs=3)
 | `Launcher`, `Providers` | the entry point and its provider view |
 | `Instance`, `AnyInstance` | an accelerator shape, and a deferred one |
 | `local`, `remote` | the two values `host` takes |
-| `Lifetime` | a string enum for how long a session lives |
 | `Env` | an environment declaration |
 | `Sweep` | a declared search space |
 | `Volume` | a content addressed store on a provider |
@@ -229,6 +228,7 @@ space.with_fixed(epochs=3)
 | `RemoteError` | The shipped function raised; carries the remote traceback | no |
 | `HandleScopeError` | A handle from one session was passed to another | no |
 | `UnsupportedMode` | The requested mode cannot work here | no |
+| `InsufficientDevices` | The devices a call asks for cannot be allocated; names what holds them | no |
 
 ### Command line
 
@@ -243,17 +243,18 @@ letify utilization [alias]    # how busy each instance's accelerator is
 letify check <alias>          # confirm a machine answers
 letify probe <host>           # whether host="local" is worth using
 letify efficiency 0.5 3 150   # expected share of a direct run
+letify stubs                  # write typings/letify_providers.pyi for editor completion
 ```
 
 ## Configuration
 
-`~/.letify` holds accounts, the project's `.letify` holds defaults, and neither holds a secret.
+Configuration is a directory. `~/.letify/config.toml` holds accounts, the project's `.letify/config.toml` holds defaults and the aliases it uses, and neither holds a secret.
 
-An account in `~/.letify` is available in a project only when the project's `.letify` names its alias, even as an empty `[colab_pro]` table, when the home entry sets `global = true`, or when it is `local`. A named alias takes every home setting and the project's own fields override them one by one. With no project `.letify` at all, only global accounts and `local` exist.
+An account in `~/.letify/config.toml` is available in a project only when the project's `.letify/config.toml` names its alias, even as an empty `[colab_pro]` table, when the home entry sets `global = true`, or when it is `local`. A named alias takes every home setting and the project's own fields override them one by one. With no project `.letify/` at all, only global accounts and `local` exist.
 
-`letify login <kind> [alias]` writes both. The account goes to `~/.letify`, which belongs to the machine. The project file gets the alias as an empty table and nothing else, which is safe to commit and tells a teammate which accounts the repository needs. An account already declared is not asked for again, so `letify login` in a second repository writes only the table. An alias the project names that this machine does not have is a configuration error naming the command that fixes it.
+`letify login <kind> [alias]` writes both. The account goes to `~/.letify/config.toml`, which belongs to the machine, and any credential it collects goes to `~/.letify/accounts/<alias>/`. `letify logout <alias>` deletes that account directory. The project file gets the alias as an empty table and nothing else, which is safe to commit and tells a teammate which accounts the repository needs. An account already declared is not asked for again, so `letify login` in a second repository writes only the table. An alias the project names that this machine does not have is a configuration error naming the command that fixes it.
 
-SSH authenticates by key, because letify opens sessions with `ssh -o BatchMode=yes`: a session is started by the pool in the background, with nobody present to answer a password prompt. So `letify login shell` generates an ed25519 key if there is none, asks for the password once to install it, drops the password, and confirms the key works before declaring the alias. Nothing about the password is written to a file, the keyring or the environment. A machine whose administrator forbids key authentication can use `--auth password`, which keeps the password in the OS keyring and drives `sshpass`; it is refused on Windows, where that tool does not exist.
+SSH authenticates by key, because letify opens sessions with `ssh -o BatchMode=yes`: a session is started by the pool in the background, with nobody present to answer a password prompt. So `letify login shell` generates an ed25519 key if there is none, asks for the password once to install it, drops the password, and confirms the key works before declaring the alias. Nothing about the password is written to a file or the environment. A machine whose administrator forbids key authentication can use `--auth password`, which reads the password from `~/.letify/accounts/<alias>/password` and drives `sshpass`; it is refused on Windows, where that tool does not exist.
 
 ```toml
 [defaults]
@@ -281,7 +282,9 @@ An alias must be a Python identifier, because providers are reached by attribute
 
 Where a service publishes no balance, an entry names a command that prints one: `usage_command` is run when `letify usage` asks, `usage_unit` names what it counts and `usage_limit` gives the ceiling. The last number in the output is read as the remaining amount.
 
-A credential is referenced, never written: `<name>_env` names an environment variable, `<name>_keyring` names a keyring entry as `service/user`.
+A credential never enters `config.toml`. It is resolved in order: the environment variable named by `<name>_env`, then the file `~/.letify/accounts/<alias>/<name>` (mode 0600, written by `letify login`), then a literal value. The OS keyring is not used.
+
+Provider types for editor completion are written to `typings/letify_providers.pyi` at the project root, automatically when the configuration loads or on demand with `letify stubs`. `[tool.letify] typings = "<path>"` in `pyproject.toml` moves it.
 
 ## Installation
 
@@ -292,11 +295,10 @@ uv add "letify[modal]"       # Modal
 uv add "letify[shell]"       # SSH, tunnel and Elice
 uv add "letify[gcs]"         # Google Cloud Storage blob store
 uv add "letify[s3]"          # S3 compatible blob store
-uv add "letify[keyring]"     # OS keyring for credentials
 uv add "letify[all]"         # everything
 ```
 
-No provider dependency is imported at package import time, so a provider whose package is absent reports itself unavailable and everything else keeps working.
+`letify` alone installs cloudpickle and blake3. The provider extras are declared but currently commented out in `pyproject.toml`, so they install nothing extra yet. No provider dependency is imported at package import time, so a provider whose package is absent reports itself unavailable and everything else keeps working.
 
 `host="local"` additionally needs [letify-core](letify-core/) built with `python letify-core/build.py`, which requires a Rust toolchain.
 

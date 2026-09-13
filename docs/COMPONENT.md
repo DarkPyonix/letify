@@ -15,7 +15,7 @@ Read this table first. Most confusion about letify is one of these words meaning
 | **device** | Where the accelerator is. The decorator argument that carries provider, account and accelerator. |
 | **host** | Where the host code runs. CUDA's word for the CPU side, paired with the device. |
 | **Runtime** | One live session. The only object that costs money. |
-| **lifetime** | How long a session lives: `call` or `process`. |
+| **keep_alive** | The block, `with let.keep_alive():`, that keeps sessions between calls. Outside it a call ends its session. |
 | **Channel** | How letify talks to a session: persistent, or one-shot. |
 | **Env** | A declaration of the remote environment, keyed by a uv lock file. Not a container image. |
 | **Volume** | A named content addressed blob store on a provider's storage. Not a mounted filesystem. |
@@ -29,7 +29,7 @@ Read this table first. Most confusion about letify is one of these words meaning
 
 ```
 Launcher (let)
-├── Config                  .letify from home and project, merged
+├── Config                  .letify/config.toml from home and project, merged
 ├── Providers               attribute access by alias
 │   └── Provider            one account on one infrastructure
 │       ├── Instance        accelerator shape
@@ -51,7 +51,7 @@ One directory per concern, so the file you need is the one named after the thing
 
 | Package | Owns |
 |---|---|
-| `config/` | Reading `.letify`, the schema, resolving credentials |
+| `config/` | Reading `.letify/config.toml`, the schema, login, resolving credentials |
 | `declare/` | `Launcher`'s surface, `Function`, `Instance`, `Env`, `Sweep` |
 | `protocol/` | Handles, the codec, framing, the remote worker, the one-shot driver |
 | `runtime/` | The channel, the session, the pool, the lease, bootstrap source |
@@ -61,12 +61,13 @@ One directory per concern, so the file you need is the one named after the thing
 | `launcher.py` | `Launcher` itself, which ties the rest together |
 | `errors.py` | The exception hierarchy, which everything imports |
 | `cli.py` | The command line |
+| `stubs.py` | Writing `typings/letify_providers.pyi` for editor completion |
 
 ## Launcher
 
 Owns the configuration, the provider cache and the runtime pool.
 
-It exists as an object rather than as module-level state because it holds the pool. It does not exist to hold per-instance configuration: everything that varies between calls, which is the device, the host placement, the lifetime, the environment and the account, varies per declaration.
+It exists as an object rather than as module-level state because it holds the pool. It does not exist to hold per-instance configuration: everything that varies between calls, which is the device, the host placement, the environment and the account, varies per declaration.
 
 `let.providers` is a view, not a dictionary of its own. Attribute access returns a `Provider` and builds it on first use, so a provider that has to connect does not connect at import time. Three names are reserved:
 
@@ -74,7 +75,7 @@ It exists as an object rather than as module-level state because it holds the po
 - `devices` returns the accelerators each provider offers, reporting a reason instead of raising for one that cannot be reached.
 - `active` returns the providers that currently hold a session, which is the quickest answer to what is costing money.
 
-There is no scope to open and nothing to tear down. `invocation()` is internal: one call brackets itself with it so a sweep, which is many calls, starts its sessions once.
+There is nothing to tear down. `keep_alive()` is the one scope, and it only keeps sessions. `invocation()` is internal: one call brackets itself with it so a sweep, which is many calls, starts its sessions once.
 
 ## Provider
 
@@ -108,7 +109,7 @@ It carries the provider so that `device=colab.G4` fixes provider, account and ac
 
 Core count and memory are reported, not requested. A provider that offers several sizes registers them as separate shapes, so there is nothing for a declaration to choose and no way to ask for a shape the provider does not have.
 
-`on_host()` returns a copy in the other mode. `Instance.key` is what the pool matches on. `AnyInstance` is the deferred form, produced by `let.providers.any.G4` and resolved by the launcher against declaration order.
+An instance carries no placement; `host=letify.local` or `letify.remote` on the declaration does. `Instance.key` is what the pool matches on. `AnyInstance` is the deferred form, produced by `let.providers.any.G4` and resolved by the launcher against declaration order.
 
 ## Channel
 
@@ -122,13 +123,13 @@ The worker cannot be sent as a script on standard input, because `python -` read
 
 ## Runtime, Lease and RuntimePool
 
-A `Runtime` is one live session. It knows its provider, its instance, its environment, its volumes, its channel and its declared lifetime.
+A `Runtime` is one live session. It knows its provider, its instance, its environment, its volumes, and its channel.
 
 Booting one opens the channel, arms the lease, installs the environment and attaches volumes. The lease is the part that protects the bill: the local process renews a deadline inside the session, and the session terminates itself if renewal stops for longer than the grace period. A crashed script therefore cannot leave a GPU billing, while a brief network drop does not kill a training run.
 
 `RuntimePool` keys sessions by instance and environment, which is the whole economic argument for the library. Starting a session per call would pay provider boot, environment installation and the first transfer every time, and all of it is billed as GPU time.
 
-The pool also enforces the release rule. A session with `lifetime="call"` ends when it is released; one with `lifetime="process"` survives. An internal hold brackets a single invocation so a sweep does not restart a session between its points. A reaper thread takes anything idle past the timeout.
+The pool also enforces the release rule. A session ends when it is released, unless a `keep_alive` block holds the pool; idle sessions end when the outermost block exits. An internal hold brackets a single invocation so a sweep does not restart a session between its points. A call whose devices cannot be allocated raises `InsufficientDevices` instead of waiting.
 
 ## Function
 
