@@ -74,11 +74,30 @@ class Instance:
     vram_gb: int | None = None
     spot: bool = False
 
+    #: How many of this accelerator one session takes. A run that trains across two cards
+    #: asks for two, which is a property of the shape rather than a separate argument, so it
+    #: travels with the value the declaration already carries.
+    devices: int = 1
+
     def on_host(self, host: Host | str | None) -> Instance:
         """Return a copy whose host code runs in the given place."""
         if host is None:
             return self
         return replace(self, host=Host(host))
+
+    def __mul__(self, count: int) -> Instance:
+        """Return a copy taking ``count`` devices, as in ``lab.A100 * 2``.
+
+        A value rather than a mutation, so the single card shape stays usable next to it.
+        """
+        if isinstance(count, bool) or not isinstance(count, int):
+            raise TypeError(f"a device count must be a whole number, not {type(count).__name__}")
+        if count < 1:
+            raise ValueError(f"a session takes at least one device, not {count}")
+        return replace(self, devices=count)
+
+    def __rmul__(self, count: int) -> Instance:
+        return self.__mul__(count)
 
     @property
     def accelerator(self) -> str:
@@ -97,12 +116,15 @@ class Instance:
                 self.provider.alias,
                 self.accelerator,
                 str(self.placement),
+                # A session holding two cards is not interchangeable with one holding one.
+                f"x{self.devices}",
                 "spot" if self.spot else "ondemand",
             ]
         )
 
     def __repr__(self) -> str:
-        return f"<Instance {self.provider.alias}:{self.accelerator} host={self.placement}>"
+        count = f"x{self.devices}" if self.devices > 1 else ""
+        return f"<Instance {self.provider.alias}:{self.accelerator}{count} host={self.placement}>"
 
 
 @dataclass(frozen=True, slots=True)

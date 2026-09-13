@@ -29,7 +29,7 @@ from collections.abc import AsyncIterator, Callable, Iterator, Sequence
 from functools import update_wrapper
 from typing import TYPE_CHECKING, Any, Generic, TypeVar
 
-from ..errors import ProtocolError, RuntimeFailure, RuntimeLost
+from ..errors import LetifyError, ProtocolError, RuntimeFailure, RuntimeLost
 from .instance import AnyInstance, Host, Instance, Lifetime
 from .sweep import Sweep
 
@@ -53,7 +53,6 @@ class Function(Generic[R]):
         env: Env,
         host: Host | str | None = None,
         volumes: Sequence[Volume] = (),
-        concurrency: int = 1,
         timeout: float | None = 3600,
         retries: int = 1,
         lifetime: Lifetime | str | None = None,
@@ -64,7 +63,6 @@ class Function(Generic[R]):
         self.env = env
         self.host = _where(host)
         self.volumes = tuple(volumes)
-        self.concurrency = max(1, concurrency)
         self.timeout = timeout
         self.retries = retries
         self.lifetime = _how_long(lifetime)
@@ -99,6 +97,25 @@ class Function(Generic[R]):
             if space is None:
                 return self._run(args, kwargs)
             return [self._run(a, k) for a, k in _expand(args, kwargs, space)]
+
+    def session(self) -> Any:
+        """The live session this declaration uses, started if it is not up yet.
+
+        Internal to the declaration surface: a user never holds a session, and a volume
+        takes the declaration rather than this. It exists because a volume moving a
+        checkpoint has to move it through the session the calls actually run in, and only
+        the declaration knows which that is. Handing the caller a session instead made it
+        possible to name a different one, and a checkpoint written into a session nothing
+        runs in is the kind of defect that passes on one machine and fails on a rented one.
+        """
+        launcher = self.launcher
+        launcher._register_at_exit()
+        runtime = launcher.pool.acquire(
+            launcher.resolve(self.device), self.env, self.volumes, lifetime=self.lifetime
+        )
+        # Handed straight back, because the point is for the next call to find it warm.
+        launcher.pool.release(runtime)
+        return runtime
 
     def local(self, *args: Any, **kwargs: Any) -> R:
         """Run the body in this process, ignoring the declaration.
@@ -195,7 +212,7 @@ class AsyncCall:
 
     def _tasks(self) -> list[asyncio.Task]:
         function = self._function
-        semaphore = asyncio.Semaphore(function.concurrency)
+        semaphore = asyncio.Semaphore(_width(function))
 
         async def one(args: tuple, kwargs: dict) -> Any:
             async with semaphore:
@@ -205,6 +222,24 @@ class AsyncCall:
             asyncio.create_task(one(a, k))
             for a, k in _expand(self._args, self._kwargs, self._space)
         ]
+
+
+def _width(function: Function) -> int:
+    """How many points of a space may be in flight at once.
+
+    The provider's inventory and nothing else. A declaration taking two cards halves the
+    width on a four card machine, which is arithmetic rather than policy, and is also why a
+    number on the declaration could not express it.
+
+    At least one, always. A provider whose inventory cannot be read yet is not a reason to
+    run nothing: the pool is what waits when a card is not there.
+    """
+    instance = function.launcher.resolve(function.device)
+    try:
+        capacity = instance.provider.capacity(instance.accelerator)
+    except LetifyError:
+        return 1
+    return max(1, capacity // max(1, instance.devices))
 
 
 def _where(host: Host | str | None) -> Host:

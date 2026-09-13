@@ -46,25 +46,24 @@ REAP_INTERVAL = 30.0
 class RuntimePool:
     """Keeps track of live runtimes and enforces the release rule.
 
-    ``max_runtimes`` is a ceiling for the whole process. It defaults to 3 and is a
-    guess: the number of sessions one Colab account may hold at once is not
-    documented and moves with tier, credit balance and current demand.
+    How many sessions may exist is the provider's inventory and nothing else. Starting one
+    reserves the devices its instance asks for, and a call that cannot reserve them waits
+    for a session to release some. There is no ceiling here: a number would be a guess about
+    hardware the provider entry already describes, and when the two disagreed the smaller
+    would win silently.
     """
 
     def __init__(
         self,
         *,
-        max_runtimes: int = 3,
         idle_timeout: float = DEFAULT_IDLE_TIMEOUT,
         on_start: object | None = None,
     ):
-        self.max_runtimes = max_runtimes
         self.idle_timeout = idle_timeout
         self.on_start = on_start
         self._runtimes: dict[str, list[Runtime]] = {}
         self._guard = threading.RLock()
         self._free = threading.Condition(self._guard)
-        self._count = 0
         self._hold_depth = 0
         self._reaper: threading.Thread | None = None
         self._stop_reaper = threading.Event()
@@ -118,21 +117,21 @@ class RuntimePool:
                             runtime.lifetime = lifetime
                         runtime.last_used = time.monotonic()
                         return runtime
-                may_start = self._count < self.max_runtimes
-                if may_start:
-                    self._count += 1
 
-            if may_start:
+            # No free session, so this needs cards. Taking them outside the pool guard,
+            # because the provider may have to ask the machine who else is on them.
+            held = instance.provider.reserve(instance)
+            if held is not None:
                 try:
-                    return self._start(instance, env, volumes, key, lifetime=lifetime)
+                    return self._start(instance, env, volumes, key, lifetime=lifetime, held=held)
                 except BaseException:
-                    with self._guard:
-                        self._count -= 1
+                    instance.provider.unreserve(instance.accelerator, held, instance.devices)
+                    with self._free:
                         self._free.notify_all()
                     raise
 
-            # Every slot is taken. Wait for one to come free rather than asking the
-            # provider for a session it would refuse.
+            # Every card this instance could use is taken. Wait for a session to give some
+            # back rather than asking the provider for a machine it would refuse.
             with self._free:
                 self._free.wait(timeout=REAP_INTERVAL)
 
@@ -149,12 +148,16 @@ class RuntimePool:
         self.discard(runtime)
 
     def discard(self, runtime: Runtime) -> None:
-        """Shut a runtime down and free its slot, whatever state it was in."""
+        """Shut a runtime down and give its devices back, whatever state it was in."""
         with self._guard:
             bucket = self._runtimes.get(runtime.key, [])
-            if runtime in bucket:
+            present = runtime in bucket
+            if present:
                 bucket.remove(runtime)
-                self._count -= 1
+        if present:
+            runtime.provider.unreserve(
+                runtime.instance.accelerator, runtime.held_devices, runtime.instance.devices
+            )
         try:
             runtime.shutdown()
         except LetifyError:
@@ -168,13 +171,16 @@ class RuntimePool:
         env: Env,
         volumes: Sequence[Volume],
         key: str,
+        held: tuple[int, ...] = (),
         *,
         lifetime: Lifetime = Lifetime.call,
     ) -> Runtime:
         name = f"letify-{instance.accelerator.lower()}-{uuid.uuid4().hex[:6]}"
         if callable(self.on_start):
             self.on_start(instance, name)
-        runtime = instance.provider.start(instance, env, name=name, volumes=tuple(volumes))
+        runtime = instance.provider.start(
+            instance, env, name=name, volumes=tuple(volumes), held=held
+        )
         runtime.busy = True
         runtime.lifetime = lifetime
         with self._guard:

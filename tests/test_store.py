@@ -40,6 +40,14 @@ def tree(tmp_path: Path) -> Path:
 
 
 @pytest.fixture
+def volume(let: letify.Launcher, tmp_path: Path) -> Volume:
+    """A volume on the local provider, with the store and the mount in a temp directory."""
+    return let.providers.local.volume(
+        "cache", root=str(tmp_path / "store"), mount=str(tmp_path / "mount")
+    )
+
+
+@pytest.fixture
 def remote_cpu(let: letify.Launcher) -> letify.Instance:
     return let.providers.local.CPU.on_host("remote")
 
@@ -374,24 +382,28 @@ def test_fetching_a_checkpoint_that_was_never_written_returns_nothing(let, tmp_p
 # -- Spec: Materializing into a runtime ----------------------------------------
 
 
-def test_a_volume_writes_into_a_runtime_through_its_channel(let, remote_cpu, tmp_path) -> None:
+def test_a_volume_writes_into_a_runtime_through_its_channel(
+    let, remote_cpu, tmp_path, live
+) -> None:
     # Not by asking the runtime to reach the bucket, so this works with every backend and
     # needs no credentials on the far side.
     volume = let.providers.local.volume(
         "cache", root=str(tmp_path / "store"), mount=str(tmp_path / "mount")
     )
     info = volume.store.put_bytes(b"model weights")
-    remote = volume.materialize(let.runtime(remote_cpu), info.digest)
+    remote = volume.materialize(live(let, remote_cpu), info.digest)
     assert Path(remote.path).read_bytes() == b"model weights"
     assert remote.size == len(b"model weights")
     let.pool.shutdown()
 
 
-def test_materializing_a_name_follows_it_to_the_current_blob(let, remote_cpu, tmp_path) -> None:
+def test_materializing_a_name_follows_it_to_the_current_blob(
+    let, remote_cpu, tmp_path, live
+) -> None:
     volume = let.providers.local.volume(
         "cache", root=str(tmp_path / "store"), mount=str(tmp_path / "mount")
     )
-    runtime = let.runtime(remote_cpu)
+    runtime = live(let, remote_cpu)
     assert volume.materialize_ref(runtime, "ckpt/absent") is None
 
     info = volume.store.put_bytes(b"epoch 2")
@@ -402,14 +414,14 @@ def test_materializing_a_name_follows_it_to_the_current_blob(let, remote_cpu, tm
 
 
 def test_resume_puts_the_newest_checkpoint_where_the_function_will_look(
-    let, remote_cpu, tmp_path
+    let, remote_cpu, tmp_path, live
 ) -> None:
     # This is what makes a preempted session cheap to restart: the body asks for its own
     # checkpoint and finds it already on disk.
     volume = let.providers.local.volume(
         "cache", root=str(tmp_path / "store"), mount=str(tmp_path / "mount")
     )
-    runtime = let.runtime(remote_cpu)
+    runtime = live(let, remote_cpu)
     target = str(tmp_path / "inside" / "epoch.pt")
     assert volume.resume(runtime, "run-1", target) is None
 
@@ -422,10 +434,10 @@ def test_resume_puts_the_newest_checkpoint_where_the_function_will_look(
 
 
 def test_a_checkpoint_written_inside_a_runtime_is_pulled_back_under_a_name(
-    let, remote_cpu, tmp_path
+    let, remote_cpu, tmp_path, live
 ) -> None:
     volume = let.providers.local.volume("cache", root=str(tmp_path / "store"))
-    runtime = let.runtime(remote_cpu)
+    runtime = live(let, remote_cpu)
     inside = tmp_path / "inside.pt"
     runtime.put_bytes(b"trained", str(inside))
 
@@ -436,12 +448,12 @@ def test_a_checkpoint_written_inside_a_runtime_is_pulled_back_under_a_name(
 
 
 def test_an_environment_installed_inside_a_runtime_is_cached_for_the_next_session(
-    let, remote_cpu, tmp_path
+    let, remote_cpu, tmp_path, live
 ) -> None:
     # This is how the first session pays the installation cost and every later one skips
     # it.
     volume = let.providers.local.volume("cache", root=str(tmp_path / "store"))
-    runtime = let.runtime(remote_cpu)
+    runtime = live(let, remote_cpu)
     installed = tmp_path / "site"
     installed.mkdir()
     (installed / "marker.txt").write_text("installed", encoding="utf-8")
@@ -449,4 +461,78 @@ def test_an_environment_installed_inside_a_runtime_is_cached_for_the_next_sessio
     env = letify.Env(lock=str(tmp_path / "absent.lock"))
     digest = volume.cache_env_from(runtime, env, str(installed))
     assert volume.cached_env(env) == digest
+    let.pool.shutdown()
+
+
+# -- Spec: Materializing into a runtime, the declaration names the session ------
+
+
+def test_a_checkpoint_is_taken_from_the_session_the_declaration_used(
+    let, remote_cpu, volume, tmp_path
+) -> None:
+    # The caller names the declaration. Which session ran the call is letify's answer, and
+    # it is the only one holding the file.
+    @let.function(device=remote_cpu, lifetime="process", volumes=[volume])
+    def write_a_file(path: str) -> str:
+        from pathlib import Path as P
+
+        P(path).parent.mkdir(parents=True, exist_ok=True)
+        P(path).write_bytes(b"weights")
+        return path
+
+    written = write_a_file(path=str(tmp_path / "out" / "adapter.pt"))
+    digest = volume.absorb(write_a_file, written, "run-1")
+    assert volume.latest_checkpoint("run-1") == digest
+    assert volume.store.get_bytes(digest) == b"weights"
+    let.pool.shutdown()
+
+
+def test_a_checkpoint_is_put_back_into_the_session_the_declaration_will_use(
+    let, remote_cpu, volume, tmp_path
+) -> None:
+    # Before the call rather than after, because the training function looks for it as an
+    # ordinary path. The session it lands in has to be the one the call is handed.
+    source = tmp_path / "seed.pt"
+    source.write_bytes(b"seed")
+    volume.put_checkpoint("run-2", source)
+    target = str(tmp_path / "inside" / "resume.pt")
+
+    @let.function(device=remote_cpu, lifetime="process", volumes=[volume])
+    def read_it_back(path: str) -> bytes:
+        from pathlib import Path as P
+
+        return P(path).read_bytes()
+
+    assert volume.resume(read_it_back, "run-2", target) is not None
+    assert read_it_back(path=target) == b"seed"
+    let.pool.shutdown()
+
+
+def test_resuming_a_name_nothing_was_stored_under_reports_nothing(
+    let, remote_cpu, volume, tmp_path
+) -> None:
+    # Nothing to put back is an answer rather than a failure: a first run has no checkpoint.
+    @let.function(device=remote_cpu, lifetime="process", volumes=[volume])
+    def anything() -> int:
+        return 1
+
+    assert volume.resume(anything, "never-written", str(tmp_path / "x.pt")) is None
+    let.pool.shutdown()
+
+
+def test_a_declaration_asked_twice_is_given_one_session(let, remote_cpu, volume, tmp_path) -> None:
+    # Otherwise moving a checkpoint in and then out would cross two sessions, and the second
+    # would not hold the file the first wrote.
+    @let.function(device=remote_cpu, lifetime="process", volumes=[volume])
+    def note(path: str) -> str:
+        from pathlib import Path as P
+
+        P(path).parent.mkdir(parents=True, exist_ok=True)
+        P(path).write_bytes(b"once")
+        return path
+
+    written = note(path=str(tmp_path / "twice" / "a.pt"))
+    volume.absorb(note, written, "run-3")
+    volume.absorb(note, written, "run-3")
+    assert let.status()["live"] == 1
     let.pool.shutdown()

@@ -154,7 +154,7 @@ def test_the_pool_key_names_provider_accelerator_placement_and_purchase(
     # so anything that makes two instances non-interchangeable belongs in it.
     provider = let.providers.local
     on_demand = Instance(provider, gpu="H100").on_host("remote")
-    assert on_demand.key == "local:H100:remote:ondemand"
+    assert on_demand.key == "local:H100:remote:x1:ondemand"
     assert Instance(provider, gpu="H100", spot=True).on_host("remote").key.endswith(":spot")
     assert on_demand.key != Instance(provider, gpu="H100").on_host("local").key
 
@@ -324,16 +324,6 @@ def test_an_async_declaration_is_recognized_at_the_def_site(
     assert compute.is_async is False
 
 
-def test_concurrency_belongs_to_the_declaration(let: letify.Launcher, cpu: letify.Instance) -> None:
-    # It describes the infrastructure the declaration may occupy, so it is not a call
-    # argument, and it cannot be less than one runtime.
-    @let.function(device=cpu, host="remote", concurrency=0)
-    def noop() -> None:
-        return None
-
-    assert noop.concurrency == 1
-
-
 def test_a_declaration_is_registered_with_the_launcher_that_made_it(
     let: letify.Launcher, cpu: letify.Instance
 ) -> None:
@@ -343,3 +333,37 @@ def test_a_declaration_is_registered_with_the_launcher_that_made_it(
 
     assert noop in let.functions
     assert noop.device.placement is Host.remote
+
+
+# -- Spec: Inventory, a device count on the instance ----------------------------
+
+
+def test_one_device_is_the_default_and_multiplication_asks_for_more(let) -> None:
+    # Two cards in one session is a property of the shape being asked for, not a separate
+    # argument, so it travels with the value the declaration already carries.
+    one = let.providers.local.CPU
+    assert one.devices == 1
+    assert (one * 2).devices == 2
+    assert (3 * one).devices == 3
+    # A value, so the original is untouched and can be reused.
+    assert one.devices == 1
+
+
+def test_the_device_count_is_part_of_the_pool_key(let) -> None:
+    # A session holding two cards is not interchangeable with one holding one.
+    one = let.providers.local.CPU
+    assert one.key != (one * 2).key
+    assert (one * 2).key == (one * 2).key
+
+
+def test_asking_for_no_devices_or_a_fraction_is_refused(let) -> None:
+    one = let.providers.local.CPU
+    for bad in (0, -1):
+        with pytest.raises(ValueError, match="at least one device"):
+            one * bad
+    with pytest.raises(TypeError):
+        one * 1.5
+
+
+def test_a_multi_device_instance_says_so_when_printed(let) -> None:
+    assert "x2" in repr(let.providers.local.CPU * 2)

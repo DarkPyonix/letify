@@ -7,7 +7,7 @@
 **Say what your function needs. Run it on the GPU you can afford.**
 
 [![Python](https://img.shields.io/badge/python-3.11%2B-3776AB?logo=python&logoColor=white)](https://www.python.org/)
-[![License](https://img.shields.io/badge/license-MIT-black)](LICENSE)
+[![License](https://img.shields.io/badge/license-Apache%202.0-black)](LICENSE)
 [![Providers](https://img.shields.io/badge/providers-Colab%20%7C%20Modal%20%7C%20SSH%20%7C%20Local-6C5CE7)](#-providers)
 [![letify-core](https://img.shields.io/badge/letify--core-rust-DEA584?logo=rust&logoColor=white)](letify-core/)
 
@@ -21,7 +21,7 @@
 import letify
 
 let = letify.Launcher()
-colab = let.providers.colab_a
+colab = let.providers.colab_pro_plus
 
 @let.function(device=colab.G4, host="remote", concurrency=3)
 def train(lr, bs):
@@ -106,7 +106,7 @@ One optional piece is native. `host="local"` needs [letify-core](letify-core/), 
 Put accounts in `~/.letify`, so they belong to your machine and never to the repository.
 
 ```toml
-[colab_a]
+[colab_pro_plus]
 kind = "colab"
 account = "you@example.com"
 
@@ -124,15 +124,15 @@ persistent = true
 
 ```bash
 $ letify providers
-colab_a   colab   ephemeral   channel=persistent
-lab_a100  shell   persistent  channel=persistent
-local     local   persistent  channel=persistent
+colab_pro_plus  colab   ephemeral   channel=persistent
+lab_a100        shell   persistent  channel=persistent
+local           local   persistent  channel=persistent
 
 $ letify devices
 {
-  "colab_a":  ["A100", "G4", "H100", "L4", "T4", "v5e1", "v6e1"],
-  "lab_a100": ["A100"],
-  "local":    ["CPU", "GeForce_RTX_4050"]
+  "colab_pro_plus": ["A100", "G4", "H100", "L4", "T4", "v5e1", "v6e1"],
+  "lab_a100":       ["A100"],
+  "local":          ["CPU", "GeForce_RTX_4050"]
 }
 ```
 
@@ -143,7 +143,7 @@ import letify
 
 let = letify.Launcher()
 env = letify.Env()                      # reads uv.lock
-colab = let.providers.colab_a
+colab = let.providers.colab_pro_plus
 cache = colab.volume("hf-cache")        # survives the session
 
 @let.function(device=colab.G4, host="remote", env=env, volumes=[cache], concurrency=3)
@@ -226,8 +226,8 @@ Provider
 **Multiple accounts are first class.** Each configuration entry is one account, and entries of the same kind coexist. Two Colab accounts means twice the concurrent sessions.
 
 ```python
-a = let.providers.colab_a
-b = let.providers.colab_b
+a = let.providers.colab_pro_plus
+b = let.providers.colab_pro
 
 @let.function(device=a.G4, host="remote")
 def train(lr): ...
@@ -418,6 +418,6 @@ Spec driven and test driven: settle [docs/SPEC.md](docs/SPEC.md), write the fail
 
 <div align="center">
 
-**MIT licensed.** Built for people who pay for their own GPUs. 🔬
+**Apache 2.0 licensed.** Built for people who pay for their own GPUs. 🔬
 
 </div>

@@ -139,16 +139,81 @@ def read_smi() -> str:
     return result.stdout if result.returncode == 0 else ""
 
 
+#: What nvidia-smi is asked for when the question is who else is on the card. A compute
+#: process is the only honest answer: memory can be held by a display server, and a card at
+#: zero percent may still be mid step.
+APPS_COMMAND = (
+    "nvidia-smi",
+    "--query-compute-apps=gpu_uuid,pid",
+    "--format=csv,noheader,nounits",
+)
+
+UUID_COMMAND = ("nvidia-smi", "--query-gpu=index,uuid", "--format=csv,noheader,nounits")
+
+
+def busy_indices(exclude_pids: set[int] | None = None) -> tuple[int, ...]:
+    """Device indices another process is currently computing on.
+
+    Registered is permission, not availability: a card a colleague is training on is not
+    something to fight over. Compute processes are read rather than utilization, because a
+    card between steps reads as idle and is not.
+
+    ``exclude_pids`` leaves out processes letify itself started, so a session asking for a
+    second card does not see its own as taken.
+    """
+    mine = exclude_pids or set()
+    uuids = _uuid_to_index()
+    if not uuids:
+        return ()
+    taken: set[int] = set()
+    for line in _run(APPS_COMMAND).splitlines():
+        fields = [part.strip() for part in line.split(",")]
+        if len(fields) < 2 or fields[0] not in uuids:
+            continue
+        try:
+            pid = int(fields[1])
+        except ValueError:
+            continue
+        if pid not in mine:
+            taken.add(uuids[fields[0]])
+    return tuple(sorted(taken))
+
+
+def _uuid_to_index() -> dict[str, int]:
+    """Map each card's uuid to its index, because compute apps are reported by uuid."""
+    table: dict[str, int] = {}
+    for line in _run(UUID_COMMAND).splitlines():
+        fields = [part.strip() for part in line.split(",")]
+        if len(fields) < 2 or not fields[0].isdigit():
+            continue
+        table[fields[1]] = int(fields[0])
+    return table
+
+
+def _run(command: tuple[str, ...]) -> str:
+    """Run one nvidia-smi query, answering with nothing when there is nothing to ask."""
+    if not shutil.which(command[0]):
+        return ""
+    try:
+        result = subprocess.run(list(command), capture_output=True, text=True, timeout=SMI_TIMEOUT)
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    return result.stdout if result.returncode == 0 else ""
+
+
 def local_load() -> list[DeviceLoad]:
     """What the accelerators in this machine are doing right now."""
     return parse_smi(read_smi())
 
 
 __all__ = [
+    "APPS_COMMAND",
     "SMI_COMMAND",
     "SMI_FIELDS",
     "SMI_TIMEOUT",
+    "UUID_COMMAND",
     "DeviceLoad",
+    "busy_indices",
     "local_load",
     "parse_smi",
     "read_smi",

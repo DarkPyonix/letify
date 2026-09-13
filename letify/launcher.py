@@ -135,7 +135,6 @@ class Launcher:
         config: str | Path | None = None,
         *,
         name: str | None = None,
-        max_runtimes: int = 3,
         idle_timeout: float = DEFAULT_IDLE_TIMEOUT,
         stream_logs: bool = True,
         announce: bool = True,
@@ -143,14 +142,12 @@ class Launcher:
     ):
         self.config: Config = load(config, home=home)
         self.name = name or self.config.defaults.get("name") or _project_name()
-        self.max_runtimes = int(self.config.defaults.get("max_runtimes", max_runtimes))
         self.idle_timeout = float(self.config.defaults.get("idle_timeout", idle_timeout))
         self.stream_logs = stream_logs
         self.announce = announce
         self.providers = Providers(self)
         self.functions: list[Function] = []
         self.pool = RuntimePool(
-            max_runtimes=self.max_runtimes,
             idle_timeout=self.idle_timeout,
             on_start=self._announce_start,
         )
@@ -205,7 +202,6 @@ class Launcher:
         host: Host | str | None = None,
         lifetime: Lifetime | str | None = None,
         volumes: Sequence[Volume] = (),
-        concurrency: int = 1,
         timeout: float | None = 3600,
         retries: int = 1,
         keep_remote: bool = False,
@@ -216,11 +212,13 @@ class Launcher:
         count and memory come with it rather than being asked for. ``host`` says where the
         host code runs: ``"local"``, the default, keeps Python here and forwards only CUDA
         calls, and ``"remote"`` ships this function to the machine with the GPU.
-        ``concurrency`` is how many runtimes this declaration may use at once.
 
         ``lifetime`` says how long the session lives. ``"call"``, the default, ends it
         with the call. ``"process"`` keeps it so the next call skips session start, at the
         cost of an unused session billing until the idle reaper takes it.
+
+        There is no width argument. A space runs as wide as the provider has devices for,
+        which the provider entry already says.
 
         ``keep_remote`` returns a handle instead of the value, so a model stays in the
         runtime and later calls refer to it without copying it back.
@@ -235,7 +233,6 @@ class Launcher:
                 host=host,
                 lifetime=lifetime,
                 volumes=volumes,
-                concurrency=concurrency,
                 timeout=timeout,
                 retries=retries,
                 keep_remote=keep_remote,
@@ -265,30 +262,6 @@ class Launcher:
             yield self
         finally:
             self.pool.unhold()
-
-    def runtime(
-        self,
-        instance: Instance | AnyInstance,
-        env: Env | None = None,
-        *,
-        volumes: Sequence[Volume] = (),
-    ) -> Any:
-        """Start one runtime now instead of on the first call.
-
-        Useful when a session takes a while to come up and there is local work to do
-        meanwhile, such as preparing data. It lives for the process, so the idle reaper or
-        process exit is what ends it.
-
-        The session is handed straight back, because the point is for the next call to
-        find it warm. Holding it would make the pool skip it and start a second one,
-        which is the opposite of what starting early is for.
-        """
-        self._register_at_exit()
-        runtime = self.pool.acquire(
-            self.resolve(instance), env or Env(), volumes, lifetime=Lifetime.process
-        )
-        self.pool.release(runtime)
-        return runtime
 
     def reap_idle(self) -> list[str]:
         """Shut down runtimes idle past the timeout, without waiting for the reaper."""
@@ -371,10 +344,10 @@ class Launcher:
     def status(self) -> dict[str, Any]:
         """What is running right now, and what it is costing.
 
-        Counts first, so a reader can see whether the ceiling is why a call is waiting.
+        Counts first, so a reader can see whether a call is waiting for a card.
         The pool's own bookkeeping is not here: whether the invocation guard is open is a
         fact about the pool rather than about what is running, and a boolean next to
-        ``max_runtimes`` gets read as a count.
+        counts gets read as a count.
 
         This process only, because the pool lives in the process that owns it. What a
         machine itself is doing is what ``letify utilization`` answers.
@@ -384,12 +357,13 @@ class Launcher:
             "name": self.name,
             "live": len(live),
             "busy": sum(1 for runtime in live if runtime.busy),
-            "max_runtimes": self.max_runtimes,
+            "devices": self._device_report(),
             "runtimes": [
                 {
                     "name": runtime.name,
                     "provider": runtime.provider.alias,
                     "accelerator": runtime.instance.accelerator,
+                    "devices": list(runtime.held_devices) or runtime.instance.devices,
                     "placement": str(runtime.instance.placement),
                     "busy": runtime.busy,
                     "lifetime": str(runtime.lifetime),
@@ -401,6 +375,31 @@ class Launcher:
             "declared": [f.__name__ for f in self.functions],
             "config_sources": [str(p) for p in self.config.sources],
         }
+
+    def _device_report(self) -> dict[str, Any]:
+        """Each provider's inventory against what is reserved.
+
+        So a reader can see whether a call is waiting for a card, which is the only thing
+        it can be waiting for now that no number stands between the two.
+        """
+        report: dict[str, Any] = {}
+        for alias in self.config.order:
+            try:
+                provider = self.provider(alias)
+                inventory = provider.inventory
+            except LetifyError:
+                # An account this machine cannot build has no inventory to report, and one
+                # missing row is better than no report at all.
+                continue
+            report[alias] = {
+                name: {
+                    "count": entry.count,
+                    "reserved": provider.reserved_count(name),
+                    "indices": list(entry.indices),
+                }
+                for name, entry in inventory.items()
+            }
+        return report
 
     # -- internals -----------------------------------------------------------
 
@@ -440,10 +439,8 @@ def _project_name() -> str:
     """
     path = Path.cwd() / "pyproject.toml"
     if path.is_file():
-        try:
-            import tomllib
-        except ModuleNotFoundError:  # pragma: no cover
-            import tomli as tomllib  # type: ignore[no-redef]
+        import tomllib
+
         try:
             data = tomllib.loads(path.read_text(encoding="utf-8"))
         except Exception:

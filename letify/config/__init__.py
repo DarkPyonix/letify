@@ -11,18 +11,14 @@ variable or a keyring entry, and the value is resolved when it is used.
 
 from __future__ import annotations
 
+import tomllib
 from pathlib import Path
 from typing import Any
 
 from ..errors import ConfigError
-from . import login, writer
+from . import inventory, login, writer
 from .schema import RESERVED_ALIASES, Config, ProviderConfig
 from .secrets import from_keyring, resolve_secret
-
-try:
-    import tomllib
-except ModuleNotFoundError:  # Python 3.10 and older
-    import tomli as tomllib  # type: ignore[no-redef]
 
 CONFIG_NAME = ".letify"
 
@@ -125,6 +121,7 @@ __all__ = [
     "Config",
     "ProviderConfig",
     "from_keyring",
+    "inventory",
     "load",
     "login",
     "resolve_secret",

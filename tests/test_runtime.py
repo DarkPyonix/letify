@@ -236,8 +236,8 @@ def test_a_one_shot_channel_carries_a_call_all_the_way_through() -> None:
 # -- Spec: Sessions ------------------------------------------------------------
 
 
-def test_a_runtime_opens_its_channel_and_reports_itself_ready(let, remote_cpu) -> None:
-    runtime = let.runtime(remote_cpu)
+def test_a_runtime_opens_its_channel_and_reports_itself_ready(let, remote_cpu, live) -> None:
+    runtime = live(let, remote_cpu)
     assert runtime.ready is True
     assert runtime.persistent_channel is True
     assert runtime.idle_for < 60
@@ -246,15 +246,15 @@ def test_a_runtime_opens_its_channel_and_reports_itself_ready(let, remote_cpu) -
     assert runtime.ready is False
 
 
-def test_the_pool_key_is_the_instance_key_and_the_environment_key(let, remote_cpu) -> None:
+def test_the_pool_key_is_the_instance_key_and_the_environment_key(let, remote_cpu, live) -> None:
     env = Env()
-    runtime = let.runtime(remote_cpu, env)
+    runtime = live(let, remote_cpu, env)
     assert runtime.key == f"{remote_cpu.key}|{env.key}"
     let.pool.shutdown()
 
 
-def test_a_request_on_a_runtime_whose_channel_is_shut_says_so(let, remote_cpu) -> None:
-    runtime = let.runtime(remote_cpu)
+def test_a_request_on_a_runtime_whose_channel_is_shut_says_so(let, remote_cpu, live) -> None:
+    runtime = live(let, remote_cpu)
     runtime.shutdown()
     with pytest.raises(RuntimeFailure, match="the channel is not open"):
         runtime.stat()
@@ -268,12 +268,12 @@ def test_installation_is_skipped_where_the_machine_already_runs_in_the_environme
     assert let.providers.local.prepares_env is False
 
 
-def test_a_directory_inside_a_runtime_can_be_packed_in_one_payload(let, remote_cpu, tmp_path):
+def test_a_directory_inside_a_runtime_can_be_packed_in_one_payload(let, remote_cpu, tmp_path, live):
     # One archive rather than one transfer per file is where the speedup is.
     source = tmp_path / "checkpoint"
     source.mkdir()
     (source / "weights.bin").write_bytes(b"x" * 64)
-    runtime = let.runtime(remote_cpu)
+    runtime = live(let, remote_cpu)
     payload, digest = runtime.pack_dir(str(source))
     assert payload.startswith(b"\x1f\x8b")
     assert digest
@@ -351,10 +351,10 @@ def test_a_volume_with_no_cached_archive_is_passed_over(tmp_path: Path) -> None:
         runtime.shutdown()
 
 
-def test_a_local_file_can_be_written_into_a_runtime(let, remote_cpu, tmp_path) -> None:
+def test_a_local_file_can_be_written_into_a_runtime(let, remote_cpu, tmp_path, live) -> None:
     source = tmp_path / "weights.bin"
     source.write_bytes(b"y" * 32)
-    runtime = let.runtime(remote_cpu)
+    runtime = live(let, remote_cpu)
     remote = runtime.put_file(source, str(tmp_path / "inside" / "weights.bin"))
     assert Path(remote.path).read_bytes() == b"y" * 32
     let.pool.shutdown()
@@ -414,8 +414,8 @@ def test_the_lease_renews_well_inside_the_grace_period() -> None:
     assert GRACE > INTERVAL * 2
 
 
-def test_arming_a_lease_sets_a_deadline_inside_the_session(let, remote_cpu) -> None:
-    runtime = let.runtime(remote_cpu)
+def test_arming_a_lease_sets_a_deadline_inside_the_session(let, remote_cpu, live) -> None:
+    runtime = live(let, remote_cpu)
     # Nothing is armed until the lease asks for it.
     with pytest.raises(letify.RemoteError):
         runtime.exec("assert _LEASE['armed']")
@@ -465,17 +465,19 @@ def test_a_lease_stops_renewing_once_the_session_is_gone(renewal_recorder) -> No
 # -- Spec: Pooling -------------------------------------------------------------
 
 
-def test_the_default_ceiling_is_three_runtimes() -> None:
-    # A placeholder: the concurrent session limit of a Colab account is undocumented.
-    assert RuntimePool().max_runtimes == 3
+def test_the_pool_has_no_ceiling_of_its_own() -> None:
+    # A number here would be a guess about hardware the provider entry already describes,
+    # and when the two disagreed the smaller would win silently.
+    assert not hasattr(RuntimePool(), "max_runtimes")
     assert DEFAULT_IDLE_TIMEOUT == 600.0
 
 
-def test_a_call_that_finds_every_slot_taken_waits_for_one_to_come_free(
-    let, remote_cpu, tmp_path
+def test_a_call_that_finds_every_card_taken_waits_for_one_to_come_free(
+    one_card_cpu, tmp_path
 ) -> None:
-    # Asking the provider for a session it would refuse is worse than waiting.
-    pool = RuntimePool(max_runtimes=1)
+    # Asking the provider for a machine it would refuse is worse than waiting.
+    remote_cpu = one_card_cpu
+    pool = RuntimePool()
     first_lock = tmp_path / "a.lock"
     first_lock.write_text("a", encoding="utf-8")
     second_lock = tmp_path / "b.lock"
@@ -500,16 +502,16 @@ def test_a_call_that_finds_every_slot_taken_waits_for_one_to_come_free(
         pool.shutdown()
 
 
-def test_a_session_that_fails_to_start_gives_its_slot_back(launcher_from, tmp_path) -> None:
+def test_a_session_that_fails_to_start_gives_its_slot_back(launcher_from, tmp_path, live) -> None:
     # Otherwise one failed start would permanently shrink the ceiling.
     let = launcher_from('[broken]\nkind = "local"\npython = "letify-no-such-python"\n')
     broken = let.providers.broken.CPU.on_host("remote")
     with pytest.raises(RuntimeFailure):
-        let.runtime(broken)
+        live(let, broken)
     assert let.pool.live == []
     # The slot is free again, so a working session still starts.
     working = let.providers.local.CPU.on_host("remote")
-    assert let.runtime(working).ready is True
+    assert live(let, working).ready is True
     let.pool.shutdown()
 
 
@@ -555,8 +557,8 @@ def test_a_runtime_idle_past_the_timeout_is_reaped(let, remote_cpu) -> None:
     assert let.pool.live == []
 
 
-def test_a_session_started_early_is_the_one_the_first_call_uses(let, remote_cpu) -> None:
-    started = let.runtime(remote_cpu)
+def test_a_session_started_early_is_the_one_the_first_call_uses(let, remote_cpu, live) -> None:
+    started = live(let, remote_cpu)
 
     @let.function(device=remote_cpu, host="remote", lifetime="process")
     def noop() -> None:
@@ -706,3 +708,75 @@ def test_the_reading_is_asked_for_in_one_pass_over_the_devices(patch_run, patch_
     assert len(telemetry.local_load()) == 1
     assert len(recorder.commands) == 1
     assert recorder.commands[0][0] == "nvidia-smi"
+
+
+# -- Spec: Pooling, capacity is the inventory ----------------------------------
+
+
+def test_the_launcher_has_no_session_ceiling(let) -> None:
+    # A number there would be a guess about hardware the provider entry already describes,
+    # and when the two disagreed the smaller would win silently.
+    assert not hasattr(let, "max_runtimes")
+    assert "max_runtimes" not in let.status()
+    with pytest.raises(TypeError):
+        letify.Launcher(max_runtimes=3)
+
+
+def test_a_session_reserves_the_devices_its_instance_asks_for(reserving) -> None:
+    provider = reserving(A100={"indices": "0-3"})
+    first = provider.reserve(provider.A100)
+    second = provider.reserve(provider.A100 * 2)
+    assert first == (0,)
+    assert second == (1, 2)
+    assert provider.free("A100") == (3,)
+
+
+def test_a_reservation_that_cannot_be_met_is_refused_rather_than_halved(reserving) -> None:
+    # Half the cards a run asked for is not a smaller version of the run.
+    provider = reserving(A100={"indices": "0-1"})
+    assert provider.reserve(provider.A100 * 2) == (0, 1)
+    assert provider.reserve(provider.A100) is None
+
+
+def test_releasing_a_reservation_gives_the_cards_back(reserving) -> None:
+    provider = reserving(A100={"indices": "0-1"})
+    held = provider.reserve(provider.A100 * 2)
+    provider.unreserve("A100", held)
+    assert provider.free("A100") == (0, 1)
+
+
+def test_a_card_another_process_is_using_is_skipped(reserving, patch_smi) -> None:
+    # Registered is permission, not availability. A colleague computing on card one is not
+    # something to fight over.
+    provider = reserving(A100={"indices": "0-2"})
+    patch_smi(busy=[1])
+    assert provider.reserve(provider.A100 * 2) == (0, 2)
+
+
+def test_a_provider_that_assigns_its_own_devices_reserves_by_count(reserving) -> None:
+    # Colab hands out the accelerator itself, so there is nothing to index and the only
+    # question is whether the account has a slot left.
+    provider = reserving(G4={"count": 2})
+    assert provider.reserve(provider.G4) == ()
+    assert provider.reserve(provider.G4) == ()
+    assert provider.reserve(provider.G4) is None
+
+
+def test_a_call_waits_for_a_card_rather_than_asking_for_a_refusal(launcher_from) -> None:
+    # One card, two declarations. The second waits for the first to finish instead of
+    # starting a session the machine cannot serve.
+    import threading
+
+    let = launcher_from('[one]\nkind = "local"\n[one.devices]\nCPU = { count = 1 }\n')
+    instance = let.provider("one").CPU.on_host("remote")
+
+    started = threading.Event()
+
+    @let.function(device=instance, lifetime="process")
+    def wait_a_moment() -> int:
+        return 1
+
+    assert wait_a_moment() == 1
+    assert let.status()["live"] == 1
+    started.set()
+    let.pool.shutdown()

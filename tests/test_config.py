@@ -9,18 +9,14 @@ where the value lives rather than holding it.
 from __future__ import annotations
 
 import sys
+import tomllib
 from pathlib import Path
 
 import pytest
 
 import letify
-from letify.config import CONFIG_NAME, load, writer
+from letify.config import CONFIG_NAME, inventory, load, writer
 from letify.config.secrets import from_keyring, resolve_secret
-
-try:
-    import tomllib
-except ModuleNotFoundError:  # pragma: no cover - Python 3.10 and older
-    import tomli as tomllib
 
 
 @pytest.fixture
@@ -313,3 +309,70 @@ def test_a_quote_inside_a_value_does_not_end_the_string() -> None:
     # A path or a comment field with a quote in it must still parse.
     updated = writer.write_block("", "x", {"kind": "shell", "user": 'od"d'})
     assert tomllib.loads(updated)["x"]["user"] == 'od"d'
+
+
+# -- Spec: Inventory -----------------------------------------------------------
+
+
+def test_an_index_range_is_read_as_the_indices_it_names() -> None:
+    # A range because a shared box is described that way by whoever hands it out: cards
+    # zero through three are yours.
+    assert inventory.read_indices("0-3") == (0, 1, 2, 3)
+    assert inventory.read_indices([0, 1, 6]) == (0, 1, 6)
+    assert inventory.read_indices("2") == (2,)
+    assert inventory.read_indices("0-1,6-7") == (0, 1, 6, 7)
+
+
+def test_an_index_range_that_is_not_one_is_refused_with_the_text() -> None:
+    for bad in ("3-0", "a-b", "", "1-", [1, "x"]):
+        with pytest.raises(letify.ConfigError, match="indices"):
+            inventory.read_indices(bad)
+
+
+def test_a_declared_count_needs_no_indices() -> None:
+    # Colab assigns the device itself, so there is nothing to index and only a count to
+    # declare.
+    entry = inventory.Devices.read("G4", {"count": 2})
+    assert entry.count == 2
+    assert entry.indices == ()
+    assert entry.chooses_indices is False
+
+
+def test_declared_indices_are_the_count() -> None:
+    entry = inventory.Devices.read("A100", {"indices": "0-3"})
+    assert entry.indices == (0, 1, 2, 3)
+    assert entry.count == 4
+    assert entry.chooses_indices is True
+
+
+def test_an_accelerator_with_neither_is_one_of_it() -> None:
+    assert inventory.Devices.read("A100", {}).count == 1
+    assert inventory.Devices.read("A100", {}).indices == ()
+
+
+def test_a_count_that_disagrees_with_the_indices_is_refused() -> None:
+    # Two statements of one fact, and no way to tell which the user meant.
+    with pytest.raises(letify.ConfigError, match="count"):
+        inventory.Devices.read("A100", {"indices": "0-3", "count": 2})
+    # Agreeing is accepted, because a user restating it is not a mistake.
+    assert inventory.Devices.read("A100", {"indices": "0-3", "count": 4}).count == 4
+
+
+def test_a_device_table_becomes_the_providers_inventory(launcher_from) -> None:
+    let = launcher_from(
+        '[lab]\nkind = "shell"\naddress = "gpu.example.edu"\n'
+        '[lab.devices]\nA100 = { indices = "0-3" }\nH100 = { count = 1 }\n'
+    )
+    lab = let.provider("lab")
+    assert sorted(lab.inventory) == ["A100", "H100"]
+    assert lab.inventory["A100"].indices == (0, 1, 2, 3)
+    assert lab.inventory["H100"].count == 1
+    # The table is also the accelerator list, so nothing has to be said twice.
+    assert sorted(lab.instances) == ["A100", "H100"]
+
+
+def test_the_older_gpu_list_still_means_one_of_each(launcher_from) -> None:
+    let = launcher_from('[lab]\nkind = "shell"\naddress = "h"\ngpus = ["A100", "H100"]\n')
+    lab = let.provider("lab")
+    assert lab.inventory["A100"].count == 1
+    assert lab.inventory["A100"].chooses_indices is False

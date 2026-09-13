@@ -74,7 +74,7 @@ def test_an_async_body_can_await_inside_the_runtime(
 
 
 def test_a_space_fans_out_to_one_call_per_point(let: letify.Launcher, cpu: letify.Instance) -> None:
-    @let.function(device=cpu, host="remote", concurrency=2)
+    @let.function(device=cpu, host="remote")
     def identity(lr: float, bs: int) -> tuple[float, int]:
         return lr, bs
 
@@ -109,7 +109,7 @@ def test_a_space_may_be_passed_by_keyword_or_by_position(
 def test_awaiting_a_space_collects_in_input_order(
     let: letify.Launcher, cpu: letify.Instance
 ) -> None:
-    @let.function(device=cpu, host="remote", concurrency=3)
+    @let.function(device=cpu, host="remote")
     async def slow(n: int) -> int:
         import asyncio as remote_asyncio
 
@@ -127,7 +127,7 @@ async def _collect(call) -> list[int]:
 def test_an_async_space_can_be_iterated_as_it_completes(
     let: letify.Launcher, cpu: letify.Instance
 ) -> None:
-    @let.function(device=cpu, host="remote", concurrency=3)
+    @let.function(device=cpu, host="remote")
     async def square(n: int) -> int:
         return n * n
 
@@ -312,12 +312,13 @@ def test_two_declarations_on_one_device_share_a_session(
     let.pool.shutdown()
 
 
-def test_a_sweep_is_one_invocation() -> None:
-    # Its runtimes start once and are released once, and the ceiling still holds.
-    limited = letify.Launcher(home=False, announce=False, max_runtimes=2)
-    here = limited.providers.local.CPU
+def test_a_sweep_is_one_invocation(launcher_from) -> None:
+    # Its runtimes start once and are released once, and the inventory still holds: two
+    # cards declared means two sessions however many points there are.
+    limited = launcher_from('[box]\nkind = "local"\n[box.devices]\nCPU = { count = 2 }\n')
+    here = limited.provider("box").CPU
 
-    @limited.function(device=here, host="remote", concurrency=4)
+    @limited.function(device=here, host="remote")
     async def slow(n: int) -> int:
         import asyncio as remote_asyncio
 
@@ -356,7 +357,7 @@ def test_status_counts_the_sessions_against_the_ceiling(let, cpu) -> None:
     empty = let.status()
     assert empty["live"] == 0
     assert empty["busy"] == 0
-    assert empty["max_runtimes"] == let.max_runtimes
+    assert "max_runtimes" not in empty
 
     @let.function(device=cpu, host="remote", lifetime="process")
     def answer() -> int:
@@ -372,11 +373,10 @@ def test_status_counts_the_sessions_against_the_ceiling(let, cpu) -> None:
 def test_status_does_not_report_the_pools_own_bookkeeping(let, cpu) -> None:
     # The pool holds a guard so one invocation does not restart a session between the
     # points of a sweep. Whether that guard is open is a fact about the pool rather than
-    # about what is running, and a boolean sitting next to max_runtimes gets read as a
-    # count.
+    # about what is running, and a boolean sitting among counts gets read as a count.
     report = let.status()
     assert "holding" not in report
-    assert all(isinstance(report[field], int) for field in ("live", "busy", "max_runtimes"))
+    assert all(isinstance(report[field], int) for field in ("live", "busy"))
 
 
 def test_a_reported_session_says_what_it_is(let, cpu) -> None:
@@ -399,3 +399,26 @@ def test_status_describes_this_process_only(let, cpu) -> None:
     # here. What a machine itself is doing is what utilization answers.
     assert let.status()["name"] == let.name
     assert let.status()["live"] == 0
+
+
+# -- Spec: Pooling, a session is not a value the caller holds -------------------
+
+
+def test_nothing_public_hands_out_a_session(let) -> None:
+    # A caller holding a session has to have asked for it with the same instance the
+    # declaration uses, and the declaration folds the host placement into that instance, so
+    # asking with the bare one starts a second session holding none of the first one's
+    # files. On one machine that still passes, because both see the same disk; on a rented
+    # one it fails. So there is nothing to hold.
+    public = [name for name in dir(let) if not name.startswith("_")]
+    assert "runtime" not in public
+    assert "release" not in public
+    assert "shutdown" not in public
+
+
+def test_status_reports_the_inventory_against_what_is_reserved(launcher_from) -> None:
+    # So a reader can see whether a call is waiting for a card rather than for a slot in a
+    # number somebody guessed.
+    let = launcher_from('[lab]\nkind = "local"\n[lab.devices]\nCPU = { count = 2 }\n')
+    report = let.status()
+    assert report["devices"]["lab"]["CPU"] == {"count": 2, "reserved": 0, "indices": []}

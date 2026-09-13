@@ -38,6 +38,22 @@ ENV_REF = "env/{key}"
 CHECKPOINT_REF = "ckpt/{name}"
 
 
+def _session(target: Any) -> Runtime:
+    """The live session behind a declaration, or a session given directly.
+
+    Both answer ``session()``, so this is one call rather than a type check. Anything else
+    is a mistake worth naming, because the alternative is an attribute error from inside a
+    transfer.
+    """
+    asked = getattr(target, "session", None)
+    if not callable(asked):
+        raise TypeError(
+            f"expected a declared function, not {type(target).__name__}. Pass the "
+            f"declaration whose calls wrote the file, and letify finds the session."
+        )
+    return asked()
+
+
 @dataclass
 class Volume:
     """A named store on one provider."""
@@ -88,13 +104,13 @@ class Volume:
         """
         return self.store.put_tree(root, key=self.env_ref(env)).digest
 
-    def cache_env_from(self, runtime: Runtime, env: Env, path: str) -> str:
+    def cache_env_from(self, target: Any, env: Env, path: str) -> str:
         """Pack an environment that was installed inside a runtime and store it.
 
         This is how the first session pays the installation cost and every later one
         skips it.
         """
-        payload, _digest = runtime.pack_dir(path)
+        payload, _digest = _session(target).pack_dir(path)
         info = self.store.put_bytes(payload)
         self.store.point(self.env_ref(env), info.digest)
         return info.digest
@@ -117,9 +133,14 @@ class Volume:
         self.store.point(CHECKPOINT_REF.format(name=name), info.digest)
         return info.digest
 
-    def absorb(self, runtime: Runtime, path: str, name: str) -> str:
-        """Pull a checkpoint out of a runtime and store it under a name."""
-        payload, _digest = runtime.get_bytes(path)
+    def absorb(self, target: Any, path: str, name: str) -> str:
+        """Pull a checkpoint out of a session and store it under a name.
+
+        ``target`` is the declaration whose calls wrote the file. Which session that is is
+        letify's answer: a caller naming one could name a different session from the one the
+        work ran in, and that session holds none of its files.
+        """
+        payload, _digest = _session(target).get_bytes(path)
         info = self.store.put_bytes(payload)
         self.store.point(CHECKPOINT_REF.format(name=name), info.digest)
         return info.digest
@@ -158,16 +179,17 @@ class Volume:
             return None
         return self.materialize(runtime, digest, unpack=unpack)
 
-    def resume(self, runtime: Runtime, name: str, path: str) -> str | None:
-        """Put the newest checkpoint for a name inside the runtime at ``path``.
+    def resume(self, target: Any, name: str, path: str) -> str | None:
+        """Put the newest checkpoint for a name inside the session at ``path``.
 
-        This is what makes a preempted session cheap to restart: the function asks for
-        its own checkpoint and finds it already on disk.
+        This is what makes a preempted session cheap to restart: the function asks for its
+        own checkpoint and finds it already on disk. ``target`` is the declaration that will
+        look for it, so the file lands in the session its calls are handed.
         """
         digest = self.latest_checkpoint(name)
         if digest is None:
             return None
-        self.materialize(runtime, digest, path=path)
+        self.materialize(_session(target), digest, path=path)
         return digest
 
     def __repr__(self) -> str:

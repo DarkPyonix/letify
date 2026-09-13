@@ -18,20 +18,20 @@ env = letify.Env()
 
 colab = let.providers.colab_a
 
-@let.function(device=colab.G4, host="remote", env=env, concurrency=3)
+@let.function(device=colab.G4, host="remote", env=env)
 def train(lr, bs):
     ...
 
 train(lr=1e-4, bs=32)
 ```
 
-The decorator takes `device`, `host`, `lifetime`, `env`, `volumes`, `concurrency`, `timeout`, `retries` and `keep_remote`. It takes no transport and no mode, because the three placements below already settle them.
+The decorator takes `device`, `host`, `lifetime`, `env`, `volumes`, `timeout`, `retries` and `keep_remote`. It takes no transport, no mode and no width: the three placements below settle where the work runs, and how much can run at once is the provider's inventory rather than a number on the declaration.
 
 ### The three placements
 
 > `device` says where the accelerator is, `host` says where the host code runs, `lifetime` says how long the session lives.
 
-`device` carries the provider, the account and the accelerator in one value, because those are one decision. `colab.G4` is such a value. Core count and memory are not arguments: they arrive with the shape the provider registered, and a provider that offers several sizes registers them as separate shapes.
+`device` carries the provider, the account, the accelerator and how many of it one session takes, because those are one decision. `colab.G4` is such a value, and so is `lab.A100 * 2` for a run that trains across two cards. Core count and memory are not arguments: they arrive with the shape the provider registered, and a provider that offers several sizes registers them as separate shapes.
 
 `host` is the CUDA word for the CPU side, paired with the device the declaration already placed. `"local"`, the default, keeps Python and the libraries in this process and forwards only CUDA calls. `"remote"` ships the declared function to the machine that holds the device.
 
@@ -59,7 +59,9 @@ A space is consumed by the language's own protocols. `await` collects results in
 
 Only one space may be passed per call. Two would make the point count the product of two arguments rather than something visible in one place.
 
-`concurrency` bounds how many runtimes one declaration may occupy at once. It belongs to the declaration rather than to a call, because it describes the infrastructure that declaration is allowed to use.
+A space runs as wide as the provider has devices for, and no wider. Nothing on the declaration bounds it, because a bound there would be a second statement of the same fact: the inventory already says how many cards exist, and a point that cannot reserve one waits for a point that can to finish.
+
+A declaration taking two cards halves the width on a four card machine, which is arithmetic rather than policy. That is also why a width knob could not work: with `device=lab.A100 * 2`, a number that says how many runtimes may exist says nothing about how many cards they need.
 
 ## Provider model
 
@@ -132,11 +134,36 @@ The last number in the command's output is read as the remaining amount. This ex
 
 `letify usage` prints one row per declared provider, and `letify usage <alias>` one provider. A provider whose optional dependency or setting is missing is reported as unavailable rather than skipped, so the table always lists every alias.
 
+### Inventory
+
+> A provider entry declares which accelerators the account can get and how many of each. That inventory is the only thing that bounds how much runs at once.
+
+Three facts force this, and no launcher-level number can express any of them.
+
+A Colab account's available accelerators depend on its state: the tier, and whether the compute unit balance is positive. So the kinds are per account, and they change without letify being told.
+
+A shared department machine holds several cards in one box, and which indices are free moves with whoever else is logged in. So an entry names the indices it may use, `indices = "0-3"`, and at the moment a session starts letify takes only those registered indices that are actually free on the machine. A card another person is already computing on is skipped, not fought over.
+
+A run can take more than one card. `device=lab.A100 * 2` asks for two, and on a four card machine that is two concurrent sessions rather than four. A number bounding how many sessions may exist cannot say that, which is the plain reason such a number is not in the declaration.
+
+| Field | Means | For |
+|---|---|---|
+| `count` | How many of this accelerator the account can hold at once | A provider that assigns the device itself, such as Colab or Modal |
+| `indices` | Which device indices on the machine letify may use, as `"0-3"` or `[0, 1, 6]` | A machine letify shares with other people, where it sets the visible devices itself |
+
+An entry with `indices` has a count: the number of indices. An entry with neither is one of that accelerator.
+
+Which registered indices are free is read with `nvidia-smi` at reservation time, not cached, because the answer changes while a run is queued. A card is taken as busy when another process is computing on it. Nothing else on the machine is inspected, and letify never kills anything.
+
+A reserved session sets the visible devices for its own process, so the training code sees its cards as 0 upward and needs to know nothing about which physical indices it was given.
+
 ### Instances
 
 > An `Instance` is one accelerator shape on one provider account.
 
-`colab.G4` is an `Instance`. It holds the provider, the accelerator name, the host placement, and the core count, memory and VRAM the provider reported. `on_host()` returns a copy in a different mode.
+`colab.G4` is an `Instance`. It holds the provider, the accelerator name, the host placement, how many devices one session takes, and the core count, memory and VRAM the provider reported. `on_host()` returns a copy in a different mode, and `n * instance` a copy taking `n` devices.
+
+The device count is part of the pool key, because a session holding two cards is not interchangeable with one holding one.
 
 Because an instance carries its provider, `device=colab.G4` fixes provider, account and accelerator in one argument. `let.providers.any.G4` defers the provider choice to the first declared provider that registers a matching accelerator, in configuration order.
 
@@ -248,9 +275,11 @@ A runtime boots in four steps: open the channel, arm the lease, install the decl
 
 > Runtimes are pooled by instance and environment, so the second call through a declaration pays nothing for setup.
 
-The pool key is the instance key joined with the environment key. Two declarations that agree on both share runtimes, which is why nothing has to be said for two functions on one device to reuse a session. A pool holds at most `max_runtimes` runtimes; a call that finds every slot taken waits for one to come free rather than asking the provider for a session it would refuse.
+The pool key is the instance key joined with the environment key. Two declarations that agree on both share runtimes, which is why nothing has to be said for two functions on one device to reuse a session.
 
-`max_runtimes` defaults to 3 and is a placeholder. The concurrent session limit of a Colab account is undocumented and moves with tier, credit balance and demand.
+How many sessions may exist is the provider's inventory and nothing else. Starting one reserves the devices its instance asks for, and a call that cannot reserve them waits for a session to release some rather than asking the provider for a machine it would refuse. There is no ceiling on the launcher: a number there would be a guess about hardware the provider entry already describes, and when the two disagreed the smaller would win silently.
+
+A session is never a value the caller holds. Pooling, reuse, lifetime and teardown are all decided from the declaration, so there is no call that starts a session, none that returns one, and none that takes one. `Runtime` exists, and letify hands it to a provider and to a volume, but it does not appear in anything a user writes.
 
 ### Lifetime
 
@@ -269,9 +298,9 @@ There is no detached execution. A detached run whose remote side is preempted wo
 
 > What is running, counted rather than described, with no internal bookkeeping in it.
 
-`Launcher.status()` answers three questions: how many sessions exist, how many are serving a call, and what each one is. `live` and `busy` are counts against `max_runtimes`, so a reader can see at a glance whether the ceiling is the reason a call is waiting. `runtimes` describes each session: its name, provider, accelerator, placement, lifetime, whether it is busy and how long it has been idle.
+`Launcher.status()` answers three questions: how many sessions exist, how many are serving a call, and what each one is. `live` and `busy` are counts, and `devices` reports each provider's inventory against what is reserved, so a reader can see at a glance whether a call is waiting for a card. `runtimes` describes each session: its name, provider, accelerator, the device indices it holds, placement, lifetime, whether it is busy and how long it has been idle.
 
-Nothing internal is reported. The pool holds a guard so that one invocation does not restart a session between the points of a sweep, and whether that guard is currently open is a fact about the pool's implementation rather than about what is running. A field next to `max_runtimes` that looks like a count and is actually a boolean is worse than no field, because it is read as a count.
+Nothing internal is reported. The pool holds a guard so that one invocation does not restart a session between the points of a sweep, and whether that guard is currently open is a fact about the pool's implementation rather than about what is running. A field among counts that looks like a count and is actually a boolean is worse than no field, because it is read as a count.
 
 `status()` describes this process only. A session started by a different process is not in it, since the pool lives in the process that owns it. What a machine itself is doing is a different question, answered by `letify utilization`.
 
@@ -309,6 +338,10 @@ Extraction checks every member's path against the destination before unpacking, 
 > A volume writes into a runtime through its channel, not by asking the runtime to reach the bucket.
 
 That works with every backend and needs no credentials on the far side, at the cost of the bytes passing through the local process. `Volume.resume()` puts the newest checkpoint for a name inside the runtime, which is what makes a preempted session cheap to restart. `Volume.absorb()` pulls one back out, and `cache_env_from()` packs an environment installed inside a runtime so the next session skips the installation.
+
+These take the declaration, not a session. A declaration already says which provider, which accelerator, which environment and which volumes, so which session is letify's answer to work out and not a value for the caller to carry. The alternative was tried and is worse: a caller holding a session has to have asked for it with the same instance the declaration uses, and the declaration folds the host placement into that instance, so asking with the bare one silently starts a second session that holds none of the first one's files. On one machine that still passes, because both sessions see the same disk. On a rented one it fails, which makes it the worst kind of defect: it works in the test and breaks where the money is.
+
+So nothing hands a session to the caller. There is no call that returns one, no argument that takes one, and no way to hold the wrong one.
 
 ### Backends
 
@@ -362,6 +395,12 @@ A credential field is never a literal in a tracked file. `<name>_env` names an e
 kind = "colab"
 account = "someone@example.com"
 
+# Which accelerators this account can get, and how many at once. Colab assigns the device
+# itself, so there are no indices to name.
+[colab_a.devices]
+G4 = { count = 2 }
+T4 = { count = 2 }
+
 [lab_a100]
 kind = "shell"
 address = "gpu.lab.example.edu"
@@ -369,12 +408,19 @@ user = "researcher"
 key = "~/.ssh/id_ed25519"
 persistent = true
 
+# Eight cards in the box, four of them ours. letify takes only those of these four that are
+# actually free when a session starts, so a card a colleague is computing on is skipped.
+[lab_a100.devices]
+A100 = { indices = "0-3" }
+
 [elice_a100]
 kind = "elice"
 zone_id = "00000000-0000-0000-0000-000000000000"
 machine_id = "00000000-0000-0000-0000-000000000000"
 access_token_env = "ELICE_ACCESS_TOKEN"
 ```
+
+The older `gpus = ["A100", "H100"]` list still works and means one of each, with letify choosing no indices. `devices` is what an entry uses once a count or an index range matters.
 
 ### Logging in
 

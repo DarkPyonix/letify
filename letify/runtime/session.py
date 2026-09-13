@@ -43,6 +43,11 @@ class Runtime:
     instance: Instance
     env: Env
     volumes: tuple[Volume, ...] = ()
+
+    #: Physical device indices this session reserved, empty where the provider assigns the
+    #: device itself. Set for the session's visible devices so the code inside sees its
+    #: cards as 0 upward.
+    held_devices: tuple[int, ...] = ()
     channel: Channel | None = None
 
     #: Provider side identifier, such as an Elice allocation id.
@@ -105,6 +110,10 @@ class Runtime:
         self.provider.stop(self)
 
     # -- requests ------------------------------------------------------------
+
+    def session(self) -> Runtime:
+        """Itself, so a volume can take either a declaration or a live session."""
+        return self
 
     def request(self, payload: dict[str, Any], *, timeout: float | None = None) -> Any:
         """Send one worker request and return its value."""

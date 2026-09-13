@@ -136,12 +136,15 @@ class Shell(Provider):
     def discover(self) -> Mapping[str, Instance]:
         """Ask the machine which GPUs it has.
 
-        A configuration entry may list them instead, which avoids connecting during
-        import. A declared list is trusted without checking.
+        A configuration entry may declare them instead, which avoids connecting during
+        import. A declaration is trusted without checking, because an entry that names its
+        cards has said what it has.
         """
-        declared = self.config.option("gpus")
-        if isinstance(declared, list) and declared:
-            return {str(name): Instance(self, gpu=str(name)) for name in declared}
+        from ..config.inventory import read_table
+
+        declared = read_table(self.config.options)
+        if declared:
+            return {name: Instance(self, gpu=name) for name in declared}
 
         self.connect()
         result = subprocess.run(

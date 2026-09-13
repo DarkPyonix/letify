@@ -25,10 +25,12 @@ and no blob table, so a large argument travels again on every call.
 from __future__ import annotations
 
 import abc
+import threading
 from collections.abc import Iterator, Mapping, Sequence
 from typing import TYPE_CHECKING, Literal
 
 from ..config import ProviderConfig
+from ..config.inventory import Devices, read_table
 from ..declare.instance import Host, Instance
 from ..errors import LetifyError, UnknownInstance
 from .usage import Usage, from_command
@@ -72,6 +74,137 @@ class Provider(abc.ABC):
         self.alias = config.alias
         self._instances: dict[str, Instance] | None = None
         self._volumes: dict[str, Volume] = {}
+        self._inventory: dict[str, Devices] | None = None
+        self._reserved: dict[str, list[int]] = {}
+        self._taken: dict[str, int] = {}
+        self._devices_guard = threading.RLock()
+
+    # -- inventory -----------------------------------------------------------
+
+    @property
+    def inventory(self) -> Mapping[str, Devices]:
+        """What this account has, read from the entry's device table.
+
+        This is the only thing that bounds how much runs at once. An entry that declares
+        nothing falls back to whatever the provider discovers, one of each, because a
+        provider that can be asked should not have to be told.
+        """
+        if self._inventory is None:
+            declared = read_table(self.config.options)
+            if not declared:
+                # Keyed by what an instance calls itself, so a discovered shape and its
+                # inventory entry are the same name. A CPU shape reports "cpu".
+                declared = {
+                    instance.accelerator: Devices(instance.accelerator)
+                    for instance in self.discover().values()
+                }
+            self._inventory = declared
+        return self._inventory
+
+    def devices_of(self, accelerator: str) -> Devices:
+        """The inventory entry for one accelerator, matched the way attribute access is.
+
+        A device table is keyed as the user wrote it and an instance reports the provider's
+        spelling, so the two are compared without case, the same way ``colab.g4`` finds
+        ``G4``. An accelerator with no entry at all is one of it: a shape the provider
+        registered is a shape it has.
+        """
+        table = self.inventory
+        if accelerator in table:
+            return table[accelerator]
+        folded = accelerator.casefold()
+        for name, entry in table.items():
+            if name.casefold() == folded:
+                return entry
+        if accelerator in {instance.accelerator for instance in self.instances.values()}:
+            return Devices(accelerator)
+        raise UnknownInstance(
+            f"{self.alias} has no {accelerator!r} in its inventory. It has: "
+            f"{', '.join(sorted(table)) or 'nothing'}"
+        )
+
+    def free(self, accelerator: str) -> tuple[int, ...]:
+        """Which registered indices could be reserved right now.
+
+        Registered is permission, not availability: an index another process is computing
+        on is skipped rather than fought over, and the answer is read fresh because it
+        changes while a run is queued.
+        """
+        entry = self.devices_of(accelerator)
+        if not entry.chooses_indices:
+            return ()
+        with self._devices_guard:
+            held = set(self._reserved.get(entry.accelerator, ()))
+        return tuple(index for index in entry.indices if index not in held | set(self.busy()))
+
+    def busy(self) -> tuple[int, ...]:
+        """Device indices another process holds. Nothing for a provider letify cannot ask.
+
+        Overridden where the machine can be asked. The base answer is nothing, which is
+        right for a provider that assigns the device itself.
+        """
+        return ()
+
+    def reserve(self, instance: Instance) -> tuple[int, ...] | None:
+        """Take the devices this instance asks for, or None when they are not there.
+
+        Returns the indices taken, which is empty for a provider that assigns the device
+        itself: there the only question is whether the account has a slot left. Half the
+        cards a run asked for is not a smaller version of the run, so a request that cannot
+        be met in full takes nothing.
+        """
+        entry = self.devices_of(instance.accelerator)
+        wanted = instance.devices
+        with self._devices_guard:
+            if entry.chooses_indices:
+                available = self.free(instance.accelerator)
+                if len(available) < wanted:
+                    return None
+                taken = tuple(available[:wanted])
+                self._reserved.setdefault(entry.accelerator, []).extend(taken)
+                return taken
+
+            used = self._taken.get(entry.accelerator, 0)
+            if used + wanted > entry.count:
+                return None
+            self._taken[entry.accelerator] = used + wanted
+            return ()
+
+    def unreserve(self, accelerator: str, indices: tuple[int, ...], devices: int = 1) -> None:
+        """Give devices back, whether they were indices or a count.
+
+        ``devices`` is how many were taken, needed only where the provider assigns the
+        device itself and there are no indices to hand back.
+        """
+        try:
+            entry = self.devices_of(accelerator)
+        except UnknownInstance:
+            entry = Devices(accelerator)
+        with self._devices_guard:
+            if indices:
+                held = self._reserved.get(entry.accelerator, [])
+                for index in indices:
+                    if index in held:
+                        held.remove(index)
+                return
+            name = entry.accelerator
+            self._taken[name] = max(0, self._taken.get(name, 0) - devices)
+
+    def reserved_count(self, accelerator: str) -> int:
+        """How much of one accelerator is currently held."""
+        with self._devices_guard:
+            return len(self._reserved.get(accelerator, ())) or self._taken.get(accelerator, 0)
+
+    def capacity(self, accelerator: str) -> int:
+        """How many sessions of one device each this account can hold at once."""
+        try:
+            return self.devices_of(accelerator).count
+        except UnknownInstance:
+            return 0
+
+    def visible_devices(self, indices: tuple[int, ...]) -> str | None:
+        """What to set CUDA_VISIBLE_DEVICES to, so the session sees its cards as 0 upward."""
+        return ",".join(str(index) for index in indices) if indices else None
 
     # -- identity ------------------------------------------------------------
 
@@ -107,6 +240,7 @@ class Provider(abc.ABC):
     def refresh(self) -> Mapping[str, Instance]:
         """Discard the cached instance list and ask again."""
         self._instances = None
+        self._inventory = None
         return self.instances
 
     def __getattr__(self, name: str) -> Instance:
@@ -176,6 +310,7 @@ class Provider(abc.ABC):
         *,
         name: str,
         volumes: Sequence[Volume] = (),
+        held: tuple[int, ...] = (),
     ) -> Runtime:
         """Bring a session up and return the live runtime.
 
@@ -192,6 +327,7 @@ class Provider(abc.ABC):
             instance=instance,
             env=env,
             volumes=tuple(volumes),
+            held_devices=held,
         )
         runtime.boot()
         return runtime

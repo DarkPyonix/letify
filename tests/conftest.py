@@ -25,7 +25,10 @@ import pytest
 
 import letify
 from letify.config.schema import ProviderConfig
+from letify.declare.env import Env
+from letify.declare.instance import Instance, Lifetime
 from letify.providers.local import Local
+from letify.runtime import telemetry
 
 # -- the real launcher ---------------------------------------------------------
 
@@ -237,6 +240,69 @@ def keyring_store(monkeypatch):
     fake = FakeKeyring({})
     monkeypatch.setitem(sys.modules, "keyring", fake)
     return fake
+
+
+# -- device inventory ----------------------------------------------------------
+
+
+@pytest.fixture
+def reserving(monkeypatch):
+    """A provider with a declared device table and nothing else it needs to connect.
+
+    Local rather than a remote kind, because reservation is bookkeeping over a declared
+    inventory and has no transport in it.
+    """
+
+    def build(**table: dict[str, Any]):
+        provider = provider_of(Local, "box", devices=dict(table))
+        # Nothing on the developer's own machine may decide the answer, so no card is taken
+        # unless a test says it is. patch_smi is how a test says so.
+        monkeypatch.setattr(telemetry, "busy_indices", lambda **kwargs: ())
+        # The local provider reads the machine's real cards otherwise, and a test must not
+        # depend on what is plugged into the developer's laptop.
+        monkeypatch.setattr(
+            provider,
+            "discover",
+            lambda: {name: Instance(provider, gpu=name) for name in provider.inventory},
+        )
+        return provider
+
+    return build
+
+
+@pytest.fixture
+def live():
+    """Start a session through the pool, for a test whose subject is the runtime itself.
+
+    Nothing public hands out a session, and these tests are not the surface a user writes
+    against: they are about what a live runtime does.
+    """
+
+    def start(let, instance, env: Any = None, volumes: Any = ()) -> Any:
+        runtime = let.pool.acquire(instance, env or Env(), volumes, lifetime=Lifetime.process)
+        let.pool.release(runtime)
+        return runtime
+
+    return start
+
+
+@pytest.fixture
+def one_card_cpu(monkeypatch) -> letify.Instance:
+    """A remote CPU shape on a provider whose inventory holds exactly one of it."""
+    provider = provider_of(Local, "box", devices={"cpu": {"count": 1}})
+    monkeypatch.setattr(telemetry, "busy_indices", lambda **kwargs: ())
+    return Instance(provider, gpu=None).on_host("remote")
+
+
+@pytest.fixture
+def patch_smi(monkeypatch):
+    """Say which device indices another process is computing on."""
+
+    def patch(busy: list[int] | None = None) -> None:
+        taken = set(busy or ())
+        monkeypatch.setattr(telemetry, "busy_indices", lambda **kwargs: tuple(sorted(taken)))
+
+    return patch
 
 
 # -- the lease renewal loop ----------------------------------------------------

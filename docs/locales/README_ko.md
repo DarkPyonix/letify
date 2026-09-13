@@ -7,7 +7,7 @@
 **함수에 필요한 것만 적으면, 감당 가능한 GPU에서 돌아갑니다.**
 
 [![Python](https://img.shields.io/badge/python-3.11%2B-3776AB?logo=python&logoColor=white)](https://www.python.org/)
-[![License](https://img.shields.io/badge/license-MIT-black)](../../LICENSE)
+[![License](https://img.shields.io/badge/license-Apache%202.0-black)](../../LICENSE)
 [![Providers](https://img.shields.io/badge/providers-Colab%20%7C%20Modal%20%7C%20SSH%20%7C%20Local-6C5CE7)](#-프로바이더)
 [![Pure Python](https://img.shields.io/badge/pure-python-2ECC71)](../../pyproject.toml)
 
@@ -21,7 +21,7 @@
 import letify
 
 let = letify.Launcher()
-colab = let.providers.colab_a
+colab = let.providers.colab_pro_plus
 
 @let.function(device=colab.G4, host="remote", concurrency=3)
 def train(lr, bs):
@@ -103,7 +103,7 @@ uv add "letify[all]"          # 전부
 계정은 `~/.letify`에 둡니다. 머신에 속하는 정보이고, 저장소에는 들어가지 않습니다.
 
 ```toml
-[colab_a]
+[colab_pro_plus]
 kind = "colab"
 account = "you@example.com"
 
@@ -121,15 +121,15 @@ persistent = true
 
 ```bash
 $ letify providers
-colab_a   colab   ephemeral   host=remote
+colab_pro_plus   colab   ephemeral   host=remote
 lab_a100  shell   persistent  host=remote
 local     local   persistent  host=local
 
 $ letify devices
 {
-  "colab_a":  ["A100", "G4", "H100", "L4", "T4", "v5e1", "v6e1"],
-  "lab_a100": ["A100"],
-  "local":    ["CPU", "GeForce_RTX_4050"]
+  "colab_pro_plus": ["A100", "G4", "H100", "L4", "T4", "v5e1", "v6e1"],
+  "lab_a100":       ["A100"],
+  "local":          ["CPU", "GeForce_RTX_4050"]
 }
 ```
 
@@ -140,7 +140,7 @@ import letify
 
 let = letify.Launcher()
 env = letify.Env()                      # uv.lock을 읽습니다
-colab = let.providers.colab_a
+colab = let.providers.colab_pro_plus
 cache = colab.volume("hf-cache")        # 세션보다 오래 살아남습니다
 
 @let.function(device=colab.G4, host="remote", env=env, volumes=[cache], concurrency=3)
@@ -224,8 +224,8 @@ Provider
 **여러 계정을 정식으로 지원합니다.** 설정 항목 하나가 계정 하나이고, 같은 종류를 여러 개 둘 수 있습니다. Colab 계정이 두 개면 동시 세션도 두 배가 됩니다.
 
 ```python
-a = let.providers.colab_a
-b = let.providers.colab_b
+a = let.providers.colab_pro_plus
+b = let.providers.colab_pro
 
 @let.function(device=a.G4, host="remote")
 def train(lr): ...
@@ -394,6 +394,6 @@ letify probe lab      # 호출 중계를 쓸 만큼 가까운가?
 
 <div align="center">
 
-**MIT 라이선스.** 자기 GPU 비용을 직접 내는 사람들을 위해 만들었습니다. 🔬
+**Apache 2.0 라이선스.** 자기 GPU 비용을 직접 내는 사람들을 위해 만들었습니다. 🔬
 
 </div>

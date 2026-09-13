@@ -83,6 +83,18 @@ class Local(Provider):
         _device_names.cache_clear()
         return super().refresh()
 
+    def busy(self) -> tuple[int, ...]:
+        """Ask this machine which cards another process is computing on.
+
+        Excluding this process, because a session asking for a second card must not see its
+        own first one as taken.
+        """
+        import os
+
+        from ..runtime import telemetry
+
+        return telemetry.busy_indices(exclude_pids={os.getpid()})
+
     def store_backend(self) -> str:
         return "filesystem"
 
