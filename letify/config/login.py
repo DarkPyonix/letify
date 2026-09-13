@@ -267,6 +267,7 @@ def check_workspace(
             f"the workspace {workspace} cannot be created and written on {target} without "
             f"root, so nothing was written: {detail}"
         )
+    print(f"workspace {workspace}: writable")
 
 
 def record_workspace(answers: Answers, options: dict[str, Any]) -> None:
