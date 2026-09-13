@@ -97,6 +97,7 @@ class Runtime:
         if self.channel is None:
             self.channel = self.provider.open_channel(self)
         self.channel.start()
+        self.restrict_devices()
         if self.provider.needs_lease:
             self.lease = Lease(self)
             self.lease.arm()
@@ -311,6 +312,23 @@ class Runtime:
         return base64.b64decode(value["payload"]), value["digest"]
 
     # -- environment and volumes ---------------------------------------------
+
+    def restrict_devices(self) -> None:
+        """Show the worker only the cards this session reserved, numbered from 0.
+
+        Set in the worker's own environment before any user code imports a CUDA library.
+        os.execv passes the environment on, so the move to the project interpreter keeps
+        it. A provider that assigns the device itself reserves no indices and sets nothing.
+        """
+        visible = self.provider.visible_devices(self.held_devices)
+        if visible is None:
+            return
+        self.exec(
+            "import os\n"
+            f"os.environ['CUDA_VISIBLE_DEVICES'] = {visible!r}\n"
+            "os.environ['CUDA_DEVICE_ORDER'] = 'PCI_BUS_ID'\n",
+            timeout=120,
+        )
 
     def prepare_workspace(self) -> None:
         """Expand, create and enter the workspace root, and point TMPDIR under it.
