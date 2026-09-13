@@ -414,6 +414,42 @@ pub fn read_frame<R: Read>(reader: &mut R) -> io::Result<Vec<u8>> {
     Ok(body)
 }
 
+/// What [`read_incoming`] took off the wire.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Incoming {
+    /// A copy to the device whose payload is the first `bytes` bytes of the staging
+    /// buffer.
+    CopyToDevice { handle: u64, offset: u64, bytes: usize },
+    /// Any other request, decoded whole.
+    Request(Request),
+}
+
+/// Write a `CopyToDevice` frame for the caller's bytes.
+///
+/// Produces the same bytes as `write_frame(encode_request(CopyToDevice { .. }))`.
+pub fn write_copy_to_device<W: Write>(
+    writer: &mut W,
+    handle: u64,
+    offset: u64,
+    payload: &[u8],
+) -> io::Result<()> {
+    let request = Request::CopyToDevice { handle, offset, payload: payload.to_vec() };
+    write_frame(writer, &encode_request(&request))
+}
+
+/// Read one request, putting the payload of a copy to the device into `staging`.
+pub fn read_incoming<R: Read>(reader: &mut R, staging: &mut Vec<u8>) -> io::Result<Incoming> {
+    let frame = read_frame(reader)?;
+    match decode_request(&frame)? {
+        Request::CopyToDevice { handle, offset, payload } => {
+            staging.clear();
+            staging.extend_from_slice(&payload);
+            Ok(Incoming::CopyToDevice { handle, offset, bytes: payload.len() })
+        }
+        other => Ok(Incoming::Request(other)),
+    }
+}
+
 /// Content address of a payload, used so the same module travels once.
 ///
 /// This is not a cryptographic decision. A module is identified by its own bytes, and a
@@ -525,6 +561,124 @@ mod tests {
         write_frame(&mut buffer, &[1, 2, 3]).unwrap();
         let mut reader = buffer.as_slice();
         assert_eq!(read_frame(&mut reader).unwrap(), vec![1, 2, 3]);
+    }
+
+    /// Records every buffer a writer is handed, by address and length.
+    #[derive(Default)]
+    struct RecordingWriter {
+        bytes: Vec<u8>,
+        slices: Vec<(usize, usize)>,
+    }
+
+    impl Write for RecordingWriter {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.slices.push((buf.as_ptr() as usize, buf.len()));
+            self.bytes.extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn write_vectored(&mut self, bufs: &[io::IoSlice<'_>]) -> io::Result<usize> {
+            let mut written = 0;
+            for buf in bufs {
+                written += self.write(buf)?;
+            }
+            Ok(written)
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Records the address of every buffer a reader fills and how many bytes went in.
+    struct RecordingReader<'a> {
+        bytes: &'a [u8],
+        destinations: Vec<(usize, usize)>,
+    }
+
+    impl Read for RecordingReader<'_> {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            let count = buf.len().min(self.bytes.len());
+            buf[..count].copy_from_slice(&self.bytes[..count]);
+            self.bytes = &self.bytes[count..];
+            self.destinations.push((buf.as_ptr() as usize, count));
+            Ok(count)
+        }
+    }
+
+    fn patterned(bytes: usize) -> Vec<u8> {
+        (0..bytes).map(|index| (index % 251) as u8).collect()
+    }
+
+    fn encoded_frame(request: &Request) -> Vec<u8> {
+        let mut frame = Vec::new();
+        write_frame(&mut frame, &encode_request(request)).unwrap();
+        frame
+    }
+
+    #[test]
+    fn a_streamed_copy_writes_the_same_bytes_as_an_encoded_frame() {
+        let payload = patterned(100_000);
+        let mut writer = RecordingWriter::default();
+        write_copy_to_device(&mut writer, 3, 16, &payload).unwrap();
+        let expected =
+            encoded_frame(&Request::CopyToDevice { handle: 3, offset: 16, payload: payload.clone() });
+        assert_eq!(writer.bytes, expected);
+    }
+
+    #[test]
+    fn a_streamed_copy_hands_the_callers_bytes_to_the_writer_uncopied() {
+        let payload = patterned(100_000);
+        let mut writer = RecordingWriter::default();
+        write_copy_to_device(&mut writer, 3, 16, &payload).unwrap();
+        assert!(
+            writer.slices.contains(&(payload.as_ptr() as usize, payload.len())),
+            "the payload reached the writer through another buffer: {:?}",
+            writer.slices
+        );
+    }
+
+    #[test]
+    fn a_copy_payload_is_read_straight_into_the_staging_buffer() {
+        let payload = patterned(100_000);
+        let frame =
+            encoded_frame(&Request::CopyToDevice { handle: 3, offset: 16, payload: payload.clone() });
+        let mut reader = RecordingReader { bytes: &frame, destinations: Vec::new() };
+        // Sized ahead so the staging buffer does not move while it is filled.
+        let mut staging = vec![0u8; 2 * payload.len()];
+        let incoming = read_incoming(&mut reader, &mut staging).unwrap();
+
+        assert_eq!(incoming, Incoming::CopyToDevice { handle: 3, offset: 16, bytes: payload.len() });
+        assert_eq!(&staging[..payload.len()], &payload[..]);
+        let start = staging.as_ptr() as usize;
+        let end = start + staging.len();
+        let elsewhere: usize = reader
+            .destinations
+            .iter()
+            .filter(|(address, _)| *address < start || *address >= end)
+            .map(|(_, count)| count)
+            .sum();
+        // Only the frame header and the fixed fields may land outside the staging buffer.
+        assert!(elsewhere <= 64, "{elsewhere} bytes were read into an intermediate buffer");
+    }
+
+    #[test]
+    fn other_requests_arrive_decoded_through_read_incoming() {
+        let frame = encoded_frame(&Request::GetFunction { module: 3, name: "add_kernel".into() });
+        let mut staging = Vec::new();
+        assert_eq!(
+            read_incoming(&mut frame.as_slice(), &mut staging).unwrap(),
+            Incoming::Request(Request::GetFunction { module: 3, name: "add_kernel".into() })
+        );
+    }
+
+    #[test]
+    fn a_corrupt_frame_length_is_an_error_not_an_allocation() {
+        let mut frame = encode_frame_header(1 << 62).to_vec();
+        frame.extend_from_slice(&[2, 0, 0]);
+        let mut staging = Vec::new();
+        assert!(read_incoming(&mut frame.as_slice(), &mut staging).is_err());
+        assert!(read_frame(&mut frame.as_slice()).is_err());
     }
 
     #[test]

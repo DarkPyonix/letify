@@ -74,6 +74,11 @@ impl Client {
         Ok(())
     }
 
+    /// Queue a copy to the device, taking the caller's bytes without owning them.
+    pub fn send_copy_to_device(&mut self, handle: u64, offset: u64, payload: &[u8]) -> io::Result<()> {
+        self.send(Request::CopyToDevice { handle, offset, payload: payload.to_vec() })
+    }
+
     /// Push everything queued to the agent without waiting for a reply.
     pub fn flush(&mut self) -> io::Result<()> {
         self.writer.flush()?;
@@ -133,6 +138,45 @@ mod tests {
         // symbol from having to decide.
         assert!(!Request::Free { handle: 1 }.needs_reply());
         assert!(Request::MemoryInfo.needs_reply());
+    }
+
+    #[test]
+    fn a_copy_to_the_device_reaches_the_agent_whole_over_tcp() {
+        use std::io::BufReader;
+        use std::net::TcpListener;
+
+        use letify_wire::{
+            Incoming, PROTOCOL_VERSION, Reply, decode_request, encode_reply, read_frame,
+            read_incoming, write_frame,
+        };
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap().to_string();
+        let payload: Vec<u8> = (0..300_000usize).map(|index| (index % 251) as u8).collect();
+        let agent = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let hello = decode_request(&read_frame(&mut reader).unwrap()).unwrap();
+            assert!(matches!(hello, Request::Hello { .. }));
+            let ready = Reply::Ready {
+                version: PROTOCOL_VERSION,
+                device_name: "loopback".into(),
+                compute: (0, 0),
+            };
+            write_frame(&mut stream, &encode_reply(&ready)).unwrap();
+            let mut staging = Vec::new();
+            let incoming = read_incoming(&mut reader, &mut staging).unwrap();
+            (incoming, staging)
+        });
+
+        let mut client = super::Client::connect(&address).unwrap();
+        client.send_copy_to_device(5, 32, &payload).unwrap();
+        client.flush().unwrap();
+        let (incoming, staging) = agent.join().unwrap();
+
+        assert_eq!(incoming, Incoming::CopyToDevice { handle: 5, offset: 32, bytes: payload.len() });
+        assert_eq!(&staging[..payload.len()], &payload[..]);
+        assert_eq!(client.sent, 2);
     }
 
     #[test]
