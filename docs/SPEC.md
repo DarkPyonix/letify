@@ -372,7 +372,7 @@ A model shard is already large, so one file is one blob. An environment is tens 
 
 A content addressed store does not by itself reduce the bytes of a first transfer. What it improves is the metadata exchange, which becomes a single manifest read instead of one request per file, and every repeat transfer, which is skipped by name. Neither it nor a synchronization tool sends deltas within a changed file.
 
-Extraction checks every member's path against the destination before unpacking, so an archive cannot write outside it.
+Extraction checks every member's path against the destination before unpacking, so an archive cannot write outside it. An environment archive is extracted with Python's `tar` filter rather than the `data` filter, because a `.venv` links its interpreter by absolute path and the `data` filter refuses such a link.
 
 ### Materializing into a runtime
 
@@ -449,6 +449,8 @@ A uv lock file resolves for every platform uv supports, so one lock file drives 
 ### Building the environment on a runtime <!-- id: remote-uv-sync -->
 
 > The runtime receives `pyproject.toml`, `uv.lock` and `.python-version`, runs `uv sync --frozen --no-install-project` in a project directory, and starts the worker with that directory's `.venv/bin/python`. A default `Env()` does the same; no path installs into the system Python or installs nothing.
+
+This applies to every provider except `local`: `shell`, `tunnel`, `colab`, `elice` and `modal`. A Modal sandbox image carries only what starts the bootstrap worker, so letify reaches the sandbox through the sync like every other package.
 
 1. The local side reads `pyproject.toml` and `uv.lock` from the project directory, and `.python-version` when it exists. A missing `pyproject.toml` or `uv.lock` raises `ConfigError` naming the file and `uv lock`, before anything runs on the runtime.
 2. The worker writes them into the runtime's project directory, `<workspace root>/project/<env key>`. The workspace root is the provider's `workspace_root`, the one place every path letify writes on the runtime derives from. It is `~/.letify` for every provider, with `~` expanded on the runtime, so it needs no root.
