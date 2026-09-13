@@ -171,6 +171,14 @@ A copy to the device through letify-core, with the payload streamed from the cal
 | Encoded frame, after the change | 515, 514, 519 MiB/s |
 | Streamed into staging | 2043, 1961, 1873 MiB/s |
 
+A copy to the host, with the payload streamed from the agent's staging buffer into the caller's buffer, moves about 3250 MiB/s over loopback TCP. The same payload through an encoded frame and a copy into the caller's buffer, the path before streaming, moves about 520 MiB/s. Both carry one 256 MiB `Payload` reply over the same socket pair and machine and report the median of five runs. The copy on the device is not included.
+
+| Path | Three invocations |
+|---|---|
+| Encoded frame, before the change | 522, 514, 519 MiB/s |
+| Encoded frame, after the change | 528, 527, 540 MiB/s |
+| Streamed into the destination | 3234, 3261, 3244 MiB/s |
+
 Loopback removes the network, so these numbers bound what the copy path itself costs. On a real link the link rate decides throughput whenever it is below them. To reproduce, run `cargo test --release -p letify-wire --test throughput -- --ignored --nocapture --test-threads=1` in `letify-core/`.
 
 ## Measuring your own numbers
