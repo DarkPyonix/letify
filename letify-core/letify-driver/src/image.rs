@@ -4,16 +4,41 @@
 //! image itself. This module owns that reading and nothing else: sending the image and
 //! naming it by digest belong to the exports and the wire crate.
 
-/// Bytes read from a module image whatever its format.
-const WINDOW: usize = 4096;
+/// Magic number at the start of a CUDA fatbinary, from the driver's `fatbinary.h`.
+const FATBIN_MAGIC: u32 = 0xBA55_ED50;
 
 /// The bytes of the module image that starts at `image`.
+///
+/// A fatbinary is `fat_size` bytes, from its header. An ELF object ends at its section
+/// header table or its program header table, whichever is later. Anything else is a PTX
+/// text image and runs through its terminating NUL.
 ///
 /// # Safety
 ///
 /// `image` must point at a module image the caller owns, readable for its whole length.
 pub unsafe fn module_image<'a>(image: *const u8) -> &'a [u8] {
-    unsafe { std::slice::from_raw_parts(image, WINDOW) }
+    let length = unsafe { image_length(image) };
+    unsafe { std::slice::from_raw_parts(image, length) }
+}
+
+unsafe fn read<T: Copy>(image: *const u8, offset: usize) -> T {
+    unsafe { std::ptr::read_unaligned(image.add(offset) as *const T) }
+}
+
+unsafe fn image_length(image: *const u8) -> usize {
+    unsafe {
+        if u32::from_le(read::<u32>(image, 0)) == FATBIN_MAGIC {
+            return u64::from_le(read::<u64>(image, 8)) as usize;
+        }
+        if read::<[u8; 4]>(image, 0) == *b"\x7fELF" && read::<u8>(image, 4) == 2 {
+            let offset = |at| u64::from_le(read::<u64>(image, at)) as usize;
+            let count = |at| u16::from_le(read::<u16>(image, at)) as usize;
+            let programs = offset(0x20) + count(0x36) * count(0x38);
+            let sections = offset(0x28) + count(0x3a) * count(0x3c);
+            return programs.max(sections);
+        }
+        std::ffi::CStr::from_ptr(image as *const std::ffi::c_char).to_bytes_with_nul().len()
+    }
 }
 
 #[cfg(test)]
@@ -35,7 +60,7 @@ mod tests {
 
     /// A buffer longer than the image, so reading past the image would be visible.
     fn with_trailing_bytes(mut image: Vec<u8>) -> Vec<u8> {
-        image.extend(std::iter::repeat_n(0xee, 2 * WINDOW));
+        image.extend(std::iter::repeat_n(0xee, 8192));
         image
     }
 
