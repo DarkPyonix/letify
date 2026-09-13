@@ -11,7 +11,7 @@
 [![Providers](https://img.shields.io/badge/providers-Colab%20%7C%20Modal%20%7C%20SSH%20%7C%20Local-6C5CE7)](#-providers)
 [![letify-core](https://img.shields.io/badge/letify--core-rust-DEA584?logo=rust&logoColor=white)](letify-core/)
 
-[Quickstart](#-quickstart) · [Why](#-why-this-exists) · [Providers](#-providers) · [Sweeps](#-sweeps) · [Docs](docs/) · [한국어](docs/locales/README_ko.md)
+[Quickstart](#-quickstart) · [Why](#-why-declare-instead-of-connect) · [Providers](#-providers) · [Sweeps](#-sweeps) · [Docs](docs/) · [한국어](docs/locales/README_ko.md)
 
 </div>
 
@@ -36,23 +36,80 @@ No session to create. No environment to install. No files to upload. No scope to
 
 ---
 
-## 💡 Why this exists
+## 💡 Why declare instead of connect
 
-The same GPU costs wildly different amounts depending on how you rent it.
+Renting a GPU normally means going to it. You open a notebook or an SSH session, rebuild your
+environment there, copy your data across, and work inside somebody else's machine for as long
+as it lives. The training is the small part. The rest is infrastructure work that produces no
+results.
+
+Declaring inverts that. You say what a function needs and where it belongs; the session,
+the environment, the transfer and the teardown are arranged for you.
+
+### 🧠 You never leave the environment you were working in
+
+Your editor, your debugger, your notes, your data and your git history stay where they are.
+The declaration sends one function to the card and brings the result back, so the remote GPU
+is a detail of one function rather than a place you move into.
+
+That continuity is the point. You are not two people, one of whom lives in a browser tab with
+a different Python and no working directory. There is nothing to keep in sync and nothing to
+copy back before the session dies.
+
+```python
+@let.function(device=colab.G4, host="remote")
+def train(lr, bs):
+    ...
+
+train(lr=1e-4, bs=32)     # the same file you were already editing
+```
+
+### ⚡ There is no infrastructure step
+
+Nothing is turned on, and nothing is left running by accident. A call starts the session it
+needs and ends it when the work is done, so forgetting to stop a GPU is not a mistake you can
+make. Neither is installing packages: the environment comes from the `uv.lock` you already
+have, cached so the second session does not pay for it.
+
+The failure mode this removes is the expensive one. A forgotten instance bills overnight, and
+a session you spent twenty minutes preparing dies with everything in it.
+
+### 📈 Nothing is tied to one server
+
+A declaration names an accelerator shape, not a machine. So the same code runs on a Colab
+runtime, a lab box over SSH, an Elice allocation or this laptop by changing one line of
+configuration, and when one account runs out you add another rather than rewriting anything.
+
+That is also how the work scales sideways. Capacity is what the provider entry declares it
+has, so a sweep spreads across every card available to you, across accounts and across
+machines:
+
+```toml
+[colab_pro.devices]
+G4 = { count = 2 }            # two sessions on this account
+
+[lab_a100.devices]
+A100 = { indices = "0-3" }    # four cards in the shared box are ours
+```
+
+Six configurations then run six ways at once if six cards exist, on hardware that never had
+to be the same hardware. Nothing about the declaration changes when the pool grows.
+
+### 💸 What that makes affordable
+
+The same card costs wildly different amounts depending on which door you rent it through.
 
 | Same card, different door | Per hour |
 |---|---|
 | 🥇 Colab credits | **~975 KRW** |
 | 💸 Modal | ~4,070 KRW |
 
-That is a factor of four for identical silicon. For anyone paying out of pocket, it decides how many experiments get run.
-
-The catch is that the cheap door is a notebook: no persistent disk, eviction at any moment, and whichever accelerator happens to be free. So you spend your session re-installing packages, re-downloading weights, and babysitting a browser tab.
-
-**letify makes the cheap door behave like the expensive one.** You declare; it handles sessions, environments, caching and teardown.
+A factor of four for identical silicon. The cheap door is a notebook, though: no persistent
+disk, eviction at any moment, and whichever accelerator happens to be free. Everything above
+is what makes that door usable, so the cheapest option stops being the inconvenient one.
 
 <table>
-<tr><th width="50%">😖 Without letify</th><th width="50%">😌 With letify</th></tr>
+<tr><th width="50%">😖 Going to the GPU</th><th width="50%">😌 Declaring it</th></tr>
 <tr valign="top"><td>
 
 ```python
