@@ -5,7 +5,7 @@ subprocess behind the same framed protocol a remote runtime uses, so the protoco
 pool, the store and the release rule are all exercised rather than stubbed.
 
 A fake appears here only where the real thing needs something a test machine does not
-have: the Colab CLI, the Elice HTTP API, Modal's client, a cloud bucket
+have: the Colab CLI, the Elice HTTP API, the Modal adapter, a cloud bucket
 and nvidia-smi. They are small objects rather than mocks, so a test still asserts on
 what a caller observes instead of on which method was called.
 """
@@ -13,6 +13,7 @@ what a caller observes instead of on which method was called.
 from __future__ import annotations
 
 import base64
+import json
 import os
 import pickle
 import subprocess
@@ -400,153 +401,50 @@ def fake_elice():
 
 # -- Modal ---------------------------------------------------------------------
 
-
-class FakeSandbox:
-    """A Modal sandbox stand-in whose replies are framed by the real protocol.
-
-    Only the plumbing is fake. The bytes on the pipe are produced and read by the same
-    codec a real sandbox would use.
-    """
-
-    def __init__(
-        self,
-        outcomes: list[dict[str, Any]] | None = None,
-        *,
-        logs: list[str] | None = None,
-    ):
-        self.written: list[bytes] = []
-        self.terminated = False
-        self.terminate_error: BaseException | None = None
-        self.write_error: BaseException | None = None
-        self._outcomes = list(outcomes or [])
-        self._logs = list(logs or [])
-        self._ready = True
-        self.stdin = self
-
-    # stdin
-    def write(self, payload: bytes) -> None:
-        if self.write_error is not None:
-            raise self.write_error
-        self.written.append(payload)
-
-    def drain(self) -> None:
-        return None
-
-    def terminate(self) -> None:
-        if self.terminate_error is not None:
-            raise self.terminate_error
-        self.terminated = True
-
-    @property
-    def text(self) -> str:
-        return b"".join(self.written).decode()
-
-    @property
-    def stdout(self):
-        from letify.protocol import REPLY
-        from letify.protocol.worker import READY
-
-        lines: list[str] = []
-        if self._ready:
-            lines.append(READY + "\n")
-            self._ready = False
-        lines.extend(self._logs)
-        self._logs = []
-        if self._outcomes:
-            outcome = self._outcomes.pop(0)
-            blob = base64.b64encode(pickle.dumps(outcome, protocol=5)).decode()
-            lines.append(REPLY + blob + "\n")
-        return iter(lines)
+#: The standard library stand-in for the Modal adapter, speaking the same JSON lines.
+FAKE_MODAL_ADAPTER = Path(__file__).with_name("fake_modal_adapter.py")
 
 
-class FakeModalVolume:
-    """An in-memory stand-in for a Modal volume."""
+class FakeModalAdapter:
+    """Where the stand-in adapter records what it was asked, and how to make it misbehave."""
 
-    def __init__(self, name: str):
-        self.name = name
-        self.files: dict[str, bytes] = {}
+    def __init__(self, monkeypatch, state: Path):
+        self.state = state
+        self._monkeypatch = monkeypatch
 
-    def listdir(self, path: str, recursive: bool = False):
-        prefix = path.rstrip("/")
-        found = [key for key in self.files if key == prefix or key.startswith(prefix + "/")]
-        if not found:
-            raise FileNotFoundError(path)
-        return [types.SimpleNamespace(path=key) for key in found]
+    def requests(self, op: str | None = None) -> list[dict[str, Any]]:
+        log = self.state / "requests.jsonl"
+        if not log.is_file():
+            return []
+        found = [json.loads(line) for line in log.read_text(encoding="utf-8").splitlines()]
+        return [r for r in found if op is None or r["op"] == op]
 
-    def read_file(self, path: str):
-        yield self.files[path]
+    def env(self) -> dict[str, str]:
+        return json.loads((self.state / "env.json").read_text(encoding="utf-8"))
 
-    def batch_upload(self, force: bool = False):
-        return _FakeBatch(self)
+    def fail(self, *ops: str) -> None:
+        self._monkeypatch.setenv("FAKE_MODAL_FAIL", ",".join(ops))
 
-
-class _FakeBatch:
-    def __init__(self, volume: FakeModalVolume):
-        self.volume = volume
-
-    def __enter__(self) -> _FakeBatch:
-        return self
-
-    def __exit__(self, *exc: object) -> bool:
-        return False
-
-    def put_file(self, stream: Any, path: str) -> None:
-        self.volume.files[path] = stream.read()
-
-
-class FakeModal:
-    """The parts of the Modal client letify touches, recording what it was asked for."""
-
-    def __init__(self, sandbox: FakeSandbox | None = None):
-        self.sandbox = sandbox or FakeSandbox()
-        self.created: dict[str, Any] = {}
-        self.looked_up: list[str] = []
-        self.volumes: dict[str, FakeModalVolume] = {}
-        owner = self
-
-        class App:
-            @staticmethod
-            def lookup(name: str, create_if_missing: bool = False) -> str:
-                owner.looked_up.append(name)
-                return f"app:{name}"
-
-        class Image:
-            def __init__(self) -> None:
-                self.packages: tuple[str, ...] = ()
-
-            @staticmethod
-            def debian_slim() -> Any:
-                return Image()
-
-            def pip_install(self, *packages: str) -> Any:
-                self.packages = packages
-                return self
-
-        class Sandbox:
-            @staticmethod
-            def create(*args: str, **kwargs: Any) -> FakeSandbox:
-                owner.created = {"args": list(args), **kwargs}
-                return owner.sandbox
-
-        class Volume:
-            @staticmethod
-            def from_name(name: str, create_if_missing: bool = False) -> FakeModalVolume:
-                return owner.volumes.setdefault(name, FakeModalVolume(name))
-
-        self.App = App
-        self.Image = Image
-        self.Sandbox = Sandbox
-        self.Volume = Volume
+    def exit_on(self, *ops: str) -> None:
+        self._monkeypatch.setenv("FAKE_MODAL_EXIT", ",".join(ops))
 
 
 @pytest.fixture
-def fake_modal(monkeypatch):
-    def install(sandbox: FakeSandbox | None = None) -> FakeModal:
-        fake = FakeModal(sandbox)
-        monkeypatch.setitem(sys.modules, "modal", fake)
-        return fake
+def fake_modal(monkeypatch, tmp_path: Path) -> FakeModalAdapter:
+    """Run the stand-in adapter wherever letify would run the real one through uv.
 
-    return install
+    Only the command is replaced. The process, the pipes, the JSON lines and the
+    environment letify builds for the account are all real.
+    """
+    from letify import tools
+
+    state = tmp_path / "fake-modal"
+    monkeypatch.setenv("FAKE_MODAL_STATE", str(state))
+    monkeypatch.setattr(tools, "find_uv", lambda: "/usr/bin/uv")
+    monkeypatch.setattr(
+        tools, "modal_adapter_command", lambda uv: [sys.executable, str(FAKE_MODAL_ADAPTER)]
+    )
+    return FakeModalAdapter(monkeypatch, state)
 
 
 # -- cloud object stores -------------------------------------------------------

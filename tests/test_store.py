@@ -4,9 +4,9 @@ Spec sections pinned here: "Storage", "Content addressed layout", "Blob granular
 "Materializing into a runtime" and "Backends".
 
 The filesystem backend is the real one throughout. The gcs backend talks HTTP to a Cloud
-Storage endpoint served on loopback by conftest, and the Modal volume backend is driven
-through an in-memory stand-in, because a bucket needs an account; what is still real there
-is the key layout, the HTTP client and the operations letify performs.
+Storage endpoint served on loopback by conftest, and the Modal volume backend talks to the
+standard library stand-in for the Modal adapter, because a bucket needs an account; what
+is still real there is the key layout, the clients and the operations letify performs.
 """
 
 from __future__ import annotations
@@ -365,33 +365,70 @@ def test_gcloud_is_asked_when_nothing_else_answers(no_google_login, monkeypatch)
     assert asked == [["/usr/bin/gcloud", "auth", "print-access-token"]]
 
 
-def test_a_modal_volume_backend_keeps_the_documented_layout(fake_modal) -> None:
-    fake_modal()
-    backend = ModalBackend("letify-study")
-    backend.put("ab12", b"payload")
-    assert backend.has("ab12") is True
-    assert backend.has("absent") is False
-    assert backend.get("ab12") == b"payload"
-    assert list(backend.list_digests()) == ["ab12"]
-    assert backend.missing(["ab12", "absent"]) == ["absent"]
-    backend.write_ref("ckpt/run", "ab12")
-    assert backend.read_ref("ckpt/run") == "ab12"
-    assert backend.read_ref("ckpt/absent") is None
+def test_a_modal_volume_backend_keeps_the_documented_layout(isolated_home, fake_modal) -> None:
+    backend = ModalBackend("letify-study", account="modal_lab")
+    try:
+        assert list(backend.list_digests()) == []
+        backend.put("ab12", b"payload")
+        assert backend.has("ab12") is True
+        assert backend.has("absent") is False
+        assert backend.get("ab12") == b"payload"
+        assert list(backend.list_digests()) == ["ab12"]
+        assert backend.missing(["ab12", "absent"]) == ["absent"]
+        backend.write_ref("ckpt/run", "ab12")
+        assert backend.read_ref("ckpt/run") == "ab12"
+        assert backend.read_ref("ckpt/absent") is None
+    finally:
+        backend.close()
+    # Spec "Modal adapter": the volume is reached as the account, through the adapter.
+    expected = Path.home() / ".letify" / "accounts" / "modal_lab" / "modal.toml"
+    assert fake_modal.env()["MODAL_CONFIG_PATH"] == str(expected)
+    assert {r["volume"] for r in fake_modal.requests("volume_put")} == {"letify-study"}
 
 
-# -- Spec: Packaging, a backend whose package is absent ------------------------
-
-
-@pytest.mark.parametrize(
-    ("cls", "argument", "module", "extra"),
-    [(ModalBackend, "volume", "modal", "modal")],
-)
-def test_a_backend_whose_package_is_absent_says_how_to_install_it(
-    cls, argument: str, module: str, extra: str, no_module
+def test_reading_a_modal_blob_that_is_absent_is_a_runtime_failure(
+    isolated_home, fake_modal
 ) -> None:
-    no_module(module)
-    with pytest.raises(letify.ProviderUnavailable, match=f"letify\\[{extra}\\]"):
-        cls(argument)
+    backend = ModalBackend("letify-study", account="modal_lab")
+    try:
+        with pytest.raises(letify.RuntimeFailure, match="does not exist"):
+            backend.get("absent")
+    finally:
+        backend.close()
+
+
+# -- Spec: Packaging, a backend whose tool is absent ---------------------------
+
+
+def test_a_modal_backend_without_uv_says_uv_is_needed(isolated_home, patch_which) -> None:
+    from letify import tools
+
+    patch_which(tools, present=False)
+    with pytest.raises(letify.ProviderUnavailable, match="uv was not found"):
+        ModalBackend("volume", account="modal_lab")
+
+
+def test_a_modal_backend_with_no_account_is_a_configuration_error() -> None:
+    with pytest.raises(letify.ConfigError, match="account"):
+        ModalBackend("volume")
+
+
+def test_a_volume_on_a_modal_provider_acts_as_that_account(isolated_home, fake_modal) -> None:
+    from conftest import provider_of
+
+    from letify.providers.modal import Modal
+
+    volume = Volume(provider_of(Modal, "modal_lab"), "cache")
+    backend = volume.store.backend
+    assert isinstance(backend, ModalBackend)
+    assert backend.account == "modal_lab"
+    assert backend.volume_name == "letify-cache"
+
+
+def test_a_volume_elsewhere_naming_the_modal_backend_needs_an_account(let) -> None:
+    volume = Volume(let.providers.local, "cache", {"backend": "modal"})
+    with pytest.raises(letify.ConfigError, match="account"):
+        volume.store  # noqa: B018
 
 
 # -- Spec: Storage, volumes ----------------------------------------------------
