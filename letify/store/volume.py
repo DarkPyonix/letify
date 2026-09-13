@@ -84,6 +84,9 @@ class Volume:
             }
             option, value = backends.default_location(backend, self.name)
             options.setdefault(option, value)
+            if backend == "modal" and self.provider.kind == "modal":
+                # A Modal volume acts as the account that owns it unless told otherwise.
+                options.setdefault("account", self.provider.alias)
             self._store = Store(backends.build(backend, **options))
         return self._store
 

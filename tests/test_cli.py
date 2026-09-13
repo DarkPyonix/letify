@@ -575,15 +575,93 @@ def test_an_elice_endpoint_is_recorded_only_when_it_is_not_the_default(isolated_
     assert "portal.example" in (Path.home() / ".letify" / "config.toml").read_text(encoding="utf-8")
 
 
-def test_a_modal_workspace_is_recorded_and_no_token_is_taken(
-    isolated_home, patch_which, capsys
+def modal_sign_in(monkeypatch, *, returncode: int = 0, writes: bool = True) -> list[dict]:
+    """Stand in for Modal's own sign in: record the call and write the token file it names."""
+    calls: list[dict] = []
+
+    def run(command, **kwargs):
+        calls.append({"command": list(command), **kwargs})
+        if writes:
+            target = Path(kwargs["env"]["MODAL_CONFIG_PATH"])
+            target.write_text('[lab-team]\ntoken_id = "ak-1"\nactive = true\n', encoding="utf-8")
+        return FakeCompleted(returncode=returncode)
+
+    monkeypatch.setattr(login.subprocess, "run", run)
+    return calls
+
+
+def test_logging_in_to_modal_runs_its_token_flow_into_the_account_directory(
+    isolated_home, patch_which, monkeypatch, capsys
 ) -> None:
-    # Modal keeps its own token in ~/.modal.toml, which letify has no way to refresh.
-    patch_which(login, present=True)
-    assert main(["login", "modal", "m", "--workspace", "lab-team", "--no-input"]) == 0
+    # Spec "Logging in": modal is never needed on PATH or in the project's environment.
+    # letify runs `modal token new` through uv, and the token lands in the account
+    # directory because MODAL_CONFIG_PATH points there.
+    from letify import tools
+
+    patch_which(tools, present=True)
+    calls = modal_sign_in(monkeypatch)
+    assert main(["login", "modal", "modal_lab", "--workspace", "lab-team", "--no-input"]) == 0
+
+    [call] = calls
+    assert call["command"][:3] == ["/usr/bin/uv", "tool", "run"]
+    assert "modal>=1.0,<2" in call["command"]
+    assert call["command"][-5:] == ["modal", "token", "new", "--profile", "lab-team"]
+    token = Path.home() / ".letify" / "accounts" / "modal_lab" / "modal.toml"
+    assert call["env"]["MODAL_CONFIG_PATH"] == str(token)
+    assert "MODAL_TOKEN_ID" not in call["env"]
+    # Interactive: Modal prints a link and waits for the browser, so nothing is captured.
+    assert "capture_output" not in call and "stdout" not in call
+
     home_file = (Path.home() / ".letify" / "config.toml").read_text(encoding="utf-8")
     assert 'workspace = "lab-team"' in home_file
     assert "token" not in home_file
+    assert token.is_file()
+
+
+def test_a_modal_login_without_a_workspace_uses_the_profile_modal_picks(
+    isolated_home, patch_which, monkeypatch, capsys
+) -> None:
+    from letify import tools
+
+    patch_which(tools, present=True)
+    calls = modal_sign_in(monkeypatch)
+    assert main(["login", "modal", "modal_lab", "--no-input"]) == 0
+    assert calls[0]["command"][-3:] == ["modal", "token", "new"]
+    assert "workspace" not in (Path.home() / ".letify" / "config.toml").read_text("utf-8")
+
+
+def test_a_modal_login_that_fails_writes_nothing(
+    isolated_home, patch_which, monkeypatch, capsys
+) -> None:
+    from letify import tools
+
+    patch_which(tools, present=True)
+    modal_sign_in(monkeypatch, returncode=1)
+    assert main(["login", "modal", "modal_lab", "--no-input"]) == 1
+    assert not (Path.home() / ".letify" / "config.toml").exists()
+    assert not (Path.home() / ".letify" / "accounts" / "modal_lab" / "modal.toml").exists()
+
+
+def test_a_modal_login_that_leaves_no_token_writes_nothing(
+    isolated_home, patch_which, monkeypatch, capsys
+) -> None:
+    from letify import tools
+
+    patch_which(tools, present=True)
+    modal_sign_in(monkeypatch, writes=False)
+    assert main(["login", "modal", "modal_lab", "--no-input"]) == 1
+    assert "modal.toml" in capsys.readouterr().err
+    assert not (Path.home() / ".letify" / "config.toml").exists()
+
+
+def test_logging_in_to_modal_without_uv_says_how_to_get_it(
+    isolated_home, patch_which, capsys
+) -> None:
+    from letify import tools
+
+    patch_which(tools, present=False)
+    assert main(["login", "modal", "modal_lab", "--no-input"]) == 1
+    assert "uv was not found" in capsys.readouterr().err
 
 
 def test_a_kind_with_no_login_says_which_kinds_have_one(isolated_home, capsys) -> None:

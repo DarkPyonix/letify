@@ -68,7 +68,7 @@ A declaration taking two cards halves the width on a four card machine, which is
 ```
 Provider (abstract)
 ├── Local                 persistent
-├── Modal                 persistent
+├── Modal                 persistent, reached through the Modal adapter
 └── Shell                 ephemeral by default, reached through the connection pipeline
     ├── Colab             session created by the Colab CLI, rendezvous over colab exec
     ├── Tunnel            a machine behind NAT, rendezvous through letify client shell connect
@@ -226,6 +226,35 @@ A **one-shot channel** can only run a command and collect its output. Every call
 Both hand back the user's own stdout separately from the outcome, because they share one stream.
 
 The worker source cannot be sent on standard input as a script, because `python -` reads to end of file before compiling anything and the pipe has to stay open for requests. A small bootstrap stub passed with `-c` reads a length-prefixed base64 blob, executes it, and leaves standard input where it was.
+
+### Modal adapter <!-- id: modal-adapter -->
+
+> The letify process never imports `modal`. A small adapter runs in its own uv environment and letify talks to it in JSON lines over its standard input and output.
+
+The adapter is `letify/providers/modal_adapter.py`. It imports only the standard library and `modal`, so it runs by file path and needs none of letify's own dependencies. letify starts it with:
+
+```
+uv run --no-project --python 3.12 --with "modal>=1.0,<2" python <path to modal_adapter.py>
+```
+
+The Modal version range is pinned in `tools.MODAL`. The adapter runs with `MODAL_CONFIG_PATH` set to `~/.letify/accounts/<alias>/modal.toml`, and with any inherited `MODAL_TOKEN_ID`, `MODAL_TOKEN_SECRET` and `MODAL_PROFILE` removed. The profile Modal uses is the one the sign in activated in that file. So the account file alone decides which Modal account acts, and two accounts coexist on one machine.
+
+The protocol is one JSON object per line. letify sends `{"id": <int>, "op": <name>, ...}` and waits for the line with the same `id`. The adapter answers `{"id": <int>, "ok": true, "value": <any>}`, or `{"id": <int>, "ok": false, "kind": <kind>, "error": <text>}`. `kind` is `unavailable` when `modal` cannot be imported, `not_found` when a volume path does not exist, and `failure` otherwise. Requests are answered one at a time, in order.
+
+| Op | Fields | Value |
+|---|---|---|
+| `hello` | none | `{"modal": <installed Modal version>}` |
+| `create` | `app`, `args`, `packages`, `gpu`, `timeout` | `{"sandbox": <id>}`. Looks up or creates the app, builds `debian_slim` with `packages` installed, and starts `args` in a sandbox |
+| `write` | `sandbox`, `data` | `null`. Writes the text to the sandbox's standard input and drains it |
+| `read_until` | `sandbox`, `prefixes` | `{"lines": [...], "eof": <bool>}`. The sandbox's stdout lines up to and including the first that starts with one of `prefixes`, or every line left when the stream ends |
+| `terminate` | `sandbox` | `null` |
+| `volume_put` | `volume`, `path`, `data` | `null`. `data` is base64. The volume is created when missing |
+| `volume_get` | `volume`, `path` | base64 of the file |
+| `volume_list` | `volume`, `path` | the paths under `path`, recursively |
+
+The persistent channel to a sandbox is that sandbox's standard input and output, carried by `write` and `read_until`. The sandbox runs the bootstrap stub `python3 -u -c BOOTSTRAP`, and the worker source goes out first as the length-prefixed base64 blob described above. A `read_until` that ends at end of stream without a reply raises `ProtocolError`.
+
+A missing uv raises `ProviderUnavailable` naming uv. A reply of kind `unavailable` raises `ProviderUnavailable` for `modal`. An adapter process that exits, or prints a line that is not the reply it was waiting for, raises `RuntimeFailure` carrying the adapter's standard error, because that is an infrastructure failure. A reply of kind `failure` raises `RuntimeFailure` with the adapter's message. One adapter process serves one provider or one backend and exits when its standard input closes.
 
 ## Call protocol
 
@@ -413,7 +442,9 @@ Detection costs one `stat` per path per call, and packing is skipped when the ma
 |---|---|---|
 | `filesystem` | `Local`, `Shell`, `Elice` | A directory. The local machine can be the origin others pull from. On Elice it sits on the machine's own disk. |
 | `gcs` | `Colab` | A Colab runtime is a Compute Engine virtual machine, so this is an internal transfer. Use a multi-region bucket, because runtime placement is not selectable. The client is the standard library HTTP client against the Cloud Storage JSON API. |
-| `modal` | `Modal` | A Modal volume, mounted beside the container. |
+| `modal` | `Modal` | A Modal volume, mounted beside the container. Reached through the Modal adapter, never through a `modal` import in the letify process. |
+
+The `modal` backend acts as one Modal account. A volume option `account` names its alias, and a volume on a `Modal` provider defaults it to that provider's alias. A volume on another provider that names the `modal` backend without `account` raises `ConfigError`, because there is no account to act as.
 
 Every backend answers "which of these digests are missing" with one listing rather than one request per digest, because object level requests are billed and add latency.
 
@@ -449,7 +480,7 @@ A package the lock file names is installed in the runtime and referenced by name
 
 > A `Shell` reaches its machine through a connection pipeline: several strategies are tried at once, the fastest acceptable one wins, and the winner is cached per account.
 
-`Modal` and `Local` are not part of this. Modal is reached through its own API, and Local starts its worker as a child process.
+`Modal` and `Local` are not part of this. Modal is reached through the Modal adapter, described in [Modal adapter](#modal-adapter), and Local starts its worker as a child process.
 
 The measurements behind the order and the rules below are in [NETWORK.md](NETWORK.md#connection-pipeline-measurements).
 
@@ -665,6 +696,8 @@ An account that is already in the home file is not asked for again. `letify logi
 
 `letify login colab <alias>` signs in to Colab itself. It runs `colab sessions` through `uv tool run --python 3.13 --from google-colab-cli colab`, with `HOME` set to `~/.letify/accounts/<alias>/`. The Colab CLI keeps its token at a fixed path under its home directory, so the token lands in the account directory and the CLI refreshes it on later calls. Every later Colab command runs with the same `HOME`, which is what lets two Colab accounts live on one machine. uv's cache, Python installs and tools stay pinned to the real home, so a changed `HOME` downloads nothing again. A sign in that exits non zero writes nothing.
 
+`letify login modal <alias>` signs in to Modal itself. It first asks for an optional workspace. It then runs `modal token new` through `uv tool run --python 3.12 --with "modal>=1.0,<2" --from modal modal`, with `MODAL_CONFIG_PATH` set to `~/.letify/accounts/<alias>/modal.toml` and, when a workspace was given, `--profile <workspace>`. Modal's command prints a link and waits for the browser approval, so `modal` never has to be on `PATH` or in the project's environment. The token lands in the account directory, and the adapter reads it from there. A sign in that exits non zero, or exits zero without writing `modal.toml`, writes nothing to either `config.toml` and removes a `modal.toml` the attempt created.
+
 Credentials never enter either `config.toml`. A token goes to a file in the account directory. An SSH password is never stored at all, which the next section explains.
 
 ### SSH authentication
@@ -684,17 +717,17 @@ Two other approaches were considered and are not the default. Connection multipl
 
 ### What each kind asks for
 
-> Where a vendor owns the credential, letify records the account and leaves the credential to the vendor.
+> Where a vendor owns the credential format, letify runs the vendor's own sign in and points it at the account directory.
 
 | Kind | Written to the home file | Credential |
 |---|---|---|
 | `shell`, `tunnel` | address, user, port, key path | an SSH key, installed by `login`; no password stored |
 | `elice` | endpoint, zone, machine | access token in `~/.letify/accounts/<alias>/access_token` |
-| `colab` | account email | the `colab` CLI owns it; `login` checks the CLI is present and says which command authenticates it |
-| `modal` | workspace | the `modal` CLI owns it, in `~/.modal.toml`; `login` checks it is present |
+| `colab` | account email | the Colab CLI's token, written by its own sign in under `~/.letify/accounts/<alias>/` |
+| `modal` | workspace, when given | Modal's token, written by `modal token new` to `~/.letify/accounts/<alias>/modal.toml` |
 | `local` | nothing | none; this machine needs no declaration |
 
-For `colab` and `modal`, letify does not touch the vendor's credential store. Wrapping another tool's login would mean owning a token letify has no way to refresh, and the vendor's own command already works.
+For `colab` and `modal`, letify runs the vendor's sign in through uv and does not parse or refresh the token. The vendor's client reads and refreshes it from the account directory.
 
 ## letify-core
 
@@ -754,7 +787,7 @@ Unified memory is the one exception that no amount of implementation removes. Ma
 
 letify is a dependency inside a research repository, so it adds as little as possible to that repository's environment.
 
-Provider tools run out of process and never in the user's `.venv`. Colab runs through `uv tool run --from google-colab-cli colab`. Modal runs in a separate uv environment that letify manages. Elice uses the standard library HTTP client. The `gcs` blob store uses a standard library client too.
+Provider tools run out of process and never in the user's `.venv`. Colab runs through `uv tool run --from google-colab-cli colab`. Modal's client runs in the Modal adapter, in a uv environment started with `uv run --no-project --with "modal>=1.0,<2"`, and its sign in runs through `uv tool run --from modal modal`. Elice uses the standard library HTTP client. The `gcs` blob store uses a standard library client too.
 
 uv must be installed. letify finds it from the `UV` environment variable, then from `PATH`. If neither has it, letify raises an error that says uv is required.
 
@@ -776,7 +809,7 @@ Linux wheels are built inside the `manylinux_2_28` containers, so the binaries n
 > Implemented and unimplemented, stated plainly so nobody builds on a promise.
 
 - **`letify-driver` covers one milestone.** The entry points a PyTorch process needs to start up and run one kernel are forwarded and verified against a real GPU. Kernel argument marshalling reads the pointer list without knowing the kernel's signature, and fatbin size comes from a conservative window rather than the image header. Both need a real workload to shape them.
-- **`Modal` and `Elice` are not exercised against the live services.** Their code follows each service's published interface, and the Elice paths come from Elice's own Terraform provider, but neither has been run end to end.
+- **`Modal` and `Elice` are not exercised against the live services.** Their code follows each service's published interface, and the Elice paths come from Elice's own Terraform provider, but neither has been run end to end. The Modal adapter's calls were checked against the signatures of Modal 1.5.5, and `letify login modal` has not been run against Modal's sign in.
 - **The connection pipeline is not exercised against live networks.** `Rendezvous`, `Strategy`, `Link`, `Probe`, `Pipeline`, `LinkCache` and the remote agent are implemented and tested over loopback sockets and faked commands. Installing and starting `sshd` on a Colab VM over `colab exec` is not yet checked against a live runtime.
 - **The Elice API runs no command on a machine.** The paths letify uses (virtual machine, allocation, instance type, pricing) create and power machines only, so Elice's remote half runs over forward SSH to the allocated machine, and the punch and Tailcat strategies need that SSH to succeed first.
 - **Orphan reconciliation is not implemented.** A session whose controlling machine was killed outright is released by the lease on the providers where the process is the cost. Where the platform bills for the machine and takes no deadline, nothing ends it: an Elice allocation bills until a delete is issued. The intended answer is that the next letify process asks the provider what is running under this project's name and ends what nothing is watching, with a command to do it on demand. Neither exists yet.

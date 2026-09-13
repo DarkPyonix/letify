@@ -15,7 +15,7 @@ from importlib import import_module
 from pathlib import Path
 
 import pytest
-from conftest import FakeCompleted, FakeResponse, FakeSandbox, provider_of
+from conftest import FakeCompleted, FakeResponse, provider_of
 
 import letify
 from letify import providers
@@ -24,6 +24,7 @@ from letify.config.schema import ProviderConfig
 from letify.declare.instance import Host, Instance
 from letify.providers import colab as colab_module
 from letify.providers import local as local_module
+from letify.providers import modal as modal_module
 from letify.providers import shell as shell_module
 from letify.providers.base import Provider
 from letify.providers.colab import ALIASES, Colab
@@ -35,7 +36,7 @@ from letify.providers.elice import (
     Elice,
 )
 from letify.providers.local import Local
-from letify.providers.modal import Modal, SandboxChannel
+from letify.providers.modal import Adapter, Modal, SandboxChannel
 from letify.providers.naming import gib_from_mib, normalize_gpu
 from letify.providers.shell import Shell
 from letify.providers.tunnel import Tunnel
@@ -135,10 +136,14 @@ def test_a_provider_is_built_without_importing_its_optional_dependency(kind: str
     assert isinstance(built, Provider)
 
 
-def test_a_provider_whose_client_is_absent_says_which_extra_installs_it(no_module) -> None:
-    no_module("modal")
-    with pytest.raises(letify.ProviderUnavailable, match=r"letify\[modal\]"):
-        provider_of(Modal).client()
+def test_a_modal_provider_without_uv_says_uv_is_needed(isolated_home, patch_which) -> None:
+    # Spec "Modal adapter": Modal's client runs in a uv environment, so uv is the one
+    # thing this machine needs, and the error names it rather than a Python package.
+    patch_which(tools_module, present=False)
+    provider = provider_of(Modal, "m")
+    runtime = type("R", (), {"name": "letify-h100-1", "instance": provider.H100})()
+    with pytest.raises(letify.ProviderUnavailable, match="uv was not found"):
+        provider.open_channel(runtime)
 
 
 # -- Spec: Provider properties -------------------------------------------------
@@ -1065,122 +1070,214 @@ def test_modal_translates_an_instance_into_the_name_its_api_expects() -> None:
     assert provider.RTX_PRO_6000.vram_gb == 96
 
 
-# -- Spec: Channels, the Modal sandbox ----------------------------------------
+# -- Spec: Modal adapter -------------------------------------------------------
 
 
-def test_a_modal_sandbox_keeps_a_process_alive_for_framed_requests(fake_modal) -> None:
-    # A sandbox rather than a function call, because without a living process there is no
-    # object table for a handle to point at.
-    fake = fake_modal()
-    provider = provider_of(Modal, "m", app="study", timeout=1800)
-    runtime = type("R", (), {"name": "letify-h100-1", "instance": provider.H100})()
-    channel = provider.open_channel(runtime)
-
-    assert isinstance(channel, SandboxChannel)
-    assert channel.persistent is True
-    assert fake.looked_up == ["study"]
-    assert fake.created["gpu"] == "H100"
-    assert fake.created["timeout"] == 1800
-    # Spec "Channels": not `python -`, which reads standard input to the end before running
-    # anything, so the requests that follow would be compiled as source.
-    from letify.protocol.worker import BOOTSTRAP
-
-    assert fake.created["args"] == ["python3", "-u", "-c", BOOTSTRAP]
-    assert fake.created["image"].packages == ("cloudpickle", "blake3")
+def modal_runtime(provider: Modal):
+    return type("R", (), {"name": "letify-h100-1", "instance": provider.H100})()
 
 
-def test_a_sandbox_started_the_way_modal_starts_it_answers_requests(fake_modal) -> None:
-    # The sandbox command and the bytes the channel writes, run with a real Python: the
-    # worker has to come up and answer a framed request on the same pipe.
-    import subprocess
+def test_the_modal_adapter_runs_in_its_own_uv_environment_with_a_pinned_modal() -> None:
+    command = tools_module.modal_adapter_command("/usr/bin/uv")
+    assert command[:6] == ["/usr/bin/uv", "run", "--no-project", "--python", "3.12", "--with"]
+    assert command[6] == "modal>=1.0,<2"
+    assert command[7] == "python"
+    assert Path(command[8]) == Path(modal_module.__file__).with_name("modal_adapter.py")
+
+
+def test_the_modal_adapter_imports_nothing_outside_the_standard_library_at_load() -> None:
+    # It runs by file path in an environment that holds only modal, so neither letify nor
+    # letify's own dependencies may be imported, and modal only when an op needs it.
+    import ast
     import sys
 
-    from letify import protocol
-    from letify.protocol.worker import READY
+    source = Path(modal_module.__file__).with_name("modal_adapter.py").read_text("utf-8")
+    top: set[str] = set()
+    for node in ast.parse(source).body:
+        if isinstance(node, ast.Import):
+            top.update(alias.name.split(".")[0] for alias in node.names)
+        elif isinstance(node, ast.ImportFrom):
+            assert node.level == 0, "a relative import needs the letify package"
+            top.add(str(node.module).split(".")[0])
+    assert top <= set(sys.stdlib_module_names) | {"__future__"}, top
 
-    fake = fake_modal()
-    provider = provider_of(Modal, "m")
-    runtime = type("R", (), {"name": "letify-h100-1", "instance": provider.H100})()
+
+def test_the_real_modal_adapter_answers_a_missing_modal_as_unavailable() -> None:
+    # The real adapter file, run in isolated mode so letify is not importable, in an
+    # interpreter that has no modal: the reply must say unavailable, not crash.
+    import sys
+
+    script = Path(modal_module.__file__).with_name("modal_adapter.py")
+    adapter = Adapter([sys.executable, "-I", str(script)], env=None, name="m")
+    try:
+        with pytest.raises(letify.ProviderUnavailable, match="modal"):
+            adapter.request("hello")
+    finally:
+        adapter.close()
+
+
+def test_the_modal_adapter_acts_as_the_account_in_the_account_directory(
+    isolated_home, fake_modal, monkeypatch
+) -> None:
+    # A token in the caller's environment would override the account file, so two
+    # accounts could not coexist. It is removed, and the account's modal.toml decides.
+    monkeypatch.setenv("MODAL_TOKEN_ID", "ak-someone-else")
+    monkeypatch.setenv("MODAL_TOKEN_SECRET", "as-someone-else")
+    monkeypatch.setenv("MODAL_PROFILE", "someone-else")
+    provider = provider_of(Modal, "modal_lab")
+    runtime = modal_runtime(provider)
+    provider.open_channel(runtime)
+    provider.stop(runtime)
+
+    env = fake_modal.env()
+    expected = Path.home() / ".letify" / "accounts" / "modal_lab" / "modal.toml"
+    assert env["MODAL_CONFIG_PATH"] == str(expected)
+    assert "MODAL_TOKEN_ID" not in env
+    assert "MODAL_TOKEN_SECRET" not in env
+    assert "MODAL_PROFILE" not in env
+
+
+def test_a_modal_sandbox_keeps_a_process_alive_for_framed_requests(
+    isolated_home, fake_modal
+) -> None:
+    # A sandbox rather than a function call, because without a living process there is no
+    # object table for a handle to point at.
+    from letify.protocol.worker import BOOTSTRAP
+
+    provider = provider_of(Modal, "m", app="study", timeout=1800)
+    runtime = modal_runtime(provider)
     channel = provider.open_channel(runtime)
-    channel.start()
-    stdin = fake.sandbox.text + protocol.encode_request({"op": "stat"}) + "\n"
-    stdin += protocol.SHUTDOWN + "\n"
+    try:
+        assert isinstance(channel, SandboxChannel)
+        assert channel.persistent is True
+        [created] = fake_modal.requests("create")
+        assert created["app"] == "study"
+        assert created["gpu"] == "H100"
+        assert created["timeout"] == 1800
+        # Spec "Channels": not `python -`, which reads standard input to the end before
+        # running anything, so the requests that follow would be compiled as source.
+        assert created["args"] == ["python3", "-u", "-c", BOOTSTRAP]
+        assert created["packages"] == ["cloudpickle", "blake3"]
+    finally:
+        provider.stop(runtime)
 
-    result = subprocess.run(
-        [sys.executable, *fake.created["args"][1:]],
-        input=stdin,
-        capture_output=True,
-        text=True,
-        timeout=60,
-    )
 
-    assert READY in result.stdout, result.stderr
-    assert protocol.REPLY in result.stdout, result.stderr
+def test_a_sandbox_started_the_way_modal_starts_it_answers_requests(
+    isolated_home, fake_modal
+) -> None:
+    # The stand-in runs the requested command as a real process, so the worker has to
+    # come up from the bootstrap stub and answer framed requests over the adapter.
+    provider = provider_of(Modal, "m")
+    runtime = modal_runtime(provider)
+    channel = provider.open_channel(runtime)
+    try:
+        assert channel.call(len, ([1, 2, 3],), {})[0] == 3
+        assert channel.call(sum, ([1, 2, 3],), {})[0] == 6
+    finally:
+        channel.close()
+        provider.stop(runtime)
 
 
-def test_a_sandbox_channel_sends_the_worker_once_and_then_framed_requests() -> None:
-    sandbox = FakeSandbox(outcomes=[{"ok": True, "value": 42}], logs=["epoch 1\n"])
-    channel = SandboxChannel(sandbox, name="letify-h100-1")
-    channel.start()
-    channel.start()
-    value, logs = channel.request({"op": "stat"})
-    assert value == 42
-    assert logs == "epoch 1\n"
-    # The worker source went out exactly once, length prefixed and base64 encoded for the
-    # bootstrap stub.
+def test_a_sandbox_channel_sends_the_worker_once_and_then_framed_requests(
+    isolated_home, fake_modal
+) -> None:
     import base64
 
     from letify.protocol.worker import SOURCE
 
-    encoded = base64.b64encode(SOURCE.encode()).decode()
-    assert sandbox.text.count(f"{len(encoded)}\n{encoded}") == 1
-
-
-def test_a_sandbox_call_carries_the_pickled_function(fake_modal) -> None:
-    sandbox = FakeSandbox(outcomes=[{"ok": True, "value": 3}])
-    channel = SandboxChannel(sandbox, name="letify-h100-1")
-    assert channel.call(len, ([1, 2, 3],), {}) == (3, "")
-
-
-def test_a_sandbox_that_stops_without_replying_is_a_protocol_error() -> None:
-    channel = SandboxChannel(FakeSandbox(outcomes=[], logs=["Killed\n"]), name="letify-h100-1")
-    with pytest.raises(letify.ProtocolError, match="died before it finished"):
-        channel.request({"op": "stat"})
-
-
-def test_closing_a_sandbox_channel_asks_the_worker_to_shut_down() -> None:
-    sandbox = FakeSandbox()
-    channel = SandboxChannel(sandbox, name="letify-h100-1")
-    channel.close()
-    assert "__LETIFY_SHUTDOWN__" in sandbox.text
-
-
-def test_closing_a_sandbox_whose_pipe_is_already_gone_is_harmless() -> None:
-    sandbox = FakeSandbox()
-    sandbox.write_error = RuntimeError("the sandbox is gone")
-    assert SandboxChannel(sandbox, name="letify-h100-1").close() is None
-
-
-def test_stopping_a_modal_runtime_terminates_its_sandbox(fake_modal) -> None:
-    sandbox = FakeSandbox()
-    fake_modal(sandbox)
     provider = provider_of(Modal, "m")
-    runtime = type("R", (), {"name": "letify-h100-1", "instance": provider.H100})()
+    runtime = modal_runtime(provider)
+    channel = provider.open_channel(runtime)
+    try:
+        channel.start()
+        channel.start()
+        channel.call(len, ("abc",), {})
+        encoded = base64.b64encode(SOURCE.encode()).decode()
+        written = "".join(r["data"] for r in fake_modal.requests("write"))
+        # The worker source went out exactly once, length prefixed and base64 encoded for
+        # the bootstrap stub.
+        assert written.count(f"{len(encoded)}\n{encoded}") == 1
+    finally:
+        provider.stop(runtime)
+
+
+def test_a_sandbox_that_stops_without_replying_is_a_protocol_error(
+    isolated_home, fake_modal
+) -> None:
+    adapter = Adapter.for_account("m")
+    try:
+        created = adapter.request(
+            "create",
+            app="letify",
+            args=["python3", "-c", "print('Killed')"],
+            packages=[],
+            gpu=None,
+            timeout=60,
+        )
+        channel = SandboxChannel(adapter, created["sandbox"], name="letify-h100-1")
+        with pytest.raises(letify.ProtocolError, match="died before it finished") as caught:
+            channel.request({"op": "stat"})
+        assert "Killed" in str(caught.value)
+    finally:
+        adapter.close()
+
+
+def test_closing_a_sandbox_channel_asks_the_worker_to_shut_down(isolated_home, fake_modal) -> None:
+    provider = provider_of(Modal, "m")
+    runtime = modal_runtime(provider)
+    channel = provider.open_channel(runtime)
+    channel.close()
+    provider.stop(runtime)
+    assert "__LETIFY_SHUTDOWN__" in "".join(r["data"] for r in fake_modal.requests("write"))
+
+
+def test_closing_a_sandbox_whose_adapter_is_already_gone_is_harmless(
+    isolated_home, fake_modal
+) -> None:
+    provider = provider_of(Modal, "m")
+    runtime = modal_runtime(provider)
+    channel = provider.open_channel(runtime)
+    provider.adapter().close()
+    assert channel.close() is None
+
+
+def test_stopping_a_modal_runtime_terminates_its_sandbox(isolated_home, fake_modal) -> None:
+    provider = provider_of(Modal, "m")
+    runtime = modal_runtime(provider)
     provider.open_channel(runtime)
     provider.stop(runtime)
-    assert sandbox.terminated is True
+    assert [r["sandbox"] for r in fake_modal.requests("terminate")] == ["sb-1"]
     # A sandbox that is already gone is fine, and so is one that was never opened.
     assert provider.stop(runtime) is None
 
 
-def test_a_sandbox_that_will_not_terminate_does_not_break_the_teardown(fake_modal) -> None:
-    sandbox = FakeSandbox()
-    sandbox.terminate_error = RuntimeError("already gone")
-    fake_modal(sandbox)
+def test_a_sandbox_that_will_not_terminate_does_not_break_the_teardown(
+    isolated_home, fake_modal
+) -> None:
+    fake_modal.fail("terminate")
     provider = provider_of(Modal, "m")
-    runtime = type("R", (), {"name": "letify-h100-1", "instance": provider.H100})()
+    runtime = modal_runtime(provider)
     provider.open_channel(runtime)
     assert provider.stop(runtime) is None
+
+
+def test_an_adapter_that_exits_is_an_infrastructure_failure_carrying_its_stderr(
+    isolated_home, fake_modal
+) -> None:
+    # Retryable, because nothing of the user's code ran.
+    fake_modal.exit_on("create")
+    provider = provider_of(Modal, "m")
+    with pytest.raises(letify.RuntimeFailure, match="crashed on create"):
+        provider.open_channel(modal_runtime(provider))
+
+
+def test_a_failure_the_adapter_reports_is_raised_with_its_message(
+    isolated_home, fake_modal
+) -> None:
+    fake_modal.fail("create")
+    provider = provider_of(Modal, "m")
+    with pytest.raises(letify.RuntimeFailure, match="create was refused by the fake"):
+        provider.open_channel(modal_runtime(provider))
 
 
 # -- Spec: Provider model, reaching providers from the launcher -----------------
