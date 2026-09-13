@@ -1054,7 +1054,9 @@ def test_a_provider_with_a_fast_path_does_not_warn(
     patch_run, recwarn, monkeypatch, tmp_path
 ) -> None:
     # A letify-core build on the developer's machine must not decide this answer.
-    from letify.remoting import probe as probe_module
+    import importlib
+
+    probe_module = importlib.import_module("letify.remoting.probe")
 
     monkeypatch.setattr(probe_module, "LIB_DIR", tmp_path)
     monkeypatch.delenv("LETIFY_CORE_PATH", raising=False)
