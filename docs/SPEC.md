@@ -74,7 +74,7 @@ Provider (abstract)
 └── Shell                 ephemeral by default, reached through the connection pipeline
     ├── Colab             session created by the Colab CLI, rendezvous over colab exec
     ├── Tunnel            a machine behind NAT, rendezvous through letify client shell connect
-    └── Elice             machine allocated through the Elice Cloud API, rendezvous over its API
+    └── Elice             machine allocated through the Elice Cloud API, rendezvous over SSH to it
 ```
 
 `Shell` is named for the shared ability, which is running a command on a remote machine, rather than for SSH, which is only its default transport.
@@ -460,7 +460,7 @@ Colab and Elice never need `letify client shell connect`. Their create and open 
 
 `letify client shell connect` is run once on a plain machine by its user. It starts the remote agent on a port the operating system chooses, starts `tailcat serve <agent port>` in front of it, and prints the Tailcat address and the agent port. The user writes both into the account once, as `tailcat = "<address>"` and `tailcat_port = <agent port>`. The agent needs letify installed on that machine.
 
-A connection to the agent is told apart by its first bytes: `SSH-` is spliced to the machine's SSH server, `LETIFY-RDV ` is followed by one JSON request line and answered with one JSON line, and `LETIFY-PROBE` is followed by the probe. For such an account the pipeline connects over Tailcat first, runs `tailcat <address> <agent port>` to exchange the TCP punch mapping and start time over that link, and then races as specified: the Tailcat link is the rank 3 candidate, and when TCP punching passes the probe it takes over.
+A connection to the agent is told apart by its first bytes: `SSH-` is spliced to the machine's SSH server, and `LETIFY-RDV ` is followed by one JSON request line and answered with one JSON line. For such an account the pipeline connects over Tailcat first, runs `tailcat <address> <agent port>` to exchange the TCP punch mapping and start time over that link, and then races as specified: the Tailcat link is the rank 3 candidate, and when TCP punching passes the probe it takes over.
 
 Both sides learn their public mapping from STUN servers reached over TCP on port 443, because networks that restrict outbound ports usually still allow 443. A punch starts at a time both sides agree on through the rendezvous. Each side connects from its bound port to the other's mapping and listens on the same port, so whichever direction's SYN arrives first completes the connection.
 
