@@ -544,29 +544,72 @@ pub enum HostCopy {
     Reply(Reply),
 }
 
+/// Tag byte of a `Payload` reply.
+const TAG_PAYLOAD: u8 = 5;
+
+/// Bytes of a `Payload` body before its bytes: tag, length.
+const PAYLOAD_FIXED_BYTES: usize = 1 + 8;
+
 /// Write a `Payload` reply for bytes the agent already holds.
 ///
-/// Produces the same bytes as `write_frame(encode_reply(Payload { .. }))`.
+/// Produces the same bytes as `write_frame(encode_reply(Payload { .. }))`, but the
+/// payload is handed to `write_vectored` as the caller's own slice. Behind a
+/// `BufWriter`, a payload larger than its buffer goes to the socket without being
+/// copied into it.
 pub fn write_payload_reply<W: Write>(writer: &mut W, payload: &[u8]) -> io::Result<()> {
-    write_frame(writer, &encode_reply(&Reply::Payload { payload: payload.to_vec() }))
+    let length = payload.len() as u64;
+    let mut head = [0u8; FRAME_HEADER_BYTES + PAYLOAD_FIXED_BYTES];
+    head[..8].copy_from_slice(&encode_frame_header(PAYLOAD_FIXED_BYTES as u64 + length));
+    head[8] = TAG_PAYLOAD;
+    head[9..17].copy_from_slice(&length.to_le_bytes());
+    write_all_vectored(writer, &mut [IoSlice::new(&head), IoSlice::new(payload)])
 }
 
 /// Read the reply to a copy to the host, putting a `Payload` into `destination`.
 ///
-/// A `Payload` whose length differs from `destination` is discarded and reported as
-/// `InvalidInput`, with the stream still in step.
+/// The tag is read before the body, so a `Payload` of exactly `destination.len()` bytes
+/// is read with `read_exact` straight into `destination`. Nothing is allocated from a
+/// length on the wire. A `Payload` of another length is read into nothing and reported
+/// as `InvalidInput`, with the stream still in step. A `Payload` whose length fields
+/// disagree is `InvalidData`, after which the stream cannot be trusted. Any other reply
+/// is decoded whole.
 pub fn read_copy_to_host<R: Read>(reader: &mut R, destination: &mut [u8]) -> io::Result<HostCopy> {
-    match decode_reply(&read_frame(reader)?)? {
-        Reply::Payload { payload } if payload.len() == destination.len() => {
-            destination.copy_from_slice(&payload);
-            Ok(HostCopy::Filled)
-        }
-        Reply::Payload { .. } => Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "a copy to the host answered with a payload of another length",
-        )),
-        other => Ok(HostCopy::Reply(other)),
+    let mut header = [0u8; FRAME_HEADER_BYTES];
+    reader.read_exact(&mut header)?;
+    let length = decode_frame_header(header);
+    if length == 0 {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "empty frame"));
     }
+    let mut tag = [0u8; 1];
+    reader.read_exact(&mut tag)?;
+
+    if tag[0] == TAG_PAYLOAD && length >= PAYLOAD_FIXED_BYTES as u64 {
+        let mut declared = [0u8; 8];
+        reader.read_exact(&mut declared)?;
+        let declared = u64::from_le_bytes(declared);
+        if declared != length - PAYLOAD_FIXED_BYTES as u64 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "a payload declares a length that disagrees with its frame",
+            ));
+        }
+        if declared != destination.len() as u64 {
+            let discarded = io::copy(&mut reader.by_ref().take(declared), &mut io::sink())?;
+            if discarded != declared {
+                return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "frame is short"));
+            }
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "a copy to the host answered with a payload of another length",
+            ));
+        }
+        reader.read_exact(destination)?;
+        return Ok(HostCopy::Filled);
+    }
+
+    let mut frame = vec![tag[0]];
+    read_body(reader, length - 1, &mut frame)?;
+    decode_reply(&frame).map(HostCopy::Reply)
 }
 
 /// Content address of a payload, used so the same module travels once.

@@ -10,7 +10,7 @@
 
 use std::ffi::{CStr, c_char, c_void};
 
-use letify_wire::{Reply, Request};
+use letify_wire::{HostCopy, Reply, Request};
 
 use crate::client::client;
 use crate::status::{
@@ -213,26 +213,19 @@ pub extern "C" fn cuMemcpyDtoH_v2(
     if destination.is_null() && bytes > 0 {
         return CUDA_ERROR_INVALID_VALUE;
     }
+    // The reply is read straight into the caller's buffer, with nothing in between.
+    let destination: &mut [u8] = if bytes == 0 {
+        &mut []
+    } else {
+        unsafe { std::slice::from_raw_parts_mut(destination as *mut u8, bytes) }
+    };
     with_client!(|connection| {
-        match connection.request(Request::CopyToHost {
-            handle,
-            offset: offset_of(source),
-            bytes: bytes as u64,
-        }) {
-            Ok(Reply::Payload { payload }) => {
-                if payload.len() != bytes {
-                    return CUDA_ERROR_INVALID_VALUE;
-                }
-                unsafe {
-                    std::ptr::copy_nonoverlapping(
-                        payload.as_ptr(),
-                        destination as *mut u8,
-                        bytes,
-                    )
-                };
-                CUDA_SUCCESS
+        match connection.request_copy_to_host(handle, offset_of(source), destination) {
+            Ok(HostCopy::Filled) => CUDA_SUCCESS,
+            Ok(HostCopy::Reply(Reply::Failed { code, .. })) => code,
+            Err(error) if error.kind() == std::io::ErrorKind::InvalidInput => {
+                CUDA_ERROR_INVALID_VALUE
             }
-            Ok(Reply::Failed { code, .. }) => code,
             _ => CUDA_ERROR_UNKNOWN,
         }
     })

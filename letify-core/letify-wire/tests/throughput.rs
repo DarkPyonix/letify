@@ -18,8 +18,9 @@ use std::thread;
 use std::time::Instant;
 
 use letify_wire::{
-    Incoming, Reply, Request, decode_reply, decode_request, encode_reply, encode_request,
-    read_frame, read_incoming, write_copy_to_device, write_frame,
+    HostCopy, Incoming, Reply, Request, decode_reply, decode_request, encode_reply,
+    encode_request, read_copy_to_host, read_frame, read_incoming, write_copy_to_device,
+    write_frame, write_payload_reply,
 };
 
 const PAYLOAD_BYTES: usize = 256 * 1024 * 1024;
@@ -113,4 +114,20 @@ fn a_256_mib_copy_to_the_host_through_an_encoded_frame() {
         },
     );
     println!("encoded frame: {rate:.0} MiB/s for a 256 MiB copy to the host");
+}
+
+#[test]
+#[ignore]
+fn a_256_mib_copy_to_the_host_streamed_into_the_destination() {
+    let rate = measure(
+        |writer, payload| write_payload_reply(writer, payload).unwrap(),
+        |reader| {
+            let mut destination = vec![0u8; PAYLOAD_BYTES];
+            match read_copy_to_host(reader, &mut destination).unwrap() {
+                HostCopy::Filled => destination.len(),
+                other => panic!("unexpected {other:?}"),
+            }
+        },
+    );
+    println!("streamed: {rate:.0} MiB/s for a 256 MiB copy to the host");
 }
