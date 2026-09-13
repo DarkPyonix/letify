@@ -369,10 +369,21 @@ class Launcher:
         return rows
 
     def status(self) -> dict[str, Any]:
-        """What is running right now, and what it is costing."""
+        """What is running right now, and what it is costing.
+
+        Counts first, so a reader can see whether the ceiling is why a call is waiting.
+        The pool's own bookkeeping is not here: whether the invocation guard is open is a
+        fact about the pool rather than about what is running, and a boolean next to
+        ``max_runtimes`` gets read as a count.
+
+        This process only, because the pool lives in the process that owns it. What a
+        machine itself is doing is what ``letify utilization`` answers.
+        """
+        live = list(self.pool.live)
         return {
             "name": self.name,
-            "holding": self.pool.holding,
+            "live": len(live),
+            "busy": sum(1 for runtime in live if runtime.busy),
             "max_runtimes": self.max_runtimes,
             "runtimes": [
                 {
@@ -385,7 +396,7 @@ class Launcher:
                     "persistent_channel": runtime.persistent_channel,
                     "idle_seconds": round(runtime.idle_for, 1),
                 }
-                for runtime in self.pool.live
+                for runtime in live
             ],
             "declared": [f.__name__ for f in self.functions],
             "config_sources": [str(p) for p in self.config.sources],

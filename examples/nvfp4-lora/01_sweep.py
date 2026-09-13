@@ -77,8 +77,7 @@ def main() -> int:
 
     # Nothing to release. The session ends with this process, and the lease means it would
     # end itself even if this process were killed.
-    live = let.status()["runtimes"]
-    print(f"\n{len(live)} session(s) live; they end with this process")
+    print(f"\n{let.status()['live']} session(s) live; they end with this process")
     return 0
 
 

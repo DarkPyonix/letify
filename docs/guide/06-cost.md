@@ -78,7 +78,7 @@ Time based saving bounds your loss in wall clock terms, which is what you actual
 
 ```python
 let.providers.active        # {'colab_a': ['letify-g4-a1b2c3']}
-let.status()                # runtimes, accelerators, placements, idle seconds
+let.status()                # counts against the ceiling, then a row per session
 let.pool.live               # the Runtime objects
 let.reap_idle()             # tear down anything past the idle timeout now
 ```

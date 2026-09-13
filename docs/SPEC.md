@@ -265,6 +265,16 @@ Nothing is torn down by hand. There is no release call and no shutdown call on t
 
 There is no detached execution. A detached run whose remote side is preempted would lose its results, so the local process stays the owner and durability comes from checkpoints in the store.
 
+### Status reporting
+
+> What is running, counted rather than described, with no internal bookkeeping in it.
+
+`Launcher.status()` answers three questions: how many sessions exist, how many are serving a call, and what each one is. `live` and `busy` are counts against `max_runtimes`, so a reader can see at a glance whether the ceiling is the reason a call is waiting. `runtimes` describes each session: its name, provider, accelerator, placement, lifetime, whether it is busy and how long it has been idle.
+
+Nothing internal is reported. The pool holds a guard so that one invocation does not restart a session between the points of a sweep, and whether that guard is currently open is a fact about the pool's implementation rather than about what is running. A field next to `max_runtimes` that looks like a count and is actually a boolean is worse than no field, because it is read as a count.
+
+`status()` describes this process only. A session started by a different process is not in it, since the pool lives in the process that owns it. What a machine itself is doing is a different question, answered by `letify utilization`.
+
 ## Storage
 
 > A volume is a content addressed blob store on whichever backend a provider has. It is what makes an ephemeral provider behave like a persistent one.

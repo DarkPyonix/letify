@@ -345,3 +345,57 @@ def test_the_providers_holding_a_session_can_be_named(
     assert let.providers.active["local"] == [let.pool.live[0].name]
     let.pool.shutdown()
     assert let.providers.active == {}
+
+
+# -- Spec: Status reporting ----------------------------------------------------
+
+
+def test_status_counts_the_sessions_against_the_ceiling(let, cpu) -> None:
+    # Counts rather than a description, so a reader can see whether the ceiling is the
+    # reason a call is waiting.
+    empty = let.status()
+    assert empty["live"] == 0
+    assert empty["busy"] == 0
+    assert empty["max_runtimes"] == let.max_runtimes
+
+    @let.function(device=cpu, host="remote", lifetime="process")
+    def answer() -> int:
+        return 7
+
+    assert answer() == 7
+    running = let.status()
+    assert running["live"] == 1
+    assert running["busy"] == 0
+    assert running["live"] == len(running["runtimes"])
+
+
+def test_status_does_not_report_the_pools_own_bookkeeping(let, cpu) -> None:
+    # The pool holds a guard so one invocation does not restart a session between the
+    # points of a sweep. Whether that guard is open is a fact about the pool rather than
+    # about what is running, and a boolean sitting next to max_runtimes gets read as a
+    # count.
+    report = let.status()
+    assert "holding" not in report
+    assert all(isinstance(report[field], int) for field in ("live", "busy", "max_runtimes"))
+
+
+def test_a_reported_session_says_what_it_is(let, cpu) -> None:
+    @let.function(device=cpu, host="remote", lifetime="process")
+    def answer() -> int:
+        return 7
+
+    answer()
+    row = let.status()["runtimes"][0]
+    assert row["provider"] == "local"
+    assert row["accelerator"] == cpu.accelerator
+    assert row["placement"] == "remote"
+    assert row["lifetime"] == "process"
+    assert row["busy"] is False
+    assert row["idle_seconds"] >= 0
+
+
+def test_status_describes_this_process_only(let, cpu) -> None:
+    # The pool lives in the process that owns it, so a session started elsewhere is not
+    # here. What a machine itself is doing is what utilization answers.
+    assert let.status()["name"] == let.name
+    assert let.status()["live"] == 0

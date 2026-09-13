@@ -62,7 +62,7 @@ def main() -> int:
 
     # A session that this process did not start is not visible here, because the pool lives in
     # the process that owns it. Ask the machine itself for that, which is what utilization does.
-    print(f"\n{len(let.status()['runtimes'])} session(s) held by this process")
+    print(f"\n{let.status()['live']} session(s) held by this process")
     return 0
 
 

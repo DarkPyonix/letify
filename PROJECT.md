@@ -114,7 +114,7 @@ Launcher(
 | `let.runtime(instance, env)` | Start one session now instead of on the first call |
 | `let.reap_idle()` | Take idle sessions now instead of waiting for the reaper |
 | `let.grid`, `let.zip` | Build a search space |
-| `let.status()` | What is running, in what mode, and for how long |
+| `let.status()` | How many sessions are live and busy against the ceiling, and what each one is |
 | `let.usage(alias=None)` | What is left on each account, or why it is not reported |
 | `let.utilization(alias=None)` | How busy each instance's accelerator is right now |
 
