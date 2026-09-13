@@ -1,4 +1,4 @@
-//! The CUDA driver shim.
+//! letify-shim, the stand-in for the CUDA driver.
 //!
 //! This library stands in for the CUDA driver on the machine that runs the Python code.
 //! Every call an application makes is forwarded to an agent on the machine that has the

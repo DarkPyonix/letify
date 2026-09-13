@@ -6,14 +6,17 @@ boots its runtimes once and releases them when the last point finishes. Nothing 
 kept alive on the chance that another call might come.
 
 Keeping one longer is declared, never assumed. A runtime acquired for a declaration
-made with ``warm=True`` is marked warm and survives its release, and ``hold()`` does
-the same for every runtime inside a ``let.warm()`` block. Both exist because starting
-a session is not free: provider boot plus environment installation is minutes on
-Colab, so several separate calls in a row are cheaper warm than cold.
+made with ``warm=True`` is marked warm and survives its release, because starting a
+session is not free: provider boot plus environment installation is minutes on Colab, so
+several separate calls in a row are cheaper warm than cold.
 
-Two backstops cover a warm runtime nobody released. A reaper thread tears down
-runtimes idle past the timeout, and each runtime's lease makes the remote worker exit
-if this process stops renewing.
+``hold`` is the other half of the rule, and it is internal. One invocation brackets
+itself with it so that a search space, which is many calls, starts its runtimes once and
+releases them when the last point finishes.
+
+Two backstops cover a warm runtime nobody uses any more. A reaper thread tears down
+runtimes idle past the timeout, and each runtime's lease makes the remote worker exit if
+this process stops renewing.
 """
 
 from __future__ import annotations
@@ -73,7 +76,11 @@ class RuntimePool:
             return self._hold_depth > 0
 
     def hold(self) -> None:
-        """Keep released runtimes alive until the matching ``unhold``."""
+        """Keep released runtimes alive until the matching ``unhold``.
+
+        Internal. One invocation uses this so a sweep does not restart a session between
+        its points.
+        """
         with self._guard:
             self._hold_depth += 1
 

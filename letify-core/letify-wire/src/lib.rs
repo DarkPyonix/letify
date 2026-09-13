@@ -1,6 +1,6 @@
-//! The protocol between the shim and the agent.
+//! The protocol between letify-core and the agent.
 //!
-//! Every CUDA driver call the shim intercepts becomes one message. The whole point of
+//! Every CUDA driver call letify-core intercepts becomes one message. The whole point of
 //! the design is that most of them do not wait for a reply: a launch, a copy or an
 //! allocation is recorded and sent, and only a call whose result the host actually
 //! reads forces a round trip.
@@ -31,7 +31,7 @@ pub enum Request {
     DeviceAttribute { device: i32, attribute: i32 },
     /// Total and free memory on the device.
     MemoryInfo,
-    /// Allocate device memory. The shim hands back a virtual pointer immediately and
+    /// Allocate device memory. letify-core hands back a virtual pointer immediately and
     /// reconciles it here, so an allocation does not cost a round trip.
     Allocate { bytes: u64, handle: u64 },
     /// Release device memory.

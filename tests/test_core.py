@@ -106,9 +106,7 @@ def test_a_call_needs_no_scope(let: letify.Launcher, cpu: letify.Instance) -> No
     assert let.pool.live == []
 
 
-def test_a_space_fans_out_to_one_call_per_point(
-    let: letify.Launcher, cpu: letify.Instance
-) -> None:
+def test_a_space_fans_out_to_one_call_per_point(let: letify.Launcher, cpu: letify.Instance) -> None:
     @let.function(device=cpu, host="remote", concurrency=2)
     def identity(lr: float, bs: int) -> tuple[float, int]:
         return lr, bs
@@ -164,7 +162,7 @@ def test_a_kept_value_stays_in_the_runtime(let: letify.Launcher, cpu: letify.Ins
     assert isinstance(handle, letify.Handle)
     # Resolving it in a later call is what the persistent worker exists for.
     assert total(model=handle) == 6
-    let.release()
+    let.shutdown()
 
 
 def test_a_large_argument_is_sent_once(let: letify.Launcher, cpu: letify.Instance) -> None:
@@ -180,12 +178,10 @@ def test_a_large_argument_is_sent_once(let: letify.Launcher, cpu: letify.Instanc
     stat = runtime.stat()
     # One blob, not two, even though the argument was passed twice.
     assert stat["blobs"] == 1
-    let.release()
+    let.shutdown()
 
 
-def test_the_worker_is_one_process_across_calls(
-    let: letify.Launcher, cpu: letify.Instance
-) -> None:
+def test_the_worker_is_one_process_across_calls(let: letify.Launcher, cpu: letify.Instance) -> None:
     @let.function(device=cpu, host="remote", warm=True)
     def noop() -> None:
         return None
@@ -194,7 +190,7 @@ def test_the_worker_is_one_process_across_calls(
     first = let.pool.live[0].stat()["pid"]
     noop()
     assert let.pool.live[0].stat()["pid"] == first
-    let.release()
+    let.shutdown()
 
 
 def test_files_written_into_a_runtime_survive_between_calls(
@@ -217,7 +213,7 @@ def test_files_written_into_a_runtime_survive_between_calls(
     payload, digest = runtime.get_bytes(target)
     assert payload == b"from the store"
     assert digest
-    let.release()
+    let.shutdown()
 
 
 # -- failure -------------------------------------------------------------------
@@ -261,9 +257,7 @@ def test_modal_refuses_a_local_host(tmp_path) -> None:
 # -- release rule --------------------------------------------------------------
 
 
-def test_a_runtime_dies_when_its_call_finishes(
-    let: letify.Launcher, cpu: letify.Instance
-) -> None:
+def test_a_runtime_dies_when_its_call_finishes(let: letify.Launcher, cpu: letify.Instance) -> None:
     @let.function(device=cpu, host="remote")
     def noop() -> None:
         return None
@@ -272,9 +266,7 @@ def test_a_runtime_dies_when_its_call_finishes(
     assert let.pool.live == []
 
 
-def test_a_warm_declaration_keeps_its_runtime(
-    let: letify.Launcher, cpu: letify.Instance
-) -> None:
+def test_a_warm_declaration_keeps_its_runtime(let: letify.Launcher, cpu: letify.Instance) -> None:
     @let.function(device=cpu, host="remote", warm=True)
     def noop() -> None:
         return None
@@ -283,7 +275,7 @@ def test_a_warm_declaration_keeps_its_runtime(
     assert len(let.pool.live) == 1
     noop()
     assert len(let.pool.live) == 1
-    assert let.release()
+    assert let.shutdown()
     assert let.pool.live == []
 
 
@@ -303,7 +295,7 @@ def test_warm_declarations_on_one_device_share_a_runtime(
     # Pooling is by instance and environment, so two declarations need no block to
     # share a session.
     assert len(let.pool.live) == 1
-    let.release()
+    let.shutdown()
 
 
 def test_a_sweep_holds_one_set_of_runtimes(let: letify.Launcher, cpu: letify.Instance) -> None:

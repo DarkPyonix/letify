@@ -1,28 +1,28 @@
 """CUDA call forwarding: the capability probe and the arithmetic behind it.
 
-The shim that does the interception is a Rust component under ``shim/``, because
+letify-core that does the interception is a Rust component under ``letify-core/``, because
 intercepting the CUDA driver cannot be done from Python. This package is the part that
-stays pure Python: it finds the shim, measures the round trip, and refuses clearly when
+stays pure Python: it finds letify-core, measures the round trip, and refuses clearly when
 forwarding cannot run.
 """
 
 from __future__ import annotations
 
 from .capability import LATENCY_BUDGET_MS, Capability
-from .loader import Injection, inject, preload_command, shim_directory
-from .probe import SHIM_NAMES, efficiency, ping, probe, require, shim_path
+from .loader import Injection, core_directory, inject, preload_command
+from .probe import CORE_NAMES, core_path, efficiency, ping, probe, require
 
 __all__ = [
+    "CORE_NAMES",
     "LATENCY_BUDGET_MS",
-    "SHIM_NAMES",
     "Capability",
     "Injection",
+    "core_directory",
+    "core_path",
     "efficiency",
     "inject",
     "ping",
     "preload_command",
     "probe",
     "require",
-    "shim_directory",
-    "shim_path",
 ]

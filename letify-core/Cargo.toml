@@ -1,8 +1,8 @@
-# The CUDA call forwarding components.
+# letify-core: the CUDA call forwarding components.
 #
-# letify's Python package stays pure Python. Intercepting the CUDA driver cannot be
-# done from Python, so that one job lives here and is built separately. A user who
-# only ships functions to remote machines never needs any of this.
+# letify's Python package stays pure Python. Standing in for the CUDA driver cannot be
+# done from Python, so that one job lives here and is built separately. A user who only
+# ships functions to remote machines never needs any of this.
 [workspace]
 resolver = "3"
 members = ["letify-wire", "letify-shim", "letify-agent"]

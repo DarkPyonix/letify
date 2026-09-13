@@ -1,6 +1,6 @@
 //! The agent that holds the real device.
 //!
-//! It listens on a TCP port, accepts one shim at a time, and executes the driver calls
+//! It listens on a TCP port, accepts one core at a time, and executes the driver calls
 //! that arrive. letify starts it on the machine with the GPU and tells the shim where to
 //! find it.
 //!
@@ -10,7 +10,7 @@
 //!
 //! Requests arrive in order and are executed in order. A batch of queued launches is
 //! simply a run of requests with no reply between them, which is why the batching on the
-//! shim side needs nothing special here.
+//! the local side needs nothing special here.
 
 mod driver;
 
@@ -68,11 +68,11 @@ fn main() {
 
 /// State that belongs to one shim connection.
 struct Session {
-    /// The shim's handle to the real device pointer behind it.
+    /// the shim's handle to the real device pointer behind it.
     allocations: HashMap<u64, u64>,
     /// Content address to the module handle, so a fatbin travels once.
     modules: HashMap<[u8; 16], u64>,
-    /// The shim's event handle to the real one.
+    /// the shim's event handle to the real one.
     events: HashMap<u64, u64>,
 }
 
@@ -90,7 +90,7 @@ impl Session {
         self.allocations.get(&handle).map(|base| base + offset)
     }
 
-    /// The real event behind a shim handle, creating it on first use.
+    /// The real event behind a stand-in library handle, creating it on first use.
     fn event(&mut self, driver: &Driver, handle: u64) -> Result<u64, String> {
         if let Some(found) = self.events.get(&handle) {
             return Ok(*found);
@@ -203,7 +203,7 @@ fn handle(request: &Request, driver: &Driver, session: &mut Session) -> Result<R
             Ok(Reply::Handle { handle: driver.function(*module, name)? })
         }
         Request::LaunchKernel { function, grid, block, shared_bytes, stream, params } => {
-            // The shim sends the pointer list it was given. Each entry is an address in
+            // the shim sends the pointer list it was given. Each entry is an address in
             // the caller's own space, so it is translated here through the allocation
             // table before the launch.
             let mut translated: Vec<*mut c_void> = params

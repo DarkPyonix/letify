@@ -13,7 +13,7 @@ LATENCY_BUDGET_MS = 40.0
 class Capability:
     """Whether forwarding can run here, and what it would cost."""
 
-    shim: bool
+    core: bool
     agent: bool
     round_trip_ms: float | None
     platform: str
@@ -21,7 +21,7 @@ class Capability:
     @property
     def usable(self) -> bool:
         """Whether forwarding can run at all, regardless of speed."""
-        return self.shim and self.agent
+        return self.core and self.agent
 
     @property
     def costly(self) -> bool:
@@ -30,9 +30,9 @@ class Capability:
 
     def explain(self) -> str:
         reasons = []
-        if not self.shim:
+        if not self.core:
             reasons.append(
-                "the letify shim library is not installed on this machine, so there is "
+                "letify-core is not installed on this machine, so there is "
                 "nothing to intercept the CUDA driver"
             )
         if not self.agent:

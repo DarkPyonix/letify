@@ -1,4 +1,4 @@
-//! The CUDA driver entry points this shim stands in for.
+//! The CUDA driver entry points this library stands in for.
 //!
 //! Each one has the signature the real driver has, because the caller was compiled
 //! against that header and does not know it is talking to us. Everything below converts

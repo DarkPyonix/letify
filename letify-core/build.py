@@ -1,6 +1,6 @@
-"""Build the shim and the agent, and put them where letify looks.
+"""Build letify-core and the agent, and put them where letify looks.
 
-The shim has to be named for the library it replaces, because being found before the real
+The library has to be installed under the name of the one it replaces, because being found before the real
 driver is the entire mechanism. Cargo cannot emit those names directly, so this copies the
 artifact into place under the right one.
 
@@ -10,8 +10,8 @@ artifact into place under the right one.
 
 Run it from the repository root or from here:
 
-    python shim/build.py
-    python shim/build.py --debug
+    python letify-core/build.py
+    python letify-core/build.py --debug
 """
 
 from __future__ import annotations
@@ -26,7 +26,7 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parent
 
-#: What the shim must be called on each platform, and what cargo actually produces.
+#: What the library must be called on each platform, and what cargo produces.
 ARTIFACTS = {
     "Windows": ("letify_shim.dll", "nvcuda.dll"),
     "Linux": ("libletify_shim.so", "libcuda.so.1"),
@@ -44,7 +44,7 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--debug", action="store_true", help="build without optimizations")
     parser.add_argument(
-        "--target-dir", default=None, help="where letify should find the shim"
+        "--target-dir", default=None, help="where letify should find letify-core"
     )
     args = parser.parse_args(argv)
 
@@ -56,7 +56,7 @@ def main(argv: list[str] | None = None) -> int:
     if shutil.which("cargo") is None:
         print(
             "letify: cargo is not on PATH. Install Rust from https://rustup.rs to build "
-            "the shim, or use host='remote' and skip it entirely.",
+            "letify-core, or use host='remote' and skip it entirely.",
             file=sys.stderr,
         )
         return 1
@@ -77,7 +77,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"letify: cargo did not produce {source}", file=sys.stderr)
         return 1
     shutil.copy2(source, destination / install_name)
-    print(f"letify: shim installed at {destination / install_name}")
+    print(f"letify: letify-core installed at {destination / install_name}")
 
     agent = built / AGENTS[system]
     if agent.is_file():

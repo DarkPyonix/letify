@@ -14,12 +14,15 @@ pool. It is the thing that does the letting, so the conventional variable name i
 There is no scope to open. A runtime lives for the invocation that needed it and is
 released when that finishes, which is why a call needs no ceremony around it.
 
-Keeping a session alive between calls is declared, not commanded. A declaration
-made with ``warm=True`` holds its runtime after the call returns, because starting a
-session costs provider boot plus environment installation, which is minutes on
-Colab, and a run of separate calls is cheaper warm than cold. ``let.warm()`` does
-the same for a block when several different declarations should share one session,
-and ``let.release()`` gives everything back early.
+Keeping a session alive between calls is declared, not commanded. A declaration made
+with ``warm=True`` holds its runtime after the call returns, because starting a session
+costs provider boot plus environment installation, which is minutes on Colab and worth
+avoiding across a run of separate calls. Two warm declarations on the same device and
+environment share one session, since the pool keys by those rather than by which
+function asked.
+
+Nothing is released by hand. A call releases its own runtime, a warm one is torn down by
+the idle reaper once it stops being used, and everything goes at process exit.
 
 Providers are reached by attribute on ``let.providers``. Three names there are
 reserved: ``any`` for a request that does not name a provider, ``devices`` for the
@@ -263,31 +266,6 @@ class Launcher:
         finally:
             self.pool.unhold()
 
-    @contextmanager
-    def warm(self) -> Iterator[Launcher]:
-        """Let every call in this block share one set of runtimes.
-
-        The declaration-level form is ``warm=True`` on ``let.function``, which is
-        where this belongs when it is a property of one function. Use this block when
-        several different declarations should share a session, since that is a fact
-        about the block rather than about any one of them.
-        """
-        self._register_at_exit()
-        self.pool.hold()
-        try:
-            yield self
-        finally:
-            self.pool.unhold()
-
-    def release(self) -> list[str]:
-        """Give back every runtime that is not running a call right now.
-
-        For a script that has finished with the GPU but keeps working, so the idle
-        timeout is not what ends the billing. Warm runtimes are released too, because
-        asking explicitly means all of them.
-        """
-        return self.pool.shutdown_idle(include_warm=True)
-
     def shutdown(self) -> list[str]:
         """Stop everything, including runtimes still running a call."""
         return self.pool.shutdown()
@@ -302,11 +280,11 @@ class Launcher:
         """Start one runtime now instead of on the first call.
 
         Useful when a session takes a while to come up and there is local work to do
-        meanwhile, such as preparing data. The caller is responsible for releasing it,
-        so use it inside ``warm()``.
+        meanwhile, such as preparing data. It is marked warm, so it survives until the
+        idle timeout or process exit.
         """
         self._register_at_exit()
-        return self.pool.acquire(self.resolve(instance), env or Env(), volumes)
+        return self.pool.acquire(self.resolve(instance), env or Env(), volumes, warm=True)
 
     def reap_idle(self) -> list[str]:
         """Shut down runtimes idle past the timeout, without waiting for the reaper."""

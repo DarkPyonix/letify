@@ -6,7 +6,7 @@ from the device. Efficiency against a direct run is ``T / (T + k * RTT)``, where
 is GPU time per step and ``k`` is host synchronizations per step.
 
 Both terms are measurable before anything is built. This module measures the round trip
-and reports whether the shim and the agent are present; ``k`` is measured in the user's
+and reports whether letify-core and the agent are present; ``k`` is measured in the user's
 own training step with ``torch.cuda.set_sync_debug_mode("warn")``, which does not depend
 on where the GPU is.
 
@@ -28,22 +28,22 @@ from pathlib import Path
 from ..errors import UnsupportedMode
 from .capability import LATENCY_BUDGET_MS, Capability
 
-#: Names the shim library goes by on each platform.
-SHIM_NAMES = {
+#: Names letify-core library goes by on each platform.
+CORE_NAMES = {
     "win32": "nvcuda.dll",
     "linux": "libcuda.so.1",
     "darwin": "libletify_shim.dylib",
 }
 
 
-def shim_path() -> Path | None:
+def core_path() -> Path | None:
     """Where the built shim library is, if it was installed."""
     import os
 
-    override = os.environ.get("LETIFY_SHIM_PATH")
+    override = os.environ.get("LETIFY_CORE_PATH")
     if override and Path(override).exists():
         return Path(override)
-    name = SHIM_NAMES.get(sys.platform, "libletify_shim.so")
+    name = CORE_NAMES.get(sys.platform, "libletify_shim.so")
     candidate = Path(__file__).resolve().parent / "lib" / name
     return candidate if candidate.exists() else None
 
@@ -51,7 +51,7 @@ def shim_path() -> Path | None:
 def probe(host: str | None = None) -> Capability:
     """Report whether forwarding could run against a host, and what it would cost."""
     return Capability(
-        shim=shim_path() is not None,
+        core=core_path() is not None,
         agent=shutil.which("letify-agent") is not None or host is None,
         round_trip_ms=ping(host) if host else None,
         platform=sys.platform,
@@ -68,8 +68,8 @@ def require(host: str | None = None) -> Capability:
     capability = probe(host)
     if not capability.usable:
         raise UnsupportedMode(
-            f"host='local' cannot run here: {capability.explain()}. Build the shim from "
-            f"the shim/ directory, or use host='remote' to ship the function instead."
+            f"host='local' cannot run here: {capability.explain()}. Build letify-core from "
+            f"the letify-core/ directory, or use host='remote' to ship the function instead."
         )
     return capability
 
@@ -102,12 +102,12 @@ def efficiency(step_seconds: float, syncs: int, round_trip_ms: float) -> float:
 
 
 __all__ = [
+    "CORE_NAMES",
     "LATENCY_BUDGET_MS",
-    "SHIM_NAMES",
     "Capability",
+    "core_path",
     "efficiency",
     "ping",
     "probe",
     "require",
-    "shim_path",
 ]

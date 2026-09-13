@@ -1,10 +1,10 @@
-"""Getting the shim loaded before the real driver.
+"""Getting letify-core loaded before the real driver.
 
 This is the one part of forwarding that has to happen in Python, because it has to happen
 before the first CUDA library is loaded and therefore before ``import torch``.
 
 Windows has no ``LD_PRELOAD``. What it has is a documented search order, and
-``os.add_dll_directory`` puts a directory at the front of it. Since the shim is named
+``os.add_dll_directory`` puts a directory at the front of it. Since letify-core is named
 ``nvcuda.dll``, the loader finds ours instead of the real one, and nothing else about the
 process changes.
 
@@ -20,7 +20,7 @@ import os
 import sys
 from pathlib import Path
 
-from .probe import shim_path
+from .probe import core_path
 
 
 class Injection:
@@ -38,16 +38,16 @@ class Injection:
 
 
 def inject(agent: str | None = None) -> Injection:
-    """Arrange for the shim to be found before the real CUDA driver.
+    """Arrange for letify-core to be found before the real CUDA driver.
 
     Call this before importing torch. Returns an ``Injection`` that is false when the
     caller has to act, carrying the exact command in ``instructions``.
     """
-    path = shim_path()
+    path = core_path()
     if path is None:
         return Injection(
             False,
-            "The shim is not built. Run `python shim/build.py` to build it, or declare "
+            "letify-core is not built. Run `python letify-core/build.py` to build it, or declare "
             "host='remote' to ship the function instead.",
         )
 
@@ -78,19 +78,19 @@ def inject(agent: str | None = None) -> Injection:
 
 
 def preload_command(script: str = "your_script.py", agent: str = "host:7654") -> str:
-    """The command that runs a script with the shim in front of the driver."""
-    path = shim_path()
+    """The command that runs a script with letify-core in front of the driver."""
+    path = core_path()
     if path is None:
-        return "python shim/build.py   # build the shim first"
+        return "python letify-core/build.py   # build letify-core first"
     if sys.platform.startswith("win"):
         return f"python {script}   # letify.remoting.inject() handles this on Windows"
     return f"LD_PRELOAD={path} LETIFY_AGENT={agent} python {script}"
 
 
-def shim_directory() -> Path | None:
-    """Where the built shim lives, for a caller that wants to place it itself."""
-    path = shim_path()
+def core_directory() -> Path | None:
+    """Where the built library lives, for a caller that wants to place it itself."""
+    path = core_path()
     return path.parent if path else None
 
 
-__all__ = ["Injection", "inject", "preload_command", "shim_directory"]
+__all__ = ["Injection", "core_directory", "inject", "preload_command"]

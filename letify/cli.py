@@ -11,8 +11,8 @@ import argparse
 import json
 import sys
 
-from .. import __version__
-from ..launcher import Launcher
+from . import __version__
+from .launcher import Launcher
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -47,7 +47,7 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
 
     if args.command == "efficiency":
-        from ..remoting import efficiency as compute
+        from .remoting import efficiency as compute
 
         share = compute(args.step_seconds, args.syncs, args.round_trip_ms)
         print(f"{share * 100:.1f}% of a direct run")
@@ -85,7 +85,7 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if args.command == "probe":
-        from ..remoting import probe as run_probe
+        from .remoting import probe as run_probe
 
         capability = run_probe(args.host)
         print(

@@ -51,7 +51,7 @@ impl Client {
             Reply::Ready { version, .. } => Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!(
-                    "the agent speaks protocol {version} and this shim speaks {}. Install \
+                    "the agent speaks protocol {version} and this library speaks {}. Install \
                      matching builds on both sides.",
                     letify_wire::PROTOCOL_VERSION
                 ),
@@ -109,7 +109,7 @@ impl Client {
 
 /// The process wide connection.
 ///
-/// One shim serves one process and one device, so a mutex around a single client is
+/// One core serves one process and one device, so a mutex around a single client is
 /// enough and keeps the ordering guarantees simple.
 pub fn client() -> &'static Mutex<Option<Client>> {
     static CLIENT: std::sync::OnceLock<Mutex<Option<Client>>> = std::sync::OnceLock::new();

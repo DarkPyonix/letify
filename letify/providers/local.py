@@ -19,6 +19,7 @@ import shutil
 import subprocess
 import sys
 from collections.abc import Mapping
+from functools import cache
 from typing import TYPE_CHECKING
 
 from ..declare.instance import Instance
@@ -50,29 +51,20 @@ class Local(Provider):
     needs_lease = False
 
     def discover(self) -> Mapping[str, Instance]:
-        """List the GPUs in this machine, plus a plain CPU instance."""
-        table: dict[str, Instance] = {"CPU": Instance(self, gpu=None)}
-        if not shutil.which("nvidia-smi"):
-            return table
-        try:
-            result = subprocess.run(
-                ["nvidia-smi", "--query-gpu=name,memory.total", "--format=csv,noheader"],
-                capture_output=True,
-                text=True,
-                timeout=30,
-            )
-        except (OSError, subprocess.TimeoutExpired):
-            return table
-        if result.returncode != 0:
-            return table
+        """List the GPUs in this machine, plus a plain CPU instance.
 
-        for line in result.stdout.splitlines():
-            if not line.strip():
-                continue
-            name, _, memory = line.partition(",")
-            label = normalize_gpu(name)
-            table[label] = Instance(self, gpu=label, vram_gb=gib_from_mib(memory))
+        The names are read once per process, because asking nvidia-smi takes seconds on a
+        laptop whose discrete GPU is asleep and the answer does not change while the
+        process runs. ``refresh()`` asks again.
+        """
+        table: dict[str, Instance] = {"CPU": Instance(self, gpu=None)}
+        for label, vram_gb in _device_names():
+            table[label] = Instance(self, gpu=label, vram_gb=vram_gb)
         return table
+
+    def refresh(self) -> Mapping[str, Instance]:
+        _device_names.cache_clear()
+        return super().refresh()
 
     def store_backend(self) -> str:
         return "filesystem"
@@ -93,3 +85,29 @@ class Local(Provider):
 
 
 __all__ = ["Local"]
+
+
+@cache
+def _device_names() -> tuple[tuple[str, int | None], ...]:
+    """Read the machine's GPU names and memory sizes once."""
+    if not shutil.which("nvidia-smi"):
+        return ()
+    try:
+        result = subprocess.run(
+            ["nvidia-smi", "--query-gpu=name,memory.total", "--format=csv,noheader"],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return ()
+    if result.returncode != 0:
+        return ()
+
+    found = []
+    for line in result.stdout.splitlines():
+        if not line.strip():
+            continue
+        name, _, memory = line.partition(",")
+        found.append((normalize_gpu(name), gib_from_mib(memory)))
+    return tuple(found)
