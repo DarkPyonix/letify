@@ -1,9 +1,10 @@
 """Shell, a machine where letify can run commands.
 
-The shared ability is command execution, not any one transport. SSH is the default,
-and the subclasses change only how the connection is obtained: ``Colab`` creates
-the session with a CLI, ``Tunnel`` builds a network path first, and ``Elice``
-allocates the machine through an API.
+The shared ability is command execution, not any one transport. Every Shell reaches its
+machine through the connection pipeline in ``letify.transport``, and a subclass differs
+only in its rendezvous and its strategy list: ``Colab`` runs its remote half over
+``colab exec``, ``Elice`` over forward SSH to a machine its API allocated, and a plain
+machine behind NAT through the remote agent over Tailcat.
 
 Persistence defaults to ephemeral. Guessing wrong in that direction only costs
 time, because letify rebuilds the environment each runtime and the work still
@@ -16,8 +17,8 @@ from __future__ import annotations
 
 import shlex
 import subprocess
-from collections.abc import Mapping
-from typing import TYPE_CHECKING
+from collections.abc import Callable, Mapping
+from typing import TYPE_CHECKING, Any
 
 from ..declare.instance import Instance
 from ..errors import ProviderUnavailable, RuntimeFailure
@@ -27,10 +28,13 @@ from .naming import gib_from_mib, normalize_gpu
 if TYPE_CHECKING:
     from ..runtime.channel import Channel
     from ..runtime.session import Runtime
+    from ..transport.link import Link
+    from ..transport.rendezvous import Rendezvous
+    from ..transport.strategies import Strategy, Target
 
 
 class Shell(Provider):
-    """A remote machine reached over SSH."""
+    """A remote machine reached through the connection pipeline."""
 
     kind = "shell"
     extra = "shell"
@@ -88,8 +92,17 @@ class Shell(Provider):
         value = self.config.option("python", "python3")
         return str(value)
 
+    @property
+    def reverse_ssh(self) -> dict[str, Any] | None:
+        value = self.config.option("reverse_ssh")
+        return dict(value) if isinstance(value, Mapping) else None
+
+    @property
+    def tailcat_binary(self) -> str:
+        return str(self.config.option("tailcat_binary", "tailcat"))
+
     def ssh_command(self, remote_command: str | None = None) -> list[str]:
-        """Build the OpenSSH command line that reaches this machine."""
+        """Build the OpenSSH command line that reaches this machine's address directly."""
         target = f"{self.user}@{self.address}" if self.user else self.address
         command = [
             "ssh",
@@ -110,15 +123,103 @@ class Shell(Provider):
             command.append(remote_command)
         return command
 
-    def connect(self) -> None:
-        """Open whatever path this provider needs. Plain SSH needs nothing."""
+    # -- the pipeline ----------------------------------------------------------
+
+    def rendezvous(self, runtime: Runtime | None = None) -> Rendezvous | None:
+        """The remote agent over Tailcat, when the account names its address."""
+        address = self.config.option("tailcat")
+        if not isinstance(address, str):
+            return None
+        port = self.config.option("tailcat_port")
+        if not isinstance(port, (int, str)):
+            raise ProviderUnavailable(
+                self.kind,
+                f"{self.alias} names a tailcat address but no tailcat_port. "
+                f"'letify client shell connect' prints both",
+            )
+        from ..transport.rendezvous import TailcatRendezvous
+
+        return TailcatRendezvous(address, int(port), self.tailcat_binary)
+
+    def strategies(self) -> list[Strategy]:
+        """The ranked strategy list. Reverse SSH joins only when the account sets it."""
+        from ..transport.strategies import (
+            DirectSSH,
+            ProviderFallback,
+            ReverseSSH,
+            TailcatUDP,
+            TCPPunch,
+        )
+
+        chosen: list[Strategy] = [DirectSSH(), TCPPunch(), TailcatUDP()]
+        if self.reverse_ssh:
+            chosen.append(ReverseSSH())
+        chosen.append(ProviderFallback(rank=5 if self.reverse_ssh else 4))
+        return chosen
+
+    def fallback(self, runtime: Runtime | None = None) -> Callable[[], Link] | None:
+        """The provider's own path. A plain machine has none."""
         return None
+
+    def target(self, runtime: Runtime | None = None) -> Target:
+        from ..transport import nat
+        from ..transport.strategies import Target
+
+        address = self.config.option("address")
+        stun: tuple[str, int] = nat.DEFAULT_STUN
+        configured = self.config.option("stun")
+        if isinstance(configured, str) and ":" in configured:
+            host, _, number = configured.rpartition(":")
+            stun = (host, int(number))
+        return Target(
+            alias=self.alias,
+            address=address if isinstance(address, str) else None,
+            direct_ssh=self.ssh_command if isinstance(address, str) else None,
+            user=self.user,
+            key=self.key_path,
+            remote_python=self.remote_python,
+            rendezvous=self.rendezvous(runtime),
+            reverse_ssh=self.reverse_ssh,
+            fallback=self.fallback(runtime),
+            stun=stun,
+            tailcat=self.tailcat_binary,
+        )
+
+    def _link_key(self, runtime: Runtime | None) -> str:
+        """Links are per machine here; a provider whose runtimes are machines keys by runtime."""
+        return ""
+
+    def link(self, runtime: Runtime | None = None) -> Link:
+        """The chosen link, connecting through the pipeline the first time it is asked for."""
+        links: dict[str, Link] = self.__dict__.setdefault("_links", {})
+        key = self._link_key(runtime)
+        if key not in links:
+            from ..transport.pipeline import LinkCache, Pipeline, network_fingerprint
+
+            target = self.target(runtime)
+            links[key] = Pipeline(
+                self.strategies(),
+                target=target,
+                alias=self.alias,
+                cache=LinkCache(self.alias),
+                fingerprint=lambda: network_fingerprint(target.stun),
+            ).connect()
+        return links[key]
+
+    def close_link(self, runtime: Runtime | None = None) -> None:
+        link = self.__dict__.get("_links", {}).pop(self._link_key(runtime), None)
+        if link is not None:
+            link.close()
+
+    def connect(self) -> None:
+        """Choose the link now rather than at the first command."""
+        self.link()
 
     def check(self) -> str:
         """Run one command to confirm the machine answers."""
-        self.connect()
+        link = self.link()
         result = subprocess.run(
-            self.ssh_command("uname -a; nvidia-smi --query-gpu=name --format=csv,noheader"),
+            link.ssh_command("uname -a; nvidia-smi --query-gpu=name --format=csv,noheader"),
             capture_output=True,
             text=True,
             timeout=120,
@@ -126,7 +227,7 @@ class Shell(Provider):
         if result.returncode != 0:
             raise RuntimeFailure(
                 f"{self.alias} did not answer over SSH",
-                command=" ".join(self.ssh_command("...")),
+                command=" ".join(link.ssh_command("...")),
                 stderr=result.stderr.strip(),
             )
         return result.stdout
@@ -146,9 +247,10 @@ class Shell(Provider):
         if declared:
             return {name: Instance(self, gpu=name) for name in declared}
 
-        self.connect()
         result = subprocess.run(
-            self.ssh_command("nvidia-smi --query-gpu=name,memory.total --format=csv,noheader"),
+            self.link().ssh_command(
+                "nvidia-smi --query-gpu=name,memory.total --format=csv,noheader"
+            ),
             capture_output=True,
             text=True,
             timeout=120,
@@ -175,14 +277,15 @@ class Shell(Provider):
     # -- sessions ------------------------------------------------------------
 
     def open_channel(self, runtime: Runtime) -> Channel:
-        """One remote Python reading framed requests from standard input."""
-        from ..runtime.channel import PersistentChannel
-
-        self.connect()
+        """One remote Python reading framed requests, or one program per call on a fallback."""
         from ..protocol.worker import BOOTSTRAP
+        from ..runtime.channel import OneShotChannel, PersistentChannel
 
+        link = self.link(runtime)
+        if not link.persistent:
+            return OneShotChannel(link.runner, name=runtime.name)  # type: ignore[attr-defined]
         return PersistentChannel(
-            self.ssh_command(f"{self.remote_python} -u -c {shlex.quote(BOOTSTRAP)}"),
+            link.ssh_command(f"{self.remote_python} -u -c {shlex.quote(BOOTSTRAP)}"),
             name=runtime.name,
         )
 

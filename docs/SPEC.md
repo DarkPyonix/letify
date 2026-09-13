@@ -74,7 +74,7 @@ Provider (abstract)
 └── Shell                 ephemeral by default, reached through the connection pipeline
     ├── Colab             session created by the Colab CLI, rendezvous over colab exec
     ├── Tunnel            a machine behind NAT, rendezvous through letify client shell connect
-    └── Elice             machine allocated through the Elice Cloud API, rendezvous over its API
+    └── Elice             machine allocated through the Elice Cloud API, rendezvous over SSH to it
 ```
 
 `Shell` is named for the shared ability, which is running a command on a remote machine, rather than for SSH, which is only its default transport.
@@ -436,7 +436,11 @@ Strategies are raced rather than tried in turn, so a strategy that times out doe
 
 Every connected strategy is probed: 30 round trips, then 2 s of transfer in each direction. A strategy whose throughput in either direction is below 25% of the fastest connected strategy in that direction is rejected. The lowest ranked strategy that remains is chosen. When only one strategy connects, it is chosen without comparison.
 
-Strategies that lose are closed.
+Strategies that lose are closed, including one that connects after the choice is made.
+
+When only one strategy is applicable there is nothing to choose between, so it is used directly: it is not raced, not probed and not cached, and a failure surfaces at its first use. When a race of two or more ends with one connected strategy, that strategy is still probed so the cache has throughput to compare against, but a failed probe does not reject it.
+
+A `Link` that cannot carry the probe, such as the provider fallback, is left out of the throughput comparison. It is chosen only when no probed strategy remains, and it is never written to the cache, so the next connection races again. A probe that fails on a strategy in a race of two or more rejects that strategy. When no strategy connects, the error names every strategy with the reason it failed or was skipped.
 
 ### Link cache <!-- id: link-cache -->
 
@@ -444,23 +448,37 @@ Strategies that lose are closed.
 
 The cache lives in `~/.letify/accounts/<alias>/link.json`. It records the strategy, the probe results, and a network fingerprint: the local machine's public IP address and the name of its default route interface.
 
-On the next connection the cached strategy is attempted alone. When it connects and its probe is at least 50% of the cached throughput, it is used. Otherwise, or when the fingerprint differs, the full race runs and the cache is rewritten.
+On the next connection the cached strategy is attempted alone. When it connects and its probe is at least 50% of the cached throughput in both directions, it is used. Otherwise, or when the fingerprint differs, the full race runs and the cache is rewritten. A fingerprint whose public IP address could not be learned matches nothing, so the race runs.
+
+The public IP address is learned from the same STUN servers the punch uses. The default route interface is read from `/proc/net/route` on Linux, `route -n get default` on macOS and `Get-NetRoute` on Windows.
 
 ### Rendezvous <!-- id: rendezvous -->
 
-> Hole punching needs a way to start a program on the remote side and swap addresses. Colab and Elice provide one; any other machine runs `letify client shell connect`.
+> Hole punching needs a way to start a program on the remote side and swap addresses. For Colab and Elice the provider layer fills that role; a plain machine behind NAT runs `letify client shell connect`.
 
 | Provider | Rendezvous |
 |---|---|
-| `Colab` | `colab exec` |
-| `Elice` | the Elice Cloud API |
-| `Tunnel`, and a plain `Shell` behind NAT | the remote agent started by `letify client shell connect` |
+| `Colab` | the provider layer: `colab new` creates the runtime and `colab exec` runs the remote half |
+| `Elice` | the provider layer: the Elice Cloud API creates and allocates the machine, and the remote half runs over forward SSH to it |
+| `Tunnel`, and a plain `Shell` behind NAT | the remote agent started by `letify client shell connect`, reached over Tailcat |
 
-`letify client shell connect` is run once on the remote machine by its user. It starts the remote agent, which stays running, keeps a connection to the rendezvous relay, and answers punch requests for the account it was started for. Installing letify on that machine is therefore a requirement for ranks 2 and 3 on a machine without a provider API.
+Colab and Elice never need `letify client shell connect`. Their create and open step is what puts letify's remote half on the machine.
+
+`letify client shell connect` is run once on a plain machine by its user. It starts the remote agent on a port the operating system chooses, starts `tailcat serve <agent port>` in front of it, and prints the Tailcat address and the agent port. The user writes both into the account once, as `tailcat = "<address>"` and `tailcat_port = <agent port>`. The agent needs letify installed on that machine.
+
+A connection to the agent is told apart by its first bytes: `SSH-` is spliced to the machine's SSH server, and `LETIFY-RDV ` is followed by one JSON request line and answered with one JSON line. For such an account the pipeline connects over Tailcat first, runs `tailcat <address> <agent port>` to exchange the TCP punch mapping and start time over that link, and then races as specified: the Tailcat link is the rank 3 candidate, and when TCP punching passes the probe it takes over.
 
 Both sides learn their public mapping from STUN servers reached over TCP on port 443, because networks that restrict outbound ports usually still allow 443. A punch starts at a time both sides agree on through the rendezvous. Each side connects from its bound port to the other's mapping and listens on the same port, so whichever direction's SYN arrives first completes the connection.
 
-A local port that letify binds for forwarding is chosen by the operating system, never fixed, because Windows reserves port ranges that vary by machine.
+Every socket in a punch is bound with `SO_REUSEADDR`, and with `SO_REUSEPORT` where the platform has it, so the STUN connection, the listener and the connecting socket share one port. Both sides may complete a connection in each direction. The user's side takes the first connection that completes and writes a hello carrying a 16 byte token the two sides agreed on through the rendezvous. The remote side keeps the connection on which that hello arrives and closes the others.
+
+A punched connection first answers the probe, then on request is spliced to the remote machine's SSH server, and SSH runs over a local forwarding port. A second SSH connection over the same link punches again.
+
+A local port that letify binds for forwarding is chosen by the operating system, never fixed, because Windows reserves port ranges that vary by machine. The remote end of a reverse forward is chosen the same way, with `ssh -R 0:`.
+
+The remote half of a punch, a Tailcat listener or a reverse forward is one standard library Python module sent as source, so a Colab or Elice machine needs Python and nothing else. Through the provider layer it runs as a detached process that prints its answer and outlives the command.
+
+Tailcat is run as `tailcat serve <port>` on the remote side, which prints `Server listening with new address: <address>`, and as `tailcat <address> <port>` in an SSH `ProxyCommand` on the user's side. It is applicable only when `tailcat` is on the user's PATH.
 
 ### Reverse SSH <!-- id: reverse-ssh -->
 
@@ -474,7 +492,9 @@ kind = "shell"
 reverse_ssh = { address = "home.example.com", port = 2222, user = "me" }
 ```
 
-It is opt-in because it needs the user's machine to accept inbound SSH and needs a key on the remote side that can log in to it. letify generates a key per session, installs it in the user's `authorized_keys` restricted to port forwarding with no shell, and removes it when the session ends. Installing that restriction is done once by an explicit command, not by the pipeline.
+It is opt-in because it needs the user's machine to accept inbound SSH and needs a key on the remote side that can log in to it.
+
+The key is per session. letify generates a new ed25519 key pair for each session and appends the public key to the user's `~/.ssh/authorized_keys` with `restrict,port-forwarding,command="/bin/false"` and the comment `letify-session <alias>`. The private key reaches the remote side through the rendezvous. Closing the link removes the line. Before a new session's key is added, every line carrying the `letify-session` marker for that alias is removed, so a crashed session never leaves a key behind.
 
 ### Colab <!-- id: colab-transport -->
 
@@ -483,6 +503,8 @@ It is opt-in because it needs the user's machine to accept inbound SSH and needs
 The Colab CLI runs as `uv tool run --from google-colab-cli colab`, with `jupyter-kernel-client<1` pinned, because release 0.6.0 of the CLI calls an API that jupyter-kernel-client 1.0 removed. `colab new` and `colab stop` manage the session.
 
 Colab limits outbound UDP to roughly 200 packets per second, so rank 3 is expected to lose the probe there. It stays in the list because the ratio rule removes it without a special case.
+
+A `channel = "exec"` entry skips the pipeline and uses the fallback directly. A Colab VM has no SSH server by default, so the rendezvous request asks the remote half to install `openssh-server` and start `sshd` first. The request carries the account's public key, `key` with `.pub` appended, which the remote side adds to `authorized_keys`. SSH over a punched or Tailcat link logs in as `root` unless `user` says otherwise.
 
 The fallback sends calls with `colab exec` and bulk data through the Jupyter contents API that the Colab runtime proxy exposes: uploads are split into parts sent in parallel, each part in chunked `PUT` requests, and downloads read `/files/<path>` in parallel parts. The contents API root is `/` on the VM, not `/content`.
 
@@ -696,7 +718,9 @@ Linux wheels are built inside the `manylinux_2_28` containers, so the binaries n
 
 - **`letify-driver` covers one milestone.** The entry points a PyTorch process needs to start up and run one kernel are forwarded and verified against a real GPU. Kernel argument marshalling reads the pointer list without knowing the kernel's signature, and fatbin size comes from a conservative window rather than the image header. Both need a real workload to shape them.
 - **`Modal` and `Elice` are not exercised against the live services.** Their code follows each service's published interface, and the Elice paths come from Elice's own Terraform provider, but neither has been run end to end.
-- **The connection pipeline is not implemented.** `Rendezvous`, `Strategy`, `Link`, `Probe`, `Pipeline`, `LinkCache`, `letify client shell connect` and the rendezvous relay exist only in this document. The current code connects `Tunnel` through Tailscale or frp and `Colab` through a channel setting.
+- **The connection pipeline is not exercised against live networks.** `Rendezvous`, `Strategy`, `Link`, `Probe`, `Pipeline`, `LinkCache` and the remote agent are implemented and tested over loopback sockets and faked commands. Installing and starting `sshd` on a Colab VM over `colab exec` is not yet checked against a live runtime.
+- **The Elice API runs no command on a machine.** The paths letify uses (virtual machine, allocation, instance type, pricing) create and power machines only, so Elice's remote half runs over forward SSH to the allocated machine, and the punch and Tailcat strategies need that SSH to succeed first.
+- **The Colab file API is not part of the fallback link.** The fallback carries calls over `colab exec`; bulk transfer through the Jupyter contents API is not implemented.
 - **Orphan reconciliation is not implemented.** A session whose controlling machine was killed outright is released by the lease on the providers where the process is the cost. Where the platform bills for the machine and takes no deadline, nothing ends it: an Elice allocation bills until a delete is issued. The intended answer is that the next letify process asks the provider what is running under this project's name and ends what nothing is watching, with a command to do it on demand. Neither exists yet.
 - **Whether the Elice allocation API takes a deadline is unverified.** If it does, that is where the guarantee belongs, because the platform outlives the caller.
 - **Persistence detection is not implemented.** Deciding a machine's disk policy by writing a marker file and looking for it in a later runtime is a decision recorded here, not yet code.

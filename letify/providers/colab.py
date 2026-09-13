@@ -1,16 +1,12 @@
 """Colab, a Google Colab runtime driven by the official CLI.
 
-Sessions are created and destroyed with ``colab new`` and ``colab stop``. For
-running work there are two paths, and which one is used decides what letify can do.
-
-``colab ssh --proxy-mode`` is an OpenSSH ProxyCommand bridge over a WebSocket, so a
-worker process can be kept alive behind pipes exactly as on any other machine. That
-is the preferred channel, because it is what makes handles resolvable and lets a
-large argument be sent once.
-
-``colab exec`` runs one command and returns its output. It always works, needs
-nothing beyond the CLI, and keeps nothing between calls. It is the fallback, and it
-is what ``channel = "exec"`` in the configuration selects.
+Sessions are created and destroyed with ``colab new`` and ``colab stop``. Colab is a
+``Shell`` whose rendezvous is its provider layer: ``colab exec`` runs letify's remote half
+on the runtime, which installs and starts an SSH server (a Colab VM has none) and answers
+the punch or Tailcat request. The connection pipeline then races TCP hole punching and
+Tailcat, with no forward SSH, and falls back to ``colab exec`` itself, one program per
+call. ``channel = "exec"`` in the configuration skips the pipeline and uses that fallback
+directly.
 
 Two facts here are settled by measurement rather than preference.
 
@@ -31,9 +27,9 @@ exhausted balance reverts the account to the free tier policy, which disallows t
 
 from __future__ import annotations
 
-import shlex
 import subprocess
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 from .. import tools
@@ -44,6 +40,9 @@ from .shell import Shell
 if TYPE_CHECKING:
     from ..runtime.channel import Channel
     from ..runtime.session import Runtime
+    from ..transport.link import Link
+    from ..transport.rendezvous import Rendezvous
+    from ..transport.strategies import Strategy, Target
 
 #: Accelerators the CLI accepts. G4 is the RTX PRO 6000 Blackwell part, which is the
 #: only Colab option with NVFP4 tensor cores.
@@ -73,8 +72,7 @@ class Colab(Shell):
     default_persistence = "ephemeral"
 
     #: The control path crosses a Google frontend rather than reaching the machine
-    #: directly, so forwarding pays a long round trip per synchronization. Possible,
-    #: since ``colab ssh --proxy-mode`` carries arbitrary TCP, but slow.
+    #: directly, so forwarding pays a long round trip per synchronization.
     has_fast_path = False
 
     #: Measured from Seoul to a Colab runtime in the United States.
@@ -92,7 +90,7 @@ class Colab(Shell):
 
     @property
     def channel_kind(self) -> str:
-        """``ssh`` for a persistent worker, ``exec`` for one command per call."""
+        """``ssh`` for a persistent worker over the pipeline, ``exec`` for one command per call."""
         return str(self.config.option("channel", "ssh"))
 
     @property
@@ -108,9 +106,6 @@ class Colab(Shell):
         if uv is None:
             raise ProviderUnavailable(self.kind, tools.missing_uv_message())
         return tools.command(tools.COLAB, uv)
-
-    def _require_cli(self) -> None:
-        self._colab()
 
     # -- instances -----------------------------------------------------------
 
@@ -165,6 +160,9 @@ class Colab(Shell):
             env["COLAB_ACCOUNT"] = self.account
         return env
 
+    def _exec(self, session: str, source: str, timeout: float | None) -> str:
+        return self._cli("exec", "-s", session, stdin=source, timeout=timeout)
+
     def sessions(self) -> list[str]:
         """Names of the sessions this account currently holds."""
         names = []
@@ -174,20 +172,48 @@ class Colab(Shell):
                 names.append(token[0])
         return names
 
-    def ssh_command(self, remote_command: str | None = None) -> list[str]:
-        """Reach the runtime through the CLI's WebSocket SSH bridge."""
-        self._require_cli()
-        command = [
-            "ssh",
-            "-o",
-            "BatchMode=yes",
-            "-o",
-            f"ProxyCommand={' '.join(self._colab())} ssh --proxy-mode",
-            "colab",
-        ]
-        if remote_command:
-            command.append(remote_command)
-        return command
+    # -- the pipeline ----------------------------------------------------------
+
+    def strategies(self) -> list[Strategy]:
+        """The Shell list without forward SSH, which a Colab VM does not accept."""
+        return [strategy for strategy in super().strategies() if strategy.name != "direct_ssh"]
+
+    def rendezvous(self, runtime: Runtime | None = None) -> Rendezvous | None:
+        if runtime is None:
+            return None
+        from ..transport.rendezvous import ColabRendezvous
+
+        name = runtime.name
+        return ColabRendezvous(
+            lambda source, timeout: self._exec(name, source, timeout), self._public_key()
+        )
+
+    def fallback(self, runtime: Runtime | None = None) -> Callable[[], Link] | None:
+        if runtime is None:
+            return None
+        from ..transport.link import OneShotLink
+
+        name = runtime.name
+        return lambda: OneShotLink(
+            "fallback", 4, lambda source, timeout: self._exec(name, source, timeout)
+        )
+
+    def target(self, runtime: Runtime | None = None) -> Target:
+        target = super().target(runtime)
+        target.user = self.user or "root"
+        if runtime is not None:
+            # Each runtime is a new VM with a new host key.
+            target.host_key_alias = f"letify-{self.alias}-{runtime.name}"
+        return target
+
+    def _link_key(self, runtime: Runtime | None) -> str:
+        return runtime.name if runtime is not None else ""
+
+    def _public_key(self) -> str | None:
+        if not self.key_path:
+            return None
+        path = Path(self.key_path + ".pub").expanduser()
+        return path.read_text(encoding="utf-8").strip() if path.is_file() else None
 
     # -- sessions ------------------------------------------------------------
 
@@ -200,6 +226,7 @@ class Colab(Shell):
         self._cli(*args, timeout=900)
 
     def stop(self, runtime: Runtime) -> None:
+        self.close_link(runtime)
         try:
             self._cli("stop", "-s", runtime.name, timeout=180)
         except (RuntimeFailure, ProviderUnavailable):
@@ -207,20 +234,16 @@ class Colab(Shell):
             pass
 
     def open_channel(self, runtime: Runtime) -> Channel:
-        from ..runtime.channel import OneShotChannel, PersistentChannel
+        from ..runtime.channel import OneShotChannel
 
-        if self.channel_kind == "ssh":
-            from ..protocol.worker import BOOTSTRAP
+        if self.channel_kind == "exec":
+            name = runtime.name
 
-            return PersistentChannel(
-                self.ssh_command(f"{self.remote_python} -u -c {shlex.quote(BOOTSTRAP)}"),
-                name=runtime.name,
-            )
+            def run(source: str, timeout: float | None) -> str:
+                return self._exec(name, source, timeout)
 
-        def run(source: str, timeout: float | None) -> str:
-            return self._cli("exec", "-s", runtime.name, stdin=source, timeout=timeout)
-
-        return OneShotChannel(run, name=runtime.name)
+            return OneShotChannel(run, name=runtime.name)
+        return super().open_channel(runtime)
 
 
 __all__ = ["ALIASES", "GPUS", "TPUS", "Colab"]

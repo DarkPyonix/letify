@@ -25,7 +25,6 @@ from letify.declare.instance import Host, Instance
 from letify.providers import colab as colab_module
 from letify.providers import local as local_module
 from letify.providers import shell as shell_module
-from letify.providers import tunnel as tunnel_module
 from letify.providers.base import Provider
 from letify.providers.colab import ALIASES, Colab
 from letify.providers.elice import (
@@ -39,9 +38,11 @@ from letify.providers.local import Local
 from letify.providers.modal import Modal, SandboxChannel
 from letify.providers.naming import gib_from_mib, normalize_gpu
 from letify.providers.shell import Shell
-from letify.providers.tunnel import DEFAULT_MTU, Tunnel
+from letify.providers.tunnel import Tunnel
 from letify.runtime.channel import OneShotChannel, PersistentChannel
 from letify.store.backends.filesystem import FilesystemBackend
+from letify.transport import strategies as strategies_module
+from letify.transport.rendezvous import ShellCommandRendezvous, TailcatRendezvous
 
 probe_module = import_module("letify.remoting.probe")
 usage_module = import_module("letify.providers.usage")
@@ -449,29 +450,6 @@ def test_stopping_a_session_that_is_already_gone_is_not_an_error(
     assert provider.stop(runtime) is None
 
 
-def test_colab_is_reached_through_the_cli_websocket_bridge(isolated_home, patch_which) -> None:
-    # An OpenSSH ProxyCommand over the CLI's bridge, which is an official path and needs
-    # no tunnel.
-    patch_which(tools_module, present=True)
-    command = provider_of(Colab, "colab_a").ssh_command("echo hello")
-    assert command[:3] == ["ssh", "-o", "BatchMode=yes"]
-    assert f"ProxyCommand={' '.join(COLAB_CLI)} ssh --proxy-mode" in command
-    assert command[-2:] == ["colab", "echo hello"]
-
-
-def test_the_persistent_colab_channel_starts_a_worker_over_that_bridge(
-    isolated_home, patch_which
-) -> None:
-    patch_which(tools_module, present=True)
-    provider = provider_of(Colab, "colab_a")
-    assert provider.channel_kind == "ssh"
-    assert provider.persistent_channel is True
-    runtime = type("R", (), {"name": "letify-g4-1"})()
-    channel = provider.open_channel(runtime)
-    assert isinstance(channel, PersistentChannel)
-    assert "python3 -u -c" in channel.command[-1]
-
-
 def test_the_exec_fallback_keeps_nothing_between_calls(
     isolated_home, patch_which, patch_run
 ) -> None:
@@ -587,165 +565,96 @@ def test_a_remote_worker_is_one_python_reading_framed_requests(patch_run) -> Non
     assert "base64" in channel.command[-1]
 
 
-# -- Spec: Transport, the tunnel -----------------------------------------------
+# -- Spec: Transport, Connection strategies per provider --------------------------
 
 
-def test_tailscale_is_the_default_transport_and_the_mtu_is_held_down() -> None:
-    # Every mesh VPN in this class stalls bulk transfers silently above about 1400.
-    provider = provider_of(Tunnel, "lab")
-    assert provider.transport == "tailscale"
-    assert provider.mtu == DEFAULT_MTU == 1280
-    assert provider_of(Tunnel, "lab", mtu=1400).mtu == 1400
+def test_a_plain_shell_lists_the_four_default_strategies_in_rank_order() -> None:
+    provider = provider_of(Shell, "lab", address="gpu.example.edu")
+    assert [(s.name, s.rank) for s in provider.strategies()] == [
+        ("direct_ssh", 1),
+        ("tcp_punch", 2),
+        ("tailcat", 3),
+        ("fallback", 4),
+    ]
 
 
-def test_a_machine_that_needs_no_tunnel_declares_none(patch_run) -> None:
-    recorder = patch_run(tunnel_module)
-    provider = provider_of(Tunnel, "lab", transport="none")
-    assert provider.connect() is None
+def test_a_shell_with_no_rendezvous_is_reached_by_forward_ssh_alone(patch_run) -> None:
+    recorder = patch_run(shell_module)
+    provider = provider_of(Shell, "lab", address="gpu.example.edu")
+    assert provider.rendezvous() is None
+    assert provider.link().strategy == "direct_ssh"
     assert recorder.calls == []
 
 
-def test_an_unknown_transport_is_refused() -> None:
-    with pytest.raises(letify.ProviderUnavailable, match="unknown transport 'wireguard'"):
-        provider_of(Tunnel, "lab", transport="wireguard").connect()
-
-
-def test_tailscale_has_to_be_installed_on_both_machines(patch_which) -> None:
-    patch_which(tunnel_module, present=False)
-    with pytest.raises(letify.ProviderUnavailable, match="Install Tailscale"):
-        provider_of(Tunnel, "lab").connect()
-
-
-def test_a_path_that_is_already_up_is_left_alone(patch_which, patch_run) -> None:
-    patch_which(tunnel_module, present=True)
-    recorder = patch_run(tunnel_module, result=FakeCompleted(stdout='{"BackendState": "Running"}'))
-    provider_of(Tunnel, "lab").connect()
-    # Status was asked, and nothing was brought up.
-    assert recorder.commands == [["tailscale", "status", "--json"]]
-
-
-def test_bringing_a_path_up_needs_an_auth_key_that_is_not_in_a_tracked_file(
-    patch_which, patch_run
-) -> None:
-    patch_which(tunnel_module, present=True)
-    patch_run(tunnel_module, result=FakeCompleted(stdout='{"BackendState": "NeedsLogin"}'))
-    with pytest.raises(letify.ProviderUnavailable, match="or set auth_key_env"):
-        provider_of(Tunnel, "lab").connect()
-
-
-def test_a_path_is_brought_up_from_an_auth_key_with_no_prompt(
-    patch_which, patch_run, monkeypatch
-) -> None:
-    patch_which(tunnel_module, present=True)
-    monkeypatch.setenv("LETIFY_TS_KEY", "tskey-auth-1")
-    recorder = patch_run(
-        tunnel_module,
-        result=lambda command: FakeCompleted(stdout='{"BackendState": "NeedsLogin"}'),
-    )
-    provider_of(Tunnel, "lab", auth_key_env="LETIFY_TS_KEY").connect()
-    assert recorder.commands[-1] == ["tailscale", "up", "--auth-key=tskey-auth-1"]
-
-
-def test_a_self_hosted_control_plane_is_passed_through(patch_which, patch_run, monkeypatch) -> None:
-    patch_which(tunnel_module, present=True)
-    monkeypatch.setenv("LETIFY_TS_KEY", "tskey-auth-1")
-    recorder = patch_run(
-        tunnel_module, result=FakeCompleted(stdout='{"BackendState": "NeedsLogin"}')
-    )
-    provider_of(
-        Tunnel,
+def test_reverse_ssh_takes_rank_four_and_moves_the_fallback_to_five() -> None:
+    provider = provider_of(
+        Shell,
         "lab",
-        auth_key_env="LETIFY_TS_KEY",
-        login_server="https://headscale.example.edu",
-    ).connect()
-    assert "--login-server=https://headscale.example.edu" in recorder.commands[-1]
-
-
-def test_a_path_that_will_not_come_up_says_what_tailscale_said(
-    patch_which, patch_run, monkeypatch
-) -> None:
-    patch_which(tunnel_module, present=True)
-    monkeypatch.setenv("LETIFY_TS_KEY", "tskey-auth-1")
-
-    def answer(command: list[str]) -> FakeCompleted:
-        if command[1] == "status":
-            return FakeCompleted(stdout='{"BackendState": "NeedsLogin"}')
-        return FakeCompleted(returncode=1, stderr="auth key expired")
-
-    patch_run(tunnel_module, result=answer)
-    provider = provider_of(Tunnel, "lab", auth_key_env="LETIFY_TS_KEY")
-    with pytest.raises(letify.ProviderUnavailable, match="auth key expired"):
-        provider.connect()
-
-
-def test_a_status_command_that_cannot_be_run_is_not_a_running_path(patch_which, patch_run) -> None:
-    patch_which(tunnel_module, present=True)
-    patch_run(tunnel_module, error=OSError("no such binary"))
-    with pytest.raises(letify.ProviderUnavailable, match="auth_key_env"):
-        provider_of(Tunnel, "lab").connect()
-
-
-def test_the_path_is_brought_up_once_per_process(patch_which, patch_run) -> None:
-    patch_which(tunnel_module, present=True)
-    recorder = patch_run(tunnel_module, result=FakeCompleted(stdout='{"BackendState": "Running"}'))
-    provider = provider_of(Tunnel, "lab")
-    provider.connect()
-    provider.connect()
-    assert len(recorder.calls) == 1
-
-
-def test_frp_is_the_fallback_for_a_network_that_blocks_udp(
-    patch_which, monkeypatch, tmp_path
-) -> None:
-    # A relayed Tailscale path keeps working but slowly, so frp over TLS 443 is the way
-    # out of the relay.
-    patch_which(tunnel_module, present=True)
-    started: list[list[str]] = []
-    monkeypatch.setattr(
-        tunnel_module.subprocess, "Popen", lambda command, **kwargs: started.append(command)
+        address="gpu.example.edu",
+        reverse_ssh={"address": "home.example.com", "port": 2222, "user": "me"},
     )
-    config = tmp_path / "frpc.toml"
-    config.write_text("serverPort = 443\n", encoding="utf-8")
-    provider_of(Tunnel, "lab", transport="frp", frp_config=str(config)).connect()
-    assert started == [["frpc", "-c", str(config)]]
+    assert [(s.name, s.rank) for s in provider.strategies()][-2:] == [
+        ("reverse_ssh", 4),
+        ("fallback", 5),
+    ]
 
 
-def test_frp_needs_its_binary_and_its_configuration(patch_which) -> None:
-    patch_which(tunnel_module, present=False)
-    with pytest.raises(letify.ProviderUnavailable, match="'frpc'"):
-        provider_of(Tunnel, "lab", transport="frp").connect()
-
-    patch_which(tunnel_module, present=True)
-    with pytest.raises(letify.ProviderUnavailable, match="needs an frp_config path"):
-        provider_of(Tunnel, "lab", transport="frp").connect()
+def test_an_account_with_a_tailcat_address_has_the_agent_as_its_rendezvous() -> None:
+    provider = provider_of(Tunnel, "lab", tailcat="tcHome", tailcat_port=40123)
+    rendezvous = provider.rendezvous()
+    assert isinstance(rendezvous, TailcatRendezvous)
+    assert (rendezvous.address, rendezvous.port) == ("tcHome", 40123)
 
 
-def test_a_diagnosis_names_the_two_usual_causes_of_a_stalled_transfer(
-    patch_which, patch_run
+def test_a_tunnel_with_no_address_and_no_tailcat_says_what_is_missing(isolated_home) -> None:
+    with pytest.raises(letify.ProviderUnavailable) as caught:
+        provider_of(Tunnel, "lab").link()
+    assert "no address" in str(caught.value)
+    assert "no rendezvous" in str(caught.value)
+
+
+def test_colab_races_without_forward_ssh(isolated_home, patch_which) -> None:
+    patch_which(tools_module, present=True)
+    provider = provider_of(Colab, "colab_a")
+    assert [s.name for s in provider.strategies()] == ["tcp_punch", "tailcat", "fallback"]
+
+
+def test_the_colab_rendezvous_is_colab_exec_and_asks_for_an_ssh_server(
+    isolated_home, patch_which, patch_run
 ) -> None:
-    # A relayed path and an MTU above 1400 are the two usual causes.
-    patch_which(tunnel_module, present=True)
-    patch_run(tunnel_module, result=FakeCompleted(stdout="100.1.1.1 lab linux relay sea\n"))
-    report = provider_of(Tunnel, "lab").diagnose()
-    assert report["transport"] == "tailscale"
-    assert report["mtu"] == 1280
-    assert report["relayed"] is True
-    assert "100.1.1.1" in report["status"]
+    patch_which(tools_module, present=True)
+    answer = FakeCompleted(stdout='LETIFY-ANSWER {"pong": true}\n')
+    recorder = patch_run(colab_module, result=answer)
+    provider = provider_of(Colab, "colab_a")
+    runtime = type("R", (), {"name": "letify-g4-1"})()
+    assert provider.rendezvous(runtime).exchange({"kind": "ping"}, 30) == {"pong": True}
+    assert recorder.command == [*COLAB_CLI, "exec", "-s", "letify-g4-1"]
+    assert '"start_sshd": true' in recorder.calls[-1]["input"]
 
 
-def test_a_diagnosis_of_a_non_tailscale_path_reports_only_what_it_knows() -> None:
-    assert provider_of(Tunnel, "lab", transport="frp").diagnose() == {
-        "transport": "frp",
-        "mtu": 1280,
-    }
-
-
-def test_a_diagnosis_says_so_when_the_tailscale_command_cannot_be_run(
-    patch_which, patch_run
+def test_colab_falls_back_to_exec_when_nothing_else_connects(
+    isolated_home, patch_which, patch_run
 ) -> None:
-    patch_which(tunnel_module, present=True)
-    patch_run(tunnel_module, error=OSError("no such binary"))
-    assert "no such binary" in provider_of(Tunnel, "lab").diagnose()["error"]
+    # One shutil module backs every which, so only tailcat is hidden and uv stays found.
+    patch_which(
+        strategies_module,
+        present=lambda name: None if name == "tailcat" else f"/usr/bin/{name}",
+    )
+    recorder = patch_run(colab_module)
+    provider = provider_of(Colab, "colab_a", stun="127.0.0.1:9")
+    runtime = type("R", (), {"name": "letify-g4-1"})()
+    channel = provider.open_channel(runtime)
+    assert isinstance(channel, OneShotChannel)
+    channel.runner("print('hello')", 60)
+    assert recorder.command == [*COLAB_CLI, "exec", "-s", "letify-g4-1"]
+
+
+def test_elice_runs_its_remote_half_over_forward_ssh_to_the_allocated_machine() -> None:
+    provider = provider_of(Elice, "e", zone_id="z", machine_id="m", address="gpu.elice.io")
+    rendezvous = provider.rendezvous()
+    assert isinstance(rendezvous, ShellCommandRendezvous)
+    assert rendezvous.ssh("python3 -")[-2:] == ["gpu.elice.io", "python3 -"]
+    assert provider_of(Elice, "e", zone_id="z", machine_id="m").rendezvous() is None
 
 
 # -- Spec: Provider model, Elice -----------------------------------------------

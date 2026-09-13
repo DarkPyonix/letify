@@ -32,6 +32,7 @@ from .usage import Usage
 
 if TYPE_CHECKING:
     from ..runtime.session import Runtime
+    from ..transport.rendezvous import Rendezvous
 
 DEFAULT_ENDPOINT = "https://portal.elice.cloud/api"
 
@@ -220,6 +221,20 @@ class Elice(Shell):
         except RuntimeFailure:
             # Releasing is best effort. An allocation that is already gone is fine.
             pass
+
+    # -- the pipeline ----------------------------------------------------------
+
+    def rendezvous(self, runtime: Runtime | None = None) -> Rendezvous | None:
+        """Forward SSH to the machine the API allocated.
+
+        The API paths letify uses create and power machines and run no command on them, so
+        once the allocation is up the remote half runs over SSH to its address.
+        """
+        if not isinstance(self.config.option("address"), str):
+            return None
+        from ..transport.rendezvous import ShellCommandRendezvous
+
+        return ShellCommandRendezvous(self.ssh_command, self.remote_python)
 
     # -- sessions ------------------------------------------------------------
 
