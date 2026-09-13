@@ -1677,15 +1677,46 @@ def test_a_check_reports_a_workspace_that_cannot_be_written(patch_run) -> None:
 REMOTE_UUIDS = "0, GPU-aaa\n1, GPU-bbb\n2, GPU-ccc\n3, GPU-ddd\n"
 
 
-def remote_smi(apps: str, *, uuids: str = REMOTE_UUIDS, returncode: int = 0):
-    """Answer the two nvidia-smi queries a busy check sends over SSH."""
+def owned_apps(apps: str, owners: dict[int, str] | None = None, login: str = "work") -> str:
+    """The output of the owner script: the listing, each visible owner, then the login user.
+
+    A pid missing from ``owners`` is owned by ``someone``, another user. A pid mapped to
+    ``None`` is not visible in the namespace, so the script prints no owner for it.
+    """
+    table = dict(owners or {})
+    lines = [line for line in apps.splitlines() if line.strip()]
+    out = [*lines, "#owners"]
+    for line in lines:
+        pid = int(line.split(",")[1])
+        owner = table.get(pid, "someone")
+        if owner is not None:
+            out.append(f"{pid} {owner}")
+    out += ["#login", login]
+    return "\n".join(out) + "\n"
+
+
+def remote_smi(
+    apps: str,
+    *,
+    uuids: str = REMOTE_UUIDS,
+    returncode: int = 0,
+    owners: dict[int, str] | None = None,
+    login: str = "work",
+    owner_returncode: int = 0,
+):
+    """Answer the two commands a busy check sends over SSH."""
 
     def answer(command: list[str]) -> FakeCompleted:
         remote = command[-1]
         if "--query-gpu=index,uuid" in remote:
             return FakeCompleted(returncode=returncode, stdout=uuids, stderr="nvidia-smi failed")
         if "--query-compute-apps=gpu_uuid,pid" in remote:
-            return FakeCompleted(returncode=returncode, stdout=apps, stderr="nvidia-smi failed")
+            code = returncode or owner_returncode
+            return FakeCompleted(
+                returncode=code,
+                stdout="" if code else owned_apps(apps, owners, login),
+                stderr="owner query failed",
+            )
         return FakeCompleted(returncode=1, stderr=f"unexpected command {remote}")
 
     return answer
@@ -1710,7 +1741,7 @@ def test_a_remote_busy_reading_is_taken_again_at_every_reservation(patch_run) ->
 
     def answer(command: list[str]) -> FakeCompleted:
         if "--query-compute-apps" in command[-1]:
-            return FakeCompleted(stdout=next(readings))
+            return FakeCompleted(stdout=owned_apps(next(readings)))
         return FakeCompleted(stdout=REMOTE_UUIDS)
 
     patch_run(shell_module, result=answer)
@@ -1745,6 +1776,76 @@ def test_a_remote_machine_whose_registered_cards_are_all_busy_reserves_nothing(
     provider = indexed_shell(P100={"indices": "0-3"})
     assert provider.reserve(provider.P100) is None
     assert provider.last_busy == (0, 1, 2, 3)
+
+
+def test_a_card_running_only_the_login_users_own_processes_is_shared(patch_run) -> None:
+    apps = "GPU-aaa, 10\nGPU-aaa, 11\nGPU-bbb, 20\n"
+    patch_run(shell_module, result=remote_smi(apps, owners={10: "work", 11: "work"}))
+    provider = indexed_shell(P100={"indices": "0-1"})
+    assert provider.busy() == (1,)
+    assert provider.reserve(provider.P100) == (0,)
+
+
+def test_a_card_with_one_process_of_another_user_is_busy(patch_run) -> None:
+    apps = "GPU-aaa, 10\nGPU-aaa, 11\n"
+    patch_run(shell_module, result=remote_smi(apps, owners={10: "work", 11: "alice"}))
+    provider = indexed_shell(P100={"indices": "0-1"})
+    assert provider.busy() == (0,)
+    assert provider.last_busy_owners == {0: ("alice",)}
+
+
+def test_a_process_whose_owner_is_not_visible_makes_its_card_busy(patch_run) -> None:
+    patch_run(shell_module, result=remote_smi("GPU-bbb, 30\n", owners={30: None}))
+    provider = indexed_shell(P100={"indices": "0-1"})
+    assert provider.busy() == (1,)
+    assert provider.last_busy_owners == {1: ("unknown",)}
+
+
+def test_a_root_login_still_reads_root_owned_foreign_processes_as_busy(patch_run) -> None:
+    apps = "GPU-aaa, 10\nGPU-bbb, 777\n"
+    patch_run(
+        shell_module, result=remote_smi(apps, owners={10: "root", 777: "root"}, login="root")
+    )
+    provider = indexed_shell(P100={"indices": "0-1"})
+    provider.add_worker_pid(777)
+    assert provider.busy() == (0,)
+    assert provider.last_busy_owners == {0: ("root",)}
+
+
+def test_an_owner_query_that_cannot_run_is_refused_rather_than_read_as_free(patch_run) -> None:
+    patch_run(shell_module, result=remote_smi("GPU-aaa, 10\n", owner_returncode=127))
+    provider = indexed_shell(P100={"indices": "0-1"})
+    with pytest.raises(letify.RuntimeFailure, match="busy check"):
+        provider.busy()
+
+
+def test_owners_are_read_in_one_remote_command_with_the_listing(patch_run) -> None:
+    recorder = patch_run(shell_module, result=remote_smi("GPU-aaa, 10\nGPU-bbb, 20\n"))
+    indexed_shell(P100={"indices": "0-1"}).busy()
+    remote = [command[-1] for command in recorder.commands]
+    assert len(remote) == 2
+    script = next(command for command in remote if "--query-compute-apps" in command)
+    assert "stat -c %U" in script and "id -un" in script
+
+
+def test_local_shares_a_card_running_only_the_current_users_processes(monkeypatch) -> None:
+    import getpass
+
+    from letify.runtime import telemetry
+
+    me = getpass.getuser()
+    asked: list[tuple[str, ...]] = []
+
+    def run(command: tuple[str, ...]) -> str:
+        asked.append(command)
+        if command == telemetry.UUID_COMMAND:
+            return REMOTE_UUIDS
+        return owned_apps("GPU-aaa, 10\nGPU-bbb, 20\n", {10: me}, login=me)
+
+    monkeypatch.setattr(telemetry, "_run", run)
+    provider = provider_of(Local, "box", devices={"P100": {"indices": "0-1"}})
+    assert provider.busy() == (1,)
+    assert asked[-1] == telemetry.OWNERS_COMMAND
 
 
 @pytest.mark.parametrize("cls", [Tunnel, Elice])
