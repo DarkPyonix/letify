@@ -114,7 +114,7 @@ This repository uses [ResearchTree](https://darkpyonix.github.io/researchtree/) 
 
 ## Code layout
 
-Python only, no compiled extensions. The package lives in `letify/` at the repository root.
+The Python package is pure Python and links no Python extension. The package lives in `letify/` at the repository root. letify-core, the Rust workspace in `letify-core/`, is built in CI and shipped as plain binaries in `letify/remoting/lib/` inside platform wheels.
 
 ```
 letify/

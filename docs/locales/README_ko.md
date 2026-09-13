@@ -140,6 +140,8 @@ uv add letify
 
 모든 프로바이더에 이것 하나면 됩니다. letify는 cloudpickle과 blake3만 설치합니다. 머신에 [uv](https://docs.astral.sh/uv/)가 있어야 합니다. Colab CLI와 Modal 클라이언트 같은 프로바이더 도구는 여러분의 `.venv`가 아니라 uv로 별도 환경에서 실행되기 때문입니다.
 
+휠에는 [letify-core](../../letify-core/)가 들어 있습니다. `host=letify.local`에서 CUDA 드라이버를 대신하는 Rust 구성 요소입니다. 휠은 Linux x86_64와 aarch64, Windows x86_64와 arm64, macOS arm64와 x86_64용으로 빌드됩니다. 다른 플랫폼에서는 letify-core가 없는 소스 배포판이 설치되고 `host=letify.local`은 거부됩니다.
+
 ---
 
 ## 🚀 빠른 시작

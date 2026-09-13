@@ -252,7 +252,7 @@ __marimo__/
 .agents
 .claude
 
-# Built shim artifacts, produced by shim/build.py
+# letify-core binaries, copied here by letify-core/build.py
 letify/remoting/lib/
 
 # Artifacts the examples write where they run

@@ -146,7 +146,7 @@ uv add letify
 
 That is the whole install, for every provider. letify installs only cloudpickle and blake3. It needs [uv](https://docs.astral.sh/uv/) on the machine, because provider tools such as the Colab CLI and the Modal client run through uv in their own environments, not in your `.venv`.
 
-One optional piece is native. `host=letify.local` needs [letify-core](letify-core/), a Rust workspace that stands in for the CUDA driver, built with `python letify-core/build.py`. If you only ship functions to remote machines you never need it.
+The wheel carries [letify-core](letify-core/), the Rust component behind `host=letify.local` that stands in for the CUDA driver. Wheels are built for Linux x86_64 and aarch64, Windows x86_64 and arm64, and macOS arm64 and x86_64. On another platform, pip falls back to the source distribution, which has no letify-core, and `host=letify.local` is refused.
 
 ---
 

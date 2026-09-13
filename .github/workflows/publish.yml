@@ -1,7 +1,12 @@
 # Publish to PyPI when a version tag is pushed.
 #
-# A tag such as v1.2.0 builds the package, checks that the tag agrees with the version in
-# pyproject.toml and letify/__init__.py, and uploads to PyPI. Tests are run before tagging.
+# A tag such as v1.2.0 checks that the tag agrees with the version in pyproject.toml and
+# letify/__init__.py, builds the sdist once and one wheel per desktop platform, and uploads
+# them all to PyPI. Tests are run before tagging.
+#
+# The Python code is pure, and letify-core binaries do not link Python, so each wheel is
+# tagged py3-none-<platform>. Linux wheels are built in manylinux_2_28 containers so the
+# binaries need only glibc 2.28, and the tag says so.
 #
 # Upload uses PyPI trusted publishing, so there is no token in this repository. Configure it
 # once on PyPI: project letify, owner DarkPyonix, repository letify, workflow publish.yml,
@@ -16,7 +21,7 @@ permissions:
   contents: read
 
 jobs:
-  build:
+  sdist:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -31,15 +36,90 @@ jobs:
             echo "::error::tag v$tag does not match pyproject.toml ($project) and letify/__init__.py ($package)"
             exit 1
           fi
-      - name: Build
-        run: uv build
+      - name: Build the sdist
+        run: uv build --sdist
       - uses: actions/upload-artifact@v4
         with:
-          name: dist
+          name: dist-sdist
           path: dist/
 
+  linux:
+    needs: sdist
+    strategy:
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            arch: x86_64
+          - runner: ubuntu-24.04-arm
+            arch: aarch64
+    runs-on: ${{ matrix.runner }}
+    container: quay.io/pypa/manylinux_2_28_${{ matrix.arch }}
+    env:
+      PATH: /root/.cargo/bin:/opt/python/cp312-cp312/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        # rustup reads letify-core/rust-toolchain.toml when cargo runs there.
+        run: curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable
+      - name: Install uv
+        run: python -m pip install uv
+      - name: Build letify-core
+        run: python letify-core/build.py
+      - name: Build the wheel
+        run: uv build --wheel
+      - name: Tag the wheel for the platform
+        run: |
+          uvx wheel tags --remove --platform-tag manylinux_2_28_${{ matrix.arch }} dist/*-py3-none-any.whl
+          ls dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-linux-${{ matrix.arch }}
+          path: dist/*.whl
+
+  native:
+    needs: sdist
+    strategy:
+      matrix:
+        include:
+          - runner: windows-latest
+            tag: win_amd64
+          - runner: windows-11-arm
+            tag: win_arm64
+          - runner: macos-latest
+            tag: macosx_11_0_arm64
+          - runner: macos-13
+            tag: macosx_10_12_x86_64
+    runs-on: ${{ matrix.runner }}
+    defaults:
+      run:
+        shell: bash
+    env:
+      # Matches the wheel tags above. Rust's own minimum is already 11.0 on arm64 and 10.12 on x86_64.
+      MACOSX_DEPLOYMENT_TARGET: ${{ matrix.runner == 'macos-13' && '10.12' || '11.0' }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: astral-sh/setup-uv@v6
+      - name: Install Rust
+        # rustup reads letify-core/rust-toolchain.toml when cargo runs there.
+        uses: dtolnay/rust-toolchain@stable
+      - name: Build letify-core
+        run: python letify-core/build.py
+      - name: Build the wheel
+        run: uv build --wheel
+      - name: Tag the wheel for the platform
+        run: |
+          uvx wheel tags --remove --platform-tag ${{ matrix.tag }} dist/*-py3-none-any.whl
+          ls dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-${{ matrix.tag }}
+          path: dist/*.whl
+
   publish:
-    needs: build
+    needs: [sdist, linux, native]
     runs-on: ubuntu-latest
     environment:
       name: pypi
@@ -49,6 +129,7 @@ jobs:
     steps:
       - uses: actions/download-artifact@v4
         with:
-          name: dist
+          pattern: dist-*
+          merge-multiple: true
           path: dist/
       - uses: pypa/gh-action-pypi-publish@release/v1

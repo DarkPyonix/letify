@@ -52,6 +52,12 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["letify"]
+# letify-core binaries are gitignored build products. CI copies them into letify/remoting/lib/
+# with letify-core/build.py before building each platform wheel, and artifacts includes them.
+artifacts = ["letify/remoting/lib/*"]
+
+[tool.hatch.build.targets.sdist]
+exclude = ["letify/remoting/lib", "letify-core/target"]
 
 # The fallback type for Launcher.providers. It is a top level module because a project's generated
 # stub replaces it by that name.
