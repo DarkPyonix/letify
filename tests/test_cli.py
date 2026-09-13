@@ -55,7 +55,7 @@ def test_the_declared_providers_are_listed_with_their_channel(isolated_home, cap
     assert "lab" in out
     assert "shell" in out
     assert "persistent" in out
-    assert "channel=persistent" in out
+    assert "channel" not in out
     # The local machine needs no declaration, so it is always there.
     assert "local" in out
 

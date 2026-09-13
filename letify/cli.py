@@ -208,9 +208,7 @@ def main(argv: list[str] | None = None) -> int:
             except Exception as exc:
                 print(f"{alias:20} unavailable: {exc}")
                 continue
-            row = f"{alias:20} {provider.kind:10} {provider.persistence:11}"
-            channel = "persistent" if provider.persistent_channel else "one-shot"
-            print(f"{row} channel={channel}")
+            print(f"{alias:20} {provider.kind:10} {provider.persistence}")
         return 0
 
     if args.command == "devices":

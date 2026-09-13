@@ -154,7 +154,14 @@ One optional piece is native. `host=letify.local` needs [letify-core](letify-cor
 
 ### 1. Declare your accounts once
 
-Put accounts in `~/.letify/config.toml`, so they belong to your machine and never to the repository.
+Run `letify login` once per account, from your project directory.
+
+```bash
+letify login colab colab_pro_plus
+letify login shell lab_a100
+```
+
+Each command writes two files. The account goes to `~/.letify/config.toml`, which belongs to your machine and never to the repository:
 
 ```toml
 [colab_pro_plus]
@@ -169,7 +176,15 @@ key = "~/.ssh/id_ed25519"
 persistent = true
 ```
 
-A project names the accounts it uses in its own `.letify/config.toml`. An empty table such as `[lab_a100]` is enough. An account with `global = true` in the home file needs no line, and neither does `local`.
+The project's `.letify/config.toml` gets only the alias, which is what makes the account usable in this project:
+
+```toml
+[colab_pro_plus]
+
+[lab_a100]
+```
+
+An account with `global = true` in the home file needs no project line, and neither does `local`.
 
 > 🔐 Secrets never go in `config.toml`. A field such as `access_token` comes from the environment variable named by `access_token_env`, or from the file `~/.letify/accounts/<alias>/access_token` that `letify login` writes with owner only permissions.
 
@@ -177,16 +192,9 @@ A project names the accounts it uses in its own `.letify/config.toml`. An empty 
 
 ```bash
 $ letify providers
-colab_pro_plus  colab   ephemeral   channel=persistent
-lab_a100        shell   persistent  channel=persistent
-local           local   persistent  channel=persistent
-
-$ letify devices
-{
-  "colab_pro_plus": ["A100", "G4", "H100", "L4", "T4", "v5e1", "v6e1"],
-  "lab_a100":       ["A100"],
-  "local":          ["CPU", "GeForce_RTX_4050"]
-}
+colab_pro_plus       colab      ephemeral
+lab_a100             shell      persistent
+local                local      persistent
 ```
 
 ### 3. Declare and run

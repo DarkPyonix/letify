@@ -146,7 +146,14 @@ uv add letify
 
 ### 1. 계정을 한 번 선언합니다
 
-계정은 `~/.letify/config.toml`에 둡니다. 머신에 속하는 정보이고, 저장소에는 들어가지 않습니다.
+계정마다 프로젝트 디렉터리에서 `letify login`을 한 번 실행합니다.
+
+```bash
+letify login colab colab_pro_plus
+letify login shell lab_a100
+```
+
+명령 하나가 파일 두 개를 씁니다. 계정은 `~/.letify/config.toml`에 들어갑니다. 머신에 속하는 정보이고, 저장소에는 들어가지 않습니다.
 
 ```toml
 [colab_pro_plus]
@@ -161,7 +168,15 @@ key = "~/.ssh/id_ed25519"
 persistent = true
 ```
 
-프로젝트는 쓰는 계정을 자기 `.letify/config.toml`에 이름으로 적습니다. `[lab_a100]` 같은 빈 테이블이면 충분합니다. 홈 파일에서 `global = true`인 계정과 `local`은 적지 않아도 됩니다.
+프로젝트의 `.letify/config.toml`에는 alias만 들어갑니다. 이 줄이 있어야 그 계정을 이 프로젝트에서 쓸 수 있습니다.
+
+```toml
+[colab_pro_plus]
+
+[lab_a100]
+```
+
+홈 파일에서 `global = true`인 계정과 `local`은 프로젝트에 적지 않아도 됩니다.
 
 > 🔐 비밀은 `config.toml`에 넣지 않습니다. `access_token` 같은 필드는 `access_token_env`가 가리키는 환경 변수, 또는 `letify login`이 소유자 전용 권한으로 쓰는 `~/.letify/accounts/<alias>/access_token` 파일에서 읽습니다.
 
@@ -169,16 +184,9 @@ persistent = true
 
 ```bash
 $ letify providers
-colab_pro_plus   colab   ephemeral   host=remote
-lab_a100  shell   persistent  host=remote
-local     local   persistent  host=local
-
-$ letify devices
-{
-  "colab_pro_plus": ["A100", "G4", "H100", "L4", "T4", "v5e1", "v6e1"],
-  "lab_a100":       ["A100"],
-  "local":          ["CPU", "GeForce_RTX_4050"]
-}
+colab_pro_plus       colab      ephemeral
+lab_a100             shell      persistent
+local                local      persistent
 ```
 
 ### 3. 선언하고 실행합니다
