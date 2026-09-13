@@ -8,8 +8,14 @@ they need a remote machine.
 from __future__ import annotations
 
 import json
+import os
+import shutil
 import socket
+import stat
+import subprocess
+import sys
 import threading
+import time
 
 import pytest
 from conftest import CannedRendezvous, FakeCompleted, LoopbackRendezvous
@@ -111,6 +117,99 @@ def test_a_tcp_punch_over_loopback_carries_the_probe_and_then_ssh(stun_server) -
     for sock in (client, conn, sshd):
         sock.close()
     link.close()
+
+
+# -- Spec: Transport, Rendezvous: known hosts ---------------------------------------
+
+
+def test_building_an_ssh_command_creates_the_account_directory_for_known_hosts(
+    tmp_path, monkeypatch
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))
+    command = Target(alias="lab").proxied_ssh("tailcat tcX 22")
+    directory = tmp_path / ".letify" / "accounts" / "lab"
+    assert f"UserKnownHostsFile={directory / 'known_hosts'}" in command
+    assert "StrictHostKeyChecking=accept-new" in command
+    assert "HostKeyAlias=letify-lab" in command
+    assert directory.is_dir()
+    if os.name != "nt":
+        assert stat.S_IMODE(directory.stat().st_mode) == 0o700
+
+
+SSHD = shutil.which("sshd") or ("/usr/sbin/sshd" if os.path.exists("/usr/sbin/sshd") else None)
+
+
+@pytest.mark.skipif(
+    SSHD is None or shutil.which("ssh") is None or os.name == "nt",
+    reason="needs OpenSSH ssh and sshd on this machine to run a real connection",
+)
+def test_ssh_through_a_proxy_records_the_key_quietly_and_refuses_a_changed_one(
+    tmp_path, monkeypatch
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    for name in ("host", "host2", "user"):
+        subprocess.run(
+            ["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-f", str(tmp_path / name)],
+            check=True,
+        )
+    (tmp_path / "authorized_keys").write_text((tmp_path / "user.pub").read_text())
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", 0))
+        port = probe.getsockname()[1]
+
+    def start(host_key: str) -> subprocess.Popen:
+        config = tmp_path / "sshd_config"
+        config.write_text(
+            f"Port {port}\nListenAddress 127.0.0.1\nHostKey {tmp_path / host_key}\n"
+            f"AuthorizedKeysFile {tmp_path / 'authorized_keys'}\nPidFile {tmp_path / 'pid'}\n"
+            "UsePAM no\nStrictModes no\n"
+        )
+        server = subprocess.Popen([SSHD, "-D", "-e", "-f", str(config)])
+        for _ in range(50):
+            try:
+                socket.create_connection(("127.0.0.1", port), timeout=0.1).close()
+                return server
+            except OSError:
+                time.sleep(0.1)
+        server.kill()
+        pytest.skip("the local sshd did not start")
+
+    relay = (
+        "import os,socket,sys,threading\n"
+        f"s=socket.create_connection(('127.0.0.1',{port}))\n"
+        "def up():\n"
+        "    while d:=os.read(0,65536): s.sendall(d)\n"
+        "    s.shutdown(socket.SHUT_WR)\n"
+        "threading.Thread(target=up,daemon=True).start()\n"
+        "while d:=s.recv(65536): os.write(1,d)\n"
+    )
+    (tmp_path / "relay.py").write_text(relay)
+    options = Target(alias="lab", key=str(tmp_path / "user"))
+    command = options.proxied_ssh(f"{sys.executable} {tmp_path / 'relay.py'}", "true")
+    # The system client config may set HashKnownHosts yes; the fix must hold either way.
+    command[1:1] = ["-o", "HashKnownHosts=yes", "-o", "UpdateHostKeys=no"]
+
+    server = start("host")
+    try:
+        for _ in range(2):
+            result = subprocess.run(command, capture_output=True, text=True, timeout=30)
+            assert result.returncode == 0, result.stderr
+            assert "Failed to add" not in result.stderr
+    finally:
+        server.kill()
+        server.wait()
+    known = tmp_path / ".letify" / "accounts" / "lab" / "known_hosts"
+    assert known.read_text().count("\n") == 1
+
+    server = start("host2")
+    try:
+        result = subprocess.run(command, capture_output=True, text=True, timeout=30)
+        assert result.returncode != 0
+        assert "Host key verification failed" in result.stderr
+    finally:
+        server.kill()
+        server.wait()
 
 
 # -- Spec: Transport, Rendezvous: Tailcat -------------------------------------------
@@ -285,6 +384,41 @@ def test_the_remote_script_is_the_standard_library_module_and_the_request() -> N
     assert script.rstrip().splitlines()[-1].startswith("run_detached(")
     assert "from ." not in script
     assert "import letify" not in script
+
+
+def test_a_punch_that_never_connects_prints_one_line_and_no_traceback(stun_server, capsys) -> None:
+    request = {
+        "kind": "tcp_punch",
+        "stun": list(stun_server.address),
+        "mapping": ["192.0.2.1", 9],
+        "token": "00" * 16,
+        "start_at": 0,
+        "window": 0.3,
+    }
+    _, continuation = nat.begin(request)
+    continuation()
+    err = capsys.readouterr().err
+    assert err == (
+        "letify agent: TCP punch with 192.0.2.1:9 did not connect within 0.3 s;"
+        " the Tailcat link is used instead\n"
+    )
+
+
+def test_an_unexpected_failure_in_the_punch_still_raises(stun_server, monkeypatch) -> None:
+    def broken(*args, **kwargs):
+        raise ValueError("bug")
+
+    monkeypatch.setattr(nat, "punch", broken)
+    request = {
+        "kind": "tcp_punch",
+        "stun": list(stun_server.address),
+        "mapping": ["192.0.2.1", 9],
+        "token": "00" * 16,
+        "start_at": 0,
+    }
+    _, continuation = nat.begin(request)
+    with pytest.raises(ValueError):
+        continuation()
 
 
 def test_a_ping_is_answered_without_a_continuation() -> None:

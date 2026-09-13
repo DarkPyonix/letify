@@ -51,7 +51,11 @@ class Target:
     workspace: str = "~/.letify-runtime"
 
     def _options(self) -> list[str]:
-        known_hosts = account_directory(self.alias) / "known_hosts"
+        directory = account_directory(self.alias)
+        # ssh creates only ~/.ssh; without this directory it cannot record the host key
+        # and warns "Failed to add the host to the list of known hosts" on every run.
+        directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+        known_hosts = directory / "known_hosts"
         options = [
             "-o",
             "BatchMode=yes",
