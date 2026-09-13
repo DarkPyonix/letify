@@ -896,6 +896,18 @@ letify looks for the library in `LETIFY_CORE_PATH`, then in `letify/remoting/lib
 
 A launch, a copy to the device and an allocation change device state and return immediately, so they are queued. A copy back to the host, a stream synchronization and an elapsed time query cannot be, and each one is a round trip. That is why the round trip count is the number of host synchronizations rather than the number of calls, which is what makes the efficiency model hold for a step that issues thousands of calls.
 
+### Framing
+
+> Every message is an 8 byte little-endian length followed by that many bytes of body. The protocol version is 2.
+
+The body is a tag byte and then fixed-width fields. The length is 64 bits because a single copy to the device may exceed 4 GiB, and a 32 bit length would wrap without an error. A reader grows its buffer as bytes arrive rather than trusting the length up front, so a corrupt length ends the connection with an error instead of an allocation failure. The driver and the agent refuse each other when their protocol versions differ.
+
+### Copies to the device
+
+> The bytes of a copy to the device are written from the caller's buffer and read into the agent's staging buffer, with no copy in between.
+
+On the driver, `cuMemcpyHtoD_v2` writes the frame header and the fixed fields, then hands the caller's slice to `write_vectored`. A payload larger than the 8 KiB write buffer goes to the socket without being copied into it. On the agent, a `CopyToDevice` frame is recognised by its tag before its body is read, and the payload is read with `read_exact` into a staging buffer the session keeps and reuses, which is then passed to the real driver. Batching and `TCP_NODELAY` are the same as for every other request. Measured throughput is in [NETWORK.md](NETWORK.md#letify-core-copy-throughput).
+
 ### Virtual pointers
 
 > An allocation returns a pointer immediately, and memory accounting stays local so that running out still fails at the call.
@@ -909,6 +921,8 @@ The cost is honest failure. A caching allocator learns the device is full when t
 > A compiled module is named by its contents, so a fatbin the agent already holds is not sent again.
 
 PyTorch loads the same modules on every process start and they are large. The agent keeps a table keyed by digest and answers with the handle it already has.
+
+`cuModuleLoadData` receives a pointer with no length, so the driver reads the size from the image itself and sends the whole image. A fatbinary is `fat_size` bytes, read from its header after the magic `0xBA55ED50`. An ELF object is `e_shoff + e_shentsize * e_shnum` bytes, or the end of its program headers when that is larger. Anything else is a PTX text image and runs to its terminating NUL, which is included.
 
 ### Loading
 

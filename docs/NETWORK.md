@@ -161,6 +161,18 @@ Both sides bound one TCP port, learned the mapping from `stun.nextcloud.com:443`
 
 `colab console` is not a usable channel: it is a terminal inside tmux, and a single input line of 4000 characters or more arrives truncated or mixed with terminal control sequences. The Colab runtime proxy reaches only port 8080 on the VM; other port prefixes return 404.
 
+### letify-core copy throughput
+
+A copy to the device through letify-core, with the payload streamed from the caller's buffer into the agent's staging buffer, moves about 2000 MiB/s over loopback TCP. The same payload through an encoded frame, the path before streaming, moves about 520 MiB/s. Both carry one 256 MiB `CopyToDevice` request between a `BufWriter` and a `BufReader` with `TCP_NODELAY`, on an AMD EPYC 7763, and report the median of five runs.
+
+| Path | Three invocations |
+|---|---|
+| Encoded frame, before the change | 545, 544, 507 MiB/s |
+| Encoded frame, after the change | 515, 514, 519 MiB/s |
+| Streamed into staging | 2043, 1961, 1873 MiB/s |
+
+Loopback removes the network, so these numbers bound what the copy path itself costs. On a real link the link rate decides throughput whenever it is below them. To reproduce, run `cargo test --release -p letify-wire --test throughput -- --ignored --nocapture --test-threads=1` in `letify-core/`.
+
 ## Measuring your own numbers
 
 Three checks settle most of what is provider specific.

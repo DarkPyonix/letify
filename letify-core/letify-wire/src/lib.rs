@@ -8,15 +8,15 @@
 //! That is why the efficiency of forwarding is `T / (T + k * RTT)` rather than
 //! `T / (T + calls * RTT)`. `k` counts the synchronizing calls, not all of them.
 //!
-//! Framing is a four byte little-endian length followed by that many bytes of payload.
+//! Framing is an eight byte little-endian length followed by that many bytes of payload.
 //! The payload is a tag byte and then fixed-width fields, hand encoded rather than
 //! going through a serialization crate, because this sits on the hot path and the shapes
 //! are small and fixed.
 
-use std::io::{self, Read, Write};
+use std::io::{self, IoSlice, Read, Write};
 
 /// Bumped when a request or reply layout changes in a breaking way.
-pub const PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 2;
 
 /// What the agent is being asked to do.
 ///
@@ -383,19 +383,156 @@ pub fn decode_reply(frame: &[u8]) -> io::Result<Reply> {
 
 // -- framing ------------------------------------------------------------------
 
+/// Size of the length prefix in front of every frame body.
+///
+/// Eight bytes, because a single copy to the device may exceed 4 GiB and a 32 bit
+/// length would wrap without an error.
+pub const FRAME_HEADER_BYTES: usize = 8;
+
+/// Encode the length prefix of a frame whose body is `length` bytes.
+pub fn encode_frame_header(length: u64) -> [u8; FRAME_HEADER_BYTES] {
+    length.to_le_bytes()
+}
+
+/// Decode the body length a frame header carries.
+pub fn decode_frame_header(header: [u8; FRAME_HEADER_BYTES]) -> u64 {
+    u64::from_le_bytes(header)
+}
+
 /// Write one length-prefixed frame.
 pub fn write_frame<W: Write>(writer: &mut W, body: &[u8]) -> io::Result<()> {
-    writer.write_all(&(body.len() as u32).to_le_bytes())?;
+    writer.write_all(&encode_frame_header(body.len() as u64))?;
     writer.write_all(body)
 }
 
 /// Read one length-prefixed frame.
+///
+/// The body grows as bytes arrive rather than being allocated from the header, so a
+/// corrupt length is a short read instead of an allocation failure.
 pub fn read_frame<R: Read>(reader: &mut R) -> io::Result<Vec<u8>> {
-    let mut length = [0u8; 4];
-    reader.read_exact(&mut length)?;
-    let mut body = vec![0u8; u32::from_le_bytes(length) as usize];
-    reader.read_exact(&mut body)?;
+    let mut header = [0u8; FRAME_HEADER_BYTES];
+    reader.read_exact(&mut header)?;
+    let mut body = Vec::new();
+    read_body(reader, decode_frame_header(header), &mut body)?;
     Ok(body)
+}
+
+/// Append exactly `length` bytes from `reader` to `body`.
+fn read_body<R: Read>(reader: &mut R, length: u64, body: &mut Vec<u8>) -> io::Result<()> {
+    let before = body.len();
+    reader.by_ref().take(length).read_to_end(body)?;
+    if (body.len() - before) as u64 != length {
+        return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "frame is short"));
+    }
+    Ok(())
+}
+
+/// Tag byte of a `CopyToDevice` request.
+const TAG_COPY_TO_DEVICE: u8 = 6;
+
+/// Bytes of a `CopyToDevice` body before its payload: tag, handle, offset, length.
+const COPY_TO_DEVICE_FIXED_BYTES: usize = 1 + 8 + 8 + 8;
+
+/// How much the staging buffer grows by at a time, so a corrupt length cannot make the
+/// agent allocate more than it has actually received plus one step.
+const STAGING_STEP: usize = 64 * 1024 * 1024;
+
+/// What [`read_incoming`] took off the wire.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Incoming {
+    /// A copy to the device whose payload is the first `bytes` bytes of the staging
+    /// buffer.
+    CopyToDevice { handle: u64, offset: u64, bytes: usize },
+    /// Any other request, decoded whole.
+    Request(Request),
+}
+
+/// Write a `CopyToDevice` frame for the caller's bytes.
+///
+/// Produces the same bytes as `write_frame(encode_request(CopyToDevice { .. }))`, but
+/// the payload is handed to `write_vectored` as the caller's own slice. Behind a
+/// `BufWriter`, a payload larger than its buffer goes to the socket without being
+/// copied into it.
+pub fn write_copy_to_device<W: Write>(
+    writer: &mut W,
+    handle: u64,
+    offset: u64,
+    payload: &[u8],
+) -> io::Result<()> {
+    let length = payload.len() as u64;
+    let mut head = [0u8; FRAME_HEADER_BYTES + COPY_TO_DEVICE_FIXED_BYTES];
+    head[..8].copy_from_slice(&encode_frame_header(COPY_TO_DEVICE_FIXED_BYTES as u64 + length));
+    head[8] = TAG_COPY_TO_DEVICE;
+    head[9..17].copy_from_slice(&handle.to_le_bytes());
+    head[17..25].copy_from_slice(&offset.to_le_bytes());
+    head[25..33].copy_from_slice(&length.to_le_bytes());
+    write_all_vectored(writer, &mut [IoSlice::new(&head), IoSlice::new(payload)])
+}
+
+fn write_all_vectored<W: Write>(writer: &mut W, mut slices: &mut [IoSlice<'_>]) -> io::Result<()> {
+    IoSlice::advance_slices(&mut slices, 0);
+    while !slices.is_empty() {
+        match writer.write_vectored(slices) {
+            Ok(0) => {
+                return Err(io::Error::new(io::ErrorKind::WriteZero, "the frame was not written"));
+            }
+            Ok(written) => IoSlice::advance_slices(&mut slices, written),
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
+}
+
+/// Read one request, putting the payload of a copy to the device into `staging`.
+///
+/// The tag is read before the body, so a copy's payload is read with `read_exact`
+/// straight into `staging`, which the caller keeps across calls. `staging` only grows,
+/// so steady state copies neither allocate nor zero. Any other request is decoded
+/// whole. A body that does not decode is reported as `InvalidData` with the frame
+/// fully consumed, so the caller may answer and carry on. A copy whose length fields
+/// disagree is `InvalidInput`, after which the stream cannot be trusted.
+pub fn read_incoming<R: Read>(reader: &mut R, staging: &mut Vec<u8>) -> io::Result<Incoming> {
+    let mut header = [0u8; FRAME_HEADER_BYTES];
+    reader.read_exact(&mut header)?;
+    let length = decode_frame_header(header);
+    if length == 0 {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "empty frame"));
+    }
+    let mut tag = [0u8; 1];
+    reader.read_exact(&mut tag)?;
+
+    if tag[0] == TAG_COPY_TO_DEVICE && length >= COPY_TO_DEVICE_FIXED_BYTES as u64 {
+        let mut fixed = [0u8; COPY_TO_DEVICE_FIXED_BYTES - 1];
+        reader.read_exact(&mut fixed)?;
+        let handle = u64::from_le_bytes(fixed[0..8].try_into().unwrap());
+        let offset = u64::from_le_bytes(fixed[8..16].try_into().unwrap());
+        let declared = u64::from_le_bytes(fixed[16..24].try_into().unwrap());
+        if declared != length - COPY_TO_DEVICE_FIXED_BYTES as u64 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "a copy to the device declares a payload that disagrees with its frame",
+            ));
+        }
+        let bytes = usize::try_from(declared)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "payload is too large"))?;
+        let mut filled = 0;
+        while filled < bytes {
+            let end = bytes.min(filled + STAGING_STEP);
+            if staging.len() < end {
+                staging.resize(end, 0);
+            }
+            reader.read_exact(&mut staging[filled..end])?;
+            filled = end;
+        }
+        return Ok(Incoming::CopyToDevice { handle, offset, bytes });
+    }
+
+    let mut frame = vec![tag[0]];
+    read_body(reader, length - 1, &mut frame)?;
+    decode_request(&frame)
+        .map(Incoming::Request)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))
 }
 
 /// Content address of a payload, used so the same module travels once.
@@ -509,6 +646,139 @@ mod tests {
         write_frame(&mut buffer, &[1, 2, 3]).unwrap();
         let mut reader = buffer.as_slice();
         assert_eq!(read_frame(&mut reader).unwrap(), vec![1, 2, 3]);
+    }
+
+    /// Records every buffer a writer is handed, by address and length.
+    #[derive(Default)]
+    struct RecordingWriter {
+        bytes: Vec<u8>,
+        slices: Vec<(usize, usize)>,
+    }
+
+    impl Write for RecordingWriter {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.slices.push((buf.as_ptr() as usize, buf.len()));
+            self.bytes.extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn write_vectored(&mut self, bufs: &[io::IoSlice<'_>]) -> io::Result<usize> {
+            let mut written = 0;
+            for buf in bufs {
+                written += self.write(buf)?;
+            }
+            Ok(written)
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Records the address of every buffer a reader fills and how many bytes went in.
+    struct RecordingReader<'a> {
+        bytes: &'a [u8],
+        destinations: Vec<(usize, usize)>,
+    }
+
+    impl Read for RecordingReader<'_> {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            let count = buf.len().min(self.bytes.len());
+            buf[..count].copy_from_slice(&self.bytes[..count]);
+            self.bytes = &self.bytes[count..];
+            self.destinations.push((buf.as_ptr() as usize, count));
+            Ok(count)
+        }
+    }
+
+    fn patterned(bytes: usize) -> Vec<u8> {
+        (0..bytes).map(|index| (index % 251) as u8).collect()
+    }
+
+    fn encoded_frame(request: &Request) -> Vec<u8> {
+        let mut frame = Vec::new();
+        write_frame(&mut frame, &encode_request(request)).unwrap();
+        frame
+    }
+
+    #[test]
+    fn a_streamed_copy_writes_the_same_bytes_as_an_encoded_frame() {
+        let payload = patterned(100_000);
+        let mut writer = RecordingWriter::default();
+        write_copy_to_device(&mut writer, 3, 16, &payload).unwrap();
+        let expected =
+            encoded_frame(&Request::CopyToDevice { handle: 3, offset: 16, payload: payload.clone() });
+        assert_eq!(writer.bytes, expected);
+    }
+
+    #[test]
+    fn a_streamed_copy_hands_the_callers_bytes_to_the_writer_uncopied() {
+        let payload = patterned(100_000);
+        let mut writer = RecordingWriter::default();
+        write_copy_to_device(&mut writer, 3, 16, &payload).unwrap();
+        assert!(
+            writer.slices.contains(&(payload.as_ptr() as usize, payload.len())),
+            "the payload reached the writer through another buffer: {:?}",
+            writer.slices
+        );
+    }
+
+    #[test]
+    fn a_copy_payload_is_read_straight_into_the_staging_buffer() {
+        let payload = patterned(100_000);
+        let frame =
+            encoded_frame(&Request::CopyToDevice { handle: 3, offset: 16, payload: payload.clone() });
+        let mut reader = RecordingReader { bytes: &frame, destinations: Vec::new() };
+        // Sized ahead so the staging buffer does not move while it is filled.
+        let mut staging = vec![0u8; 2 * payload.len()];
+        let incoming = read_incoming(&mut reader, &mut staging).unwrap();
+
+        assert_eq!(incoming, Incoming::CopyToDevice { handle: 3, offset: 16, bytes: payload.len() });
+        assert_eq!(&staging[..payload.len()], &payload[..]);
+        let start = staging.as_ptr() as usize;
+        let end = start + staging.len();
+        let elsewhere: usize = reader
+            .destinations
+            .iter()
+            .filter(|(address, _)| *address < start || *address >= end)
+            .map(|(_, count)| count)
+            .sum();
+        // Only the frame header and the fixed fields may land outside the staging buffer.
+        assert!(elsewhere <= 64, "{elsewhere} bytes were read into an intermediate buffer");
+    }
+
+    #[test]
+    fn other_requests_arrive_decoded_through_read_incoming() {
+        let frame = encoded_frame(&Request::GetFunction { module: 3, name: "add_kernel".into() });
+        let mut staging = Vec::new();
+        assert_eq!(
+            read_incoming(&mut frame.as_slice(), &mut staging).unwrap(),
+            Incoming::Request(Request::GetFunction { module: 3, name: "add_kernel".into() })
+        );
+    }
+
+    #[test]
+    fn a_corrupt_frame_length_is_an_error_not_an_allocation() {
+        let mut frame = encode_frame_header(1 << 62).to_vec();
+        frame.extend_from_slice(&[2, 0, 0]);
+        let mut staging = Vec::new();
+        assert!(read_incoming(&mut frame.as_slice(), &mut staging).is_err());
+        assert!(read_frame(&mut frame.as_slice()).is_err());
+    }
+
+    #[test]
+    fn a_frame_length_above_four_gib_survives_the_header() {
+        // A batch copied to the device can exceed 4 GiB. The header codec is tested
+        // directly so the test does not allocate the body.
+        for length in [u32::MAX as u64 + 1, 5 * (1u64 << 30), u64::MAX] {
+            assert_eq!(decode_frame_header(encode_frame_header(length)), length);
+        }
+    }
+
+    #[test]
+    fn the_protocol_version_names_the_64_bit_frame_layout() {
+        assert_eq!(PROTOCOL_VERSION, 2);
+        assert_eq!(FRAME_HEADER_BYTES, 8);
     }
 
     #[test]

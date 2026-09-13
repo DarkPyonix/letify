@@ -183,13 +183,14 @@ pub extern "C" fn cuMemcpyHtoD_v2(
     if source.is_null() && bytes > 0 {
         return CUDA_ERROR_INVALID_VALUE;
     }
-    let payload = unsafe { std::slice::from_raw_parts(source as *const u8, bytes) }.to_vec();
+    // Borrowed, not copied: the bytes go from here to the socket.
+    let payload: &[u8] = if bytes == 0 {
+        &[]
+    } else {
+        unsafe { std::slice::from_raw_parts(source as *const u8, bytes) }
+    };
     with_client!(|connection| {
-        match connection.send(Request::CopyToDevice {
-            handle,
-            offset: offset_of(destination),
-            payload,
-        }) {
+        match connection.send_copy_to_device(handle, offset_of(destination), payload) {
             Ok(()) => CUDA_SUCCESS,
             Err(_) => CUDA_ERROR_UNKNOWN,
         }
@@ -248,9 +249,8 @@ pub extern "C" fn cuModuleLoadData(module: *mut u64, image: *const c_void) -> CU
     if module.is_null() || image.is_null() {
         return CUDA_ERROR_INVALID_VALUE;
     }
-    // A fatbin has no length argument here, so its size comes from its own header. Until
-    // that parsing is in, a conservative window is copied and the agent trims it.
-    let payload = unsafe { std::slice::from_raw_parts(image as *const u8, 4096) }.to_vec();
+    // There is no length argument here, so the size comes from the image itself.
+    let payload = unsafe { crate::image::module_image(image as *const u8) }.to_vec();
     let digest = letify_wire::digest(&payload);
     with_client!(|connection| {
         match connection.request(Request::LoadModule { digest, payload }) {
