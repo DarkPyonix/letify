@@ -1,0 +1,9 @@
+[package]
+name = "letify-wire"
+description = "The protocol between the letify CUDA shim and its agent."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]

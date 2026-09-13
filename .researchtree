@@ -1,0 +1,4 @@
+root: develop
+prefix: feat/
+spec: docs/SPEC.md
+intent: docs/INTENT.md

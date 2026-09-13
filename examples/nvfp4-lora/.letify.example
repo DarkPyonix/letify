@@ -1,0 +1,24 @@
+# Copy this to .letify in your own project, or run `letify login` and let it write the file.
+#
+# This file is the project half of the configuration. It may be committed, because it holds
+# no credential and no detail of one person's machine: an entry here either sets a default
+# or references an account that lives in ~/.letify.
+
+[defaults]
+name = "nvfp4-lora"
+idle_timeout = 900
+
+# A reference, which is what `letify login` writes here. The address, the user and the key
+# are in ~/.letify, where they belong. An alias referenced but not declared there is a
+# configuration error naming the command that fixes it.
+#
+# [lab_a100]
+# kind = "shell"
+# from_home = true
+#
+# [colab_a]
+# kind = "colab"
+# from_home = true
+
+# The local machine needs no declaration at all, which is why every script in this scenario
+# defaults to --provider local.

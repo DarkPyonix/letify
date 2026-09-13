@@ -1,0 +1,529 @@
+//! The protocol between letify-core and the agent.
+//!
+//! Every CUDA driver call letify-core intercepts becomes one message. The whole point of
+//! the design is that most of them do not wait for a reply: a launch, a copy or an
+//! allocation is recorded and sent, and only a call whose result the host actually
+//! reads forces a round trip.
+//!
+//! That is why the efficiency of forwarding is `T / (T + k * RTT)` rather than
+//! `T / (T + calls * RTT)`. `k` counts the synchronizing calls, not all of them.
+//!
+//! Framing is a four byte little-endian length followed by that many bytes of payload.
+//! The payload is a tag byte and then fixed-width fields, hand encoded rather than
+//! going through a serialization crate, because this sits on the hot path and the shapes
+//! are small and fixed.
+
+use std::io::{self, Read, Write};
+
+/// Bumped when a request or reply layout changes in a breaking way.
+pub const PROTOCOL_VERSION: u32 = 1;
+
+/// What the agent is being asked to do.
+///
+/// The split that matters is in [`Request::needs_reply`]: everything that does not need
+/// one is batched, and that is what keeps the round trip count at the number of host
+/// synchronizations instead of the number of calls.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Request {
+    /// Check that the agent speaks the same protocol and has a device.
+    Hello { version: u32 },
+    /// Read a device attribute, such as compute capability.
+    DeviceAttribute { device: i32, attribute: i32 },
+    /// Total and free memory on the device.
+    MemoryInfo,
+    /// Allocate device memory. letify-core hands back a virtual pointer immediately and
+    /// reconciles it here, so an allocation does not cost a round trip.
+    Allocate { bytes: u64, handle: u64 },
+    /// Release device memory.
+    Free { handle: u64 },
+    /// Copy host memory to the device.
+    CopyToDevice { handle: u64, offset: u64, payload: Vec<u8> },
+    /// Copy device memory back to the host. Always needs a reply, because the host is
+    /// about to read it.
+    CopyToHost { handle: u64, offset: u64, bytes: u64 },
+    /// Load a compiled module. Content addressed, so the same fatbin travels once.
+    LoadModule { digest: [u8; 16], payload: Vec<u8> },
+    /// Look up a kernel inside a loaded module.
+    GetFunction { module: u64, name: String },
+    /// Launch a kernel.
+    LaunchKernel {
+        function: u64,
+        grid: [u32; 3],
+        block: [u32; 3],
+        shared_bytes: u32,
+        stream: u64,
+        params: Vec<u8>,
+    },
+    /// Wait for a stream to drain. This is a synchronization, so it pays a round trip.
+    SynchronizeStream { stream: u64 },
+    /// Record an event on a stream.
+    RecordEvent { event: u64, stream: u64 },
+    /// Wait for an event. Another synchronization.
+    SynchronizeEvent { event: u64 },
+    /// Elapsed milliseconds between two events, which the host reads.
+    ElapsedTime { start: u64, end: u64 },
+    /// Tell the agent to exit.
+    Shutdown,
+}
+
+impl Request {
+    /// Whether the caller has to wait for the agent's answer.
+    ///
+    /// A call that only changes device state is fire and forget. A call whose result the
+    /// host reads cannot be, and every one of those is a round trip on the critical
+    /// path.
+    pub fn needs_reply(&self) -> bool {
+        matches!(
+            self,
+            Request::Hello { .. }
+                | Request::DeviceAttribute { .. }
+                | Request::MemoryInfo
+                | Request::CopyToHost { .. }
+                | Request::GetFunction { .. }
+                | Request::SynchronizeStream { .. }
+                | Request::SynchronizeEvent { .. }
+                | Request::ElapsedTime { .. }
+        )
+    }
+
+    fn tag(&self) -> u8 {
+        match self {
+            Request::Hello { .. } => 1,
+            Request::DeviceAttribute { .. } => 2,
+            Request::MemoryInfo => 3,
+            Request::Allocate { .. } => 4,
+            Request::Free { .. } => 5,
+            Request::CopyToDevice { .. } => 6,
+            Request::CopyToHost { .. } => 7,
+            Request::LoadModule { .. } => 8,
+            Request::GetFunction { .. } => 9,
+            Request::LaunchKernel { .. } => 10,
+            Request::SynchronizeStream { .. } => 11,
+            Request::RecordEvent { .. } => 12,
+            Request::SynchronizeEvent { .. } => 13,
+            Request::ElapsedTime { .. } => 14,
+            Request::Shutdown => 15,
+        }
+    }
+}
+
+/// What the agent answers.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Reply {
+    /// The agent is ready, and this is the device it holds.
+    Ready { version: u32, device_name: String, compute: (i32, i32) },
+    /// One integer value, for an attribute query.
+    Value { value: i64 },
+    /// Two integers, for a memory query.
+    Pair { first: u64, second: u64 },
+    /// A handle the agent assigned, for a module or a kernel.
+    Handle { handle: u64 },
+    /// Device memory copied back to the host.
+    Payload { payload: Vec<u8> },
+    /// A floating point result, for elapsed time.
+    Elapsed { milliseconds: f32 },
+    /// The request succeeded and returns nothing.
+    Done,
+    /// The driver reported an error, carrying its code and message.
+    Failed { code: i32, message: String },
+}
+
+impl Reply {
+    fn tag(&self) -> u8 {
+        match self {
+            Reply::Ready { .. } => 1,
+            Reply::Value { .. } => 2,
+            Reply::Pair { .. } => 3,
+            Reply::Handle { .. } => 4,
+            Reply::Payload { .. } => 5,
+            Reply::Elapsed { .. } => 6,
+            Reply::Done => 7,
+            Reply::Failed { .. } => 8,
+        }
+    }
+}
+
+// -- encoding -----------------------------------------------------------------
+
+fn put_u32(out: &mut Vec<u8>, value: u32) {
+    out.extend_from_slice(&value.to_le_bytes());
+}
+
+fn put_u64(out: &mut Vec<u8>, value: u64) {
+    out.extend_from_slice(&value.to_le_bytes());
+}
+
+fn put_i32(out: &mut Vec<u8>, value: i32) {
+    out.extend_from_slice(&value.to_le_bytes());
+}
+
+fn put_bytes(out: &mut Vec<u8>, value: &[u8]) {
+    put_u64(out, value.len() as u64);
+    out.extend_from_slice(value);
+}
+
+fn put_str(out: &mut Vec<u8>, value: &str) {
+    put_bytes(out, value.as_bytes());
+}
+
+/// Encode a request, without its length prefix.
+pub fn encode_request(request: &Request) -> Vec<u8> {
+    let mut out = vec![request.tag()];
+    match request {
+        Request::Hello { version } => put_u32(&mut out, *version),
+        Request::DeviceAttribute { device, attribute } => {
+            put_i32(&mut out, *device);
+            put_i32(&mut out, *attribute);
+        }
+        Request::MemoryInfo | Request::Shutdown => {}
+        Request::Allocate { bytes, handle } => {
+            put_u64(&mut out, *bytes);
+            put_u64(&mut out, *handle);
+        }
+        Request::Free { handle } => put_u64(&mut out, *handle),
+        Request::CopyToDevice { handle, offset, payload } => {
+            put_u64(&mut out, *handle);
+            put_u64(&mut out, *offset);
+            put_bytes(&mut out, payload);
+        }
+        Request::CopyToHost { handle, offset, bytes } => {
+            put_u64(&mut out, *handle);
+            put_u64(&mut out, *offset);
+            put_u64(&mut out, *bytes);
+        }
+        Request::LoadModule { digest, payload } => {
+            out.extend_from_slice(digest);
+            put_bytes(&mut out, payload);
+        }
+        Request::GetFunction { module, name } => {
+            put_u64(&mut out, *module);
+            put_str(&mut out, name);
+        }
+        Request::LaunchKernel { function, grid, block, shared_bytes, stream, params } => {
+            put_u64(&mut out, *function);
+            for value in grid {
+                put_u32(&mut out, *value);
+            }
+            for value in block {
+                put_u32(&mut out, *value);
+            }
+            put_u32(&mut out, *shared_bytes);
+            put_u64(&mut out, *stream);
+            put_bytes(&mut out, params);
+        }
+        Request::SynchronizeStream { stream } => put_u64(&mut out, *stream),
+        Request::RecordEvent { event, stream } => {
+            put_u64(&mut out, *event);
+            put_u64(&mut out, *stream);
+        }
+        Request::SynchronizeEvent { event } => put_u64(&mut out, *event),
+        Request::ElapsedTime { start, end } => {
+            put_u64(&mut out, *start);
+            put_u64(&mut out, *end);
+        }
+    }
+    out
+}
+
+/// Encode a reply, without its length prefix.
+pub fn encode_reply(reply: &Reply) -> Vec<u8> {
+    let mut out = vec![reply.tag()];
+    match reply {
+        Reply::Ready { version, device_name, compute } => {
+            put_u32(&mut out, *version);
+            put_str(&mut out, device_name);
+            put_i32(&mut out, compute.0);
+            put_i32(&mut out, compute.1);
+        }
+        Reply::Value { value } => out.extend_from_slice(&value.to_le_bytes()),
+        Reply::Pair { first, second } => {
+            put_u64(&mut out, *first);
+            put_u64(&mut out, *second);
+        }
+        Reply::Handle { handle } => put_u64(&mut out, *handle),
+        Reply::Payload { payload } => put_bytes(&mut out, payload),
+        Reply::Elapsed { milliseconds } => out.extend_from_slice(&milliseconds.to_le_bytes()),
+        Reply::Done => {}
+        Reply::Failed { code, message } => {
+            put_i32(&mut out, *code);
+            put_str(&mut out, message);
+        }
+    }
+    out
+}
+
+// -- decoding -----------------------------------------------------------------
+
+/// Reads fixed-width fields out of a frame, reporting a short frame rather than
+/// panicking, because the far side may be a different version.
+struct Cursor<'a> {
+    bytes: &'a [u8],
+    at: usize,
+}
+
+impl<'a> Cursor<'a> {
+    fn new(bytes: &'a [u8]) -> Self {
+        Cursor { bytes, at: 0 }
+    }
+
+    fn take(&mut self, count: usize) -> io::Result<&'a [u8]> {
+        if self.at + count > self.bytes.len() {
+            return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "frame is short"));
+        }
+        let slice = &self.bytes[self.at..self.at + count];
+        self.at += count;
+        Ok(slice)
+    }
+
+    fn u32(&mut self) -> io::Result<u32> {
+        Ok(u32::from_le_bytes(self.take(4)?.try_into().unwrap()))
+    }
+
+    fn i32(&mut self) -> io::Result<i32> {
+        Ok(i32::from_le_bytes(self.take(4)?.try_into().unwrap()))
+    }
+
+    fn u64(&mut self) -> io::Result<u64> {
+        Ok(u64::from_le_bytes(self.take(8)?.try_into().unwrap()))
+    }
+
+    fn i64(&mut self) -> io::Result<i64> {
+        Ok(i64::from_le_bytes(self.take(8)?.try_into().unwrap()))
+    }
+
+    fn f32(&mut self) -> io::Result<f32> {
+        Ok(f32::from_le_bytes(self.take(4)?.try_into().unwrap()))
+    }
+
+    fn bytes(&mut self) -> io::Result<Vec<u8>> {
+        let length = self.u64()? as usize;
+        Ok(self.take(length)?.to_vec())
+    }
+
+    fn string(&mut self) -> io::Result<String> {
+        String::from_utf8(self.bytes()?)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "field is not UTF-8"))
+    }
+
+    fn triple(&mut self) -> io::Result<[u32; 3]> {
+        Ok([self.u32()?, self.u32()?, self.u32()?])
+    }
+}
+
+fn unknown_tag(tag: u8) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, format!("unknown tag {tag}"))
+}
+
+/// Decode a request from a frame body.
+pub fn decode_request(frame: &[u8]) -> io::Result<Request> {
+    let (tag, body) = frame
+        .split_first()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::UnexpectedEof, "empty frame"))?;
+    let mut cursor = Cursor::new(body);
+    Ok(match tag {
+        1 => Request::Hello { version: cursor.u32()? },
+        2 => Request::DeviceAttribute { device: cursor.i32()?, attribute: cursor.i32()? },
+        3 => Request::MemoryInfo,
+        4 => Request::Allocate { bytes: cursor.u64()?, handle: cursor.u64()? },
+        5 => Request::Free { handle: cursor.u64()? },
+        6 => Request::CopyToDevice {
+            handle: cursor.u64()?,
+            offset: cursor.u64()?,
+            payload: cursor.bytes()?,
+        },
+        7 => Request::CopyToHost {
+            handle: cursor.u64()?,
+            offset: cursor.u64()?,
+            bytes: cursor.u64()?,
+        },
+        8 => Request::LoadModule {
+            digest: cursor.take(16)?.try_into().unwrap(),
+            payload: cursor.bytes()?,
+        },
+        9 => Request::GetFunction { module: cursor.u64()?, name: cursor.string()? },
+        10 => Request::LaunchKernel {
+            function: cursor.u64()?,
+            grid: cursor.triple()?,
+            block: cursor.triple()?,
+            shared_bytes: cursor.u32()?,
+            stream: cursor.u64()?,
+            params: cursor.bytes()?,
+        },
+        11 => Request::SynchronizeStream { stream: cursor.u64()? },
+        12 => Request::RecordEvent { event: cursor.u64()?, stream: cursor.u64()? },
+        13 => Request::SynchronizeEvent { event: cursor.u64()? },
+        14 => Request::ElapsedTime { start: cursor.u64()?, end: cursor.u64()? },
+        15 => Request::Shutdown,
+        other => return Err(unknown_tag(*other)),
+    })
+}
+
+/// Decode a reply from a frame body.
+pub fn decode_reply(frame: &[u8]) -> io::Result<Reply> {
+    let (tag, body) = frame
+        .split_first()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::UnexpectedEof, "empty frame"))?;
+    let mut cursor = Cursor::new(body);
+    Ok(match tag {
+        1 => Reply::Ready {
+            version: cursor.u32()?,
+            device_name: cursor.string()?,
+            compute: (cursor.i32()?, cursor.i32()?),
+        },
+        2 => Reply::Value { value: cursor.i64()? },
+        3 => Reply::Pair { first: cursor.u64()?, second: cursor.u64()? },
+        4 => Reply::Handle { handle: cursor.u64()? },
+        5 => Reply::Payload { payload: cursor.bytes()? },
+        6 => Reply::Elapsed { milliseconds: cursor.f32()? },
+        7 => Reply::Done,
+        8 => Reply::Failed { code: cursor.i32()?, message: cursor.string()? },
+        other => return Err(unknown_tag(*other)),
+    })
+}
+
+// -- framing ------------------------------------------------------------------
+
+/// Write one length-prefixed frame.
+pub fn write_frame<W: Write>(writer: &mut W, body: &[u8]) -> io::Result<()> {
+    writer.write_all(&(body.len() as u32).to_le_bytes())?;
+    writer.write_all(body)
+}
+
+/// Read one length-prefixed frame.
+pub fn read_frame<R: Read>(reader: &mut R) -> io::Result<Vec<u8>> {
+    let mut length = [0u8; 4];
+    reader.read_exact(&mut length)?;
+    let mut body = vec![0u8; u32::from_le_bytes(length) as usize];
+    reader.read_exact(&mut body)?;
+    Ok(body)
+}
+
+/// Content address of a payload, used so the same module travels once.
+///
+/// This is not a cryptographic decision. A module is identified by its own bytes, and a
+/// 128 bit digest of them is enough to tell two fatbins apart.
+pub fn digest(payload: &[u8]) -> [u8; 16] {
+    // FNV-1a over two lanes, which is fast, dependency free, and plenty for a lookup
+    // key. Collisions here would mean two different modules with identical digests,
+    // which at 128 bits is not a practical concern.
+    let mut low: u64 = 0xcbf29ce484222325;
+    let mut high: u64 = 0x9e3779b97f4a7c15;
+    for (index, byte) in payload.iter().enumerate() {
+        if index % 2 == 0 {
+            low ^= *byte as u64;
+            low = low.wrapping_mul(0x100000001b3);
+        } else {
+            high ^= *byte as u64;
+            high = high.wrapping_mul(0x100000001b3);
+        }
+    }
+    high ^= payload.len() as u64;
+    let mut out = [0u8; 16];
+    out[..8].copy_from_slice(&low.to_le_bytes());
+    out[8..].copy_from_slice(&high.to_le_bytes());
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn round_trip_request(request: Request) {
+        let encoded = encode_request(&request);
+        assert_eq!(decode_request(&encoded).unwrap(), request);
+    }
+
+    #[test]
+    fn requests_survive_a_round_trip() {
+        round_trip_request(Request::Hello { version: PROTOCOL_VERSION });
+        round_trip_request(Request::DeviceAttribute { device: 0, attribute: 75 });
+        round_trip_request(Request::MemoryInfo);
+        round_trip_request(Request::Allocate { bytes: 4096, handle: 7 });
+        round_trip_request(Request::Free { handle: 7 });
+        round_trip_request(Request::CopyToDevice {
+            handle: 7,
+            offset: 16,
+            payload: vec![1, 2, 3, 4],
+        });
+        round_trip_request(Request::CopyToHost { handle: 7, offset: 0, bytes: 64 });
+        round_trip_request(Request::LoadModule { digest: [9u8; 16], payload: vec![0xff; 32] });
+        round_trip_request(Request::GetFunction { module: 3, name: "add_kernel".into() });
+        round_trip_request(Request::LaunchKernel {
+            function: 4,
+            grid: [8, 1, 1],
+            block: [256, 1, 1],
+            shared_bytes: 0,
+            stream: 0,
+            params: vec![7; 24],
+        });
+        round_trip_request(Request::SynchronizeStream { stream: 0 });
+        round_trip_request(Request::RecordEvent { event: 1, stream: 0 });
+        round_trip_request(Request::SynchronizeEvent { event: 1 });
+        round_trip_request(Request::ElapsedTime { start: 1, end: 2 });
+        round_trip_request(Request::Shutdown);
+    }
+
+    fn round_trip_reply(reply: Reply) {
+        let encoded = encode_reply(&reply);
+        assert_eq!(decode_reply(&encoded).unwrap(), reply);
+    }
+
+    #[test]
+    fn replies_survive_a_round_trip() {
+        round_trip_reply(Reply::Ready {
+            version: PROTOCOL_VERSION,
+            device_name: "NVIDIA RTX PRO 6000".into(),
+            compute: (12, 0),
+        });
+        round_trip_reply(Reply::Value { value: -3 });
+        round_trip_reply(Reply::Pair { first: 1024, second: 2048 });
+        round_trip_reply(Reply::Handle { handle: 12 });
+        round_trip_reply(Reply::Payload { payload: vec![5; 10] });
+        round_trip_reply(Reply::Elapsed { milliseconds: 1.5 });
+        round_trip_reply(Reply::Done);
+        round_trip_reply(Reply::Failed { code: 2, message: "out of memory".into() });
+    }
+
+    #[test]
+    fn only_reads_force_a_round_trip() {
+        // This split is the whole performance argument: a launch or a copy to the device
+        // is batched, and a read back is not.
+        assert!(!Request::LaunchKernel {
+            function: 1,
+            grid: [1, 1, 1],
+            block: [1, 1, 1],
+            shared_bytes: 0,
+            stream: 0,
+            params: vec![],
+        }
+        .needs_reply());
+        assert!(!Request::CopyToDevice { handle: 1, offset: 0, payload: vec![] }.needs_reply());
+        assert!(!Request::Allocate { bytes: 1, handle: 1 }.needs_reply());
+        assert!(Request::CopyToHost { handle: 1, offset: 0, bytes: 1 }.needs_reply());
+        assert!(Request::SynchronizeStream { stream: 0 }.needs_reply());
+    }
+
+    #[test]
+    fn frames_carry_their_length() {
+        let mut buffer = Vec::new();
+        write_frame(&mut buffer, &[1, 2, 3]).unwrap();
+        let mut reader = buffer.as_slice();
+        assert_eq!(read_frame(&mut reader).unwrap(), vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn a_short_frame_is_an_error_not_a_panic() {
+        // The far side may be a different version, so a malformed frame has to be
+        // reported rather than crash the process it was injected into.
+        assert!(decode_request(&[2, 0, 0]).is_err());
+        assert!(decode_request(&[]).is_err());
+        assert!(decode_request(&[99]).is_err());
+    }
+
+    #[test]
+    fn the_digest_separates_different_payloads() {
+        assert_eq!(digest(b"same"), digest(b"same"));
+        assert_ne!(digest(b"same"), digest(b"other"));
+        assert_ne!(digest(b"ab"), digest(b"ba"));
+    }
+}

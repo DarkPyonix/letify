@@ -1,0 +1,67 @@
+# Publish to PyPI when a version tag is pushed.
+#
+# A tag such as v1.2.0 builds the package, checks that the tag agrees with the version in
+# pyproject.toml and letify/__init__.py, runs the tests, and uploads to PyPI.
+#
+# Upload uses PyPI trusted publishing, so there is no token in this repository. Configure it
+# once on PyPI: project letify, owner DarkPyonix, repository letify, workflow publish.yml,
+# environment pypi.
+name: publish
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: "3.11"
+      - name: Lint
+        run: uv run --group dev ruff check letify tests examples
+      - name: Test
+        run: uv run --group dev pytest -q
+
+  build:
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - name: Check the tag matches the package version
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          project="$(python3 -c 'import tomllib; print(tomllib.load(open("pyproject.toml", "rb"))["project"]["version"])')"
+          package="$(sed -n 's/^__version__ = "\(.*\)"$/\1/p' letify/__init__.py)"
+          echo "tag=$tag pyproject=$project __version__=$package"
+          if [ "$tag" != "$project" ] || [ "$tag" != "$package" ]; then
+            echo "::error::tag v$tag does not match pyproject.toml ($project) and letify/__init__.py ($package)"
+            exit 1
+          fi
+      - name: Build
+        run: uv build
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/project/letify/
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+      - uses: pypa/gh-action-pypi-publish@release/v1

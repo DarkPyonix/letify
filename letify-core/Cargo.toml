@@ -1,0 +1,18 @@
+# letify-core: the CUDA call forwarding components.
+#
+# letify's Python package stays pure Python. Standing in for the CUDA driver cannot be
+# done from Python, so that one job lives here and is built separately. A user who only
+# ships functions to remote machines never needs any of this.
+[workspace]
+resolver = "3"
+members = ["letify-wire", "letify-driver", "letify-agent"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+repository = "https://github.com/DarkPyonix/letify"
+
+[workspace.dependencies]
+letify-wire = { path = "letify-wire" }
+libloading = "0.8"
