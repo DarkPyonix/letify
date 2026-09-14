@@ -146,11 +146,25 @@ class Executor:
     def define_step(self, sid: int, ops) -> None:
         compiled = []
         before = [0]
-        for tid, wiring, news in ops:
+        last: dict = {}
+        made = 0
+        for index, (tid, wiring, news) in enumerate(ops):
             fn, builder, name, scalars, blobs = self._templates[tid]
             compiled.append((fn, builder, name, scalars, blobs, tuple(wiring), tuple(news)))
-            before.append(before[-1] + sum(news))
-        self._steps[sid] = (compiled, before)
+            for offset in wiring:
+                if offset >= 0:
+                    last[offset] = index
+            for flag in news:
+                if flag:
+                    last[made] = index
+                    made += 1
+            before.append(made)
+        # The offsets last read at each position, released after it as spec "Step capture",
+        # **Early release**, describes; the client computes the same schedule in ``trace``.
+        frees: list = [[] for _ in ops]
+        for offset, index in last.items():
+            frees[index].append(offset)
+        self._steps[sid] = (compiled, before, tuple(tuple(sorted(group)) for group in frees))
 
     # -- execution ---------------------------------------------------------------
 
@@ -271,8 +285,10 @@ class Executor:
         return value if want == "value" else None
 
     def replay(self, entry) -> None:
-        _, sid, first, start, stop, externals, scalars, blobs = entry
-        ops, before = self._steps[sid]
+        _, sid, first, start, stop, externals, scalars, blobs, keep = entry
+        ops, before, frees = self._steps[sid]
+        if len(keep) > 8:
+            keep = frozenset(keep)
         table = self.tensors
         torch_tensor = self.torch.Tensor
         handle = first + before[start]
@@ -310,6 +326,13 @@ class Executor:
                         if flag:
                             table[handle] = leaf
                             handle += 1
+            value = None
+            inputs = None
+            drop = frees[index]
+            if drop:
+                for offset in drop:
+                    if offset not in keep:
+                        table.pop(first + offset, None)
 
     def _describe(self, value):
         torch = self.torch

@@ -31,7 +31,7 @@ class Step:
     where the output is a new handle.
     """
 
-    __slots__ = ("mutates", "news_before", "ops", "readers", "sid")
+    __slots__ = ("frees", "mutates", "news_before", "ops", "readers", "sid")
 
     def __init__(self, sid: int, ops: tuple):
         self.sid = sid
@@ -45,6 +45,30 @@ class Step:
             before.append(before[-1] + sum(op[3]))
         #: How many handles the operators before each position create.
         self.news_before = tuple(before)
+        #: Per position, the offsets whose last use in the step is that position.
+        self.frees = release_positions([(op[2], op[3]) for op in ops])
+
+
+def release_positions(ops: list[tuple]) -> tuple[tuple[int, ...], ...]:
+    """Per position, the created offsets last read there, from ``(wiring, news)`` per operator.
+
+    An offset no later operator reads is released at the position that created it, as spec
+    "Step capture", **Early release**, describes. The executor computes the same schedule.
+    """
+    last: dict[int, int] = {}
+    made = 0
+    for index, (wiring, news) in enumerate(ops):
+        for offset in wiring:
+            if offset >= 0:
+                last[offset] = index
+        for flag in news:
+            if flag:
+                last[made] = index
+                made += 1
+    frees: list[list[int]] = [[] for _ in ops]
+    for offset, index in last.items():
+        frees[index].append(offset)
+    return tuple(tuple(sorted(group)) for group in frees)
 
 
 class Tracer:
@@ -184,7 +208,11 @@ class Tracer:
         return self.active is not None and self.pos > 0
 
     def take(self) -> tuple | None:
-        """The matched operators not yet queued, as a step entry, or None when there are none."""
+        """The matched operators not yet queued, as a step entry, or None when there are none.
+
+        The entry's last field, ``keep``, is None until the client takes the entry into a
+        batch, as spec "Step capture", **Early release**, describes.
+        """
         step = self.active
         if step is None or self.pos == self.start:
             return None
@@ -196,6 +224,7 @@ class Tracer:
             tuple(self.externals),
             tuple(self.scalars),
             tuple(self.blobs),
+            None,
         )
         self.start = self.pos
         self.externals = []
@@ -204,4 +233,4 @@ class Tracer:
         return entry
 
 
-__all__ = ["MAX_STEP", "MIN_STEP", "Step", "Tracer"]
+__all__ = ["MAX_STEP", "MIN_STEP", "Step", "Tracer", "release_positions"]
