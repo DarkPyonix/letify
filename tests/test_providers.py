@@ -2211,7 +2211,10 @@ def test_a_request_on_an_adapter_out_of_step_fails_without_waiting(
 
     from letify.errors import RuntimeFailure
 
-    provider = provider_of(Modal, "m")
+    # Spec "modal-abort": an adapter falls out of step when a request on its standard input
+    # and output is interrupted, so the call has to travel there rather than over the data
+    # channel, where an interrupted call leaves the adapter idle.
+    provider = provider_of(Modal, "m", data_channel=False)
     runtime = modal_runtime(provider)
     channel = provider.open_channel(runtime)
     channel.start()
