@@ -306,15 +306,15 @@ def test_files_written_into_a_runtime_survive_between_calls(
 
 
 def test_the_prints_a_body_made_reach_the_caller(let, cpu, capsys) -> None:
-    # The user's own stdout comes back separately from the outcome, and letify passes it
-    # through rather than swallowing it.
+    # Spec "Worker output": the body's stdout is written to the caller's own stdout, live,
+    # rather than swallowed or held until the call returns.
     @let.function(device=cpu, host=letify.remote)
     def train() -> int:
         print("epoch 1 loss 0.5")
         return 1
 
     assert train() == 1
-    assert "epoch 1 loss 0.5" in capsys.readouterr().err
+    assert "epoch 1 loss 0.5" in capsys.readouterr().out
 
 
 # -- Spec: Failure and retry ---------------------------------------------------

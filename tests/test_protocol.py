@@ -8,7 +8,6 @@ does with it, and the markers and the decoder are then the real ones.
 
 from __future__ import annotations
 
-import base64
 import pickle
 import subprocess
 import sys
@@ -22,9 +21,9 @@ import pytest
 import letify
 from letify import protocol
 from letify.declare.env import Env
-from letify.protocol import codec, driver, framing
+from letify.protocol import codec, driver, wire
 from letify.protocol.handle import Blob, RemoteFile
-from letify.protocol.worker import BOOTSTRAP, READY, REPLY
+from letify.protocol.worker import BOOTSTRAP
 
 
 def run_script(source: str) -> str:
@@ -189,26 +188,33 @@ def test_a_worker_call_whose_body_imports_letify_while_running_names_the_reason(
 
     from letify.protocol.worker import SOURCE
 
-    payload = base64.b64encode(cloudpickle.dumps((work, (), {}))).decode()
-    source = base64.b64encode(SOURCE.encode()).decode()
-    stdin = (
-        f"{len(source)}\n{source}"
-        + framing.encode_request({"op": "call", "payload": payload})
-        + "\n__LETIFY_SHUTDOWN__\n"
-    )
+    source = SOURCE.encode()
+    stdin = bytearray(b"%d\n" % len(source) + source)
+    sender = wire.Sender(lambda view: stdin.extend(view) or view.nbytes)
+    head, buffers = codec.dumps_call_parts(work, (), {})
+    sender.message(wire.REQUEST, 1, {"op": "call", "payload": head, "buffers": buffers})
+    sender.frame(wire.SHUTDOWN, 0)
     import os
 
     env = {**os.environ, "PYTHONPATH": str(tmp_path)}
     stdout = subprocess.run(
         [sys.executable, "-u", "-c", BOOTSTRAP],
-        input=stdin,
+        input=bytes(stdin),
         capture_output=True,
-        text=True,
         timeout=120,
         env=env,
         cwd=tmp_path,
     ).stdout
-    [reply] = [framing.decode_reply(line) for line in stdout.splitlines() if framing.is_reply(line)]
+    receiver = wire.Receiver(_reader(stdout))
+    replies = []
+    while True:
+        try:
+            event = receiver.next_event()
+        except EOFError:
+            break
+        if event is not None and event[0] == wire.REPLY:
+            replies.append(wire.loads(*event[2]))
+    [reply] = replies
     assert reply["ok"] is False
     assert "letify is not installed" in reply["error"] and "uv add letify" in reply["error"]
 
@@ -233,45 +239,84 @@ def test_the_inline_limit_is_sixty_four_kilobytes() -> None:
     assert codec.INLINE_LIMIT == 64 * 1024
 
 
-# -- Spec: Channels, framing ---------------------------------------------------
+# -- Spec: Channels, frames ---------------------------------------------------
 
 
-def test_a_request_travels_as_one_base64_line() -> None:
-    # One line per message is what survives an SSH channel, a WebSocket bridge and a
-    # plain pipe without any of them mangling the bytes.
-    line = framing.encode_request({"op": "stat"})
-    assert "\n" not in line
-    assert pickle.loads(base64.b64decode(line)) == {"op": "stat"}
+def test_a_request_travels_as_frames_with_no_base64() -> None:
+    written = bytearray()
+    sender = wire.Sender(lambda view: written.extend(view) or view.nbytes)
+    sender.message(wire.REQUEST, 1, {"op": "stat"})
+    magic, kind, _flags, stream, length = wire.HEADER.unpack_from(written)
+    assert (magic, kind, stream) == (b"LF", wire.REQUEST, 1)
+    assert len(written) == wire.HEADER.size + length
+    receiver = wire.Receiver(_reader(bytes(written)))
+    kind, stream, (head, buffers) = receiver.next_event()
+    assert wire.loads(head, buffers) == {"op": "stat"}
 
 
-def test_a_reply_is_told_apart_from_the_user_own_output_by_its_prefix() -> None:
-    # letify's replies and the user's prints share one stream, so the marker is what
+def test_output_frames_are_told_apart_from_replies_by_their_type() -> None:
+    # letify's replies and the user's prints travel on one pipe, so the frame type is what
     # separates them.
-    outcome = {"ok": True, "value": 7}
-    line = REPLY + base64.b64encode(pickle.dumps(outcome)).decode() + "\n"
-    assert framing.is_reply(line)
-    assert framing.decode_reply(line) == outcome
-    assert not framing.is_reply("a line the user printed\n")
+    written = bytearray()
+    sender = wire.Sender(lambda view: written.extend(view) or view.nbytes)
+    sender.frame(wire.STDOUT, 0, b"a line the user printed\n")
+    sender.message(wire.REPLY, 3, {"ok": True, "value": 7})
+    receiver = wire.Receiver(_reader(bytes(written)))
+    assert receiver.next_event() == (wire.STDOUT, 0, b"a line the user printed\n")
+    kind, stream, (head, buffers) = receiver.next_event()
+    assert (kind, stream) == (wire.REPLY, 3)
+    assert wire.loads(head, buffers) == {"ok": True, "value": 7}
 
 
-def test_the_worker_announces_itself_before_it_reads_requests() -> None:
-    assert framing.is_ready(READY + "\n")
-    assert not framing.is_ready("still installing\n")
+def test_the_hello_frame_names_the_python_version_the_worker_runs_on() -> None:
+    # Spec "Frames" and "Interpreter check".
+    written = bytearray()
+    wire.Sender(lambda view: written.extend(view) or view.nbytes).frame(wire.HELLO, 0, b"3.12")
+    assert wire.Receiver(_reader(bytes(written))).next_event() == (wire.HELLO, 0, "3.12")
 
 
-def test_the_ready_line_names_the_python_version_the_worker_runs_on() -> None:
-    # Spec "Channels" and "Interpreter check".
-    assert framing.is_ready(READY + " 3.12\n")
-    assert framing.ready_version(READY + " 3.12\n") == "3.12"
-    assert framing.ready_version(READY + "\n") is None
+def test_a_frame_split_across_reads_is_reassembled_in_order() -> None:
+    payload = bytes(range(256)) * 40000
+    written = bytearray()
+    sender = wire.Sender(lambda view: written.extend(view) or view.nbytes)
+    sender.message(wire.REPLY, 5, {"ok": True, "value": bytearray(payload)})
+    receiver = wire.Receiver(_reader(bytes(written), step=7777))
+    event = None
+    while event is None:
+        event = receiver.next_event()
+    assert wire.loads(event[2][0], event[2][1])["value"] == payload
 
 
-def test_the_bootstrap_stub_leaves_standard_input_open_for_requests() -> None:
-    # python - reads to end of file before compiling anything, so the worker source
-    # cannot be sent as a script. The stub reads a length-prefixed blob instead.
-    assert "sys.stdin.readline()" in BOOTSTRAP
-    assert "sys.stdin.read(n)" in BOOTSTRAP
-    assert "\n" not in BOOTSTRAP
+def test_text_frames_carry_the_same_frames_as_base64_lines() -> None:
+    # Spec "Modal adapter": a transport whose output is text gets one line per frame.
+    import base64
+
+    written = bytearray()
+    wire.TextSender(lambda view: written.extend(view) or view.nbytes).message(
+        wire.REPLY, 1, {"ok": True, "value": b"x" * (2 << 20)}
+    )
+    lines = bytes(written).splitlines()
+    assert all(b"\n" not in line for line in lines)
+    batches = iter([[base64.b64decode(line)] for line in lines] + [[]])
+    receiver = wire.Receiver(wire.chunks_readinto(lambda: next(batches)))
+    event = None
+    while event is None:
+        event = receiver.next_event()
+    assert wire.loads(event[2][0], event[2][1])["value"] == b"x" * (2 << 20)
+
+
+def _reader(data: bytes, step: int = 1 << 30):
+    view = memoryview(data)
+    position = 0
+
+    def readinto(target: memoryview) -> int:
+        nonlocal position
+        count = min(target.nbytes, step, len(view) - position)
+        target[:count] = view[position : position + count]
+        position += count
+        return count
+
+    return readinto
 
 
 # -- Spec: Call protocol, the one-shot path ------------------------------------

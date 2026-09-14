@@ -41,7 +41,7 @@ class Sandbox:
 
     def write(self, data: str) -> None:
         assert self.process.stdin is not None
-        self.process.stdin.write(data.encode())
+        self.process.stdin.write(base64.b64decode(data))
         self.process.stdin.flush()
 
     def read_until(self, prefixes: list[str]) -> dict[str, object]:

@@ -17,6 +17,7 @@ blob table to keep a large argument from travelling twice.
 
 from __future__ import annotations
 
+import base64
 import json
 import subprocess
 import tempfile
@@ -27,7 +28,9 @@ from typing import IO, TYPE_CHECKING, Any
 
 from ..config import ProviderConfig
 from ..declare.instance import Host, Instance
-from ..errors import ProtocolError, ProviderUnavailable, RuntimeFailure, UnsupportedMode
+from ..errors import ProviderUnavailable, RuntimeFailure, UnsupportedMode
+from ..protocol import wire
+from ..runtime.channel import Connection, FramedChannel
 from .base import Provider
 
 if TYPE_CHECKING:
@@ -293,83 +296,71 @@ class Modal(Provider):
             pass
 
 
-class SandboxChannel:
-    """Carries the framed worker protocol over a sandbox's pipes, through the adapter.
+class SandboxChannel(FramedChannel):
+    """Carries the worker's frames over a sandbox's pipes, through the adapter.
 
-    The framed protocol is the same one that runs over SSH. Only the plumbing differs:
-    a write is a ``write`` request and reading up to a reply is a ``read_until`` request.
+    The frames are the ones that run over SSH, as spec "Modal adapter" describes. Only the
+    plumbing differs: Modal returns a sandbox's output as text, so the worker writes each
+    frame as a base64 line, a write is a ``write`` request, and each line is read with a
+    ``read_until`` request.
     """
 
-    persistent = True
+    text_frames = True
 
     def __init__(self, adapter: Adapter, sandbox: str, *, name: str):
         self.adapter = adapter
         self.sandbox = sandbox
         self.name = name
-        self._started = False
+        self._connection = None
 
     def start(self) -> None:
-        """Hand the worker source to the bootstrap stub as a length-prefixed base64 blob."""
-        import base64
-
-        from ..protocol.worker import SOURCE
-
-        if self._started:
+        if self._connection is not None:
             return
-        payload = base64.b64encode(SOURCE.replace("\r\n", "\n").encode()).decode()
-        self._write(f"{len(payload)}\n{payload}")
-        self._started = True
+        self._raw = bytearray()
+        self._connection = Connection(
+            self.name,
+            self._write,
+            wire.chunks_readinto(self._read_chunks),
+            self._emit,
+            death_detail=lambda: bytes(self._raw[-2000:]).decode("utf-8", "replace"),
+        )
+        self._send_worker()
+        self._await_ready()
 
     def close(self) -> None:
-        from .. import protocol
-
+        connection = self._connection
+        if connection is None:
+            return
         try:
-            self._write(protocol.SHUTDOWN + "\n")
+            connection.sender.frame(wire.SHUTDOWN, 0)
         except Exception:
             pass
 
-    def _write(self, text: str) -> None:
-        self.adapter.request("write", sandbox=self.sandbox, data=text)
+    def _write(self, view: memoryview) -> int:
+        data = base64.b64encode(view).decode("ascii")
+        self.adapter.request("write", sandbox=self.sandbox, data=data)
+        return view.nbytes
 
-    def request(self, payload: dict[str, Any], *, timeout: float | None = None) -> tuple[Any, str]:
-        from .. import protocol
+    def _read_chunks(self) -> list[bytes]:
+        """The next frame line, decoded. A line that is not base64 is output from before the
+        worker started, such as the interpreter's own error, and is kept for the failure."""
+        import binascii
 
-        self.start()
-        self._write(protocol.encode_request(payload) + "\n")
-        read = self.adapter.request("read_until", sandbox=self.sandbox, prefixes=[protocol.REPLY])
-        logs: list[str] = []
-        for line in read.get("lines", []):
-            if protocol.is_ready(line):
-                continue
-            if protocol.is_reply(line):
-                outcome = protocol.decode_reply(line)
-                return protocol.unwrap(outcome, runtime_key=self.name), "".join(logs)
-            logs.append(line)
-        raise ProtocolError(
-            f"{self.name}: the sandbox stopped without replying, so the process died "
-            f"before it finished.\n--- last remote output ---\n"
-            f"{''.join(logs)[-2000:]}"
-        )
+        read = self.adapter.request("read_until", sandbox=self.sandbox, prefixes=[""])
+        chunks: list[bytes] = []
+        for line in read.get("lines") or []:
+            try:
+                chunks.append(base64.b64decode(line.strip(), validate=True))
+            except (binascii.Error, ValueError):
+                self._raw += line.encode("utf-8", "replace")
+        if not chunks and not read.get("eof"):
+            # Only unframed output came back, so read again rather than report an end.
+            return self._read_chunks()
+        return chunks
 
-    def call(
-        self,
-        fn: Any,
-        args: tuple,
-        kwargs: dict,
-        *,
-        timeout: float | None = None,
-    ) -> tuple[Any, str]:
-        import base64
-
-        from .. import protocol
-
-        return self.request(
-            {
-                "op": "call",
-                "payload": base64.b64encode(protocol.dumps_call(fn, args, kwargs)).decode(),
-            },
-            timeout=timeout,
-        )
+    def _startup_failure(self, expired: bool, cause: Exception) -> Exception:
+        # Spec "Modal adapter": a sandbox that ends without replying is a ProtocolError.
+        return cause
 
 
 __all__ = [
