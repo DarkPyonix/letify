@@ -196,6 +196,9 @@ class Pipeline:
             f"{skipped_note}{held_note}"
         )
         link, measured = self._race(applicable, reasons)
+        if measured is not None:
+            # Kept on the link so status can say how far away the machine is.
+            link.rtt_ms = measured.rtt_ms
         if self.cache is not None and network is not None and measured is not None:
             self.cache.save(link.strategy, measured, network)
             self._say(f"cache rewritten: {link.strategy}")

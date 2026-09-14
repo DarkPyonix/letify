@@ -76,7 +76,7 @@ def test_the_accelerators_every_provider_offers_are_listed(isolated_home, capsys
     (isolated_home / ".letify" / "config.toml").write_text(
         '[lab]\nkind = "shell"\naddress = "a"\ngpus = ["A100"]\n', encoding="utf-8"
     )
-    assert main(["devices"]) == 0
+    assert main(["devices", "--json"]) == 0
     table = json.loads(capsys.readouterr().out)
     assert table["lab"] == ["A100"]
     assert "CPU" in table["local"]
@@ -87,7 +87,7 @@ def test_a_configuration_file_can_be_named_explicitly(isolated_home, tmp_path, c
     elsewhere.write_text(
         '[lab]\nkind = "shell"\naddress = "a"\ngpus = ["H100"]\n', encoding="utf-8"
     )
-    assert main(["--config", str(elsewhere), "devices"]) == 0
+    assert main(["--config", str(elsewhere), "devices", "--json"]) == 0
     assert json.loads(capsys.readouterr().out)["lab"] == ["H100"]
 
 
@@ -96,7 +96,7 @@ def test_a_configuration_file_can_be_named_explicitly(isolated_home, tmp_path, c
 
 def test_the_capability_probe_is_on_the_command_line(isolated_home, capsys) -> None:
     # Whether forwarding can run here, and what it would cost.
-    assert main(["probe"]) == 0
+    assert main(["probe", "--json"]) == 0
     report = json.loads(capsys.readouterr().out)
     assert report["platform"]
     assert report["reason"]
@@ -162,6 +162,14 @@ def test_a_machine_reached_by_ssh_is_printed_as_having_no_quota(isolated_home, c
     assert main(["usage", "lab"]) == 0
     out = capsys.readouterr().out
     assert "no quota" in out
+
+
+def test_the_usage_command_prints_one_block_per_account(isolated_home, capsys) -> None:
+    (isolated_home / ".letify" / "config.toml").write_text(
+        '[lab]\nkind = "shell"\naddress = "gpu.example.edu"\n', encoding="utf-8"
+    )
+    assert main(["usage", "lab"]) == 0
+    assert capsys.readouterr().out == "lab  shell\n  no quota, unmetered\n"
 
 
 def _row(**fields: object) -> dict:
@@ -244,34 +252,79 @@ def test_a_configured_command_is_what_the_table_prints(isolated_home, capsys) ->
 # -- Spec: GPU utilization -----------------------------------------------------
 
 
-def test_an_instance_with_no_live_session_is_listed_with_its_reason(isolated_home, capsys) -> None:
+def test_a_session_instance_with_no_live_session_is_listed_with_its_reason(
+    isolated_home, capsys
+) -> None:
     # Starting a session to measure its load would cost money and change the answer.
     (isolated_home / ".letify" / "config.toml").write_text(
-        '[lab]\nkind = "shell"\naddress = "gpu.example.edu"\ngpus = ["A100"]\n',
-        encoding="utf-8",
+        '[e]\nkind = "elice"\nzone_id = "z"\ngpus = ["A100"]\n', encoding="utf-8"
     )
-    assert main(["utilization", "lab", "--json"]) == 0
+    assert main(["utilization", "e", "--json"]) == 0
     rows = json.loads(capsys.readouterr().out)
     assert rows[0]["accelerator"] == "A100"
+    assert rows[0]["scope"] == "session"
     assert rows[0]["devices"] == []
     assert "no live session" in rows[0]["reason"]
+
+
+def test_a_machine_reached_by_ssh_is_read_over_its_link_without_a_session(
+    isolated_home, capsys, monkeypatch
+) -> None:
+    from letify.providers import shell as shell_module
+    from letify.providers.shell import Shell
+
+    (isolated_home / ".letify" / "config.toml").write_text(
+        '[lab]\nkind = "shell"\naddress = "gpu.example.edu"\ngpus = ["P100"]\n',
+        encoding="utf-8",
+    )
+    link = type("L", (), {"ssh_command": lambda self, remote=None: ["ssh", "h", remote]})()
+    monkeypatch.setattr(Shell, "link", lambda self, runtime=None: link)
+    asked: list[str] = []
+
+    def run(command, **kwargs):
+        remote = command[-1]
+        asked.append(remote)
+        if "--query-gpu=index,uuid" in remote:
+            return FakeCompleted(stdout="0, GPU-aaa\n1, GPU-bbb\n")
+        if "--query-compute-apps" in remote:
+            return FakeCompleted(stdout="GPU-bbb, 42\n#owners\n42 alice\n#login\nbrew\n")
+        return FakeCompleted(
+            stdout="0, Tesla P100, 20, 1638, 16384, 41, 38\n"
+            "1, Tesla P100, 99, 8192, 16384, 70, 200\n"
+        )
+
+    monkeypatch.setattr(shell_module.subprocess, "run", run)
+    assert main(["utilization", "lab", "--json"]) == 0
+    rows = json.loads(capsys.readouterr().out)
+    assert len(rows) == 1
+    assert (rows[0]["scope"], rows[0]["accelerator"]) == ("machine", None)
+    holders = [(d["index"], d["holder"], d["users"]) for d in rows[0]["devices"]]
+    assert holders == [(0, "free", []), (1, "others", ["alice"])]
+    assert all("nvidia-smi" in remote for remote in asked)
 
 
 def test_a_device_reading_is_printed_with_the_fields_the_card_reported(
     isolated_home, capsys, monkeypatch
 ) -> None:
     # A card that reports neither power nor temperature is printed without them rather
-    # than with a zero.
+    # than with a zero. Local is read as a machine, so this holds on a machine with no GPU.
     monkeypatch.setattr(
         telemetry,
         "read_smi",
         lambda: "0, NVIDIA RTX PRO 6000, 87, 40960, 98304, [N/A], [Not Supported]\n",
     )
+    owners = {
+        telemetry.UUID_COMMAND: "0, GPU-a\n",
+        telemetry.OWNERS_COMMAND: "#owners\n#login\nbrew\n",
+    }
+    monkeypatch.setattr(telemetry, "_run", lambda command: owners.get(command, ""))
+    monkeypatch.setenv("COLUMNS", "80")
     assert main(["utilization", "local"]) == 0
     out = capsys.readouterr().out
-    assert "87% busy" in out
-    assert "40.0/96.0 GiB" in out
-    assert "W" not in out
+    assert "  gpu0  NVIDIA RTX PRO 6000  free\n" in out
+    assert "]  87%\n" in out
+    assert "]  42%  40.0/96.0 GiB\n" in out
+    assert "W" not in out.replace("NVIDIA RTX PRO 6000", "")
 
 
 def test_the_cpu_shape_is_not_asked_how_busy_its_accelerator_is(

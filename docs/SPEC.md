@@ -120,6 +120,7 @@ A provider is built from one entry in the configuration file and reached by attr
 | `unmetered` | True when there is no quota at all |
 | `as_of` | When the figure was read, as Unix seconds |
 | `note` | Why a figure is missing, in one line |
+| `resources` | Further allowances on the same account, such as Kaggle's TPU hours beside its GPU hours. A list of records with `name`, `unit`, `remaining`, `used`, `limit` and `resets_at`, empty when there are none |
 
 Every field except `alias`, `kind`, `unit` and `source` may be `None`. A provider that cannot be read returns a record with `remaining` set to `None` and the reason in `note`. It does not raise.
 
@@ -146,19 +147,57 @@ usage_limit = 100.0
 
 The last number in the command's output is read as the remaining amount. The command runs only when usage is asked for, never during a call.
 
+`usage_limit` without `usage_command` is the plan allowance for the provider's own reading. It fills `limit` only when the service did not state one, and `used` becomes `limit - remaining`, not below 0. Colab reports a balance and no allowance, so this is how a Colab row gets a percentage.
+
 `Launcher.usage()` asks every provider at once, one thread each, and waits at most `usage_timeout` seconds per provider, 20 by default. A provider that has not answered by then, or that raised, gets a row with `remaining` set to `None` and the reason in `note`. The other rows are unaffected.
 
-`letify usage` prints one row per declared provider, and `letify usage <alias>` one provider. A provider whose optional dependency or setting is missing is reported as unavailable rather than skipped, so the table always lists every alias. `letify usage --json` prints the records unformatted. The table formats amounts by unit:
+`letify usage` prints one block per declared provider, and `letify usage <alias>` one provider. A provider whose optional dependency or setting is missing is reported as unavailable rather than skipped, so the output always lists every alias. `letify usage --json` prints the records unformatted.
+
+Amounts are formatted by unit:
 
 | Unit | Printed as |
 |---|---|
 | `KRW` | `12,345 KRW`, whole won with thousands separators |
 | `USD` | `$29.50` |
 | `compute units` | `99.93 compute units`, two decimals |
-| `GPU hours` | `12.5 GPU hours`, one decimal |
+| a unit ending in `hours`, such as `GPU hours` | `12.5 GPU hours`, one decimal |
 | any other | the number as given, then the unit |
 
-A row prints `<remaining> left`, then `of <limit>` when the limit is known, then `resets <YYYY-MM-DD HH:MM UTC>` when `resets_at` is known, then the hourly rate when it is known. An unmetered row prints `no quota, unmetered`. A row with no figure prints `not reported` with the note or the source.
+A block is a header line, `<alias>  <kind>`, followed by lines indented by 2 spaces:
+
+```
+colab_a  colab
+  [████████████████░░░░░░░░░░░░░░░░░░░░░░░░] 40% used
+  60.00 compute units left of 100.00
+  1.96 compute units/hour running now, about 1 d 6 h at this rate
+
+kaggle  kaggle
+  [████████████████████████░░░░░░░░░░░░░░░░] 60% used
+  12.0 GPU hours left of 30.0
+  resets in 4 d 6 h (2026-09-18 12:00 UTC)
+  TPU [████░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░] 10% used
+      18.0 TPU hours left of 20.0
+
+lab  shell
+  no quota, unmetered
+```
+
+| Line | Printed when | Content |
+|---|---|---|
+| Gauge | `limit` is known and above 0 | `[<filled><empty>] <p>% used`, where `p` is `used / limit` rounded to a whole percent, with `used` taken as `limit - remaining` when the service did not state it |
+| Amount | `remaining` is known | `<remaining> left`, then ` of <limit>` when the limit is known. With no limit the line ends `, limit unknown` and no gauge or percentage is printed |
+| Reset | `resets_at` is known | `resets in <relative> (<YYYY-MM-DD HH:MM UTC>)`, or `reset due (<date>)` once the time has passed |
+| Rate | `rate_per_hour` is known | `<rate>/hour running now`, then `, about <relative> at this rate` when the rate is above 0 and `remaining` is known |
+| No quota | `unmetered` is true | `no quota, unmetered`, and no other line |
+| Not reported | neither `remaining` nor `rate_per_hour` is known | `not reported` |
+| Note | `note` is set | the note |
+| Unavailable | the provider could not be built | `unavailable: <reason>` |
+
+A relative time uses the two largest units of days, hours and minutes, as `4 d 6 h`, `3 h 12 min` or `45 min`. Each record in `resources` prints its own gauge, amount and reset lines under the account's lines. Its gauge line starts with its `name` and its other lines are indented to the gauge's bracket.
+
+The gauge is 16 to 40 cells wide. Its width is the terminal width from `shutil.get_terminal_size`, minus the 2 space indent, the 2 brackets and 10 columns for the percentage text, then clamped to that range. A further allowance's gauge is also shorter by its name and a space, with the same 16 cell minimum, so a narrow terminal still gets a 16 cell gauge. A filled cell is `█` and an empty cell is `░` when the standard output encoding is UTF-8. Otherwise they are `#` and `-`.
+
+Colour is added only when standard output is a terminal and the `NO_COLOR` environment variable is unset or empty. The gauge and its percentage are green while more than 50% of the allowance remains, yellow from 20% to 50%, and red below 20%. The header's alias is bold. Without colour no escape sequence is written.
 
 ### Inventory
 
@@ -213,11 +252,43 @@ Every provider that can start a session without an accelerator registers it as `
 
 > How hard each declared instance's accelerator is working right now, read from the machine that owns it.
 
-`letify utilization` reports one row per instance: the provider alias, the accelerator, and for each physical device its utilization percentage, memory used against memory total, temperature and power draw. `nvidia-smi --query-gpu` is the single source, because it is the only reading present on every machine letify reaches and it needs no framework loaded.
+`letify utilization` reports, for each physical device, its utilization percentage, memory used against memory total, temperature and power draw. `nvidia-smi --query-gpu` is the single source for those readings, because it is the only reading present on every machine letify reaches and it needs no framework loaded.
 
-Where the reading comes from depends on where the device is. An instance on the local provider is read by running `nvidia-smi` here. An instance on a remote provider is read inside its live session, by shipping the same reader function through the ordinary call protocol, so no new channel and no new remote dependency is involved.
+Where the reading comes from depends on whether the machine outlives a session.
 
-An instance with no live session reports no devices and says why, because starting a session to measure its load would cost money and change the answer. A machine without `nvidia-smi` reports no devices with that as the reason. Neither is an error: the table lists every declared instance either way.
+| Provider | Scope | Read from |
+|---|---|---|
+| `Local`, `Shell`, `Tunnel` | `machine` | The machine itself, with no session: `nvidia-smi` here for `Local`, and over the provider's link for `Shell` and `Tunnel`. One row per provider |
+| `Colab`, `Elice`, `Modal`, `Kaggle` | `session` | Inside the instance's live session, by shipping the same reader function through the ordinary call protocol. One row per instance |
+
+A `machine` reading is read-only. It runs the three `nvidia-smi` queries the busy check runs, starts no process on a card and reserves nothing. Each device in it also carries who holds the card:
+
+| `holder` | Means |
+|---|---|
+| `letify` | This process has reserved the index |
+| `others` | Another user is computing on it, by the busy check rule under Inventory. `users` names them |
+| `mine` | Only the login user's own processes, or this client's workers, are computing on it |
+| `free` | No compute process is on it |
+| `unknown` | The utilization was read but the owner query failed |
+
+The first row of that table that applies wins. A `session` device has `holder` set to `None`.
+
+A `session` instance with no live session reports no devices and says why, because starting a session to measure its load would cost money and change the answer. A machine without `nvidia-smi`, or one the link cannot reach, reports no devices with that as the reason. Neither is an error: every declared provider is listed either way. `--json` prints the rows with `alias`, `accelerator` (`None` for a `machine` row), `scope`, `devices` and `reason`.
+
+The command prints one block per provider, with the same header, indent, gauge characters, colour and width rules as `letify usage`:
+
+```
+dept_gpu  shell
+  gpu0  Tesla P100-PCIE-16GB  free
+    load   [████████░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░]  20%
+    memory [████░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░]  10%  1.6/16.0 GiB
+    41C  38W
+
+colab_pro_plus  colab
+  no live session, so nothing to measure
+```
+
+A card's header line is `gpu<index>  <name>  <holder text>`, where the holder text is `reserved by letify`, `busy: <users>`, `in use by your processes`, `free` or `holder unknown`, coloured cyan, red, yellow, green and not at all. The load line is left out when the card reports no utilization, the memory line when it reports no total, and the last line holds whichever of temperature and power the card reported. Each gauge is 16 to 40 cells: the terminal width minus 4 columns of indent, 7 of label, 2 brackets, 5 of percentage and 16 of memory text. Both gauges are coloured by the unused share with the thresholds `letify usage` uses. A `session` row's reason is printed as `<accelerator>: <reason>`, or once without the accelerator when every instance of the provider gives the same reason.
 
 The reading is taken at the moment it is asked for and carries no history. A load that has to be watched over time belongs in the caller's own loop, not in a CLI that shells out to `nvidia-smi` per poll.
 
@@ -494,6 +565,8 @@ There is no detached execution. A detached run whose remote side is preempted wo
 `Launcher.status()` answers three questions: how many sessions exist, how many are serving a call, and what each one is. `live` and `busy` are counts, and `devices` reports each provider's inventory against what is reserved, so a reader can see at a glance whether a call is waiting for a card. `runtimes` describes each session: its name, provider, accelerator, the device indices it holds, placement, whether it is busy and how long it has been idle.
 
 Nothing internal is reported. The pool holds a guard so that a session released by one call is not ended while an overlapping call is still running, and whether that guard is currently open is a fact about the pool's implementation rather than about what is running. A field among counts that looks like a count and is actually a boolean is worse than no field, because it is read as a count.
+
+Each runtime also reports `uptime_seconds`, the `link` strategy its provider connected over and the `rtt_ms` that link measured, each `None` where there is none. `letify status` asks `usage()` only of providers with a live runtime, because a runtime is what costs money, and adds that record as `usage`.
 
 `status()` describes this process only. A session started by a different process is not in it, since the pool lives in the process that owns it. What a machine itself is doing is a different question, answered by `letify utilization`.
 
@@ -1183,6 +1256,63 @@ A lost worker process or link raises `RuntimeLost`, and the session is discarded
 > `host="local"` does not load letify-core. Standing in for the CUDA driver was replaced by operator forwarding.
 
 Measured on 2026-09-14 against a Tesla P100 server with torch 2.5.1 cu121: libcudart 12.1 resolves 425 driver symbols by name and the stand-in `libcuda.so.1` exports 20, so CUDA initialization fails with `cudaErrorInsufficientDriver`. The private `cuGetExportTable` blocks adding symbols one by one, and PyTorch kernels arrive through fatbinary registration that `cuModuleLoadData` does not see. Operator forwarding depends on PyTorch's public extension points instead of the driver's private ones. The Rust crates in `letify-core/` and `letify.remoting.probe` remain in the tree and the wheels, and nothing on the `host="local"` path calls them.
+
+## Command line
+
+> Every command prints for a person by default and for a program with `--json`, through one renderer, `letify/render.py`.
+
+### Output conventions
+
+A style is chosen per stream, so standard output and standard error decide separately:
+
+| Setting | Rule |
+|---|---|
+| Colour | Only when the stream is a terminal and `NO_COLOR` is unset or empty |
+| Characters | Block characters and symbols when the stream encoding is UTF-8, ASCII otherwise |
+| Width | `shutil.get_terminal_size`, 80 columns when it cannot be read |
+
+| Mark | UTF-8 | ASCII | Colour | Means |
+|---|---|---|---|---|
+| success | `✓` | `+` | green | The command did what was asked |
+| failure | `✗` | `x` | red | It did not, and the line says why |
+| warning | `!` | `!` | yellow | It ran, with something to notice |
+
+A heading, an alias at the top of a block and a table's column names are bold. Secondary text, such as a note, a path hint or a reset date, is dim. A table left-aligns each column to its longest cell with two spaces between columns and names its columns in capitals.
+
+A `LetifyError` that reaches the command line prints `✗ <message>` on standard error and exits with 1. An argument error is argparse's own and exits with 2.
+
+`--json` prints the records with no styling on `providers`, `devices`, `status`, `usage`, `utilization`, `probe` and `efficiency`.
+
+Connection decision lines stay on standard error as `letify: <message>`, with the content set by Transport. When standard error is a terminal with colour, the `letify:` prefix is dim and nothing else changes.
+
+### Commands
+
+| Command | Prints |
+|---|---|
+| `providers` | A table `ALIAS  KIND  PERSISTENCE`. A provider that cannot be built has `✗ unavailable: <reason>` in place of kind and persistence. `--json` is a list of `{alias, kind, persistence}` or `{alias, unavailable}` |
+| `devices` | A table `PROVIDER  ACCELERATORS`, the accelerators joined by `, `. `--json` is the mapping from alias to accelerator names |
+| `status` | The header `<name>  <live> live, <busy> busy`, one block per live runtime, then a table `PROVIDER  ACCELERATOR  RESERVED  INDICES` with reserved as `<reserved>/<count>`. With no runtime the blocks are replaced by `no live session in this process`. `--json` is `Launcher.status()` |
+| `usage`, `utilization` | As Remaining usage and GPU utilization describe |
+| `probe` | A mark and `forwarding usable`, `forwarding usable but costly` or `forwarding not usable`, then aligned `platform`, `core`, `agent` and `round trip` fields and the reason, dim. `--json` is the capability record |
+| `efficiency` | `<p>% of a direct run`. `--json` is `{"efficiency": <fraction>}` |
+| `check` | `✓ <alias> answers`, then the machine's output indented by 2 spaces |
+| `login` | `✓ <alias> declared in <home>`, or `! <alias> was already declared in <home>, so nothing was asked for`, then `✓ <alias> referenced in <project>, which is safe to commit` |
+| `logout` | `✓ <alias> removed from <home>`, then the note about the project reference, dim |
+| `stubs` | `✓ <path written>` |
+| `client shell connect` | `On your own machine, run:` bold, the login command plain so it can be copied, and the notes dim |
+
+A runtime block in `status` is:
+
+```
+run-1  lab.P100  busy
+  cards 0, 1  host remote  link forward-ssh, 42.0 ms
+  up 1 h 2 min  idle 3 min
+  about 2.07 compute units so far at 2.00 compute units/hour
+  [████████████████████░░░░░░░░░░░░░░░░░░░░] 50% used
+  50.00 compute units left of 100.00
+```
+
+The header ends `busy` while a call runs and `idle` otherwise. `cards` is left out where the provider assigns the device, `link` where there is none, and the round trip where it was not measured. The cost line needs a usage record with a rate, and is uptime times the rate, so it is an estimate and says `about`. The gauge and amount lines are the usage block's own lines for that record.
 
 ## Packaging
 

@@ -25,9 +25,10 @@ and no blob table, so a large argument travels again on every call.
 from __future__ import annotations
 
 import abc
+import dataclasses
 import threading
 from collections.abc import Iterator, Mapping, Sequence
-from typing import TYPE_CHECKING, Literal
+from typing import TYPE_CHECKING, Any, Literal
 
 from ..config import ProviderConfig
 from ..config.inventory import Devices, read_table
@@ -145,6 +146,19 @@ class Provider(abc.ABC):
         busy = tuple(self.busy())
         self.last_busy = busy
         return tuple(index for index in entry.indices if index not in held | set(busy))
+
+    #: Whether ``letify utilization`` reads the machine itself rather than a live session.
+    #: True only where the machine outlives a session and can be asked without starting one.
+    reads_machine: bool = False
+
+    def read_machine(self) -> tuple[list[Any], dict[int, tuple[str, tuple[str, ...]]]]:
+        """Every card's load and holder on the machine, with no session. See ``reads_machine``."""
+        raise NotImplementedError(f"{self.kind} is read inside a live session")
+
+    def reserved_indices(self) -> set[int]:
+        """The device indices this process has reserved on this provider."""
+        with self._devices_guard:
+            return {index for held in self._reserved.values() for index in held}
 
     def busy(self) -> tuple[int, ...]:
         """Device indices another user is computing on. Nothing for a provider letify cannot ask.
@@ -481,7 +495,13 @@ class Provider(abc.ABC):
                 str(unit) if isinstance(unit, str) else self.usage_unit,
                 float(limit) if isinstance(limit, (int, float)) else None,
             )
-        return self.report_usage()
+        reading = self.report_usage()
+        plan = self.config.option("usage_limit")
+        if reading.limit is None and isinstance(plan, (int, float)) and plan > 0:
+            # A plan allowance the user configured, for a service that states only a balance.
+            used = None if reading.remaining is None else max(float(plan) - reading.remaining, 0.0)
+            reading = dataclasses.replace(reading, limit=float(plan), used=used)
+        return reading
 
     def report_usage(self) -> Usage:
         """What the provider itself can answer, with no configured command in the way."""

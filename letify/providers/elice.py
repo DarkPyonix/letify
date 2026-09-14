@@ -60,6 +60,8 @@ class Elice(Shell):
     extra = "shell"
     default_persistence = "persistent"
     has_fast_path = True
+    #: Its machine lives only as long as a session, so utilization is read inside one.
+    reads_machine = False
 
     # -- configuration -------------------------------------------------------
 

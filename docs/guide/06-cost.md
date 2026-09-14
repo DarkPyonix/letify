@@ -156,6 +156,15 @@ letify utilization                   # how busy each declared GPU is right now
 letify devices                          # what each provider offers
 ```
 
+`letify usage` prints one block per account. A gauge appears when the limit is known:
+
+```
+modal  modal
+  [██████████████████░░░░░░░░░░░░░░░░░░░░░░] 45% used
+  $16.50 left of $30.00
+  resets in 16 d 18 h (2026-10-01 00:00 UTC)
+```
+
 For a new provider, run one trivial function first. A `check` declaration that returns the torch version and device name costs seconds and confirms the whole path before you commit a long run to it.
 
 ```python

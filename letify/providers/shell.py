@@ -358,6 +358,18 @@ class Shell(Provider):
         """
         from ..runtime import telemetry
 
+        run = self._remote_runner(
+            "the busy check could not run, so which cards are free is unknown and nothing was "
+            "reserved"
+        )
+
+        owners: dict[int, tuple[str, ...]] = {}
+        busy = telemetry.busy_indices(exclude_pids=self.worker_pids(), run=run, owners_out=owners)
+        self.last_busy_owners = owners
+        return busy
+
+    def _remote_runner(self, failure: str) -> Callable[[tuple[str, ...]], str]:
+        """Run one command on the machine over its link, raising ``failure`` when it cannot."""
         link = self.link()
 
         def run(command: tuple[str, ...]) -> str:
@@ -367,17 +379,22 @@ class Shell(Provider):
             )
             if result.returncode != 0:
                 raise RuntimeFailure(
-                    f"{self.alias}: the busy check could not run, so which cards are free "
-                    f"is unknown and nothing was reserved",
+                    f"{self.alias}: {failure}",
                     command=remote,
                     stderr=result.stderr.strip(),
                 )
             return result.stdout
 
-        owners: dict[int, tuple[str, ...]] = {}
-        busy = telemetry.busy_indices(exclude_pids=self.worker_pids(), run=run, owners_out=owners)
-        self.last_busy_owners = owners
-        return busy
+        return run
+
+    reads_machine = True
+
+    def read_machine(self) -> tuple[list[Any], dict[int, tuple[str, tuple[str, ...]]]]:
+        """The machine's cards and who holds them, asked over the link with no session."""
+        from ..runtime import telemetry
+
+        run = self._remote_runner("nvidia-smi could not be read over the link")
+        return telemetry.read_machine(run, self.worker_pids())
 
     def store_backend(self) -> str:
         backend = self.config.option("store")
