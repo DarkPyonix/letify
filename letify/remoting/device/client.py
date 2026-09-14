@@ -11,6 +11,7 @@ detected, which is ``trace``, or which stream the bytes cross, which is a ``Tran
 
 from __future__ import annotations
 
+import asyncio
 import collections
 import contextlib
 import os
@@ -47,6 +48,47 @@ BATCH_RELEASES = 4096
 
 #: Handles reserved for the outputs of an operator the runtime ran at once.
 DESCRIBED_OUTPUTS = 64
+
+#: Unread replies at which the next non-blocking read first reads the oldest.
+UNREAD_LIMIT = 1024
+
+
+class Waiter:
+    """The synchronization a reply-carrying batch ends with."""
+
+    __slots__ = ("buffers", "done", "failure", "results")
+
+    def __init__(self) -> None:
+        self.done = False
+        self.results: list = []
+        self.buffers: list = []
+        self.failure: tuple | None = None
+
+
+class Pending:
+    """A non-blocking read: the CPU tensor it fills and the fetch entry that fills it."""
+
+    __slots__ = ("done", "entry", "error", "target")
+
+    def __init__(self, target: torch.Tensor, entry: tuple):
+        self.target = target
+        self.entry = entry
+        self.done = False
+        self.error: RemoteError | None = None
+
+    def apply(self, value: Any, buffers: list, failure: tuple | None) -> None:
+        if value is None:
+            op, message, remote_traceback = failure or ("letify.fetch", "skipped", "")
+            self.error = RemoteError(f"{op} failed on the runtime: {message}", remote_traceback)
+        else:
+            index, shape, got = value
+            data = buffers[index]
+            if len(data):
+                source = torch.frombuffer(data, dtype=getattr(torch, got)).reshape(shape)
+                with torch._C.DisableTorchFunction():
+                    self.target.copy_(source)
+        self.done = True
+
 
 #: Passed to ``python -c`` to start the worker: read a length-prefixed source, execute it.
 BOOTSTRAP = (
@@ -94,6 +136,8 @@ class Stats:
     replayed: int = 0
     #: Repetitions ended by an operator that did not match.
     fallbacks: int = 0
+    #: Non-blocking reads queued.
+    deferred: int = 0
 
     def snapshot(self) -> Stats:
         return Stats(**{field.name: getattr(self, field.name) for field in fields(self)})
@@ -151,6 +195,14 @@ class Client:
         self._mutating: dict[int, bool] = {}
         self._steps: dict[int, Any] = {}
         self.tracer = Tracer()
+        #: The consumers of each reply-carrying batch sent and not yet answered, in send order.
+        self._replies: collections.deque[list] = collections.deque()
+        #: Non-blocking reads whose fetch entry is still queued, by ``id`` of the entry.
+        self._later: dict[int, Pending] = {}
+        #: Non-blocking reads not yet applied, by ``id`` of the CPU tensor they fill.
+        self.unfilled: dict[int, Pending] = {}
+        #: A failure carried by a reply no synchronization waited for.
+        self._deferred: tuple | None = None
         self.hello: dict[str, Any] = {}
         self._sender: threading.Thread | None = None
 
@@ -347,11 +399,28 @@ class Client:
                     self._waiting.set()
 
     def _flush(
-        self, *, reply: bool = False, count: int | None = None, extra: Sequence[tuple] = ()
+        self,
+        *,
+        waiter: Waiter | None = None,
+        count: int | None = None,
+        extra: Sequence[tuple] = (),
+        through: tuple | None = None,
     ) -> None:
-        """Take ``count`` entries, or all, plus ``extra``, and hand them to the sender thread."""
+        """Take ``count`` entries, or all, plus ``extra``, and hand them to the sender thread.
+
+        ``through`` takes the entries up to and including that queued entry, and none when it
+        has already left the queue.
+        """
         with self._flush_lock:
             pending = self._queue
+            if through is not None:
+                count = 0
+                for index, queued in enumerate(pending):
+                    if queued is through:
+                        count = index + 1
+                        break
+                if not count:
+                    return
             taken = len(pending) if count is None else count
             entries = [pending.popleft() for _ in range(taken)]
             entries.extend(extra)
@@ -390,14 +459,29 @@ class Client:
                 released = [handle for handle in taken_releases if handle < upto]
                 if held:
                     self.released.extend(held)
+            consumers: list = []
+            later = self._later
+            if later:
+                for entry in entries:
+                    if entry[0] == E_REQUEST:
+                        read = later.pop(id(entry), None)
+                        if read is not None:
+                            consumers.append(read)
+            if waiter is not None:
+                consumers.append(waiter)
+            reply = bool(consumers)
             if not entries and not released and not reply:
                 return
             head = pickle.dumps(
                 {"entries": entries, "release": released, "reply": reply}, protocol=5
             )
-            if reply and self._unsent == 0:
+            direct = waiter is not None and self._unsent == 0 and not self._replies
+            if reply:
+                self._replies.append(consumers)
+            if direct:
                 # The waiting thread writes its own synchronization, in order, because no
-                # earlier batch is queued for or being written by the sender thread.
+                # earlier batch is queued for or being written by the sender thread and no
+                # earlier reply is unread.
                 try:
                     self.transport.send(head, buffers)
                 except TransportClosed as exc:
@@ -479,15 +563,86 @@ class Client:
                 self._cut()
             self.stats.ops += 1
             self.stats.entries += 1
-            self._flush(reply=True, count=count, extra=[*defines, entry])
-            head, buffers = self._recv()
+            waiter = Waiter()
+            self._flush(waiter=waiter, count=count, extra=[*defines, entry])
+            while not waiter.done:
+                self._receive()
             self.stats.round_trips += 1
-        reply = pickle.loads(head)
-        failure = reply.get("failure")
+            failure, self._deferred = self._deferred or waiter.failure, None
         if failure is not None:
             op, message, remote_traceback = failure
             raise RemoteError(f"{op} failed on the runtime: {message}", remote_traceback)
-        return reply["results"], buffers
+        return waiter.results, waiter.buffers
+
+    def _receive(self) -> None:
+        """Read the oldest unread reply and hand its results to their consumers."""
+        head, buffers = self._recv()
+        consumers = self._replies.popleft()
+        reply = pickle.loads(head)
+        results = reply["results"]
+        failure = reply.get("failure")
+        waiter = None
+        reported = False
+        # Reads come first in a batch, so the i-th read owns the i-th result. A waiter's
+        # entry may ask for no result, and it takes the whole list.
+        for position, consumer in enumerate(consumers):
+            if type(consumer) is Waiter:
+                waiter = consumer
+                continue
+            consumer.apply(results[position], buffers, failure)
+            reported = reported or consumer.error is not None
+            self.unfilled.pop(id(consumer.target), None)
+        if waiter is not None:
+            waiter.results, waiter.buffers, waiter.failure = results, buffers, failure
+            waiter.done = True
+        elif failure is not None and not reported and self._deferred is None:
+            self._deferred = failure
+
+    def read_later(
+        self, tensor: Any, dtype: torch.dtype | None = None, target: torch.Tensor | None = None
+    ) -> torch.Tensor:
+        """Queue a fetch of ``tensor`` and return the CPU tensor it fills, without waiting."""
+        self._check_open()
+        if len(self._replies) >= UNREAD_LIMIT:
+            with self._request_lock:
+                if self._replies:
+                    self._receive()
+        if target is None:
+            with torch._C.DisableTorchFunction():
+                target = torch.empty(tuple(tensor.shape), dtype=dtype or tensor.dtype)
+        name = None if dtype is None else str(dtype).split(".")[-1]
+        entry = (E_REQUEST, "letify.fetch", (tensor._ref.handle, name), "fetch")
+        read = Pending(target, entry)
+        self._cut()
+        self.stats.ops += 1
+        self.stats.deferred += 1
+        self._later[id(entry)] = read
+        self.unfilled[id(target)] = read
+        self._enqueue(entry)
+        return target
+
+    def wait(self, read: Pending) -> torch.Tensor:
+        """Send what ``read`` needs and read replies until it is applied."""
+        with self._request_lock:
+            if not read.done:
+                self._check_open()
+                self._flush(through=read.entry)
+                while not read.done:
+                    self._receive()
+        if read.error is not None:
+            raise read.error
+        return read.target
+
+    def wait_used(self, values: Any) -> None:
+        """Wait for every unfilled tensor among ``values``, or one list level down."""
+        unfilled = self.unfilled
+        for value in values:
+            if type(value) in (list, tuple):
+                self.wait_used(value)
+                continue
+            read = unfilled.get(id(value))
+            if read is not None and read.target is value:
+                self.wait(read)
 
     def synchronize(self) -> None:
         """Wait for every queued operator, raising the first failure among them."""
@@ -610,6 +765,35 @@ class Client:
             yield
 
 
+class Fetch:
+    """What ``letify.fetch`` returns: an awaitable resolving to a CPU tensor."""
+
+    __slots__ = ("client", "read", "value")
+
+    def __init__(self, client: Client | None, read: Pending | None, value: torch.Tensor):
+        self.client = client
+        self.read = read
+        self.value = value
+
+    def __await__(self) -> Iterator[Any]:
+        if self.client is not None and self.read is not None and not self.read.done:
+            yield from asyncio.to_thread(self.client.wait, self.read).__await__()
+        if self.read is not None and self.read.error is not None:
+            raise self.read.error
+        return self.value
+
+
+def fetch(tensor: torch.Tensor) -> Fetch:
+    """Queue a read of ``tensor`` now and return an awaitable for its CPU copy."""
+    from .tensor import RemoteTensor
+
+    if type(tensor) is RemoteTensor:
+        client = tensor._ref.client
+        target = client.read_later(tensor)
+        return Fetch(client, client.unfilled.get(id(target)), target)
+    return Fetch(None, None, tensor.detach().cpu())
+
+
 def connect(
     command: list[str],
     *,
@@ -672,6 +856,7 @@ __all__ = [
     "Stats",
     "attach",
     "connect",
+    "fetch",
     "worker_command",
     "worker_source",
 ]
