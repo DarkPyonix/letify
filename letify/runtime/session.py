@@ -493,10 +493,7 @@ class Runtime:
 
 def _pickled(value: Any, immutable: bool) -> dict[str, Any]:
     """A ``put_blob`` message for a value: its protocol 5 pickle and out-of-band buffers."""
-    import pickle
-
-    buffers: list[pickle.PickleBuffer] = []
-    head = pickle.dumps(value, protocol=5, buffer_callback=buffers.append)
+    head, buffers = protocol.wire.pickle_parts(value)
     return {"kind": "pickle", "immutable": immutable, "head": head, "buffers": buffers}
 
 

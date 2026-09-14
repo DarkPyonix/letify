@@ -83,6 +83,69 @@ def test_a_large_bytes_value_travels_out_of_band_without_a_copy() -> None:
     assert wire.loads(head, [bytearray(b) for b in buffers]) == {"op": "call", "payload": payload}
 
 
+def test_a_large_cpu_tensor_travels_out_of_band_sharing_its_memory() -> None:
+    torch = pytest.importorskip("torch")
+    tensor = torch.arange(2 * MiB // 4, dtype=torch.float32).reshape(512, -1)
+    head, buffers = wire.dumps({"value": tensor})
+    assert len(head) < 4096
+    assert [memoryview(b).nbytes for b in buffers] == [2 * MiB]
+    # The buffer is the tensor's own memory, so a later write shows through it.
+    tensor[0, 0] = -1.0
+    assert struct.unpack_from("<f", memoryview(buffers[0]))[0] == -1.0
+    back = wire.loads(head, [bytearray(b) for b in buffers])["value"]
+    assert back.dtype == tensor.dtype and back.shape == tensor.shape
+    assert torch.equal(back, tensor)
+
+
+def test_a_state_dict_is_pickled_without_its_tensors_inside_the_pickle() -> None:
+    torch = pytest.importorskip("torch")
+    # 256 KiB each: a state_dict is mostly tensors far below a mebibyte.
+    state = {f"layer{i}.weight": torch.full((1 << 16,), float(i)) for i in range(20)}
+    state["step"] = torch.tensor(7)
+    head, buffers = codec.dumps_call_parts(len, (state,), {})
+    assert len(head) < 16 * 1024
+    assert sum(memoryview(b).nbytes for b in buffers) == 5 * MiB
+    _fn, (back,), _kwargs = __import__("cloudpickle").loads(
+        head, buffers=[bytearray(memoryview(b)) for b in buffers]
+    )
+    assert back.keys() == state.keys()
+    assert all(torch.equal(back[k], state[k]) for k in state)
+
+
+def test_a_blob_argument_holding_a_tensor_is_pickled_out_of_band() -> None:
+    torch = pytest.importorskip("torch")
+    from letify.runtime.session import _pickled
+
+    message = _pickled(torch.ones(4 * MiB // 8, dtype=torch.float64), immutable=False)
+    assert len(message["head"]) < 4096
+    assert [memoryview(b).nbytes for b in message["buffers"]] == [4 * MiB]
+
+
+@pytest.mark.parametrize(
+    "make",
+    [
+        lambda torch: torch.randn(300, 700),
+        lambda torch: torch.randn(300, 700).to(torch.bfloat16),
+        lambda torch: torch.randn(300, 700).t(),
+        lambda torch: torch.randn(1000, 1000)[10:20],
+        lambda torch: torch.randn(512, 512, requires_grad=True),
+        lambda torch: torch.nn.Parameter(torch.randn(512, 512)),
+        lambda torch: torch.zeros(0, 3),
+        lambda torch: torch.arange(10**6) % 2 == 0,
+    ],
+    ids=["float", "bfloat16", "transposed", "slice", "requires_grad", "parameter", "empty", "bool"],
+)
+def test_tensors_of_every_layout_round_trip_with_dtype_shape_and_grad_flag(make) -> None:
+    torch = pytest.importorskip("torch")
+    tensor = make(torch)
+    head, buffers = wire.dumps([tensor, tensor])
+    first, second = wire.loads(head, [bytearray(memoryview(b).cast("B")) for b in buffers])
+    assert type(first) is type(tensor) and first is second
+    assert first.dtype == tensor.dtype and first.shape == tensor.shape
+    assert first.requires_grad == tensor.requires_grad
+    assert torch.equal(first.detach(), tensor.detach())
+
+
 def test_data_frames_are_at_most_eight_mebibytes() -> None:
     assert 8 * MiB == wire.CHUNK
 
@@ -407,6 +470,28 @@ def test_a_mutable_argument_is_hashed_again_and_a_mutation_does_not_leak(let, cp
         assert scribble(value) == 0
         value[0] = 9
         assert scribble(value) == 9
+
+
+def test_a_tensor_argument_and_a_tensor_result_round_trip_through_a_runtime(let, cpu) -> None:
+    torch = pytest.importorskip("torch")
+
+    @let.function(device=cpu, host=letify.remote)
+    def scale(state: dict, factor: float) -> dict:
+        out = {name: value * factor for name, value in state.items()}
+        state["w0"][0] = 1e9
+        return out
+
+    torch.manual_seed(0)
+    state = {f"w{i}": torch.randn(1 << 18) for i in range(8)}
+    expected = {name: value * 2.0 for name, value in state.items()}
+    with let.keep_alive():
+        first = scale(state, 2.0)
+        # The worker wrote into its own copy, so the next call still sees the original.
+        second = scale(state, 2.0)
+    assert state["w0"][0] != 1e9
+    for result in (first, second):
+        assert result.keys() == expected.keys()
+        assert all(torch.equal(result[k], expected[k]) for k in expected)
 
 
 @pytest.mark.skipif(sys.platform != "linux", reason="F_SETPIPE_SZ is Linux only")
