@@ -1597,7 +1597,7 @@ The header ends `busy` while a call runs and `idle` otherwise. `cards` is left o
 
 **Lookup.** When letify needs a tool it takes the first of:
 
-1. The project environment: `<venv>/bin/<tool>`, or `<venv>\Scripts\<tool>.exe` on Windows. The environment is `sys.prefix` when letify runs inside a virtual environment, and otherwise `.venv` in the working directory when it holds `pyvenv.cfg`.
+1. The project environment: `<venv>/bin/<tool>`, or `<venv>\Scripts\<tool>.exe` on Windows. The environment is `sys.prefix` when letify runs inside a virtual environment, and otherwise `.venv` in the working directory when it holds `pyvenv.cfg`. A link letify made for another version is skipped here and replaced in step 2.
 2. The cache for the pinned version, `~/.letify/tools/<tool>/<version>/<tool>` (`.exe` on Windows). A hit is linked into the project environment as below.
 3. `PATH`. A user's own install is used as it is and never replaced.
 4. The confirmed install.

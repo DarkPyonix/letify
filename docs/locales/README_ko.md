@@ -440,6 +440,7 @@ def test_train_returns_a_loss():
 letify login shell lab # 계정을 등록하고, 이 저장소에서 참조
 letify logout lab     # 이 머신에서 계정 제거
 letify client shell connect  # NAT 뒤 원격 머신에서 실행해, letify가 접속할 수 있게 함
+letify setup tailcat  # 확인을 받은 뒤 배포처에서 tailcat 또는 eci 설치
 letify providers      # 선언된 프로바이더, 저장소 수명, 기본 배치
 letify devices           # 각자 제공하는 GPU
 letify status         # 지금 돌고 있는 것

@@ -166,7 +166,7 @@ Setup is two commands, one on each machine. Both machines need `tailcat`, and th
 letify client shell connect --name home_box
 ```
 
-If `tailcat` or an SSH server is missing, the command prints the exact install steps for that machine and exits. Otherwise it prints one command to run on your own machine:
+If `tailcat` is missing and you are at a terminal, the command offers to install it. If you decline, run without a terminal, or the SSH server is missing, it prints the exact install steps for that machine and exits. Otherwise it prints one command to run on your own machine:
 
 ```
 letify login tunnel home_box --connect eyJ0YWlsY2F0Ijoi...
@@ -226,11 +226,14 @@ spot_fallback = "ondemand"          # optional: none (default) or ondemand
 access_token_env = "ELICE_ACCESS_TOKEN"
 ```
 
-Targets Elice Cloud Infrastructure through `eci`, Elice's own command line. Install it once:
+Targets Elice Cloud Infrastructure through `eci`, Elice's own command line. `letify login elice` offers to install it when it is missing, or install it yourself:
 
 ```bash
+letify setup eci                 # letify downloads Elice's release after you confirm
 curl -fsSL https://raw.githubusercontent.com/elice-dev/eci-cli/main/scripts/install.sh | sh
 ```
+
+See [Installing tailcat and eci](#installing-tailcat-and-eci) for where letify puts it.
 
 **No machine has to exist.** `letify login elice elice_a100` checks the token with `eci`, and without a machine it records none. On the first call letify launches `letify-elice-a100`, or `letify-elice-a100-spot` for spot, with an instance type matching the declaration. It keeps a generated password in `~/.letify/accounts/elice_a100/machine_password` and installs your SSH key. Later calls start the same machine again. To use a machine you made yourself, pick it at login or set `machine_id`.
 
@@ -316,3 +319,24 @@ letify check lab_a100
 ---
 
 [← Getting started](01-getting-started.md) · [Guides](README.md) · [Next: Execution modes →](03-execution-modes.md)
+
+## Installing tailcat and eci
+
+letify runs two programs it does not ship: `tailcat`, from Tailscale, for Tunnel accounts, and `eci`, from Elice, for Elice accounts. Neither is part of letify or covered by its license. letify installs one only after you say yes:
+
+```bash
+letify setup tailcat          # asks first; --yes skips the question
+letify setup eci --yes        # for scripts and CI
+letify setup tailcat --where  # where it is and which copy letify uses
+```
+
+The commands that need a tool ask the same question at a terminal. Without a terminal, in CI, or with `--no-input`, they never ask: they print the install steps and the `letify setup <tool> --yes` command.
+
+What an install does:
+
+1. Downloads the pinned release archive from the publisher's GitHub releases, `tailscale/tailcat` or `elice-dev/eci-cli`.
+2. Checks its SHA-256 against the digest pinned in letify and against the release's `checksums.txt`, and refuses a mismatch.
+3. Unpacks it into `~/.letify/tools/<tool>/<version>/`, refusing any archive entry that points outside that directory.
+4. Links it into your project's `.venv/bin`: a hard link for `tailcat` (a copy when a hard link is impossible), a small launcher script for `eci`.
+
+letify never writes to `~/.local/bin`, `/usr/local/bin` or your shell profile. A copy you installed yourself on `PATH` is used as it is and never replaced, and a file in `.venv/bin` that letify did not create is left alone. On macOS with Homebrew, `tailcat` comes from `brew install tailcat`.

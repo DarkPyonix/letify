@@ -440,6 +440,7 @@ def test_train_returns_a_loss():
 letify login shell lab        # declare an account, and reference it here
 letify logout lab             # take the account off this machine
 letify client shell connect   # run on a remote machine behind NAT, so letify can reach it
+letify setup tailcat          # install tailcat or eci from its publisher, after you confirm
 letify providers              # who is declared, storage, channel kind
 letify devices                # what each one offers
 letify status                 # what is running right now
