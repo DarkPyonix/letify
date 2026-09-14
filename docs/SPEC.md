@@ -566,6 +566,8 @@ There is no detached execution. A detached run whose remote side is preempted wo
 
 Nothing internal is reported. The pool holds a guard so that a session released by one call is not ended while an overlapping call is still running, and whether that guard is currently open is a fact about the pool's implementation rather than about what is running. A field among counts that looks like a count and is actually a boolean is worse than no field, because it is read as a count.
 
+Each runtime also reports `uptime_seconds`, the `link` strategy its provider connected over and the `rtt_ms` that link measured, each `None` where there is none. `letify status` asks `usage()` only of providers with a live runtime, because a runtime is what costs money, and adds that record as `usage`.
+
 `status()` describes this process only. A session started by a different process is not in it, since the pool lives in the process that owns it. What a machine itself is doing is a different question, answered by `letify utilization`.
 
 ## Storage
@@ -1254,6 +1256,63 @@ A lost worker process or link raises `RuntimeLost`, and the session is discarded
 > `host="local"` does not load letify-core. Standing in for the CUDA driver was replaced by operator forwarding.
 
 Measured on 2026-09-14 against a Tesla P100 server with torch 2.5.1 cu121: libcudart 12.1 resolves 425 driver symbols by name and the stand-in `libcuda.so.1` exports 20, so CUDA initialization fails with `cudaErrorInsufficientDriver`. The private `cuGetExportTable` blocks adding symbols one by one, and PyTorch kernels arrive through fatbinary registration that `cuModuleLoadData` does not see. Operator forwarding depends on PyTorch's public extension points instead of the driver's private ones. The Rust crates in `letify-core/` and `letify.remoting.probe` remain in the tree and the wheels, and nothing on the `host="local"` path calls them.
+
+## Command line
+
+> Every command prints for a person by default and for a program with `--json`, through one renderer, `letify/render.py`.
+
+### Output conventions
+
+A style is chosen per stream, so standard output and standard error decide separately:
+
+| Setting | Rule |
+|---|---|
+| Colour | Only when the stream is a terminal and `NO_COLOR` is unset or empty |
+| Characters | Block characters and symbols when the stream encoding is UTF-8, ASCII otherwise |
+| Width | `shutil.get_terminal_size`, 80 columns when it cannot be read |
+
+| Mark | UTF-8 | ASCII | Colour | Means |
+|---|---|---|---|---|
+| success | `✓` | `+` | green | The command did what was asked |
+| failure | `✗` | `x` | red | It did not, and the line says why |
+| warning | `!` | `!` | yellow | It ran, with something to notice |
+
+A heading, an alias at the top of a block and a table's column names are bold. Secondary text, such as a note, a path hint or a reset date, is dim. A table left-aligns each column to its longest cell with two spaces between columns and names its columns in capitals.
+
+A `LetifyError` that reaches the command line prints `✗ <message>` on standard error and exits with 1. An argument error is argparse's own and exits with 2.
+
+`--json` prints the records with no styling on `providers`, `devices`, `status`, `usage`, `utilization`, `probe` and `efficiency`.
+
+Connection decision lines stay on standard error as `letify: <message>`, with the content set by Transport. When standard error is a terminal with colour, the `letify:` prefix is dim and nothing else changes.
+
+### Commands
+
+| Command | Prints |
+|---|---|
+| `providers` | A table `ALIAS  KIND  PERSISTENCE`. A provider that cannot be built has `✗ unavailable: <reason>` in place of kind and persistence. `--json` is a list of `{alias, kind, persistence}` or `{alias, unavailable}` |
+| `devices` | A table `PROVIDER  ACCELERATORS`, the accelerators joined by `, `. `--json` is the mapping from alias to accelerator names |
+| `status` | The header `<name>  <live> live, <busy> busy`, one block per live runtime, then a table `PROVIDER  ACCELERATOR  RESERVED  INDICES` with reserved as `<reserved>/<count>`. With no runtime the blocks are replaced by `no live session in this process`. `--json` is `Launcher.status()` |
+| `usage`, `utilization` | As Remaining usage and GPU utilization describe |
+| `probe` | A mark and `forwarding usable`, `forwarding usable but costly` or `forwarding not usable`, then aligned `platform`, `core`, `agent` and `round trip` fields and the reason, dim. `--json` is the capability record |
+| `efficiency` | `<p>% of a direct run`. `--json` is `{"efficiency": <fraction>}` |
+| `check` | `✓ <alias> answers`, then the machine's output indented by 2 spaces |
+| `login` | `✓ <alias> declared in <home>`, or `! <alias> was already declared in <home>, so nothing was asked for`, then `✓ <alias> referenced in <project>, which is safe to commit` |
+| `logout` | `✓ <alias> removed from <home>`, then the note about the project reference, dim |
+| `stubs` | `✓ <path written>` |
+| `client shell connect` | `On your own machine, run:` bold, the login command plain so it can be copied, and the notes dim |
+
+A runtime block in `status` is:
+
+```
+run-1  lab.P100  busy
+  cards 0, 1  host remote  link forward-ssh, 42.0 ms
+  up 1 h 2 min  idle 3 min
+  about 2.07 compute units so far at 2.00 compute units/hour
+  [████████████████████░░░░░░░░░░░░░░░░░░░░] 50% used
+  50.00 compute units left of 100.00
+```
+
+The header ends `busy` while a call runs and `idle` otherwise. `cards` is left out where the provider assigns the device, `link` where there is none, and the round trip where it was not measured. The cost line needs a usage record with a rate, and is uptime times the rate, so it is an estimate and says `about`. The gauge and amount lines are the usage block's own lines for that record.
 
 ## Packaging
 
