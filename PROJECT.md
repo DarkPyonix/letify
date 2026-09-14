@@ -265,7 +265,7 @@ workspace = "/workspace/researcher/letify"
 [elice_a100]
 kind = "elice"
 zone_id = "..."
-machine_id = "..."
+price_type = "ondemand"        # or "spot"; letify creates the machine through eci on first use
 access_token_env = "ELICE_ACCESS_TOKEN"
 ```
 
