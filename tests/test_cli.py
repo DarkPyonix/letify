@@ -548,6 +548,64 @@ def test_a_colab_login_that_fails_writes_nothing(
     assert not (Path.home() / ".letify" / "config.toml").exists()
 
 
+def test_a_declared_colab_account_without_a_key_gets_one_on_a_new_login(
+    isolated_home, patch_which, patch_run, monkeypatch
+) -> None:
+    from letify import tools
+
+    monkeypatch.setenv("HOME", str(Path.home()))
+    (Path.home() / ".letify" / "config.toml").write_text(
+        '[colab_a]\nkind = "colab"\n', encoding="utf-8"
+    )
+    patch_which(tools, present=True)
+    recorder = patch_run(login, result=FakeCompleted())
+    assert main(["login", "colab", "colab_a", "--no-input"]) == 0
+    assert len([c for c in recorder.commands if c and c[0] == "ssh-keygen"]) == 1
+    assert home_config()["colab_a"]["key"] == "~/.ssh/id_letify"
+    assert home_config()["colab_a"]["kind"] == "colab"
+
+
+def test_a_colab_login_generates_and_records_the_letify_key(
+    isolated_home, patch_which, patch_run, monkeypatch
+) -> None:
+    # Without a key the Colab rendezvous is unavailable, so tcp_punch never runs.
+    from letify import tools
+
+    monkeypatch.setenv("HOME", str(Path.home()))
+    patch_which(tools, present=True)
+    recorder = patch_run(login, result=FakeCompleted())
+    assert main(["login", "colab", "colab_a", "--no-input"]) == 0
+    generated = [c for c in recorder.commands if c and c[0] == "ssh-keygen"]
+    assert len(generated) == 1
+    assert generated[0][-1] == str(Path.home() / ".ssh" / "id_letify")
+    assert home_config()["colab_a"]["key"] == "~/.ssh/id_letify"
+
+
+def test_a_colab_login_reuses_an_existing_key_without_regenerating_it(
+    isolated_home, patch_which, patch_run
+) -> None:
+    from letify import tools
+
+    patch_which(tools, present=True)
+    existing = Path.home() / ".ssh" / "id_mine"
+    existing.parent.mkdir(parents=True, exist_ok=True)
+    existing.write_text("user key", encoding="utf-8")
+    recorder = patch_run(login, result=FakeCompleted())
+    assert main(["login", "colab", "colab_a", "--no-input", "--key", str(existing)]) == 0
+    assert [c for c in recorder.commands if c and c[0] == "ssh-keygen"] == []
+    assert existing.read_text(encoding="utf-8") == "user key"
+    assert home_config()["colab_a"]["key"] == str(existing)
+
+
+def test_a_failed_colab_login_generates_no_key(isolated_home, patch_which, patch_run) -> None:
+    from letify import tools
+
+    patch_which(tools, present=True)
+    recorder = patch_run(login, result=FakeCompleted(returncode=1))
+    assert main(["login", "colab", "colab_a", "--no-input"]) == 1
+    assert [c for c in recorder.commands if c and c[0] == "ssh-keygen"] == []
+
+
 def test_logging_in_to_colab_without_uv_says_how_to_get_it(
     isolated_home, patch_which, capsys
 ) -> None:
