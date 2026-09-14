@@ -743,3 +743,19 @@ def test_ssh_that_never_answers_after_a_launch_deletes_the_machine(
     with pytest.raises(letify.RuntimeFailure, match=r"203\.0\.113\.1"):
         provider.start(Instance(provider, gpu="A100"), None, name="letify-a100-1")
     assert "compute vm delete letify-elice-a100" in fake_eci.commands()
+
+
+def test_the_host_key_is_forgotten_for_an_alias_with_capitals(account) -> None:
+    # ssh writes the alias lower cased, as a live account named BrewBrew showed.
+    provider = account(alias="BrewBrew")
+    known = account_directory("BrewBrew") / "known_hosts"
+    known.parent.mkdir(parents=True, exist_ok=True)
+    known.write_text(
+        "letify-brewbrew ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOldOldOld\n"
+        "other-host ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIKeepKeepKeep\n",
+        encoding="utf-8",
+    )
+    provider.create_session(Instance(provider, gpu="A100"), "letify-a100-1")
+    text = known.read_text(encoding="utf-8")
+    assert "letify-brewbrew" not in text
+    assert "other-host" in text

@@ -920,13 +920,14 @@ class Elice(Shell):
             lines = known.read_text(encoding="utf-8").splitlines(keepends=True)
         except OSError:
             return
-        name = f"letify-{self.alias}"
-        kept = [
-            line
-            for line in lines
-            if name not in line.split(" ", 1)[0].split(",")
-            and f"[{name}]" not in line.split(" ", 1)[0]
-        ]
+        # ssh records host names lower cased, so an alias with capitals is matched that way.
+        name = f"letify-{self.alias}".lower()
+
+        def names(line: str) -> list[str]:
+            field = line.split(" ", 1)[0].lower()
+            return [part.strip("[]").split("]:")[0] for part in field.split(",")]
+
+        kept = [line for line in lines if name not in names(line)]
         if len(kept) != len(lines):
             known.write_text("".join(kept), encoding="utf-8")
         self.close_link()
