@@ -148,7 +148,7 @@ def _has_remote(values: Any) -> bool:
 class _Prepared:
     """What one pass over an operator's arguments collected."""
 
-    __slots__ = ("big", "buffers", "client", "floats_keyed", "inputs", "key", "keep", "order")
+    __slots__ = ("big", "buffers", "client", "floats_keyed", "inputs", "keep", "key", "order")
 
     def __init__(self, client: Client | None, floats_keyed: bool = True):
         self.client = client
