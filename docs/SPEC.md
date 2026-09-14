@@ -426,7 +426,7 @@ The protocol is one JSON object per line. letify sends `{"id": <int>, "op": <nam
 |---|---|---|
 | `hello` | none | `{"modal": <installed Modal version>}` |
 | `create` | `app`, `args`, `packages`, `gpu`, `timeout` | `{"sandbox": <id>}`. Runs `app` as an ephemeral app on first use, builds `debian_slim` with `packages` installed, and starts `args` in a sandbox |
-| `write` | `sandbox`, `data` | `null`. `data` is base64. Writes the decoded bytes to the sandbox's standard input and drains it |
+| `write` | `sandbox`, `data` | `null`. `data` is base64 of at most 1 MiB. Writes the decoded bytes to the sandbox's standard input and drains it. Modal refuses a write that would buffer more than 2 MiB, so the channel splits a larger frame into `write` requests of 1 MiB, in order |
 | `read_until` | `sandbox`, `prefixes` | `{"lines": [...], "eof": <bool>}`. The sandbox's stdout lines up to and including the first that starts with one of `prefixes`, or every line left when the stream ends |
 | `terminate` | `sandbox` | `null` |
 | `billing_summary` | none | `{"metered_cost": <text>, "billed_cost": <text>, "credits": <text>, "start": <Unix seconds>, "end": <Unix seconds>}` for the current month, from `modal.Workspace.billing.summary()`. Amounts are decimal text in USD. `credits` is the `Credits` adjustment, negative when credit was applied |
