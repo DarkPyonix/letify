@@ -224,6 +224,61 @@ A copy to the host, with the payload streamed from the agent's staging buffer in
 
 Loopback removes the network, so these numbers bound what the copy path itself costs. On a real link the link rate decides throughput whenever it is below them. To reproduce, run `cargo test --release -p letify-wire --test throughput -- --ignored --nocapture --test-threads=1` in `letify-core/`.
 
+## PyTorch forwarding on dept_gpu
+
+> Reading the loss once every 50 steps, `host="local"` takes a median 3.45 ms per step against 1.70 ms directly on the server: about twice the direct time, and one round trip per 45 steps. Measured on 2026-09-14.
+
+Setup: the benchmark model is `Linear 256->2048, ReLU, Linear 2048->256`, batch 512, Adam, 1000 timed steps after 50 warm steps. The client is a Linux container in Daejeon, Korea, with torch 2.5.1 on CPU and a load average near 130 on 128 cores, so local dispatch is measured under contention. The runtime is one free Tesla P100 on dept_gpu with torch 2.5.1 cu121, reached by direct SSH, where an empty synchronization measured a median 0.41 ms and p99 0.57 ms over 500 samples. Direct means the same loop run over plain SSH in the same project `.venv` on the same card type. Step time is measured in the local process; `wall` includes the final synchronization, so it counts GPU work the loop left queued.
+
+| Loop | Mode | Median step | p99 step | Wall per step | Ops per step | Round trips per step | Ops per round trip |
+|---|---|---|---|---|---|---|---|
+| `loss.item()` every 50 steps | direct | 1.70 ms | 2.06 ms | 1.93 ms | | | |
+| `loss.item()` every 50 steps | host=local | 3.45 ms | 23.5 ms | 5.17 ms | 31.0 | 0.022 | 1410 |
+| `loss.item()` every step | direct | 1.74 ms | 2.34 ms | 1.76 ms | | | |
+| `loss.item()` every step | host=local | 6.52 ms | 20.1 ms | 8.49 ms | 32.0 | 1.002 | 32 |
+
+| Copy of 256 MiB | Direct, on the server | host=local over SSH |
+|---|---|---|
+| Host to device | 3866 MiB/s | 101 MiB/s |
+| Device to host | 1154 MiB/s | 84 MiB/s |
+
+Both runs reach the same loss, 0.038251, so the forwarded step computes what the direct one does. The copy rate over the link matches the SSH ceiling of about 100 MiB/s measured for this account, so the transfer path adds no bound of its own there.
+
+Where the time goes, from a separate run that timed each queue send and each read: sending a queue took 0.18 ms per step with a p99 of 0.37 ms, garbage collection 0.003 ms per step, and `loss.item()` a median 1.85 ms, of which 0.41 ms is the round trip and the rest is waiting for the P100 to finish the queued step. The p99 near 20 ms is not the link and not the sender: the timed sends above have a p99 of 0.37 ms, and 206 of 1000 steps still took over 10 ms. A worker on the meta device on this client, with no network at all, gave 593 to 722 such steps, so the likely cause is scheduling of this process on a contended client. It is untested on an idle client.
+
+Reading every step costs 3.1 ms more than reading every 50 steps. A read waits for the GPU to finish the step and then pays the round trip, so on a GPU step this short the efficiency model's `k * RTT` term is joined by the queued GPU time that a direct run never waits for.
+
+The first 60 steps take a median 8.3 ms, because the operator metadata cache fills during them. Its hit rate is 0.82 in those steps and 0.99 after.
+
+### Before the local dispatch changes
+
+The first measurement on dept_gpu, before the metadata cache, the foreach registration and moving the aged queue send onto the dispatching thread:
+
+| Loop | Median step | p99 step | Wall per step | Ops per step |
+|---|---|---|---|---|
+| `loss.item()` every 50 steps | 3.81 ms | 22.3 ms | 6.36 ms | 31.0 |
+| `loss.item()` every step | 6.60 ms | 21.3 ms | 8.52 ms | 32.0 |
+
+The cache and foreach changes had already reduced operators per step from 52 to 31 on the CPU worker, the first because Adam's per parameter path issued 28 operators for four parameters and its foreach path issues 7. The table above is after those two; the send change moved the median from 3.81 ms to 3.45 ms and wall time from 6.36 ms to 5.17 ms.
+
+## PyTorch forwarding on lab_docker
+
+> Over a 69 ms Tailcat round trip, reading once every 50 steps keeps the median step at 3.7 ms, and reading every step costs 116 ms per step. Synchronizations per step decide this link, not operators. Measured on 2026-09-14.
+
+Setup: the same model, loop and client as dept_gpu, with torch 2.8.0 on CPU locally and torch 2.8.0 cu128 on one RTX PRO 5000 Blackwell shared with the owner's own jobs. The link is Tailcat, whose probe measured a 68.6 ms round trip, 0.9 MiB/s up and 1.0 MiB/s down. No direct run was measured on this machine.
+
+| Loop | Median step | p99 step | Wall per step | Ops per step | Round trips per step | Ops per round trip |
+|---|---|---|---|---|---|---|
+| `loss.item()` every 50 steps | 3.74 ms | 76.0 ms | 7.37 ms | 31.0 | 0.022 | 1410 |
+| `loss.item()` every step | 115.9 ms | 215.9 ms | 115.2 ms | 32.0 | 1.002 | 32 |
+
+| Copy of 16 MiB | host=local over Tailcat |
+|---|---|
+| Host to device | 1.5 MiB/s |
+| Device to host | 2.1 MiB/s |
+
+The p99 of 76 ms in the first loop is the one step in 50 that reads the loss, a round trip plus the queued GPU work. Setting up the session, link included, took 49 s against 7 s to 9 s on dept_gpu.
+
 ## Measuring your own numbers
 
 Three checks settle most of what is provider specific.
