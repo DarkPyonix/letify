@@ -893,7 +893,7 @@ The Colab CLI runs as `uv tool run --from google-colab-cli colab`, with `jupyter
 
 Colab limits outbound UDP to roughly 200 packets per second, so rank 3 is expected to lose the probe there. It stays in the list because the ratio rule removes it without a special case.
 
-A `channel = "exec"` entry skips the pipeline and uses the fallback directly. A Colab VM has no SSH server by default, so the rendezvous request asks the remote half to install `openssh-server` and start `sshd` first. The request carries the account's public key, `key` with `.pub` appended, which the remote side adds to `authorized_keys`. SSH over a punched or Tailcat link logs in as `root` unless `user` says otherwise.
+A `channel = "exec"` entry skips the pipeline and uses the fallback directly. A Colab VM has no SSH server by default, so the rendezvous request asks the remote half to install `openssh-server` and start `sshd` first. The request carries the account's public key, `key` with `.pub` appended, which the remote side adds to `authorized_keys`. An account with no `key`, or whose `.pub` file is missing, has nothing the VM could authorize, so its Colab rendezvous is unavailable with the reason `no key`: `tcp_punch` and `tailcat` are skipped with that reason and the fallback carries the session. SSH over a punched or Tailcat link logs in as `root` unless `user` says otherwise.
 
 The fallback sends calls with `colab exec` and bulk data through the Jupyter contents API that the Colab runtime proxy exposes: uploads are split into parts sent in parallel, each part in chunked `PUT` requests, and downloads read `/files/<path>` in parallel parts. The contents API root is `/` on the VM, not `/content`.
 

@@ -77,6 +77,10 @@ class ColabRendezvous(CommandRendezvous):
         self._run = run
         self.public_key = public_key
 
+    def unavailable(self) -> str | None:
+        # The VM authorizes the account's public key; without one SSH cannot log in.
+        return None if self.public_key else "no key"
+
     def extras(self) -> dict[str, Any]:
         extra: dict[str, Any] = {"start_sshd": True}
         if self.public_key:

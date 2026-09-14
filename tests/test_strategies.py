@@ -87,6 +87,25 @@ def test_a_tcp_punch_needs_a_rendezvous() -> None:
     assert TCPPunch.rank == 2
 
 
+def test_a_colab_account_without_a_key_skips_the_strategies_that_log_in_over_ssh(
+    patch_which,
+) -> None:
+    # Spec "Colab": the key is what the VM authorizes, so without one SSH cannot log in.
+    from letify.transport.rendezvous import ColabRendezvous
+
+    patch_which(strategies, present=True)
+
+    def run(source: str, timeout: float) -> str:
+        return ""
+
+    keyless = Target(alias="colab_a", rendezvous=ColabRendezvous(run, None))
+    assert TCPPunch().needs(keyless) == "no key"
+    assert TailcatUDP().needs(keyless) == "no key"
+    keyed = Target(alias="colab_a", rendezvous=ColabRendezvous(run, "ssh-ed25519 AAAA me"))
+    assert TCPPunch().needs(keyed) is None
+    assert TailcatUDP().needs(keyed) is None
+
+
 def test_a_tcp_punch_over_loopback_carries_the_probe_and_then_ssh(stun_server) -> None:
     sshd = fake_sshd()
     rendezvous = LoopbackRendezvous()
