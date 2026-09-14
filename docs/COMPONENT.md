@@ -22,7 +22,9 @@ Read this table first. Most confusion about letify is one of these words meaning
 | **session cache** | Values a declared body built with `letify.session_cache`, kept in the session's worker process until the session ends. |
 | **Blob** | A large argument named by the hash of its contents. |
 | **persistence** | Whether a provider's storage outlives a session: `persistent` or `ephemeral`. |
-| **letify-core** | The Rust workspace behind `host="local"`. Its crates are `letify-wire`, `letify-driver` and `letify-agent`. |
+| **RemoteTensor** | Under `host="local"`, the local stand-in for a tensor on the runtime's GPU: a meta tensor for shape and dtype plus a handle. Reports its device as `cuda:0`. |
+| **device worker** | The process on the runtime that runs PyTorch operators on real tensors keyed by handle, one per session. |
+| **letify-core** | A Rust workspace from an earlier `host="local"` design that stood in for the CUDA driver. Retired from that path; nothing on it calls letify-core. |
 
 ## The shape of the thing
 
@@ -36,6 +38,7 @@ Launcher (let)
 │       │   └── Store ── Backend    filesystem, gcs, modal
 │       └── Runtime         one live session
 │           ├── Channel     persistent, or one-shot
+│           ├── Client      the device worker connection, for host="local"
 │           └── Lease       the deadline that outlives nothing
 ├── RuntimePool             sessions keyed by (Instance, Env)
 └── Function                one declaration, created by @let.function
@@ -55,7 +58,7 @@ One directory per concern, so the file you need is the one named after the thing
 | `runtime/` | The channel, the session, the pool, the lease, bootstrap source |
 | `providers/` | The base class, name normalization, and one module per provider |
 | `store/` | The content addressed store, volumes, and `backends/` |
-| `remoting/` | The capability probe and the loader for `letify-core` |
+| `remoting/` | PyTorch forwarding in `remoting/device/`, and the round trip probe and efficiency arithmetic |
 | `launcher.py` | `Launcher` itself, which ties the rest together |
 | `errors.py` | The exception hierarchy, which everything imports |
 | `cli.py` | The command line |
@@ -81,7 +84,7 @@ Abstract base with five responsibilities: say which accelerators the account off
 
 Four class attributes drive every default, and none is a user-facing switch.
 
-`persistence` says whether storage outlives a session. `has_fast_path` says whether the machine is close enough for CUDA call forwarding to pay off, which controls whether a warning is issued rather than whether the mode is allowed. `persistent_channel` says whether a worker process can be kept alive. `needs_lease` says whether a session can outlive this process and keep billing.
+`persistence` says whether storage outlives a session. `has_fast_path` says whether the machine is close enough for PyTorch forwarding to pay off, which controls whether a warning is issued rather than whether the mode is allowed. `persistent_channel` says whether a worker process can be kept alive. `needs_lease` says whether a session can outlive this process and keep billing.
 
 ### The hierarchy
 
@@ -135,7 +138,7 @@ What `@let.function` returns. Holds the declaration and the launcher, and decide
 
 `is_async` is read from the wrapped `def`, which is what makes blocking behaviour a property of the declaration. A sync declaration returns its value. An async one returns a plain coroutine, so `await`, `asyncio.gather` and `asyncio.as_completed` accept it, and concurrency comes from those rather than from a type letify adds.
 
-Retry policy lives here. `RuntimeFailure` and `ProtocolError` discard the session and retry, because the session is at fault. `RemoteError` propagates, because the user's code is at fault and a retry reproduces it.
+Retry policy lives here. `RuntimeFailure` and `ProtocolError` discard the session and retry, because the session is at fault. `RemoteError` propagates, because the user's code is at fault and a retry reproduces it. A `host="local"` call is never retried: its body runs in this process, so it has already run its side effects once.
 
 ## Env
 
@@ -167,20 +170,21 @@ Three protocol rules exist for performance rather than tidiness. Large arguments
 
 ## remoting
 
-The Python half of CUDA call forwarding: find the built library, measure the round trip, report what is missing, and get the library loaded before the real driver.
+PyTorch forwarding, in `remoting/device/`, and the round trip arithmetic beside it.
 
-It refuses rather than degrading when the library or the agent is absent. It does not refuse merely because the link is slow, because that judgement belongs to whoever wrote the declaration.
+| Module | Owns |
+|---|---|
+| `tensor.py` | `RemoteTensor` and operator dispatch: metadata computed on meta tensors and cached per operator, values sent to the runtime |
+| `cuda.py` | `CudaMode`, which rewrites `"cuda"` devices, and the `torch.cuda` functions provided or refused |
+| `client.py` | `Client`: the operator queue, handles, batching, synchronization, and turning a runtime failure into `RemoteError` |
+| `frames.py` | The `Transport` interface and `StreamTransport`, a head plus out-of-band buffers over two file descriptors |
+| `executor.py` | `Executor`, the device worker. Standard library and PyTorch only, because its source is sent to the runtime |
+| `guard.py` | The PyTorch version checks, importable without PyTorch |
 
-`inject()` is where the platforms differ. On Windows it calls `os.add_dll_directory`, which puts the library at the front of the loader's search order, and it must run before `import torch`. On Linux the equivalent is `LD_PRELOAD`, which cannot be set from inside a running process, so it reports the command instead of pretending it succeeded.
+The split follows who pays for what. Everything in `tensor.py` and `cuda.py` runs once per operator in this process, so it is where local dispatch cost lives. `client.py` decides when bytes move, so it is where the round trip count lives. `executor.py` is the only part that touches a GPU.
+
+It refuses rather than degrading when PyTorch is absent or too old. It does not refuse merely because the link is slow, because that judgement belongs to whoever wrote the declaration.
 
 ## letify-core
 
-The native component, outside the Python package because standing in for the CUDA driver cannot be done from Python.
-
-| Crate | Owns |
-|---|---|
-| `letify-wire` | The protocol. A request declares whether it needs a reply, which is where the batching rule lives. |
-| `letify-driver` | The cdylib that stands in for the driver. Virtual pointers, local memory accounting, and the entry points themselves. |
-| `letify-agent` | Holds the real device. Maps handles onto real pointers and keys modules by content. |
-
-The split matters because the batching rule is a property of the protocol rather than of any one intercepted symbol. A launch, a copy to the device and an allocation are queued; a copy back, a stream synchronization and an elapsed time query are not. That is why the round trip count is the number of host synchronizations rather than the number of calls.
+A Rust workspace that stood in for the CUDA driver in an earlier design of `host="local"`. It is retired from that path because libcudart needs driver symbols the stand-in cannot provide; the spec's "The driver stand-in is retired" gives the measurement. The crates remain in `letify-core/` and nothing in the Python package calls them on the `host="local"` path.

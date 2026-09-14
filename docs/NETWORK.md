@@ -196,4 +196,4 @@ ls -l /dev/net/tun
 nc -zvu stun.l.google.com 19302
 ```
 
-For the synchronization count `k`, run one real training step with `torch.cuda.set_sync_debug_mode("warn")` and count the warnings. That number, together with the round trip, is enough to decide whether call forwarding is worth using for a given workload, and it can be measured on any CUDA GPU because it does not depend on where the GPU is.
+For the synchronization count `k`, run one real training step with `torch.cuda.set_sync_debug_mode("warn")` and count the warnings. Under `host="local"`, `letify.remoting.device.current_client().stats` counts it directly: `round_trips` is `k` and `ops` is `n`. Those two numbers, together with the round trip, are enough to decide whether PyTorch forwarding is worth using for a given workload, and `k` can be measured on any CUDA GPU because it does not depend on where the GPU is.
