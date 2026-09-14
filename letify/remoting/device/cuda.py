@@ -510,8 +510,84 @@ def replacements(client: Client) -> dict[str, Any]:
 
 _MISSING = object()
 
+#: Set on a CPU tensor that ``Tensor.pin_memory`` returned while forwarding was active.
+_PINNED_MARK = "_letify_pinned"
+
+#: The ``torch.accelerator`` functions spec "Pinned memory" replaces, where PyTorch has them.
+_ACCELERATOR_NAMES = ("is_available", "current_device_index", "set_device_index", "set_device_idx")
+
+
+def _host_owners() -> list[tuple[Any, str]]:
+    """Every ``(owner, name)`` spec "Pinned memory" replaces in this PyTorch."""
+    found: list[tuple[Any, str]] = [(torch.Tensor, "pin_memory"), (torch.Tensor, "is_pinned")]
+    accelerator = getattr(torch, "accelerator", None)
+    if accelerator is not None:
+        names = [name for name in _ACCELERATOR_NAMES if hasattr(accelerator, name)]
+        found.extend((accelerator, name) for name in names)
+    return found
+
+
+def host_replacements() -> dict[tuple[Any, str], Any]:
+    """Pinning and ``torch.accelerator`` as spec "Pinned memory" describes.
+
+    They are replaced on the class and the module, because the DataLoader pins in a thread
+    where the ``TorchFunctionMode`` is not active.
+    """
+    is_pinned = torch.Tensor.is_pinned
+
+    def pin_memory(self: torch.Tensor, device: Any = None) -> torch.Tensor:
+        if getattr(self, _PINNED_MARK, False):
+            return self
+        with torch._C.DisableTorchFunction():
+            copy = self.clone(memory_format=torch.preserve_format)
+        setattr(copy, _PINNED_MARK, True)
+        return copy
+
+    def pinned(self: torch.Tensor, *args: Any, **kwargs: Any) -> bool:
+        if getattr(self, _PINNED_MARK, False):
+            return True
+        return is_pinned(self, *args, **kwargs)
+
+    def set_device_index(device: Any) -> None:
+        index = device if isinstance(device, int) else _cuda_index(device)
+        _check_index(-1 if index is None else index)
+
+    table: dict[tuple[Any, str], Any] = {
+        (torch.Tensor, "pin_memory"): pin_memory,
+        (torch.Tensor, "is_pinned"): pinned,
+    }
+    values = {
+        "is_available": lambda: True,
+        "current_device_index": lambda: 0,
+        "set_device_index": set_device_index,
+        "set_device_idx": set_device_index,
+    }
+    for owner, name in _host_owners():
+        if owner is not torch.Tensor:
+            table[(owner, name)] = values[name]
+    return table
+
+
+def _patch_host(table: dict[tuple[Any, str], Any]) -> dict[tuple[Any, str], Any]:
+    saved = {key: getattr(key[0], key[1], _MISSING) for key in table}
+    for (owner, name), value in table.items():
+        setattr(owner, name, value)
+    return saved
+
+
+def _restore_host(saved: dict[tuple[Any, str], Any]) -> None:
+    for (owner, name), value in saved.items():
+        if value is _MISSING:
+            delattr(owner, name)
+        else:
+            setattr(owner, name, value)
+
+
 #: The torch.cuda attributes each active mapping replaced, innermost last.
 _ACTIVE: list[dict[str, Any]] = []
+
+#: The pinning and accelerator attributes each active mapping replaced, innermost last.
+_ACTIVE_HOST: list[dict[tuple[Any, str], Any]] = []
 
 
 def _patch(table: dict[str, Any]) -> dict[str, Any]:
@@ -534,7 +610,10 @@ def mapped(client: Client) -> Iterator[None]:
     """Install the CUDA mapping for the duration of the block."""
     table = replacements(client)
     saved = _patch(table)
+    host = host_replacements()
+    host_saved = _patch_host(host)
     _ACTIVE.append(table)
+    _ACTIVE_HOST.append(host)
     _CLIENTS.append(client)
     registered = [found for found in _foreach_types() if RemoteTensor not in found]
     for found in registered:
@@ -546,7 +625,9 @@ def mapped(client: Client) -> Iterator[None]:
         for found in registered:
             found.remove(RemoteTensor)
         _CLIENTS.pop()
+        _ACTIVE_HOST.pop()
         _ACTIVE.pop()
+        _restore_host(host_saved)
         _restore(saved)
 
 
@@ -588,13 +669,16 @@ def unmapped() -> Iterator[None]:
         yield
         return
     originals = {name: getattr(torch.cuda, name) for name in _ACTIVE[-1]}
+    host = {key: getattr(key[0], key[1]) for key in _ACTIVE_HOST[-1]} if _ACTIVE_HOST else {}
     _restore(_ORIGINALS)
+    _restore_host({key: _HOST_ORIGINALS[key] for key in host if key in _HOST_ORIGINALS})
     _CLIENTS.append(None)
     try:
         with _pop_mode_temporarily():
             yield
     finally:
         _CLIENTS.pop()
+        _patch_host(host)
         _patch(originals)
 
 
@@ -603,10 +687,12 @@ def _forget_in_child() -> None:
     if not _ACTIVE:
         return
     _restore(_ORIGINALS)
+    _restore_host(_HOST_ORIGINALS)
     for found in _foreach_types():
         while RemoteTensor in found:
             found.remove(RemoteTensor)
     _ACTIVE.clear()
+    _ACTIVE_HOST.clear()
     _CLIENTS.clear()
     stack = torch._C._len_torch_function_stack
     while stack() and isinstance(torch._C._get_function_stack_at(stack() - 1), CudaMode):
@@ -640,4 +726,9 @@ _ORIGINALS: dict[str, Any] = {
         "empty_cache",
         *REFUSED,
     )
+}
+
+#: Pinning and torch.accelerator as they were before any mapping, read once at import.
+_HOST_ORIGINALS: dict[tuple[Any, str], Any] = {
+    key: getattr(key[0], key[1], _MISSING) for key in _host_owners()
 }

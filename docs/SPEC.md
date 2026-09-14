@@ -1224,7 +1224,23 @@ These `torch.cuda` functions are replaced while the function runs, and restored 
 
 No replaced function initializes CUDA in this process. A CUDA build of PyTorch on a machine with no NVIDIA driver raises `CUDA driver version is insufficient` from any call that does, and a training loop makes such calls without naming them: `Adam.step()` and `AdamW.step()` call `is_current_stream_capturing()`, and `torch.cuda.is_bf16_supported()`, which `autocast` reads for `bfloat16`, calls `get_device_properties()`.
 
-A process forked while forwarding is active, such as a `DataLoader` worker, starts with the mapping undone: `torch.cuda` holds PyTorch's own functions, the device rewrite is off and `current_client()` is None, so the worker's `torch.manual_seed` and its CPU tensors stay in that process. The client refuses to send from a process other than the one that connected it, raising `RuntimeLost` naming the fork, because the channel it would write to belongs to the parent. `DataLoader(pin_memory=True)` is not supported, because PyTorch pins through its own CUDA context in a thread letify does not map.
+A process forked while forwarding is active, such as a `DataLoader` worker, starts with the mapping undone: `torch.cuda` holds PyTorch's own functions, the device rewrite is off and `current_client()` is None, so the worker's `torch.manual_seed` and its CPU tensors stay in that process. The client refuses to send from a process other than the one that connected it, raising `RuntimeLost` naming the fork, because the channel it would write to belongs to the parent.
+
+### Pinned memory <!-- id: forwarding-pinned-memory -->
+
+> Under `host="local"`, pinning host memory is a copy into ordinary memory that reports itself as pinned, so `DataLoader(pin_memory=True)` runs unchanged and never initializes CUDA in this process.
+
+Pinned memory exists so the CUDA driver can copy to the device asynchronously. No driver runs in this process, and an upload is already asynchronous, as [Transfers](#forwarding-transfers) describes, so pinning has nothing to speed up. While forwarding is active:
+
+| Function | Behaviour |
+|---|---|
+| `Tensor.pin_memory(device=None)` | A copy of the tensor in ordinary CPU memory, with the same shape, strides, dtype and values. A tensor that already reports itself pinned is returned as it is |
+| `Tensor.is_pinned(device=None)` | `True` for a tensor `pin_memory` returned, and PyTorch's own answer for any other tensor, which is `False` without a driver |
+| `torch.accelerator.is_available()` | `True` |
+| `torch.accelerator.current_device_index()` | `0` |
+| `torch.accelerator.set_device_index(i)`, `torch.accelerator.set_device_idx(i)` | Accepted for device 0, `UnsupportedMode` otherwise |
+
+The two `Tensor` methods are replaced on the class and the `torch.accelerator` functions on the module, not in the `TorchFunctionMode`, because the `DataLoader` pins in a thread of its own, where the mode is not active. They are restored when forwarding ends, and undone in a forked process as the rest of the mapping is. A pinned tensor uploaded with `non_blocking=True` takes the same queued, asynchronous path as any other upload.
 ### Autocast <!-- id: forwarding-autocast -->
 
 > Inside `torch.autocast("cuda")`, an operator on a `RemoteTensor` gets the argument casts CUDA autocast gives it, so a mixed precision loop computes in the same dtypes as on the runtime's own GPU.

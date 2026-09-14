@@ -385,6 +385,69 @@ def test_a_dataloader_with_forked_workers_leaves_the_session_usable(client) -> N
     assert total.cpu().tolist() == data.sum(dim=0).tolist()
 
 
+# -- Spec: Pinned memory ------------------------------------------------------------
+
+
+def _forbid_local_pinning(monkeypatch) -> None:
+    """Make PyTorch's own pinning raise, as it does on a CUDA build without a driver."""
+    _forbid_local_cuda(monkeypatch)
+
+    def no_driver(*args, **kwargs):
+        raise RuntimeError("Found no NVIDIA driver on your system")
+
+    monkeypatch.setattr(torch.Tensor, "pin_memory", no_driver)
+    monkeypatch.setattr(torch.accelerator, "current_device_index", no_driver)
+    monkeypatch.setattr(torch.accelerator, "set_device_index", no_driver)
+    monkeypatch.setattr(torch.accelerator, "is_available", lambda: False)
+
+
+def test_pinning_a_host_tensor_copies_it_and_reports_it_pinned(monkeypatch) -> None:
+    _forbid_local_pinning(monkeypatch)
+    connected = forwarding.connect(forwarding.worker_command(sys.executable), device="cpu")
+    try:
+        with connected.activate():
+            source = torch.arange(12.0).reshape(3, 4)
+            pinned = source.pin_memory()
+            assert pinned.device.type == "cpu"
+            assert pinned.is_pinned() and not source.is_pinned()
+            assert pinned.data_ptr() != source.data_ptr()
+            assert torch.equal(pinned, source)
+            assert pinned.pin_memory() is pinned
+            assert torch.accelerator.is_available()
+            assert torch.accelerator.current_device_index() == 0
+            with pytest.raises(UnsupportedMode):
+                torch.accelerator.set_device_index(1)
+    finally:
+        connected.close()
+    with pytest.raises(RuntimeError, match="no NVIDIA driver"):
+        torch.ones(2).pin_memory()
+
+
+def test_a_dataloader_with_pin_memory_feeds_non_blocking_uploads(monkeypatch) -> None:
+    _forbid_local_pinning(monkeypatch)
+    data = torch.arange(64.0).reshape(32, 2)
+    connected = forwarding.connect(forwarding.worker_command(sys.executable), device="cpu")
+    try:
+        with connected.activate():
+            for workers in (0, 2):
+                loader = torch.utils.data.DataLoader(
+                    torch.utils.data.TensorDataset(data),
+                    batch_size=8,
+                    num_workers=workers,
+                    pin_memory=True,
+                    timeout=60 if workers else 0,
+                )
+                total = torch.zeros(2, device="cuda")
+                before = connected.stats.round_trips
+                for (batch,) in loader:
+                    assert batch.is_pinned()
+                    total += batch.cuda(non_blocking=True).sum(dim=0)
+                assert connected.stats.round_trips == before
+                assert total.cpu().tolist() == data.sum(dim=0).tolist()
+    finally:
+        connected.close()
+
+
 def _child_view(queue) -> None:
     import torch
 
