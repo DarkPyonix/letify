@@ -402,7 +402,9 @@ Nothing in this path runs per training step. A `print` inside a loop costs one p
 
 Any number of threads may send requests on one channel. Whichever waiting thread holds the read lock reads the next frame and hands it to the request it belongs to, so a `stat` or a lease renewal sent while a call runs gets its reply while the call is still running. On the worker, `stat` and `lease` are answered by the thread that reads frames. Every other request is queued and run in order on the worker's main thread, so user code runs on the main thread.
 
-A request that passes its timeout kills the worker process, which ends every read, and raises `RuntimeFailure`. A worker that closes its pipe fails every open request with `ProtocolError` quoting the last output.
+A request that passes its timeout kills the worker process, which ends every read, and raises `RuntimeFailure`.
+
+A body may fork, as `multiprocessing` and a `DataLoader` with `num_workers > 0` do. The thread that reads frames may hold the lock of `sys.stdin` at the fork, so every process forked from the worker replaces `sys.stdin` with `/dev/null` before anything else runs in it, and a child that closes `sys.stdin`, as `multiprocessing` does, never waits for that lock. On Linux each process forked from the worker asks for `SIGKILL` when the worker's main thread exits (`prctl(PR_SET_PDEATHSIG)`), so a worker killed by a timeout or closed with its session takes its forked children with it. A worker that closes its pipe fails every open request with `ProtocolError` quoting the last output.
 
 The worker never installs anything into the interpreter it starts on. Everything it runs before it moves to the project interpreter uses only the standard library: the ready line, workspace preparation, the environment build and the move itself. The worker imports cloudpickle only when it loads a call, so a system Python that lacks cloudpickle and refuses `pip install`, as an externally managed Python under PEP 668 does, still starts the worker. blake3 and letify are likewise imported only after the move, and blake3 falls back to blake2b where it is absent.
 
