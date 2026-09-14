@@ -640,6 +640,8 @@ Forward SSH is first because it needs no remote agent and costs one connection a
 
 A strategy whose needs are not met is skipped, not attempted. A `Shell` with no rendezvous has only rank 1. An account with no `address`, such as a Tunnel account that names only `tailcat`, has no rank 1: forward SSH is skipped with the reason `no address`, and no SSH command is built for a guessed or empty address. `letify check` on such an account runs over the strategies that remain.
 
+An account reaches SSH on two ports when the machine publishes its SSH server under another port, such as a Docker container started with `-p 30501:8022`. `port` is the SSH server's port inside the machine, and the remote agent splices TCP punch and Tailcat connections to `127.0.0.1:<port>`. `public_port` is the port forward SSH dials at `address`. Forward SSH uses `public_port` when the account sets it, and otherwise `port`, read through `port_command` when that is set. TCP punching and Tailcat always use `port`.
+
 Each stage is its own object behind a small interface, so a strategy can be added, removed or reordered by changing the subclass's list:
 
 | Object | Owns |
@@ -673,8 +675,8 @@ Every connection decision is printed, one line per event, on stderr with the `le
 
 | Event | The line carries |
 |---|---|
-| Race start | the strategies attempted, each skipped strategy with its reason, and that the fallback is held back when it is applicable |
-| Lone strategy | the one strategy used without a race |
+| Race start | the strategies attempted, each skipped strategy with its reason, and that the fallback is held back when it is applicable. Forward SSH is named with the address and port it dials, as `direct_ssh (<address>:<port>)` |
+| Lone strategy | the one strategy used without a race, forward SSH with its address and port as above |
 | Strategy outcome | connected with the seconds since the race started, failed with the exception text, timed out, or connected after the choice and closed |
 | Probe | round trip in ms, upload and download in MiB/s, or the probe error |
 | Choice | the chosen strategy and why: the lowest rank within 25% of the fastest, the only one connected, or the fallback because no probed strategy connected. Each strategy rejected by the 25% rule is named with its upload and download against the fastest |
@@ -709,7 +711,7 @@ Colab and Elice never need `letify client shell connect`. Their create and open 
 1. `tailcat` is on `PATH`. Otherwise it prints the install command for the detected operating system and CPU architecture, for the Tailcat release pinned in `letify.transport.setup.TAILCAT_VERSION`: on Linux amd64, arm64 and armv7, `mkdir -p ~/.local/bin && curl -L <release tar.gz> | tar xz -C ~/.local/bin tailcat` with a note that `~/.local/bin` must be on `PATH`; on macOS, `brew install tailcat`; on Windows amd64 and arm64, the release zip and where to put `tailcat.exe`. Any other platform gets the releases page.
 2. An SSH server answers on `--ssh-port`, default 22: a TCP connection to `127.0.0.1` on that port must send a line starting with `SSH-` within 3 s. Otherwise it prints how to install and start one, for a Debian or Ubuntu container `apt-get install -y openssh-server`, `mkdir -p /run/sshd` and `/usr/sbin/sshd`.
 
-It then starts the remote agent on a port the operating system chooses, starts `tailcat serve <agent port>` in front of it, and prints exactly one command for the user's own machine, `letify login tunnel <alias> --connect <token>`. The alias is `--name`, or this machine's host name with every character that is not a letter, digit or underscore replaced by `_`. The token is the URL-safe base64 encoding, without `=` padding, of the compact JSON object `{"tailcat": <address>, "tailcat_port": <agent port>, "user": <this machine's user name>, "port": <SSH port>}`. After the command it prints that the agent must keep running, how to keep it running with `tmux` or `nohup`, and that a restart prints a new address, so the login is run again with the new token.
+It then starts the remote agent on a port the operating system chooses, starts `tailcat serve <agent port>` in front of it, and prints exactly one command for the user's own machine, `letify login tunnel <alias> --connect <token>`. The alias is `--name`, or this machine's host name with every character that is not a letter, digit or underscore replaced by `_`. The token is the URL-safe base64 encoding, without `=` padding, of the compact JSON object `{"tailcat": <address>, "tailcat_port": <agent port>, "user": <this machine's user name>, "port": <SSH port>}`. `--public-address` and `--public-port` add `"address"` and `"public_port"` to that object, for a machine whose SSH server is also reachable directly from outside under a published port. After the command it prints that the agent must keep running, how to keep it running with `tmux` or `nohup`, and that a restart prints a new address, so the login is run again with the new token.
 
 A connection to the agent is told apart by its first bytes: `SSH-` is spliced to the machine's SSH server, and `LETIFY-RDV ` is followed by one JSON request line and answered with one JSON line. For such an account the pipeline connects over Tailcat first, runs `tailcat <address> <agent port>` to exchange the TCP punch mapping and start time over that link, and then races as specified: the Tailcat link is the rank 3 candidate, and when TCP punching passes the probe it takes over.
 
@@ -907,7 +909,7 @@ An account that is already in the home file is not asked for again. `letify logi
 5. `workspace`: the workspace root is chosen and checked as for `shell`, over the same `ProxyCommand`.
 6. `devices`: the GPUs are recorded as Recording devices at login describes, over the same `ProxyCommand`.
 
-The account is written with `kind = "tunnel"`, `tailcat`, `tailcat_port`, `user`, `port` and `key` from the token and the options, and no `address`.
+The account is written with `kind = "tunnel"`, `tailcat`, `tailcat_port`, `user`, `port` and `key` from the token and the options. It has no `address` unless the token or `--address` gives one, and `public_port` is written when the token or `--public-port` gives it. A value in the token wins over the option. Every login step still runs over Tailcat.
 
 Credentials never enter either `config.toml`. A token goes to a file in the account directory. An SSH password is never stored at all, which the next section explains.
 
@@ -960,7 +962,7 @@ One other approach is not the default. `sshpass` feeds a stored password to each
 | Kind | Written to the home file | Credential |
 |---|---|---|
 | `shell` | address, user, port, key path, `workspace` when it is not the default, and the `devices` table the machine reported | an SSH key, installed by `login`; no password stored |
-| `tunnel` | `tailcat`, `tailcat_port`, user and port from the token `letify client shell connect` printed, key path, `workspace` when it is not the default, and the `devices` table; no address | an SSH key, installed by `login` over Tailcat; no password stored |
+| `tunnel` | `tailcat`, `tailcat_port`, user and port from the token `letify client shell connect` printed, key path, `workspace` when it is not the default, and the `devices` table; `address` and `public_port` only when the token or the options give them | an SSH key, installed by `login` over Tailcat; no password stored |
 | `elice` | endpoint, zone, machine, `workspace` when given | access token in `~/.letify/accounts/<alias>/access_token` |
 | `colab` | account email, `workspace` when given | the Colab CLI's token, written by its own sign in under `~/.letify/accounts/<alias>/` |
 | `modal` | `profile` and `workspace`, each when given | Modal's token, written by `modal token new` to `~/.letify/accounts/<alias>/modal.toml` |

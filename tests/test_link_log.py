@@ -179,7 +179,7 @@ def test_a_changed_network_fingerprint_is_printed(isolated_home, capsys) -> None
 def test_a_launcher_prints_the_connection_lines_by_default(config_file, capsys) -> None:
     body = '[lab]\nkind = "shell"\naddress = "gpu.example.edu"\n'
     letify.Launcher(config_file(body), home=False).provider("lab").connect()
-    one(lines(capsys), "connecting to lab", "direct_ssh alone")
+    one(lines(capsys), "connecting to lab", "direct_ssh (gpu.example.edu:22) alone")
 
 
 def test_a_quiet_launcher_prints_no_connection_lines(config_file, capsys) -> None:

@@ -37,6 +37,8 @@ class Target:
     alias: str
     address: str | None = None
     direct_ssh: Callable[[str | None], list[str]] | None = None
+    #: The port forward SSH dials at ``address``; ``ssh_port`` is the port inside the machine.
+    direct_port: int | None = None
     user: str | None = None
     key: str | None = None
     remote_python: str = "python3"
@@ -105,6 +107,10 @@ class Strategy:
         """The link to use when this is the only applicable strategy."""
         return self.attempt(target)
 
+    def label(self, target: Target | None) -> str:
+        """How the connection log names this strategy for ``target``."""
+        return self.name
+
 
 def _rendezvous_unmet(target: Target) -> str | None:
     if target.rendezvous is None:
@@ -126,6 +132,11 @@ class DirectSSH(Strategy):
 
     def needs(self, target: Target) -> str | None:
         return None if target.address and target.direct_ssh else "no address"
+
+    def label(self, target: Target | None) -> str:
+        if target is None or not target.address or target.direct_port is None:
+            return self.name
+        return f"{self.name} ({target.address}:{target.direct_port})"
 
     def assume(self, target: Target) -> Link:
         # Alone there is nothing to race, so the first real command is the check, and its

@@ -146,6 +146,11 @@ class Pipeline:
         #: The strategy of a closed link to this account, when this connects to it again.
         self.previous = previous
 
+    def _label(self, strategy: Any) -> str:
+        """The strategy's name in a log line, with forward SSH's address and port."""
+        label = getattr(strategy, "label", None)
+        return label(self.target) if callable(label) else strategy.name
+
     def _say(self, message: str) -> None:
         self.say(f"{self.alias}: {message}")
 
@@ -172,7 +177,7 @@ class Pipeline:
             raise ProviderUnavailable("shell", self._explain(reasons))
         if len(applicable) == 1:
             self.say(
-                f"connecting to {self.alias}: using {applicable[0].name} alone, "
+                f"connecting to {self.alias}: using {self._label(applicable[0])} alone, "
                 f"without a race{skipped_note}"
             )
             return applicable[0].assume(self.target)
@@ -183,7 +188,7 @@ class Pipeline:
             if kept is not None:
                 return kept
 
-        raced = [s.name for s in applicable if getattr(s, "probed", True)]
+        raced = [self._label(s) for s in applicable if getattr(s, "probed", True)]
         held = [s.name for s in applicable if not getattr(s, "probed", True)]
         held_note = f"; {', '.join(held)} held back" if held else ""
         self.say(
