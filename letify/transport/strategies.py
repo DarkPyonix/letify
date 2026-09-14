@@ -206,7 +206,8 @@ class TailcatUDP(Strategy):
 
     def needs(self, target: Target) -> str | None:
         if shutil.which(target.tailcat) is None:
-            return f"{target.tailcat} is not on PATH"
+            hint = "; run 'letify setup tailcat'" if target.tailcat == "tailcat" else ""
+            return f"{target.tailcat} is not on PATH{hint}"
         return _rendezvous_unmet(target)
 
     def attempt(self, target: Target, cancel: threading.Event | None = None) -> Link:

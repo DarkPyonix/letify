@@ -164,11 +164,22 @@ def eci_install_message(system: str | None = None) -> str:
 
 
 def find_eci(binary: str = "eci") -> str:
-    """The eci executable, or ``ProviderUnavailable`` carrying the install command."""
-    found = shutil.which(binary)
-    if found is None:
-        raise ProviderUnavailable("elice", eci_install_message())
-    return found
+    """The eci executable, or ``ProviderUnavailable`` carrying the install command.
+
+    The default name goes through the lookup of spec "Installing external tools", which
+    installs it when automatic install is on. Another name is run as written.
+    """
+    from .. import install
+
+    if binary != "eci":
+        found = shutil.which(binary)
+        if found is None:
+            raise ProviderUnavailable("elice", eci_install_message())
+        return found
+    try:
+        return install.ensure("eci", instructions=eci_install_message())
+    except install.InstallError as exc:
+        raise ProviderUnavailable("elice", str(exc)) from None
 
 
 def eci_environment(alias: str, token: str, endpoint: str, zone_id: str | None) -> dict[str, str]:

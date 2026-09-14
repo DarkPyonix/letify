@@ -146,6 +146,14 @@ def build_parser() -> argparse.ArgumentParser:
     efficiency.add_argument("round_trip_ms", type=float, help="network round trip")
     efficiency.add_argument("--json", action="store_true", help="print the record unformatted")
 
+    setup_parser = sub.add_parser(
+        "setup", help="install tailcat or eci from its publisher ahead of time"
+    )
+    setup_parser.add_argument("tool", choices=("tailcat", "eci"), help="the tool to install")
+    setup_parser.add_argument(
+        "--where", action="store_true", help="print where the tool is and which copy letify uses"
+    )
+
     client = sub.add_parser("client", help="run letify's side on a remote machine")
     client_sub = client.add_subparsers(dest="client_command", required=True)
     client_shell = client_sub.add_parser("shell", help="a plain machine with no provider API")
@@ -177,10 +185,17 @@ def build_parser() -> argparse.ArgumentParser:
 
 def _client_shell_connect(args: argparse.Namespace) -> int:
     """Check tailcat and the SSH server, run the remote agent, and print the login command."""
+    from .install import InstallError, ensure
     from .transport import setup
     from .transport.agent import Agent
 
-    if not setup.tailcat_on_path(args.tailcat):
+    if args.tailcat == "tailcat":
+        try:
+            args.tailcat = ensure("tailcat", instructions=setup.tailcat_install_instructions())
+        except InstallError as exc:
+            _fail(str(exc))
+            return 1
+    elif not setup.tailcat_on_path(args.tailcat):
         _fail(setup.tailcat_install_instructions())
         return 1
     if not setup.ssh_answers(args.ssh_port):
@@ -231,6 +246,33 @@ def _client_shell_connect(args: argparse.Namespace) -> int:
     return 0
 
 
+def _setup_tool(args: argparse.Namespace) -> int:
+    """``letify setup <tool>``. Spec "Installing external tools"."""
+    from . import install
+
+    tool = args.tool
+    if args.where:
+        rows = install.where(tool)
+        width = max(len(label) for label, _ in rows)
+        for label, value in rows:
+            print(f"{label.ljust(width)}  {value}")
+        return 0
+    version = install.version_of(tool)
+    found = install.find(tool)
+    if found is None:
+        try:
+            install.install_and_link(tool)
+        except install.InstallError as exc:
+            _fail(str(exc))
+            return 1
+        found = install.find(tool)
+    if found is None:  # pragma: no cover - brew put tailcat off PATH
+        _fail(f"{tool} was installed but letify cannot find it")
+        return 1
+    _say("ok", f"{tool} {version} at {found}")
+    return 0
+
+
 def _describe_usage(row: dict) -> str:
     """One line for a usage row, formatted by its unit as spec "Remaining usage" says."""
     from .providers.usage import describe_row
@@ -276,6 +318,9 @@ def _dispatch(args: argparse.Namespace) -> int:
             return _json({"efficiency": share})
         print(f"{share * 100:.1f}% of a direct run")
         return 0
+
+    if args.command == "setup":
+        return _setup_tool(args)
 
     if args.command == "client":
         # Runs on the remote machine, which has no accounts, so no Launcher is built.

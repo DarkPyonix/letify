@@ -752,13 +752,19 @@ def tunnel_account(answers: Answers) -> dict[str, Any]:
     Every SSH command runs with ``ProxyCommand=tailcat <address> <agent port>``, and the
     account is written with no address. A failure at any step names the step.
     """
+    from ..install import InstallError, ensure
     from ..transport import setup
 
     def failed(step: str, reason: object) -> LoginError:
         return LoginError(f"tunnel login failed at {step}: {reason}")
 
-    if not setup.tailcat_on_path():
-        raise failed("tailcat", setup.tailcat_install_instructions())
+    try:
+        tailcat = ensure(
+            "tailcat",
+            instructions=setup.tailcat_install_instructions(),
+        )
+    except InstallError as exc:
+        raise failed("tailcat", exc) from None
 
     token = answers.get("connect")
     if not (isinstance(token, str) and token):
@@ -775,7 +781,7 @@ def tunnel_account(answers: Answers) -> dict[str, Any]:
 
     address = str(fields["tailcat"])
     agent_port = int(fields["tailcat_port"])
-    proxy = f"tailcat {address} {agent_port}"
+    proxy = f"{tailcat} {address} {agent_port}"
     user = fields.get("user") or answers.get("user")
     port = int(fields.get("port") or answers.get("port") or 22)
     key_path = str(answers.get("key") or DEFAULT_KEY)
