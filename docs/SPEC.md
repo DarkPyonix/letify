@@ -937,6 +937,10 @@ The `meta` device is an implementation detail. Through `__torch_function__`, a `
 
 Autograd runs locally. Backward operators and optimizer steps reach `__torch_dispatch__` like forward ones, so they are queued and executed on the runtime the same way. A tensor that requires grad on the runtime never exists: the runtime holds values only.
 
+Inferred metadata is cached per operator. The key is the overload, the shape, strides, storage offset and dtype of every tensor argument, and every other argument's value. A hit builds the outputs with `torch.empty_strided` on meta and returns an input where the first inference returned that input, so a training step that repeats its operators runs each meta kernel once. An operator whose arguments include a value that cannot be a key, such as a generator, is inferred every time.
+
+While forwarding is active, `RemoteTensor` is added to `torch.utils._foreach_utils._foreach_supported_types`, so an optimizer that picks its foreach path for CUDA tensors picks it here too and a step issues one operator per tensor list instead of one per parameter. A PyTorch without that list keeps the per parameter path.
+
 `aten.detach` and `aten.alias` produce a new `RemoteTensor` sharing the same handle, with no operator sent. An in-place operator, or one writing to `out=`, returns the input it wrote to. Every other operator output gets a new handle.
 
 A plain CPU tensor passed to an operator travels with it as a buffer and is a CPU tensor on the runtime, so a zero-dimensional CPU scalar mixes with device tensors as it does in PyTorch. A CPU tensor larger than 4 KiB flushes the queue immediately after its operator, so a later write to it in this process cannot change what the runtime received.
@@ -988,7 +992,7 @@ The queue is sent when it holds 256 operators, when its oldest operator has wait
 
 A synchronization is one round trip. These synchronize: `Tensor.item()`, `tolist()`, `cpu()` and `to("cpu")`, `bool()`, `int()` and `float()` of a tensor, which includes control flow on a tensor value, `repr()` and `str()` of a tensor, copying a device tensor into a CPU tensor, an operator whose meta inference raised, the `torch.cuda` queries in [Mapping cuda](#mapping-cuda), `torch.cuda.synchronize()`, and the end of the declared function.
 
-The client counts operators, batches, round trips and released handles, so ops per round trip and synchronizations per step are read from the session rather than estimated.
+The client counts operators, batches, round trips, released handles and metadata cache hits, so ops per round trip and synchronizations per step are read from the session rather than estimated.
 
 ### Handles <!-- id: forwarding-handles -->
 

@@ -96,6 +96,36 @@ def test_a_module_trained_with_adam_matches_a_local_cpu_run(client) -> None:
         assert torch.allclose(remote, local, rtol=1e-5, atol=1e-6)
 
 
+
+def test_a_repeated_operator_reuses_its_inferred_metadata(client) -> None:
+    a = torch.ones(8, 4, device="cuda")
+    b = torch.ones(4, device="cuda")
+    first = a + b
+    before = client.stats.cached
+    second = a + b
+    assert client.stats.cached == before + 1
+    assert second.shape == first.shape and second.stride() == first.stride()
+    assert torch.equal(second.cpu(), torch.full((8, 4), 2.0))
+
+
+def test_an_in_place_operator_served_from_the_cache_returns_its_input(client) -> None:
+    a = torch.zeros(3, device="cuda")
+    first = a.add_(1.0)
+    second = a.add_(1.0)
+    assert first is a and second is a
+    assert a.cpu().tolist() == [2.0, 2.0, 2.0]
+
+
+def test_an_optimizer_takes_its_foreach_path_on_remote_tensors(client) -> None:
+    model = torch.nn.Sequential(torch.nn.Linear(4, 4), torch.nn.Linear(4, 4)).cuda()
+    optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+    model(torch.ones(2, 4, device="cuda")).sum().backward()
+    optimizer.step()
+    before = client.stats.ops
+    optimizer.step()
+    # Four parameters: the per parameter path issues well over twenty operators.
+    assert client.stats.ops - before < 20
+
 # -- Spec: Mapping cuda --------------------------------------------------------
 
 
