@@ -1114,6 +1114,8 @@ A step is what a training loop repeats: forward, backward and the optimizer upda
 
 A handle is an integer from a per-session counter. `RemoteTensor`s that share a handle, through `detach` or an in-place result, share one reference object, and when the last of them is collected its handle is appended to a release list. The list travels in the next batch, and a batch is sent early when it reaches 4096 handles. The worker applies a batch's releases after its operators, because an operator queued before its input was collected can travel in the same batch as that input's release.
 
+A release never reaches the worker ahead of an operator that uses the handle. A batch takes the release list before it takes entries from the queue, so every entry dispatched before a handle was collected is in that batch or an earlier one. A batch carries no releases when it leaves entries in the queue, as a read that sends only its dependencies does, or while a repetition has matched operators not yet queued, whose externals are not in the queue. Those releases stay in the list for a later batch. This holds whichever thread sends the batch: the dispatching thread, the idle sender, or a collection that runs mid-step.
+
 ### Transfers <!-- id: forwarding-transfers -->
 
 > A copy to the device and a copy to the host travel as out-of-band binary buffers, with no base64 and no copy beyond the one the kernel makes.
