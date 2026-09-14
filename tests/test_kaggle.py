@@ -326,3 +326,97 @@ def test_every_kaggle_call_names_this_accounts_token_file_in_kaggle_api_token(
     env = recorder.calls[-1]["env"]
     assert env["KAGGLE_API_TOKEN"] == str(path)
     assert ACCESS_TOKEN not in env.values()
+
+
+# -- Spec: Placements a provider cannot serve --------------------------------------
+
+
+def test_declaring_host_local_on_kaggle_fails_at_decoration(let) -> None:
+    import letify
+
+    device = kaggle_provider().P100
+    with pytest.raises(letify.UnsupportedMode, match="host='remote'"):
+
+        @let.function(device=device)
+        def body() -> None: ...
+
+    with pytest.raises(letify.UnsupportedMode):
+        let.function(device=device, host=letify.local)(lambda: None)
+    declared = let.function(device=device, host=letify.remote)(lambda: None)
+    assert declared.device.placement == "remote"
+
+
+def test_an_any_request_resolving_to_kaggle_with_host_local_is_refused() -> None:
+    import letify
+
+    provider = kaggle_provider()
+    with pytest.raises(letify.UnsupportedMode):
+        provider.check_mode(provider.T4._placed("local"))
+    assert provider.check_mode(provider.T4._placed("remote")) is None
+
+
+def test_the_generated_types_mark_kaggle_accelerators_remote_only(isolated_home) -> None:
+    import letify
+    from letify import stubs
+
+    (isolated_home / ".letify" / "config.toml").write_text('[kg]\nkind = "kaggle"\n')
+    text = stubs.render(letify.Launcher(announce=False))
+    body = text.split("class Kg(")[1].split("\nclass ")[0]
+    assert "    P100: letify.declare.instance.RemoteOnlyInstance" in body
+    assert ": Instance" not in body
+
+
+TYPED = """\
+import letify
+from letify.declare.instance import Instance, RemoteOnlyInstance
+
+let = letify.Launcher()
+kaggle: RemoteOnlyInstance = RemoteOnlyInstance(None)  # type: ignore[arg-type]
+lab: Instance = Instance(None)  # type: ignore[arg-type]
+
+
+@let.function(device=kaggle, host=letify.remote)
+def fine() -> None: ...
+
+
+@let.function(device=lab)
+def also_fine() -> None: ...
+
+
+@let.function(device=kaggle, host=letify.local)
+def wrong() -> None: ...
+
+
+@let.function(device=kaggle)
+def wrong_by_default() -> None: ...
+"""
+
+
+def test_a_type_checker_rejects_host_local_on_a_remote_only_instance(tmp_path) -> None:
+    import os
+    import shutil
+    import subprocess
+
+    import letify
+
+    uv = shutil.which("uv")
+    if uv is None:
+        pytest.skip("uv is not installed, so no type checker can be run")
+    snippet = tmp_path / "declare.py"
+    snippet.write_text(TYPED, encoding="utf-8")
+    checkout = str(Path(letify.__file__).resolve().parent.parent)
+    command = [uv, "tool", "run", "--offline", "mypy", "--no-incremental", str(snippet)]
+    checked = subprocess.run(
+        command,
+        capture_output=True,
+        text=True,
+        cwd=tmp_path,
+        env={**os.environ, "MYPYPATH": checkout},
+        timeout=300,
+    )
+    if checked.returncode not in (0, 1) or "declare.py" not in checked.stdout:
+        pytest.skip(f"mypy could not be run offline: {checked.stderr.strip()[-300:]}")
+    # mypy also reports on letify's own modules it follows into; only the snippet is asserted on.
+    errors = [line for line in checked.stdout.splitlines() if line.startswith("declare.py:")]
+    lines = sorted({int(line.split(":")[1]) for line in errors if ": error:" in line})
+    assert lines == [17, 21], checked.stdout

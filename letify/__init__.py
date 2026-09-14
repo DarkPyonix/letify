@@ -27,6 +27,8 @@ the base install and a provider whose package is missing reports itself unavaila
 
 from __future__ import annotations
 
+from typing import Final
+
 from .declare.cache import session_cache
 from .declare.env import Env
 from .declare.function import Function
@@ -52,8 +54,9 @@ from .store.volume import Volume
 
 #: Where a declaration's host code runs. Two named values rather than the enum class that holds
 #: them, because a declaration only ever needs one of the two.
-local = Host.local
-remote = Host.remote
+#: ``Final`` so a type checker sees the literal member, which the declaration overloads match on.
+local: Final = Host.local
+remote: Final = Host.remote
 
 # The enum class stays importable from letify.declare.instance for letify's own use.
 del Host

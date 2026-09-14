@@ -59,6 +59,10 @@ class Provider(abc.ABC):
     #: Whether CUDA call forwarding can reach this provider at useful latency.
     has_fast_path: bool = False
 
+    #: Whether a declaration may place its host code here with ``host="local"``. False makes
+    #: the declaration a type error and a decoration-time ``UnsupportedMode``.
+    serves_host_local: bool = True
+
     #: Whether a worker process can be kept alive between calls.
     persistent_channel: bool = True
 

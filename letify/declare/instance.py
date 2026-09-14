@@ -112,6 +112,40 @@ class Instance:
         return f"<Instance {self.provider.alias}:{self.accelerator}{count} host={self.placement}>"
 
 
+if TYPE_CHECKING:
+
+    class RemoteOnlyInstance:
+        """An accelerator of a provider that cannot serve ``host="local"``, for a type checker.
+
+        Deliberately not a subtype of ``Instance`` for a type checker, so ``Launcher.function``
+        accepts it only in the overload whose ``host`` is ``remote``. At run time it is
+        ``Instance``, as spec "Placements a provider cannot serve" describes.
+        """
+
+        provider: Provider
+        gpu: str | None
+        tpu: str | None
+        host: Host | None
+        cpus: int | None
+        memory_gb: int | None
+        vram_gb: int | None
+        spot: bool
+        devices: int
+
+        def __init__(self, provider: Provider, gpu: str | None = None) -> None: ...
+        def __mul__(self, count: int) -> RemoteOnlyInstance: ...
+        def __rmul__(self, count: int) -> RemoteOnlyInstance: ...
+        @property
+        def accelerator(self) -> str: ...
+        @property
+        def placement(self) -> Host: ...
+        @property
+        def key(self) -> str: ...
+
+else:
+    RemoteOnlyInstance = Instance
+
+
 @dataclass(frozen=True, slots=True)
 class AnyInstance:
     """A request for an accelerator without naming the provider.
@@ -134,4 +168,4 @@ class AnyInstance:
         return f"<AnyInstance {self.accelerator}>"
 
 
-__all__ = ["AnyInstance", "Host", "Instance"]
+__all__ = ["AnyInstance", "Host", "Instance", "RemoteOnlyInstance"]

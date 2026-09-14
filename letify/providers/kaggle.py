@@ -18,7 +18,7 @@ from typing import TYPE_CHECKING, Any
 
 from .. import tools
 from ..config.secrets import account_directory
-from ..declare.instance import Instance
+from ..declare.instance import Host, Instance
 from ..errors import ProviderUnavailable, RuntimeFailure, UnsupportedMode
 from .base import Provider
 from .usage import Usage
@@ -71,6 +71,9 @@ class Kaggle(Provider):
     persistent_channel = False
     needs_lease = False
 
+    #: No device stream can reach a Kaggle session without a tunnel, which Kaggle forbids.
+    serves_host_local = False
+
     usage_unit = "GPU hours"
     usage_source = "kaggle quota, the weekly accelerator quota endpoint"
 
@@ -90,6 +93,14 @@ class Kaggle(Provider):
 
     def store_backend(self) -> str:
         return "filesystem"
+
+    def check_mode(self, instance: Instance) -> None:
+        """Refuse ``host="local"``, which reaches here only through ``let.providers.any``."""
+        if instance.placement is Host.local:
+            raise UnsupportedMode(
+                f"{self.alias} cannot serve host='local': Kaggle forbids tunnels and port "
+                f"forwarding, so no device stream reaches the session. Use host='remote'."
+            )
 
     def open_channel(self, runtime: Runtime) -> Channel:
         raise UnsupportedMode(

@@ -206,6 +206,17 @@ The reading is taken at the moment it is asked for and carries no history. A loa
 
 The declared function runs in the calling process, inside a session whose device worker is started on first use. It is not retried: a failure part way through has already run the function's side effects here once.
 
+### Placements a provider cannot serve <!-- id: remote-only-providers -->
+
+> A provider whose class sets `serves_host_local = False` cannot be declared with `host="local"`, and both the type checker and the decorator say so before anything runs.
+
+`Kaggle` sets it, because the Kaggle Acceptable Use Policy forbids circumvention tools and Kaggle does not support port forwarding, so no device stream can reach a Kaggle session. The refusal happens in two places:
+
+1. **The type checker.** The generated provider types annotate each accelerator of such an account as `RemoteOnlyInstance`, and `Launcher.function` has two overloads: one takes `RemoteOnlyInstance` with `host` typed `Literal[letify.remote, "remote"]` and no default, the other takes `Instance` or `AnyInstance`. `RemoteOnlyInstance` is not a subtype of `Instance` to a type checker, so `host=letify.local`, `host="local"` or no `host` at all matches neither overload and pyright and mypy report an error. At run time `RemoteOnlyInstance` is `Instance`. `letify.local` and `letify.remote` are `Final`, so a type checker sees their literal values.
+2. **The decorator.** `@let.function` raises `UnsupportedMode` naming the account and `host='remote'` when the resolved placement is local and the instance's provider does not serve it, at decoration, before any call. `let.providers.any` requests are checked when they resolve, in `check_mode`.
+
+The same mechanism fits a limit that makes a declaration impossible, such as `Modal`'s. It is not used for `has_fast_path`, because a slow path is a warning and the declaration still runs.
+
 A provider refuses a mode only when it cannot serve it. `Modal` refuses `host="local"` because it exposes function calls into a container and there is no device to forward at. `host="local"` is refused with `UnsupportedMode` when PyTorch does not import in this process or is older than 2.1. A provider without a fast path warns with its expected round trip and then runs, because the choice belongs to whoever wrote the declaration.
 
 ### Efficiency model
