@@ -469,6 +469,26 @@ def test_the_sessions_an_account_holds_are_read_from_the_cli(
     assert provider_of(Colab, "colab_a").sessions() == ["letify-g4-1", "letify-t4-2"]
 
 
+def test_an_account_with_no_colab_session_lists_none(isolated_home, patch_which, patch_run) -> None:
+    # Spec "Colab": the CLI's own message line names no session.
+    patch_which(tools_module, present=True)
+    listing = "[colab] No active sessions found on server.\n"
+    patch_run(colab_module, result=FakeCompleted(stdout=listing))
+    assert provider_of(Colab, "colab_a").sessions() == []
+
+
+def test_a_colab_session_listed_in_brackets_is_named_without_them(
+    isolated_home, patch_which, patch_run
+) -> None:
+    # Spec "Colab": the listing line the CLI printed for a live CPU session.
+    patch_which(tools_module, present=True)
+    listing = (
+        "[letify-cpu-514e8c] m-s-kkb-ase1a1-32hpj198ieqis | Hardware: CPU | Variant: DEFAULT\n"
+    )
+    patch_run(colab_module, result=FakeCompleted(stdout=listing))
+    assert provider_of(Colab, "colab_a").sessions() == ["letify-cpu-514e8c"]
+
+
 def test_a_failing_cli_command_carries_the_command_and_the_error(
     isolated_home, patch_which, patch_run
 ) -> None:
@@ -1415,6 +1435,26 @@ def test_a_sandbox_started_the_way_modal_starts_it_answers_requests(
         provider.stop(runtime)
 
 
+def test_a_sandbox_channel_sends_an_argument_larger_than_modal_stdin_buffer(
+    isolated_home, fake_modal
+) -> None:
+    # Spec "Modal adapter", op write: a frame above Modal's 2 MiB stdin buffer goes out as
+    # write requests of at most 1 MiB, so a 16 MiB argument arrives whole.
+    import base64
+
+    provider = provider_of(Modal, "m")
+    runtime = modal_runtime(provider)
+    channel = provider.open_channel(runtime)
+    try:
+        payload = bytes(range(256)) * (16 * 1024 * 1024 // 256)
+        assert channel.call(len, (payload,), {})[0] == len(payload)
+        sizes = [len(base64.b64decode(r["data"])) for r in fake_modal.requests("write")]
+        assert max(sizes) <= 1024 * 1024
+    finally:
+        channel.close()
+        provider.stop(runtime)
+
+
 def test_a_sandbox_channel_reads_a_result_longer_than_a_modal_output_line(
     isolated_home, fake_modal
 ) -> None:
@@ -2102,3 +2142,100 @@ def test_every_shell_kind_reads_busy_cards_on_its_machine(cls, patch_run, monkey
     link = type("L", (), {"ssh_command": lambda self, remote=None: ["ssh", "h", remote]})()
     monkeypatch.setattr(provider, "link", lambda runtime=None: link)
     assert provider.busy() == (2,)
+
+
+# -- Modal: ending a sandbox while a request is blocked (spec "modal-abort") ----------
+
+
+def test_a_modal_call_past_its_timeout_leaves_no_sandbox_running(isolated_home, fake_modal) -> None:
+    import time
+
+    from letify.errors import ProtocolError, RuntimeFailure
+
+    provider = provider_of(Modal, "m")
+    runtime = modal_runtime(provider)
+    channel = provider.open_channel(runtime)
+    channel.start()
+    [pid] = fake_modal.sandbox_pids()
+    started = time.monotonic()
+    with pytest.raises((RuntimeFailure, ProtocolError)):
+        channel.call(time.sleep, (600,), {}, timeout=2)
+    assert time.monotonic() - started < 30
+    assert not fake_modal.alive(pid)
+    channel.close()
+    provider.stop(runtime)
+
+
+def test_a_modal_call_interrupted_while_blocked_leaves_no_sandbox_running(
+    isolated_home, fake_modal
+) -> None:
+    import signal
+    import time
+
+    provider = provider_of(Modal, "m")
+    runtime = modal_runtime(provider)
+    channel = provider.open_channel(runtime)
+    channel.start()
+    [pid] = fake_modal.sandbox_pids()
+
+    def interrupt(signum, frame):
+        raise KeyboardInterrupt
+
+    previous = signal.signal(signal.SIGALRM, interrupt)
+    signal.setitimer(signal.ITIMER_REAL, 2)
+    try:
+        with pytest.raises(KeyboardInterrupt):
+            channel.call(time.sleep, (600,), {})
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, previous)
+    started = time.monotonic()
+    channel.close()
+    provider.stop(runtime)
+    assert time.monotonic() - started < 30
+    assert not fake_modal.alive(pid)
+
+
+def test_a_request_on_an_adapter_out_of_step_fails_without_waiting(
+    isolated_home, fake_modal
+) -> None:
+    import signal
+    import time
+
+    from letify.errors import RuntimeFailure
+
+    provider = provider_of(Modal, "m")
+    runtime = modal_runtime(provider)
+    channel = provider.open_channel(runtime)
+    channel.start()
+
+    def interrupt(signum, frame):
+        raise KeyboardInterrupt
+
+    previous = signal.signal(signal.SIGALRM, interrupt)
+    signal.setitimer(signal.ITIMER_REAL, 2)
+    try:
+        with pytest.raises(KeyboardInterrupt):
+            channel.call(time.sleep, (600,), {})
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, previous)
+    started = time.monotonic()
+    with pytest.raises(RuntimeFailure, match="out of step"):
+        provider.adapter().request("hello")
+    assert time.monotonic() - started < 5
+    provider.stop(runtime)
+
+
+def test_a_modal_sandbox_is_created_with_a_lifetime_and_an_idle_limit(
+    isolated_home, fake_modal
+) -> None:
+    provider = provider_of(Modal, "m")
+    runtime = modal_runtime(provider)
+    provider.open_channel(runtime)
+    try:
+        [created] = fake_modal.requests("create")
+        assert created["timeout"] == 3600
+        assert created["idle_timeout"] == 600
+    finally:
+        provider.stop(runtime)

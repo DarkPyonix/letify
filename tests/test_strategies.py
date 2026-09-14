@@ -87,6 +87,25 @@ def test_a_tcp_punch_needs_a_rendezvous() -> None:
     assert TCPPunch.rank == 2
 
 
+def test_a_colab_account_without_a_key_skips_the_strategies_that_log_in_over_ssh(
+    patch_which,
+) -> None:
+    # Spec "Colab": the key is what the VM authorizes, so without one SSH cannot log in.
+    from letify.transport.rendezvous import ColabRendezvous
+
+    patch_which(strategies, present=True)
+
+    def run(source: str, timeout: float) -> str:
+        return ""
+
+    keyless = Target(alias="colab_a", rendezvous=ColabRendezvous(run, None))
+    assert TCPPunch().needs(keyless) == "no key"
+    assert TailcatUDP().needs(keyless) == "no key"
+    keyed = Target(alias="colab_a", rendezvous=ColabRendezvous(run, "ssh-ed25519 AAAA me"))
+    assert TCPPunch().needs(keyed) is None
+    assert TailcatUDP().needs(keyed) is None
+
+
 def test_a_tcp_punch_over_loopback_carries_the_probe_and_then_ssh(stun_server) -> None:
     sshd = fake_sshd()
     rendezvous = LoopbackRendezvous()
@@ -528,3 +547,48 @@ def test_client_shell_connect_without_tailcat_says_so(isolated_home, patch_which
     patch_which(agent_module, present=False)
     assert main(["client", "shell", "connect"]) == 1
     assert "tailcat" in capsys.readouterr().err
+
+
+def _silent_port() -> int:
+    probe = socket.socket()
+    probe.bind(("127.0.0.1", 0))
+    port = probe.getsockname()[1]
+    probe.close()
+    return port
+
+
+def test_the_remote_half_starts_sshd_on_the_splice_port_when_nothing_answers_there(
+    patch_run, monkeypatch, tmp_path
+) -> None:
+    # Spec "Colab": a Colab image's own sshd serves 127.0.0.1:2222, so the remote half
+    # starts one with the port letify splices to named on the command line.
+    binary = tmp_path / "sshd"
+    binary.write_text("")
+    monkeypatch.setattr(nat, "SSHD", str(binary))
+    recorder = patch_run(nat)
+    port = _silent_port()
+    nat._start_sshd(port)
+    assert [str(binary), "-p", str(port), "-o", "ListenAddress=127.0.0.1"] in recorder.commands
+    assert not any("apt-get" in command for command in recorder.commands)
+
+
+def test_the_remote_half_starts_no_sshd_when_an_ssh_server_already_answers(
+    patch_run, monkeypatch, tmp_path
+) -> None:
+    binary = tmp_path / "sshd"
+    binary.write_text("")
+    monkeypatch.setattr(nat, "SSHD", str(binary))
+    server = fake_sshd()
+
+    def greet() -> None:
+        conn, _ = server.accept()
+        conn.sendall(b"SSH-2.0-OpenSSH_test\r\n")
+        conn.close()
+
+    threading.Thread(target=greet, daemon=True).start()
+    recorder = patch_run(nat)
+    try:
+        nat._start_sshd(server.getsockname()[1])
+    finally:
+        server.close()
+    assert not any(str(binary) in command for command in recorder.commands)
