@@ -504,6 +504,9 @@ def test_no_remote_path_is_hard_coded_outside_the_workspace_defaults() -> None:
             for literal in re.findall(r"[\"'](/(?:opt|tmp|content)(?:/[^\"']*)?)[\"']", line):
                 if source.name == "colab.py" and literal == "/content/letify":
                     continue
+                # SSH control sockets are a client-side path, not a remote one.
+                if source.name == "sshopts.py" and literal.startswith("/tmp/letify-"):
+                    continue
                 offenders.append(f"{source.relative_to(package)}:{number}: {literal}")
     assert offenders == []
 

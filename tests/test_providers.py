@@ -11,6 +11,8 @@ line, the request and the instance table letify builds, which is what a caller o
 
 from __future__ import annotations
 
+import hashlib
+import os
 from importlib import import_module
 from pathlib import Path
 
@@ -710,6 +712,8 @@ def test_ssh_commands_share_one_connection_and_prefer_fast_ciphers(
     from letify.transport.strategies import Target
 
     monkeypatch.setattr(sshopts, "WINDOWS", platform == "nt")
+    # The pytest temporary directory is too long for a socket path, so the /tmp default is used.
+    monkeypatch.delenv("XDG_RUNTIME_DIR", raising=False)
     provider = provider_of(Shell, "lab", address="gpu.lab.example.edu", user="researcher")
     for command in (
         provider.ssh_command("true"),
@@ -717,7 +721,8 @@ def test_ssh_commands_share_one_connection_and_prefer_fast_ciphers(
     ):
         assert "Ciphers=^aes128-gcm@openssh.com,chacha20-poly1305@openssh.com" in command
         assert not any(part.startswith("Compression=yes") for part in command)
-        control = Path.home() / ".letify" / "accounts" / "lab" / "ssh-%C"
+        tag = hashlib.sha256(b"lab").hexdigest()[:8]
+        control = Path(f"/tmp/letify-{os.getuid()}") / f"{tag}-%C"
         if platform == "nt":
             assert not any(part.startswith("Control") for part in command)
         else:
@@ -725,6 +730,75 @@ def test_ssh_commands_share_one_connection_and_prefer_fast_ciphers(
             assert "ControlPersist=60" in command
             assert f"ControlPath={control}" in command
             assert control.parent.is_dir()
+            assert control.parent.stat().st_mode & 0o777 == 0o700
+
+
+def control_options(command: list[str]) -> list[str]:
+    return [part for part in command if part.startswith("Control")]
+
+
+def test_a_control_socket_fits_the_socket_limit_for_a_very_long_home(
+    tmp_path: Path, monkeypatch
+) -> None:
+    # Spec "SSH authentication": sockets live in a short per-user directory.
+    from letify.transport import sshopts
+
+    monkeypatch.setattr(sshopts, "WINDOWS", False)
+    monkeypatch.delenv("XDG_RUNTIME_DIR", raising=False)
+    home = tmp_path / ("h" * 150)
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: home))
+    command = sshopts.options("a-rather-long-account-alias-for-the-lab-machine")
+    (path,) = [part[len("ControlPath=") :] for part in command if part.startswith("ControlPath=")]
+    expanded = path.replace("%C", "0" * 40)
+    assert len(expanded.encode()) + 17 < sshopts.SOCKET_LIMIT
+    assert Path(path).parent == Path(f"/tmp/letify-{os.getuid()}")
+
+
+def test_sharing_is_left_out_when_the_socket_path_would_exceed_the_limit(
+    tmp_path: Path, monkeypatch
+) -> None:
+    from letify.transport import sshopts
+
+    monkeypatch.setattr(sshopts, "WINDOWS", False)
+    monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path / ("r" * 120)))
+    command = sshopts.options("lab")
+    assert control_options(command) == []
+    assert "Ciphers=^aes128-gcm@openssh.com,chacha20-poly1305@openssh.com" in command
+
+
+def test_a_control_directory_that_is_a_symbolic_link_is_refused(
+    tmp_path: Path, monkeypatch
+) -> None:
+    from letify.transport import sshopts
+
+    monkeypatch.setattr(sshopts, "WINDOWS", False)
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir(mode=0o700)
+    (tmp_path / "letify").symlink_to(elsewhere)
+    monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path))
+    with pytest.raises(letify.ConfigError, match="symbolic link"):
+        sshopts.options("lab")
+
+
+def test_a_control_directory_open_to_other_users_is_refused(tmp_path: Path, monkeypatch) -> None:
+    from letify.transport import sshopts
+
+    monkeypatch.setattr(sshopts, "WINDOWS", False)
+    (tmp_path / "letify").mkdir()
+    (tmp_path / "letify").chmod(0o755)
+    monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path))
+    with pytest.raises(letify.ConfigError, match="permission"):
+        sshopts.options("lab")
+
+
+def test_a_control_directory_owned_by_another_user_is_refused(tmp_path: Path, monkeypatch) -> None:
+    from letify.transport import sshopts
+
+    monkeypatch.setattr(sshopts, "WINDOWS", False)
+    monkeypatch.setenv("XDG_RUNTIME_DIR", str(tmp_path))
+    monkeypatch.setattr(sshopts.os, "getuid", lambda: os.stat(tmp_path).st_uid + 1)
+    with pytest.raises(letify.ConfigError, match="owned"):
+        sshopts.options("lab")
 
 
 def test_a_jump_host_is_used_before_any_tunnel() -> None:

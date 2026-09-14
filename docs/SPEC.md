@@ -926,7 +926,14 @@ So `letify login shell` sets up key authentication and treats the password as a 
 4. The connection is confirmed with `BatchMode=yes`, which proves the key works before the alias is declared rather than at the first call.
 5. The machine's GPUs are detected over that confirmed connection, as described under Recording devices at login.
 
-Every SSH command letify builds also carries `-o ControlMaster=auto`, `-o ControlPersist=60` and `-o ControlPath=~/.letify/accounts/<alias>/ssh-%C`, so the worker channel, the busy card check and every later command to the same machine share one authenticated connection, instead of paying about 0.24 s for a new one each. On Windows, where OpenSSH does not implement connection multiplexing, the three options are left out and each command opens its own connection. Every command also carries `-o Ciphers=^aes128-gcm@openssh.com,chacha20-poly1305@openssh.com`, which puts those two ciphers first in the client's default list, so a server that offers neither still connects. Compression stays off.
+Every SSH command letify builds also carries `-o ControlMaster=auto`, `-o ControlPersist=60` and `-o ControlPath=<control directory>/<tag>-%C`, so the worker channel, the busy card check and every later command to the same machine share one authenticated connection, instead of paying about 0.24 s for a new one each. On Windows, where OpenSSH does not implement connection multiplexing, the three options are left out and each command opens its own connection.
+
+Control sockets live in a short per-user directory, not under the home directory, because a Unix domain socket path is limited to 108 bytes on Linux and 104 bytes on macOS, including the terminating byte:
+
+- The control directory is `$XDG_RUNTIME_DIR/letify` when `XDG_RUNTIME_DIR` is set, and `/tmp/letify-<uid>` otherwise. It is created with mode 0700.
+- Before use, the directory is checked with `lstat`: it must be a directory, not a symbolic link, owned by the current user, and have no group or other permission bits. Any other state raises `ConfigError` and no SSH command is built.
+- `<tag>` is the first 8 hex digits of the SHA-256 of the account alias, so accounts that reach the same machine keep separate connections. `%C` expands to 40 hex digits.
+- The length checked is the path with `%C` expanded, plus the 17 bytes OpenSSH appends to name the temporary socket while it binds. If that reaches the platform limit, the three options are left out for that command and it opens its own connection. Every command also carries `-o Ciphers=^aes128-gcm@openssh.com,chacha20-poly1305@openssh.com`, which puts those two ciphers first in the client's default list, so a server that offers neither still connects. Compression stays off.
 
 One other approach is not the default. `sshpass` feeds a stored password to each connection, which needs the password kept somewhere and exposes it in the process arguments of every call. `sshpass` is available as `auth = "password"` for a machine whose administrator forbids key authentication, reading the password from `~/.letify/accounts/<alias>/password`, and it refuses on Windows, where the tool does not exist.
 
