@@ -345,7 +345,7 @@ def test_a_reserved_alias_is_refused_before_anything_is_written(isolated_home, c
 
 
 def test_an_elice_token_goes_to_the_account_directory_and_not_the_config(
-    isolated_home, capsys
+    isolated_home, fake_elice, capsys
 ) -> None:
     # A token in a file is a token in a backup, so the file gets the pointer only.
     code = main(
@@ -359,6 +359,8 @@ def test_an_elice_token_goes_to_the_account_directory_and_not_the_config(
             "machine-1",
             "--token",
             "secret-token",
+            "--endpoint",
+            fake_elice.endpoint,
             "--no-input",
         ]
     )
@@ -412,7 +414,9 @@ def test_logging_in_to_colab_without_uv_says_how_to_get_it(
     assert "uv was not found" in capsys.readouterr().err
 
 
-def test_logging_out_takes_the_account_and_its_directory(isolated_home, capsys) -> None:
+def test_logging_out_takes_the_account_and_its_directory(
+    isolated_home, fake_elice, capsys
+) -> None:
     # The repository still needs the account, so the reference stays; this machine is what
     # stopped having it.
     main(
@@ -426,6 +430,8 @@ def test_logging_out_takes_the_account_and_its_directory(isolated_home, capsys) 
             "m",
             "--token",
             "t",
+            "--endpoint",
+            fake_elice.endpoint,
             "--no-input",
         ]
     )
@@ -614,7 +620,9 @@ def test_the_optional_fields_reach_the_file_when_they_are_given(isolated_home, p
     assert "persistent = true" in home_file
 
 
-def test_an_elice_endpoint_is_recorded_only_when_it_is_not_the_default(isolated_home) -> None:
+def test_an_elice_endpoint_is_recorded_only_when_it_is_not_the_default(
+    isolated_home, fake_elice
+) -> None:
     assert (
         main(
             [
@@ -628,13 +636,113 @@ def test_an_elice_endpoint_is_recorded_only_when_it_is_not_the_default(isolated_
                 "--token",
                 "t",
                 "--endpoint",
-                "https://portal.example/api",
+                fake_elice.endpoint,
                 "--no-input",
             ]
         )
         == 0
     )
-    assert "portal.example" in (Path.home() / ".letify" / "config.toml").read_text(encoding="utf-8")
+    assert fake_elice.endpoint in (Path.home() / ".letify" / "config.toml").read_text(encoding="utf-8")
+
+
+# -- Spec: Logging in, the Elice login ------------------------------------------
+
+
+def elice_login_argv(fake_elice, *extra: str) -> list[str]:
+    return [
+        "login",
+        "elice",
+        "e",
+        "--token",
+        "token-1",
+        "--endpoint",
+        fake_elice.endpoint,
+        *extra,
+    ]
+
+
+def test_an_elice_login_verifies_the_token_and_records_the_account(
+    isolated_home, fake_elice, capsys
+) -> None:
+    from conftest import FakeResponse
+
+    fake_elice.answer("GET", "/user/organization", FakeResponse(200, {"name_short": "lab"}))
+    argv = elice_login_argv(
+        fake_elice,
+        "--zone-id",
+        "zone-1",
+        "--machine-id",
+        "machine-1",
+        "--billing-endpoint",
+        "https://billing.example/api",
+        "--no-input",
+    )
+    assert main(argv) == 0
+    verify = fake_elice.requests[0]
+    assert (verify["method"], verify["path"]) == ("GET", "/user/organization")
+    assert verify["authorization"] == "Bearer token-1"
+    entry = tomllib.loads((Path.home() / ".letify" / "config.toml").read_text(encoding="utf-8"))[
+        "e"
+    ]
+    assert entry["kind"] == "elice"
+    assert entry["zone_id"] == "zone-1"
+    assert entry["machine_id"] == "machine-1"
+    assert entry["organization"] == "lab"
+    assert entry["billing_endpoint"] == "https://billing.example/api"
+    token_file = Path.home() / ".letify" / "accounts" / "e" / "access_token"
+    assert token_file.read_text(encoding="utf-8") == "token-1"
+    if sys.platform != "win32":
+        assert token_file.stat().st_mode & 0o777 == 0o600
+
+
+def test_a_rejected_elice_token_writes_nothing(isolated_home, fake_elice, capsys) -> None:
+    from conftest import FakeResponse
+
+    fake_elice.answer("GET", "/user/organization", FakeResponse(401, {"message": "bad token"}))
+    argv = elice_login_argv(fake_elice, "--zone-id", "z", "--machine-id", "m", "--no-input")
+    assert main(argv) == 1
+    assert "Elice refused the access token" in capsys.readouterr().err
+    assert not (Path.home() / ".letify" / "config.toml").exists()
+    assert not (Path.home() / ".letify" / "accounts" / "e").exists()
+
+
+def test_an_elice_zone_and_machine_are_chosen_from_the_listed_ones(
+    isolated_home, fake_elice, monkeypatch, capsys
+) -> None:
+    from conftest import FakeResponse
+
+    from letify.providers.elice import VM_PATH
+
+    fake_elice.answer(
+        "GET",
+        "/user/infra/zone",
+        FakeResponse(200, [{"id": "zone-a", "name": "Seoul"}, {"id": "zone-b", "name": "Busan"}]),
+    )
+    fake_elice.answer(
+        "GET", VM_PATH, FakeResponse(200, {"items": [{"id": "machine-9", "name": "a100"}]})
+    )
+    answers = iter(["7", "2", "", "https://billing.example/api"])
+    prompts: list[str] = []
+
+    def read_line(prompt: str) -> str:
+        prompts.append(prompt)
+        return next(answers)
+
+    monkeypatch.setattr(login, "read_line", read_line)
+    assert main(elice_login_argv(fake_elice)) == 0
+    out = capsys.readouterr().out
+    assert "1. Seoul (zone-a)" in out
+    assert "2. Busan (zone-b)" in out
+    assert prompts[:3] == ["Elice zone [1-2]: ", "Elice zone [1-2]: ", "Elice machine [1-1]: "]
+    listing = [r for r in fake_elice.requests if r["path"] == VM_PATH][0]
+    assert listing["params"] == {"zone_id": "zone-b"}
+    entry = tomllib.loads((Path.home() / ".letify" / "config.toml").read_text(encoding="utf-8"))[
+        "e"
+    ]
+    assert entry["zone_id"] == "zone-b"
+    assert entry["machine_id"] == "machine-9"
+    assert entry["billing_endpoint"] == "https://billing.example/api"
+    assert "organization" not in entry
 
 
 def modal_sign_in(monkeypatch, *, returncode: int = 0, writes: bool = True) -> list[dict]:
