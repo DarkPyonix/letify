@@ -14,6 +14,7 @@ import {
   escapeHtml as e,
   formatAmount,
   formatDuration,
+  holderLabel,
   isReserved,
   paceProjection,
   periodElapsed,
@@ -60,17 +61,23 @@ export function quotaCard(row: UsageRow, now: number): string {
     lines.push(`<div class="muted">${burn}</div>`);
   }
   if (row.note) lines.push(`<div class="muted">${e(row.note)}</div>`);
+  for (const r of row.resources) {
+    const amount = r.remaining === null
+      ? "not reported"
+      : r.limit
+        ? `${formatAmount(r.remaining, r.unit)} left of ${formatAmount(r.limit, r.unit)}`
+        : `${formatAmount(r.remaining, r.unit)} left`;
+    lines.push(`<div class="row resource"><span>${e(r.name)}</span><span>${e(amount)}</span></div>`);
+    if (r.remaining !== null && r.limit) lines.push(gauge(Math.max(0, Math.min(1, 1 - r.remaining / r.limit)), null));
+    if (r.resets_at !== null) lines.push(`<div class="muted">Resets in ${formatDuration(r.resets_at - now)}, ${stamp(r.resets_at)}</div>`);
+  }
   return `<div class="card">${lines.join("")}</div>`;
 }
 
 function deviceBlock(alias: string, device: Device, status: Status | null): string {
   const util = device.utilization_percent;
   const mem = device.memory_percent;
-  const holder = isReserved(status, alias, device.index)
-    ? "letify reserved"
-    : util !== null && util > 0
-      ? "in use"
-      : "free";
+  const holder = holderLabel(device, isReserved(status, alias, device.index)) || null;
   const facts = [
     device.temperature_c !== null ? `${Math.round(device.temperature_c)} C` : null,
     device.power_w !== null ? `${Math.round(device.power_w)} W` : null,
@@ -87,7 +94,7 @@ function deviceBlock(alias: string, device: Device, status: Status | null): stri
 }
 
 export function gpuCard(row: UtilizationRow, status: Status | null): string {
-  const title = `<div class="title"><b>${e(row.alias)}</b> <span class="muted">${e(row.accelerator)}</span></div>`;
+  const title = `<div class="title"><b>${e(row.alias)}</b> <span class="muted">${e(row.accelerator ?? row.kind)}</span></div>`;
   if (row.unavailable) return `<div class="card">${title}<div class="muted">unavailable: ${e(row.unavailable)}</div></div>`;
   if (row.devices.length === 0) {
     return `<div class="card">${title}<div class="muted">${e(row.reason ?? "nothing reported")}</div></div>`;
@@ -135,6 +142,7 @@ body{font-family:var(--vscode-font-family);font-size:var(--vscode-font-size);col
 .fill.error{background:var(--vscode-editorError-foreground)}
 .mark{position:absolute;top:-2px;bottom:-2px;width:2px;background:var(--vscode-foreground)}
 .device{margin-top:6px}
+.resource{margin-top:6px}
 .chart{display:flex;align-items:flex-end;gap:2px;height:48px}
 .bar{flex:1;background:var(--vscode-charts-blue,var(--vscode-progressBar-background));min-width:3px}
 .footer{display:flex;justify-content:space-between;gap:8px;flex-wrap:wrap}

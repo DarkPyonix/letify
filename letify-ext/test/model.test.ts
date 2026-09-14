@@ -9,6 +9,7 @@ import {
   formatDuration,
   gpuStatusText,
   gpuSummary,
+  holderLabel,
   mostConstrained,
   paceProjection,
   parseJson,
@@ -19,7 +20,7 @@ import {
   quotaStatusText,
   severity,
 } from "../src/model";
-import { quotaCard } from "../src/render";
+import { gpuCard, quotaCard } from "../src/render";
 
 // Shapes copied from spec "Machine-readable output".
 const row = (fields: Partial<UsageRow>): UsageRow =>
@@ -143,9 +144,9 @@ describe("status bar", () => {
     ]);
     const status = parseStatus({ name: "p", live: 1, busy: 1, devices: { lab: { A100: { count: 4, reserved: 1, indices: [0, 1, 2, 3] } } }, runtimes: [] });
     const summary = gpuSummary(util, status, 10);
-    expect(summary).toEqual({ total: 4, busy: 2, meanPercent: 50, reserved: 1 });
+    expect(summary).toEqual({ total: 4, busy: 2, meanPercent: 50, reserved: 1, free: 0, withHolder: 0 });
     expect(gpuStatusText(summary)).toBe("GPU 2/4 busy 50%");
-    expect(gpuStatusText({ total: 0, busy: 0, meanPercent: null, reserved: 0 })).toBe("GPU idle");
+    expect(gpuStatusText({ total: 0, busy: 0, meanPercent: null, reserved: 0, free: 0, withHolder: 0 })).toBe("GPU idle");
   });
 });
 
@@ -163,5 +164,70 @@ describe("history", () => {
     let h = recordSample([], NOW - 40 * 86400, 10, {});
     h = recordSample(h, NOW, 10, {});
     expect(h.map((b) => b.day)).toEqual(["2026-09-14"]);
+  });
+});
+
+describe("holders", () => {
+  const util = parseUtilization([
+    { alias: "lab", kind: "shell", scope: "machine", accelerator: null, reason: null, devices: [
+      { index: 0, name: "P100", utilization_percent: 0, holder: "free", users: [], reserved: false },
+      { index: 1, name: "P100", utilization_percent: 90, holder: "others", users: ["alice", "bob"], reserved: false },
+      { index: 2, name: "P100", utilization_percent: 40, holder: "letify", users: [], reserved: true },
+      { index: 3, name: "P100", utilization_percent: 20, holder: "mine", users: [], reserved: false },
+      { index: 4, name: "P100", utilization_percent: null, holder: "unknown", users: [], reserved: false },
+    ] },
+  ]);
+
+  it("reads holder, users, reserved and a null accelerator", () => {
+    const d = util[0].devices;
+    expect(util[0].accelerator).toBeNull();
+    expect(util[0].scope).toBe("machine");
+    expect(d[1].users).toEqual(["alice", "bob"]);
+    expect(d[2].reserved).toBe(true);
+    expect(parseUtilization([{ alias: "c", devices: [{ index: 0, holder: "weird" }] }])[0].devices[0].holder).toBeNull();
+  });
+
+  it("labels each holder for a person", () => {
+    const d = util[0].devices;
+    expect(d.map((x) => holderLabel(x, false))).toEqual([
+      "free",
+      "other users: alice, bob",
+      "letify reserved",
+      "yours",
+      "unknown",
+    ]);
+    const session = parseUtilization([{ alias: "c", devices: [{ index: 0, holder: null }] }])[0].devices[0];
+    expect(holderLabel(session, true)).toBe("letify reserved");
+    expect(holderLabel(session, false)).toBe("");
+  });
+
+  it("counts free cards in the status bar when holders are known", () => {
+    const summary = gpuSummary(util, null, 10);
+    expect(summary.free).toBe(1);
+    expect(summary.withHolder).toBe(5);
+    expect(gpuStatusText(summary)).toBe("GPU 1/5 free 38%");
+  });
+
+  it("shows holder labels on the GPU card", () => {
+    const html = gpuCard(util[0], null);
+    expect(html).toContain("other users: alice, bob");
+    expect(html).toContain("yours");
+    expect(html).toContain("lab");
+  });
+});
+
+describe("secondary resources", () => {
+  it("reads resources and shows each as a row in the quota card", () => {
+    const [kaggle] = parseUsage([
+      { alias: "kaggle", kind: "kaggle", unit: "GPU hours", source: "api", remaining: 20, limit: 30, used: 10, unmetered: false,
+        resources: [{ name: "TPU", unit: "TPU hours", remaining: 15, used: 5, limit: 20, resets_at: NOW + 86400 }] },
+    ]);
+    expect(kaggle.resources).toHaveLength(1);
+    expect(kaggle.resources[0].name).toBe("TPU");
+    const html = quotaCard(kaggle, NOW);
+    expect(html).toContain("TPU");
+    expect(html).toContain("15 TPU hours left of 20 TPU hours");
+    expect(html).toContain("Resets in 1d");
+    expect(row({}).resources).toEqual([]);
   });
 });

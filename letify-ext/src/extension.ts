@@ -13,7 +13,10 @@ import {
   Status,
   UsageRow,
   UtilizationRow,
+  formatAmount,
   gpuStatusText,
+  holderLabel,
+  isReserved,
   gpuSummary,
   mostConstrained,
   parseStatus,
@@ -90,7 +93,11 @@ export function activate(context: vscode.ExtensionContext): void {
         const left = shareLeft(row);
         if (row.unavailable) return `**${escapeHtml(row.alias)}** unavailable`;
         if (row.unmetered) return `**${escapeHtml(row.alias)}** no quota`;
-        return `**${escapeHtml(row.alias)}** ${left === null ? "" : `${Math.round((1 - left) * 100)}% used · `}${escapeHtml(quotaStatusText([row], now))}`;
+        const extra = row.resources
+          .filter((r) => r.remaining !== null)
+          .map((r) => ` · ${escapeHtml(r.name)} ${escapeHtml(formatAmount(r.remaining ?? 0, r.unit))} left`)
+          .join("");
+        return `**${escapeHtml(row.alias)}** ${left === null ? "" : `${Math.round((1 - left) * 100)}% used · `}${escapeHtml(quotaStatusText([row], now))}${extra}`;
       }),
   };
 
@@ -117,8 +124,11 @@ export function activate(context: vscode.ExtensionContext): void {
     gpuItem.text = `$(server) ${gpuStatusText(summary)}`;
     const deviceLines = state.utilization.flatMap((row) =>
       row.devices.length
-        ? row.devices.map((d) => `**${escapeHtml(row.alias)}** gpu${d.index} ${escapeHtml(d.name)} · ${d.utilization_percent ?? "?"}% · ${d.memory_percent === null ? "?" : Math.round(d.memory_percent)}% mem`)
-        : [`**${escapeHtml(row.alias)}.${escapeHtml(row.accelerator)}** ${escapeHtml(row.reason ?? row.unavailable ?? "")}`],
+        ? row.devices.map((d) => {
+            const label = holderLabel(d, isReserved(state.status, row.alias, d.index));
+            return `**${escapeHtml(row.alias)}** gpu${d.index} ${escapeHtml(d.name)} · ${d.utilization_percent ?? "?"}% · ${d.memory_percent === null ? "?" : Math.round(d.memory_percent)}% mem${label ? ` · ${escapeHtml(label)}` : ""}`;
+          })
+        : [`**${escapeHtml(row.alias)}${row.accelerator ? `.${escapeHtml(row.accelerator)}` : ""}** ${escapeHtml(row.reason ?? row.unavailable ?? "")}`],
     );
     gpuItem.tooltip = tooltip([`**letify GPU activity** · ${summary.reserved} reserved by letify`, ...deviceLines, footer(true)].join("\n\n"));
     cfg.get("showQuota", true) ? quotaItem.show() : quotaItem.hide();

@@ -20,8 +20,24 @@ export interface UsageRow {
   unmetered: boolean;
   as_of: number | null;
   note: string | null;
+  resources: Resource[];
   unavailable?: string;
 }
+
+/** A further allowance on the same account, such as Kaggle's TPU hours. */
+export interface Resource {
+  name: string;
+  unit: string;
+  remaining: number | null;
+  used: number | null;
+  limit: number | null;
+  resets_at: number | null;
+}
+
+/** Who holds a card, as `letify utilization --json` reports it; null on a session row. */
+export type Holder = "letify" | "others" | "mine" | "free" | "unknown" | null;
+
+const HOLDERS = new Set(["letify", "others", "mine", "free", "unknown"]);
 
 export interface Device {
   index: number;
@@ -32,11 +48,16 @@ export interface Device {
   memory_percent: number | null;
   temperature_c: number | null;
   power_w: number | null;
+  holder: Holder;
+  users: string[];
+  reserved: boolean;
 }
 
 export interface UtilizationRow {
   alias: string;
-  accelerator: string;
+  kind: string;
+  scope: string;
+  accelerator: string | null;
   devices: Device[];
   reason: string | null;
   unavailable?: string;
@@ -96,6 +117,14 @@ export function parseUsage(data: unknown): UsageRow[] {
     unmetered: raw.unmetered === true,
     as_of: num(raw.as_of),
     note: str(raw.note),
+    resources: (Array.isArray(raw.resources) ? raw.resources : []).map((r: Record<string, unknown>) => ({
+      name: str(r.name) ?? "",
+      unit: str(r.unit) ?? "",
+      remaining: num(r.remaining),
+      used: num(r.used),
+      limit: num(r.limit),
+      resets_at: num(r.resets_at),
+    })),
     ...(typeof raw.unavailable === "string" ? { unavailable: raw.unavailable } : {}),
   }));
 }
@@ -104,7 +133,9 @@ export function parseUtilization(data: unknown): UtilizationRow[] {
   if (!Array.isArray(data)) throw new Error("letify utilization --json did not print a list");
   return data.map((raw: Record<string, unknown>) => ({
     alias: str(raw.alias) ?? "?",
-    accelerator: str(raw.accelerator) ?? "",
+    kind: str(raw.kind) ?? "",
+    scope: str(raw.scope) ?? "",
+    accelerator: str(raw.accelerator),
     reason: str(raw.reason),
     devices: (Array.isArray(raw.devices) ? raw.devices : []).map((d: Record<string, unknown>) => ({
       index: num(d.index) ?? 0,
@@ -115,6 +146,9 @@ export function parseUtilization(data: unknown): UtilizationRow[] {
       memory_percent: num(d.memory_percent),
       temperature_c: num(d.temperature_c),
       power_w: num(d.power_w),
+      holder: typeof d.holder === "string" && HOLDERS.has(d.holder) ? (d.holder as Holder) : null,
+      users: Array.isArray(d.users) ? d.users.filter((u): u is string => typeof u === "string") : [],
+      reserved: d.reserved === true,
     })),
     ...(typeof raw.unavailable === "string" ? { unavailable: raw.unavailable } : {}),
   }));
@@ -226,6 +260,10 @@ export interface GpuSummary {
   busy: number;
   meanPercent: number | null;
   reserved: number;
+  /** Devices whose holder is `free`. */
+  free: number;
+  /** Devices that report any holder at all. */
+  withHolder: number;
 }
 
 export function gpuSummary(rows: UtilizationRow[], status: Status | null, busyPercent: number): GpuSummary {
@@ -242,6 +280,8 @@ export function gpuSummary(rows: UtilizationRow[], status: Status | null, busyPe
     busy: readings.filter((v) => v >= busyPercent).length,
     meanPercent: readings.length ? readings.reduce((a, b) => a + b, 0) / readings.length : null,
     reserved,
+    free: devices.filter((d) => d.holder === "free").length,
+    withHolder: devices.filter((d) => d.holder !== null).length,
   };
 }
 
@@ -250,7 +290,26 @@ export function gpuStatusText(summary: GpuSummary): string {
     return summary.reserved ? `GPU ${summary.reserved} reserved` : "GPU idle";
   }
   const mean = summary.meanPercent === null ? "" : ` ${Math.round(summary.meanPercent)}%`;
+  if (summary.withHolder > 0) return `GPU ${summary.free}/${summary.total} free${mean}`;
   return `GPU ${summary.busy}/${summary.total} busy${mean}`;
+}
+
+/** The label a person reads for who holds a card (spec "Editor extension"). */
+export function holderLabel(device: Device, reservedByStatus: boolean): string {
+  switch (device.holder) {
+    case "letify":
+      return "letify reserved";
+    case "others":
+      return device.users.length ? `other users: ${device.users.join(", ")}` : "other users";
+    case "mine":
+      return "yours";
+    case "free":
+      return "free";
+    case "unknown":
+      return "unknown";
+    default:
+      return reservedByStatus ? "letify reserved" : "";
+  }
 }
 
 /** Whether letify's own status lists this device index as reserved on the alias. */
