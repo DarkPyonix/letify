@@ -203,6 +203,24 @@ def test_control_flow_on_a_tensor_value_reads_it(client) -> None:
     assert "tensor(" in repr(x)
 
 
+def test_the_active_client_is_readable_inside_forwarding(client) -> None:
+    assert forwarding.current_client() is client
+    with client.suspended():
+        assert forwarding.current_client() is None
+
+
+def test_an_operator_is_counted_when_dispatched_rather_than_when_sent(client, monkeypatch) -> None:
+    from letify.remoting.device import client as client_module
+
+    monkeypatch.setattr(client_module, "LINGER_S", 60.0)
+    x = torch.ones(4, device="cuda")
+    before = client.stats.snapshot()
+    x.add_(1.0)
+    delta = client.stats.snapshot() - before
+    assert delta.ops == 1
+    assert delta.batches == 0
+
+
 # -- Spec: Handles --------------------------------------------------------------
 
 

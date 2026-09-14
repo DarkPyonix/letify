@@ -21,6 +21,7 @@ _LAZY = {
     "worker_command": "client",
     "worker_source": "client",
     "RemoteTensor": "tensor",
+    "current_client": "cuda",
 }
 
 
@@ -40,6 +41,7 @@ __all__ = [
     "check_torch_version",
     "check_worker_version",
     "connect",
+    "current_client",
     "require_torch",
     "worker_command",
     "worker_source",

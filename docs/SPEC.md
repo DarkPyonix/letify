@@ -939,7 +939,7 @@ Autograd runs locally. Backward operators and optimizer steps reach `__torch_dis
 
 Inferred metadata is cached per operator. The key is the overload, the shape, strides, storage offset and dtype of every tensor argument, and every other argument's value, except that a float argument of a `_foreach_` operator is keyed by its type, because an optimizer passes per step values such as bias corrections there and they never change output metadata. A hit builds the outputs with `torch.empty_strided` on meta and returns an input where the first inference returned that input, so a training step that repeats its operators runs each meta kernel once. An operator whose arguments include a value that cannot be a key, such as a generator, is inferred every time.
 
-While forwarding is active, `RemoteTensor` is added to `torch.utils._foreach_utils._foreach_supported_types`, so an optimizer that picks its foreach path for CUDA tensors picks it here too and a step issues one operator per tensor list instead of one per parameter. A PyTorch without that list keeps the per parameter path.
+While forwarding is active, `RemoteTensor` is added to every `_foreach_supported_types` list PyTorch keeps, which in 2.5 is one in `torch.optim.optimizer` and one in `torch.utils._foreach_utils`, so an optimizer that picks its foreach path for CUDA tensors picks it here too and a step issues one operator per tensor list instead of one per parameter. A PyTorch without such a list keeps the per parameter path.
 
 `aten.detach` and `aten.alias` produce a new `RemoteTensor` sharing the same handle, with no operator sent. An in-place operator, or one writing to `out=`, returns the input it wrote to. Every other operator output gets a new handle.
 
@@ -992,7 +992,7 @@ The queue is sent when it holds 256 operators, when its oldest operator has wait
 
 A synchronization is one round trip. These synchronize: `Tensor.item()`, `tolist()`, `cpu()` and `to("cpu")`, `bool()`, `int()` and `float()` of a tensor, which includes control flow on a tensor value, `repr()` and `str()` of a tensor, copying a device tensor into a CPU tensor, an operator whose meta inference raised, the `torch.cuda` queries in [Mapping cuda](#mapping-cuda), `torch.cuda.synchronize()`, and the end of the declared function.
 
-The client counts operators, batches, round trips, released handles and metadata cache hits, so ops per round trip and synchronizations per step are read from the session rather than estimated.
+The client counts operators, batches, round trips, released handles and metadata cache hits, so ops per round trip and synchronizations per step are read from the session rather than estimated. An operator is counted when it is dispatched, not when its batch is sent. `letify.remoting.device.current_client()` returns the client of the innermost active forwarding, or None outside one, so code inside a `host="local"` function reads `current_client().stats`.
 
 ### Handles <!-- id: forwarding-handles -->
 

@@ -66,6 +66,7 @@ def worker_command(python: str) -> list[str]:
 class Stats:
     """What one client has done, counted."""
 
+    #: Operators and requests dispatched, counted when queued rather than when sent.
     ops: int = 0
     batches: int = 0
     round_trips: int = 0
@@ -168,6 +169,7 @@ class Client:
                 self._first_at = time.monotonic()
                 self._wake.notify()
             self._queue.append((*entry, base))
+            self.stats.ops += 1
             if (
                 len(self._queue) >= BATCH_OPS
                 or (state is not None and state.big)
@@ -207,7 +209,6 @@ class Client:
         except TransportClosed as exc:
             raise self._lose(str(exc)) from exc
         del keep
-        self.stats.ops += len(ops)
         self.stats.batches += 1
         self.stats.released += len(released)
         self.stats.sent_bytes += len(head) + sum(memoryview(b).nbytes for b in buffers)
@@ -224,6 +225,7 @@ class Client:
                 self._keep.extend(state.keep)
             for entry in entries:
                 self._queue.append((*entry, base))
+            self.stats.ops += len(entries)
             self._flush(reply=True)
             head, buffers = self._recv()
             self.stats.round_trips += 1

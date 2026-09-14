@@ -201,28 +201,48 @@ def mapped(client: Client) -> Iterator[None]:
     table = replacements(client)
     saved = _patch(table)
     _ACTIVE.append(table)
-    foreach_types = _foreach_types()
-    registered = foreach_types is not None and RemoteTensor not in foreach_types
-    if registered:
-        foreach_types.append(RemoteTensor)  # type: ignore[union-attr]
+    _CLIENTS.append(client)
+    registered = [types for types in _foreach_types() if RemoteTensor not in types]
+    for types in registered:
+        types.append(RemoteTensor)
     try:
         with CudaMode(client):
             yield
     finally:
-        if registered:
-            foreach_types.remove(RemoteTensor)  # type: ignore[union-attr]
+        for types in registered:
+            types.remove(RemoteTensor)
+        _CLIENTS.pop()
         _ACTIVE.pop()
         _restore(saved)
 
 
-def _foreach_types() -> list | None:
-    """The list optimizers read to decide whether a tensor type takes the foreach path."""
-    try:
-        from torch.utils import _foreach_utils
-    except ImportError:  # pragma: no cover - a PyTorch without the module
-        return None
-    found = getattr(_foreach_utils, "_foreach_supported_types", None)
-    return found if isinstance(found, list) else None
+#: The client of each active mapping, innermost last. None marks a suspended one.
+_CLIENTS: list[Client | None] = []
+
+
+def current_client() -> Client | None:
+    """The client of the innermost active forwarding, or None outside one."""
+    return _CLIENTS[-1] if _CLIENTS else None
+
+
+def _foreach_types() -> list[list]:
+    """Every list PyTorch reads to decide whether a tensor type takes the foreach path.
+
+    ``torch.optim.optimizer`` keeps its own list in some versions, 2.5 among them, and
+    ``torch.utils._foreach_utils`` keeps another, so both are found when present.
+    """
+    from importlib import import_module
+
+    found: list[list] = []
+    for module_name in ("torch.optim.optimizer", "torch.utils._foreach_utils"):
+        try:
+            module = import_module(module_name)
+        except ImportError:  # pragma: no cover - a PyTorch without the module
+            continue
+        types = getattr(module, "_foreach_supported_types", None)
+        if isinstance(types, list) and all(types is not other for other in found):
+            found.append(types)
+    return found
 
 
 @contextlib.contextmanager
@@ -235,10 +255,12 @@ def unmapped() -> Iterator[None]:
         return
     originals = {name: getattr(torch.cuda, name) for name in _ACTIVE[-1]}
     _restore(_ORIGINALS)
+    _CLIENTS.append(None)
     try:
         with _pop_mode_temporarily():
             yield
     finally:
+        _CLIENTS.pop()
         _patch(originals)
 
 
