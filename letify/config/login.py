@@ -746,8 +746,55 @@ def kaggle_account(answers: Answers) -> dict[str, Any]:
             f"the Kaggle token check exited {result.returncode}, so nothing was written: {detail}"
         )
     if url is not None:
+        try:
+            devices = kaggle_devices(answers.alias, url)
+        except LetifyError:
+            forget_files(answers.alias, written)
+            raise
         store_secret(answers.alias, KAGGLE_SESSION_URL, url)
+        if devices:
+            # Written by log_in as its own [<alias>.devices] table.
+            options["devices"] = devices
     return options
+
+
+#: Run on the session at a --connect login. It prints nvidia-smi rows, or a line saying why not.
+KAGGLE_DEVICE_SOURCE = (
+    "import shutil, subprocess\n"
+    "tool = shutil.which('nvidia-smi')\n"
+    "if tool is None:\n"
+    "    print('nvidia-smi is not on this Kaggle session')\n"
+    "else:\n"
+    "    found = subprocess.run([tool, '--query-gpu=index,name,memory.total',\n"
+    "                            '--format=csv,noheader'], capture_output=True, text=True)\n"
+    "    print(found.stdout if found.returncode == 0 else\n"
+    "          'nvidia-smi exited %d on this Kaggle session' % found.returncode)\n"
+)
+
+
+def kaggle_devices(alias: str, url: str) -> dict[str, dict[str, int]] | None:
+    """Read the session's GPUs once through a kernel letify creates and deletes.
+
+    Kaggle assigns the cards, so the table holds a count per name. A session with no GPU is
+    not an error: a note is printed and ``None`` returned.
+    """
+    from ..providers.kaggle import Session
+
+    session = Session(alias, url)
+    kernel = session.create_kernel()
+    try:
+        output = session.run(kernel, KAGGLE_DEVICE_SOURCE, 120)
+    finally:
+        session.delete_kernel(kernel)
+    rows = "\n".join(line.replace(", Tesla ", ", ") for line in output.splitlines())
+    groups = group_devices(rows)
+    if not groups:
+        reason = output.strip().splitlines()[-1] if output.strip() else "nvidia-smi listed no GPU"
+        print(f"{reason}. No devices table was written.")
+        return None
+    for group in groups:
+        print(group.describe())
+    return {group.name: {"count": len(group.indices)} for group in groups}
 
 
 def forget_files(alias: str, names: list[str]) -> None:
@@ -757,14 +804,16 @@ def forget_files(alias: str, names: list[str]) -> None:
         (directory / name).unlink(missing_ok=True)
 
 
-def register_session(answers: Answers, text: str) -> None:
-    """Replace the session URL of an already declared Kaggle account."""
+def register_session(answers: Answers, text: str) -> dict[str, dict[str, int]] | None:
+    """Replace the session URL of an already declared Kaggle account, and read its GPUs."""
     entry = tomllib.loads(text).get(answers.alias, {})
     if entry.get("kind", answers.kind) != "kaggle":
-        return
+        return None
     url = valid_session_url(answers.alias, str(answers.get("connect")))
+    devices = kaggle_devices(answers.alias, url)
     store_secret(answers.alias, KAGGLE_SESSION_URL, url)
     print(f"{answers.alias}: the Kaggle Jupyter Server session URL was replaced")
+    return devices
 
 
 #: The prompt for the token when ``--connect`` is not given.
@@ -919,7 +968,7 @@ def log_in(answers: Answers, *, project: str | Path | None = None) -> tuple[bool
         writer.update(home, answers.alias, options, private=True)
     else:
         if answers.get("connect"):
-            register_session(answers, existing)
+            devices = register_session(answers, existing)
         if answers.get("workspace"):
             change_workspace(answers, existing, home)
         if answers.get("detect_devices"):

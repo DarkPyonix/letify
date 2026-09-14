@@ -995,3 +995,153 @@ def patch_popen(monkeypatch):
         return started
 
     return patch
+
+
+# -- a Kaggle Jupyter Server session -------------------------------------------
+
+
+class FakeKaggleJupyter:
+    """The Jupyter REST API of a Kaggle Jupyter Server session, on loopback.
+
+    Answers ``/api/status``, kernel creation, lookup and deletion, the contents API and
+    ``/files`` with ``Range``, all requiring ``token`` in the query. Contents paths are
+    absolute paths of this machine, as ``/`` is the contents root on the session.
+    ``end_session()`` makes every later request answer 404, as an ended session does.
+    """
+
+    def __init__(self, token: str = "kaggle-session-token"):
+        import http.server
+        import threading
+        import uuid
+
+        self.token = token
+        self.requests: list[dict[str, Any]] = []
+        self.kernels: set[str] = set()
+        self.ended = False
+        self._lock = threading.Lock()
+        self._uuid = uuid
+        owner = self
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def log_message(self, *args: Any) -> None:
+                return None
+
+            def do_GET(self) -> None:
+                owner._handle(self, "GET")
+
+            def do_PUT(self) -> None:
+                owner._handle(self, "PUT")
+
+            def do_POST(self) -> None:
+                owner._handle(self, "POST")
+
+            def do_DELETE(self) -> None:
+                owner._handle(self, "DELETE")
+
+        self._server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self._server.daemon_threads = True
+        base = f"http://127.0.0.1:{self._server.server_address[1]}/k/123/proxy"
+        self.base = base
+        self.url = f"{base}?token={token}"
+        threading.Thread(target=self._server.serve_forever, daemon=True).start()
+
+    def close(self) -> None:
+        self._server.shutdown()
+        self._server.server_close()
+
+    def end_session(self) -> None:
+        self.ended = True
+
+    def _handle(self, handler: Any, method: str) -> None:
+        import urllib.parse
+
+        parsed = urllib.parse.urlsplit(handler.path)
+        query = dict(urllib.parse.parse_qsl(parsed.query))
+        length = int(handler.headers.get("Content-Length") or 0)
+        body = handler.rfile.read(length) if length else b""
+        path = urllib.parse.unquote(parsed.path).removeprefix("/k/123/proxy")
+        with self._lock:
+            self.requests.append(
+                {
+                    "method": method,
+                    "path": path,
+                    "query": query,
+                    "authorization": handler.headers.get("Authorization"),
+                }
+            )
+
+        def answer(status: int, payload: bytes = b"", extra: dict[str, str] | None = None) -> None:
+            handler.send_response(status)
+            for key, value in (extra or {}).items():
+                handler.send_header(key, value)
+            handler.send_header("Content-Length", str(len(payload)))
+            handler.end_headers()
+            handler.wfile.write(payload)
+
+        if self.ended:
+            return answer(404, b'{"message": "session not found"}')
+        if query.get("token") != self.token:
+            return answer(403, b'{"message": "forbidden"}')
+        if path == "/api/status" and method == "GET":
+            return answer(200, b'{"started": "2026-09-14T00:00:00Z"}')
+        if path == "/api/kernels" and method == "POST":
+            kernel = self._uuid.uuid4().hex
+            self.kernels.add(kernel)
+            return answer(201, json.dumps({"id": kernel, "name": "python3"}).encode())
+        if path.startswith("/api/kernels/"):
+            kernel = path.rsplit("/", 1)[-1]
+            if kernel not in self.kernels:
+                return answer(404, b'{"message": "no such kernel"}')
+            if method == "DELETE":
+                self.kernels.discard(kernel)
+                return answer(204)
+            return answer(200, json.dumps({"id": kernel}).encode())
+        if path.startswith("/api/contents/"):
+            local = Path("/") / path[len("/api/contents/") :]
+            if method == "PUT":
+                model = json.loads(body)
+                content = base64.b64decode(model["content"])
+                mode = "ab" if model.get("chunk") not in (None, 1) else "wb"
+                with open(local, mode) as handle:
+                    handle.write(content)
+                return answer(200, json.dumps({"path": str(local), "type": "file"}).encode())
+            if not local.is_file():
+                return answer(404, b'{"message": "no such file"}')
+            model = {"path": str(local), "type": "file", "size": local.stat().st_size}
+            return answer(200, json.dumps(model).encode())
+        if path.startswith("/files/") and method == "GET":
+            local = Path("/") / path[len("/files/") :]
+            if not local.is_file():
+                return answer(404, b"no such file")
+            data = local.read_bytes()
+            wanted = handler.headers.get("Range")
+            if wanted:
+                first, _, last = wanted.removeprefix("bytes=").partition("-")
+                start, end = int(first), min(int(last), len(data) - 1)
+                piece = data[start : end + 1]
+                return answer(206, piece, {"Content-Range": f"bytes {start}-{end}/{len(data)}"})
+            return answer(200, data)
+        return answer(400, b'{"message": "unexpected request"}')
+
+    def made(self, method: str, prefix: str) -> list[dict[str, Any]]:
+        return [r for r in self.requests if r["method"] == method and r["path"].startswith(prefix)]
+
+
+@pytest.fixture
+def fake_kaggle(isolated_home, monkeypatch, tmp_path: Path):
+    """A registered Kaggle session for alias ``kaggle_a``, with the adapter replaced.
+
+    The fake adapter in ``tests/fake_kaggle_adapter.py`` keeps the real adapter's contract and
+    runs each program in a local interpreter, so the driver programs are the real ones.
+    """
+    from letify.config.secrets import write_secret
+    from letify.providers import kaggle as kaggle_module
+
+    server = FakeKaggleJupyter()
+    write_secret("kaggle_a", "jupyter_url", server.url)
+    script = Path(__file__).with_name("fake_kaggle_adapter.py")
+    monkeypatch.setattr(kaggle_module, "adapter_command", lambda: [sys.executable, str(script)])
+    server.log = tmp_path / "kaggle-adapter.jsonl"
+    monkeypatch.setenv("FAKE_KAGGLE_LOG", str(server.log))
+    yield server
+    server.close()

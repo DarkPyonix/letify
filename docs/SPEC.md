@@ -110,7 +110,29 @@ These follow from the Kaggle Acceptable Use Policy, which forbids tools for circ
 
 - No keep-alive request is ever sent, and accounts are never rotated.
 - The accelerators are `CPU`, `P100`, `T4` and `TPU_V3_8`, a fixed list read without a network call.
-- Running a declared function on a Kaggle Jupyter Server session, and batch runs through `kaggle kernels push`, are not implemented. `open_channel` raises `UnsupportedMode` saying so.
+- Batch runs through `kaggle kernels push` are not implemented.
+
+#### Kaggle Jupyter Server session <!-- id: kaggle-session -->
+
+> A declared function runs on the Kaggle Jupyter Server session the user started, through the URL registered with `--connect`, one program per request over a one-shot channel.
+
+The user starts the session in the Kaggle editor with Run, Kaggle Jupyter Server, choosing the accelerator there, and registers its Colab Compatible URL. letify never starts, extends or stops that session, so `create_session` does nothing and `needs_lease` is false. An account with no `jupyter_url` raises `ConfigError` naming `letify login kaggle <alias> --connect <URL>` when a session would start.
+
+The URL is split into the server base, the URL without its query string, and the token, the `token` query parameter when present. Every REST request goes to `<base>/api/...` with `token=<token>` in the query and `Authorization: token <token>`, through the standard library HTTP client. The full URL and the token never appear in a message, a log or a command line; a message names only the host.
+
+1. **Start.** `open_channel` reads `<base>/api/status`. It then creates one kernel with `POST <base>/api/kernels` and body `{"name": "python3"}` and keeps its id for the runtime. `stop` deletes it with `DELETE <base>/api/kernels/<id>`, best effort.
+2. **A program.** Each program is run by the Kaggle adapter, `letify/providers/kaggle_adapter.py`, started by `uv run --no-project --python 3.13 --with "jupyter-kernel-client<1" python -P`. It receives the URL, the kernel id and the timeout in the environment variables `LETIFY_JUPYTER_URL`, `LETIFY_KERNEL_ID` and `LETIFY_TIMEOUT`, and the program source on standard input. It runs the source in that kernel and writes the kernel's `stdout` stream to its standard output and the `stderr` stream and any error traceback to its standard error. It exits 0 when the execution reply status is `ok`, 3 when the program raised, and 4 when the server could not be reached. The letify process never imports `jupyter_kernel_client`.
+3. **Failure.** Exit 3 raises `RuntimeFailure` carrying the adapter's standard error. Exit 4, any other exit, or a timeout makes the provider read `<base>/api/status` again. When that read fails or returns anything other than 200, `KaggleSessionEnded` is raised. It is a `RuntimeLost`, and its message says the session has ended, names the two usual causes (20 minutes idle, the 12 hour limit) and tells the user to start a new session with Run, Kaggle Jupyter Server and run `letify login kaggle <alias> --connect <new URL>`. When the status read still succeeds, `RuntimeFailure` is raised with the adapter's standard error.
+4. **Files.** `put_file`, `get_file` and `pack_dir` use the Jupyter contents API and `/files/<path>` exactly as the Colab fallback describes, with the Kaggle token authentication above instead of the Colab proxy token.
+5. **Environment.** The session builds the environment like any other runtime: uv is installed, and `uv sync` runs with this process's Python minor version, so the interpreter check compares like with like. The default workspace root is `/kaggle/working/letify`.
+
+No request is sent to keep the session alive. A session that Kaggle ends for being idle stays ended.
+
+#### Recording devices at login for Kaggle <!-- id: kaggle-login-devices -->
+
+> A `--connect` login runs `nvidia-smi --query-gpu=index,name,memory.total --format=csv,noheader` on the session once and writes a `count` per accelerator to `[<alias>.devices]`.
+
+It runs on a new kernel through the adapter, as a session program does, and the kernel is deleted afterwards. Names are normalized as for other providers after a leading `Tesla ` is removed, so `Tesla T4` is `T4` and `Tesla P100-PCIE-16GB` is `P100`. The table holds `NAME = { count = N }`, because Kaggle assigns the cards. When `nvidia-smi` is missing, fails or lists nothing, as on a CPU session, the login still succeeds, no table is written and a note says so. A session that cannot be reached fails the login with `KaggleSessionEnded` and writes nothing.
 
 `Shell` and its subclasses default to ephemeral because a machine's disk policy is not knowable in advance. Assuming ephemeral costs time, since letify rebuilds the environment each runtime and the work still succeeds; assuming persistent fails outright when the disk turns out to be wiped. A configuration entry overrides it with `persistent = true`.
 

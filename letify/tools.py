@@ -65,6 +65,18 @@ KAGGLE = Tool(
     pins=("kaggle>=2.2,<3",),
 )
 
+#: The environment the Kaggle adapter runs in. ``jupyter-kernel-client`` below 1.0 is the
+#: release whose ``KernelClient`` the Colab CLI also uses.
+KAGGLE_KERNEL = Tool(
+    package="jupyter-kernel-client",
+    executable="python",
+    python="3.13",
+    pins=("jupyter-kernel-client<1",),
+)
+
+#: The Kaggle adapter file, run by path so it needs nothing of letify's own environment.
+KAGGLE_ADAPTER = Path(__file__).parent / "providers" / "kaggle_adapter.py"
+
 #: Variables that would make the Kaggle CLI act as someone other than the account's files say.
 KAGGLE_OVERRIDES = ("KAGGLE_API_TOKEN", "KAGGLE_USERNAME", "KAGGLE_KEY", "KAGGLE_CONFIG_DIR")
 

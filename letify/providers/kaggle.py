@@ -12,16 +12,35 @@ starting a session raises ``UnsupportedMode`` rather than falling back to anythi
 from __future__ import annotations
 
 import json
+import os
 import subprocess
+import urllib.error
+import urllib.parse
+import urllib.request
 from collections.abc import Mapping
 from typing import TYPE_CHECKING, Any
 
 from .. import tools
+from ..config import ProviderConfig
 from ..config.secrets import account_directory
 from ..declare.instance import Host, Instance
-from ..errors import ProviderUnavailable, RuntimeFailure, UnsupportedMode
+from ..errors import (
+    ConfigError,
+    ProviderUnavailable,
+    RuntimeFailure,
+    RuntimeLost,
+    UnsupportedMode,
+)
 from .base import Provider
+from .colab_files import ContentsTransfer
 from .usage import Usage
+
+#: Seconds one REST request to the session may take.
+REST_TIMEOUT = 30
+
+#: A program's timeout when the caller gives none, and the adapter's extra allowance on top.
+DEFAULT_PROGRAM_TIMEOUT = 3600.0
+ADAPTER_GRACE = 60.0
 
 if TYPE_CHECKING:
     from ..runtime.channel import Channel
@@ -60,6 +79,139 @@ def parse_quota(output: str) -> dict[str, dict[str, Any]]:
         for row in rows
         if isinstance(row, dict) and row.get("resource")
     }
+
+
+class KaggleSessionEnded(RuntimeLost):
+    """The registered Kaggle Jupyter Server session no longer answers."""
+
+
+def session_url(alias: str) -> str | None:
+    """The Colab Compatible URL registered with ``--connect``, or None."""
+    path = account_directory(alias) / "jupyter_url"
+    if not path.is_file():
+        return None
+    return path.read_text(encoding="utf-8").strip() or None
+
+
+def split_url(url: str) -> tuple[str, str | None]:
+    """The server base, which is the URL without its query, and the ``token`` parameter."""
+    parts = urllib.parse.urlsplit(url)
+    base = urllib.parse.urlunsplit((parts.scheme, parts.netloc, parts.path.rstrip("/"), "", ""))
+    token = dict(urllib.parse.parse_qsl(parts.query)).get("token")
+    return base, token
+
+
+def adapter_command() -> list[str]:
+    """The argument list that starts the Kaggle adapter through uv."""
+    uv = tools.find_uv()
+    if uv is None:
+        raise ProviderUnavailable("kaggle", tools.missing_uv_message())
+    return tools.script_command(tools.KAGGLE_KERNEL, uv, tools.KAGGLE_ADAPTER)
+
+
+class JupyterTransfer(ContentsTransfer):
+    """The contents API of a plain Jupyter server, authenticated with its token."""
+
+    def _auth_query(self) -> dict[str, str]:
+        return {"token": self.token} if self.token else {}
+
+    def _auth_headers(self) -> dict[str, str]:
+        return {"Authorization": f"token {self.token}"} if self.token else {}
+
+
+class Session:
+    """The REST side of one Kaggle Jupyter Server session, through the standard library."""
+
+    def __init__(self, alias: str, url: str):
+        self.alias = alias
+        self._url = url
+        self.base, self.token = split_url(url)
+        self.host = urllib.parse.urlsplit(url).netloc
+
+    def _request(self, method: str, path: str, body: dict[str, Any] | None = None) -> bytes:
+        query = f"?{urllib.parse.urlencode({'token': self.token})}" if self.token else ""
+        data = json.dumps(body).encode() if body is not None else None
+        request = urllib.request.Request(f"{self.base}{path}{query}", data=data, method=method)
+        if self.token:
+            request.add_header("Authorization", f"token {self.token}")
+        if data is not None:
+            request.add_header("Content-Type", "application/json")
+        with urllib.request.urlopen(request, timeout=REST_TIMEOUT) as response:
+            return response.read()
+
+    def alive(self) -> bool:
+        """Whether ``/api/status`` answers 200."""
+        try:
+            self._request("GET", "/api/status")
+        except (urllib.error.URLError, OSError, ValueError):
+            return False
+        return True
+
+    def ended(self) -> KaggleSessionEnded:
+        return KaggleSessionEnded(
+            f"{self.alias}: the Kaggle Jupyter Server session at {self.host} has ended. Kaggle "
+            f"ends a session after 20 minutes idle or at its 12 hour limit. Start a new session "
+            f"in the Kaggle editor with Run, Kaggle Jupyter Server, then run: "
+            f"letify login kaggle {self.alias} --connect <new Colab Compatible URL>"
+        )
+
+    def create_kernel(self) -> str:
+        if not self.alive():
+            raise self.ended()
+        try:
+            reply = json.loads(self._request("POST", "/api/kernels", {"name": "python3"}))
+        except (urllib.error.URLError, OSError, ValueError) as exc:
+            if not self.alive():
+                raise self.ended() from None
+            raise RuntimeFailure(
+                f"{self.alias}: the Kaggle session at {self.host} refused a new kernel: "
+                f"{type(exc).__name__}"
+            ) from None
+        return str(reply["id"])
+
+    def delete_kernel(self, kernel: str) -> None:
+        """Best effort, because a session that already ended has no kernel to delete."""
+        try:
+            self._request("DELETE", f"/api/kernels/{urllib.parse.quote(kernel)}")
+        except (urllib.error.URLError, OSError, ValueError):
+            pass
+
+    def transfer(self) -> ContentsTransfer:
+        return JupyterTransfer(self.base, self.token or "")
+
+    def run(self, kernel: str, source: str, timeout: float | None) -> str:
+        """Run one program through the adapter and return its standard output."""
+        env = dict(os.environ)
+        env["LETIFY_JUPYTER_URL"] = self._url
+        env["LETIFY_KERNEL_ID"] = kernel
+        env["LETIFY_TIMEOUT"] = str(timeout or DEFAULT_PROGRAM_TIMEOUT)
+        process = subprocess.Popen(
+            adapter_command(),
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            env=env,
+        )
+        limit = (timeout or DEFAULT_PROGRAM_TIMEOUT) + ADAPTER_GRACE
+        try:
+            stdout, stderr = process.communicate(source, timeout=limit)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            stdout, stderr = process.communicate()
+            code = None
+        else:
+            code = process.returncode
+        if code == 0:
+            return stdout
+        if code == 3:
+            raise RuntimeFailure(
+                f"{self.alias}: a program raised on the Kaggle session", stderr=stderr
+            )
+        if not self.alive():
+            raise self.ended()
+        reason = "timed out" if code is None else f"exited {code}"
+        raise RuntimeFailure(f"{self.alias}: the Kaggle adapter {reason}", stderr=stderr)
 
 
 class Kaggle(Provider):
@@ -102,11 +254,46 @@ class Kaggle(Provider):
                 f"forwarding, so no device stream reaches the session. Use host='remote'."
             )
 
+    def __init__(self, config: ProviderConfig):
+        super().__init__(config)
+        #: The session and kernel id each runtime runs its programs in.
+        self._kernels: dict[str, tuple[Session, str]] = {}
+
     def open_channel(self, runtime: Runtime) -> Channel:
-        raise UnsupportedMode(
-            f"{self.alias}: running on a Kaggle Jupyter Server session is not available in "
-            f"this version of letify, only login and usage are"
+        """A one-shot channel whose programs run in a new kernel of the registered session."""
+        from ..runtime.channel import OneShotChannel
+        from .colab_files import ColabFiles
+
+        url = session_url(self.alias)
+        if url is None:
+            raise ConfigError(
+                f"{self.alias} has no Kaggle Jupyter Server session registered. Start one in the "
+                f"Kaggle editor with Run, Kaggle Jupyter Server, then run: "
+                f"letify login kaggle {self.alias} --connect <Colab Compatible URL>"
+            )
+        session = Session(self.alias, url)
+        kernel = session.create_kernel()
+        self._kernels[runtime.name] = (session, kernel)
+
+        def run(source: str, timeout: float | None) -> str:
+            return session.run(kernel, source, timeout)
+
+        files = ColabFiles(
+            self.alias,
+            runtime.name,
+            run,
+            workspace=self.workspace_root,
+            transfer=session.transfer,
         )
+        return OneShotChannel(run, name=runtime.name, files=files)
+
+    def stop(self, runtime: Runtime) -> None:
+        """Delete the kernel letify created. The session itself is the user's and keeps running."""
+        held = self._kernels.pop(runtime.name, None)
+        if held is None:
+            return
+        session, kernel = held
+        session.delete_kernel(kernel)
 
     def _secrets(self) -> list[str]:
         """Values in the account's credential files, to hide from error output."""
@@ -169,4 +356,17 @@ class Kaggle(Provider):
         )
 
 
-__all__ = ["GPUS", "QUOTA", "TPUS", "Kaggle", "hours", "parse_quota"]
+__all__ = [
+    "GPUS",
+    "QUOTA",
+    "TPUS",
+    "JupyterTransfer",
+    "Kaggle",
+    "KaggleSessionEnded",
+    "Session",
+    "adapter_command",
+    "hours",
+    "parse_quota",
+    "session_url",
+    "split_url",
+]
