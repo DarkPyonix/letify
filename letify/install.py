@@ -1,7 +1,7 @@
 """Finding and, after the user confirms, installing the external tools letify runs.
 
 Owns the lookup of ``tailcat`` and ``eci`` (project environment, per-version cache,
-``PATH``), the confirmation question, the verified download of each tool's pinned GitHub
+``PATH``), the automatic install and its switch, the verified download of each tool's pinned GitHub
 release from its publisher into ``~/.letify/tools/<tool>/<version>/``, safe extraction,
 and linking the cached tool into the project's virtual environment. Spec "Installing
 external tools".
@@ -23,6 +23,7 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import tomllib
 import urllib.request
 import zipfile
 from collections.abc import Callable
@@ -145,18 +146,22 @@ def _bin_directory(environment: Path) -> Path:
     return environment / ("Scripts" if host()[0] == "Windows" else "bin")
 
 
-def can_ask() -> bool:
-    """Whether a question may be asked: a terminal on standard input and no ``CI``."""
+def auto_install_enabled() -> bool:
+    """``LETIFY_AUTO_INSTALL`` when set, else ``auto_install`` in the home file, else on."""
+    value = os.environ.get("LETIFY_AUTO_INSTALL")
+    if value is not None:
+        return value.strip().lower() not in ("0", "false", "no")
+    home_file = Path.home() / ".letify" / "config.toml"
     try:
-        terminal = sys.stdin is not None and sys.stdin.isatty()
-    except (AttributeError, ValueError):
-        return False
-    return terminal and not os.environ.get("CI")
+        settings = tomllib.loads(home_file.read_text(encoding="utf-8"))
+    except (OSError, tomllib.TOMLDecodeError):
+        return True
+    return settings.get("auto_install") is not False
 
 
-def read_answer(prompt: str) -> str:
-    print(prompt, end="", file=sys.stderr, flush=True)
-    return sys.stdin.readline().strip()
+def log(message: str) -> None:
+    """One ``letify:`` line on standard error, as connection decision lines are."""
+    print(f"letify: {message}", file=sys.stderr, flush=True)
 
 
 # -- lookup ------------------------------------------------------------------------
@@ -400,6 +405,7 @@ def install(tool: str, *, say: Say = _say) -> Path:
         return Path(found) if found else Path("tailcat")
 
     asset = asset_for(tool)
+    log(f"installing {tool} {version_of(tool)} from {asset.url} into {cache_path(tool).parent}")
     data = _download(asset.url)
     checksums = _download(asset.checksums_url).decode("utf-8", "replace")
     verify(asset, data, checksums)
@@ -432,42 +438,32 @@ def install(tool: str, *, say: Say = _say) -> Path:
     return final / binary
 
 
-# -- asking ------------------------------------------------------------------------
-
-
-def question(tool: str) -> str:
-    version = version_of(tool)
-    if tool == "tailcat":
-        return (
-            f"Install tailcat {version} from Tailscale's GitHub release into ~/.letify/tools? "
-            "tailcat is Tailscale's program and not part of letify. [y/N] "
-        )
-    return (
-        f"eci is not installed. Install eci {version} from Elice's GitHub release into "
-        "~/.letify/tools? eci is Elice's program and not part of letify or covered by its "
-        "license. [y/N] "
-    )
+# -- installing on need -------------------------------------------------------------
 
 
 def setup_hint(tool: str) -> str:
-    return f"Or let letify install it: letify setup {tool} --yes"
+    return f"Install it with: letify setup {tool}"
 
 
-def confirmed(tool: str) -> bool:
-    return read_answer(question(tool)).strip().lower() in ("y", "yes")
+def install_and_link(tool: str, *, say: Say = _say) -> str:
+    """Install into the cache, link into the project, log the result, return the path."""
+    installed = install(tool, say=say)
+    if installed.parent.parent.parent != tools_home():
+        return str(installed)
+    path = link(tool, say=say)
+    pinned = asset_for(tool).pinned
+    log(f"{tool} {version_of(tool)} verified sha256 {pinned}, linked at {path}")
+    return path
 
 
-def ensure(tool: str, *, interactive: bool, instructions: str, say: Say = _say) -> str:
-    """The command to run ``tool`` by, installing it when the user says yes."""
+def ensure(tool: str, *, instructions: str, say: Say = _say) -> str:
+    """The command to run ``tool`` by, installing it first when automatic install is on."""
     found = find(tool, say=say)
     if found is not None:
         return found
-    if not (interactive and can_ask() and confirmed(tool)):
+    if not auto_install_enabled():
         raise InstallError(f"{instructions}\n\n{setup_hint(tool)}")
-    installed = install(tool, say=say)
-    if installed.parent.parent.parent == tools_home():
-        return link(tool, say=say)
-    return str(installed)
+    return install_and_link(tool, say=say)
 
 
 def where(tool: str) -> list[tuple[str, str]]:

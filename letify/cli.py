@@ -147,12 +147,9 @@ def build_parser() -> argparse.ArgumentParser:
     efficiency.add_argument("--json", action="store_true", help="print the record unformatted")
 
     setup_parser = sub.add_parser(
-        "setup", help="install tailcat or eci from its publisher, after you confirm"
+        "setup", help="install tailcat or eci from its publisher ahead of time"
     )
     setup_parser.add_argument("tool", choices=("tailcat", "eci"), help="the tool to install")
-    setup_parser.add_argument(
-        "--yes", action="store_true", help="install without asking, for scripts"
-    )
     setup_parser.add_argument(
         "--where", action="store_true", help="print where the tool is and which copy letify uses"
     )
@@ -194,9 +191,7 @@ def _client_shell_connect(args: argparse.Namespace) -> int:
 
     if args.tailcat == "tailcat":
         try:
-            args.tailcat = ensure(
-                "tailcat", interactive=True, instructions=setup.tailcat_install_instructions()
-            )
+            args.tailcat = ensure("tailcat", instructions=setup.tailcat_install_instructions())
         except InstallError as exc:
             _fail(str(exc))
             return 1
@@ -265,11 +260,8 @@ def _setup_tool(args: argparse.Namespace) -> int:
     version = install.version_of(tool)
     found = install.find(tool)
     if found is None:
-        if not (args.yes or (install.can_ask() and install.confirmed(tool))):
-            _fail(f"{tool} was not installed. {install.setup_hint(tool)}")
-            return 1
         try:
-            install.install(tool)
+            install.install_and_link(tool)
         except install.InstallError as exc:
             _fail(str(exc))
             return 1

@@ -379,7 +379,9 @@ def test_a_missing_tool_is_installed_on_first_need_and_both_steps_are_logged(
     lines = [line for line in capsys.readouterr().err.splitlines() if line.startswith("letify: ")]
     version = setup.TAILCAT_VERSION
     assert len(lines) == 2
-    assert f"installing tailcat {version} from {releases.url}/v{version}/{TAILCAT_ASSET}" in lines[0]
+    assert (
+        f"installing tailcat {version} from {releases.url}/v{version}/{TAILCAT_ASSET}" in lines[0]
+    )
     assert str(cached("tailcat", version).parent) in lines[0]
     archive_digest = install.TAILCAT_SHA256[TAILCAT_ASSET]
     assert f"verified sha256 {archive_digest}, linked at {path}" in lines[1]

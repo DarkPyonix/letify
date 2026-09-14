@@ -558,7 +558,7 @@ def elice_account(answers: Answers) -> dict[str, Any]:
     from ..providers import elice
 
     try:
-        binary = elice.find_eci(interactive=answers.interactive)
+        binary = elice.find_eci()
     except LetifyError as exc:
         raise LoginError(str(exc)) from None
     given = answers.get("endpoint")
@@ -761,7 +761,6 @@ def tunnel_account(answers: Answers) -> dict[str, Any]:
     try:
         tailcat = ensure(
             "tailcat",
-            interactive=answers.interactive,
             instructions=setup.tailcat_install_instructions(),
         )
     except InstallError as exc:
