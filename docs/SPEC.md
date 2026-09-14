@@ -273,7 +273,7 @@ A frame is a header followed by `length` payload bytes. The header is `struct.St
 | 6 | `STDERR` | worker to client | raw bytes the worker wrote to file descriptor 2 |
 | 7 | `SHUTDOWN` | client to worker | empty. The worker exits |
 
-Streams multiplex the one pipe pair. Stream 0 carries `HELLO`, `STDOUT`, `STDERR` and `SHUTDOWN`. Each request takes the next odd stream id from 1 upward, and its `REQUEST`, its `REPLY` and the `DATA` frames of both use that id.
+Streams multiplex the one pipe pair. Stream 0 carries `HELLO`, `STDOUT`, `STDERR` and `SHUTDOWN`. Each request takes the next odd stream id from 1 upward, and its `REQUEST`, its `REPLY` and the `DATA` frames of both use that id. Stream 2 carries the PyTorch device executor's messages, as [Transport](#forwarding-transport) describes.
 
 A message is one Python object. It is pickled with protocol 5 and a `buffer_callback`, so every `PickleBuffer` inside it, such as a `bytearray`, a `bytes` value of 1 MiB or more at the top level or inside a list, tuple or dict, or a NumPy array, becomes an out-of-band buffer instead of being copied into the pickle. The head frame's payload is `<I>` buffer count, `<Q>` length of each buffer, then the pickle. The buffers follow in order as `DATA` frames of at most 8 MiB each. The sender writes each frame with `os.write` on a `memoryview` of the buffer, so no joined copy is made. The receiver preallocates one buffer per out-of-band buffer and fills it with `readinto`, then unpickles with `buffers=`. The high bit of a buffer's 8 byte length marks a buffer that unpickles as a `bytes` value. For such a buffer the receiver allocates an uninitialized `bytes` object of that length with `PyBytes_FromStringAndSize(NULL, n)` through `ctypes` and reads into it, so the unpickled value is that object and no copy is made. Where `ctypes` is unavailable it reads into a `bytearray` and `bytes()` copies it once. Any other buffer is read into a `bytearray`. Peak memory for a `bytes` value is therefore one copy on each side.
 
@@ -978,17 +978,18 @@ Without `python`, a `shell`, `tunnel`, `colab` or `elice` account starts its boo
 
 > `host="local"` runs the user's PyTorch code here and executes its operators on the runtime's GPU, through PyTorch's own `__torch_dispatch__` extension point.
 
-Five modules, all in `letify/remoting/device/`:
+Six modules, all in `letify/remoting/device/`:
 
 | Module | Holds |
 |---|---|
 | `tensor.py` | `RemoteTensor`, the local stand-in for a tensor on the runtime, and operator dispatch |
 | `cuda.py` | The mapping of `"cuda"` onto the runtime's device and the `torch.cuda` functions letify provides |
 | `client.py` | The operator queue, handles, synchronization and error reporting |
-| `frames.py` | The `Transport` interface and its stream implementation |
-| `executor.py` | The worker that runs operators on real tensors keyed by handle |
+| `trace.py` | Step capture: the trace, detection, and matching a repetition against a step |
+| `frames.py` | The `Transport` interface, its stream implementation and its channel implementation |
+| `executor.py` | The worker that runs operators and steps on real tensors keyed by handle |
 
-`frames.py` and `executor.py` import the standard library and PyTorch only, because their source is sent to the runtime ahead of the worker start, where letify may be absent or older.
+`frames.py` and `executor.py` import the standard library, `wire.py` and PyTorch only, because their source is sent to the runtime ahead of the executor start, where letify may be absent or older.
 
 ### Dispatch mechanism <!-- id: dispatch-mechanism -->
 
@@ -998,15 +999,23 @@ The meta tensor carries shape, dtype, strides and storage offset, so every opera
 
 PrivateUse1 is not used. On torch 2.5.1 a wrapper tensor on a device renamed through `torch.utils.rename_privateuse1_backend` aborts the process in autograd, because no device guard can be registered from Python. On torch 2.14.0 `torch.utils.backend_registration._setup_privateuseone_for_python_backend` registers one, and backward still fails an internal assert in the autograd engine's device queues. A wrapper subclass reporting `cuda` aborts the same way on a CPU build. The meta wrapper runs forward and backward on both versions. The probe is in the pull request.
 
-The `meta` device is an implementation detail. Through `__torch_function__`, a `RemoteTensor` reports `device` as `cuda:0`, `is_cuda` as `True` and `get_device()` as `0`, which is what code written for CUDA reads.
+The `meta` device is an implementation detail. The `TorchFunctionMode` of [Mapping cuda](#mapping-cuda) answers `device` as `cuda:0`, `is_cuda` as `True` and `get_device()` as `0` for a `RemoteTensor`, which is what code written for CUDA reads. `RemoteTensor` disables its own `__torch_function__`, so a tensor method enters Python once, in the mode, instead of twice.
 
 Autograd runs locally. Backward operators and optimizer steps reach `__torch_dispatch__` like forward ones, so they are queued and executed on the runtime the same way. A tensor that requires grad on the runtime never exists: the runtime holds values only.
 
-Inferred metadata is cached per operator. The key is the overload, the shape, strides, storage offset and dtype of every tensor argument, and every other argument's value, except that a float argument of a `_foreach_` operator is keyed by its type, because an optimizer passes per step values such as bias corrections there and they never change output metadata. A hit builds the outputs with `torch.empty_strided` on meta and returns an input where the first inference returned that input, so a training step that repeats its operators runs each meta kernel once. An operator whose arguments include a value that cannot be a key, such as a generator, is inferred every time.
+Inferred metadata is cached per operator. Every `RemoteTensor` carries its signature, the shape, strides, storage offset and dtype, and builds its meta tensor only when an inference needs one. One pass over an operator's arguments reads three things:
+
+| Part | Holds |
+|---|---|
+| structure | the overload, the signature of every tensor argument, the type of every `int` and `float` argument, and the value of every other argument |
+| scalars | the values of the `int` and `float` arguments, in order |
+| handles | the handles of the `RemoteTensor` arguments, in order |
+
+The metadata key is the structure plus the scalars, except that a float argument of a `_foreach_` operator is left out, because an optimizer passes per step values such as bias corrections there and they never change output metadata. A hit builds the outputs with `_make_wrapper_subclass` from the recorded signatures and returns an input where the first inference returned that input, so a training step that repeats its operators runs each meta kernel once. An operator whose arguments include a value that cannot be a key, such as a generator, is inferred every time.
 
 While forwarding is active, `RemoteTensor` is added to every `_foreach_supported_types` list PyTorch keeps, which in 2.5 is one in `torch.optim.optimizer` and one in `torch.utils._foreach_utils`, so an optimizer that picks its foreach path for CUDA tensors picks it here too and a step issues one operator per tensor list instead of one per parameter. A PyTorch without such a list keeps the per parameter path.
 
-`aten.detach` and `aten.alias` produce a new `RemoteTensor` sharing the same handle, with no operator sent. An in-place operator, or one writing to `out=`, returns the input it wrote to. Every other operator output gets a new handle.
+`aten.detach` and `aten.alias` are recognized before the arguments are read, and produce a new `RemoteTensor` sharing the same handle, with no operator sent. An in-place operator, or one writing to `out=`, returns the input it wrote to. Every other operator output gets a new handle.
 
 A plain CPU tensor passed to an operator travels with it as a buffer and is a CPU tensor on the runtime, so a zero-dimensional CPU scalar mixes with device tensors as it does in PyTorch. A CPU tensor larger than 4 KiB flushes the queue immediately after its operator, so a later write to it in this process cannot change what the runtime received.
 
@@ -1039,27 +1048,55 @@ These `torch.cuda` functions are replaced while the function runs, and restored 
 
 ### The device worker <!-- id: device-worker -->
 
-> One Python process per session on the runtime, in the project's environment, executing ATen operators on tensors keyed by integer handle.
+> One executor per session, running in a thread of the session's call worker, executing ATen operators on tensors keyed by integer handle.
 
-It is started with the interpreter the session built: the project `.venv` from [Building the environment on a runtime](#remote-uv-sync) on a remote machine, the account's `python` where one is named, and this interpreter on `Local`. The command is `python -u -c <stub>`, and the stub reads a length-prefixed source from standard input and executes it, as [Channels](#channels) describes for the call worker. The process sees only the session's cards, through `CUDA_VISIBLE_DEVICES`. It uses `cuda` where the instance has a GPU and `cpu` otherwise, so the same executor is exercised on a machine without one.
+The call worker already runs the interpreter the session built: the project `.venv` from [Building the environment on a runtime](#remote-uv-sync) on a remote machine, the account's `python` where one is named, and this interpreter on `Local`. It already sees only the session's cards, because `CUDA_VISIBLE_DEVICES` is set in its environment before any code imports a CUDA library. The client starts the executor with a `device` request naming `cuda` where the instance has a GPU and `cpu` otherwise, so the same executor is exercised on a machine without one. The request's source is `wire.py`, `frames.py` and `executor.py`, executed once per worker process. From then on the executor's messages travel on the call worker's channel as [Transport](#forwarding-transport) describes, so a session keeps one connection to the account.
 
-On a `Shell` provider the worker runs over the account's link, as a second command beside the call worker. Standard output carries frames only: the worker moves Python's `sys.stdout` onto standard error before executing anything.
+`connect` starts an executor as a process of its own instead, with the command `python -u -c <stub>`, where the stub reads a length-prefixed source from standard input and executes it, as [Channels](#channels) describes for the call worker. Standard output then carries frames only: that process moves Python's `sys.stdout` onto standard error before executing anything. The test suite uses it to reach the executor without a session.
 
 The worker's first message names its device, the device name, and its PyTorch version. The client refuses a worker whose PyTorch major.minor differs from its own, because ATen operator schemas change between minor versions.
 
 An operator is named by its overload, such as `aten.addmm.default`, and resolved on the runtime through `torch.ops` once per name.
 
+### Operator templates <!-- id: forwarding-templates -->
+
+> Each distinct operator structure is described to the worker once, and every later call of it travels as a template number with its handles, scalars and blobs.
+
+The client numbers structures, as [Dispatch mechanism](#dispatch-mechanism) defines them, from 1 in the order they are first dispatched. A structure's first use puts its definition in the batch ahead of the entry that uses it: the overload name and the argument layout, where each tensor argument is a handle position, each `int` or `float` a scalar position, each CPU tensor a blob position, and every other value is kept as it is. An eager entry is `(template, handles, scalars, blobs, outputs, want)`, where `outputs` holds a new handle for each tensor output and None for an output that is one of the inputs.
+
+The worker turns each definition into one generated Python function that builds the positional and keyword arguments from the three lists, so an entry is executed with one call to build its arguments and one to run the operator. Requests such as a fetch, a seed or a memory query keep their `letify.` names.
+
 ### Batching and synchronization <!-- id: forwarding-batching -->
 
 > Operators are queued locally and sent without waiting. Only a read of a value waits for the runtime.
 
-The queue is sent when it holds 256 operators, when its oldest operator has waited 2 ms, or at a synchronization. A send never waits for a reply.
+The queue is sent when it holds 256 entries, when its oldest entry has waited 2 ms, or at a synchronization. A send never waits for a reply.
 
-The dispatching thread does the sending: it sends an aged queue when it queues the next operator. A background thread sends only a queue that nothing has been added to for 50 ms, so operators do not wait behind idle time between steps. Sending from a background thread on every age would take the GIL from the dispatching thread once per batch, and on a busy machine that doubled local dispatch time.
+The dispatching thread appends an entry without taking a lock. When the queue is due, the dispatching thread pickles the batch and hands the bytes to a sender thread, which writes them. A full pipe or SSH buffer therefore blocks the sender thread, never the step, and the dispatching thread holds the GIL only for the pickling. A background thread sends only a queue that nothing has been added to for 50 ms, so operators do not wait behind idle time between steps, and it never sends the unfinished part of a captured step, which [Step capture](#forwarding-step-capture) leaves to the dispatching thread.
 
 A synchronization is one round trip. These synchronize: `Tensor.item()`, `tolist()`, `cpu()` and `to("cpu")`, `bool()`, `int()` and `float()` of a tensor, which includes control flow on a tensor value, `repr()` and `str()` of a tensor, copying a device tensor into a CPU tensor, an operator whose meta inference raised, the `torch.cuda` queries in [Mapping cuda](#mapping-cuda), `torch.cuda.synchronize()`, and the end of the declared function.
 
-The client counts operators, batches, round trips, released handles and metadata cache hits, so ops per round trip and synchronizations per step are read from the session rather than estimated. An operator is counted when it is dispatched, not when its batch is sent. `letify.remoting.device.current_client()` returns the client of the innermost active forwarding, or None outside one, so code inside a `host="local"` function reads `current_client().stats`.
+A read of one tensor's value sends only what that value depends on when that can be decided from the queue alone. If the tensor was created by a queued eager entry and no entry after it is an in-place operator, whose overload name ends in `_`, or writes to `out=`, the entries up to and including that one are sent with the read, and the rest stay queued in order. If the tensor was created before the queue and nothing in the queue is in-place, the read is sent alone. Otherwise the whole queue, the unfinished part of a captured step included, is sent with the read. `torch.cuda.synchronize()` and the end of the declared function always send everything.
+
+The client counts operators, batches, round trips, released handles, metadata cache hits, captured steps and replayed operators, so ops per round trip and synchronizations per step are read from the session rather than estimated. An operator is counted when it is dispatched, not when its batch is sent, and a replayed operator counts as an operator too. `letify.remoting.device.current_client()` returns the client of the innermost active forwarding, or None outside one, so code inside a `host="local"` function reads `current_client().stats`.
+
+### Step capture <!-- id: forwarding-step-capture -->
+
+> A sequence of operators that repeats is registered with the worker once as a step, and each later repetition is queued as one entry naming the step and carrying only its handles, scalars and blobs.
+
+A step is what a training loop repeats: forward, backward and the optimizer update. Backward and foreach optimizer operators reach `__torch_dispatch__` like forward ones, so they are traced and replayed the same way, and nothing about autograd or the optimizer is special cased. The local side of a replayed operator is unchanged: its outputs are built from the metadata cache, so autograd sees the same tensors it sees eagerly.
+
+**Trace.** Every eagerly dispatched operator appends a trace key: its template number and, for each tensor argument, the distance back in operators to the operator that created that handle together with the output position, or `external` when the handle was created more than 4096 operators back or not by a traced operator. Scalars and blobs are not in the trace key, so the bias corrections an optimizer passes and the bounds of a batch slice vary without breaking a repetition. Requests are not traced and do not break the trace. An operator run at once because its meta inference raised ends the trace, and tracing starts again after it.
+
+**Detection.** When an operator's trace key occurred earlier at a distance `P` of at least 8 and at most 4096 operators, and the last `P` trace keys equal the `P` before them, the last `P` operators are a step. A step is therefore registered after it has run eagerly twice in a row. A step records, for each operator, its template, the signatures of its outputs, and for each tensor argument either the offset of its handle among the handles the repetition creates or `external`. Its definition goes into the next batch. A step equal to one already registered keeps that number.
+
+**Replay.** After a step is registered, each dispatched operator is compared with the step's next one. It matches when its template is the same, its output signatures from the metadata cache are the same, and each tensor argument was created at the expected offset in this repetition, or before this repetition began where the step expects `external`. A matching operator builds its outputs as eager dispatch does, taking handles from the same counter, so a repetition's new handles are one consecutive range, and it adds its external handles, scalars and blobs to the repetition. Nothing is queued per operator. When the last operator matches, one entry `(step, first handle, start, stop, externals, scalars, blobs)` is queued and the next repetition begins with the next operator.
+
+**Fallback.** An operator that does not match ends the repetition. The operators matched so far are queued as an entry with `stop` at the mismatch, and the mismatching operator is dispatched eagerly and starts a new trace. A shape that changes mid-run, a different operator, an argument from a different producer, and an inference that raises are all mismatches. The runtime has executed nothing of the repetition before its entry arrives, so a fallback runs every operator exactly once, in dispatch order, and values are the same as eager.
+
+**Partial sends.** A synchronization during a repetition, and a matched operator carrying a CPU tensor larger than 4 KiB, queue the repetition so far as an entry and send the queue; the repetition then continues with `start` at the next operator and the same first handle. A handle created in a repetition and released before its entry is queued stays in the release list until the entry is queued.
+
+**Worker.** The worker executes operators `start` to `stop - 1` of the step in order, reading an argument's handle as `first handle + offset` or from `externals`, and stores each new output under the next handle counted from `first handle`. Each operator is the same call an eager entry makes, so a failure is recorded and reported as [Failure semantics](#forwarding-failure) describes, naming the operator. The worker does not use CUDA graphs, because the handles bound to a step, such as the batch, change between repetitions and a graph needs fixed input memory.
 
 ### Handles <!-- id: forwarding-handles -->
 
@@ -1086,7 +1123,9 @@ class Transport(Protocol):
 
 `head` is a pickled message whose tensors are replaced by buffer indices. `buffers` are written in order without being joined to the head.
 
-`StreamTransport` implements it over a readable and a writable file descriptor, such as the worker's pipes or an SSH command's. A message is an 8 byte little-endian head length, a 4 byte buffer count, an 8 byte length per buffer, the head, then the buffers. It is written with `os.writev` and read with `readinto` into buffers sized from the lengths.
+Both implementations put the frames of [Frames](#frames) on the wire: a message is a head frame, `REQUEST` from client to executor and `REPLY` back, whose payload is the buffer count, the buffer lengths and `head`, followed by the buffers as `DATA` frames written from the caller's memory and read into preallocated buffers. Device messages use stream 2, which no call uses because calls take odd stream ids.
+
+`ChannelTransport` implements it on a session's persistent channel, beside the calls. The channel's reader hands every stream 2 reply to the transport, and the call worker's frame reader hands every stream 2 request to the executor thread. `StreamTransport` implements it over a readable and a writable file descriptor, for an executor started by `connect`.
 
 ### Failure semantics <!-- id: forwarding-failure -->
 
@@ -1136,7 +1175,6 @@ Linux wheels are built inside the `manylinux_2_28` containers, so the binaries n
 > Implemented and unimplemented, stated plainly so nobody builds on a promise.
 
 - **PyTorch forwarding misses its step time on a short GPU step.** On dept_gpu the benchmark step takes a median 3.45 ms under `host="local"` against 1.70 ms directly, with a p99 near 20 ms, reading the loss once per 50 steps. The measurement is in [NETWORK.md](NETWORK.md#pytorch-forwarding-on-dept_gpu). The client was contended, so the dispatch cost `d` on an idle machine is not yet measured.
-- **The device worker has its own SSH process and does not ride the call channel's binary frames.** `StreamTransport` is written to the `Transport` interface so it can move onto a stream of the persistent channel without changing the client or the executor.
 - **PyTorch forwarding covers one device per session and no CUDA streams, events, graphs or generator state.** Custom CUDA extensions and Triton kernels compiled in this process cannot run, because nothing here compiles for the runtime's GPU. `torch.compile` is untested.
 - **`Modal` and `Elice` are not exercised against the live services.** Their code follows each service's published interface, and the Elice paths come from Elice's own Terraform provider, but neither has been run end to end. The Modal adapter's calls were checked against the signatures of Modal 1.5.5, and `letify login modal` has not been run against Modal's sign in.
 - **The connection pipeline is not exercised against live networks.** `Rendezvous`, `Strategy`, `Link`, `Probe`, `Pipeline`, `LinkCache` and the remote agent are implemented and tested over loopback sockets and faked commands. Installing and starting `sshd` on a Colab VM over `colab exec` is not yet checked against a live runtime.
