@@ -448,6 +448,73 @@ def test_a_dataloader_with_pin_memory_feeds_non_blocking_uploads(monkeypatch) ->
         connected.close()
 
 
+# -- Spec: Compilation --------------------------------------------------------------
+
+
+def test_torch_compile_returns_the_module_and_warns_that_it_runs_eagerly(
+    client, monkeypatch
+) -> None:
+    import warnings
+
+    from letify.remoting.device import cuda as mapping
+
+    _forbid_local_cuda(monkeypatch)
+    monkeypatch.setattr(mapping, "_COMPILE_WARNED", [False])
+    model = torch.nn.Linear(4, 2).cuda()
+    with pytest.warns(UserWarning, match="host='local'"):
+        compiled = torch.compile(model)
+    assert compiled is model
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        decorate = torch.compile(mode="max-autotune")
+
+        def function(x):
+            return x * 2
+
+        assert decorate(function) is function
+        assert torch.compile(function, fullgraph=True) is function
+        assert model.compile() is None
+    x = torch.ones(3, 4, device="cuda")
+    assert torch.equal(compiled(x).cpu(), model(x).cpu())
+
+
+def test_a_compiled_training_loop_matches_the_same_loop_run_eagerly(client) -> None:
+    def train(compile_it):
+        torch.manual_seed(0)
+        model = torch.nn.Sequential(
+            torch.nn.Linear(8, 16), torch.nn.GELU(), torch.nn.Linear(16, 4)
+        ).cuda()
+        forward = torch.compile(model) if compile_it else model
+        optimizer = torch.optim.AdamW(model.parameters(), lr=1e-2)
+        data = torch.randn(6, 8)
+        losses = []
+        for _ in range(4):
+            loss = torch.nn.functional.mse_loss(forward(data.cuda()), torch.zeros(6, 4).cuda())
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+            losses.append(loss.item())
+        return losses
+
+    import warnings
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        assert train(True) == train(False)
+
+
+def test_torch_compile_is_restored_when_forwarding_ends() -> None:
+    original, method = torch.compile, torch.nn.Module.compile
+    connected = forwarding.connect(forwarding.worker_command(sys.executable), device="cpu")
+    try:
+        with connected.activate():
+            assert torch.compile is not original
+        assert torch.compile is original
+        assert torch.nn.Module.compile is method
+    finally:
+        connected.close()
+
+
 def _child_view(queue) -> None:
     import torch
 

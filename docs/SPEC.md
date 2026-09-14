@@ -1241,6 +1241,17 @@ Pinned memory exists so the CUDA driver can copy to the device asynchronously. N
 | `torch.accelerator.set_device_index(i)`, `torch.accelerator.set_device_idx(i)` | Accepted for device 0, `UnsupportedMode` otherwise |
 
 The two `Tensor` methods are replaced on the class and the `torch.accelerator` functions on the module, not in the `TorchFunctionMode`, because the `DataLoader` pins in a thread of its own, where the mode is not active. They are restored when forwarding ends, and undone in a forked process as the rest of the mapping is. A pinned tensor uploaded with `non_blocking=True` takes the same queued, asynchronous path as any other upload.
+
+### Compilation <!-- id: forwarding-compile -->
+
+> Under `host="local"`, `torch.compile` returns the function or module it is given, unchanged, and warns once that it runs eagerly, so a compiled training loop runs and computes what eager code computes.
+
+Inductor, the default backend, cannot compile here: before tracing it creates a CUDA tensor in this process to set up a device context, which needs a driver this process does not have. Dynamo with any backend also traces into `RemoteTensor` dispatch, which is letify's own Python, and recompiles it for every operator. A replayed step already sends the whole step as one entry, as [Step capture](#forwarding-step-capture) describes, so compiling on the client has nothing left to batch.
+
+While forwarding is active, `torch.compile(model, ...)` with any arguments returns `model` itself, and `torch.compile(...)` used as a decorator factory returns a decorator that returns the function itself. `Module.compile(...)` does nothing. The first such call in a process emits a `UserWarning` naming `host="local"` and eager execution. `torch.compile` and `Module.compile` are restored when forwarding ends and undone in a forked process, as the rest of the mapping is.
+
+`torch.cuda.get_rng_state` and `torch.cuda.set_rng_state` stay refused, so code that saves and restores the generator state names the gap instead of silently restoring a state that is not the runtime's.
+
 ### Autocast <!-- id: forwarding-autocast -->
 
 > Inside `torch.autocast("cuda")`, an operator on a `RemoteTensor` gets the argument casts CUDA autocast gives it, so a mixed precision loop computes in the same dtypes as on the runtime's own GPU.
