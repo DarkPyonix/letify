@@ -425,10 +425,10 @@ The protocol is one JSON object per line. letify sends `{"id": <int>, "op": <nam
 | Op | Fields | Value |
 |---|---|---|
 | `hello` | none | `{"modal": <installed Modal version>}` |
-| `create` | `app`, `args`, `packages`, `gpu`, `timeout` | `{"sandbox": <id>}`. Runs `app` as an ephemeral app on first use, builds `debian_slim` with `packages` installed, and starts `args` in a sandbox |
+| `create` | `app`, `args`, `packages`, `gpu`, `timeout`, `idle_timeout` | `{"sandbox": <id>}`. Runs `app` as an ephemeral app on first use, builds `debian_slim` with `packages` installed, and starts `args` in a sandbox |
 | `write` | `sandbox`, `data` | `null`. `data` is base64 of at most 1 MiB. Writes the decoded bytes to the sandbox's standard input and drains it. Modal refuses a write that would buffer more than 2 MiB, so the channel splits a larger frame into `write` requests of 1 MiB, in order |
 | `read_until` | `sandbox`, `prefixes` | `{"lines": [...], "eof": <bool>}`. The sandbox's stdout lines up to and including the first that starts with one of `prefixes`, or every line left when the stream ends |
-| `terminate` | `sandbox` | `null` |
+| `terminate` | `sandbox` | `null`. Also ends a sandbox this adapter did not create, found by id |
 | `billing_summary` | none | `{"metered_cost": <text>, "billed_cost": <text>, "credits": <text>, "start": <Unix seconds>, "end": <Unix seconds>}` for the current month, from `modal.Workspace.billing.summary()`. Amounts are decimal text in USD. `credits` is the `Credits` adjustment, negative when credit was applied |
 | `volume_put` | `volume`, `version`, `path`, `data` | `null`. `data` is base64 |
 | `volume_get` | `volume`, `version`, `path` | base64 of the file |
@@ -440,6 +440,21 @@ Every volume op creates the volume when it is missing, as version `version`.
 The persistent channel to a sandbox is that sandbox's standard input and output, carried by `write` and `read_until`. The sandbox runs the bootstrap stub `python3 -u -c BOOTSTRAP`, and the worker source goes out first as the byte count line and source described above. Modal returns a sandbox's standard output as text, so the source the channel sends sets `_LETIFY_TEXT_FRAMES = True` after the frame code, and that worker writes each frame as lines of base64 of the frame's bytes, each line encoding at most 36 KiB, so no line is longer than 48 KiB. Modal delivers a stdout line longer than 64 KiB as several lines, which are not base64 on their own, and ends the stream on a line of 768 KiB. Each line decodes on its own, because 36 KiB is a multiple of 3 bytes. The channel reads those lines with `read_until` and `prefixes` `[""]`, one line per request, and joins the decoded bytes back into frames. Frames sent to the sandbox are raw bytes, base64 encoded only inside the `write` request. A `read_until` that ends at end of stream without a reply raises `ProtocolError`.
 
 A missing uv raises `ProviderUnavailable` naming uv. A reply of kind `unavailable` raises `ProviderUnavailable` for `modal`. An adapter process that exits, or prints a line that is not the reply it was waiting for, raises `RuntimeFailure` carrying the adapter's standard error, because that is an infrastructure failure. A reply of kind `failure` raises `RuntimeFailure` with the adapter's message. One adapter process serves one provider or one backend and exits when its standard input closes.
+
+#### Ending a sandbox while a request is blocked <!-- id: modal-abort -->
+
+> A sandbox is terminated through a second adapter process, so a request blocked in the first adapter cannot keep the sandbox running.
+
+A `read_until` blocks until the sandbox prints a line, and the adapter answers one request at a time. So while a call runs, the adapter that carries it cannot take a `terminate`.
+
+- `Adapter` records the id of every sandbox `create` returned, until a `terminate` for it succeeds.
+- A request interrupted after its line was written and before its reply was read, by `KeyboardInterrupt` or any other exception, leaves the adapter out of step. Every later request on that adapter raises `RuntimeFailure` without writing anything.
+- `Modal.stop` and the `SHUTDOWN` frame written by `SandboxChannel.close` wait at most 5 s for the adapter's lock. Other requests wait as long as they need.
+- `Adapter.abort()` starts a second adapter process for the same account, sends it `terminate` for every recorded sandbox, and closes it. It then kills the first adapter's process group with `SIGKILL`. The first adapter is started in its own session, so that group holds only the adapter and its children. An aborted adapter is closed, and the provider starts a new one for its next request.
+- `Modal.stop` calls `abort()` when the adapter is out of step or its lock is still held after 5 s. The call timeout watchdog calls it through `SandboxChannel._kill`, so a call past its `timeout` ends its sandbox too.
+- The adapter's `terminate` for an id it did not create finds the sandbox with `modal.Sandbox.from_id` and terminates it. A sandbox that is already gone is not an error.
+
+Modal also bounds a sandbox that nothing terminates. `create` passes `timeout`, the entry option `timeout`, 3600 s by default, as the sandbox's maximum lifetime. It passes `idle_timeout`, the entry option `idle_timeout`, 600 s by default, after which Modal terminates a sandbox that is idle.
 
 The adapter never deploys an app. `create` starts `modal.App(app).run()` the first time it sees an app name and holds that context for the adapter's lifetime. When standard input closes, the adapter terminates its remaining sandboxes and then leaves every app context, which stops the ephemeral app. An adapter that dies stops sending Modal's client heartbeat, and Modal stops the ephemeral app for it. So no app named `app` stays on the account after letify stops.
 
@@ -1037,7 +1052,6 @@ An account that is already in the home file is not asked for again. `letify logi
 `letify logout <alias>` removes the account from `~/.letify/config.toml` and deletes `~/.letify/accounts/<alias>/` with everything in it. It leaves the project reference alone, because the repository still needs that account; what changed is only that this machine no longer has it.
 
 `letify login colab <alias>` signs in to Colab itself. It runs `colab sessions` through `uv tool run --python 3.13 --from google-colab-cli colab`, with `HOME` set to `~/.letify/accounts/<alias>/`. The Colab CLI keeps its token at a fixed path under its home directory, so the token lands in the account directory and the CLI refreshes it on later calls. Every later Colab command runs with the same `HOME`, which is what lets two Colab accounts live on one machine. uv's cache, Python installs and tools stay pinned to the real home, so a changed `HOME` downloads nothing again. A sign in that exits non zero writes nothing.
-
 `letify login modal <alias>` signs in to Modal itself. It first asks for an optional Modal profile, which names the Modal workspace to sign in to. It then runs `modal token new` through `uv tool run --python 3.12 --with "modal>=1.0,<2" --from modal modal`, with `MODAL_CONFIG_PATH` set to `~/.letify/accounts/<alias>/modal.toml` and, when a profile was given, `--profile <profile>`. The profile is written as `profile`, because `workspace` is the workspace root. Modal's command prints a link and waits for the browser approval, so `modal` never has to be on `PATH` or in the project's environment. The token lands in the account directory, and the adapter reads it from there. A sign in that exits non zero, or exits zero without writing `modal.toml`, writes nothing to either `config.toml` and removes a `modal.toml` the attempt created.
 
 `letify login elice <alias>` checks the access token before it writes anything. The steps run in this order:

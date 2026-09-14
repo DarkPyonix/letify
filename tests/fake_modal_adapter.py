@@ -19,6 +19,7 @@ import base64
 import json
 import os
 import shutil
+import signal
 import subprocess
 import sys
 from pathlib import Path
@@ -36,7 +37,13 @@ class Sandbox:
     def __init__(self, args: list[str]):
         command = [sys.executable if args[0] == "python3" else args[0], *args[1:]]
         self.process = subprocess.Popen(
-            command, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL
+            command,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            # A Modal sandbox does not end when the adapter process dies, so the stand-in's
+            # sandbox is kept out of the adapter's process group.
+            start_new_session=True,
         )
 
     def write(self, data: str) -> None:
@@ -79,6 +86,14 @@ def log_app(event: str, name: str) -> None:
         log.write(json.dumps([event, name]) + "\n")
 
 
+def known_sandboxes() -> dict[str, int]:
+    """Every sandbox any stand-in process started under this state directory, with its pid."""
+    log = STATE / "sandboxes.jsonl"
+    if not log.is_file():
+        return {}
+    return dict(json.loads(line) for line in log.read_text(encoding="utf-8").splitlines())
+
+
 def volume_file(volume: str, path: str) -> Path:
     return STATE / "volumes" / volume / path.lstrip("/")
 
@@ -96,8 +111,10 @@ def handle(request: dict, sandboxes: dict[str, Sandbox]) -> object:
         if request["app"] not in APPS:
             APPS.append(request["app"])
             log_app("run_start", request["app"])
-        sandbox_id = f"sb-{len(sandboxes) + 1}"
+        sandbox_id = f"sb-{len(known_sandboxes()) + 1}"
         sandboxes[sandbox_id] = Sandbox(list(request["args"]))
+        with (STATE / "sandboxes.jsonl").open("a", encoding="utf-8") as log:
+            log.write(json.dumps([sandbox_id, sandboxes[sandbox_id].process.pid]) + "\n")
         return {"sandbox": sandbox_id}
     if op == "write":
         sandboxes[request["sandbox"]].write(request["data"])
@@ -105,7 +122,18 @@ def handle(request: dict, sandboxes: dict[str, Sandbox]) -> object:
     if op == "read_until":
         return sandboxes[request["sandbox"]].read_until(list(request["prefixes"]))
     if op == "terminate":
-        sandboxes.pop(request["sandbox"]).terminate()
+        sandbox = sandboxes.pop(request["sandbox"], None)
+        if sandbox is not None:
+            sandbox.terminate()
+            return None
+        # Another adapter process created it, as Modal's Sandbox.from_id would find it.
+        pid = known_sandboxes().get(request["sandbox"])
+        if pid is None:
+            raise KeyError(f"no sandbox {request['sandbox']!r}")
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
         return None
     if op == "volume_put":
         target = volume_file(request["volume"], request["path"])
