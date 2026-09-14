@@ -373,6 +373,20 @@ class Provider(abc.ABC):
         """Ask the provider for a machine. Nothing to do where one already exists."""
         return None
 
+    #: Whether this provider can run an instance at spot pricing. Spec "Price type".
+    offers_spot: bool = False
+
+    def price_type_of(self, instance: Instance) -> str | None:
+        """The price type a session of this instance runs at, or None where there is none."""
+        return None
+
+    def diagnose(self, runtime: Runtime, failure: Exception) -> Exception:
+        """Name an infrastructure failure more precisely before it is retried.
+
+        Spec "Failure and retry". The default returns the failure unchanged.
+        """
+        return failure
+
     def stop(self, runtime: Runtime) -> None:
         """Release whatever the provider allocated for this runtime."""
         return None
@@ -394,6 +408,10 @@ class Provider(abc.ABC):
         from ..runtime.session import Runtime
 
         self.check_mode(instance)
+        if instance.price_type == "spot" and not self.offers_spot:
+            raise UnsupportedMode(
+                f"{self.alias} has no spot pricing. Only an elice account runs spot instances"
+            )
         if self.prepares_env and not self.managed_python:
             from ..runtime.bootstrap import project_files
 

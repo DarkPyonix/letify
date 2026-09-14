@@ -219,7 +219,7 @@ class Shell(Provider):
         from ..transport import nat
         from ..transport.strategies import Target
 
-        address = self.config.option("address")
+        address = self.target_address()
         stun: tuple[str, int] = nat.DEFAULT_STUN
         configured = self.config.option("stun")
         if isinstance(configured, str) and ":" in configured:
@@ -241,6 +241,11 @@ class Shell(Provider):
             tailcat=self.tailcat_binary,
             workspace=self.workspace_root,
         )
+
+    def target_address(self) -> str | None:
+        """The address forward SSH dials: the account's ``address``, where it has one."""
+        value = self.config.option("address")
+        return value if isinstance(value, str) else None
 
     def _link_key(self, runtime: Runtime | None) -> str:
         """Links are per machine here; a provider whose runtimes are machines keys by runtime."""

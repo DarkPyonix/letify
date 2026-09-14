@@ -70,7 +70,17 @@ def build_parser() -> argparse.ArgumentParser:
         help="the machine keeps its disk between sessions",
     )
     log_in.add_argument("--zone-id", dest="zone_id", help="Elice zone id")
-    log_in.add_argument("--machine-id", dest="machine_id", help="Elice machine id")
+    log_in.add_argument(
+        "--machine-id",
+        dest="machine_id",
+        help="Elice machine name or id; without it letify creates one on first use",
+    )
+    log_in.add_argument(
+        "--price-type",
+        dest="price_type",
+        choices=("ondemand", "spot"),
+        help="Elice price type for machines letify creates; ondemand by default",
+    )
     log_in.add_argument("--endpoint", help="API endpoint, where it is not the default")
     log_in.add_argument(
         "--organization", help="Elice organization short name, sent as x-elice-org-name-short"
@@ -286,6 +296,7 @@ def _dispatch(args: argparse.Namespace) -> int:
                 "persistent": args.persistent,
                 "zone_id": args.zone_id,
                 "machine_id": args.machine_id,
+                "price_type": args.price_type,
                 "endpoint": args.endpoint,
                 "organization": args.organization,
                 "billing_endpoint": args.billing_endpoint,
