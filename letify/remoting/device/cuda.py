@@ -35,6 +35,25 @@ REFUSED = (
 )
 
 
+#: Tensor functions that read metadata only, so an unfilled tensor passed to them does not wait.
+METADATA = frozenset(
+    {
+        torch.Tensor.shape.__get__,  # type: ignore[attr-defined]
+        torch.Tensor.dtype.__get__,  # type: ignore[attr-defined]
+        torch.Tensor.device.__get__,  # type: ignore[attr-defined]
+        torch.Tensor.ndim.__get__,  # type: ignore[attr-defined]
+        torch.Tensor.is_cuda.__get__,  # type: ignore[attr-defined]
+        torch.Tensor.requires_grad.__get__,  # type: ignore[attr-defined]
+        torch.Tensor.size,
+        torch.Tensor.dim,
+        torch.Tensor.numel,
+        torch.Tensor.stride,
+        torch.Tensor.element_size,
+        torch.Tensor.__len__,
+    }
+)
+
+
 def _cuda_index(value: Any) -> int | None:
     """The CUDA index a device argument names, -1 for an unindexed one, None for no CUDA."""
     if isinstance(value, torch.device):
@@ -70,6 +89,10 @@ class CudaMode(TorchFunctionMode):
 
     def __torch_function__(self, func, types, args=(), kwargs=None):
         kwargs = kwargs or {}
+        if self.client.unfilled and func not in METADATA:
+            self.client.wait_used(args)
+            if kwargs:
+                self.client.wait_used(kwargs.values())
         if args and type(args[0]) is RemoteTensor:
             special = SPECIAL.get(func)
             if special is not None:

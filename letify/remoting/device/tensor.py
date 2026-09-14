@@ -352,9 +352,16 @@ def dispatch(func: Any, args: tuple, kwargs: dict, client: Client | None) -> Any
         target = kwargs.get("device")
         if target is not None and torch.device(target).type == "cpu":
             dtype = kwargs.get("dtype")
+            if kwargs.get("non_blocking"):
+                return args[0]._ref.client.read_later(args[0], dtype)
             return args[0]._ref.client.fetch(args[0], None if dtype is None else _dtype_name(dtype))
 
     if func is _COPY and not isinstance(args[0], RemoteTensor) and type(args[1]) is RemoteTensor:
+        if (args[2] if len(args) > 2 else kwargs.get("non_blocking")) and args[0].shape == args[
+            1
+        ].shape:
+            args[1]._ref.client.read_later(args[1], None, args[0])
+            return args[0]
         args[0].copy_(args[1]._ref.client.fetch(args[1], None))
         return args[0]
 

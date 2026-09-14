@@ -68,6 +68,8 @@ Function shipping is about 99% at every one of those round trips, and hundreds o
 | Loss or gradient norm logging | every logging step | `.item()` |
 | Gradient scaler | every step under fp16 | checks for infinities |
 
+A read does not have to be a synchronization. `loss.detach().to("cpu", non_blocking=True)` returns a CPU tensor at once and the loop keeps going, and the value is waited for only where it is used, for example when it is printed a step later. In `async def` code, `await letify.fetch(loss)` does the same without blocking the event loop.
+
 Other things that force a synchronization: `nonzero()`, boolean mask indexing, `unique()`, and mixture of experts routing, which reads per-expert token counts back to the host. Any operation whose output shape the host has to know is a synchronization.
 
 ### Measure it instead of guessing
