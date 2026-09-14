@@ -329,15 +329,9 @@ def main(argv: list[str] | None = None) -> int:
         if args.json:
             print(json.dumps(rows, indent=2))
             return 0
-        for row in rows:
-            alias = str(row["alias"])
-            if "unavailable" in row:
-                print(f"{alias:20} unavailable: {row['unavailable']}")
-                continue
-            line = f"{alias:20} {row['kind']!s:10} {_describe_usage(row)}"
-            print(line)
-            if row.get("note"):
-                print(f"{'':20} {row['note']}")
+        from . import render
+
+        sys.stdout.write(render.usage_blocks(rows, render.Style.for_stream(sys.stdout)))
         return 0
 
     if args.command == "utilization":
