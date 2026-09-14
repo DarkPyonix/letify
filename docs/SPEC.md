@@ -629,6 +629,18 @@ The environment archive is automatic. The first session that runs `uv sync` for 
 
 A volume's files on a runtime live in its volume directory, `<workspace root>/volumes/<volume name>`. A blob materialized without a named destination is written to `<volume directory>/blobs/<first two hex characters>/<digest>`. The volume option `mount` names another directory for one volume; nothing else sets it. A restored `.venv/bin/python` that does not start is treated as no archive, and the session syncs. Nothing in the public surface names this step.
 
+### Volumes on a persistent runtime <!-- id: persistent-volumes -->
+
+> On a persistent provider the volume directory under the workspace root is the runtime's copy of the volume. A file is sent only when that copy does not already hold its digest, and no environment archive is packed or restored.
+
+A persistent runtime keeps `<workspace root>/volumes/<volume name>` between sessions, so a later session already holds what an earlier one received. The volume directory holds a manifest, `.letify-manifest.json`, mapping each materialized destination path to the digest, size in bytes and modification time in nanoseconds it had when it was written.
+
+Before a blob is written to a destination that is not unpacked, the local process asks the runtime for that manifest entry. When the entry names the same digest and the file on disk still has the recorded size and modification time, nothing is sent. Otherwise the blob is written as Materializing into a runtime describes, and the entry is recorded. A file changed on the runtime by anything other than letify fails the size or time comparison and is sent again. The manifest is replaced atomically, so a session that reads it while another writes sees one version or the other, and at worst sends a file twice.
+
+A persistent provider builds its environment with `uv sync` in `<workspace root>/project/<env key>` every session, and never packs the project directory into a volume or unpacks an archive from one. A sync over an existing `.venv` checks it and installs nothing, so it is faster than any archive transfer, and the `.venv` is already on the disk the archive would be unpacked to.
+
+An ephemeral provider keeps the behaviour of Materializing into a runtime: every file is sent each session, and the environment archive is packed and restored.
+
 Nothing hands a session to the caller. There is no call that returns one, no argument that takes one, and no way to hold the wrong one, because which session serves a call is the pool's answer to work out from the declaration.
 
 ### Project data <!-- id: project-data -->

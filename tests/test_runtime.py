@@ -31,6 +31,7 @@ from letify.declare.env import Env
 from letify.declare.instance import Instance
 from letify.errors import RuntimeFailure
 from letify.protocol.worker import BOOTSTRAP
+from letify.providers.local import Local
 from letify.runtime import bootstrap, telemetry
 from letify.runtime.channel import OneShotChannel, PersistentChannel
 from letify.runtime.lease import GRACE, INTERVAL, Lease
@@ -292,8 +293,9 @@ def test_a_synced_environment_is_archived_and_the_next_session_restores_it_inste
 ) -> None:
     # Spec "Materializing into a runtime": the first session that syncs packs its project
     # directory into its first volume, and a later session with the same key and platform
-    # unpacks that archive instead of running uv sync.
-    provider = provider_of(PreparingLocal, "lab")
+    # unpacks that archive instead of running uv sync. Spec "Volumes on a persistent
+    # runtime" limits this to an ephemeral provider.
+    provider = provider_of(PreparingLocal, "lab", persistent=False)
     volume = provider.volume(
         "cache", backend="filesystem", root=str(tmp_path / "store"), mount=str(tmp_path / "mount")
     )
@@ -318,6 +320,119 @@ def test_a_synced_environment_is_archived_and_the_next_session_restores_it_inste
         second.shutdown()
 
 
+def test_a_persistent_provider_syncs_every_session_and_never_archives_the_environment(
+    uv_project: Path, tmp_path: Path
+) -> None:
+    # Spec "Volumes on a persistent runtime": the .venv is already on the runtime's disk, so
+    # no archive is packed into the volume or restored from it.
+    provider = provider_of(PreparingLocal, "lab")
+    assert provider.persistent
+    volume = provider.volume(
+        "cache", backend="filesystem", root=str(tmp_path / "store"), mount=str(tmp_path / "mount")
+    )
+    env = Env()
+    instance = Instance(provider, gpu=None)._placed("remote")
+    for name in ("lab-1", "lab-2"):
+        runtime = provider.start(instance, env, name=name, volumes=(volume,))
+        try:
+            assert runtime.env_source == "sync"
+            platform = runtime.platform
+        finally:
+            runtime.shutdown()
+    assert volume.cached_env(env, platform) is None
+
+
+def counting_puts(monkeypatch) -> list[str]:
+    """Record the destination of every file written through the channel."""
+    from letify.runtime.session import Runtime
+
+    sent: list[str] = []
+    original = Runtime.put_bytes
+
+    def put_bytes(self, payload, path, **kwargs):
+        sent.append(path)
+        return original(self, payload, path, **kwargs)
+
+    monkeypatch.setattr(Runtime, "put_bytes", put_bytes)
+    return sent
+
+
+def test_a_persistent_runtime_is_sent_only_the_files_its_volume_directory_lacks(
+    tmp_path: Path, monkeypatch
+) -> None:
+    # Spec "Volumes on a persistent runtime": a later session holds what an earlier one
+    # received, so an unchanged file is not sent and a changed one is.
+    sent = counting_puts(monkeypatch)
+    provider = provider_of(Local, "lab")
+    mount = tmp_path / "mount"
+    volume = provider.volume(
+        "cache", backend="filesystem", root=str(tmp_path / "store"), mount=str(mount)
+    )
+    instance = Instance(provider, gpu=None)._placed("remote")
+    env = Env(lock=str(tmp_path / "absent.lock"))
+    first = volume.store.put_bytes(b"weights-1").digest
+    second = volume.store.put_bytes(b"tokens").digest
+    changed = volume.store.put_bytes(b"weights-2").digest
+
+    def session(name: str, digests: dict[str, str]) -> None:
+        runtime = provider.start(instance, env, name=name, volumes=(volume,))
+        try:
+            for path, digest in digests.items():
+                remote = volume.materialize(runtime, digest, path=str(mount / path))
+                assert Path(remote.path).read_bytes() == volume.store.get_bytes(digest)
+        finally:
+            runtime.shutdown()
+
+    session("lab-1", {"a.bin": first, "b.bin": second})
+    assert len(sent) == 2
+    session("lab-2", {"a.bin": first, "b.bin": second})
+    assert len(sent) == 2
+    session("lab-3", {"a.bin": changed, "b.bin": second})
+    assert sent[2:] == [str(mount / "a.bin")]
+
+
+def test_a_file_changed_on_the_runtime_is_sent_again(tmp_path: Path, monkeypatch) -> None:
+    # Spec "Volumes on a persistent runtime": the recorded size and time no longer match.
+    sent = counting_puts(monkeypatch)
+    provider = provider_of(Local, "lab")
+    mount = tmp_path / "mount"
+    volume = provider.volume(
+        "cache", backend="filesystem", root=str(tmp_path / "store"), mount=str(mount)
+    )
+    instance = Instance(provider, gpu=None)._placed("remote")
+    env = Env(lock=str(tmp_path / "absent.lock"))
+    digest = volume.store.put_bytes(b"weights").digest
+    for name in ("lab-1", "lab-2"):
+        runtime = provider.start(instance, env, name=name, volumes=(volume,))
+        try:
+            volume.materialize(runtime, digest, path=str(mount / "a.bin"))
+        finally:
+            runtime.shutdown()
+        (mount / "a.bin").write_bytes(b"edited on the runtime")
+    assert len(sent) == 2
+    assert (mount / "a.bin").read_bytes() == b"edited on the runtime"
+
+
+def test_an_ephemeral_runtime_is_sent_every_file_each_session(tmp_path: Path, monkeypatch) -> None:
+    # Spec "Volumes on a persistent runtime": an ephemeral disk is not trusted to keep them.
+    sent = counting_puts(monkeypatch)
+    provider = provider_of(Local, "lab", persistent=False)
+    mount = tmp_path / "mount"
+    volume = provider.volume(
+        "cache", backend="filesystem", root=str(tmp_path / "store"), mount=str(mount)
+    )
+    instance = Instance(provider, gpu=None)._placed("remote")
+    env = Env(lock=str(tmp_path / "absent.lock"))
+    digest = volume.store.put_bytes(b"weights").digest
+    for name in ("lab-1", "lab-2"):
+        runtime = provider.start(instance, env, name=name, volumes=(volume,))
+        try:
+            volume.materialize(runtime, digest, path=str(mount / "a.bin"))
+        finally:
+            runtime.shutdown()
+    assert len(sent) == 2
+
+
 def test_a_runtime_boots_its_channel_then_arms_its_lease(tmp_path: Path) -> None:
     # Spec "Sessions": open the channel, arm the lease, install the environment, attach
     # volumes. A session that could outlive this process gets the lease.
@@ -338,7 +453,7 @@ def test_a_runtime_boots_its_channel_then_arms_its_lease(tmp_path: Path) -> None
 def test_a_volume_with_no_cached_archive_is_passed_over(uv_project: Path, tmp_path: Path) -> None:
     # Spec "Blob granularity": the archive is keyed by the environment and the platform, so
     # a volume that does not hold this one is not the place to look.
-    provider = provider_of(PreparingLocal, "lab")
+    provider = provider_of(PreparingLocal, "lab", persistent=False)
     env = Env()
     instance = Instance(provider, gpu=None)._placed("remote")
     stocked = Volume(

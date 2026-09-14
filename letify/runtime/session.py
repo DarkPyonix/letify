@@ -427,7 +427,10 @@ class Runtime:
         where = self.eval(bootstrap.probe_source(self.env, root), timeout=120)
         self.platform = where["platform"]
 
-        for volume in self.volumes:
+        # Spec "Volumes on a persistent runtime": the .venv is already on the runtime's
+        # disk, so an archive is neither restored nor packed there.
+        archives = () if self.provider.persistent else self.volumes
+        for volume in archives:
             digest = volume.cached_env(self.env, self.platform)
             if not digest:
                 continue
@@ -453,10 +456,8 @@ class Runtime:
                     message.removeprefix("RuntimeError: "), stderr=exc.remote_traceback
                 ) from exc
             self.env_source = "sync"
-            if self.volumes:
-                self.volumes[0].cache_env_from(
-                    self, self.env, where["root"], platform=self.platform
-                )
+            if archives:
+                archives[0].cache_env_from(self, self.env, where["root"], platform=self.platform)
         self.python = where["python"]
         self.channel.switch_interpreter(where["python"])
 
