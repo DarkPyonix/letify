@@ -1273,16 +1273,22 @@ class Image:
     def pip_install(self, *packages):
         return self
 
+class _Tunnel:
+    host = "r7.modal.host"
+    port = 443
+
 class _Sandbox:
     object_id = None
     stdout = ()
     def terminate(self):
         _log("terminate")
+    def tunnels(self, timeout=50):
+        return {8765: _Tunnel()}
 
 class Sandbox:
     @staticmethod
     def create(*args, app=None, **kwargs):
-        _log("create", app.name)
+        _log("create", app.name, list(kwargs.get("encrypted_ports") or []))
         return _Sandbox()
 """
 
@@ -1309,6 +1315,7 @@ def test_the_modal_adapter_runs_sandboxes_in_an_ephemeral_app_it_stops_on_exit(
     adapter.close()
 
     events = [tuple(json.loads(line)) for line in log.read_text("utf-8").splitlines()]
+    events = [e[:2] if e[0] == "create" else e for e in events]
     assert ("lookup", "study") not in events
     assert events[0] == ("run_start", "study")
     assert events[-1] == ("run_stop", "study")
@@ -1442,7 +1449,7 @@ def test_a_sandbox_channel_sends_an_argument_larger_than_modal_stdin_buffer(
     # write requests of at most 1 MiB, so a 16 MiB argument arrives whole.
     import base64
 
-    provider = provider_of(Modal, "m")
+    provider = provider_of(Modal, "m", data_channel=False)
     runtime = modal_runtime(provider)
     channel = provider.open_channel(runtime)
     try:
@@ -1462,7 +1469,7 @@ def test_a_sandbox_channel_reads_a_result_longer_than_a_modal_output_line(
     # below that and a 1 MiB result arrives whole.
     import os
 
-    provider = provider_of(Modal, "m")
+    provider = provider_of(Modal, "m", data_channel=False)
     runtime = modal_runtime(provider)
     channel = provider.open_channel(runtime)
     try:
@@ -1519,7 +1526,7 @@ def test_a_sandbox_that_stops_without_replying_is_a_protocol_error(
 
 
 def test_closing_a_sandbox_channel_asks_the_worker_to_shut_down(isolated_home, fake_modal) -> None:
-    provider = provider_of(Modal, "m")
+    provider = provider_of(Modal, "m", data_channel=False)
     runtime = modal_runtime(provider)
     channel = provider.open_channel(runtime)
     channel.start()
@@ -2204,7 +2211,10 @@ def test_a_request_on_an_adapter_out_of_step_fails_without_waiting(
 
     from letify.errors import RuntimeFailure
 
-    provider = provider_of(Modal, "m")
+    # Spec "modal-abort": an adapter falls out of step when a request on its standard input
+    # and output is interrupted, so the call has to travel there rather than over the data
+    # channel, where an interrupted call leaves the adapter idle.
+    provider = provider_of(Modal, "m", data_channel=False)
     runtime = modal_runtime(provider)
     channel = provider.open_channel(runtime)
     channel.start()
@@ -2239,3 +2249,420 @@ def test_a_modal_sandbox_is_created_with_a_lifetime_and_an_idle_limit(
         assert created["idle_timeout"] == 600
     finally:
         provider.stop(runtime)
+
+
+# -- Modal data channel ----------------------------------------------------------
+
+
+def test_the_real_modal_adapter_exposes_encrypted_ports_and_resolves_their_tunnel(
+    tmp_path: Path,
+) -> None:
+    # Spec "Modal adapter", ops create and tunnel.
+    import json
+    import os
+    import sys
+
+    site = tmp_path / "site" / "modal"
+    site.mkdir(parents=True)
+    (site / "__init__.py").write_text(STUB_MODAL, encoding="utf-8")
+    log = tmp_path / "modal.log"
+    script = Path(modal_module.__file__).with_name("modal_adapter.py")
+    env = {**os.environ, "PYTHONPATH": str(tmp_path / "site"), "STUB_MODAL_LOG": str(log)}
+    adapter = Adapter([sys.executable, "-P", str(script)], env=env, name="m")
+    try:
+        fields = {"app": "study", "args": ["python3"], "packages": [], "gpu": None, "timeout": 60}
+        sandbox = adapter.request("create", ports=[8765], **fields)["sandbox"]
+        tunnel = adapter.request("tunnel", sandbox=sandbox, port=8765)
+    finally:
+        adapter.close()
+    assert tunnel == {"host": "r7.modal.host", "port": 443, "tls": True}
+    events = [json.loads(line) for line in log.read_text("utf-8").splitlines()]
+    assert ["create", "study", [8765]] in events
+
+
+def test_a_modal_sandbox_is_created_with_the_data_port_exposed(isolated_home, fake_modal) -> None:
+    provider = provider_of(Modal, "m")
+    runtime = modal_runtime(provider)
+    provider.open_channel(runtime)
+    try:
+        [created] = fake_modal.requests("create")
+        assert created["ports"] == [modal_module.DATA_PORT]
+    finally:
+        provider.stop(runtime)
+
+
+def test_a_modal_sandbox_without_the_data_channel_exposes_no_port(
+    isolated_home, fake_modal
+) -> None:
+    provider = provider_of(Modal, "m", data_channel=False)
+    runtime = modal_runtime(provider)
+    provider.open_channel(runtime)
+    try:
+        [created] = fake_modal.requests("create")
+        assert created["ports"] == []
+    finally:
+        provider.stop(runtime)
+
+
+def test_a_sandbox_channel_carries_frames_over_the_data_connection(
+    isolated_home, fake_modal
+) -> None:
+    # Spec "Modal data channel": after hello, frames leave standard input and output, so a
+    # result far above what Modal's stdout carried arrives with no further stdio request.
+    import os
+
+    provider = provider_of(Modal, "m")
+    runtime = modal_runtime(provider)
+    channel = provider.open_channel(runtime)
+    try:
+        channel.start()
+        assert [r["port"] for r in fake_modal.requests("tunnel")] == [modal_module.DATA_PORT]
+        reads = len(fake_modal.requests("read_until"))
+        writes = len(fake_modal.requests("write"))
+        payload = os.urandom(8 << 20)
+        assert channel.call(len, (payload,), {})[0] == len(payload)
+        assert len(channel.call(os.urandom, (32 << 20,), {})[0]) == 32 << 20
+        assert len(fake_modal.requests("read_until")) == reads
+        assert len(fake_modal.requests("write")) == writes
+    finally:
+        channel.close()
+        provider.stop(runtime)
+
+
+def test_worker_output_arrives_over_the_data_connection(isolated_home, fake_modal) -> None:
+    provider = provider_of(Modal, "m")
+    runtime = modal_runtime(provider)
+    channel = provider.open_channel(runtime)
+    seen: list[bytes] = []
+    channel.on_output = lambda stream, data: seen.append(data)
+    try:
+        channel.start()
+        reads = len(fake_modal.requests("read_until"))
+        channel.request({"op": "exec", "source": "print('hello from the sandbox', flush=True)"})
+        assert b"hello from the sandbox" in b"".join(seen)
+        assert len(fake_modal.requests("read_until")) == reads
+    finally:
+        channel.close()
+        provider.stop(runtime)
+
+
+def test_a_sandbox_whose_tunnel_fails_keeps_frames_on_standard_io(
+    isolated_home, fake_modal, capfd
+) -> None:
+    # Spec "Modal data channel": a failure is reported in one line and stdio carries on,
+    # without waiting for the worker's listen window to end.
+    import time
+
+    fake_modal.fail("tunnel")
+    provider = provider_of(Modal, "m")
+    runtime = modal_runtime(provider)
+    channel = provider.open_channel(runtime)
+    try:
+        started = time.monotonic()
+        channel.start()
+        assert channel.call(sum, ([1, 2, 3],), {})[0] == 6
+        assert time.monotonic() - started < 30
+        err = capfd.readouterr().err
+        assert "the data channel did not open" in err
+        assert "frames stay on standard input and output" in err
+    finally:
+        channel.close()
+        provider.stop(runtime)
+
+
+def test_switching_the_interpreter_reopens_the_data_channel(isolated_home, fake_modal) -> None:
+    import sys
+
+    provider = provider_of(Modal, "m")
+    runtime = modal_runtime(provider)
+    channel = provider.open_channel(runtime)
+    try:
+        channel.start()
+        channel.switch_interpreter(sys.executable)
+        assert channel.call(len, (b"x" * (4 << 20),), {})[0] == 4 << 20
+        assert len(fake_modal.requests("tunnel")) == 2
+    finally:
+        channel.close()
+        provider.stop(runtime)
+
+
+def _listening_worker():
+    """A local worker whose frame reader was asked to listen, its port, and its token."""
+    import socket
+    import sys
+
+    from letify.protocol.worker import BOOTSTRAP
+    from letify.runtime.channel import PersistentChannel
+
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", 0))
+        port = probe.getsockname()[1]
+    channel = PersistentChannel([sys.executable, "-u", "-c", BOOTSTRAP], name="w")
+    channel.start()
+    token = "ab" * 32
+    channel.request({"op": "listen", "port": port, "token": token, "wait": 20})
+    return channel, port, token
+
+
+def _connect(port: int):
+    import socket
+    import time
+
+    for _ in range(100):
+        try:
+            return socket.create_connection(("127.0.0.1", port), timeout=10)
+        except OSError:
+            time.sleep(0.05)
+    raise AssertionError("the worker never listened")
+
+
+def test_a_data_connection_with_the_wrong_token_is_closed_and_the_right_one_gets_hello() -> None:
+    # Spec "Modal data channel", step 4, through the real worker.
+    from letify.protocol import wire
+
+    channel, port, token = _listening_worker()
+    try:
+        intruder = _connect(port)
+        intruder.sendall(b"LETIFY-DATA " + b"cd" * 32 + b"\n")
+        assert intruder.recv(16) == b""
+        intruder.close()
+        good = _connect(port)
+        good.sendall(b"LETIFY-DATA " + token.encode() + b"\n")
+        receiver = wire.Receiver(good.recv_into)
+        kind, _stream, _value = receiver.next_event()
+        assert kind == wire.HELLO
+        good.close()
+    finally:
+        channel.close()
+
+
+class _WatchedTls:
+    """An identity cipher over two memory buffers that records two threads inside it at once."""
+
+    def __init__(self, incoming, outgoing):
+        import threading
+
+        self.incoming = incoming
+        self.outgoing = outgoing
+        self.overlapped = False
+        self._inside = 0
+        self._count = threading.Lock()
+
+    def _enter(self) -> None:
+        import time
+
+        with self._count:
+            self._inside += 1
+            if self._inside > 1:
+                self.overlapped = True
+        time.sleep(0.0005)
+
+    def _leave(self) -> None:
+        with self._count:
+            self._inside -= 1
+
+    def do_handshake(self) -> None:
+        return None
+
+    def write(self, data) -> int:
+        self._enter()
+        try:
+            self.outgoing.write(bytes(data))
+            return memoryview(data).nbytes
+        finally:
+            self._leave()
+
+    def read(self, size, buffer) -> int:
+        import ssl
+
+        self._enter()
+        try:
+            data = self.incoming.read(size)
+            if not data:
+                raise ssl.SSLWantReadError("no data")
+            buffer[: len(data)] = data
+            return len(data)
+        finally:
+            self._leave()
+
+
+def test_the_tls_state_is_never_used_by_two_threads_at_once() -> None:
+    # Spec "Modal data channel": a writing thread and the reading thread share one TLS
+    # object, which OpenSSL does not allow, so the channel serializes every use of it.
+    import os
+    import socket
+    import ssl
+    import threading
+
+    from letify.providers.modal import TlsStream
+
+    near, far = socket.socketpair()
+
+    def echo() -> None:
+        while True:
+            data = far.recv(1 << 16)
+            if not data:
+                break
+            far.sendall(data)
+        far.close()
+
+    threading.Thread(target=echo, daemon=True).start()
+    incoming, outgoing = ssl.MemoryBIO(), ssl.MemoryBIO()
+    tls = _WatchedTls(incoming, outgoing)
+    stream = TlsStream(near, tls, incoming, outgoing)
+    payload = os.urandom(4 << 20)
+    received = bytearray()
+
+    def read() -> None:
+        buffer = bytearray(1 << 20)
+        while len(received) < len(payload):
+            count = stream.recv_into(memoryview(buffer))
+            if not count:
+                break
+            received.extend(buffer[:count])
+
+    reader = threading.Thread(target=read)
+    reader.start()
+    view = memoryview(payload)
+    while view:
+        view = view[stream.send(view[: 256 << 10]) :]
+    reader.join(60)
+    near.close()
+    assert bytes(received) == payload
+    assert tls.overlapped is False
+
+
+def test_a_tls_data_connection_carries_overlapping_requests_during_large_transfers(
+    isolated_home, fake_modal, tls_proxy
+) -> None:
+    # Spec "Modal data channel": frames through a TLS-terminating proxy, as Modal's encrypted
+    # port is, while a second thread keeps sending requests during every transfer.
+    import os
+    import threading
+
+    fake_modal.tunnel_to("localhost", tls_proxy.start(modal_module.DATA_PORT), tls=True)
+    provider = provider_of(Modal, "m")
+    runtime = modal_runtime(provider)
+    channel = provider.open_channel(runtime)
+    channel.tls_context = tls_proxy.context
+    stop = threading.Event()
+    replies: list[object] = []
+    errors: list[BaseException] = []
+
+    def overlap() -> None:
+        while not stop.is_set():
+            try:
+                replies.append(channel.request({"op": "stat"}, timeout=60)[0])
+            except BaseException as exc:
+                errors.append(exc)
+                return
+
+    try:
+        channel.start()
+        reads = len(fake_modal.requests("read_until"))
+        thread = threading.Thread(target=overlap, daemon=True)
+        thread.start()
+        for _ in range(3):
+            assert channel.call(len, (os.urandom(16 << 20),), {}, timeout=60)[0] == 16 << 20
+            assert len(channel.call(os.urandom, (16 << 20,), {}, timeout=60)[0]) == 16 << 20
+        stop.set()
+        thread.join(60)
+        assert errors == []
+        assert replies
+        assert len(fake_modal.requests("read_until")) == reads
+    finally:
+        stop.set()
+        channel.close()
+        provider.stop(runtime)
+
+
+# -- parallel data streams: spec "Parallel data streams" ----------------------------------
+
+
+def _count_connections(monkeypatch) -> list[object]:
+    import socket
+
+    opened: list[object] = []
+    real = socket.create_connection
+
+    def counting(address, *args, **kwargs):
+        opened.append(address)
+        return real(address, *args, **kwargs)
+
+    monkeypatch.setattr(modal_module.socket, "create_connection", counting)
+    return opened
+
+
+def test_a_modal_channel_opens_one_connection_per_data_stream(
+    isolated_home, fake_modal, monkeypatch
+) -> None:
+    import os
+
+    opened = _count_connections(monkeypatch)
+    provider = provider_of(Modal, "m", data_streams=3)
+    runtime = modal_runtime(provider)
+    channel = provider.open_channel(runtime)
+    try:
+        channel.start()
+        assert len(opened) == 3
+        payload = os.urandom(24 << 20)
+        assert channel.call(len, (payload,), {})[0] == len(payload)
+        assert channel.call(bytes, (payload,), {})[0] == payload
+    finally:
+        channel.close()
+        provider.stop(runtime)
+
+
+def test_the_data_streams_default_is_four(isolated_home, fake_modal, monkeypatch) -> None:
+    opened = _count_connections(monkeypatch)
+    provider = provider_of(Modal, "m")
+    runtime = modal_runtime(provider)
+    channel = provider.open_channel(runtime)
+    try:
+        channel.start()
+        assert len(opened) == 4
+    finally:
+        channel.close()
+        provider.stop(runtime)
+
+
+@pytest.mark.parametrize("value", [0, 17, "4", True])
+def test_a_data_streams_value_out_of_range_is_refused(isolated_home, fake_modal, value) -> None:
+    provider = provider_of(Modal, "m", data_streams=value)
+    runtime = modal_runtime(provider)
+    with pytest.raises(letify.ConfigError, match="data_streams"):
+        provider.open_channel(runtime)
+
+
+def test_a_lane_whose_index_is_taken_is_closed_and_hello_waits_for_every_lane() -> None:
+    # Spec "Parallel data streams", step 1, through the real worker.
+    import socket
+    import sys
+
+    from letify.protocol import wire
+    from letify.protocol.worker import BOOTSTRAP
+    from letify.runtime.channel import PersistentChannel
+
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", 0))
+        port = probe.getsockname()[1]
+    channel = PersistentChannel([sys.executable, "-u", "-c", BOOTSTRAP], name="w")
+    channel.start()
+    token = "ab" * 32
+    channel.request({"op": "listen", "port": port, "token": token, "wait": 20, "streams": 2})
+    try:
+        lane0 = _connect(port)
+        lane0.sendall(b"LETIFY-DATA " + token.encode() + b"\n")
+        again = _connect(port)
+        again.sendall(b"LETIFY-DATA " + token.encode() + b"\n")
+        assert again.recv(16) == b""
+        again.close()
+        lane1 = _connect(port)
+        lane1.sendall(b"LETIFY-DATA " + token.encode() + b" 1\n")
+        stream = wire.Striped([lane0.send, lane1.send], [lane0.recv_into, lane1.recv_into])
+        kind, _stream, _value = wire.Receiver(stream.recv_into).next_event()
+        assert kind == wire.HELLO
+        lane0.close()
+        lane1.close()
+    finally:
+        channel.close()

@@ -425,7 +425,8 @@ The protocol is one JSON object per line. letify sends `{"id": <int>, "op": <nam
 | Op | Fields | Value |
 |---|---|---|
 | `hello` | none | `{"modal": <installed Modal version>}` |
-| `create` | `app`, `args`, `packages`, `gpu`, `timeout`, `idle_timeout` | `{"sandbox": <id>}`. Runs `app` as an ephemeral app on first use, builds `debian_slim` with `packages` installed, and starts `args` in a sandbox |
+| `create` | `app`, `args`, `packages`, `gpu`, `timeout`, `idle_timeout`, `volumes`, `ports` | `{"sandbox": <id>}`. Runs `app` as an ephemeral app on first use, builds `debian_slim` with `packages` installed, and starts `args` in a sandbox. Each port in `ports` is exposed with Modal `encrypted_ports` |
+| `tunnel` | `sandbox`, `port` | `{"host": <text>, "port": <int>, "tls": <bool>}`. The address that reaches `port` inside the sandbox, from `Sandbox.tunnels()`. `tls` is true when the connection has to be made with TLS, which an encrypted port needs |
 | `write` | `sandbox`, `data` | `null`. `data` is base64 of at most 1 MiB. Writes the decoded bytes to the sandbox's standard input and drains it. Modal refuses a write that would buffer more than 2 MiB, so the channel splits a larger frame into `write` requests of 1 MiB, in order |
 | `read_until` | `sandbox`, `prefixes` | `{"lines": [...], "eof": <bool>}`. The sandbox's stdout lines up to and including the first that starts with one of `prefixes`, or every line left when the stream ends |
 | `terminate` | `sandbox` | `null`. Also ends a sandbox this adapter did not create, found by id |
@@ -437,7 +438,7 @@ The protocol is one JSON object per line. letify sends `{"id": <int>, "op": <nam
 
 Every volume op creates the volume when it is missing, as version `version`.
 
-The persistent channel to a sandbox is that sandbox's standard input and output, carried by `write` and `read_until`. The sandbox runs the bootstrap stub `python3 -u -c BOOTSTRAP`, and the worker source goes out first as the byte count line and source described above. Modal returns a sandbox's standard output as text, so the source the channel sends sets `_LETIFY_TEXT_FRAMES = True` after the frame code, and that worker writes each frame as lines of base64 of the frame's bytes, each line encoding at most 36 KiB, so no line is longer than 48 KiB. Modal delivers a stdout line longer than 64 KiB as several lines, which are not base64 on their own, and ends the stream on a line of 768 KiB. Each line decodes on its own, because 36 KiB is a multiple of 3 bytes. The channel reads those lines with `read_until` and `prefixes` `[""]`, one line per request, and joins the decoded bytes back into frames. Frames sent to the sandbox are raw bytes, base64 encoded only inside the `write` request. A `read_until` that ends at end of stream without a reply raises `ProtocolError`.
+The persistent channel to a sandbox starts on that sandbox's standard input and output, carried by `write` and `read_until`. The sandbox runs the bootstrap stub `python3 -u -c BOOTSTRAP`, and the worker source goes out first as the byte count line and source described above. Modal returns a sandbox's standard output as text, so the source the channel sends sets `_LETIFY_TEXT_FRAMES = True` after the frame code, and that worker writes each frame as lines of base64 of the frame's bytes, each line encoding at most 36 KiB, so no line is longer than 48 KiB. Modal delivers a stdout line longer than 64 KiB as several lines, which are not base64 on their own, and ends the stream on a line of 768 KiB. Each line decodes on its own, because 36 KiB is a multiple of 3 bytes. The channel reads those lines with `read_until` and `prefixes` `[""]`, one line per request, and joins the decoded bytes back into frames. Frames sent to the sandbox are raw bytes, base64 encoded only inside the `write` request. A `read_until` that ends at end of stream without a reply raises `ProtocolError`.
 
 A missing uv raises `ProviderUnavailable` naming uv. A reply of kind `unavailable` raises `ProviderUnavailable` for `modal`. An adapter process that exits, or prints a line that is not the reply it was waiting for, raises `RuntimeFailure` carrying the adapter's standard error, because that is an infrastructure failure. A reply of kind `failure` raises `RuntimeFailure` with the adapter's message. One adapter process serves one provider or one backend and exits when its standard input closes.
 
@@ -455,6 +456,46 @@ A `read_until` blocks until the sandbox prints a line, and the adapter answers o
 - The adapter's `terminate` for an id it did not create finds the sandbox with `modal.Sandbox.from_id` and terminates it. A sandbox that is already gone is not an error.
 
 Modal also bounds a sandbox that nothing terminates. `create` passes `timeout`, the entry option `timeout`, 3600 s by default, as the sandbox's maximum lifetime. It passes `idle_timeout`, the entry option `idle_timeout`, 600 s by default, after which Modal terminates a sandbox that is idle.
+
+### Modal data channel <!-- id: modal-data-channel -->
+
+> Once the worker has said hello over the sandbox's standard input and output, the channel moves its frames to a TCP connection through a Modal encrypted port. Standard input and output stay the control path and the fallback.
+
+`Modal.open_channel` creates the sandbox with `ports` `[DATA_PORT]`, where `modal.DATA_PORT` is 8765. The provider option `data_channel = false` creates it with no port and keeps every frame on standard input and output.
+
+After each `HELLO` that arrives over standard input and output, the first and the one after every `reexec`, the channel opens the data channel:
+
+1. It makes a token of 32 random bytes with `secrets.token_hex(32)` and sends the request `{"op": "listen", "port": DATA_PORT, "token": <token>, "wait": 60}` over standard input and output.
+2. The worker's frame reader answers that request itself, before reading another frame. It binds `0.0.0.0:<port>` with `SO_REUSEADDR`, sends the reply, and accepts connections until one authenticates, `wait` seconds pass, or a byte arrives on standard input.
+3. The channel asks the adapter for `tunnel` on `DATA_PORT` and connects to that host and port with a 30 s timeout, wrapping the socket in TLS with the tunnel host as server name when `tls` is true. It sets `TCP_NODELAY` and writes the line `LETIFY-DATA <token>\n`.
+4. The worker reads that line within 10 s and compares the token with `hmac.compare_digest`. A connection that sends anything else is closed and the worker accepts again. On a match it closes the listener, sends `HELLO` on the connection, sends every later frame there as binary frames under the old sender's lock so no frame is split, and its frame reader reads frames from the connection instead of standard input.
+5. The channel waits for that `HELLO` and then carries every request over the connection.
+
+TLS comes from the Modal tunnel. The channel's side of TLS is an `ssl.SSLObject` over two `ssl.MemoryBIO` buffers, not an `ssl.SSLSocket`, because the thread reading frames and a thread writing a request run at the same time and OpenSSL does not allow two threads inside one TLS object. One lock guards the TLS object and its buffers. A second lock orders the encrypted bytes on the socket. Socket reads and writes happen outside the first lock, so a write blocked on a full socket never stops the reading thread from decrypting. Each write encrypts at most 1 MiB. The token is what stops another client of the public tunnel address from speaking the protocol, and it travels only over the adapter's authenticated control path.
+
+#### Parallel data streams <!-- id: modal-data-streams -->
+
+> The data channel is `N` TCP connections through the same tunnel, called lanes, and a write of 1 MiB or more is split across all of them, because one TCP stream over a path with a round trip near 190 ms carries about 12 MiB/s.
+
+`N` is the provider option `data_streams`, an integer from 1 to 16, 4 when it is not set. Any other value raises `ConfigError` naming the account. `data_streams = 1` is the single connection described above, with no segment framing.
+
+With `N` above 1:
+
+1. The `listen` request carries `"streams": N`. Lane 0 authenticates with the line `LETIFY-DATA <token>\n` and lane `i` from 1 to `N - 1` with `LETIFY-DATA <token> <i>\n`. The channel opens the `N` connections at the same time. The worker accepts until every lane from 0 to `N - 1` has authenticated once, and closes a connection with a wrong token, an index out of range or an index already taken. Only then does it close the listener and send `HELLO`.
+2. The frames of both directions become one byte stream carried as segments. A segment is a frame header, `wire.HEADER`, with type 8 `SEGMENT`, flags 0, stream set to the lane index and length set to the segment's bytes, followed by the 8 byte little endian offset of its first byte in the byte stream, then the bytes. `SEGMENT` appears only on a lane, never inside the byte stream.
+3. A write shorter than 1 MiB (`wire.STRIPE_MIN`) is one segment on lane 0, sent by the writing thread. A longer write is cut into `N` pieces of `ceil(length / N)` bytes, the last one shorter or absent, and piece `i` goes on lane `i`. Lane 0's piece is sent by the writing thread and every other piece by that lane's own sending thread, and the write returns once every piece is sent. One lock holds a write from its offset to its last piece, so offsets follow write order. The 8 MiB `DATA` chunks of [Frames](#frames) are writes, so a large buffer crosses all lanes chunk by chunk.
+4. Each end has one reading thread per lane. It reads segments and hands them to one reassembly buffer keyed by offset, and the frame reader takes bytes from it in offset order only. A lane whose next segment does not start at the next undelivered offset waits before reading its bytes while the buffer holds more than 64 MiB (`wire.STRIPE_HOLD`), so memory held out of order stays bounded. A segment whose magic or type is wrong, or whose offset repeats bytes already received, ends the stream.
+5. The byte stream ends for its reader once every lane has reached end of stream or failed, and the bytes received in order before that have been delivered. The channel handles that as a closed connection. One lane ending leaves the others running, because a worker that replies to `reexec` and then replaces its process closes all lanes at once, and the reply may still be arriving on another lane when the first end of stream does. A malformed segment ends the stream at once. Shutting the socket of every lane is how closing and a request timeout end a blocked read.
+
+While the channel waits for `HELLO` each read waits at most 30 s, and a lane reading thread treats a socket timeout as no data yet. After `HELLO` reads wait without a limit.
+
+Socket buffers are left to the kernel. `SO_SNDBUF` and `SO_RCVBUF` are never set, because setting them turns off the kernel's buffer tuning and the value is capped at `net.core.wmem_max`, 212 KiB by default.
+
+When any step fails, a `tunnel` failure, a connection that does not open, or no `HELLO` within 30 s, the channel prints one line on stderr, `letify: <runtime>: the data channel did not open (<reason>); frames stay on standard input and output`, and keeps using standard input and output. The worker returns to reading standard input when a byte arrives there or its `wait` ends without an authenticated connection, so a request the channel sends over standard input after a failure is answered without waiting for `wait`.
+
+A `reexec` request goes over the data connection. The worker replies there and replaces its process, which closes the connection. The channel then sends the worker source over standard input, waits for `HELLO` there, and opens the data channel again.
+
+Closing the channel sends `SHUTDOWN` over the connection that carries frames and closes the socket. A connection that ends while requests are open fails them with `ProtocolError`, as a closed pipe does. A request timeout closes the socket, which ends the blocked read.
 
 The adapter never deploys an app. `create` starts `modal.App(app).run()` the first time it sees an app name and holds that context for the adapter's lifetime. When standard input closes, the adapter terminates its remaining sandboxes and then leaves every app context, which stops the ephemeral app. An adapter that dies stops sending Modal's client heartbeat, and Modal stops the ephemeral app for it. So no app named `app` stays on the account after letify stops.
 
@@ -732,6 +773,18 @@ This applies to every provider except `local`: `shell`, `tunnel`, `colab`, `elic
 
 A failed sync raises `EnvironmentFailure` saying `uv sync failed on <runtime>`, with the command and the last lines of uv's standard error. `EnvironmentFailure` is a `RuntimeFailure`, so the call is retried on a fresh runtime.
 
+### Environment on the sandbox disk <!-- id: modal-env-disk -->
+
+> On `modal` the project directory, its `.venv` and uv's cache live on the sandbox's own disk, not on the workspace volume, because importing a large package from a Modal volume reads thousands of small files over the network.
+
+A provider's `env_root` names where the project directory lives instead of the workspace root. It is None for every kind except `modal`, whose `env_root` is `/root/.letify-env`. When `env_root` is set:
+
+1. The project directory is `<env_root>/project/<env key>`.
+2. The sync sets no `UV_CACHE_DIR`, so uv uses its default cache under `~/.cache/uv` on the same disk and hard links from it.
+3. No environment archive is packed or restored, as on any persistent provider.
+
+The sandbox disk is discarded with the sandbox, so every Modal session syncs from the package index. Everything else under the workspace root, volumes, argument blobs and temporary files, stays on the volume.
+
 ### Interpreter version <!-- id: interpreter-version -->
 
 > The runtime's `.venv` always runs the same Python major.minor as the local process, and `Env` guarantees it.
@@ -752,7 +805,7 @@ The worker looks for `uv` on `PATH`, then at `~/.local/bin/uv`. When neither exi
 
 uv installs a package into a `.venv` by hard linking it from its cache, and falls back to a full copy when the cache is on another filesystem. A container's home directory is often an overlay while the workspace root is a mounted disk, so the default cache under `~/.cache/uv` makes every new env key copy the whole environment.
 
-The sync step sets `UV_CACHE_DIR=<workspace root>/uv-cache` for `uv sync` and `uv pip install` when the provider's `persistence` is `persistent`. On a runtime with a persistent workspace root the cache then outlives a container rebuild along with the projects built from it. An `Env.vars` entry naming `UV_CACHE_DIR` wins over this rule.
+The sync step sets `UV_CACHE_DIR=<workspace root>/uv-cache` for `uv sync` and `uv pip install` when the provider's `persistence` is `persistent` and it sets no `env_root`. On a runtime with a persistent workspace root the cache then outlives a container rebuild along with the projects built from it. An `Env.vars` entry naming `UV_CACHE_DIR` wins over this rule.
 
 An ephemeral provider sets nothing. Its disk is discarded with the runtime, so a cache there is filled once per runtime wherever it lives, and moving it only matters when the home directory and the project are on different filesystems.
 
@@ -774,7 +827,7 @@ A package the lock file names is installed in the runtime and referenced by name
 
 > A `Shell` reaches its machine through a connection pipeline: several strategies are tried at once, the fastest acceptable one wins, and the winner is cached per account.
 
-`Modal` and `Local` are not part of this. Modal is reached through the Modal adapter, described in [Modal adapter](#modal-adapter), and Local starts its worker as a child process.
+`Modal` and `Local` are not part of this. Modal is reached through the Modal adapter, described in [Modal adapter](#modal-adapter), with frames on a TCP connection through a Modal encrypted port as [Modal data channel](#modal-data-channel) describes, and Local starts its worker as a child process.
 
 The measurements behind the order and the rules below are in [NETWORK.md](NETWORK.md#connection-pipeline-measurements).
 
@@ -1008,7 +1061,7 @@ Everything letify writes on the runtime is under the root:
 
 | Path | Holds |
 |---|---|
-| `<workspace root>/project/<env key>` | the project files `uv sync` reads, and the `.venv` it builds |
+| `<workspace root>/project/<env key>` | the project files `uv sync` reads, and the `.venv` it builds, except on `modal`, as Environment on the sandbox disk describes |
 | `<workspace root>/project/.<digest>.tar.gz` | an environment archive while it is unpacked, removed once the `.venv` starts |
 | `<workspace root>/uv-cache` | uv's cache on a persistent provider, as uv cache describes |
 | `<workspace root>/volumes/<volume name>` | a volume's materialized blobs and project data |

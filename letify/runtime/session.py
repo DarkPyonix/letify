@@ -423,7 +423,10 @@ class Runtime:
 
         assert self.channel is not None
         files = bootstrap.project_files(self.env)
-        root = bootstrap.project_dir(self.workspace or self.provider.workspace_root, self.env)
+        env_root = self.provider.env_root
+        root = bootstrap.project_dir(
+            env_root or self.workspace or self.provider.workspace_root, self.env
+        )
         where = self.eval(bootstrap.probe_source(self.env, root), timeout=120)
         self.platform = where["platform"]
 
@@ -444,7 +447,9 @@ class Runtime:
 
         if self.env_source != "archive":
             workspace = self.workspace or self.provider.workspace_root
-            cache = bootstrap.uv_cache_dir(workspace) if self.provider.persistent else None
+            # Spec "Environment on the sandbox disk": an env root keeps uv's default cache.
+            persistent_cache = self.provider.persistent and env_root is None
+            cache = bootstrap.uv_cache_dir(workspace) if persistent_cache else None
             source = bootstrap.sync_source(
                 self.env, files, root=root, name=self.name, cache_dir=cache
             )

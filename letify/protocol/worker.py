@@ -589,6 +589,123 @@ def _run(stream, request, settle):
     _reply(stream, outcome)
 
 
+_DATA_PREFIX = b"LETIFY-DATA "
+
+
+def _listen(stream, request):
+    """Answer a listen request, then wait for the data connection that carries the token.
+
+    Spec "Modal data channel". Returns the authenticated connection, with every later frame
+    already sent over it, or None when standard input became readable, the wait ended, or
+    the port could not be bound, so the caller keeps reading standard input.
+    """
+    import select
+    import socket
+
+    token = str(request["token"]).encode("ascii")
+    deadline = time.monotonic() + float(request.get("wait") or 60)
+    server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        server.bind(("0.0.0.0", int(request["port"])))
+        server.listen(4)
+    except OSError as exc:
+        server.close()
+        _reply(stream, {"ok": False, "error": "OSError: %s" % exc, "traceback": ""})
+        return None
+    _reply(stream, {"ok": True, "value": None})
+    streams = int(request.get("streams") or 1)
+    lanes = {}
+    stdin = sys.stdin.fileno()
+    try:
+        while True:
+            left = deadline - time.monotonic()
+            if left <= 0:
+                return None
+            ready = select.select([server, stdin], [], [], left)[0]
+            if stdin in ready:
+                return None
+            if server not in ready:
+                continue
+            connection, _address = server.accept()
+            lane = _authenticated(connection, token, streams)
+            if lane is None or lane in lanes:
+                connection.close()
+                continue
+            lanes[lane] = connection
+            if len(lanes) == streams:
+                ordered = [lanes[index] for index in range(streams)]
+                lanes = {}
+                return _use_connection(ordered)
+    finally:
+        server.close()
+        for connection in lanes.values():
+            connection.close()
+
+
+def _authenticated(connection, token, streams=1):
+    """The lane index the connection's first line names with the expected token, or None.
+
+    Spec "Parallel data streams": lane 0 sends ``LETIFY-DATA <token>`` and lane ``i`` sends
+    ``LETIFY-DATA <token> <i>``.
+    """
+    import hmac
+
+    expected = _DATA_PREFIX + token
+    line = b""
+    try:
+        connection.settimeout(10)
+        while not line.endswith(b"\n") and len(line) < len(expected) + 4:
+            chunk = connection.recv(1)
+            if not chunk:
+                return None
+            line += chunk
+        connection.settimeout(None)
+    except OSError:
+        return None
+    if not line.endswith(b"\n"):
+        return None
+    head, rest = line[: len(expected)], line[len(expected) : -1]
+    if not hmac.compare_digest(head, expected):
+        return None
+    if not rest:
+        return 0
+    if rest[:1] != b" " or not rest[1:].isdigit():
+        return None
+    lane = int(rest[1:])
+    return lane if 0 < lane < streams else None
+
+
+def _use_connection(connections):
+    """Send hello, then every later frame, over the data connections as binary frames.
+
+    Returns what the frame reader reads from: the one connection, or a ``Striped`` stream
+    over every lane.
+    """
+    global _SENDER
+    import socket
+
+    for connection in connections:
+        try:
+            connection.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        except OSError:
+            pass
+    if len(connections) == 1:
+        carrier = connections[0]
+    else:
+        carrier = Striped(
+            [connection.send for connection in connections],
+            [connection.recv_into for connection in connections],
+        )
+    sender = Sender(carrier.send)
+    old = _SENDER
+    # Under the old lock, so no frame is split between the two transports.
+    with old.lock:
+        sender.frame(HELLO, 0, ("%d.%d" % sys.version_info[:2]).encode("ascii"))
+        _SENDER = sender
+    return carrier
+
+
 def _read():
     """Read frames, answer light requests, and queue the rest for the main thread."""
     receiver = Receiver(sys.stdin.buffer.readinto)
@@ -626,6 +743,12 @@ def _read():
         op = request.get("op") if isinstance(request, dict) else None
         if op in _LIGHT:
             _run(stream, request, False)
+            continue
+        if op == "listen":
+            connection = _listen(stream, request)
+            request = None
+            if connection is not None:
+                receiver = Receiver(connection.recv_into)
             continue
         _JOBS.put((stream, request))
         if op == "reexec":
