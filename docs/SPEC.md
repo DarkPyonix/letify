@@ -718,7 +718,7 @@ refs/<name>
 
 Immutability buys two things. Concurrent writers cannot conflict, because different contents get different names, where a two way synchronization loses one writer's changes to the other. And nothing is verified twice, because holding a digest is proof of holding the contents.
 
-Refs carry the mutable part, in the way Git keeps branch names apart from objects. A ref is a few dozen bytes, so a last writer wins race on one is harmless and both blobs survive it. letify reserves `env/<env key>-<platform>` for environment archives and `path/<path key>` for project data; nothing else is written there.
+Refs carry the mutable part, in the way Git keeps branch names apart from objects. A ref is a few dozen bytes, so a last writer wins race on one is harmless and both blobs survive it. letify reserves `env/<env key>-<platform>` for environment archives; nothing else is written there. Project data needs no ref, because a call carries its own manifest.
 
 ### Blob granularity
 
@@ -764,24 +764,61 @@ Nothing hands a session to the caller. There is no call that returns one, no arg
 
 ### Project data <!-- id: project-data -->
 
-> A call's data is found in the call itself. Every `pathlib.Path` the function reaches travels with it: the local contents go up to the provider's volume, the runtime sees the same path already filled, and what the call changes under it comes back when the call ends.
+> A call's data is found in the call itself. Every local `pathlib.Path` the function reaches is sent as content addressed file blobs, only the blobs the runtime or the account's bucket lacks travel, and the body sees a path on the runtime with the same layout.
 
-The declared function is sent with cloudpickle, which serializes its closure variables, the globals it references, its default arguments and the call's arguments. letify's pickler intercepts every `pathlib.Path` among them through `reducer_override`. Nothing is declared: the function's own references are the declaration, which is what makes the decorator behave as a closure over the data it uses.
+The declared function is sent with cloudpickle, which serializes its closure variables, the globals it references, its default arguments and the call's arguments. letify's pickler intercepts every `os.PathLike` among them through `reducer_override`. Nothing is declared: the function's own references are the declaration.
 
-A path is project data when it exists on the local machine at call time, as a file or a directory. For each one:
+Detection runs on a persistent channel only. A one-shot channel has no worker to hold a cache, so its paths travel as plain paths.
 
-1. The local contents are packed into content addressed blobs, large files as their own blobs and trees of small files as one archive, and only the digests the volume is missing are uploaded, directly to the backend.
-2. The ref `path/<path key>` records the manifest, where the path key is the digest of the path resolved against the project root.
-3. In the pickled call, the path is replaced by the path the runtime materializes it at, under the volume directory, so the function body uses it unchanged.
-4. Before the call runs, the runtime pulls the manifest's blobs straight from the backend, as Materializing into a runtime describes.
+#### Which paths are data <!-- id: project-data-detection -->
 
-A path that does not exist locally is an output location. It is created empty in the runtime and replaced the same way.
+A path is project data when all of these hold at call time:
 
-When the call returns, the runtime compares each replaced path with the manifest it started from. Files that are new or changed are stored as blobs in the volume, and the local process writes them back to the local path. So a checkpoint written under a referenced `Path` is on the local disk when the call returns, and the next session receives it as input with no separate resume step.
+1. `os.fspath` gives a `str`, and it names an existing regular file or directory on the local machine.
+2. Its resolved form is inside an allowed root. The allowed roots are the project root, which is the nearest directory upward from the working directory holding a `pyproject.toml` or the working directory when there is none, and each entry of `[tool.letify] data_roots` in that `pyproject.toml`, relative to the root.
+3. It is not the project root itself nor a directory above it, because a path such as `Path(__file__).parent` names the code and its `.venv`, not data.
 
-Only `pathlib.Path` objects are detected. A string that happens to name a local file is left alone, because no rule can tell a path from any other string, and uploading on a guess would send data the user did not mean to send.
+Any other path is pickled unchanged, so the body receives the local path as it was. Only `os.PathLike` objects are detected. A string that happens to name a local file is left alone, because no rule tells a path from any other string.
 
-Detection costs one `stat` per path per call, and packing is skipped when the manifest ref already matches the local tree's modification times and sizes.
+A directory is walked without following symbolic links to directories. Regular files and symbolic links to regular files are included. Entries named `.git`, `.venv` and `__pycache__` are skipped.
+
+#### Digests and the digest cache <!-- id: project-data-digests -->
+
+Each file is one blob, named by the blake3 digest of its contents with 16 byte output, the digest of Argument addressing. A file of 64 MiB or more is hashed through a memory map with blake3's multithreaded update. A directory is a manifest: a list of relative POSIX path, digest and size per file, sorted by path.
+
+The local digest cache is `~/.cache/letify/digests.json`. An entry is keyed by the resolved path and holds size, modification time in nanoseconds, inode and digest. A file whose four stat fields match its entry is not read again. The file is replaced atomically after a call that added or changed an entry.
+
+#### Where the bytes come from <!-- id: project-data-transfer -->
+
+The runtime keeps a file blob cache at `<workspace root>/data/blobs/<first two hex characters>/<digest>`. A cache file is made read-only when it is committed. Before a call the local process asks the worker which digests that cache holds with the expected size, with one `data_have` request. Then:
+
+| Provider | Missing blobs come from |
+|---|---|
+| persistent (`shell` or `tunnel` with `persistent = true`, `modal`, `elice` with a persistent account, `local`) | the local process over the channel. The cache is on the machine's own disk, so a later session already holds what an earlier one received |
+| ephemeral, account sets `bucket` | the bucket. The local process lists the bucket once, uploads the digests the bucket lacks straight to it, and the worker downloads the rest into its cache |
+| ephemeral, no `bucket` | the local process over the channel, every session |
+
+`bucket = "<name>"` on an account names a Cloud Storage bucket for its data, reached as the `gcs` backend describes. `bucket_prefix` sets the object prefix, `letify` by default, and `bucket_endpoint` and `sts_endpoint` point the client and the token exchange elsewhere. A persistent account ignores `bucket`.
+
+Over the channel, a file travels in `data_put` requests of at most 64 MiB each, carried as out-of-band `DATA` frames. The worker writes them to `<digest>.partial.<pid>`, checks the digest of the whole file, and renames it into the cache. A digest that does not match raises `RuntimeFailure` and nothing is renamed.
+
+From the bucket, the worker receives one `data_pull` request naming each missing digest's object URL and the request headers, which carry a read token downscoped to the bucket and prefix exactly as Materializing into a runtime describes. It downloads up to 8 objects at a time into the cache with the same partial file and digest check, and discards the headers when the request finishes.
+
+An upload of 64 MiB or more shows the download progress line of Installing external tools on standard error, with `uploading` in place of `downloading`.
+
+#### Materializing and the rewritten path <!-- id: project-data-materialize -->
+
+Each call that carries data gets a call directory, `<workspace root>/data/calls/<call id>`, where the call id is 16 random hex characters. The `n`th distinct detected path, counted from 0, is placed at `<call directory>/<n>/<name>`, where `<name>` is the local path's final component. A file is placed there; a directory is recreated there with every manifest entry at its relative path. Each entry is a hard link to the cache file, or a copy where a hard link fails. The same local path detected twice in one call maps to the same runtime path.
+
+In the pickled call a detected `pathlib.Path` is replaced by `pathlib.Path(<runtime path>)`, and any other `os.PathLike` by the same `pathlib.Path`. The worker creates the call directory before it loads the call, and removes it after the call's outcome is computed, whether the body returned or raised.
+
+#### Data log line <!-- id: project-data-log -->
+
+A call that detected data prints one line on standard error:
+
+`letify: data <files> files <size> detected, <files> files <size> already on <the runtime|the bucket>, uploaded <files> files <size> in <seconds> s (<rate> MiB/s)`
+
+Sizes are in MiB with one decimal. `<the bucket>` is named when the bytes come from the bucket.
 
 
 ### Backends
@@ -1129,6 +1166,7 @@ Everything letify writes on the runtime is under the root:
 | `<workspace root>/uv-cache` | uv's cache on a persistent provider, as uv cache describes |
 | `<workspace root>/volumes/<volume name>` | a volume's materialized blobs and project data |
 | `<workspace root>/blobs` | argument blobs on a persistent provider, as Argument blobs on a persistent disk describes |
+| `<workspace root>/data` | the file blob cache and the per-call data directories of Project data |
 | `<workspace root>/tmp` | temporary files, including the archive `pack_dir` builds on a one-shot channel; `TMPDIR` points here |
 
 The worker's working directory is the root, so a relative path in user code resolves under it. The uv installer is the one exception to the root: uv goes to `~/.local/bin`, as uv on the runtime describes, because it is shared by every account on that home directory.
@@ -1726,4 +1764,5 @@ Pushing a tag `v*` runs `.github/workflows/publish.yml`. It builds the sdist, th
 - **The connection pipeline is not exercised against live networks.** `Rendezvous`, `Strategy`, `Link`, `Probe`, `Pipeline`, `LinkCache` and the remote agent are implemented and tested over loopback sockets and faked commands. Installing and starting `sshd` on a Colab VM over `colab exec` is not yet checked against a live runtime.
 - **letify runs no command on an Elice machine through `eci`.** Elice's remote half runs over forward SSH to the machine's public IP, and the punch and Tailcat strategies need that SSH to succeed first.
 - **Orphan reconciliation is not implemented.** A session whose controlling machine was killed outright is released by the lease on the providers where the process is the cost. Where the platform bills for the machine and takes no deadline, nothing ends it: an Elice machine bills compute until it is stopped. The intended answer is that the next letify process asks the provider what is running under this project's name and ends what nothing is watching, with a command to do it on demand. Neither exists yet.
+- **Project data flows one way.** Files a call writes under a detected path stay in the call directory, which is removed when the call ends, and nothing is written back to the local path. The runtime's file blob cache under `<workspace root>/data/blobs` is never evicted.
 - **Persistence detection is not implemented.** Deciding a machine's disk policy by writing a marker file and looking for it in a later runtime is a decision recorded here, not yet code.

@@ -109,14 +109,17 @@ class GCSBackend(Backend):
 
     def pull_source(self, digest: str) -> dict[str, object] | None:
         """A Colab runtime is a Compute Engine VM, so it reads the bucket over Google's network."""
-        name = self._key(blob_key(digest))
         return {
-            "url": self.object_url(name, media=True),
+            "url": self.blob_url(digest),
             "headers": {"Authorization": f"Bearer {self.read_token()}"},
         }
 
     def _key(self, key: str) -> str:
         return f"{self.prefix}/{key}" if self.prefix else key
+
+    def blob_url(self, digest: str) -> str:
+        """The media download URL of one blob, which carries no credential."""
+        return self.object_url(self._key(blob_key(digest)), media=True)
 
     # -- HTTP ------------------------------------------------------------------
 
@@ -150,6 +153,31 @@ class GCSBackend(Backend):
         query = urllib.parse.urlencode({"uploadType": "media", "name": name})
         url = f"{self.endpoint}/upload/storage/v1/b/{urllib.parse.quote(self.bucket)}/o?{query}"
         self._request("POST", url, data=payload, what=name)
+
+    def put_file(self, digest: str, path: str, size: int, progress: Any = None) -> None:
+        """Upload one file as a blob, streamed from disk rather than read into memory.
+
+        ``progress``, when given, is called with the number of bytes sent so far.
+        """
+        name = self._key(blob_key(digest))
+        query = urllib.parse.urlencode({"uploadType": "media", "name": name})
+        url = f"{self.endpoint}/upload/storage/v1/b/{urllib.parse.quote(self.bucket)}/o?{query}"
+        with open(path, "rb") as handle:
+            body = _CountingReader(handle, progress)
+            request = urllib.request.Request(url, data=body, method="POST")  # type: ignore[arg-type]
+            request.add_header("Authorization", f"Bearer {self.tokens.token()}")
+            request.add_header("Content-Type", "application/octet-stream")
+            request.add_header("Content-Length", str(size))
+            try:
+                with urllib.request.urlopen(request, timeout=3600) as response:
+                    response.read()
+            except urllib.error.HTTPError as exc:
+                detail = exc.read()[:500].decode(errors="replace")
+                raise RuntimeFailure(
+                    f"gs://{self.bucket}/{name}: POST returned {exc.code}: {detail}"
+                ) from exc
+            except (urllib.error.URLError, OSError) as exc:
+                raise RuntimeFailure(f"gs://{self.bucket}/{name}: POST failed: {exc}") from exc
 
     def _download(self, name: str) -> bytes | None:
         return self._request("GET", self.object_url(name, media=True), what=name)
@@ -198,6 +226,23 @@ class GCSBackend(Backend):
 
     def write_ref(self, name: str, digest: str) -> None:
         self._upload(self._key(ref_key(name)), digest.encode())
+
+
+class _CountingReader:
+    """A file object for an upload body that reports how many bytes were read."""
+
+    def __init__(self, handle: Any, progress: Any) -> None:
+        self._handle = handle
+        self._progress = progress
+        self._done = 0
+
+    def read(self, size: int = -1) -> bytes:
+        # http.client reads the body in blocks of its own size; a wider block sends faster.
+        chunk = self._handle.read(max(size, 1 << 20) if size > 0 else size)
+        self._done += len(chunk)
+        if self._progress is not None:
+            self._progress(self._done)
+        return chunk
 
 
 class ModalBackend(Backend):

@@ -122,6 +122,32 @@ The arithmetic: 50,000 images at 100 ms each is over an hour of pure input and o
 
 Drive is a fine warehouse. It is not a working disk. If you already keep data there, pull one archive at session start rather than reading from it during training.
 
+## Data your call reads
+
+Use `pathlib.Path` for local data, and letify sends it with the call. A `Path` argument, a `Path` default, or a `Path` in a global or closure the function reads is detected while the call is pickled. The body receives a `Path` on the runtime with the same file names and directory layout.
+
+```python
+DATA = Path("data/corpus")
+
+@let.function(device=lab.A100, host=letify.remote)
+def train(lr):
+    files = sorted(DATA.rglob("*.bin"))   # a directory on the runtime
+```
+
+What is detected: an existing file or directory under the project root, the nearest directory with a `pyproject.toml`, or under a directory listed in `[tool.letify] data_roots`. A path that does not exist, a path outside those roots, and the project root itself stay plain paths. `.git`, `.venv` and `__pycache__` inside a directory are skipped.
+
+Each file is hashed once and remembered by size, modification time and inode in `~/.cache/letify/digests.json`, so an unchanged dataset is not read again. Where the bytes come from depends on the account:
+
+| Account | First session | Later sessions |
+|---|---|---|
+| persistent (`persistent = true`, Modal, local) | missing files over the link | nothing uploaded; the runtime's disk holds them |
+| ephemeral with `bucket = "<name>"` | missing files to the bucket, then the runtime downloads them | nothing uploaded; the runtime downloads from the bucket |
+| ephemeral without `bucket` | every file over the link | every file over the link again |
+
+A changed file is sent again on its own; the rest is not. Each call that carries data prints one line, for example `letify: data 8 files 1024.0 MiB detected, 7 files 896.0 MiB already on the runtime, uploaded 1 files 128.0 MiB in 1.4 s (91.4 MiB/s)`.
+
+Files the call writes under a detected path are not copied back. Write results to a volume or return them.
+
 ## Data that is too big to move
 
 Three options, in the order worth trying.
