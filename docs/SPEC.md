@@ -120,6 +120,7 @@ A provider is built from one entry in the configuration file and reached by attr
 | `unmetered` | True when there is no quota at all |
 | `as_of` | When the figure was read, as Unix seconds |
 | `note` | Why a figure is missing, in one line |
+| `resources` | Further allowances on the same account, such as Kaggle's TPU hours beside its GPU hours. A list of records with `name`, `unit`, `remaining`, `used`, `limit` and `resets_at`, empty when there are none |
 
 Every field except `alias`, `kind`, `unit` and `source` may be `None`. A provider that cannot be read returns a record with `remaining` set to `None` and the reason in `note`. It does not raise.
 
@@ -128,7 +129,7 @@ Each provider reads its own service. Every call is read-only: none creates a run
 | Provider | Unit | Remaining comes from |
 |---|---|---|
 | `Colab` | compute units | `GET https://colab.research.google.com/tun/m/ccu-info?authuser=0`, the call the Colab web page makes. `remaining` is `currentBalance` and `rate_per_hour` is `consumptionRateHourly`. The OAuth token is the Colab CLI's `.config/colab-cli/token.json` in the account directory. An expired token is refreshed in memory at its `token_uri` and the file is not rewritten |
-| `Elice` | KRW | `GET <billing_endpoint>/stats` with the account's bearer token and, when `organization` is set, the `x-elice-org-name-short` header. `remaining` is `total_credit_remaining_amount`, sent as a number or as `"<amount> <currency>"`. `rate_per_hour` prices the live allocations against the zone price list. `billing_endpoint` is the Elice billing API base URL. The portal takes it from its runtime settings, so it is a configuration field, and without it `note` says so |
+| `Elice` | KRW | `GET <billing_endpoint>/stats` with the account's bearer token and, when `organization` is set, the `x-elice-org-name-short` header. `remaining` is `total_credit_remaining_amount`, sent as a number or as `"<amount> <currency>"`. `rate_per_hour` prices the live allocations against the zone price list. `billing_endpoint` is the Elice billing API base URL. The public portal assets do not carry it, so it has no default: `letify login elice` records it from `--billing-endpoint` or the prompt, and without it `note` says so |
 | `Modal` | USD | The Modal adapter op `billing_summary`, which calls `modal.Workspace.billing.summary()` for the current month. `used` is the month's metered cost and `limit` is the monthly credit, `monthly_credit` in the entry or 30 USD, the Starter plan credit. `remaining` is `limit - used`, not below 0. `resets_at` is 00:00 UTC on the first of next month |
 | `Kaggle` | GPU hours | The weekly GPU quota the Kaggle provider reads. `remaining`, `used` and `limit` are hours, and `resets_at` is the weekly renewal |
 | `Local` | hours | unmetered: this machine bills nobody |
@@ -146,19 +147,57 @@ usage_limit = 100.0
 
 The last number in the command's output is read as the remaining amount. The command runs only when usage is asked for, never during a call.
 
+`usage_limit` without `usage_command` is the plan allowance for the provider's own reading. It fills `limit` only when the service did not state one, and `used` becomes `limit - remaining`, not below 0. Colab reports a balance and no allowance, so this is how a Colab row gets a percentage.
+
 `Launcher.usage()` asks every provider at once, one thread each, and waits at most `usage_timeout` seconds per provider, 20 by default. A provider that has not answered by then, or that raised, gets a row with `remaining` set to `None` and the reason in `note`. The other rows are unaffected.
 
-`letify usage` prints one row per declared provider, and `letify usage <alias>` one provider. A provider whose optional dependency or setting is missing is reported as unavailable rather than skipped, so the table always lists every alias. `letify usage --json` prints the records unformatted. The table formats amounts by unit:
+`letify usage` prints one block per declared provider, and `letify usage <alias>` one provider. A provider whose optional dependency or setting is missing is reported as unavailable rather than skipped, so the output always lists every alias. `letify usage --json` prints the records unformatted.
+
+Amounts are formatted by unit:
 
 | Unit | Printed as |
 |---|---|
 | `KRW` | `12,345 KRW`, whole won with thousands separators |
 | `USD` | `$29.50` |
 | `compute units` | `99.93 compute units`, two decimals |
-| `GPU hours` | `12.5 GPU hours`, one decimal |
+| a unit ending in `hours`, such as `GPU hours` | `12.5 GPU hours`, one decimal |
 | any other | the number as given, then the unit |
 
-A row prints `<remaining> left`, then `of <limit>` when the limit is known, then `resets <YYYY-MM-DD HH:MM UTC>` when `resets_at` is known, then the hourly rate when it is known. An unmetered row prints `no quota, unmetered`. A row with no figure prints `not reported` with the note or the source.
+A block is a header line, `<alias>  <kind>`, followed by lines indented by 2 spaces:
+
+```
+colab_a  colab
+  [████████████████░░░░░░░░░░░░░░░░░░░░░░░░] 40% used
+  60.00 compute units left of 100.00
+  1.96 compute units/hour running now, about 1 d 6 h at this rate
+
+kaggle  kaggle
+  [████████████████████████░░░░░░░░░░░░░░░░] 60% used
+  12.0 GPU hours left of 30.0
+  resets in 4 d 6 h (2026-09-18 12:00 UTC)
+  TPU [████░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░] 10% used
+      18.0 TPU hours left of 20.0
+
+lab  shell
+  no quota, unmetered
+```
+
+| Line | Printed when | Content |
+|---|---|---|
+| Gauge | `limit` is known and above 0 | `[<filled><empty>] <p>% used`, where `p` is `used / limit` rounded to a whole percent, with `used` taken as `limit - remaining` when the service did not state it |
+| Amount | `remaining` is known | `<remaining> left`, then ` of <limit>` when the limit is known. With no limit the line ends `, limit unknown` and no gauge or percentage is printed |
+| Reset | `resets_at` is known | `resets in <relative> (<YYYY-MM-DD HH:MM UTC>)`, or `reset due (<date>)` once the time has passed |
+| Rate | `rate_per_hour` is known | `<rate>/hour running now`, then `, about <relative> at this rate` when the rate is above 0 and `remaining` is known |
+| No quota | `unmetered` is true | `no quota, unmetered`, and no other line |
+| Not reported | neither `remaining` nor `rate_per_hour` is known | `not reported` |
+| Note | `note` is set | the note |
+| Unavailable | the provider could not be built | `unavailable: <reason>` |
+
+A relative time uses the two largest units of days, hours and minutes, as `4 d 6 h`, `3 h 12 min` or `45 min`. Each record in `resources` prints its own gauge, amount and reset lines under the account's lines. Its gauge line starts with its `name` and its other lines are indented to the gauge's bracket.
+
+The gauge is 16 to 40 cells wide. Its width is the terminal width from `shutil.get_terminal_size`, minus the 2 space indent, the 2 brackets and 10 columns for the percentage text, then clamped to that range. A further allowance's gauge is also shorter by its name and a space, with the same 16 cell minimum, so a narrow terminal still gets a 16 cell gauge. A filled cell is `█` and an empty cell is `░` when the standard output encoding is UTF-8. Otherwise they are `#` and `-`.
+
+Colour is added only when standard output is a terminal and the `NO_COLOR` environment variable is unset or empty. The gauge and its percentage are green while more than 50% of the allowance remains, yellow from 20% to 50%, and red below 20%. The header's alias is bold. Without colour no escape sequence is written.
 
 ### Inventory
 
@@ -213,11 +252,43 @@ Every provider that can start a session without an accelerator registers it as `
 
 > How hard each declared instance's accelerator is working right now, read from the machine that owns it.
 
-`letify utilization` reports one row per instance: the provider alias, the accelerator, and for each physical device its utilization percentage, memory used against memory total, temperature and power draw. `nvidia-smi --query-gpu` is the single source, because it is the only reading present on every machine letify reaches and it needs no framework loaded.
+`letify utilization` reports, for each physical device, its utilization percentage, memory used against memory total, temperature and power draw. `nvidia-smi --query-gpu` is the single source for those readings, because it is the only reading present on every machine letify reaches and it needs no framework loaded.
 
-Where the reading comes from depends on where the device is. An instance on the local provider is read by running `nvidia-smi` here. An instance on a remote provider is read inside its live session, by shipping the same reader function through the ordinary call protocol, so no new channel and no new remote dependency is involved.
+Where the reading comes from depends on whether the machine outlives a session.
 
-An instance with no live session reports no devices and says why, because starting a session to measure its load would cost money and change the answer. A machine without `nvidia-smi` reports no devices with that as the reason. Neither is an error: the table lists every declared instance either way.
+| Provider | Scope | Read from |
+|---|---|---|
+| `Local`, `Shell`, `Tunnel` | `machine` | The machine itself, with no session: `nvidia-smi` here for `Local`, and over the provider's link for `Shell` and `Tunnel`. One row per provider |
+| `Colab`, `Elice`, `Modal`, `Kaggle` | `session` | Inside the instance's live session, by shipping the same reader function through the ordinary call protocol. One row per instance |
+
+A `machine` reading is read-only. It runs the three `nvidia-smi` queries the busy check runs, starts no process on a card and reserves nothing. Each device in it also carries who holds the card:
+
+| `holder` | Means |
+|---|---|
+| `letify` | This process has reserved the index |
+| `others` | Another user is computing on it, by the busy check rule under Inventory. `users` names them |
+| `mine` | Only the login user's own processes, or this client's workers, are computing on it |
+| `free` | No compute process is on it |
+| `unknown` | The utilization was read but the owner query failed |
+
+The first row of that table that applies wins. A `session` device has `holder` set to `None`.
+
+A `session` instance with no live session reports no devices and says why, because starting a session to measure its load would cost money and change the answer. A machine without `nvidia-smi`, or one the link cannot reach, reports no devices with that as the reason. Neither is an error: every declared provider is listed either way. `--json` prints the rows with `alias`, `accelerator` (`None` for a `machine` row), `scope`, `devices` and `reason`.
+
+The command prints one block per provider, with the same header, indent, gauge characters, colour and width rules as `letify usage`:
+
+```
+dept_gpu  shell
+  gpu0  Tesla P100-PCIE-16GB  free
+    load   [████████░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░]  20%
+    memory [████░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░]  10%  1.6/16.0 GiB
+    41C  38W
+
+colab_pro_plus  colab
+  no live session, so nothing to measure
+```
+
+A card's header line is `gpu<index>  <name>  <holder text>`, where the holder text is `reserved by letify`, `busy: <users>`, `in use by your processes`, `free` or `holder unknown`, coloured cyan, red, yellow, green and not at all. The load line is left out when the card reports no utilization, the memory line when it reports no total, and the last line holds whichever of temperature and power the card reported. Each gauge is 16 to 40 cells: the terminal width minus 4 columns of indent, 7 of label, 2 brackets, 5 of percentage and 16 of memory text. Both gauges are coloured by the unused share with the thresholds `letify usage` uses. A `session` row's reason is printed as `<accelerator>: <reason>`, or once without the accelerator when every instance of the provider gives the same reason.
 
 The reading is taken at the moment it is asked for and carries no history. A load that has to be watched over time belongs in the caller's own loop, not in a CLI that shells out to `nvidia-smi` per poll.
 
@@ -494,6 +565,8 @@ There is no detached execution. A detached run whose remote side is preempted wo
 `Launcher.status()` answers three questions: how many sessions exist, how many are serving a call, and what each one is. `live` and `busy` are counts, and `devices` reports each provider's inventory against what is reserved, so a reader can see at a glance whether a call is waiting for a card. `runtimes` describes each session: its name, provider, accelerator, the device indices it holds, placement, whether it is busy and how long it has been idle.
 
 Nothing internal is reported. The pool holds a guard so that a session released by one call is not ended while an overlapping call is still running, and whether that guard is currently open is a fact about the pool's implementation rather than about what is running. A field among counts that looks like a count and is actually a boolean is worse than no field, because it is read as a count.
+
+Each runtime also reports `uptime_seconds`, the `link` strategy its provider connected over and the `rtt_ms` that link measured, each `None` where there is none. `letify status` asks `usage()` only of providers with a live runtime, because a runtime is what costs money, and adds that record as `usage`.
 
 `status()` describes this process only. A session started by a different process is not in it, since the pool lives in the process that owns it. What a machine itself is doing is a different question, answered by `letify utilization`.
 
@@ -929,6 +1002,18 @@ An account that is already in the home file is not asked for again. `letify logi
 
 `letify login modal <alias>` signs in to Modal itself. It first asks for an optional Modal profile, which names the Modal workspace to sign in to. It then runs `modal token new` through `uv tool run --python 3.12 --with "modal>=1.0,<2" --from modal modal`, with `MODAL_CONFIG_PATH` set to `~/.letify/accounts/<alias>/modal.toml` and, when a profile was given, `--profile <profile>`. The profile is written as `profile`, because `workspace` is the workspace root. Modal's command prints a link and waits for the browser approval, so `modal` never has to be on `PATH` or in the project's environment. The token lands in the account directory, and the adapter reads it from there. A sign in that exits non zero, or exits zero without writing `modal.toml`, writes nothing to either `config.toml` and removes a `modal.toml` the attempt created.
 
+`letify login elice <alias>` checks the access token before it writes anything. The steps run in this order:
+
+1. The token comes from `--token`, or else from a hidden prompt, `Elice access token: `. `--no-input` without `--token` refuses.
+2. `GET <endpoint>/user/organization` with the token as a bearer token. `endpoint` is `--endpoint` or `https://portal.elice.cloud/api`. Any answer other than 200 fails the login with `LoginError`, whose message starts with `Elice refused the access token`, and nothing is written: no `config.toml` entry and no file in the account directory.
+3. The zone is `--zone-id`. Without it, a terminal is shown the zones from `GET <endpoint>/user/infra/zone`, one numbered line each, `1. <name> (<id>)`, and asked `Elice zone [1-<n>]: `. A blank answer takes the only zone when there is exactly one. An answer that is not a listed number is refused and asked again. `--no-input` without `--zone-id` refuses, and so does an empty list.
+4. The machine is `--machine-id`, or chosen the same way from `GET <endpoint>/user/resource/compute/virtual_machine?zone_id=<zone>`, asked as `Elice machine [1-<n>]: `.
+5. `organization` is `--organization`, or else the `name_short` of the organization answer in step 2. It is written only when one of them gives a value.
+6. `billing_endpoint` is `--billing-endpoint`, or else a terminal is asked `Elice billing API base URL (blank to skip): `. It is written only when given.
+7. The token is written to `~/.letify/accounts/<alias>/access_token` with mode 0600.
+
+The account is written with `kind = "elice"`, `zone_id`, `machine_id`, and `endpoint` only when it is not the default.
+
 `letify login tunnel <alias> --connect <token>` declares a machine behind NAT from the command `letify client shell connect` printed on it. Without `--connect`, a terminal is asked `Token printed by 'letify client shell connect': `, and `--no-input` refuses. The steps run in this order, and a failure at any step writes nothing to either file and raises `LoginError` whose message starts with `tunnel login failed at <step>: `:
 
 1. `tailcat`: `tailcat` must be on the local `PATH`. Otherwise the message is the same install instructions `letify client shell connect` prints, for this machine's operating system and architecture.
@@ -1184,6 +1269,105 @@ A lost worker process or link raises `RuntimeLost`, and the session is discarded
 
 Measured on 2026-09-14 against a Tesla P100 server with torch 2.5.1 cu121: libcudart 12.1 resolves 425 driver symbols by name and the stand-in `libcuda.so.1` exports 20, so CUDA initialization fails with `cudaErrorInsufficientDriver`. The private `cuGetExportTable` blocks adding symbols one by one, and PyTorch kernels arrive through fatbinary registration that `cuModuleLoadData` does not see. Operator forwarding depends on PyTorch's public extension points instead of the driver's private ones. The Rust crates in `letify-core/` and `letify.remoting.probe` remain in the tree and the wheels, and nothing on the `host="local"` path calls them.
 
+## Command line
+
+> Every command prints for a person by default and for a program with `--json`, through one renderer, `letify/render.py`.
+
+### Output conventions
+
+A style is chosen per stream, so standard output and standard error decide separately:
+
+| Setting | Rule |
+|---|---|
+| Colour | Only when the stream is a terminal and `NO_COLOR` is unset or empty |
+| Characters | Block characters and symbols when the stream encoding is UTF-8, ASCII otherwise |
+| Width | `shutil.get_terminal_size`, 80 columns when it cannot be read |
+
+| Mark | UTF-8 | ASCII | Colour | Means |
+|---|---|---|---|---|
+| success | `✓` | `+` | green | The command did what was asked |
+| failure | `✗` | `x` | red | It did not, and the line says why |
+| warning | `!` | `!` | yellow | It ran, with something to notice |
+
+A heading, an alias at the top of a block and a table's column names are bold. Secondary text, such as a note, a path hint or a reset date, is dim. A table left-aligns each column to its longest cell with two spaces between columns and names its columns in capitals.
+
+A `LetifyError` that reaches the command line prints `✗ <message>` on standard error and exits with 1. An argument error is argparse's own and exits with 2.
+
+`--json` prints the records with no styling on `providers`, `devices`, `status`, `usage`, `utilization`, `probe` and `efficiency`.
+
+Connection decision lines stay on standard error as `letify: <message>`, with the content set by Transport. When standard error is a terminal with colour, the `letify:` prefix is dim and nothing else changes.
+
+### Commands
+
+| Command | Prints |
+|---|---|
+| `providers` | A table `ALIAS  KIND  PERSISTENCE`. A provider that cannot be built has `✗ unavailable: <reason>` in place of kind and persistence. `--json` is a list of `{alias, kind, persistence}` or `{alias, unavailable}` |
+| `devices` | A table `PROVIDER  ACCELERATORS`, the accelerators joined by `, `. `--json` is the mapping from alias to accelerator names |
+| `status` | The header `<name>  <live> live, <busy> busy`, one block per live runtime, then a table `PROVIDER  ACCELERATOR  RESERVED  INDICES` with reserved as `<reserved>/<count>`. With no runtime the blocks are replaced by `no live session in this process`. `--json` is `Launcher.status()` |
+| `usage`, `utilization` | As Remaining usage and GPU utilization describe |
+| `probe` | A mark and `forwarding usable`, `forwarding usable but costly` or `forwarding not usable`, then aligned `platform`, `core`, `agent` and `round trip` fields and the reason, dim. `--json` is the capability record |
+| `efficiency` | `<p>% of a direct run`. `--json` is `{"efficiency": <fraction>}` |
+| `check` | `✓ <alias> answers`, then the machine's output indented by 2 spaces |
+| `login` | `✓ <alias> declared in <home>`, or `! <alias> was already declared in <home>, so nothing was asked for`, then `✓ <alias> referenced in <project>, which is safe to commit` |
+| `logout` | `✓ <alias> removed from <home>`, then the note about the project reference, dim |
+| `stubs` | `✓ <path written>` |
+| `client shell connect` | `On your own machine, run:` bold, the login command plain so it can be copied, and the notes dim |
+
+A runtime block in `status` is:
+
+```
+run-1  lab.P100  busy
+  cards 0, 1  host remote  link forward-ssh, 42.0 ms
+  up 1 h 2 min  idle 3 min
+  about 2.07 compute units so far at 2.00 compute units/hour
+  [████████████████████░░░░░░░░░░░░░░░░░░░░] 50% used
+  50.00 compute units left of 100.00
+```
+
+The header ends `busy` while a call runs and `idle` otherwise. `cards` is left out where the provider assigns the device, `link` where there is none, and the round trip where it was not measured. The cost line needs a usage record with a rate, and is uptime times the rate, so it is an estimate and says `about`. The gauge and amount lines are the usage block's own lines for that record.
+
+### Machine-readable output <!-- id: machine-readable-output -->
+
+> `letify usage --json`, `letify utilization --json` and `letify status --json` print JSON whose field names and types are a contract: a field may be added, but none is renamed, removed or retyped.
+
+Each command prints one JSON document on standard output and exits 0. An error that stops the command prints a message on standard error and exits non zero, with nothing on standard output. The formatting of the human output does not change the JSON.
+
+`letify usage --json` prints a list with one object per declared alias, in configuration order. A usage object carries every field of the `Usage` record under "Remaining usage", all keys always present:
+
+| Key | Type |
+|---|---|
+| `alias`, `kind`, `unit`, `source` | string |
+| `remaining`, `limit`, `used`, `rate_per_hour` | number or null |
+| `resets_at`, `as_of` | number of Unix seconds, or null |
+| `unmetered` | boolean |
+| `note` | string or null |
+| `resources` | list of `{"name", "unit"}` strings with `remaining`, `used`, `limit` and `resets_at` as number or null, empty when the account has no further allowance |
+
+An alias whose provider cannot be built prints `{"alias": <string>, "unavailable": <string>}` instead.
+
+`letify utilization --json` prints a list of rows as "GPU utilization" describes: one per `machine` provider and one per `session` instance with an accelerator. A row has `alias`, `kind` and `scope` (string), `accelerator` (string, or null on a `machine` row), `devices` (list) and `reason` (string or null, why `devices` is empty). A device object has `index` (integer), `name` (string), `utilization_percent`, `memory_used_gb`, `memory_total_gb`, `memory_percent`, `temperature_c`, `power_w` (number or null each), `holder` (one of `letify`, `others`, `mine`, `free`, `unknown`, or null on a `session` row), `users` (list of strings, the owners when `holder` is `others`) and `reserved` (boolean). An alias whose provider cannot be built prints `{"alias": <string>, "unavailable": <string>}`.
+
+`letify status --json` prints the `Launcher.status()` object described under "Status reporting": `name` (string), `live` and `busy` (integer), `devices` (object keyed by alias, then by accelerator, each `{"count": integer, "reserved": integer, "indices": [integer]}`), `runtimes` (list of `{"name", "provider", "accelerator", "placement"}` strings, `devices` list, `busy` and `persistent_channel` booleans, `idle_seconds` number), `declared` and `config_sources` (lists of strings). `letify status` without the flag prints the same document.
+
+### Editor extension <!-- id: editor-extension -->
+
+> `letify-ext/` is a VS Code extension that shows the remaining quota and GPU load in the status bar, read only through the JSON above.
+
+The extension runs `uv run letify <command> --json` in the first workspace folder. The command is the setting `letify.command`. It reads usage every `letify.usageIntervalSeconds`, 60 by default, and utilization and status every `letify.utilizationIntervalSeconds`, 10 by default while its view is visible and at the usage interval otherwise. It makes no network call of its own and writes no credential anywhere.
+
+The quota status bar item shows the account with the lowest remaining share, `remaining / limit`, as `<alias> <percent>% left`, with `(<time to reset>)` when `resets_at` is known. An account with no limit is ranked after every account with one. The item turns to the warning color when the share left is below `letify.warningPercent`, 20 by default, and to the error color below `letify.errorPercent`, 5 by default. The GPU item shows `GPU <free>/<total> free <mean>%` when any device reports a `holder`, where a device is free when its `holder` is `free`. When no device reports one it shows `GPU <busy>/<total> busy <mean>%`, where a device is busy at `letify.busyPercent`, 10 by default, or above. The mean is over devices that report utilization.
+
+Hovering either item shows its cards. Clicking one opens the letify view with the tabs Quota, GPU and Runtimes. A quota card shows a gauge of the share used, the reset time, the share of the period elapsed where the period length is known (7 days for `GPU hours`, the calendar month for `USD`), the projection `used / elapsed share` capped at 999 percent, and the hourly rate. Each record in `resources` adds a row under them: its `name`, the amount left of its limit, a gauge of the share used when the limit is known, and its reset time. A GPU card shows, per device, utilization and memory gauges, temperature, power and the holder label:
+
+| `holder` | Label |
+|---|---|
+| `letify` | `letify reserved` |
+| `others` | `other users: <users>` |
+| `mine` | `yours` |
+| `free` | `free` |
+| `unknown` | `unknown` |
+| null | `letify reserved` when `status` lists the index as reserved, nothing otherwise | Daily history is the mean GPU utilization and the quota spent per UTC day, kept by the extension in its own storage for 30 days from its own samples.
+
 ## Packaging
 
 > One install, `uv add letify`, with no extras. It installs cloudpickle and blake3 and nothing else.
@@ -1206,42 +1390,6 @@ The Python code is pure and links no Python extension. letify-core binaries are 
 | macOS x86_64 | `macosx_10_12_x86_64` |
 
 Linux wheels are built inside the `manylinux_2_28` containers, so the binaries need glibc 2.28 or newer. That covers RHEL 8, Debian 10 and Ubuntu 18.10 onward. The sdist carries no binaries, and an install from it has no letify-core.
-
-## Command line
-
-> `letify` subcommands print for a person by default, and `--json` prints a fixed record other programs may parse.
-
-### Machine-readable output <!-- id: machine-readable-output -->
-
-> `letify usage --json`, `letify utilization --json` and `letify status --json` print JSON whose field names and types are a contract: a field may be added, but none is renamed, removed or retyped.
-
-Each command prints one JSON document on standard output and exits 0. An error that stops the command prints a message on standard error and exits non zero, with nothing on standard output. The formatting of the human output does not change the JSON.
-
-`letify usage --json` prints a list with one object per declared alias, in configuration order. A usage object carries every field of the `Usage` record under "Remaining usage", all keys always present:
-
-| Key | Type |
-|---|---|
-| `alias`, `kind`, `unit`, `source` | string |
-| `remaining`, `limit`, `used`, `rate_per_hour` | number or null |
-| `resets_at`, `as_of` | number of Unix seconds, or null |
-| `unmetered` | boolean |
-| `note` | string or null |
-
-An alias whose provider cannot be built prints `{"alias": <string>, "unavailable": <string>}` instead.
-
-`letify utilization --json` prints a list with one object per declared instance that has an accelerator: `alias` (string), `accelerator` (string), `devices` (list) and `reason` (string or null, why `devices` is empty). A device object has `index` (integer), `name` (string) and `utilization_percent`, `memory_used_gb`, `memory_total_gb`, `memory_percent`, `temperature_c`, `power_w` (number or null each). An alias whose provider cannot be built prints `{"alias": <string>, "unavailable": <string>}`.
-
-`letify status --json` prints the `Launcher.status()` object described under "Status reporting": `name` (string), `live` and `busy` (integer), `devices` (object keyed by alias, then by accelerator, each `{"count": integer, "reserved": integer, "indices": [integer]}`), `runtimes` (list of `{"name", "provider", "accelerator", "placement"}` strings, `devices` list, `busy` and `persistent_channel` booleans, `idle_seconds` number), `declared` and `config_sources` (lists of strings). `letify status` without the flag prints the same document.
-
-### Editor extension <!-- id: editor-extension -->
-
-> `letify-ext/` is a VS Code extension that shows the remaining quota and GPU load in the status bar, read only through the JSON above.
-
-The extension runs `uv run letify <command> --json` in the first workspace folder. The command is the setting `letify.command`. It reads usage every `letify.usageIntervalSeconds`, 60 by default, and utilization and status every `letify.utilizationIntervalSeconds`, 10 by default while its view is visible and at the usage interval otherwise. It makes no network call of its own and writes no credential anywhere.
-
-The quota status bar item shows the account with the lowest remaining share, `remaining / limit`, as `<alias> <percent>% left`, with `(<time to reset>)` when `resets_at` is known. An account with no limit is ranked after every account with one. The item turns to the warning color when the share left is below `letify.warningPercent`, 20 by default, and to the error color below `letify.errorPercent`, 5 by default. The GPU item shows `GPU <busy>/<total> busy <mean>%`, where a device is busy at `letify.busyPercent`, 10 by default, or above, and the mean is over devices that report utilization.
-
-Hovering either item shows its cards. Clicking one opens the letify view with the tabs Quota, GPU and Runtimes. A quota card shows a gauge of the share used, the reset time, the share of the period elapsed where the period length is known (7 days for `GPU hours`, the calendar month for `USD`), the projection `used / elapsed share` capped at 999 percent, and the hourly rate. A GPU card shows, per device, utilization and memory gauges, temperature, power and `letify reserved` when `status` lists the index as reserved. Daily history is the mean GPU utilization and the quota spent per UTC day, kept by the extension in its own storage for 30 days from its own samples.
 
 ## Known gaps
 

@@ -15,7 +15,7 @@ from __future__ import annotations
 import re
 import subprocess
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 #: The last number in a command's output is the remaining amount, so a command that
@@ -42,6 +42,9 @@ class Usage:
     unmetered: bool = False
     as_of: float | None = None
     note: str | None = None
+    #: Further allowances on the same account, each a dictionary with ``name``, ``unit``,
+    #: ``remaining``, ``used``, ``limit`` and ``resets_at``.
+    resources: tuple[dict[str, Any], ...] = field(default=())
 
     @property
     def known(self) -> bool:
@@ -66,6 +69,7 @@ class Usage:
             "unmetered": self.unmetered,
             "as_of": self.as_of,
             "note": self.note,
+            "resources": [dict(resource) for resource in self.resources],
         }
 
 
@@ -77,7 +81,7 @@ def _number(value: float, unit: str) -> str:
         return f"${value:,.2f}"
     if unit == "compute units":
         return f"{value:,.2f}"
-    if unit == "GPU hours":
+    if unit.endswith("hours"):
         return f"{value:,.1f}"
     return f"{value:g}"
 

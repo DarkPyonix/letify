@@ -1425,3 +1425,19 @@ def test_devices_that_cannot_be_allocated_are_not_an_infrastructure_failure() ->
     # A retry asks for the same devices from the same inventory, so it is never retried.
     assert issubclass(letify.InsufficientDevices, letify.LetifyError)
     assert not issubclass(letify.InsufficientDevices, letify.RuntimeFailure)
+
+
+def test_holders_separate_other_users_from_the_login_users_own_processes() -> None:
+    from letify.runtime import telemetry
+
+    uuids = {"GPU-a": 0, "GPU-b": 1, "GPU-c": 2}
+    output = "GPU-a, 10\nGPU-b, 20\n#owners\n10 brew\n20 alice\n#login\nbrew\n"
+    holders = telemetry.parse_holders(output, uuids)
+    assert holders == {0: ("mine", ()), 1: ("others", ("alice",)), 2: ("free", ())}
+
+
+def test_a_worker_of_this_client_marks_its_card_as_the_login_users() -> None:
+    from letify.runtime import telemetry
+
+    output = "GPU-a, 10\n#owners\n10 root\n#login\nroot\n"
+    assert telemetry.parse_holders(output, {"GPU-a": 0}, {10}) == {0: ("mine", ())}

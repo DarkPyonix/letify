@@ -76,7 +76,7 @@ def test_the_accelerators_every_provider_offers_are_listed(isolated_home, capsys
     (isolated_home / ".letify" / "config.toml").write_text(
         '[lab]\nkind = "shell"\naddress = "a"\ngpus = ["A100"]\n', encoding="utf-8"
     )
-    assert main(["devices"]) == 0
+    assert main(["devices", "--json"]) == 0
     table = json.loads(capsys.readouterr().out)
     assert table["lab"] == ["A100"]
     assert "CPU" in table["local"]
@@ -87,7 +87,7 @@ def test_a_configuration_file_can_be_named_explicitly(isolated_home, tmp_path, c
     elsewhere.write_text(
         '[lab]\nkind = "shell"\naddress = "a"\ngpus = ["H100"]\n', encoding="utf-8"
     )
-    assert main(["--config", str(elsewhere), "devices"]) == 0
+    assert main(["--config", str(elsewhere), "devices", "--json"]) == 0
     assert json.loads(capsys.readouterr().out)["lab"] == ["H100"]
 
 
@@ -96,7 +96,7 @@ def test_a_configuration_file_can_be_named_explicitly(isolated_home, tmp_path, c
 
 def test_the_capability_probe_is_on_the_command_line(isolated_home, capsys) -> None:
     # Whether forwarding can run here, and what it would cost.
-    assert main(["probe"]) == 0
+    assert main(["probe", "--json"]) == 0
     report = json.loads(capsys.readouterr().out)
     assert report["platform"]
     assert report["reason"]
@@ -162,6 +162,14 @@ def test_a_machine_reached_by_ssh_is_printed_as_having_no_quota(isolated_home, c
     assert main(["usage", "lab"]) == 0
     out = capsys.readouterr().out
     assert "no quota" in out
+
+
+def test_the_usage_command_prints_one_block_per_account(isolated_home, capsys) -> None:
+    (isolated_home / ".letify" / "config.toml").write_text(
+        '[lab]\nkind = "shell"\naddress = "gpu.example.edu"\n', encoding="utf-8"
+    )
+    assert main(["usage", "lab"]) == 0
+    assert capsys.readouterr().out == "lab  shell\n  no quota, unmetered\n"
 
 
 def _row(**fields: object) -> dict:
@@ -244,34 +252,79 @@ def test_a_configured_command_is_what_the_table_prints(isolated_home, capsys) ->
 # -- Spec: GPU utilization -----------------------------------------------------
 
 
-def test_an_instance_with_no_live_session_is_listed_with_its_reason(isolated_home, capsys) -> None:
+def test_a_session_instance_with_no_live_session_is_listed_with_its_reason(
+    isolated_home, capsys
+) -> None:
     # Starting a session to measure its load would cost money and change the answer.
     (isolated_home / ".letify" / "config.toml").write_text(
-        '[lab]\nkind = "shell"\naddress = "gpu.example.edu"\ngpus = ["A100"]\n',
-        encoding="utf-8",
+        '[e]\nkind = "elice"\nzone_id = "z"\ngpus = ["A100"]\n', encoding="utf-8"
     )
-    assert main(["utilization", "lab", "--json"]) == 0
+    assert main(["utilization", "e", "--json"]) == 0
     rows = json.loads(capsys.readouterr().out)
     assert rows[0]["accelerator"] == "A100"
+    assert rows[0]["scope"] == "session"
     assert rows[0]["devices"] == []
     assert "no live session" in rows[0]["reason"]
+
+
+def test_a_machine_reached_by_ssh_is_read_over_its_link_without_a_session(
+    isolated_home, capsys, monkeypatch
+) -> None:
+    from letify.providers import shell as shell_module
+    from letify.providers.shell import Shell
+
+    (isolated_home / ".letify" / "config.toml").write_text(
+        '[lab]\nkind = "shell"\naddress = "gpu.example.edu"\ngpus = ["P100"]\n',
+        encoding="utf-8",
+    )
+    link = type("L", (), {"ssh_command": lambda self, remote=None: ["ssh", "h", remote]})()
+    monkeypatch.setattr(Shell, "link", lambda self, runtime=None: link)
+    asked: list[str] = []
+
+    def run(command, **kwargs):
+        remote = command[-1]
+        asked.append(remote)
+        if "--query-gpu=index,uuid" in remote:
+            return FakeCompleted(stdout="0, GPU-aaa\n1, GPU-bbb\n")
+        if "--query-compute-apps" in remote:
+            return FakeCompleted(stdout="GPU-bbb, 42\n#owners\n42 alice\n#login\nbrew\n")
+        return FakeCompleted(
+            stdout="0, Tesla P100, 20, 1638, 16384, 41, 38\n"
+            "1, Tesla P100, 99, 8192, 16384, 70, 200\n"
+        )
+
+    monkeypatch.setattr(shell_module.subprocess, "run", run)
+    assert main(["utilization", "lab", "--json"]) == 0
+    rows = json.loads(capsys.readouterr().out)
+    assert len(rows) == 1
+    assert (rows[0]["scope"], rows[0]["accelerator"]) == ("machine", None)
+    holders = [(d["index"], d["holder"], d["users"]) for d in rows[0]["devices"]]
+    assert holders == [(0, "free", []), (1, "others", ["alice"])]
+    assert all("nvidia-smi" in remote for remote in asked)
 
 
 def test_a_device_reading_is_printed_with_the_fields_the_card_reported(
     isolated_home, capsys, monkeypatch
 ) -> None:
     # A card that reports neither power nor temperature is printed without them rather
-    # than with a zero.
+    # than with a zero. Local is read as a machine, so this holds on a machine with no GPU.
     monkeypatch.setattr(
         telemetry,
         "read_smi",
         lambda: "0, NVIDIA RTX PRO 6000, 87, 40960, 98304, [N/A], [Not Supported]\n",
     )
+    owners = {
+        telemetry.UUID_COMMAND: "0, GPU-a\n",
+        telemetry.OWNERS_COMMAND: "#owners\n#login\nbrew\n",
+    }
+    monkeypatch.setattr(telemetry, "_run", lambda command: owners.get(command, ""))
+    monkeypatch.setenv("COLUMNS", "80")
     assert main(["utilization", "local"]) == 0
     out = capsys.readouterr().out
-    assert "87% busy" in out
-    assert "40.0/96.0 GiB" in out
-    assert "W" not in out
+    assert "  gpu0  NVIDIA RTX PRO 6000  free\n" in out
+    assert "]  87%\n" in out
+    assert "]  42%  40.0/96.0 GiB\n" in out
+    assert "W" not in out.replace("NVIDIA RTX PRO 6000", "")
 
 
 def test_the_cpu_shape_is_not_asked_how_busy_its_accelerator_is(
@@ -299,6 +352,7 @@ USAGE_KEYS = {
     "unmetered",
     "as_of",
     "note",
+    "resources",
 }
 
 DEVICE_KEYS = {
@@ -330,6 +384,7 @@ def test_usage_json_carries_every_key_the_editor_extension_reads(isolated_home, 
         lab[key] is None or isinstance(lab[key], int | float)
         for key in ("remaining", "limit", "used", "rate_per_hour", "resets_at", "as_of")
     )
+    assert isinstance(lab["resources"], list)
     assert isinstance(rows["odd"]["unavailable"], str)
 
 
@@ -342,8 +397,12 @@ def test_utilization_json_carries_every_row_key_the_editor_extension_reads(
     )
     assert main(["utilization", "lab", "--json"]) == 0
     row = json.loads(capsys.readouterr().out)[0]
-    assert set(row) >= {"alias", "accelerator", "devices", "reason"}
+    assert set(row) >= {"alias", "kind", "scope", "accelerator", "devices", "reason"}
     assert isinstance(row["devices"], list)
+    for device in row["devices"]:
+        assert device["holder"] in {"letify", "others", "mine", "free", "unknown"}
+        assert isinstance(device["users"], list)
+        assert isinstance(device["reserved"], bool)
 
 
 def test_a_device_record_carries_every_key_the_editor_extension_reads() -> None:
@@ -430,7 +489,7 @@ def test_a_reserved_alias_is_refused_before_anything_is_written(isolated_home, c
 
 
 def test_an_elice_token_goes_to_the_account_directory_and_not_the_config(
-    isolated_home, capsys
+    isolated_home, fake_elice, capsys
 ) -> None:
     # A token in a file is a token in a backup, so the file gets the pointer only.
     code = main(
@@ -444,6 +503,8 @@ def test_an_elice_token_goes_to_the_account_directory_and_not_the_config(
             "machine-1",
             "--token",
             "secret-token",
+            "--endpoint",
+            fake_elice.endpoint,
             "--no-input",
         ]
     )
@@ -497,7 +558,7 @@ def test_logging_in_to_colab_without_uv_says_how_to_get_it(
     assert "uv was not found" in capsys.readouterr().err
 
 
-def test_logging_out_takes_the_account_and_its_directory(isolated_home, capsys) -> None:
+def test_logging_out_takes_the_account_and_its_directory(isolated_home, fake_elice, capsys) -> None:
     # The repository still needs the account, so the reference stays; this machine is what
     # stopped having it.
     main(
@@ -511,6 +572,8 @@ def test_logging_out_takes_the_account_and_its_directory(isolated_home, capsys) 
             "m",
             "--token",
             "t",
+            "--endpoint",
+            fake_elice.endpoint,
             "--no-input",
         ]
     )
@@ -699,7 +762,9 @@ def test_the_optional_fields_reach_the_file_when_they_are_given(isolated_home, p
     assert "persistent = true" in home_file
 
 
-def test_an_elice_endpoint_is_recorded_only_when_it_is_not_the_default(isolated_home) -> None:
+def test_an_elice_endpoint_is_recorded_only_when_it_is_not_the_default(
+    isolated_home, fake_elice
+) -> None:
     assert (
         main(
             [
@@ -713,13 +778,115 @@ def test_an_elice_endpoint_is_recorded_only_when_it_is_not_the_default(isolated_
                 "--token",
                 "t",
                 "--endpoint",
-                "https://portal.example/api",
+                fake_elice.endpoint,
                 "--no-input",
             ]
         )
         == 0
     )
-    assert "portal.example" in (Path.home() / ".letify" / "config.toml").read_text(encoding="utf-8")
+    assert fake_elice.endpoint in (Path.home() / ".letify" / "config.toml").read_text(
+        encoding="utf-8"
+    )
+
+
+# -- Spec: Logging in, the Elice login ------------------------------------------
+
+
+def elice_login_argv(fake_elice, *extra: str) -> list[str]:
+    return [
+        "login",
+        "elice",
+        "e",
+        "--token",
+        "token-1",
+        "--endpoint",
+        fake_elice.endpoint,
+        *extra,
+    ]
+
+
+def test_an_elice_login_verifies_the_token_and_records_the_account(
+    isolated_home, fake_elice, capsys
+) -> None:
+    from conftest import FakeResponse
+
+    fake_elice.answer("GET", "/user/organization", FakeResponse(200, {"name_short": "lab"}))
+    argv = elice_login_argv(
+        fake_elice,
+        "--zone-id",
+        "zone-1",
+        "--machine-id",
+        "machine-1",
+        "--billing-endpoint",
+        "https://billing.example/api",
+        "--no-input",
+    )
+    assert main(argv) == 0
+    verify = fake_elice.requests[0]
+    assert (verify["method"], verify["path"]) == ("GET", "/user/organization")
+    assert verify["authorization"] == "Bearer token-1"
+    entry = tomllib.loads((Path.home() / ".letify" / "config.toml").read_text(encoding="utf-8"))[
+        "e"
+    ]
+    assert entry["kind"] == "elice"
+    assert entry["zone_id"] == "zone-1"
+    assert entry["machine_id"] == "machine-1"
+    assert entry["organization"] == "lab"
+    assert entry["billing_endpoint"] == "https://billing.example/api"
+    token_file = Path.home() / ".letify" / "accounts" / "e" / "access_token"
+    assert token_file.read_text(encoding="utf-8") == "token-1"
+    if sys.platform != "win32":
+        assert token_file.stat().st_mode & 0o777 == 0o600
+
+
+def test_a_rejected_elice_token_writes_nothing(isolated_home, fake_elice, capsys) -> None:
+    from conftest import FakeResponse
+
+    fake_elice.answer("GET", "/user/organization", FakeResponse(401, {"message": "bad token"}))
+    argv = elice_login_argv(fake_elice, "--zone-id", "z", "--machine-id", "m", "--no-input")
+    assert main(argv) == 1
+    assert "Elice refused the access token" in capsys.readouterr().err
+    assert not (Path.home() / ".letify" / "config.toml").exists()
+    assert not (Path.home() / ".letify" / "accounts" / "e").exists()
+
+
+def test_an_elice_zone_and_machine_are_chosen_from_the_listed_ones(
+    isolated_home, fake_elice, monkeypatch, capsys
+) -> None:
+    from conftest import FakeResponse
+
+    from letify.providers.elice import VM_PATH
+
+    fake_elice.answer(
+        "GET",
+        "/user/infra/zone",
+        FakeResponse(200, [{"id": "zone-a", "name": "Seoul"}, {"id": "zone-b", "name": "Busan"}]),
+    )
+    fake_elice.answer(
+        "GET", VM_PATH, FakeResponse(200, {"items": [{"id": "machine-9", "name": "a100"}]})
+    )
+    answers = iter(["7", "2", "", "https://billing.example/api"])
+    prompts: list[str] = []
+
+    def read_line(prompt: str) -> str:
+        prompts.append(prompt)
+        return next(answers)
+
+    monkeypatch.setattr(login, "read_line", read_line)
+    assert main(elice_login_argv(fake_elice)) == 0
+    out = capsys.readouterr().out
+    assert "1. Seoul (zone-a)" in out
+    assert "2. Busan (zone-b)" in out
+    assert prompts[:3] == ["Elice zone [1-2]: ", "Elice zone [1-2]: ", "Elice machine [1-1]: "]
+    listing = next(r for r in fake_elice.requests if r["path"] == VM_PATH)
+    assert listing["params"] == {"zone_id": "zone-b"}
+    entry = tomllib.loads((Path.home() / ".letify" / "config.toml").read_text(encoding="utf-8"))[
+        "e"
+    ]
+    assert entry["zone_id"] == "zone-b"
+    assert entry["machine_id"] == "machine-9"
+    assert entry["billing_endpoint"] == "https://billing.example/api"
+    assert "organization" not in entry
 
 
 def modal_sign_in(monkeypatch, *, returncode: int = 0, writes: bool = True) -> list[dict]:

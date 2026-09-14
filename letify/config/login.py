@@ -24,6 +24,7 @@ import getpass
 import subprocess
 import sys
 import tomllib
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -544,25 +545,79 @@ def shell_account(answers: Answers) -> dict[str, Any]:
 
 
 def elice_account(answers: Answers) -> dict[str, Any]:
-    """Record the zone and machine, and keep the access token in the account directory."""
-    zone = ask(answers, "zone_id", "Elice zone id: ")
-    machine = ask(answers, "machine_id", "Elice machine id: ")
+    """Check the access token, choose the zone and machine, and keep the token.
+
+    Nothing is written until a read-only call has accepted the token, so a mistyped
+    token leaves no account and no secret file behind.
+    """
+    from ..providers import elice
+
+    given = answers.get("endpoint")
+    endpoint = given if isinstance(given, str) and given else elice.DEFAULT_ENDPOINT
     token = answers.token or (
         read_password("Elice access token: ") if answers.interactive else None
     )
     if not token:
         raise LoginError(f"{answers.alias} needs an access token. Pass --token or drop --no-input.")
-    store_secret(answers.alias, "access_token", token)
-    options: dict[str, Any] = {
-        "kind": answers.kind,
-        "zone_id": zone,
-        "machine_id": machine,
-    }
-    endpoint = answers.get("endpoint")
-    if isinstance(endpoint, str) and endpoint:
+    try:
+        organization = elice.request("GET", elice.ORGANIZATION_PATH, token=token, endpoint=endpoint)
+    except LetifyError as exc:
+        raise LoginError(f"Elice refused the access token, so nothing was written: {exc}") from None
+
+    def listing(path: str, params: dict[str, str] | None = None) -> list[dict[str, Any]]:
+        try:
+            body = elice.request("GET", path, token=token, endpoint=endpoint, params=params)
+        except LetifyError as exc:
+            raise LoginError(f"could not list Elice {path}: {exc}") from None
+        return elice.items(body)
+
+    zone = choose(answers, "zone_id", "zone", lambda: listing(elice.ZONE_PATH))
+    machine = choose(
+        answers, "machine_id", "machine", lambda: listing(elice.VM_PATH, {"zone_id": zone})
+    )
+    options: dict[str, Any] = {"kind": answers.kind, "zone_id": zone, "machine_id": machine}
+    if endpoint != elice.DEFAULT_ENDPOINT:
         options["endpoint"] = endpoint
+    short_name = answers.get("organization")
+    if not (isinstance(short_name, str) and short_name) and isinstance(organization, dict):
+        short_name = organization.get("name_short") or organization.get("nameShort")
+    if isinstance(short_name, str) and short_name:
+        options["organization"] = short_name
+    billing = ask(
+        answers, "billing_endpoint", "Elice billing API base URL (blank to skip): ", required=False
+    )
+    if billing:
+        options["billing_endpoint"] = billing
     record_workspace(answers, options)
+    store_secret(answers.alias, "access_token", token)
     return options
+
+
+def choose(
+    answers: Answers, name: str, noun: str, fetch: Callable[[], list[dict[str, Any]]]
+) -> str:
+    """A given id, or one picked by number from what the API lists."""
+    value = answers.get(name)
+    if isinstance(value, str) and value:
+        return value
+    if not answers.interactive:
+        raise LoginError(
+            f"{answers.alias} needs {name!r}. Pass --{name.replace('_', '-')} or drop "
+            f"--no-input so it can be chosen."
+        )
+    found = [item for item in fetch() if item.get("id")]
+    if not found:
+        raise LoginError(f"Elice lists no {noun} for this token, so there is nothing to choose.")
+    for number, item in enumerate(found, start=1):
+        print(f"{number}. {item.get('name') or item['id']} ({item['id']})")
+    prompt = f"Elice {noun} [1-{len(found)}]: "
+    while True:
+        answer = read_line(prompt)
+        if not answer and len(found) == 1:
+            return str(found[0]["id"])
+        if answer.isdigit() and 1 <= int(answer) <= len(found):
+            return str(found[int(answer) - 1]["id"])
+        print(f"Enter a number from 1 to {len(found)}.")
 
 
 def modal_account(answers: Answers) -> dict[str, Any]:
