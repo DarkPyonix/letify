@@ -654,3 +654,92 @@ def test_a_declared_machine_is_stopped_never_deleted_even_when_not_persistent(
     provider.stop(runtime_on(provider, instance))
     assert "compute vm stop my-vm" in fake_eci.commands()
     assert not any(c.startswith("compute vm delete") for c in fake_eci.commands())
+
+
+# -- Spec: Elice machines, a new machine's host key and a start that fails ----------------
+
+
+def _known_hosts(alias: str) -> Path:
+    path = account_directory(alias) / "known_hosts"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        f"letify-{alias} ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOldOldOld\n"
+        "other-host ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIKeepKeepKeep\n",
+        encoding="utf-8",
+    )
+    return path
+
+
+def test_launching_a_machine_forgets_the_host_key_recorded_for_the_alias(account) -> None:
+    provider = account()
+    known = _known_hosts("elice_a100")
+    provider.create_session(Instance(provider, gpu="A100"), "letify-a100-1")
+    text = known.read_text(encoding="utf-8")
+    assert "letify-elice_a100" not in text
+    assert "other-host" in text
+
+
+def test_starting_an_idle_machine_keeps_its_recorded_host_key(account, fake_eci) -> None:
+    fake_eci.set(
+        vms=[
+            {
+                "id": "vm-3",
+                "name": "letify-elice-a100",
+                "status": "idle",
+                "public_ip": "203.0.113.3",
+            }
+        ]
+    )
+    provider = account()
+    known = _known_hosts("elice_a100")
+    provider.create_session(Instance(provider, gpu="A100"), "letify-a100-1")
+    assert "letify-elice_a100" in known.read_text(encoding="utf-8")
+
+
+def _failing_boot(monkeypatch) -> None:
+    from letify.providers import base
+
+    def start(self, instance, env, *, name, volumes=(), held=()):
+        self.create_session(instance, name)
+        raise letify.RuntimeFailure("boot failed")
+
+    monkeypatch.setattr(base.Provider, "start", start)
+
+
+def test_a_start_that_fails_deletes_the_machine_launched_for_it(
+    account, fake_eci, monkeypatch
+) -> None:
+    _failing_boot(monkeypatch)
+    provider = account()
+    with pytest.raises(letify.RuntimeFailure, match="boot failed"):
+        provider.start(Instance(provider, gpu="A100"), None, name="letify-a100-1")
+    assert "compute vm delete letify-elice-a100" in fake_eci.commands()
+    assert fake_eci.read()["vms"] == []
+
+
+def test_a_start_that_fails_on_a_persistent_account_stops_the_machine(
+    account, fake_eci, monkeypatch
+) -> None:
+    _failing_boot(monkeypatch)
+    provider = account(persistent=True)
+    with pytest.raises(letify.RuntimeFailure, match="boot failed"):
+        provider.start(Instance(provider, gpu="A100"), None, name="letify-a100-1")
+    assert "compute vm stop letify-elice-a100" in fake_eci.commands()
+    assert not any(c.startswith("compute vm delete") for c in fake_eci.commands())
+
+
+def test_ssh_that_never_answers_after_a_launch_deletes_the_machine(
+    account, fake_eci, monkeypatch
+) -> None:
+    from letify.providers import base
+
+    def start(self, instance, env, *, name, volumes=(), held=()):
+        self.create_session(instance, name)
+
+    monkeypatch.setattr(base.Provider, "start", start)
+    monkeypatch.setattr(elice_module, "port_open", lambda host, port: False)
+    monkeypatch.setattr(elice_module, "SSH_WAIT_SECONDS", 0)
+    provider = account()
+    with pytest.raises(letify.RuntimeFailure, match=r"203\.0\.113\.1"):
+        provider.start(Instance(provider, gpu="A100"), None, name="letify-a100-1")
+    assert "compute vm delete letify-elice-a100" in fake_eci.commands()

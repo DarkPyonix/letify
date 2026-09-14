@@ -343,6 +343,8 @@ class Elice(Shell):
         self._fallen_back: set[tuple[str, int]] = set()
         self._machine_address: str | None = None
         self._pending_machine: str | None = None
+        #: The machine a start in progress launched or started, until the session runs.
+        self._starting: str | None = None
 
     # -- configuration -------------------------------------------------------
 
@@ -727,9 +729,14 @@ class Elice(Shell):
             machine = self.machine_name(price_type)
             record = self.find_machine(machine)
             if record is None:
+                self._starting = machine
                 password = self._launch(instance, machine, price_type)
                 record = self.get_machine(machine) or {}
+                # A new machine has a new host key, even on an address a deleted one had.
+                self.forget_host_key()
         already_started = password is None and str(record.get("status") or "") == "started"
+        if not already_started:
+            self._starting = machine
         record = self._ensure_started(machine, record)
         address = public_address(record)
         if not address:
@@ -895,9 +902,50 @@ class Elice(Shell):
         volumes: Any = (),
         held: tuple[int, ...] = (),
     ) -> Runtime:
-        runtime = super().start(instance, env, name=name, volumes=volumes, held=held)
+        self._starting = None
+        self._pending_machine = None
+        try:
+            runtime = super().start(instance, env, name=name, volumes=volumes, held=held)
+        except BaseException:
+            self._release_failed_start()
+            raise
+        self._starting = None
         runtime.external_id = self._pending_machine
         return runtime
+
+    def forget_host_key(self) -> None:
+        """Drop the host key recorded for ``letify-<alias>``. Spec "Elice machines", step 6."""
+        known = account_directory(self.alias) / "known_hosts"
+        try:
+            lines = known.read_text(encoding="utf-8").splitlines(keepends=True)
+        except OSError:
+            return
+        name = f"letify-{self.alias}"
+        kept = [
+            line
+            for line in lines
+            if name not in line.split(" ", 1)[0].split(",")
+            and f"[{name}]" not in line.split(" ", 1)[0]
+        ]
+        if len(kept) != len(lines):
+            known.write_text("".join(kept), encoding="utf-8")
+        self.close_link()
+
+    def _release_failed_start(self) -> None:
+        """End the machine a failed start launched or started. Spec "A start that fails"."""
+        machine = self._pending_machine or getattr(self, "_starting", None)
+        self._starting = None
+        if not machine:
+            return
+        if self._pending_machine == machine:
+            remaining = self._holders.get(machine, 0) - 1
+            if remaining > 0:
+                self._holders[machine] = remaining
+                return
+            self._holders.pop(machine, None)
+        elif self._holders.get(machine, 0) > 0:
+            return
+        self._end_machine(machine)
 
     def stop(self, runtime: Runtime) -> None:
         """Stop or delete the machine once no other runtime is on it. Spec "Elice machines", Stop.
@@ -916,6 +964,10 @@ class Elice(Shell):
         self._holders.pop(machine, None)
         if machine in self._preempted:
             return
+        self._end_machine(machine)
+
+    def _end_machine(self, machine: str) -> None:
+        """Delete a launched machine on a non-persistent account, otherwise stop it."""
         self._stopped.add(machine)
         if not self.persistent and not self.machine_id:
             command = ["compute", "vm", "delete", machine, "--cascade", "-y"]
