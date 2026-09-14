@@ -79,6 +79,11 @@ def handle(request: dict, sandboxes: dict[str, Sandbox]) -> object:
     op = request["op"]
     if op == "hello":
         return {"modal": "fake"}
+    if op == "billing_summary":
+        summary = os.environ.get("FAKE_MODAL_BILLING")
+        if summary is None:
+            raise ValueError("no billing summary configured")
+        return json.loads(summary)
     if op == "create":
         if request["app"] not in APPS:
             APPS.append(request["app"])

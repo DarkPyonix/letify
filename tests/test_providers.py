@@ -12,6 +12,7 @@ line, the request and the instance table letify builds, which is what a caller o
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import sys
 from importlib import import_module
@@ -1604,15 +1605,131 @@ def test_a_provider_names_itself_by_alias_and_persistence(let: letify.Launcher) 
 # -- Spec: Remaining usage ----------------------------------------------------
 
 
-def test_a_provider_that_cannot_report_a_balance_says_so_instead_of_guessing() -> None:
-    # A fabricated balance is worse than an absent one, because a researcher spends
-    # against it. Every field but the alias, the unit and the source may be None.
+def _modal_billing(monkeypatch, **summary: object) -> None:
+    monkeypatch.setenv("FAKE_MODAL_BILLING", json.dumps(summary))
+
+
+def test_modal_counts_the_months_metered_cost_against_the_monthly_credit(
+    isolated_home, fake_modal, monkeypatch
+) -> None:
+    # Modal publishes the month's spend, not a balance, so the balance is the plan credit
+    # minus that spend, renewed at the start of the next month.
+    _modal_billing(
+        monkeypatch,
+        metered_cost="4.50000000",
+        billed_cost="0",
+        credits="-4.5",
+        start=1788220800.0,
+        end=1790812800.0,
+    )
     usage = provider_of(Modal, "m").usage()
-    assert usage.alias == "m"
-    assert usage.remaining is None
     assert usage.unit == "USD"
-    assert "no workspace balance" in usage.source
-    assert usage.unmetered is False
+    assert usage.used == 4.5
+    assert usage.limit == 30.0
+    assert usage.remaining == 25.5
+    assert usage.resets_at == 1790812800.0
+    assert usage.note is None
+    assert [r["op"] for r in fake_modal.requests()] == ["billing_summary"]
+
+
+def test_a_declared_monthly_credit_replaces_the_starter_plan_credit(
+    isolated_home, fake_modal, monkeypatch
+) -> None:
+    _modal_billing(monkeypatch, metered_cost="120", billed_cost="20", credits="-100", end=1.0)
+    usage = provider_of(Modal, "m", monthly_credit=100.0).usage()
+    assert usage.limit == 100.0
+    # Spend past the credit leaves nothing, not a negative balance.
+    assert usage.remaining == 0.0
+
+
+def test_a_modal_billing_failure_is_a_note_rather_than_an_error(isolated_home, fake_modal) -> None:
+    # FAKE_MODAL_BILLING is unset, so the adapter answers the op with a failure.
+    usage = provider_of(Modal, "m").usage()
+    assert usage.remaining is None
+    assert "billing" in (usage.note or "")
+
+
+def _colab_token(home: Path, alias: str, token_uri: str, expiry: str) -> Path:
+    path = home / ".letify" / "accounts" / alias / ".config" / "colab-cli" / "token.json"
+    path.parent.mkdir(parents=True)
+    path.write_text(
+        json.dumps(
+            {
+                "token": "stale-token",
+                "refresh_token": "refresh-1",
+                "client_id": "client-1",
+                "client_secret": "secret-1",
+                "token_uri": token_uri,
+                "expiry": expiry,
+            }
+        ),
+        encoding="utf-8",
+    )
+    return path
+
+
+def test_colab_reads_the_compute_unit_balance_the_web_page_reads(
+    isolated_home, fake_google, monkeypatch
+) -> None:
+    # An expired token is refreshed in memory and the CLI's file is left as it was.
+    home = Path.home()
+    token = _colab_token(home, "colab_a", f"{fake_google.endpoint}/token", "2000-01-01T00:00:00Z")
+    before = token.read_text(encoding="utf-8")
+    monkeypatch.setattr(colab_module, "CCU_INFO_URL", f"{fake_google.endpoint}/ccu-info")
+    fake_google.answer("POST", "/token", FakeResponse(200, {"access_token": "fresh-token"}))
+    fake_google.answer(
+        "GET",
+        "/ccu-info",
+        FakeResponse(200, text=')]}\'\n{"currentBalance": 99.93, "consumptionRateHourly": 1.5}'),
+    )
+    usage = provider_of(Colab, "colab_a").usage()
+    assert usage.unit == "compute units"
+    assert usage.remaining == 99.93
+    assert usage.rate_per_hour == 1.5
+    assert fake_google.requests[0]["form"]["refresh_token"] == "refresh-1"
+    assert fake_google.last["authorization"] == "Bearer fresh-token"
+    assert token.read_text(encoding="utf-8") == before
+
+
+def test_a_colab_account_that_never_signed_in_says_how_to(isolated_home) -> None:
+    usage = provider_of(Colab, "colab_a").usage()
+    assert usage.remaining is None
+    assert "letify login colab colab_a" in (usage.note or "")
+
+
+def test_elice_reads_the_remaining_credit_from_the_billing_api(fake_google) -> None:
+    provider = provider_of(
+        Elice,
+        "e",
+        endpoint=fake_google.endpoint,
+        billing_endpoint=f"{fake_google.endpoint}/billing",
+        organization="lab",
+        access_token="token-1",
+    )
+    fake_google.answer(
+        "GET", "/billing/stats", FakeResponse(200, {"total_credit_remaining_amount": "12345 KRW"})
+    )
+    usage = provider.usage()
+    assert usage.unit == "KRW"
+    assert usage.remaining == 12345.0
+    stats = next(r for r in fake_google.requests if r["path"] == "/billing/stats")
+    assert stats["authorization"] == "Bearer token-1"
+    assert stats["org"] == "lab"
+
+
+def test_elice_without_a_billing_endpoint_names_the_missing_field(elice, fake_elice) -> None:
+    fake_elice.answer("GET", ALLOCATION_PATH, FakeResponse(200, {"items": []}))
+    fake_elice.answer("GET", PRICING_PATH, FakeResponse(200, {"items": []}))
+    usage = elice.usage()
+    assert usage.remaining is None
+    assert "billing_endpoint" in (usage.note or "")
+
+
+def test_a_machine_reached_by_ssh_has_no_quota() -> None:
+    usage = provider_of(Shell, "lab", address="gpu.example.edu").usage()
+    assert usage.unmetered is True
+    assert "no quota" in usage.source
+    assert provider_of(Tunnel, "t", address="10.0.0.1").usage().unmetered is True
 
 
 def test_this_machine_is_reported_as_unmetered_rather_than_unknown() -> None:

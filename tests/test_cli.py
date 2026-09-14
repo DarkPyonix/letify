@@ -155,14 +155,76 @@ def test_the_usage_table_lists_every_declared_alias(isolated_home, capsys) -> No
     assert "unavailable" in out
 
 
-def test_an_unreported_balance_says_where_it_would_have_come_from(isolated_home, capsys) -> None:
+def test_a_machine_reached_by_ssh_is_printed_as_having_no_quota(isolated_home, capsys) -> None:
     (isolated_home / ".letify" / "config.toml").write_text(
         '[lab]\nkind = "shell"\naddress = "gpu.example.edu"\n', encoding="utf-8"
     )
     assert main(["usage", "lab"]) == 0
     out = capsys.readouterr().out
-    assert "not reported" in out
-    assert "no account behind it" in out
+    assert "no quota" in out
+
+
+def _row(**fields: object) -> dict:
+    return {"alias": "a", "kind": "k", "source": "s", **fields}
+
+
+@pytest.mark.parametrize(
+    ("row", "expected"),
+    [
+        (_row(unit="KRW", remaining=12345.4), "12,345 KRW left"),
+        (_row(unit="USD", remaining=25.5, limit=30.0), "$25.50 left of $30.00"),
+        (_row(unit="compute units", remaining=99.93343), "99.93 compute units left"),
+        (_row(unit="GPU hours", remaining=12.54, limit=30.0), "12.5 GPU hours left of 30.0"),
+    ],
+)
+def test_amounts_are_formatted_by_their_unit(row: dict, expected: str) -> None:
+    from letify.cli import _describe_usage
+
+    assert _describe_usage(row).startswith(expected)
+
+
+def test_a_row_with_a_renewal_prints_when_it_resets() -> None:
+    from letify.cli import _describe_usage
+
+    row = _row(unit="GPU hours", remaining=3.0, limit=30.0, resets_at=1790812800.0)
+    assert "resets 2026-10-01 00:00 UTC" in _describe_usage(row)
+
+
+def test_a_row_with_no_figure_prints_its_note(isolated_home) -> None:
+    from letify.cli import _describe_usage
+
+    row = _row(unit="KRW", note="set billing_endpoint")
+    assert _describe_usage(row) == "not reported (set billing_endpoint)"
+
+
+def test_usage_asks_every_provider_at_once_and_a_slow_one_does_not_hold_the_others(
+    launcher_from, monkeypatch
+) -> None:
+    import time as _time
+
+    from letify.providers.local import Local
+
+    real = Local.usage
+
+    def usage(self):
+        if self.alias == "slow":
+            _time.sleep(3)
+        if self.alias == "broken":
+            raise RuntimeError("service down")
+        return real(self)
+
+    monkeypatch.setattr(Local, "usage", usage)
+    let = launcher_from(
+        '[slow]\nkind = "local"\nusage_timeout = 0.5\n'
+        '[broken]\nkind = "local"\n[fine]\nkind = "local"\n'
+    )
+    started = _time.monotonic()
+    rows = {row["alias"]: row for row in let.usage()}
+    assert _time.monotonic() - started < 2.5
+    assert rows["fine"]["unmetered"] is True
+    assert rows["slow"]["remaining"] is None
+    assert "0.5 s" in rows["slow"]["note"]
+    assert "service down" in rows["broken"]["note"]
 
 
 def test_a_configured_command_is_what_the_table_prints(isolated_home, capsys) -> None:
