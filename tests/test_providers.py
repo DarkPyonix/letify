@@ -1455,6 +1455,23 @@ def test_a_sandbox_channel_sends_an_argument_larger_than_modal_stdin_buffer(
         provider.stop(runtime)
 
 
+def test_a_sandbox_channel_reads_a_result_longer_than_a_modal_output_line(
+    isolated_home, fake_modal
+) -> None:
+    # Spec "Modal adapter": Modal splits a stdout line above 64 KiB, so a frame line stays
+    # below that and a 1 MiB result arrives whole.
+    import os
+
+    provider = provider_of(Modal, "m")
+    runtime = modal_runtime(provider)
+    channel = provider.open_channel(runtime)
+    try:
+        assert len(channel.call(os.urandom, (1 << 20,), {})[0]) == 1 << 20
+    finally:
+        channel.close()
+        provider.stop(runtime)
+
+
 def test_a_sandbox_channel_sends_the_worker_once_and_then_framed_requests(
     isolated_home, fake_modal
 ) -> None:
