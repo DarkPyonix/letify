@@ -462,7 +462,7 @@ TLS comes from the Modal tunnel. The channel's side of TLS is an `ssl.SSLObject`
 
 > The data channel is `N` TCP connections through the same tunnel, called lanes, and a write of 1 MiB or more is split across all of them, because one TCP stream over a path with a round trip near 190 ms carries about 12 MiB/s.
 
-`N` is the provider option `data_streams`, an integer from 1 to 16, 8 when it is not set. Any other value raises `ConfigError` naming the account. `data_streams = 1` is the single connection described above, with no segment framing.
+`N` is the provider option `data_streams`, an integer from 1 to 16, 4 when it is not set. Any other value raises `ConfigError` naming the account. `data_streams = 1` is the single connection described above, with no segment framing.
 
 With `N` above 1:
 

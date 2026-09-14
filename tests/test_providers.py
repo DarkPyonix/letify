@@ -2513,14 +2513,14 @@ def test_a_modal_channel_opens_one_connection_per_data_stream(
         provider.stop(runtime)
 
 
-def test_the_data_streams_default_is_eight(isolated_home, fake_modal, monkeypatch) -> None:
+def test_the_data_streams_default_is_four(isolated_home, fake_modal, monkeypatch) -> None:
     opened = _count_connections(monkeypatch)
     provider = provider_of(Modal, "m")
     runtime = modal_runtime(provider)
     channel = provider.open_channel(runtime)
     try:
         channel.start()
-        assert len(opened) == 8
+        assert len(opened) == 4
     finally:
         channel.close()
         provider.stop(runtime)

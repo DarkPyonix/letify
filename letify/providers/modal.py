@@ -86,7 +86,7 @@ DATA_CONNECT_TIMEOUT = 30
 
 #: TCP connections the data channel opens when ``data_streams`` is not set, and the most
 #: it accepts. Spec "Parallel data streams".
-DATA_STREAMS = 8
+DATA_STREAMS = 4
 MAX_DATA_STREAMS = 16
 
 #: Packages the sandbox image installs for the worker.
