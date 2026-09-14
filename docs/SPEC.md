@@ -203,7 +203,7 @@ Colour is added only when standard output is a terminal and the `NO_COLOR` envir
 
 > letify finds, creates, starts and stops an Elice Cloud Infrastructure virtual machine through Elice's own `eci` command, so an account needs no machine made in the portal beforehand.
 
-`eci` is the standalone binary Elice publishes at github.com/elice-dev/eci-cli for macOS arm64, Linux x86_64 and Windows x86_64. letify runs it as a separate process and never bundles or mirrors it. `eci` is found by the lookup [Installing external tools](#confirmed-tool-install) describes. When it is found nowhere, or `eci_binary` names a program that is not on `PATH`, a login or a session start installs it automatically from Elice's release, and when automatic install is turned off raises with the install command for this system:
+`eci` is the standalone binary Elice publishes at github.com/elice-dev/eci-cli for macOS arm64, Linux x86_64 and Windows x86_64. letify runs it as a separate process and never bundles or mirrors it. `eci` is found by the lookup [Installing external tools](#confirmed-tool-install) describes. When it is found nowhere, `letify login elice` asks `eci, Elice's command line, is not installed. letify can download eci <version> from Elice's GitHub release into ~/.letify/tools; it is Elice's software, not part of letify. Install it now? [y/N]: `. `y` or `yes` installs it as [Installing external tools](#confirmed-tool-install) describes and the login continues. Any other answer, and a login with `--no-input`, stops the login with the install command and `Install it with: letify setup eci`, and writes nothing. An Elice session start never asks and never installs; it raises `ProviderUnavailable` with the same text. `eci` is never installed without that answer or `letify setup eci`, because its release carries no license. When `eci_binary` names a program that is not on `PATH`, the error carries the install command for this system:
 
 - macOS and Linux: `curl -fsSL https://raw.githubusercontent.com/elice-dev/eci-cli/main/scripts/install.sh | sh`
 - Windows: `powershell -c "irm https://eci.sh/install.ps1 | iex"`
@@ -1604,7 +1604,7 @@ The header ends `busy` while a call runs and `idle` otherwise. `cards` is left o
 
 An account's `tailcat_binary` or `eci_binary`, when set, skips the lookup and is run as written.
 
-**Automatic install.** A tool is installed when a command that needs it finds none: `letify client shell connect` and `letify login tunnel` for `tailcat`, `letify login elice` and an Elice session start for `eci`. It happens with or without a terminal and asks nothing. Two lines go to standard error, as connection decision lines do:
+**Automatic install.** `tailcat` is installed when a command that needs it finds none: `letify client shell connect` and `letify login tunnel`. It happens with or without a terminal and asks nothing. `eci` is not installed automatically: `letify login elice` asks first, as [Elice machines](#elice-machines) describes, and otherwise only `letify setup eci` installs it. Two lines go to standard error, as connection decision lines do:
 
 - before the download, `letify: installing <tool> <version> from <asset URL> into <version directory>`
 - after it, `letify: <tool> <version> verified sha256 <digest>, linked at <path>`, where the path is the project link, or the cache path when nothing is linked

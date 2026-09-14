@@ -557,8 +557,14 @@ def elice_account(answers: Answers) -> dict[str, Any]:
     """
     from ..providers import elice
 
+    confirm = None
+    if answers.interactive:
+
+        def confirm() -> bool:
+            return read_line(elice.install_question()).lower() in ("y", "yes")
+
     try:
-        binary = elice.find_eci()
+        binary = elice.find_eci(confirm=confirm)
     except LetifyError as exc:
         raise LoginError(str(exc)) from None
     given = answers.get("endpoint")

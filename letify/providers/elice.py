@@ -196,7 +196,18 @@ def eci_install_message(system: str | None = None) -> str:
     )
 
 
-def find_eci(binary: str = "eci") -> str:
+def install_question() -> str:
+    """The question a login asks before letify downloads eci. Spec "Elice machines"."""
+    from .. import install
+
+    return (
+        "eci, Elice's command line, is not installed. letify can download eci "
+        f"{install.ECI_VERSION} from Elice's GitHub release into ~/.letify/tools; it is "
+        "Elice's software, not part of letify. Install it now? [y/N]: "
+    )
+
+
+def find_eci(binary: str = "eci", confirm: Any = None) -> str:
     """The eci executable, or ``ProviderUnavailable`` carrying the install command.
 
     The default name goes through the lookup of spec "Installing external tools", which
@@ -210,7 +221,7 @@ def find_eci(binary: str = "eci") -> str:
             raise ProviderUnavailable("elice", eci_install_message())
         return found
     try:
-        return install.ensure("eci", instructions=eci_install_message())
+        return install.ensure("eci", instructions=eci_install_message(), confirm=confirm)
     except install.InstallError as exc:
         raise ProviderUnavailable("elice", str(exc)) from None
 
