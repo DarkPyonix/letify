@@ -276,6 +276,93 @@ def _autocast(policy: str, args: tuple, kwargs: dict) -> tuple[tuple, dict]:
     return tuple(cast(value) for value in args), {key: cast(v) for key, v in kwargs.items()}
 
 
+_BATCH_NORM = inspect.signature(torch.nn.functional.batch_norm)
+_ATTENTION = ("query", "key", "value", "attn_mask", "dropout_p", "is_causal", "scale", "enable_gqa")
+_ATTENTION_DEFAULTS = {
+    "attn_mask": None,
+    "dropout_p": 0.0,
+    "is_causal": False,
+    "scale": None,
+    "enable_gqa": False,
+}
+
+
+def _batch_norm(client: Client, args: tuple, kwargs: dict) -> Any:
+    """``batch_norm`` through ``aten.cudnn_batch_norm`` when the runtime picks cuDNN.
+
+    Returns NotImplemented for any other answer, which leaves the call on the ordinary path.
+    """
+    bound = _BATCH_NORM.bind(*args, **kwargs)
+    bound.apply_defaults()
+    given = bound.arguments
+    x, weight, bias = given["input"], given["weight"], given["bias"]
+    mean, var, training = given["running_mean"], given["running_var"], bool(given["training"])
+    if any(type(value) is not RemoteTensor for value in (x, weight, bias)):
+        return NotImplemented
+    if any(value is not None and type(value) is not RemoteTensor for value in (mean, var)):
+        return NotImplemented
+    if not training and (mean is None or var is None):
+        return NotImplemented
+    answer = client.kernel(
+        "batch_norm",
+        (x, weight, bias, mean, var),
+        {"training": training, "eps": float(given["eps"])},
+    )
+    if answer != "Cudnn":
+        return NotImplemented
+    if training:
+        torch.nn.functional._verify_batch_size(x.size())
+    momentum = given["momentum"]
+    return torch.ops.aten.cudnn_batch_norm.default(
+        x,
+        weight,
+        bias,
+        mean,
+        var,
+        training,
+        0.0 if momentum is None else float(momentum),
+        float(given["eps"]),
+    )[0]
+
+
+def _attention(client: Client, args: tuple, kwargs: dict) -> Any:
+    """Attention through the runtime's fused kernel when it picks one, else NotImplemented."""
+    given = dict(_ATTENTION_DEFAULTS)
+    given.update(zip(_ATTENTION, args, strict=False))
+    given.update(kwargs)
+    query, key, value, mask = given["query"], given["key"], given["value"], given["attn_mask"]
+    if any(type(tensor) is not RemoteTensor for tensor in (query, key, value)):
+        return NotImplemented
+    if mask is not None and type(mask) is not RemoteTensor:
+        return NotImplemented
+    if given["enable_gqa"]:
+        return NotImplemented
+    dropout, causal, scale = float(given["dropout_p"]), bool(given["is_causal"]), given["scale"]
+    flags = {"dropout_p": dropout, "is_causal": causal, "scale": scale, "enable_gqa": False}
+    answer = client.kernel("scaled_dot_product_attention", (query, key, value, mask), flags)
+    grads = torch.is_grad_enabled() and any(t.requires_grad for t in (query, key, value))
+    if answer == "FLASH_ATTENTION" and mask is None and query.shape[-1] % 8 == 0:
+        return torch.ops.aten._scaled_dot_product_flash_attention.default(
+            query, key, value, dropout, causal, False, scale=scale
+        )[0]
+    if answer == "EFFICIENT_ATTENTION":
+        return torch.ops.aten._scaled_dot_product_efficient_attention.default(
+            query, key, value, mask, grads, dropout, causal, scale=scale
+        )[0]
+    if answer == "CUDNN_ATTENTION":
+        return torch.ops.aten._scaled_dot_product_cudnn_attention.default(
+            query, key, value, mask, grads, dropout, causal, False, scale=scale
+        )[0]
+    return NotImplemented
+
+
+#: Functions whose kernel the runtime chooses, as spec "Kernel selection" describes.
+_SELECTED = {
+    torch.nn.functional.batch_norm: _batch_norm,
+    torch.nn.functional.scaled_dot_product_attention: _attention,
+}
+
+
 class CudaMode(TorchFunctionMode):
     """Rewrites CUDA devices in torch calls to the runtime's device."""
 
@@ -298,6 +385,11 @@ class CudaMode(TorchFunctionMode):
             if policy == "cross_entropy":
                 return _cross_entropy(func, args, kwargs)
             args, kwargs = _autocast(policy, args, kwargs)
+        selected = _SELECTED.get(func)
+        if selected is not None and str(self.client.hello.get("device", "")).startswith("cuda"):
+            result = selected(self.client, args, kwargs)
+            if result is not NotImplemented:
+                return result
         rewritten = False
         device = kwargs.get("device")
         if device is not None:

@@ -1178,6 +1178,20 @@ A plain CPU tensor passed to an operator travels with it as a buffer and is a CP
 
 When the meta operator raises, the operator is sent at once and executed on the runtime, and the reply carries its output metadata. That covers data-dependent shapes such as `nonzero` and `masked_select`, and reports a genuine error with the runtime's own message.
 
+### Kernel selection <!-- id: forwarding-kernel-selection -->
+
+> `batch_norm` and `scaled_dot_product_attention` on a `RemoteTensor` run the kernel the runtime's own CUDA dispatch chooses, not the one a meta tensor chooses.
+
+PyTorch picks the kernel for these two functions from the device when it dispatches. A meta tensor gets `native_batch_norm` and math attention. A CUDA tensor gets cuDNN batch norm, and flash, memory-efficient or cuDNN attention depending on shape, dtype and card. Those kernels give different values and use different memory.
+
+When the executor's hello reports a CUDA device, the `TorchFunctionMode` of [Mapping cuda](#mapping-cuda) asks the executor which backend applies, with a `letify.kernel` request, once per distinct signature, and caches the answer in the client. A signature is the function and, for every tensor argument, its shape, strides, dtype and whether it is None, plus `training` and `eps` for batch norm and `dropout_p`, `is_causal`, `scale` and `enable_gqa` for attention. The executor answers by calling `torch._C._select_batch_norm_backend` or `torch._fused_sdp_choice` on empty tensors of that signature on its own device. A PyTorch without the selector answers `Native` or `MATH`.
+
+Attention with `enable_gqa`, and flash attention for a head dimension that is not a multiple of 8, keep the ordinary path, because PyTorch reshapes or pads those before its fused kernel.
+
+The mode then calls the chosen ATen operator directly: `aten.cudnn_batch_norm` for `Cudnn`, and `aten._scaled_dot_product_flash_attention`, `aten._scaled_dot_product_efficient_attention` or `aten._scaled_dot_product_cudnn_attention` for the attention backends. Each of them has a meta kernel that infers its outputs and an autograd formula that records its backward, so it is dispatched and forwarded like any other operator. The function returns the operator's first output, the normalized or attended tensor, and `cudnn_batch_norm` updates the running statistics in place as `batch_norm` does.
+
+The ordinary path applies when the executor's device is CPU, when the runtime answers `Native` or math attention, or when an argument is not a `RemoteTensor`.
+
 ### Mapping cuda <!-- id: mapping-cuda -->
 
 > Code written with `"cuda"`, `.cuda()` and `torch.cuda.is_available()` runs unchanged under `host="local"`.
