@@ -199,6 +199,67 @@ The gauge is 16 to 40 cells wide. Its width is the terminal width from `shutil.g
 
 Colour is added only when standard output is a terminal and the `NO_COLOR` environment variable is unset or empty. The gauge and its percentage are green while more than 50% of the allowance remains, yellow from 20% to 50%, and red below 20%. The header's alias is bold. Without colour no escape sequence is written.
 
+### Elice machines <!-- id: elice-machines -->
+
+> letify finds, creates, starts and stops an Elice Cloud Infrastructure virtual machine through Elice's own `eci` command, so an account needs no machine made in the portal beforehand.
+
+`eci` is the standalone binary Elice publishes at github.com/elice-dev/eci-cli for macOS arm64, Linux x86_64 and Windows x86_64. letify runs it as a separate process and never installs it. When `eci` is not on `PATH`, or `eci_binary` names a program that is not, a login or a session start raises with the install command for this system:
+
+- macOS and Linux: `curl -fsSL https://raw.githubusercontent.com/elice-dev/eci-cli/main/scripts/install.sh | sh`
+- Windows: `powershell -c "irm https://eci.sh/install.ps1 | iex"`
+
+Every `eci` command runs with four environment variables and no `eci` configuration of the user's own:
+
+| Variable | Value |
+|---|---|
+| `ECI_API_ENDPOINT` | the account's `endpoint`, default `https://portal.elice.cloud/api`. The public sector portal is `https://portal.gov.elice.cloud/api` |
+| `ECI_API_TOKEN` | the account's access token |
+| `ECI_ZONE_ID` | the account's `zone_id`, once one is chosen |
+| `ECI_CONFIG` | `~/.letify/accounts/<alias>/eci.yaml` |
+
+The token is never an argument and never printed. Reads pass `--format json`. A command that exits non zero raises `RuntimeFailure` naming the command, with any password replaced by `***`, and its standard error. When that standard error contains `401`, `403`, `unauthorized` or `permission`, the message starts with `Elice refused the access token or it lacks permission` and says a token is issued in the portal under User management, User access token.
+
+**Which machine.** `machine_id` names an existing machine by name or UUID. Without it the machine is named `letify-<alias>` for an ondemand machine and `letify-<alias>-spot` for a spot one, with the alias lowercased and `_` replaced by `-`. A machine is found with `eci compute vm list --format json`, taking the row whose `name` or `id` equals it exactly. The name is how a later start finds the same machine, so nothing is written back to a configuration file.
+
+**Start.** Starting a session runs these steps in order:
+
+1. Find the machine.
+2. A declared `machine_id` that is not listed raises `ProviderUnavailable` naming it.
+3. A missing letify machine is launched. The instance type is the account's `instance_type` when set. Otherwise it comes from `eci instance-type list --activated true --format json`: a GPU instance takes a row whose `devices` normalize to the instance's accelerator and number exactly the instance's device count, and `CPU` takes the row with no devices and the fewest `cpu_vcore`. No match raises `ProviderUnavailable` listing the names that were offered. The price type, price line and quota check follow Price type below. The password is generated: 20 characters with an upper case letter, a lower case letter, a digit and a symbol, and no three characters that run consecutively up or down such as `123` or `cba`. It is written to `~/.letify/accounts/<alias>/machine_password` with mode 0600 before the launch runs, so a launch that succeeds after letify is interrupted still has its password. The command is `eci compute vm launch --name <name> --instance-type <type> --password <password> --wait`, with `--price-type spot` for a spot machine and `--image <image>` and `--size-gib <disk_gib>` only when the account sets `image` and `disk_gib`. Without them `eci` chooses Ubuntu 24.04 AI/GPU with 50 GiB for an accelerator type and Ubuntu 24.04 Standard with 20 GiB for a CPU type.
+4. A machine with status `started` is used as it is. A machine with status `idle` is started with `eci compute vm start <name>`. Any other status is a transition, and `eci compute vm get <name> --format json` is read every 10 seconds until it is `idle`, for up to 300 seconds, before the start. After a start the status is read every 10 seconds until it is `started`, for up to 600 seconds. Either limit raises `RuntimeFailure` naming the last status.
+5. The address is the machine's first public IP in `eci compute vm get <name> --format json`: a string under a key containing `public_ip`, or the `ip` of the first entry of a list under such a key. No public IP raises `ProviderUnavailable` saying the machine has none.
+6. Right after a launch, letify's key is installed. The key is `key`, default `~/.ssh/id_letify`, generated as at login when missing. Its public half is appended to `~/.ssh/authorized_keys` of `user`, default `root`, over one SSH connection that reads the password through `SSH_ASKPASS` from the password file. The password is therefore never an argument of letify's own SSH command. A machine letify did not launch must already accept the account's key.
+
+The runtime's `external_id` is the machine name, and the session runs over forward SSH to the address.
+
+**Stop.** Ending a session runs `eci compute vm stop <name>` once no other runtime of this provider is on that machine. An idle machine bills no compute, while its disk and public IP keep billing. letify never deletes a machine, its disk, its network interface or its public IP. A stop that fails prints `letify: could not stop <name>: <reason>. Run 'eci compute vm stop <name>'` and does not raise, because the session is already ending. `eci compute vm delete <name> --cascade` removes a machine and everything attached to it; without `--cascade` the disk, network interface and public IP remain and keep billing. `letify logout` deletes nothing on Elice.
+
+#### Price type <!-- id: elice-price-type -->
+
+> An Elice machine runs ondemand or spot, chosen on the account and overridable on one instance.
+
+`price_type = "ondemand"` or `"spot"` on the account, default `ondemand`. Any other value raises `ConfigError`. Elice's reserved pricing is not offered. `instance.priced("spot")` and `instance.priced("ondemand")` return a copy with that price type, the way `n * instance` returns a copy with `n` devices, and any other argument raises `ValueError`. The price type is part of the pool key. A spot machine may be stopped or deleted by Elice at any time.
+
+A spot instance on a provider that has no spot pricing, which is every provider except `elice`, raises `UnsupportedMode` when its session starts. On Elice, spot on a CPU instance type raises `UnsupportedMode` before anything is created, because Elice offers spot for accelerator types only. A declared `machine_id` keeps the pricing it was created with, so a requested price type that differs from the machine's `pricing_type` raises `ConfigError` naming both.
+
+Before a launch, letify reads `eci pricing list --resource-kind vm_allocation --format json` and prints `letify: <name>: <type> <price type> at <price> KRW/hour` from the row whose `name` is the instance type and whose `pricing_type` is the price type, or `letify: <name>: no <price type> price listed for <type>` when there is no such row.
+
+An ondemand launch checks quota first, and a spot launch does not, because spot does not count against Elice's compute quota. letify reads `eci org info --format json`. A value of 0 for the instance type's id or name under `resource_quota.compute.instance_types`, or a `resource_quota.compute.devices` of 0 for an accelerator type, raises `ProviderUnavailable` saying the ondemand quota for that type is 0 and that the portal takes a quota request or `price_type = "spot"` avoids the quota. A quota that cannot be read prints `letify: <name>: the ondemand quota could not be read, launching anyway` and does not refuse.
+
+`Launcher.status()` reports `price_type` on each runtime, `ondemand` or `spot` on Elice and `None` elsewhere, and `letify status` prints it. An Elice `Usage` record carries the account's `price_type`, which `letify usage` prints and `--json` includes.
+
+#### Spot preemption <!-- id: elice-spot-preemption -->
+
+> A spot machine that Elice stopped or deleted is an infrastructure failure, raised as `SpotPreempted` and retried under the ordinary retry rule.
+
+When a call on a runtime fails with `RuntimeFailure` or `ProtocolError`, the call path asks the provider to diagnose it before retrying. On Elice, for a spot runtime, the provider reads `eci compute vm get <name> --format json`. A machine that is gone, or whose status is not `started` while letify did not stop it, turns the failure into `SpotPreempted`, a `RuntimeLost`, carrying `machine`, `state` (the last status, or `deleted`) and `at` in Unix seconds. A read that itself fails leaves the original failure standing.
+
+A preemption prints `letify: <name> was preempted by Elice (state <state>)`. When the machine still exists it also prints `letify: <name> keeps its disk and public IP, which keep billing. 'eci compute vm delete <name> --cascade' removes them`. letify removes nothing.
+
+Recovery follows [Failure and retry](#failure-and-retry). The call already running fails, the runtime is discarded, and the call is retried up to `retries` times; when no retry is left, `SpotPreempted` itself is raised. A retry starts a machine again by the start steps above, so an idle machine is started and a deleted one is launched. There is no fall back to local execution. `spot_fallback = "none"` or `"ondemand"` on the account, default `none`, decides the price type of that retry. With `none` the retry uses spot again and prints `letify: <name> preempted, retrying on spot`. With `ondemand`, every later start of that instance in this process uses the ondemand machine and prints `letify: <name> preempted, retrying on ondemand machine <ondemand name>`.
+
+A preemption loses the worker's memory and every session cache handle. Files survive only on the machine's disk, which includes the workspace root, when Elice stopped the machine rather than deleted it, and in volumes, which live in the store.
+
 ### Inventory
 
 > A provider entry declares which accelerators the account can get and how many of each. That inventory is the only thing that bounds how much runs at once.
@@ -234,7 +295,7 @@ A reserved session sets `CUDA_VISIBLE_DEVICES` to its reserved physical indices 
 
 > An `Instance` is one accelerator shape on one provider account.
 
-`colab.G4` is an `Instance`. It holds the provider, the accelerator name, the host placement, how many devices one session takes, and the core count, memory and VRAM the provider reported. `n * instance` returns a copy taking `n` devices. An instance has no method that changes where the host code runs, because that is the declaration's `host`.
+`colab.G4` is an `Instance`. It holds the provider, the accelerator name, the host placement, how many devices one session takes, and the core count, memory and VRAM the provider reported. `n * instance` returns a copy taking `n` devices, and `instance.priced("spot")` a copy with that price type, as [Price type](#elice-price-type) describes. An instance has no method that changes where the host code runs, because that is the declaration's `host`.
 
 The device count is part of the pool key, because a session holding two cards is not interchangeable with one holding one.
 
@@ -564,7 +625,7 @@ After each write the worker lists the blob directory and removes files, oldest m
 
 > Infrastructure failure may be retried. User code failure never is. Neither falls back to a slower path.
 
-`RuntimeFailure` and `ProtocolError` mean the session misbehaved, so the runtime is discarded and the call is retried on a fresh one up to `retries` times. `RemoteError` means the shipped function raised, and it propagates with the remote traceback attached.
+`RuntimeFailure` and `ProtocolError` mean the session misbehaved, so the runtime is discarded and the call is retried on a fresh one up to `retries` times. Before that, `Provider.diagnose(runtime, failure)` may replace the failure with a more specific infrastructure failure, as Elice does with `SpotPreempted`; the default returns it unchanged. A `SpotPreempted` left after the last retry is raised as it is. `RemoteError` means the shipped function raised, and it propagates with the remote traceback attached.
 
 A `RuntimeFailure` raised for a failed command carries `command` and `stderr`, and its message names the command and the last 40 lines of stderr. The `RuntimeLost` raised after the last retry keeps the last failure's message, `command` and `stderr`.
 
@@ -620,11 +681,11 @@ What the lease actually does is exit the worker process, which releases the occu
 | `Shell`, `Tunnel` | nothing; the card is occupied | the worker exits, so the card frees |
 | `Modal` | the sandbox | **guaranteed.** A deadline is set when the sandbox is created and Modal enforces it |
 | `Colab` | the runtime | not guaranteed. Colab's own idle policy is what ends it |
-| `Elice` | the allocation | **not guaranteed.** An allocation bills until something issues the delete |
+| `Elice` | the started machine | **not guaranteed.** A started machine bills compute until something runs `eci compute vm stop` |
 
-Where it is not guaranteed, the preferred answer is a deadline at creation time, because the platform outlives the caller. Modal takes one and letify sets it. Whether the Elice allocation API takes one is unverified.
+Where it is not guaranteed, the preferred answer is a deadline at creation time, because the platform outlives the caller. Modal takes one and letify sets it. `eci compute vm launch` documents no deadline.
 
-Where the platform takes none, the intended bound is reconciliation: the next letify process asks the provider what is running under this project's name and ends what nothing is watching. That is not immediate, and it is **not implemented yet**, so today an Elice allocation left by a killed machine bills until somebody deletes it. It is listed under Known gaps.
+Where the platform takes none, the intended bound is reconciliation: the next letify process asks the provider what is running under this project's name and ends what nothing is watching. That is not immediate, and it is **not implemented yet**, so today an Elice machine left started by a killed process bills until somebody stops it. It is listed under Known gaps.
 
 There is no detached execution. A detached run whose remote side is preempted would lose its results, so the local process stays the owner and durability comes from checkpoints in the store.
 
@@ -636,7 +697,7 @@ There is no detached execution. A detached run whose remote side is preempted wo
 
 Nothing internal is reported. The pool holds a guard so that a session released by one call is not ended while an overlapping call is still running, and whether that guard is currently open is a fact about the pool's implementation rather than about what is running. A field among counts that looks like a count and is actually a boolean is worse than no field, because it is read as a count.
 
-Each runtime also reports `uptime_seconds`, the `link` strategy its provider connected over and the `rtt_ms` that link measured, each `None` where there is none. `letify status` asks `usage()` only of providers with a live runtime, because a runtime is what costs money, and adds that record as `usage`.
+Each runtime also reports `price_type`, as [Price type](#elice-price-type) describes, `uptime_seconds`, the `link` strategy its provider connected over and the `rtt_ms` that link measured, each `None` where there is none. `letify status` asks `usage()` only of providers with a live runtime, because a runtime is what costs money, and adds that record as `usage`.
 
 `status()` describes this process only. A session started by a different process is not in it, since the pool lives in the process that owns it. What a machine itself is doing is a different question, answered by `letify utilization`.
 
@@ -909,7 +970,7 @@ The public IP address is learned from the same STUN servers the punch uses. The 
 | Provider | Rendezvous |
 |---|---|
 | `Colab` | the provider layer: `colab new` creates the runtime and `colab exec` runs the remote half |
-| `Elice` | the provider layer: the Elice Cloud API creates and allocates the machine, and the remote half runs over forward SSH to it |
+| `Elice` | the provider layer: `eci` launches or starts the machine, and the remote half runs over forward SSH to its public IP |
 | `Tunnel`, and a plain `Shell` behind NAT | the remote agent started by `letify client shell connect`, reached over Tailcat |
 
 Colab and Elice never need `letify client shell connect`. Their create and open step is what puts letify's remote half on the machine.
@@ -1034,7 +1095,7 @@ A100 = { indices = "0-3" }
 [elice_a100]
 kind = "elice"
 zone_id = "00000000-0000-0000-0000-000000000000"
-machine_id = "00000000-0000-0000-0000-000000000000"
+price_type = "spot"            # ondemand by default; the machine letify-elice-a100-spot is created on first use
 access_token_env = "ELICE_ACCESS_TOKEN"
 ```
 
@@ -1112,17 +1173,21 @@ After the sign in succeeds, the Colab login records `key`, the SSH private key w
 
 `letify login modal <alias>` signs in to Modal itself. It first asks for an optional Modal profile, which names the Modal workspace to sign in to. It then runs `modal token new` through `uv tool run --python 3.12 --with "modal>=1.0,<2" --from modal modal`, with `MODAL_CONFIG_PATH` set to `~/.letify/accounts/<alias>/modal.toml` and, when a profile was given, `--profile <profile>`. The profile is written as `profile`, because `workspace` is the workspace root. Modal's command prints a link and waits for the browser approval, so `modal` never has to be on `PATH` or in the project's environment. The token lands in the account directory, and the adapter reads it from there. A sign in that exits non zero, or exits zero without writing `modal.toml`, writes nothing to either `config.toml` and removes a `modal.toml` the attempt created.
 
-`letify login elice <alias>` checks the access token before it writes anything. The steps run in this order:
+`letify login elice <alias>` checks the access token with `eci` before it writes anything, and needs no machine to exist. Every `eci` command runs as [Elice machines](#elice-machines) describes. The steps run in this order, and a failure at any step writes nothing: no `config.toml` entry and no file in the account directory.
 
-1. The token comes from `--token`, or else from a hidden prompt, `Elice access token: `. `--no-input` without `--token` refuses.
-2. `GET <endpoint>/user/organization` with the token as a bearer token. `endpoint` is `--endpoint` or `https://portal.elice.cloud/api`. Any answer other than 200 fails the login with `LoginError`, whose message starts with `Elice refused the access token`, and nothing is written: no `config.toml` entry and no file in the account directory.
-3. The zone is `--zone-id`. Without it, a terminal is shown the zones from `GET <endpoint>/user/infra/zone`, one numbered line each, `1. <name> (<id>)`, and asked `Elice zone [1-<n>]: `. A blank answer takes the only zone when there is exactly one. An answer that is not a listed number is refused and asked again. `--no-input` without `--zone-id` refuses, and so does an empty list.
-4. The machine is `--machine-id`, or chosen the same way from `GET <endpoint>/user/resource/compute/virtual_machine?zone_id=<zone>`, asked as `Elice machine [1-<n>]: `.
-5. `organization` is `--organization`, or else the `name_short` of the organization answer in step 2. It is written only when one of them gives a value.
-6. `billing_endpoint` is `--billing-endpoint`, or else a terminal is asked `Elice billing API base URL (blank to skip): `. It is written only when given.
-7. The token is written to `~/.letify/accounts/<alias>/access_token` with mode 0600.
+1. `eci` must be on `PATH`. Otherwise `LoginError` carries the install command.
+2. The token comes from `--token`, or else from a hidden prompt, `Elice access token: `. `--no-input` without `--token` refuses.
+3. `eci zone list --format json`. `endpoint` is `--endpoint` or `https://portal.elice.cloud/api`. A non zero exit fails the login with `LoginError`, whose message starts with `Elice refused the access token`.
+4. The zone is `--zone-id`. Without it, a terminal is shown the listed zones, one numbered line each, `1. <name> (<id>)`, and asked `Elice zone [1-<n>]: `. A blank answer takes the only zone when there is exactly one. An answer that is not a listed number is refused and asked again. `--no-input` without `--zone-id` refuses, and so does an empty list.
+5. `eci config verify` with that zone. A non zero exit fails the login with `LoginError` naming its output.
+6. The machine is `--machine-id` when given. Otherwise `eci compute vm list --format json` is read. With no machines listed, nothing is asked and no machine is recorded, and the login prints `Elice lists no machine; letify creates one on first use.` With machines listed, a terminal is shown them as `1. <name> (<id>)` followed by `<n+1>. Create a new machine with letify`, and asked `Elice machine [1-<n+1>]: `. A listed machine is recorded as `machine_id`; the last choice records none. `--no-input` without `--machine-id` records none.
+7. `price_type` is `--price-type` and is written only when given.
+8. `organization` is `--organization`, or else the `name_short` of `eci org info --format json`. It is written only when one of them gives a value.
+9. `billing_endpoint` is `--billing-endpoint`, or else a terminal is asked `Elice billing API base URL (blank to skip): `. It is written only when given.
+10. `key` is `--key` or `~/.ssh/id_letify`, generated as for Colab when missing.
+11. The token is written to `~/.letify/accounts/<alias>/access_token` with mode 0600.
 
-The account is written with `kind = "elice"`, `zone_id`, `machine_id`, and `endpoint` only when it is not the default.
+The account is written with `kind = "elice"`, `zone_id`, `key`, `machine_id` and `price_type` when chosen, and `endpoint` only when it is not the default.
 
 `letify login tunnel <alias> --connect <token>` declares a machine behind NAT from the command `letify client shell connect` printed on it. Without `--connect`, a terminal is asked `Token printed by 'letify client shell connect': `, and `--no-input` refuses. The steps run in this order, and a failure at any step writes nothing to either file and raises `LoginError` whose message starts with `tunnel login failed at <step>: `:
 
@@ -1187,7 +1252,7 @@ One other approach is not the default. `sshpass` feeds a stored password to each
 |---|---|---|
 | `shell` | address, user, port, key path, `workspace` when it is not the default, and the `devices` table the machine reported | an SSH key, installed by `login`; no password stored |
 | `tunnel` | `tailcat`, `tailcat_port`, user and port from the token `letify client shell connect` printed, key path, `workspace` when it is not the default, and the `devices` table; `address` and `public_port` only when the token or the options give them | an SSH key, installed by `login` over Tailcat; no password stored |
-| `elice` | endpoint, zone, machine, `workspace` when given | access token in `~/.letify/accounts/<alias>/access_token` |
+| `elice` | endpoint when not the default, zone, key path, and `machine_id`, `price_type` and `workspace` when given | access token in `~/.letify/accounts/<alias>/access_token`; the generated machine password in `machine_password` once letify launches a machine |
 | `colab` | account email, `workspace` when given | the Colab CLI's token, written by its own sign in under `~/.letify/accounts/<alias>/` |
 | `modal` | `profile` and `workspace`, each when given | Modal's token, written by `modal token new` to `~/.letify/accounts/<alias>/modal.toml` |
 | `local` | nothing | none; this machine needs no declaration |
@@ -1608,9 +1673,9 @@ Pushing a tag `v*` runs `.github/workflows/publish.yml`. It builds the sdist, th
 
 - **PyTorch forwarding still pays one round trip per value read.** On dept_gpu the benchmark step takes a median 1.31 ms under `host="local"` against 1.72 ms directly when the loss is read once per 50 steps, and 4.94 ms against 1.78 ms when it is read every step. The measurement is in [NETWORK.md](NETWORK.md#pytorch-forwarding-on-dept_gpu).
 - **PyTorch forwarding covers one device per session and no CUDA streams, events, graphs or generator state.** Custom CUDA extensions and Triton kernels compiled in this process cannot run, because nothing here compiles for the runtime's GPU. `torch.compile` is untested.
-- **`Modal` and `Elice` are not exercised against the live services.** Their code follows each service's published interface, and the Elice paths come from Elice's own Terraform provider, but neither has been run end to end. The Modal adapter's calls were checked against the signatures of Modal 1.5.5, and `letify login modal` has not been run against Modal's sign in.
+- **`Modal` and `Elice` are not exercised against the live services.** Their code follows each service's published interface, but neither has been run end to end. The `eci` commands and flags come from Elice's CLI documentation. The JSON field names letify reads from `eci` (`devices`, `cpu_vcore`, `pricing_type`, `price_per_hour`, `status`, the public IP, `resource_quota`) come from the models in Elice's Terraform provider, elice-dev/terraform-provider-eci, and are not checked against `eci` output. That `root` is the SSH user of a launched machine is assumed from the documentation calling the launch password the root password.
+- **`eci compute vm launch` takes the machine password as an argument.** It is visible to other local users that can list processes while the launch runs. letify generates a password per account and never prints it. The Modal adapter's calls were checked against the signatures of Modal 1.5.5, and `letify login modal` has not been run against Modal's sign in.
 - **The connection pipeline is not exercised against live networks.** `Rendezvous`, `Strategy`, `Link`, `Probe`, `Pipeline`, `LinkCache` and the remote agent are implemented and tested over loopback sockets and faked commands. Installing and starting `sshd` on a Colab VM over `colab exec` is not yet checked against a live runtime.
-- **The Elice API runs no command on a machine.** The paths letify uses (virtual machine, allocation, instance type, pricing) create and power machines only, so Elice's remote half runs over forward SSH to the allocated machine, and the punch and Tailcat strategies need that SSH to succeed first.
-- **Orphan reconciliation is not implemented.** A session whose controlling machine was killed outright is released by the lease on the providers where the process is the cost. Where the platform bills for the machine and takes no deadline, nothing ends it: an Elice allocation bills until a delete is issued. The intended answer is that the next letify process asks the provider what is running under this project's name and ends what nothing is watching, with a command to do it on demand. Neither exists yet.
-- **Whether the Elice allocation API takes a deadline is unverified.** If it does, that is where the guarantee belongs, because the platform outlives the caller.
+- **letify runs no command on an Elice machine through `eci`.** Elice's remote half runs over forward SSH to the machine's public IP, and the punch and Tailcat strategies need that SSH to succeed first.
+- **Orphan reconciliation is not implemented.** A session whose controlling machine was killed outright is released by the lease on the providers where the process is the cost. Where the platform bills for the machine and takes no deadline, nothing ends it: an Elice machine bills compute until it is stopped. The intended answer is that the next letify process asks the provider what is running under this project's name and ends what nothing is watching, with a command to do it on demand. Neither exists yet.
 - **Persistence detection is not implemented.** Deciding a machine's disk policy by writing a marker file and looking for it in a later runtime is a decision recorded here, not yet code.
