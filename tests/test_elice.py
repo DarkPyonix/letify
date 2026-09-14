@@ -29,6 +29,9 @@ from letify.providers.local import Local
 @pytest.fixture(autouse=True)
 def no_waiting(monkeypatch):
     monkeypatch.setattr(elice_module, "POLL_SECONDS", 0)
+    monkeypatch.setattr(elice_module, "SSH_POLL_SECONDS", 0, raising=False)
+    # The fake machines have documentation addresses, so SSH is taken as answering.
+    monkeypatch.setattr(elice_module, "port_open", lambda host, port: True, raising=False)
 
 
 @pytest.fixture
@@ -516,3 +519,90 @@ def test_with_ondemand_fallback_the_retry_launches_the_ondemand_machine(
 def test_spot_fallback_refuses_other_values(account) -> None:
     with pytest.raises(letify.ConfigError, match="spot_fallback"):
         account(spot_fallback="reserved").spot_fallback  # noqa: B018
+
+
+# -- Spec: Elice machines, checked against eci 0.2.1 --------------------------------
+
+
+def test_instance_types_are_listed_without_an_activated_option_and_inactive_rows_are_skipped(
+    account, fake_eci
+) -> None:
+    provider = account()
+    listed = [c["argv"] for c in fake_eci.calls if c["argv"][:2] == ["instance-type", "list"]]
+    assert listed == []
+    with pytest.raises(letify.ProviderUnavailable) as raised:
+        provider.create_session(Instance(provider, gpu="H100"), "letify-h100-1")
+    assert "G-NHHS-80-OLD" not in str(raised.value)
+    for call in fake_eci.calls:
+        if call["argv"][:2] == ["instance-type", "list"]:
+            assert "--activated" not in call["argv"]
+
+
+@pytest.mark.parametrize(
+    ("device", "label"),
+    [
+        ("nvidia_a100_80gb_pcie", "A100"),
+        ("nvidia_h100_80gb_sxm", "H100"),
+        ("nvidia_b200_180gb_sxm", "B200"),
+        ("furiosaai_warboy", "WARBOY"),
+    ],
+)
+def test_an_eci_device_id_becomes_the_accelerator_label_other_providers_use(device, label) -> None:
+    assert elice_module.accelerator_label(device) == label
+
+
+def test_a_launch_ignores_a_saved_default_spec(account, fake_eci) -> None:
+    provider = account()
+    provider.create_session(Instance(provider, gpu="A100"), "letify-a100-1")
+    launch = next(c["argv"] for c in fake_eci.calls if c["argv"][:3] == ["compute", "vm", "launch"])
+    assert "--no-spec" in launch
+
+
+def test_a_launched_machine_is_reached_as_ubuntu(account) -> None:
+    provider = account()
+    assert provider.user == "ubuntu"
+
+
+# -- Spec: Elice machines, waiting for SSH after a start -----------------------------
+
+
+def test_a_launched_machine_is_waited_for_until_ssh_answers(account, monkeypatch, capsys) -> None:
+    answers = iter([False, False, True])
+    probed: list[tuple[str, int]] = []
+
+    def port_open(host: str, port: int) -> bool:
+        probed.append((host, port))
+        return next(answers)
+
+    monkeypatch.setattr(elice_module, "port_open", port_open)
+    provider = account()
+    provider.create_session(Instance(provider, gpu="A100"), "letify-a100-1")
+    assert probed == [("203.0.113.1", 22)] * 3
+    assert provider.authorized
+    assert "letify-elice-a100: waiting for SSH on 203.0.113.1" in capsys.readouterr().err
+
+
+def test_a_machine_already_started_is_not_waited_for(account, fake_eci, monkeypatch) -> None:
+    fake_eci.set(
+        vms=[
+            {
+                "id": "vm-9",
+                "name": "letify-elice-a100",
+                "status": "started",
+                "public_ip": "203.0.113.9",
+            }
+        ]
+    )
+    calls: list[str] = []
+    monkeypatch.setattr(elice_module, "port_open", lambda host, port: calls.append(host) or True)
+    provider = account()
+    provider.create_session(Instance(provider, gpu="A100"), "letify-a100-1")
+    assert calls == []
+
+
+def test_ssh_that_never_answers_raises_naming_the_address(account, monkeypatch) -> None:
+    monkeypatch.setattr(elice_module, "port_open", lambda host, port: False)
+    monkeypatch.setattr(elice_module, "SSH_WAIT_SECONDS", 0, raising=False)
+    provider = account()
+    with pytest.raises(letify.RuntimeFailure, match=r"203\.0\.113\.1"):
+        provider.create_session(Instance(provider, gpu="A100"), "letify-a100-1")

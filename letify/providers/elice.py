@@ -73,6 +73,10 @@ POLL_SECONDS = 10.0
 IDLE_WAIT_SECONDS = 300.0
 START_WAIT_SECONDS = 600.0
 
+#: A machine reports started before its SSH server accepts connections.
+SSH_WAIT_SECONDS = 300.0
+SSH_POLL_SECONDS = 5.0
+
 #: What ``spot_fallback`` accepts. Spec "Spot preemption".
 SPOT_FALLBACKS = ("none", "ondemand")
 
@@ -81,7 +85,7 @@ DEFAULT_KEY = "~/.ssh/id_letify"
 
 #: The user a launched machine is reached as. The documentation calls the launch password
 #: the root password.
-DEFAULT_USER = "root"
+DEFAULT_USER = "ubuntu"
 
 INSTALL_UNIX = (
     "curl -fsSL https://raw.githubusercontent.com/elice-dev/eci-cli/main/scripts/install.sh | sh"
@@ -96,6 +100,35 @@ PASSWORD_SYMBOLS = "!@#%^*_=+"
 
 
 # -- the HTTP API, for billing -------------------------------------------------
+
+
+#: Vendor prefixes on the device ids eci lists, such as ``nvidia_a100_80gb_pcie``.
+DEVICE_VENDORS = ("nvidia", "amd", "intel", "furiosaai", "rebellions")
+
+
+def port_open(host: str, port: int) -> bool:
+    """Whether a TCP connection to ``host:port`` is accepted within 5 seconds."""
+    import socket
+
+    try:
+        with socket.create_connection((host, port), timeout=5):
+            return True
+    except OSError:
+        return False
+
+
+def accelerator_label(device: str) -> str:
+    """The accelerator label other providers use for an eci device id or a product name.
+
+    ``nvidia_a100_80gb_pcie`` becomes ``A100`` and ``furiosaai_warboy`` becomes ``WARBOY``,
+    the label ``normalize_gpu`` gives ``NVIDIA A100-SXM4-80GB``.
+    """
+    if " " in device or "-" in device or not device.islower():
+        return normalize_gpu(device)
+    parts = [part for part in device.split("_") if part]
+    if parts and parts[0] in DEVICE_VENDORS:
+        parts = parts[1:]
+    return parts[0].upper() if parts else normalize_gpu(device)
 
 
 def request(
@@ -459,7 +492,7 @@ class Elice(Shell):
         table: dict[str, Instance] = {}
         for row in self._instance_types():
             devices = row.get("devices") or []
-            label = normalize_gpu(str(devices[0])) if devices else "CPU"
+            label = accelerator_label(str(devices[0])) if devices else "CPU"
             if label in table:
                 continue
             table[label] = Instance(
@@ -471,7 +504,9 @@ class Elice(Shell):
         return table
 
     def _instance_types(self) -> list[dict[str, Any]]:
-        return items(self._eci(["instance-type", "list", "--activated", "true"]))
+        rows = items(self._eci(["instance-type", "list"]))
+        # eci has no option to filter activated types, so the flag each row carries is read.
+        return [row for row in rows if row.get("activated") is not False]
 
     def instance_type_for(self, instance: Instance) -> dict[str, Any]:
         """The instance type a launch uses for this instance. Spec "Elice machines"."""
@@ -490,7 +525,7 @@ class Elice(Shell):
                 r
                 for r in rows
                 if len(r.get("devices") or []) == instance.devices
-                and all(normalize_gpu(str(d)) == instance.gpu for d in r.get("devices") or [])
+                and all(accelerator_label(str(d)) == instance.gpu for d in r.get("devices") or [])
             ]
         if not matches:
             offered = ", ".join(str(r.get("name")) for r in rows) or "none"
@@ -683,6 +718,7 @@ class Elice(Shell):
             if record is None:
                 password = self._launch(instance, machine, price_type)
                 record = self.get_machine(machine) or {}
+        already_started = password is None and str(record.get("status") or "") == "started"
         record = self._ensure_started(machine, record)
         address = public_address(record)
         if not address:
@@ -690,6 +726,8 @@ class Elice(Shell):
                 self.kind,
                 f"Elice machine {machine} has no public IP, so letify cannot reach it over SSH",
             )
+        if not already_started:
+            self._wait_for_ssh(machine, address)
         if self._machine_address and self._machine_address != address:
             self.close_link()
         self._machine_address = address
@@ -727,6 +765,7 @@ class Elice(Shell):
             "--password",
             password,
             "--wait",
+            "--no-spec",
         ]
         if price_type == "spot":
             args += ["--price-type", "spot"]
@@ -747,6 +786,22 @@ class Elice(Shell):
             self._wait_for(machine, "idle", IDLE_WAIT_SECONDS)
         self._eci(["compute", "vm", "start", machine], parse=False)
         return self._wait_for(machine, "started", START_WAIT_SECONDS)
+
+    def _wait_for_ssh(self, machine: str, address: str) -> None:
+        """Wait until the machine's SSH server accepts. Spec "Elice machines", step 5."""
+        port = self.direct_port
+        deadline = time.monotonic() + SSH_WAIT_SECONDS
+        said = False
+        while not port_open(address, port):
+            if not said:
+                self._say(f"{machine}: waiting for SSH on {address}")
+                said = True
+            if time.monotonic() >= deadline:
+                raise RuntimeFailure(
+                    f"SSH on {address}:{port} did not answer within {SSH_WAIT_SECONDS:.0f} s "
+                    f"after Elice machine {machine} started"
+                )
+            time.sleep(SSH_POLL_SECONDS)
 
     def _wait_for(self, machine: str, wanted: str, limit: float) -> dict[str, Any]:
         deadline = time.monotonic() + limit
@@ -820,8 +875,16 @@ class Elice(Shell):
             time.sleep(POLL_SECONDS)
         raise RuntimeFailure(f"installing the key on Elice machine {address} failed", stderr=last)
 
-    def start(self, instance: Instance, env: Any, *, name: str, volumes: Any = ()) -> Runtime:
-        runtime = super().start(instance, env, name=name, volumes=volumes)
+    def start(
+        self,
+        instance: Instance,
+        env: Any,
+        *,
+        name: str,
+        volumes: Any = (),
+        held: tuple[int, ...] = (),
+    ) -> Runtime:
+        runtime = super().start(instance, env, name=name, volumes=volumes, held=held)
         runtime.external_id = self._pending_machine
         return runtime
 
