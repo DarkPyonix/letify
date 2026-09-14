@@ -764,7 +764,7 @@ Nothing hands a session to the caller. There is no call that returns one, no arg
 
 ### Project data <!-- id: project-data -->
 
-> A call's data is found in the call itself. Every local `pathlib.Path` the function reaches is sent as content addressed file blobs, only the blobs the runtime or the account's bucket lacks travel, and the body sees a path on the runtime with the same layout.
+> A call's data is found in the call itself. Every local `pathlib.Path` the function reaches is sent as content addressed file blobs, only the blobs the runtime or the account's bucket lacks travel, and the body sees a path on the runtime with the same layout. What the body writes into a detected directory or a path that did not exist comes back to the local path when the call returns.
 
 The declared function is sent with cloudpickle, which serializes its closure variables, the globals it references, its default arguments and the call's arguments. letify's pickler intercepts every `os.PathLike` among them through `reducer_override`. Nothing is declared: the function's own references are the declaration.
 
@@ -774,9 +774,11 @@ Detection runs on a persistent channel only. A one-shot channel has no worker to
 
 A path is project data when all of these hold at call time:
 
-1. `os.fspath` gives a `str`, and it names an existing regular file or directory on the local machine.
+1. `os.fspath` gives a `str`, and it names an existing regular file or directory on the local machine, or nothing at all.
 2. Its resolved form is inside an allowed root. The allowed roots are the project root, which is the nearest directory upward from the working directory holding a `pyproject.toml` or the working directory when there is none, and each entry of `[tool.letify] data_roots` in that `pyproject.toml`, relative to the root.
 3. It is not the project root itself nor a directory above it, because a path such as `Path(__file__).parent` names the code and its `.venv`, not data.
+
+A detected path that exists is an input. A detected directory and a detected path that does not exist are also output locations, which Writing back describes. An existing file is an input only.
 
 Any other path is pickled unchanged, so the body receives the local path as it was. Only `os.PathLike` objects are detected. A string that happens to name a local file is left alone, because no rule tells a path from any other string.
 
@@ -808,7 +810,7 @@ An upload of 64 MiB or more shows the download progress line of Installing exter
 
 #### Materializing and the rewritten path <!-- id: project-data-materialize -->
 
-Each call that carries data gets a call directory, `<workspace root>/data/calls/<call id>`, where the call id is 16 random hex characters. The `n`th distinct detected path, counted from 0, is placed at `<call directory>/<n>/<name>`, where `<name>` is the local path's final component. A file is placed there; a directory is recreated there with every manifest entry at its relative path. Each entry is a hard link to the cache file, or a copy where a hard link fails. The same local path detected twice in one call maps to the same runtime path.
+Each call that carries data gets a call directory, `<workspace root>/data/calls/<call id>`, where the call id is 16 random hex characters. The `n`th distinct detected path, counted from 0, is placed at `<call directory>/<n>/<name>`, where `<name>` is the local path's final component. A file is placed there; a directory is recreated there with every manifest entry at its relative path. For a path that does not exist, only `<call directory>/<n>` is created, so the body may create a file or a directory at the runtime path. Each entry of an input-only file is a hard link to the cache file, or a copy where a hard link fails. Each entry inside a directory is a writable copy of the cache file, because a directory is an output location and the body may rewrite a file in it, which a read-only link refuses. The same local path detected twice in one call maps to the same runtime path.
 
 In the pickled call a detected `pathlib.Path` is replaced by `pathlib.Path(<runtime path>)`, and any other `os.PathLike` by the same `pathlib.Path`. The worker creates the call directory before it loads the call, and removes it after the call's outcome is computed, whether the body returned or raised.
 
@@ -818,7 +820,27 @@ A call that detected data prints one line on standard error:
 
 `letify: data <files> files <size> detected, <files> files <size> already on <the runtime|the bucket>, uploaded <files> files <size> in <seconds> s (<rate> MiB/s)`
 
-Sizes are in MiB with one decimal. `<the bucket>` is named when the bytes come from the bucket.
+The line is printed when the call has at least one input file. Sizes are in MiB with one decimal. `<the bucket>` is named when the bytes come from the bucket.
+
+A call with an output location that returned prints a second line after the write-back:
+
+`letify: data wrote back <files> files <size> in <seconds> s (<rate> MiB/s), <files> files <size> already on the client`
+
+#### Writing back <!-- id: project-data-write-back -->
+
+When a call with an output location returns, every file the body created or changed at the output's runtime path is copied to the same relative path under the local path. A call that raised writes nothing back.
+
+On the runtime, after the body returned and before the call directory is removed, the worker walks each output's runtime path as Which paths are data walks a directory, without following symbolic links. A file is unchanged when it is the hard link or copy the worker placed and its inode, size and modification time in nanoseconds equal those recorded when it was placed; it is not read. Any other regular file is hashed with the file digest, and a file whose digest equals the digest placed at that relative path is unchanged too. Each changed file is renamed into the file blob cache and made read-only, or dropped when the cache already holds its digest with its size. The worker keeps the list of relative path, digest and size per output under the call id until the local process asks for it with one `data_written` request, which removes it.
+
+When the runtime path of an output that did not exist is a regular file, the local path receives that file. When it is a directory, the local path becomes a directory holding the changed files. When nothing was created there, nothing is written.
+
+Deletions are not written back. A file the body removed from an output location stays on the local disk, because a missing file on the runtime cannot be told apart from a file the body never needed, and write-back never destroys local data.
+
+On the local side, a listed file whose local copy exists with the same digest, by the digest cache, is skipped and counted as already on the client. Every other file travels in `data_get` requests of at most 64 MiB each, answered with the bytes as out-of-band `DATA` frames. The local process writes them to `.<name>.letify-partial.<pid>.<thread id>` beside the target, checks the digest of the whole file, then renames it over the target with `os.replace` and records the new file in the digest cache. A digest that does not match raises `RuntimeFailure` and the partial file is removed. A download of 64 MiB or more shows the download progress line of Installing external tools.
+
+Concurrent calls that write back to the same local path take one local lock per resolved local path, held for the whole write-back of that output. So one call's files land after the other's, never interleaved inside one file, and the last call to return wins per file. Files only one of the calls wrote are all kept.
+
+A file placed as a hard link shares its inode with the cache file. When a body writes into such a file in place, which a process running as root can do despite the read-only mode, the cache file no longer matches its digest. After every call, whether it returned or raised, the worker compares each placed cache file's size and modification time with those recorded at placement and removes the cache file when they differ, so the next call receives the digest again.
 
 
 ### Backends
@@ -1764,5 +1786,5 @@ Pushing a tag `v*` runs `.github/workflows/publish.yml`. It builds the sdist, th
 - **The connection pipeline is not exercised against live networks.** `Rendezvous`, `Strategy`, `Link`, `Probe`, `Pipeline`, `LinkCache` and the remote agent are implemented and tested over loopback sockets and faked commands. Installing and starting `sshd` on a Colab VM over `colab exec` is not yet checked against a live runtime.
 - **letify runs no command on an Elice machine through `eci`.** Elice's remote half runs over forward SSH to the machine's public IP, and the punch and Tailcat strategies need that SSH to succeed first.
 - **Orphan reconciliation is not implemented.** A session whose controlling machine was killed outright is released by the lease on the providers where the process is the cost. Where the platform bills for the machine and takes no deadline, nothing ends it: an Elice machine bills compute until it is stopped. The intended answer is that the next letify process asks the provider what is running under this project's name and ends what nothing is watching, with a command to do it on demand. Neither exists yet.
-- **Project data flows one way.** Files a call writes under a detected path stay in the call directory, which is removed when the call ends, and nothing is written back to the local path. The runtime's file blob cache under `<workspace root>/data/blobs` is never evicted.
+- **The runtime's file blob cache is never evicted.** The cache under `<workspace root>/data/blobs` grows with every distinct file a call sends or writes back.
 - **Persistence detection is not implemented.** Deciding a machine's disk policy by writing a marker file and looking for it in a later runtime is a decision recorded here, not yet code.
