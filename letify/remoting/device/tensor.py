@@ -432,7 +432,7 @@ def reader(args: tuple, kwargs: dict, floats_keyed: bool, offsets_keyed: bool = 
         return "(" + "".join(f"{item}, " for item in names) + ")"
 
     lines.append(f"    return {pack(tensors)}, {pack(scalars)}, {pack(tail)}")
-    exec(compile("\n".join(lines), "letify-reader", "exec"), constants)  # noqa: S102
+    exec(compile("\n".join(lines), "letify-reader", "exec"), constants)
     return constants["read"]
 
 
