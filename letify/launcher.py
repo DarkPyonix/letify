@@ -168,6 +168,8 @@ class Launcher:
                 f"Name it in .letify/config.toml, and declare the account in ~/.letify/config.toml."
             )
         provider = provider_registry.build(entry)
+        # Connection decisions are printed only when the session start line is.
+        provider.announce = self.announce  # type: ignore[attr-defined]
         self._cache[alias] = provider
         return provider
 

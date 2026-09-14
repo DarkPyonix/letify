@@ -52,6 +52,9 @@ class Shell(Provider):
     #: A machine letify only runs commands on has no account behind it to meter.
     usage_source = "a machine reached by SSH has no account behind it"
 
+    #: Whether connection decisions are printed. The Launcher sets its own announce flag here.
+    announce = True
+
     #: SSH keeps a process alive behind pipes, so handles and blob reuse work.
     persistent_channel = True
 
@@ -203,6 +206,7 @@ class Shell(Provider):
         links: dict[str, Link] = self.__dict__.setdefault("_links", {})
         key = self._link_key(runtime)
         if key not in links:
+            from ..transport.announce import printer
             from ..transport.pipeline import LinkCache, Pipeline, network_fingerprint
 
             target = self.target(runtime)
@@ -212,12 +216,17 @@ class Shell(Provider):
                 alias=self.alias,
                 cache=LinkCache(self.alias),
                 fingerprint=lambda: network_fingerprint(target.stun),
+                say=printer(self.announce),
+                previous=self.__dict__.get("_closed_links", {}).pop(key, None),
             ).connect()
         return links[key]
 
     def close_link(self, runtime: Runtime | None = None) -> None:
-        link = self.__dict__.get("_links", {}).pop(self._link_key(runtime), None)
+        key = self._link_key(runtime)
+        link = self.__dict__.get("_links", {}).pop(key, None)
         if link is not None:
+            # Remembered so a later connection to the same key is printed as re-established.
+            self.__dict__.setdefault("_closed_links", {})[key] = link.strategy
             link.close()
 
     def connect(self) -> None:
