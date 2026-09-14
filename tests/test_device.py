@@ -138,6 +138,48 @@ def test_an_in_place_operator_served_from_the_cache_returns_its_input(client) ->
     assert a.cpu().tolist() == [2.0, 2.0, 2.0]
 
 
+def test_an_in_place_restride_is_mirrored_on_the_wrapper_it_returns(client) -> None:
+    for _ in range(2):  # the second call is served from the metadata cache
+        x = torch.arange(16.0).reshape(1, 16, 1, 1).cuda()
+        alias = x.detach()
+        y = x.as_strided_((1, 16, 1, 1), (16, 1, 16, 16))
+        assert y is x
+        assert x.stride() == (16, 1, 16, 16)
+        assert alias.stride() == (16, 1, 1, 1)
+        assert x.contiguous().cpu().flatten().tolist() == list(range(16))
+
+
+def test_a_channels_last_convolution_net_trains_as_it_does_on_cpu(client) -> None:
+    def train(to_device):
+        torch.manual_seed(0)
+        model = torch.nn.Sequential(
+            torch.nn.Conv2d(3, 8, 3, padding=1),
+            torch.nn.BatchNorm2d(8),
+            torch.nn.ReLU(),
+            torch.nn.AdaptiveAvgPool2d(1),
+            torch.nn.Flatten(),
+            torch.nn.Linear(8, 4),
+        )
+        model = to_device(model).to(memory_format=torch.channels_last)
+        optimizer = torch.optim.SGD(model.parameters(), lr=0.1, momentum=0.9)
+        data = torch.randn(4, 3, 6, 6)
+        target = torch.tensor([0, 1, 2, 3])
+        losses = []
+        for _ in range(4):
+            x = to_device(data).contiguous(memory_format=torch.channels_last)
+            loss = torch.nn.functional.cross_entropy(model(x), to_device(target))
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+            losses.append(float(loss))
+        return losses, x.stride()
+
+    expected, expected_stride = train(lambda value: value)
+    got, stride = train(lambda value: value.cuda())
+    assert stride == expected_stride
+    assert got == pytest.approx(expected, rel=1e-5)
+
+
 def test_an_optimizer_takes_its_foreach_path_on_remote_tensors(client) -> None:
     model = torch.nn.Sequential(torch.nn.Linear(4, 4), torch.nn.Linear(4, 4)).cuda()
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
