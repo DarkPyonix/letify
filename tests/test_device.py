@@ -588,6 +588,56 @@ def test_a_buffer_travels_beside_the_head_rather_than_inside_it() -> None:
     receiver.close()
 
 
+def _hold_writes(client, monkeypatch):
+    import threading
+
+    gate = threading.Event()
+    original = client.transport.send
+
+    def held(head, buffers):
+        gate.wait(10)
+        original(head, buffers)
+
+    monkeypatch.setattr(client.transport, "send", held)
+    return gate
+
+
+def test_an_upload_returns_before_its_bytes_are_written(client, monkeypatch) -> None:
+    import time
+
+    gate = _hold_writes(client, monkeypatch)
+    data = torch.randn(1 << 20)
+    started = time.monotonic()
+    uploaded = data.cuda(non_blocking=True)
+    doubled = uploaded * 2
+    elapsed = time.monotonic() - started
+    gate.set()
+    assert elapsed < 2.0
+    assert torch.equal(doubled.cpu(), data * 2)
+
+
+def test_a_cpu_tensor_changed_after_a_blocking_upload_does_not_change_the_upload(
+    client, monkeypatch
+) -> None:
+    gate = _hold_writes(client, monkeypatch)
+    data = torch.zeros(1 << 16)
+    uploaded = data.cuda()
+    data.fill_(7.0)
+    gate.set()
+    assert uploaded.sum().item() == 0.0
+
+
+def test_a_cpu_tensor_changed_after_a_pageable_non_blocking_upload_does_not_change_it(
+    client, monkeypatch
+) -> None:
+    gate = _hold_writes(client, monkeypatch)
+    data = torch.zeros(1 << 16)
+    uploaded = data.to("cuda", non_blocking=True)
+    data.fill_(7.0)
+    gate.set()
+    assert uploaded.sum().item() == 0.0
+
+
 def test_a_large_copy_round_trips_both_ways(client) -> None:
     data = torch.randn(1 << 20)
     back = data.cuda().cpu()
