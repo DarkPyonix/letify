@@ -21,6 +21,7 @@
 | 5️⃣ | **[Concurrency and capacity](05-concurrency.md)** | You are running many configurations and want them in parallel |
 | 6️⃣ | **[Cost control](06-cost.md)** | You are paying for this yourself and want no surprises |
 | 7️⃣ | **[Troubleshooting](07-troubleshooting.md)** | Something failed and you want the specific cause |
+| 8️⃣ | **[Releasing](08-releasing.md)** | You maintain letify and are cutting a release |
 
 ---
 
