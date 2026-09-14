@@ -555,6 +555,114 @@ def test_a_volume_materializes_under_the_expanded_workspace_root(tmp_path: Path)
         runtime.shutdown()
 
 
+# -- Spec: Argument blobs on a persistent disk ---------------------------------
+
+
+def _counting_puts(runtime) -> list[str]:
+    """Record the digest of every put_blob the runtime sends."""
+    sent: list[str] = []
+    original = runtime.request
+
+    def request(message, *args, **kwargs):
+        if message.get("op") == "put_blob":
+            sent.append(message["digest"])
+        return original(message, *args, **kwargs)
+
+    runtime.request = request
+    return sent
+
+
+def _start_workspace_runtime(provider, tmp_path: Path, name: str):
+    instance = Instance(provider, gpu=None)._placed("remote")
+    return provider.start(instance, Env(lock=str(tmp_path / "absent.lock")), name=name)
+
+
+def test_a_persistent_runtime_receives_a_repeated_argument_from_an_earlier_session_as_a_digest(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "ws"
+    provider = provider_of(
+        WorkspaceLocal, "lab", python=sys.executable, workspace=str(root), persistent=True
+    )
+    payload = b"x" * (256 * 1024)
+    first = _start_workspace_runtime(provider, tmp_path, "lab-1")
+    try:
+        assert first.call(len, (payload,), {})[0] == len(payload)
+    finally:
+        first.shutdown()
+    assert [p for p in (root / "blobs").rglob("*") if p.is_file()], "no blob file was written"
+
+    second = _start_workspace_runtime(provider, tmp_path, "lab-2")
+    try:
+        sent = _counting_puts(second)
+        assert second.call(len, (payload,), {})[0] == len(payload)
+        assert sent == []
+    finally:
+        second.shutdown()
+
+
+def test_a_mutable_argument_blob_on_disk_still_arrives_as_a_fresh_copy(tmp_path: Path) -> None:
+    root = tmp_path / "ws"
+    provider = provider_of(
+        WorkspaceLocal, "lab", python=sys.executable, workspace=str(root), persistent=True
+    )
+    value = bytearray(b"y" * (256 * 1024))
+
+    def mutate(buffer: bytearray) -> int:
+        first = buffer[0]
+        buffer[0] = 0
+        return first
+
+    first = _start_workspace_runtime(provider, tmp_path, "lab-1")
+    try:
+        first.call(mutate, (value,), {})
+    finally:
+        first.shutdown()
+    second = _start_workspace_runtime(provider, tmp_path, "lab-2")
+    try:
+        sent = _counting_puts(second)
+        assert second.call(mutate, (value,), {})[0] == ord("y")
+        assert second.call(mutate, (value,), {})[0] == ord("y")
+        assert sent == []
+    finally:
+        second.shutdown()
+
+
+def test_an_ephemeral_runtime_writes_no_argument_blob_to_disk(tmp_path: Path) -> None:
+    root = tmp_path / "ws"
+    provider = provider_of(
+        WorkspaceLocal, "lab", python=sys.executable, workspace=str(root), persistent=False
+    )
+    runtime = _start_workspace_runtime(provider, tmp_path, "lab-1")
+    try:
+        runtime.call(len, (b"z" * (256 * 1024),), {})
+    finally:
+        runtime.shutdown()
+    assert not (root / "blobs").exists()
+
+
+def test_argument_blobs_on_disk_are_evicted_oldest_first_beyond_the_limit(
+    tmp_path: Path, monkeypatch
+) -> None:
+    from letify.runtime import session as session_module
+
+    monkeypatch.setattr(session_module, "BLOB_DISK_LIMIT", 600 * 1024, raising=False)
+    root = tmp_path / "ws"
+    provider = provider_of(
+        WorkspaceLocal, "lab", python=sys.executable, workspace=str(root), persistent=True
+    )
+    runtime = _start_workspace_runtime(provider, tmp_path, "lab-1")
+    try:
+        for fill in (b"a", b"b", b"c"):
+            runtime.call(len, (fill * (256 * 1024),), {})
+            time.sleep(0.05)
+    finally:
+        runtime.shutdown()
+    files = [p for p in (root / "blobs").rglob("*") if p.is_file()]
+    assert len(files) == 2
+    assert sorted(p.read_bytes()[:1] for p in files) == [b"b", b"c"]
+
+
 def test_modal_builds_the_project_environment_like_every_remote_runtime() -> None:
     # Spec "Building the environment on a runtime": a Modal sandbox syncs the project .venv
     # too, because nothing in its image carries letify.

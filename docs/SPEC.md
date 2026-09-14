@@ -492,6 +492,16 @@ The digest of an immutable argument is cached on the `Runtime` for the life of t
 
 The worker keeps the unpickled value of an immutable blob, so a repeated argument is not unpickled again either. For any other blob it keeps the pickle and the buffers, and unpickles a fresh copy for each call, so a call that mutates its argument does not change what the next call receives.
 
+### Argument blobs on a persistent disk <!-- id: persistent-argument-blobs -->
+
+> On a persistent provider an argument blob is also written under the workspace root, so a later session on the same machine receives the digest instead of the bytes.
+
+A session whose provider is persistent, prepares a workspace root and has a persistent channel sends `{"op": "blob_dir", "path": "<workspace root>/blobs", "limit": <bytes>}` once, after the interpreter check. From then on the worker writes every blob it receives with `put_blob` to `<workspace root>/blobs/<first two hex characters>/<digest>`, before it replies. A `bytes` blob is the file as it is. Any other blob goes to `<digest>.pickle`: the eight bytes `LTFYPKL1`, one byte that is 1 for an immutable value, a big-endian 32-bit part count, a big-endian 64-bit size per part, then the pickle and each buffer in order. A file is written to a name ending in `.partial.<pid>` and renamed, so a reader never sees half a blob.
+
+`have` reports a digest as held when it is in the worker's memory or its file exists, and sets that file's modification time to now. A call that names a blob the worker holds only on disk loads it into memory first. An ephemeral provider sends no `blob_dir`, so its worker writes nothing.
+
+After each write the worker lists the blob directory and removes files, oldest modification time first, until their total size is at most `limit`. `limit` is 32 GiB. The file just written is never removed by its own write.
+
 ### Failure and retry
 
 > Infrastructure failure may be retried. User code failure never is. Neither falls back to a slower path.
@@ -962,6 +972,7 @@ Everything letify writes on the runtime is under the root:
 | `<workspace root>/project/<env key>` | the project files `uv sync` reads, and the `.venv` it builds |
 | `<workspace root>/project/.<digest>.tar.gz` | an environment archive while it is unpacked, removed once the `.venv` starts |
 | `<workspace root>/volumes/<volume name>` | a volume's materialized blobs and project data |
+| `<workspace root>/blobs` | argument blobs on a persistent provider, as Argument blobs on a persistent disk describes |
 | `<workspace root>/tmp` | temporary files, including the archive `pack_dir` builds on a one-shot channel; `TMPDIR` points here |
 
 The worker's working directory is the root, so a relative path in user code resolves under it. The uv installer is the one exception to the root: uv goes to `~/.local/bin`, as uv on the runtime describes, because it is shared by every account on that home directory.

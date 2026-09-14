@@ -41,6 +41,9 @@ if TYPE_CHECKING:
     from ..store.volume import Volume
     from .channel import Channel
 
+#: The total size of argument blob files kept under a persistent workspace root, 32 GiB.
+BLOB_DISK_LIMIT = 32 * 1024**3
+
 
 @dataclass
 class Runtime:
@@ -136,9 +139,25 @@ class Runtime:
             # Not retried, so nothing else would end this session.
             self.shutdown()
             raise
+        self.keep_blobs_on_disk()
         for volume in self.volumes:
             self.attach(volume)
         self.ready = True
+
+    def keep_blobs_on_disk(self) -> None:
+        """Have the worker write argument blobs under the workspace root on a persistent disk.
+
+        Spec "Argument blobs on a persistent disk". A later session on the same machine then
+        answers ``have`` from those files, so a repeated argument travels as its digest.
+        """
+        provider = self.provider
+        if not (provider.persistent and provider.prepares_workspace and self.persistent_channel):
+            return
+        root = self.workspace or provider.workspace_root
+        self.request(
+            {"op": "blob_dir", "path": f"{root.rstrip('/')}/blobs", "limit": BLOB_DISK_LIMIT},
+            timeout=120,
+        )
 
     def shutdown(self) -> None:
         """Stop everything that bills for this runtime."""
