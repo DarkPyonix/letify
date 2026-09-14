@@ -1415,6 +1415,26 @@ def test_a_sandbox_started_the_way_modal_starts_it_answers_requests(
         provider.stop(runtime)
 
 
+def test_a_sandbox_channel_sends_an_argument_larger_than_modal_stdin_buffer(
+    isolated_home, fake_modal
+) -> None:
+    # Spec "Modal adapter", op write: a frame above Modal's 2 MiB stdin buffer goes out as
+    # write requests of at most 1 MiB, so a 16 MiB argument arrives whole.
+    import base64
+
+    provider = provider_of(Modal, "m")
+    runtime = modal_runtime(provider)
+    channel = provider.open_channel(runtime)
+    try:
+        payload = bytes(range(256)) * (16 * 1024 * 1024 // 256)
+        assert channel.call(len, (payload,), {})[0] == len(payload)
+        sizes = [len(base64.b64decode(r["data"])) for r in fake_modal.requests("write")]
+        assert max(sizes) <= 1024 * 1024
+    finally:
+        channel.close()
+        provider.stop(runtime)
+
+
 def test_a_sandbox_channel_sends_the_worker_once_and_then_framed_requests(
     isolated_home, fake_modal
 ) -> None:

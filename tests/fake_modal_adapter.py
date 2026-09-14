@@ -41,7 +41,11 @@ class Sandbox:
 
     def write(self, data: str) -> None:
         assert self.process.stdin is not None
-        self.process.stdin.write(base64.b64decode(data))
+        decoded = base64.b64decode(data)
+        # Modal's sandbox stdin writer refuses to buffer more than 2 MiB before a drain.
+        if len(decoded) > 2 * 1024 * 1024:
+            raise BufferError("Buffer size exceed limit. Call drain to flush the buffer.")
+        self.process.stdin.write(decoded)
         self.process.stdin.flush()
 
     def read_until(self, prefixes: list[str]) -> dict[str, object]:

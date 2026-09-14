@@ -379,10 +379,15 @@ class SandboxChannel(FramedChannel):
         except Exception:
             pass
 
+    #: The most bytes one write request carries. Modal refuses a sandbox stdin write that
+    #: would buffer more than 2 MiB, so a larger frame goes out in several requests.
+    WRITE_LIMIT = 1 << 20
+
     def _write(self, view: memoryview) -> int:
-        data = base64.b64encode(view).decode("ascii")
+        piece = view[: self.WRITE_LIMIT]
+        data = base64.b64encode(piece).decode("ascii")
         self.adapter.request("write", sandbox=self.sandbox, data=data)
-        return view.nbytes
+        return piece.nbytes
 
     def _read_chunks(self) -> list[bytes]:
         """The next frame line, decoded. A line that is not base64 is output from before the
