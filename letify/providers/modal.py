@@ -22,20 +22,26 @@ import json
 import subprocess
 import tempfile
 import threading
+import time
 import weakref
 from collections.abc import Mapping
 from typing import IO, TYPE_CHECKING, Any
 
 from ..config import ProviderConfig
 from ..declare.instance import Host, Instance
-from ..errors import ProviderUnavailable, RuntimeFailure, UnsupportedMode
+from ..errors import LetifyError, ProviderUnavailable, RuntimeFailure, UnsupportedMode
 from ..protocol import wire
 from ..runtime.channel import Connection, FramedChannel
 from .base import Provider
+from .usage import Usage
 
 if TYPE_CHECKING:
     from ..runtime.channel import Channel
     from ..runtime.session import Runtime
+
+#: The credit the Starter plan includes each month, in USD, used when an entry declares no
+#: ``monthly_credit``.
+STARTER_MONTHLY_CREDIT = 30.0
 
 #: GPU names Modal accepts, with the memory each one carries.
 GPUS = {
@@ -207,10 +213,47 @@ class Modal(Provider):
     default_persistence = "persistent"
     has_fast_path = False
 
-    #: Modal bills in dollars and exposes no workspace balance through its SDK, so the
-    #: figure has to come from a configured command or from the dashboard.
+    #: Modal bills in dollars and publishes the month's spend, not a balance, so the balance
+    #: is the monthly credit minus the month's metered cost.
     usage_unit = "USD"
-    usage_source = "the Modal SDK exposes no workspace balance"
+    usage_source = "Modal billing summary for this month, against the monthly credit"
+
+    def report_usage(self) -> Usage:
+        """This month's metered cost against ``monthly_credit``, through a one-off adapter.
+
+        The adapter is its own process and is closed here, so asking for usage leaves no
+        process behind and touches no sandbox.
+        """
+        declared = self.config.option("monthly_credit")
+        limit = float(declared) if isinstance(declared, (int, float)) else STARTER_MONTHLY_CREDIT
+        adapter = Adapter.for_account(self.alias)
+        try:
+            summary = adapter.request("billing_summary")
+            used = float(summary["metered_cost"])
+            end = summary.get("end")
+        except (LetifyError, ValueError, KeyError, TypeError) as exc:
+            return Usage(
+                alias=self.alias,
+                kind=self.kind,
+                unit=self.usage_unit,
+                source=self.usage_source,
+                limit=limit,
+                as_of=time.time(),
+                note=f"billing summary could not be read: {exc}",
+            )
+        finally:
+            adapter.close()
+        return Usage(
+            alias=self.alias,
+            kind=self.kind,
+            unit=self.usage_unit,
+            source=self.usage_source,
+            remaining=max(limit - used, 0.0),
+            limit=limit,
+            used=used,
+            resets_at=float(end) if isinstance(end, (int, float)) else None,
+            as_of=time.time(),
+        )
 
     #: A sandbox keeps a process alive, so handles and blob reuse work.
     persistent_channel = True

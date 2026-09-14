@@ -29,7 +29,7 @@ from collections.abc import Mapping
 from typing import TYPE_CHECKING, Any
 
 from ..declare.instance import Instance
-from ..errors import ProviderUnavailable, RuntimeFailure
+from ..errors import LetifyError, ProviderUnavailable, RuntimeFailure
 from .naming import normalize_gpu
 from .shell import Shell
 from .usage import Usage
@@ -45,6 +45,12 @@ VM_PATH = "/user/resource/compute/virtual_machine"
 ALLOCATION_PATH = "/user/resource/compute/virtual_machine_allocation"
 INSTANCE_TYPE_PATH = "/user/infra/instance_type"
 PRICING_PATH = "/user/pricing"
+
+#: The billing API path the portal reads the organization's remaining credit from.
+BILLING_STATS_PATH = "/stats"
+
+#: A person is waiting for the usage table, so a billing read gets less than a call does.
+USAGE_HTTP_TIMEOUT = 15.0
 
 
 class Elice(Shell):
@@ -104,19 +110,27 @@ class Elice(Shell):
         *,
         params: Mapping[str, Any] | None = None,
         json: Any = None,
+        base: str | None = None,
+        headers: Mapping[str, str] | None = None,
+        timeout: float = 60.0,
     ) -> Any:
-        """One request with the standard library HTTP client, answering the decoded body."""
-        url = f"{self.endpoint}{path}"
+        """One request with the standard library HTTP client, answering the decoded body.
+
+        ``base`` replaces the compute API endpoint, for the billing API that lives apart.
+        """
+        url = f"{base or self.endpoint}{path}"
         if params:
             url = f"{url}?{urllib.parse.urlencode(params)}"
         data = None if json is None else _json.dumps(json).encode()
         request = urllib.request.Request(url, data=data, method=method)
         request.add_header("Authorization", f"Bearer {self._token()}")
         request.add_header("Accept", "application/json")
+        for name, value in (headers or {}).items():
+            request.add_header(name, value)
         if data is not None:
             request.add_header("Content-Type", "application/json")
         try:
-            with urllib.request.urlopen(request, timeout=60.0) as response:
+            with urllib.request.urlopen(request, timeout=timeout) as response:
                 status, raw = response.status, response.read()
         except urllib.error.HTTPError as exc:
             status, raw = exc.code, exc.read()
@@ -178,39 +192,80 @@ class Elice(Shell):
     def machines(self) -> list[dict[str, Any]]:
         return self._items(self._call("GET", VM_PATH, params={"zone_id": self.zone_id}))
 
-    #: Elice bills in Korean won and publishes no account balance, so what it can answer
-    #: is the rate of what is powered on right now.
+    #: Elice bills in Korean won. The credit comes from the billing API the portal reads,
+    #: and the hourly rate from the live allocations priced against the zone price list.
     usage_unit = "KRW"
-    usage_source = "live allocations priced from the zone price list; Elice publishes no balance"
+    usage_source = "Elice billing /stats for the credit, allocations priced from the price list"
+
+    def credit_remaining(self) -> float:
+        """The organization's remaining credit in won, from ``<billing_endpoint>/stats``."""
+        endpoint = self.config.option("billing_endpoint")
+        if not isinstance(endpoint, str) or not endpoint:
+            raise ProviderUnavailable(
+                self.kind,
+                f"{self.alias} has no 'billing_endpoint' field, the Elice billing API base URL "
+                f"the portal reads the credit from",
+            )
+        organization = self.config.option("organization")
+        headers = {"x-elice-org-name-short": organization} if isinstance(organization, str) else {}
+        body = self._call(
+            "GET",
+            BILLING_STATS_PATH,
+            base=endpoint.rstrip("/"),
+            headers=headers,
+            timeout=USAGE_HTTP_TIMEOUT,
+        )
+        if not isinstance(body, dict):
+            raise RuntimeFailure(f"Elice billing stats answered {type(body).__name__}")
+        amount = body.get("total_credit_remaining_amount", body.get("totalCreditRemainingAmount"))
+        if isinstance(amount, (int, float)):
+            return float(amount)
+        if isinstance(amount, str) and amount.strip():
+            # The portal sends "<amount> <currency>", with KRW as the currency.
+            return float(amount.split()[0].replace(",", ""))
+        raise RuntimeFailure("Elice billing stats answered without total_credit_remaining_amount")
 
     def report_usage(self) -> Usage:
-        """Price the allocations that exist against the zone's own price list.
+        """The remaining credit, and what the allocations that exist cost per hour.
 
-        There is no balance endpoint, so the honest answer is the burn rate: an allocation
-        bills by the second while it is powered on, and a machine nobody stopped is the
-        way money disappears here. Storage keeps billing with no allocation running and is
-        not included, because the API prices the machine, not the disk.
+        An allocation bills by the second while it is powered on. Storage keeps billing
+        with no allocation running and is not in the rate, because the API prices the
+        machine, not the disk. Either figure that cannot be read leaves a note and the
+        other figure still stands.
         """
-        rates = {
-            str(item.get("instance_type_id")): item
-            for item in self.pricing()
-            if item.get("instance_type_id")
-        }
-        rate = 0.0
-        for allocation in self.allocations():
-            priced = rates.get(str(allocation.get("instance_type_id")))
-            if priced is None:
-                continue
-            amount = priced.get("price_per_hour")
-            if isinstance(amount, (int, float)):
-                rate += float(amount)
+        notes: list[str] = []
+        remaining: float | None = None
+        rate: float | None = None
+        try:
+            remaining = self.credit_remaining()
+        except (LetifyError, ValueError) as exc:
+            notes.append(str(exc))
+        try:
+            rates = {
+                str(item.get("instance_type_id")): item
+                for item in self.pricing()
+                if item.get("instance_type_id")
+            }
+            rate = 0.0
+            for allocation in self.allocations():
+                priced = rates.get(str(allocation.get("instance_type_id")))
+                if priced is None:
+                    continue
+                amount = priced.get("price_per_hour")
+                if isinstance(amount, (int, float)):
+                    rate += float(amount)
+        except LetifyError as exc:
+            rate = None
+            notes.append(str(exc))
         return Usage(
             alias=self.alias,
             kind=self.kind,
             unit=self.usage_unit,
             source=self.usage_source,
+            remaining=remaining,
             rate_per_hour=rate,
             as_of=time.time(),
+            note="; ".join(notes) or None,
         )
 
     # -- allocations, which are runtimes -------------------------------------

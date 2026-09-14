@@ -204,19 +204,10 @@ def _client_shell_connect(args: argparse.Namespace) -> int:
 
 
 def _describe_usage(row: dict) -> str:
-    """One line for a usage row, saying plainly when there is no number."""
-    if row.get("unmetered"):
-        return "unmetered"
-    unit = row.get("unit") or ""
-    parts = []
-    if row.get("remaining") is not None:
-        left = f"{row['remaining']:g} {unit} left"
-        if row.get("limit"):
-            left += f" of {row['limit']:g}"
-        parts.append(left)
-    if row.get("rate_per_hour") is not None:
-        parts.append(f"{row['rate_per_hour']:g} {unit}/hour running now")
-    return ", ".join(parts) or f"not reported ({row.get('source')})"
+    """One line for a usage row, formatted by its unit as spec "Remaining usage" says."""
+    from .providers.usage import describe_row
+
+    return describe_row(row)
 
 
 def _describe_device(device: dict) -> str:
