@@ -458,6 +458,24 @@ After each `HELLO` that arrives over standard input and output, the first and th
 
 TLS comes from the Modal tunnel. The channel's side of TLS is an `ssl.SSLObject` over two `ssl.MemoryBIO` buffers, not an `ssl.SSLSocket`, because the thread reading frames and a thread writing a request run at the same time and OpenSSL does not allow two threads inside one TLS object. One lock guards the TLS object and its buffers. A second lock orders the encrypted bytes on the socket. Socket reads and writes happen outside the first lock, so a write blocked on a full socket never stops the reading thread from decrypting. Each write encrypts at most 1 MiB. The token is what stops another client of the public tunnel address from speaking the protocol, and it travels only over the adapter's authenticated control path.
 
+#### Parallel data streams <!-- id: modal-data-streams -->
+
+> The data channel is `N` TCP connections through the same tunnel, called lanes, and a write of 1 MiB or more is split across all of them, because one TCP stream over a path with a round trip near 190 ms carries about 12 MiB/s.
+
+`N` is the provider option `data_streams`, an integer from 1 to 16, 8 when it is not set. Any other value raises `ConfigError` naming the account. `data_streams = 1` is the single connection described above, with no segment framing.
+
+With `N` above 1:
+
+1. The `listen` request carries `"streams": N`. Lane 0 authenticates with the line `LETIFY-DATA <token>\n` and lane `i` from 1 to `N - 1` with `LETIFY-DATA <token> <i>\n`. The channel opens the `N` connections at the same time. The worker accepts until every lane from 0 to `N - 1` has authenticated once, and closes a connection with a wrong token, an index out of range or an index already taken. Only then does it close the listener and send `HELLO`.
+2. The frames of both directions become one byte stream carried as segments. A segment is a frame header, `wire.HEADER`, with type 8 `SEGMENT`, flags 0, stream set to the lane index and length set to the segment's bytes, followed by the 8 byte little endian offset of its first byte in the byte stream, then the bytes. `SEGMENT` appears only on a lane, never inside the byte stream.
+3. A write shorter than 1 MiB (`wire.STRIPE_MIN`) is one segment on lane 0, sent by the writing thread. A longer write is cut into `N` pieces of `ceil(length / N)` bytes, the last one shorter or absent, and piece `i` goes on lane `i`. Lane 0's piece is sent by the writing thread and every other piece by that lane's own sending thread, and the write returns once every piece is sent. One lock holds a write from its offset to its last piece, so offsets follow write order. The 8 MiB `DATA` chunks of [Frames](#frames) are writes, so a large buffer crosses all lanes chunk by chunk.
+4. Each end has one reading thread per lane. It reads segments and hands them to one reassembly buffer keyed by offset, and the frame reader takes bytes from it in offset order only. A lane whose next segment does not start at the next undelivered offset waits before reading its bytes while the buffer holds more than 64 MiB (`wire.STRIPE_HOLD`), so memory held out of order stays bounded. A segment whose magic or type is wrong, or whose offset repeats bytes already received, ends the stream.
+5. A lane that reaches end of stream or fails ends the byte stream for its reader once the bytes before the gap have been delivered, which the channel handles as a closed connection. Shutting the socket of every lane is how closing and a request timeout end a blocked read.
+
+While the channel waits for `HELLO` each read waits at most 30 s, and a lane reading thread treats a socket timeout as no data yet. After `HELLO` reads wait without a limit.
+
+Socket buffers are left to the kernel. `SO_SNDBUF` and `SO_RCVBUF` are never set, because setting them turns off the kernel's buffer tuning and the value is capped at `net.core.wmem_max`, 212 KiB by default.
+
 When any step fails, a `tunnel` failure, a connection that does not open, or no `HELLO` within 30 s, the channel prints one line on stderr, `letify: <runtime>: the data channel did not open (<reason>); frames stay on standard input and output`, and keeps using standard input and output. The worker returns to reading standard input when a byte arrives there or its `wait` ends without an authenticated connection, so a request the channel sends over standard input after a failure is answered without waiting for `wait`.
 
 A `reexec` request goes over the data connection. The worker replies there and replaces its process, which closes the connection. The channel then sends the worker source over standard input, waits for `HELLO` there, and opens the data channel again.
