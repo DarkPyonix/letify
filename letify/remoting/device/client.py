@@ -30,7 +30,7 @@ from ...errors import RemoteError, RuntimeLost
 from .executor import E_DEFINE, E_OP, E_REQUEST, E_STEP, E_STEP_DEFINE
 from .frames import ChannelTransport, StreamTransport, Transport, TransportClosed
 from .guard import check_torch_version, check_worker_version
-from .tensor import Big, layout
+from .tensor import _CACHE, MISS, REPLAY, Big, layout, outputs, reader
 from .trace import Tracer
 
 #: A queue this long is sent without waiting for more.
@@ -181,6 +181,8 @@ class Client:
                 except (RuntimeLost, TransportClosed):
                     pass
             self._closed = True
+            if REPLAY[0] is self:
+                REPLAY[0] = None
             self._waiting.set()
             self._outbox.put(None)
         if self._sender is not None:
@@ -248,8 +250,13 @@ class Client:
         blobs: list,
         outs: list,
         big: bool,
+        key: tuple | None = None,
     ) -> None:
-        """Queue or replay one operator whose outputs ``tensor.dispatch`` already built."""
+        """Queue or replay one operator whose outputs ``tensor.dispatch`` already built.
+
+        ``key`` is the operator's metadata key, from which a matched position's reader is
+        recorded, or None when the arguments cannot be a key.
+        """
         if self._lost is not None or self._closed:
             self._check_open()
         tid = self._templates.get(structure)
@@ -261,6 +268,9 @@ class Client:
         if tracer.active is not None:
             if tracer.match(tid, plan.shape_id, handles, scalars, blobs):
                 self.stats.replayed += 1
+                readers = tracer.active.readers
+                if readers[tracer.pos - 1] is None:
+                    readers[tracer.pos - 1] = self._reader(structure, name, args, kwargs, plan, key)
                 if tracer.pos == tracer.size:
                     self._enqueue((E_STEP, *tracer.take()))  # type: ignore[misc]
                     tracer.begin(tracer.active, self._next_handle)
@@ -282,8 +292,67 @@ class Client:
                 self._enqueue((E_STEP_DEFINE, step.sid, ops), check=False, counted=False)
                 self.stats.steps += 1
             tracer.begin(step, self._next_handle)
+            REPLAY[0] = self
         if big:
             self._flush()
+
+    @staticmethod
+    def _reader(
+        structure: tuple, name: str, args: tuple, kwargs: dict, plan: Any, key: tuple | None
+    ) -> tuple:
+        """The reader entry of a step position, as spec "Step capture" describes."""
+        if key is None or len(key) < 1 or key[0] is not structure:
+            return (None,)
+        read = reader(args, kwargs, "_foreach_" not in name)
+        if read is None:
+            return (None,)
+        return (structure[0], read, plan, key[1:], structure)
+
+    def replay(self, func: Any, args: tuple, kwargs: dict, given: Any) -> Any:
+        """Replay one operator through its position's reader, or ``MISS`` for the full path."""
+        tracer = self.tracer
+        step = tracer.active
+        if step is None:
+            return MISS
+        pos = tracer.pos
+        entry = step.readers[pos]
+        if entry is None or entry[0] is not func:
+            return MISS
+        got = entry[1](args, kwargs)
+        if got is None:
+            return MISS
+        tensors, scalars, tail = got
+        if tensors:
+            if tensors[0]._ref.client is not self or (given is not None and given is not self):
+                return MISS
+        elif given is not self:
+            return MISS
+        if tail == entry[3]:
+            plan = entry[2]
+        else:
+            try:
+                plan = _CACHE.get((entry[4], *tail))
+            except TypeError:  # pragma: no cover - a key value that cannot be hashed
+                return MISS
+            if plan is None:
+                return MISS
+        expected = step.ops[pos]
+        if plan.shape_id != expected[1]:
+            return MISS
+        if self._lost is not None or self._closed:
+            self._check_open()
+        handles = tuple([tensor._ref.handle for tensor in tensors])
+        if not tracer.match(expected[0], expected[1], handles, scalars, ()):
+            return MISS
+        stats = self.stats
+        stats.ops += 1
+        stats.cached += 1
+        stats.replayed += 1
+        result, _outs = outputs(plan, self, tensors)
+        if tracer.pos == tracer.size:
+            self._enqueue((E_STEP, *tracer.take()))  # type: ignore[misc]
+            tracer.begin(step, self._next_handle)
+        return result
 
     def _fall_back(self) -> None:
         tracer = self.tracer
@@ -295,6 +364,8 @@ class Client:
         if tracer.pos:
             self.stats.fallbacks += 1
         tracer.active = None
+        if REPLAY[0] is self:
+            REPLAY[0] = None
         tracer.reset()
 
     def _cut(self) -> None:
