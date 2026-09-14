@@ -23,6 +23,7 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import time
 import tomllib
 import urllib.request
 import zipfile
@@ -36,6 +37,15 @@ from .transport.setup import TAILCAT_VERSION
 
 #: Seconds to wait for a release server.
 DOWNLOAD_TIMEOUT = 60.0
+
+#: Bytes read from a release server at a time, so progress can be reported.
+DOWNLOAD_CHUNK = 64 << 10
+
+#: Seconds between redraws of the progress line on a terminal.
+PROGRESS_INTERVAL = 0.1
+
+#: Cells in the progress gauge.
+PROGRESS_CELLS = 20
 
 TAILCAT_RELEASE = "https://github.com/tailscale/tailcat/releases/download/v{version}"
 TAILCAT_RELEASES_PAGE = "https://github.com/tailscale/tailcat/releases"
@@ -281,10 +291,84 @@ def asset_for(tool: str) -> Asset:
     return Asset(name, f"{root}/{name}", f"{root}/checksums.txt", pins.get(name))
 
 
-def _download(url: str) -> bytes:
+class _Progress:
+    """The download progress line of spec "Installing external tools", Download progress."""
+
+    def __init__(self, label: str, total: int | None, stream) -> None:
+        self.label = label
+        self.total = total if total and total > 0 else None
+        self.stream = stream
+        self.terminal = render.color_enabled(stream) or _isatty(stream)
+        self.style = render.Style.for_stream(stream)
+        self.started = time.monotonic()
+        self.drawn = 0.0
+        self.quarter = 0
+
+    def _line(self, done: int, gauge: bool) -> str:
+        elapsed = max(time.monotonic() - self.started, 1e-6)
+        rate = done / elapsed / (1 << 20)
+        mib = done / (1 << 20)
+        head = f"letify: downloading {self.label} "
+        if self.total is None:
+            return f"{head}{mib:.1f} MiB {rate:.1f} MiB/s"
+        fraction = done / self.total
+        bar = render.gauge(fraction, PROGRESS_CELLS, self.style) + " " if gauge else ""
+        total = self.total / (1 << 20)
+        return f"{head}{bar}{fraction * 100:.0f}% {mib:.1f}/{total:.1f} MiB {rate:.1f} MiB/s"
+
+    def update(self, done: int) -> None:
+        if self.terminal:
+            now = time.monotonic()
+            if now - self.drawn >= PROGRESS_INTERVAL:
+                self.drawn = now
+                self.stream.write("\r" + self._line(done, gauge=True))
+                self.stream.flush()
+            return
+        if self.total is None:
+            return
+        reached = min(4, done * 4 // self.total)
+        while self.quarter < reached:
+            self.quarter += 1
+            shown = self.total if self.quarter == 4 else self.total * self.quarter // 4
+            print(self._line(shown, gauge=False), file=self.stream, flush=True)
+
+    def finish(self, done: int) -> None:
+        if self.terminal:
+            self.stream.write("\r" + self._line(done, gauge=True) + "\n")
+            self.stream.flush()
+        elif self.total is None:
+            print(self._line(done, gauge=False), file=self.stream, flush=True)
+        else:
+            self.update(self.total)
+
+
+def _isatty(stream) -> bool:
+    try:
+        return bool(stream.isatty())
+    except (AttributeError, ValueError):
+        return False
+
+
+def _download(url: str, *, label: str | None = None, stream=None) -> bytes:
+    """Fetch ``url``; with ``label``, report progress on ``stream`` (standard error)."""
     try:
         with urllib.request.urlopen(url, timeout=DOWNLOAD_TIMEOUT) as response:
-            return response.read()
+            if label is None:
+                return response.read()
+            length = response.headers.get("Content-Length")
+            total = int(length) if length and str(length).isdigit() else None
+            progress = _Progress(label, total, stream if stream is not None else sys.stderr)
+            parts: list[bytes] = []
+            done = 0
+            while True:
+                chunk = response.read(DOWNLOAD_CHUNK)
+                if not chunk:
+                    break
+                parts.append(chunk)
+                done += len(chunk)
+                progress.update(done)
+            progress.finish(done)
+            return b"".join(parts)
     except OSError as exc:
         raise InstallError(f"could not download {url}: {exc}") from None
 
@@ -406,7 +490,7 @@ def install(tool: str, *, say: Say = _say) -> Path:
 
     asset = asset_for(tool)
     log(f"installing {tool} {version_of(tool)} from {asset.url} into {cache_path(tool).parent}")
-    data = _download(asset.url)
+    data = _download(asset.url, label=f"{tool} {version_of(tool)}")
     checksums = _download(asset.checksums_url).decode("utf-8", "replace")
     verify(asset, data, checksums)
     members = _select(tool, _members(asset, data))

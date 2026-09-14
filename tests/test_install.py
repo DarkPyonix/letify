@@ -376,7 +376,13 @@ def test_a_missing_tool_is_installed_on_first_need_and_both_steps_are_logged(
     path = install.ensure("tailcat", instructions="how to install")
 
     assert path == str(venv / "bin" / "tailcat")
-    lines = [line for line in capsys.readouterr().err.splitlines() if line.startswith("letify: ")]
+    err = capsys.readouterr().err.splitlines()
+    # Download progress lines are spec "Download progress"; the two install lines stay.
+    lines = [
+        line
+        for line in err
+        if line.startswith("letify: ") and not line.startswith("letify: downloading")
+    ]
     version = setup.TAILCAT_VERSION
     assert len(lines) == 2
     assert (
@@ -470,3 +476,81 @@ def test_pinned_digests_cover_every_published_asset() -> None:
     for arch in ("amd64", "arm64"):
         assert len(install.TAILCAT_SHA256[f"tailcat_{version}_windows_{arch}.zip"]) == 64
     assert len(install.ECI_SHA256) == 3
+
+
+# -- Spec: Installing external tools, download progress ------------------------------
+
+
+class _Terminal(io.StringIO):
+    """A standard error stand-in that says it is a terminal."""
+
+    def isatty(self) -> bool:
+        return True
+
+
+def test_a_download_without_a_terminal_logs_progress_at_each_quarter(
+    releases, monkeypatch, nothing_on_path, capsys
+) -> None:
+    archive = tar_gz([("tailcat", os.urandom(4096), "file")])
+    publish_tailcat(monkeypatch, releases, archive)
+    monkeypatch.setattr(install, "DOWNLOAD_CHUNK", 64)
+    install.install("tailcat")
+
+    lines = [line for line in capsys.readouterr().err.splitlines() if "downloading" in line]
+    assert [
+        line.split("] ")[-1].split()[0] if "]" in line else line.split()[4] for line in lines
+    ] == [
+        "25%",
+        "50%",
+        "75%",
+        "100%",
+    ]
+    assert all(
+        line.startswith(f"letify: downloading tailcat {setup.TAILCAT_VERSION} ") for line in lines
+    )
+    assert "\r" not in capsys.readouterr().err
+
+
+def test_a_download_on_a_terminal_redraws_one_line_with_a_gauge(releases, monkeypatch) -> None:
+    body = os.urandom(200_000)
+    releases.files["/blob"] = body
+    stream = _Terminal()
+    monkeypatch.setattr(install, "DOWNLOAD_CHUNK", 1024)
+    clock = iter(range(10_000))
+    monkeypatch.setattr(install.time, "monotonic", lambda: next(clock) * 0.2)
+
+    data = install._download(releases.url + "/blob", label="eci 0.2.1", stream=stream)
+
+    assert data == body
+    text = stream.getvalue()
+    assert text.count("\r") > 1
+    assert text.endswith("\n")
+    final = text.rstrip("\n").split("\r")[-1]
+    assert final.startswith("letify: downloading eci 0.2.1 [")
+    assert "100%" in final and "MiB/s" in final
+
+
+def test_a_download_with_no_size_shows_bytes_and_rate_without_a_percent(monkeypatch) -> None:
+    class NoLength:
+        def __init__(self) -> None:
+            self.headers: dict[str, str] = {}
+            self.left = [b"x" * 1024] * 3
+
+        def read(self, size: int) -> bytes:
+            return self.left.pop() if self.left else b""
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc: object) -> None:
+            return None
+
+    monkeypatch.setattr(install.urllib.request, "urlopen", lambda url, timeout: NoLength())
+    stream = io.StringIO()
+    assert (
+        install._download("http://example.invalid/x", label="tailcat 0.6.0", stream=stream)
+        == b"x" * 3072
+    )
+    lines = stream.getvalue().splitlines()
+    assert len(lines) == 1
+    assert "%" not in lines[0] and "MiB/s" in lines[0]
