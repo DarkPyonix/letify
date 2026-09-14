@@ -46,11 +46,66 @@ ALLOCATION_PATH = "/user/resource/compute/virtual_machine_allocation"
 INSTANCE_TYPE_PATH = "/user/infra/instance_type"
 PRICING_PATH = "/user/pricing"
 
+#: Paths the portal calls, read from its public JavaScript bundle.
+ZONE_PATH = "/user/infra/zone"
+ORGANIZATION_PATH = "/user/organization"
+
 #: The billing API path the portal reads the organization's remaining credit from.
 BILLING_STATS_PATH = "/stats"
 
 #: A person is waiting for the usage table, so a billing read gets less than a call does.
 USAGE_HTTP_TIMEOUT = 15.0
+
+
+def request(
+    method: str,
+    path: str,
+    *,
+    token: str,
+    endpoint: str = DEFAULT_ENDPOINT,
+    params: Mapping[str, Any] | None = None,
+    json: Any = None,
+    headers: Mapping[str, str] | None = None,
+    timeout: float = 60.0,
+) -> Any:
+    """One request with the standard library HTTP client, answering the decoded body.
+
+    Kept apart from the provider so a login can check a token before any account exists.
+    """
+    url = f"{endpoint.rstrip('/')}{path}"
+    if params:
+        url = f"{url}?{urllib.parse.urlencode(params)}"
+    data = None if json is None else _json.dumps(json).encode()
+    call = urllib.request.Request(url, data=data, method=method)
+    call.add_header("Authorization", f"Bearer {token}")
+    call.add_header("Accept", "application/json")
+    for name, value in (headers or {}).items():
+        call.add_header(name, value)
+    if data is not None:
+        call.add_header("Content-Type", "application/json")
+    try:
+        with urllib.request.urlopen(call, timeout=timeout) as response:
+            status, raw = response.status, response.read()
+    except urllib.error.HTTPError as exc:
+        status, raw = exc.code, exc.read()
+    except (urllib.error.URLError, OSError) as exc:
+        raise RuntimeFailure(f"Elice {method} {path} failed: {exc}") from exc
+
+    text = raw.decode(errors="replace")
+    # This API answers 200 for every success, so anything else is a failure.
+    if status != 200:
+        try:
+            body = _json.loads(text)
+            detail = body.get("message") or str(body)
+        except Exception:
+            detail = text[:500]
+        raise RuntimeFailure(f"Elice {method} {path} returned {status}: {detail}")
+    return _json.loads(text) if text else {}
+
+
+def items(body: Any) -> list[dict[str, Any]]:
+    """The records of a listing, sent either as a bare list or under ``items``."""
+    return body if isinstance(body, list) else body.get("items", [])
 
 
 class Elice(Shell):
@@ -114,43 +169,24 @@ class Elice(Shell):
         headers: Mapping[str, str] | None = None,
         timeout: float = 60.0,
     ) -> Any:
-        """One request with the standard library HTTP client, answering the decoded body.
+        """One request under this account's token, answering the decoded body.
 
         ``base`` replaces the compute API endpoint, for the billing API that lives apart.
         """
-        url = f"{base or self.endpoint}{path}"
-        if params:
-            url = f"{url}?{urllib.parse.urlencode(params)}"
-        data = None if json is None else _json.dumps(json).encode()
-        request = urllib.request.Request(url, data=data, method=method)
-        request.add_header("Authorization", f"Bearer {self._token()}")
-        request.add_header("Accept", "application/json")
-        for name, value in (headers or {}).items():
-            request.add_header(name, value)
-        if data is not None:
-            request.add_header("Content-Type", "application/json")
-        try:
-            with urllib.request.urlopen(request, timeout=timeout) as response:
-                status, raw = response.status, response.read()
-        except urllib.error.HTTPError as exc:
-            status, raw = exc.code, exc.read()
-        except (urllib.error.URLError, OSError) as exc:
-            raise RuntimeFailure(f"Elice {method} {path} failed: {exc}") from exc
-
-        text = raw.decode(errors="replace")
-        # This API answers 200 for every success, so anything else is a failure.
-        if status != 200:
-            try:
-                body = _json.loads(text)
-                detail = body.get("message") or str(body)
-            except Exception:
-                detail = text[:500]
-            raise RuntimeFailure(f"Elice {method} {path} returned {status}: {detail}")
-        return _json.loads(text) if text else {}
+        return request(
+            method,
+            path,
+            token=self._token(),
+            endpoint=base or self.endpoint,
+            params=params,
+            json=json,
+            headers=headers,
+            timeout=timeout,
+        )
 
     @staticmethod
     def _items(body: Any) -> list[dict[str, Any]]:
-        return body if isinstance(body, list) else body.get("items", [])
+        return items(body)
 
     # -- instances -----------------------------------------------------------
 
@@ -326,7 +362,11 @@ __all__ = [
     "ALLOCATION_PATH",
     "DEFAULT_ENDPOINT",
     "INSTANCE_TYPE_PATH",
+    "ORGANIZATION_PATH",
     "PRICING_PATH",
     "VM_PATH",
+    "ZONE_PATH",
     "Elice",
+    "items",
+    "request",
 ]
