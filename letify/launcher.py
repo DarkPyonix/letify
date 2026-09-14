@@ -335,12 +335,16 @@ class Launcher:
         return [row for row in rows if row is not None]
 
     def utilization(self, alias: str | None = None) -> list[dict[str, Any]]:
-        """How hard each declared instance's accelerator is working right now.
+        """How hard each declared provider's accelerators are working right now.
 
-        A local instance is read here. A remote one is read inside its live session, and
-        an instance with no session reports no devices and says so, because starting one
-        to measure its load would cost money and change the answer.
+        A provider whose machine outlives a session is read directly and read-only, one row
+        for the machine, with who holds each card. Any other is read inside its live
+        session, one row per instance, and an instance with no session reports no devices
+        and says so, because starting one to measure its load would cost money and change
+        the answer. Providers are asked at once, since each remote read is a round trip.
         """
+        from concurrent.futures import ThreadPoolExecutor
+
         from .runtime.telemetry import parse_smi, read_smi
 
         wanted = [alias] if alias else list(self.config.order)
@@ -348,45 +352,98 @@ class Launcher:
             (runtime.provider.alias, runtime.instance.accelerator): runtime
             for runtime in self.pool.live
         }
-        rows: list[dict[str, Any]] = []
-        for name in wanted:
-            try:
-                provider = self.provider(name)
-                instances = provider.instances
-            except LetifyError as exc:
-                rows.append({"alias": name, "unavailable": str(exc)})
-                continue
 
-            for accelerator, instance in instances.items():
+        def machine(provider: Provider) -> dict[str, Any]:
+            row: dict[str, Any] = {
+                "alias": provider.alias,
+                "kind": provider.kind,
+                "accelerator": None,
+                "scope": "machine",
+                "devices": [],
+                "reason": None,
+            }
+            try:
+                devices, holders = provider.read_machine()
+            except LetifyError as exc:
+                row["reason"] = str(exc)
+                return row
+            reserved = provider.reserved_indices()
+            for device in devices:
+                holder, users = (
+                    ("letify", ())
+                    if device.index in reserved
+                    else holders.get(device.index, ("unknown", ()))
+                )
+                row["devices"].append(
+                    {
+                        **device.to_dict(),
+                        "holder": holder,
+                        "users": list(users),
+                        "reserved": device.index in reserved,
+                    }
+                )
+            if not devices:
+                row["reason"] = "nvidia-smi reported nothing on that machine"
+            return row
+
+        def sessions(provider: Provider) -> list[dict[str, Any]]:
+            rows: list[dict[str, Any]] = []
+            for accelerator, instance in provider.instances.items():
                 if instance.gpu is None:
                     continue
                 row: dict[str, Any] = {
-                    "alias": name,
+                    "alias": provider.alias,
+                    "kind": provider.kind,
                     "accelerator": accelerator,
+                    "scope": "session",
                     "devices": [],
                     "reason": None,
                 }
-                runtime = live.get((name, accelerator))
+                rows.append(row)
+                runtime = live.get((provider.alias, accelerator))
+                if runtime is None:
+                    row["reason"] = "no live session, so nothing to measure"
+                    continue
                 try:
-                    if provider.kind == "local":
-                        output = read_smi()
-                    elif runtime is not None:
-                        output, _logs = runtime.call(read_smi, (), {})
-                    else:
-                        row["reason"] = "no live session, so nothing to measure"
-                        rows.append(row)
-                        continue
+                    output, _logs = runtime.call(read_smi, (), {})
                 except LetifyError as exc:
                     row["reason"] = str(exc)
-                    rows.append(row)
                     continue
-
                 devices = parse_smi(output or "")
-                row["devices"] = [device.to_dict() for device in devices]
+                row["devices"] = [
+                    {**device.to_dict(), "holder": None, "users": [], "reserved": False}
+                    for device in devices
+                ]
                 if not devices:
                     row["reason"] = "nvidia-smi reported nothing on that machine"
-                rows.append(row)
-        return rows
+            return rows
+
+        def read(name: str) -> list[dict[str, Any]]:
+            try:
+                provider = self.provider(name)
+                if provider.reads_machine:
+                    return [machine(provider)]
+                rows = sessions(provider)
+            except LetifyError as exc:
+                return [{"alias": name, "unavailable": str(exc)}]
+            if not rows:
+                rows = [
+                    {
+                        "alias": name,
+                        "kind": provider.kind,
+                        "accelerator": None,
+                        "scope": "session",
+                        "devices": [],
+                        "reason": "no GPU instance is declared",
+                    }
+                ]
+            return rows
+
+        if not wanted:
+            return []
+        with ThreadPoolExecutor(max_workers=len(wanted)) as pool:
+            answers = list(pool.map(read, wanted))
+        return [row for rows in answers for row in rows]
 
     def status(self) -> dict[str, Any]:
         """What is running right now, and what it is costing.

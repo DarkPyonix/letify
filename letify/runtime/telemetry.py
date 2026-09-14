@@ -208,13 +208,17 @@ def parse_uuids(output: str) -> dict[str, int]:
     return table
 
 
-def parse_busy(
+def parse_holders(
     output: str,
     uuids: dict[str, int],
     exclude_pids: set[int] | None = None,
-    owners_out: dict[int, tuple[str, ...]] | None = None,
-) -> tuple[int, ...]:
-    """The indices another user computes on, read from the output of ``OWNERS_COMMAND``.
+) -> dict[int, tuple[str, tuple[str, ...]]]:
+    """Who holds each card, read from the output of ``OWNERS_COMMAND``.
+
+    Every index in ``uuids`` gets ``("others", users)`` when another user computes on it,
+    ``("mine", ())`` when only the login user's own processes or this client's workers do,
+    and ``("free", ())`` otherwise. The login user rule is the busy check's: when the login
+    user is root, a root process that is not one of this client's workers is another user's.
 
     Raises ``RuntimeFailure`` when the output carries no login user, because without it no
     process can be told apart from the login user's own.
@@ -233,8 +237,9 @@ def parse_busy(
         pid_text, _, user = line.strip().partition(" ")
         if pid_text.isdigit() and user:
             owner_of[int(pid_text)] = user.strip()
-    mine = exclude_pids or set()
+    workers = exclude_pids or set()
     taken: dict[int, set[str]] = {}
+    mine: set[int] = set()
     for line in apps.splitlines():
         fields = [part.strip() for part in line.split(",")]
         if len(fields) < 2 or fields[0] not in uuids:
@@ -243,15 +248,62 @@ def parse_busy(
             pid = int(fields[1])
         except ValueError:
             continue
-        if pid in mine:
-            continue
+        index = uuids[fields[0]]
         owner = owner_of.get(pid)
-        if owner is not None and owner == login and login != "root":
+        if pid in workers or (owner is not None and owner == login and login != "root"):
+            mine.add(index)
             continue
-        taken.setdefault(uuids[fields[0]], set()).add(owner or UNKNOWN_OWNER)
+        taken.setdefault(index, set()).add(owner or UNKNOWN_OWNER)
+    holders: dict[int, tuple[str, tuple[str, ...]]] = {}
+    for index in sorted(uuids.values()):
+        if index in taken:
+            holders[index] = ("others", tuple(sorted(taken[index])))
+        elif index in mine:
+            holders[index] = ("mine", ())
+        else:
+            holders[index] = ("free", ())
+    return holders
+
+
+def parse_busy(
+    output: str,
+    uuids: dict[str, int],
+    exclude_pids: set[int] | None = None,
+    owners_out: dict[int, tuple[str, ...]] | None = None,
+) -> tuple[int, ...]:
+    """The indices another user computes on, read from the output of ``OWNERS_COMMAND``.
+
+    Raises ``RuntimeFailure`` when the output carries no login user, because without it no
+    process can be told apart from the login user's own.
+    """
+    holders = parse_holders(output, uuids, exclude_pids)
+    taken = {index: users for index, (holder, users) in holders.items() if holder == "others"}
     if owners_out is not None:
-        owners_out.update({index: tuple(sorted(users)) for index, users in taken.items()})
+        owners_out.update(taken)
     return tuple(sorted(taken))
+
+
+def read_machine(
+    run: Callable[[tuple[str, ...]], str],
+    exclude_pids: set[int] | None = None,
+) -> tuple[list[DeviceLoad], dict[int, tuple[str, tuple[str, ...]]]]:
+    """Every card's load and who holds it, from the three read-only nvidia-smi queries.
+
+    ``run`` answers one command with its output. The load query failing raises, because
+    then there is nothing to report. The owner queries failing leaves the holders empty,
+    which a caller prints as unknown, because the load is still worth showing.
+    """
+    from ..errors import LetifyError
+
+    devices = parse_smi(run(SMI_COMMAND))
+    if not devices:
+        return devices, {}
+    try:
+        uuids = parse_uuids(run(UUID_COMMAND))
+        holders = parse_holders(run(OWNERS_COMMAND), uuids, exclude_pids) if uuids else {}
+    except LetifyError:
+        holders = {}
+    return devices, holders
 
 
 def _run(command: tuple[str, ...]) -> str:
@@ -283,7 +335,9 @@ __all__ = [
     "busy_indices",
     "local_load",
     "parse_busy",
+    "parse_holders",
     "parse_smi",
     "parse_uuids",
+    "read_machine",
     "read_smi",
 ]

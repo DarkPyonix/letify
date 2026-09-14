@@ -2,7 +2,8 @@
 
 This module owns how records look on a terminal: the style decision (colour, block
 characters, width), the gauge, relative times, and the usage block layout from spec
-"Remaining usage". It does not read any provider and does not decide what a record
+"Remaining usage" and the utilization block layout from spec "GPU utilization". It does
+not read any provider and does not decide what a record
 contains, which belongs to the providers and to ``providers/usage.py``.
 """
 
@@ -30,6 +31,7 @@ _DIM = "\x1b[2m"
 _GREEN = "\x1b[32m"
 _YELLOW = "\x1b[33m"
 _RED = "\x1b[31m"
+_CYAN = "\x1b[36m"
 
 
 @dataclass(frozen=True, slots=True)
@@ -167,6 +169,81 @@ def usage_blocks(rows: Iterable[Mapping[str, Any]], style: Style, now: float | N
     return "\n".join(usage_block(row, style, now) for row in rows)
 
 
+#: The header text and colour for each card holder, as spec "GPU utilization" lists them.
+HOLDERS: dict[str, tuple[str, str | None]] = {
+    "letify": ("reserved by letify", _CYAN),
+    "others": ("busy", _RED),
+    "mine": ("in use by your processes", _YELLOW),
+    "free": ("free", _GREEN),
+    "unknown": ("holder unknown", None),
+}
+
+#: Columns a card's gauge line spends on things other than the gauge.
+_CARD_TAKEN = 4 + 7 + 2 + 5 + 16
+
+
+def _card_lines(device: Mapping[str, Any], style: Style) -> list[str]:
+    """A card's header, load and memory gauges, and temperature and power, unindented."""
+    head = f"gpu{device.get('index')}  {device.get('name')}"
+    holder = device.get("holder")
+    if holder in HOLDERS:
+        text, code = HOLDERS[holder]
+        if holder == "others":
+            text = f"busy: {', '.join(device.get('users') or ()) or 'another user'}"
+        head += "  " + (style.paint(text, code) if code else text)
+    lines = [head]
+    cells = max(GAUGE_MIN, min(GAUGE_MAX, style.width - _CARD_TAKEN))
+    load = device.get("utilization_percent")
+    if load is not None:
+        fraction = float(load) / 100
+        text = f"{gauge(fraction, cells, style)} {round(float(load)):>3}%"
+        lines.append("  load   " + style.paint(text, share_color(1.0 - fraction)))
+    total = device.get("memory_total_gb")
+    if total:
+        used = float(device.get("memory_used_gb") or 0.0)
+        fraction = used / float(total)
+        text = f"{gauge(fraction, cells, style)} {round(fraction * 100):>3}%"
+        painted = style.paint(text, share_color(1.0 - fraction))
+        lines.append(f"  memory {painted}  {used:.1f}/{float(total):.1f} GiB")
+    extra = []
+    if device.get("temperature_c") is not None:
+        extra.append(f"{float(device['temperature_c']):.0f}C")
+    if device.get("power_w") is not None:
+        extra.append(f"{float(device['power_w']):.0f}W")
+    if extra:
+        lines.append("  " + style.dim("  ".join(extra)))
+    return lines
+
+
+def utilization_block(rows: list[Mapping[str, Any]], style: Style) -> str:
+    """One provider's block: its cards, or why it has none to show."""
+    first = rows[0]
+    alias = str(first.get("alias"))
+    if "unavailable" in first:
+        return f"{style.bold(alias)}\n{INDENT}unavailable: {first['unavailable']}\n"
+    body: list[str] = []
+    reasons = {row.get("reason") for row in rows}
+    if len(reasons) == 1 and None not in reasons:
+        body.append(str(first["reason"]))
+    else:
+        for row in rows:
+            if row.get("reason"):
+                named = row.get("scope") == "session" and row.get("accelerator")
+                body.append(f"{row['accelerator']}: {row['reason']}" if named else row["reason"])
+            for device in row.get("devices") or ():
+                body.extend(_card_lines(device, style))
+    header = f"{style.bold(alias)}  {first.get('kind')}"
+    return "\n".join([header, *(INDENT + line for line in body)]) + "\n"
+
+
+def utilization_blocks(rows: Iterable[Mapping[str, Any]], style: Style) -> str:
+    """Every provider's block, grouping its rows by alias in the order they came."""
+    groups: dict[str, list[Mapping[str, Any]]] = {}
+    for row in rows:
+        groups.setdefault(str(row.get("alias")), []).append(row)
+    return "\n".join(utilization_block(group, style) for group in groups.values())
+
+
 __all__ = [
     "GAUGE_MAX",
     "GAUGE_MIN",
@@ -177,4 +254,6 @@ __all__ = [
     "share_color",
     "usage_block",
     "usage_blocks",
+    "utilization_block",
+    "utilization_blocks",
 ]

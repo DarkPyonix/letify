@@ -210,24 +210,6 @@ def _describe_usage(row: dict) -> str:
     return describe_row(row)
 
 
-def _describe_device(device: dict) -> str:
-    """One line for a device reading, leaving out what the card did not report."""
-    load = (
-        f"{device['utilization_percent']:.0f}% busy"
-        if device.get("utilization_percent") is not None
-        else "load unknown"
-    )
-    parts = [f"gpu{device['index']}", str(device["name"]), load]
-    if device.get("memory_total_gb"):
-        used = device.get("memory_used_gb") or 0.0
-        parts.append(f"{used:.1f}/{device['memory_total_gb']:.1f} GiB")
-    if device.get("temperature_c") is not None:
-        parts.append(f"{device['temperature_c']:.0f}C")
-    if device.get("power_w") is not None:
-        parts.append(f"{device['power_w']:.0f}W")
-    return " ".join(parts)
-
-
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
 
@@ -339,18 +321,9 @@ def main(argv: list[str] | None = None) -> int:
         if args.json:
             print(json.dumps(rows, indent=2))
             return 0
-        for row in rows:
-            alias = str(row["alias"])
-            if "unavailable" in row:
-                print(f"{alias:20} unavailable: {row['unavailable']}")
-                continue
-            head = f"{alias}.{row['accelerator']}"
-            devices = row.get("devices") or []
-            if not devices:
-                print(f"{head:28} {row.get('reason') or 'nothing reported'}")
-                continue
-            for device in devices:
-                print(f"{head:28} {_describe_device(device)}")
+        from . import render
+
+        sys.stdout.write(render.utilization_blocks(rows, render.Style.for_stream(sys.stdout)))
         return 0
 
     if args.command == "check":

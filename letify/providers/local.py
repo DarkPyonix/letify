@@ -20,7 +20,7 @@ import subprocess
 import sys
 from collections.abc import Mapping
 from functools import cache
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from ..declare.instance import Instance
 from .base import Provider
@@ -102,6 +102,21 @@ class Local(Provider):
         )
         self.last_busy_owners = owners
         return busy
+
+    reads_machine = True
+
+    def read_machine(self) -> tuple[list[Any], dict[int, tuple[str, tuple[str, ...]]]]:
+        """This machine's cards and who holds them, read with nvidia-smi here."""
+        import os
+
+        from ..runtime import telemetry
+
+        def run(command: tuple[str, ...]) -> str:
+            if command == telemetry.SMI_COMMAND:
+                return telemetry.read_smi()
+            return telemetry._run(command)
+
+        return telemetry.read_machine(run, {os.getpid(), *self.worker_pids()})
 
     def store_backend(self) -> str:
         return "filesystem"

@@ -118,6 +118,8 @@ class Colab(Shell):
     kind = "colab"
     extra = "colab"
     default_persistence = "ephemeral"
+    #: Its machine lives only as long as a session, so utilization is read inside one.
+    reads_machine = False
 
     #: The control path crosses a Google frontend rather than reaching the machine
     #: directly, so forwarding pays a long round trip per synchronization.

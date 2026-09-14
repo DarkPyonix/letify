@@ -289,7 +289,8 @@ def test_a_machine_reached_by_ssh_is_read_over_its_link_without_a_session(
         if "--query-compute-apps" in remote:
             return FakeCompleted(stdout="GPU-bbb, 42\n#owners\n42 alice\n#login\nbrew\n")
         return FakeCompleted(
-            stdout="0, Tesla P100, 20, 1638, 16384, 41, 38\n1, Tesla P100, 99, 8192, 16384, 70, 200\n"
+            stdout="0, Tesla P100, 20, 1638, 16384, 41, 38\n"
+            "1, Tesla P100, 99, 8192, 16384, 70, 200\n"
         )
 
     monkeypatch.setattr(shell_module.subprocess, "run", run)
@@ -312,7 +313,11 @@ def test_a_device_reading_is_printed_with_the_fields_the_card_reported(
         "read_smi",
         lambda: "0, NVIDIA RTX PRO 6000, 87, 40960, 98304, [N/A], [Not Supported]\n",
     )
-    monkeypatch.setattr(telemetry, "_run", lambda command: "")
+    owners = {
+        telemetry.UUID_COMMAND: "0, GPU-a\n",
+        telemetry.OWNERS_COMMAND: "#owners\n#login\nbrew\n",
+    }
+    monkeypatch.setattr(telemetry, "_run", lambda command: owners.get(command, ""))
     monkeypatch.setenv("COLUMNS", "80")
     assert main(["utilization", "local"]) == 0
     out = capsys.readouterr().out
