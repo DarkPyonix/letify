@@ -214,6 +214,13 @@ def test_the_runtime_is_asked_for_a_kernel_once_per_signature(client) -> None:
     assert client.stats.round_trips == before + 1
 
 
+def test_the_runtime_answers_an_attention_kernel_request(client) -> None:
+    query = torch.randn(2, 2, 16, 8, device="cuda")
+    flags = {"dropout_p": 0.0, "is_causal": True, "scale": None, "enable_gqa": False}
+    answer = client.kernel("scaled_dot_product_attention", (query, query, query, None), flags)
+    assert answer in {"MATH", "FLASH_ATTENTION", "EFFICIENT_ATTENTION", "CUDNN_ATTENTION"}
+
+
 @pytest.fixture
 def unsent():
     """A client whose queued operators are never executed, for kernels a CPU cannot run."""

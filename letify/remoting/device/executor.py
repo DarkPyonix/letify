@@ -403,8 +403,8 @@ class Executor:
                     mask,
                     float(flags["dropout_p"]),
                     bool(flags["is_causal"]),
-                    flags.get("scale"),
-                    bool(flags.get("enable_gqa", False)),
+                    scale=flags.get("scale"),
+                    enable_gqa=bool(flags.get("enable_gqa", False)),
                 )
             )
             names = (
