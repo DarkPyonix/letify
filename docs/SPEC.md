@@ -1118,6 +1118,16 @@ A handle is an integer from a per-session counter. `RemoteTensor`s that share a 
 
 A contiguous CPU tensor is sent as a view of its own memory, taken through `ctypes` from its data pointer, so no NumPy is needed. A non-contiguous one is made contiguous first. On the runtime the buffer is received into a `bytearray` and wrapped with `torch.frombuffer`. A copy to the host is made contiguous on the runtime, copied to CPU memory, sent as a view of that memory, received into a `bytearray` and wrapped with `torch.frombuffer`.
 
+### Upload cache <!-- id: forwarding-upload-cache -->
+
+> A CPU tensor whose bytes the executor already holds travels as its digest, so a batch repeated across epochs, a fixed tensor sent every step and reloaded weights cross the link once.
+
+The client hashes each CPU tensor argument of at least 64 KiB with BLAKE3 when its batch is flushed, which is at the call for an upload because an entry carrying such a tensor flushes the queue. Tensors of 1 MiB or more are hashed with BLAKE3's automatic multithreading. The key is the 32-byte digest together with the byte length.
+
+The executor keeps the received bytes of recent uploads in a least recently used table bounded by `UPLOAD_CACHE_BYTES`, 1 GiB. The client keeps a mirror of that table holding only keys and lengths. Both apply the same two updates in the same order, the order of blobs within entries within batches: a key sent with its bytes is inserted, or moved to the most recent end if present, and then the least recently used keys are evicted until the total is within the budget; a key sent alone is moved to the most recent end. A tensor larger than the budget is sent with its bytes and not inserted. Because the mirror is exact, a key sent alone is always present on the executor, and no reply is needed to decide what to send.
+
+The executor applies a batch's cache updates before it executes the batch's entries, so an entry skipped after a failure still updates the table. An operator reads a cached upload through `torch.frombuffer` over the table's bytes, which operators on the upload path only read. `Client.set_upload_cache_bytes(n)` changes the budget on both ends, evicting at once; `0` turns the cache off. The client counts uploads sent as digests and the bytes they saved in `Stats.cache_hits` and `Stats.cache_saved_bytes`.
+
 ### Transport <!-- id: forwarding-transport -->
 
 > The client and the worker talk through a `Transport` with three methods, so the stream underneath can be replaced without touching either.

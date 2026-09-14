@@ -594,6 +594,76 @@ def test_a_large_copy_round_trips_both_ways(client) -> None:
     assert torch.equal(back, data)
 
 
+# -- Spec: Upload cache ----------------------------------------------------------
+
+
+def test_a_repeated_upload_travels_as_its_digest(client) -> None:
+    data = torch.randn(1 << 18)
+    first = data.cuda()
+    client.synchronize()
+    sent = client.stats.sent_bytes
+    second = data.cuda()
+    client.synchronize()
+    assert client.stats.sent_bytes - sent < 4096
+    assert client.stats.cache_hits == 1
+    assert torch.equal(second.cpu(), data)
+    assert torch.equal(first.cpu(), data)
+
+
+def test_changed_bytes_are_uploaded_again(client) -> None:
+    data = torch.zeros(1 << 18)
+    data.cuda()
+    client.synchronize()
+    data.fill_(3.0)
+    again = data.cuda()
+    assert client.stats.cache_hits == 0
+    assert again.sum().item() == 3.0 * (1 << 18)
+
+
+def test_an_upload_evicted_from_the_budget_is_sent_with_its_bytes(client) -> None:
+    client.set_upload_cache_bytes(2 * (1 << 18) * 4)
+    tensors = [torch.full((1 << 18,), float(index)) for index in range(3)]
+    for tensor in tensors:
+        tensor.cuda()
+    before = client.stats.cache_hits
+    uploaded = [tensor.cuda() for tensor in reversed(tensors)]
+    # The oldest of the three was evicted, so of the second pass only two are digests.
+    assert client.stats.cache_hits - before == 2
+    for got, tensor in zip(uploaded, reversed(tensors), strict=True):
+        assert torch.equal(got.cpu(), tensor)
+
+
+def test_an_in_place_change_to_a_cached_upload_leaves_the_cached_bytes(client) -> None:
+    data = torch.ones(1 << 18)
+    first = data.cuda()
+    first.mul_(5.0)
+    second = data.cuda()
+    assert client.stats.cache_hits == 1
+    assert second.sum().item() == float(1 << 18)
+    assert first.sum().item() == 5.0 * (1 << 18)
+
+
+def test_a_failure_before_a_cached_upload_keeps_both_tables_in_step(client) -> None:
+    data = torch.randn(1 << 18)
+    good = torch.ones(3, device="cuda")
+    picked = good[torch.tensor([5]).cuda()]
+    picked.add_(1)
+    data.cuda()
+    with pytest.raises(RemoteError):
+        client.synchronize()
+    again = data.cuda()
+    assert client.stats.cache_hits == 1
+    assert torch.equal(again.cpu(), data)
+
+
+def test_a_small_tensor_is_not_hashed(client) -> None:
+    small = torch.randn(1024)
+    small.cuda()
+    small.cuda()
+    client.synchronize()
+    assert client.stats.cache_hits == 0
+
+
 # -- Spec: Failure semantics -------------------------------------------------------
 
 
