@@ -977,6 +977,8 @@ Linux wheels are built inside the `manylinux_2_28` containers, so the binaries n
 
 ## Known gaps
 
+- **host=local does not run PyTorch yet.** Measured on 2026-09-14 against a Tesla P100 server with torch 2.5.1 cu121: libcudart 12.1 resolves 425 driver symbols by name and the stand-in `libcuda.so.1` exports 20, so CUDA initialization fails with `cudaErrorInsufficientDriver` before any call reaches letify. The missing symbols include the context calls, `cuGetProcAddress` and the private `cuGetExportTable`, so adding a few exports does not close the gap, and PyTorch kernels arrive through fatbinary registration that `cuModuleLoadData` does not see. `LaunchKernel` also forwards argument pointers that name host memory the agent cannot read, and `cuMemHostAlloc` is not implemented. The forwarding path itself measured 0.7 us per queued call, 0.30 ms median round trip over an SSH forward (0.04 ms on the server loopback) with a 40 ms tail on 0.6% of synchronizations over the forward, and about 100 MiB/s for copies limited by SSH.
+
 > Implemented and unimplemented, stated plainly so nobody builds on a promise.
 
 - **`letify-driver` covers one milestone.** The entry points a PyTorch process needs to start up and run one kernel are forwarded and verified against a real GPU. Kernel argument marshalling reads the pointer list without knowing the kernel's signature, and fatbin size comes from a conservative window rather than the image header. Both need a real workload to shape them.
