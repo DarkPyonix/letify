@@ -1769,3 +1769,35 @@ def test_a_worker_of_this_client_marks_its_card_as_the_login_users() -> None:
 
     output = "GPU-a, 10\n#owners\n10 root\n#login\nroot\n"
     assert telemetry.parse_holders(output, {"GPU-a": 0}, {10}) == {0: ("mine", ())}
+
+
+# -- environment on the sandbox disk: spec "Environment on the sandbox disk" --------------
+
+
+def test_a_provider_with_an_env_root_builds_the_venv_there_with_the_default_uv_cache(
+    uv_project: Path, tmp_path: Path
+) -> None:
+    disk = tmp_path / "sandbox-disk"
+    kind = type("DiskEnvLocal", (PreparingLocal,), {"env_root": str(disk)})
+    provider = provider_of(kind, "lab")
+    assert provider.persistent
+    env = Env()
+    runtime = provider.start(remote_instance(provider), env, name="lab-1")
+    try:
+        executable, _version, imported = runtime.call(reports_interpreter(), (), {})[0]
+        venv = disk / "project" / env.key / ".venv"
+        assert Path(executable).parent == venv / "bin"
+        assert Path(imported).is_relative_to(venv)
+        assert runtime.env_source == "sync"
+        assert not (remote_projects() / env.key).exists()
+        assert not (Path(bootstrap.DEFAULT_WORKSPACE_ROOT) / "uv-cache").exists()
+    finally:
+        runtime.shutdown()
+
+
+def test_only_modal_sets_an_env_root() -> None:
+    from letify.providers.base import Provider
+    from letify.providers.modal import Modal
+
+    assert Provider.env_root is None
+    assert Modal.env_root == "/root/.letify-env"

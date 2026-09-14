@@ -775,6 +775,18 @@ This applies to every provider except `local`: `shell`, `tunnel`, `colab`, `elic
 
 A failed sync raises `EnvironmentFailure` saying `uv sync failed on <runtime>`, with the command and the last lines of uv's standard error. `EnvironmentFailure` is a `RuntimeFailure`, so the call is retried on a fresh runtime.
 
+### Environment on the sandbox disk <!-- id: modal-env-disk -->
+
+> On `modal` the project directory, its `.venv` and uv's cache live on the sandbox's own disk, not on the workspace volume, because importing a large package from a Modal volume reads thousands of small files over the network.
+
+A provider's `env_root` names where the project directory lives instead of the workspace root. It is None for every kind except `modal`, whose `env_root` is `/root/.letify-env`. When `env_root` is set:
+
+1. The project directory is `<env_root>/project/<env key>`.
+2. The sync sets no `UV_CACHE_DIR`, so uv uses its default cache under `~/.cache/uv` on the same disk and hard links from it.
+3. No environment archive is packed or restored, as on any persistent provider.
+
+The sandbox disk is discarded with the sandbox, so every Modal session syncs from the package index. Everything else under the workspace root, volumes, argument blobs and temporary files, stays on the volume.
+
 ### Interpreter version <!-- id: interpreter-version -->
 
 > The runtime's `.venv` always runs the same Python major.minor as the local process, and `Env` guarantees it.
@@ -795,7 +807,7 @@ The worker looks for `uv` on `PATH`, then at `~/.local/bin/uv`. When neither exi
 
 uv installs a package into a `.venv` by hard linking it from its cache, and falls back to a full copy when the cache is on another filesystem. A container's home directory is often an overlay while the workspace root is a mounted disk, so the default cache under `~/.cache/uv` makes every new env key copy the whole environment.
 
-The sync step sets `UV_CACHE_DIR=<workspace root>/uv-cache` for `uv sync` and `uv pip install` when the provider's `persistence` is `persistent`. On a runtime with a persistent workspace root the cache then outlives a container rebuild along with the projects built from it. An `Env.vars` entry naming `UV_CACHE_DIR` wins over this rule.
+The sync step sets `UV_CACHE_DIR=<workspace root>/uv-cache` for `uv sync` and `uv pip install` when the provider's `persistence` is `persistent` and it sets no `env_root`. On a runtime with a persistent workspace root the cache then outlives a container rebuild along with the projects built from it. An `Env.vars` entry naming `UV_CACHE_DIR` wins over this rule.
 
 An ephemeral provider sets nothing. Its disk is discarded with the runtime, so a cache there is filled once per runtime wherever it lives, and moving it only matters when the home directory and the project are on different filesystems.
 
@@ -1051,7 +1063,7 @@ Everything letify writes on the runtime is under the root:
 
 | Path | Holds |
 |---|---|
-| `<workspace root>/project/<env key>` | the project files `uv sync` reads, and the `.venv` it builds |
+| `<workspace root>/project/<env key>` | the project files `uv sync` reads, and the `.venv` it builds, except on `modal`, as Environment on the sandbox disk describes |
 | `<workspace root>/project/.<digest>.tar.gz` | an environment archive while it is unpacked, removed once the `.venv` starts |
 | `<workspace root>/uv-cache` | uv's cache on a persistent provider, as uv cache describes |
 | `<workspace root>/volumes/<volume name>` | a volume's materialized blobs and project data |
