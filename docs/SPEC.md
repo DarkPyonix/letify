@@ -1174,6 +1174,8 @@ While forwarding is active, `RemoteTensor` is added to every `_foreach_supported
 
 `aten.detach` and `aten.alias` are recognized before the arguments are read, and produce a new `RemoteTensor` sharing the same handle, with no operator sent. An in-place operator, or one writing to `out=`, returns the input it wrote to. Every other operator output gets a new handle.
 
+An in-place operator that changes the view metadata of the input it returns, such as `as_strided_`, which the composite `adaptive_avg_pool2d` calls to give a `channels_last` result `channels_last` strides, is mirrored on that input's wrapper: its signature, and the wrapper's own shape, strides and storage offset, take the meta result's values before the operator returns. Only that wrapper changes, as in PyTorch, and other `RemoteTensor`s sharing its handle keep their metadata. The metadata cache records the new signature, so a cache hit and a replayed step apply the same change. Memory formats need nothing else: strides are part of every signature, so a `channels_last` tensor keeps its strides through inference and the runtime computes on tensors with the same strides.
+
 A plain CPU tensor passed to an operator travels with it as a buffer and is a CPU tensor on the runtime, so a zero-dimensional CPU scalar mixes with device tensors as it does in PyTorch. A CPU tensor larger than 4 KiB flushes the queue immediately after its operator, so a later write to it in this process cannot change what the runtime received.
 
 When the meta operator raises, the operator is sent at once and executed on the runtime, and the reply carries its output metadata. That covers data-dependent shapes such as `nonzero` and `masked_select`, and reports a genuine error with the runtime's own message.

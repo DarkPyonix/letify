@@ -436,6 +436,19 @@ def reader(args: tuple, kwargs: dict, floats_keyed: bool, offsets_keyed: bool = 
     return constants["read"]
 
 
+def _restride(tensor: RemoteTensor, sig: tuple) -> None:
+    """Give a wrapper the view metadata an in-place operator gave its meta counterpart."""
+    from torch.utils._mode_utils import no_dispatch
+
+    if tensor._sig == sig:
+        return
+    with no_dispatch(), torch._C.DisableTorchFunction():
+        torch.Tensor.as_strided_(tensor, sig[0], sig[1], sig[2])
+    tensor._sig = sig
+    tensor._form = (sig[0], sig[1], sig[3])
+    tensor._m = None
+
+
 def outputs(plan: Plan, client: Client, tensors: Any) -> tuple[Any, list]:
     """Build an operator's results from its plan, and the new handle of each tensor output."""
     outs: list = []
@@ -449,7 +462,10 @@ def outputs(plan: Plan, client: Client, tensors: Any) -> tuple[Any, list]:
             results.append(RemoteTensor(leaf[1], Ref(client, handle)))
         elif tag == _IN:
             outs.append(None)
-            results.append(tensors[leaf[1]])
+            existing = tensors[leaf[1]]
+            if len(leaf) > 2:
+                _restride(existing, leaf[2])
+            results.append(existing)
         else:
             results.append(leaf[1])
     if plan.container is None:
@@ -557,11 +573,11 @@ def _plan(name: str, meta_out: Any, tensors: list) -> Plan:
             planned.append((_NEW, signature(leaf)))
             continue
         existing = tensors[position]
-        if leaf.shape != existing.shape or leaf.stride() != existing.stride():
-            raise UnsupportedMode(
-                f"{name} changed the shape of a tensor in place, which host='local' "
-                f"cannot mirror on the local wrapper"
-            )
+        changed = signature(leaf)
+        if changed != existing._sig:
+            # An in-place restride, such as as_strided_: the wrapper takes the new view.
+            planned.append((_IN, position, changed))
+            continue
         planned.append((_IN, position))
     return Plan(container, tuple(planned))
 
