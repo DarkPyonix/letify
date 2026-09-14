@@ -67,10 +67,18 @@ class Executor:
 
     def hello(self) -> dict:
         torch = self.torch
-        name = torch.cuda.get_device_name(self.device) if self.device.type == "cuda" else "cpu"
+        if self.device.type == "cuda":
+            properties = torch.cuda.get_device_properties(self.device)
+            name = properties.name
+            capability = (properties.major, properties.minor)
+            total_memory = properties.total_memory
+        else:
+            name, capability, total_memory = "cpu", (0, 0), 0
         return {
             "device": str(self.device),
             "name": name,
+            "capability": capability,
+            "total_memory": total_memory,
             "torch": torch.__version__,
             "pid": os.getpid(),
         }
