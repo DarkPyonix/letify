@@ -9,6 +9,8 @@ provides or refuses, as spec "Mapping cuda" describes. It does not own dispatch,
 from __future__ import annotations
 
 import contextlib
+import inspect
+import os
 import types
 from collections.abc import Iterator
 from typing import TYPE_CHECKING, Any
@@ -32,6 +34,25 @@ REFUSED = (
     "graph",
     "get_rng_state",
     "set_rng_state",
+)
+
+
+#: Tensor functions that read metadata only, so an unfilled tensor passed to them does not wait.
+METADATA = frozenset(
+    {
+        torch.Tensor.shape.__get__,  # type: ignore[attr-defined]
+        torch.Tensor.dtype.__get__,  # type: ignore[attr-defined]
+        torch.Tensor.device.__get__,  # type: ignore[attr-defined]
+        torch.Tensor.ndim.__get__,  # type: ignore[attr-defined]
+        torch.Tensor.is_cuda.__get__,  # type: ignore[attr-defined]
+        torch.Tensor.requires_grad.__get__,  # type: ignore[attr-defined]
+        torch.Tensor.size,
+        torch.Tensor.dim,
+        torch.Tensor.numel,
+        torch.Tensor.stride,
+        torch.Tensor.element_size,
+        torch.Tensor.__len__,
+    }
 )
 
 
@@ -61,6 +82,287 @@ def _check_index(index: int) -> None:
         )
 
 
+#: The signature ``_cross_entropy`` binds a call's arguments against.
+_CROSS_ENTROPY = inspect.signature(torch.nn.functional.cross_entropy)
+
+#: CUDA autocast policy by function name, as spec "Autocast" lists it.
+_AUTOCAST: dict[str, str] = {
+    **dict.fromkeys(
+        [
+            "conv1d",
+            "conv2d",
+            "conv3d",
+            "conv_transpose1d",
+            "conv_transpose2d",
+            "conv_transpose3d",
+            "conv_tbc",
+            "prelu",
+            "addmm",
+            "addmv",
+            "addr",
+            "matmul",
+            "__matmul__",
+            "__rmatmul__",
+            "einsum",
+            "mm",
+            "mv",
+            "linear",
+            "bmm",
+            "baddbmm",
+            "addbmm",
+            "chain_matmul",
+            "multi_dot",
+            "scaled_dot_product_attention",
+            "lstm_cell",
+            "gru_cell",
+            "rnn_tanh_cell",
+            "rnn_relu_cell",
+        ],
+        "lower",
+    ),
+    **dict.fromkeys(
+        [
+            "acos",
+            "asin",
+            "cosh",
+            "erfinv",
+            "exp",
+            "expm1",
+            "log",
+            "log10",
+            "log2",
+            "log1p",
+            "reciprocal",
+            "rsqrt",
+            "sinh",
+            "tan",
+            "pow",
+            "__pow__",
+            "softplus",
+            "layer_norm",
+            "group_norm",
+            "norm",
+            "cosine_similarity",
+            "poisson_nll_loss",
+            "cosine_embedding_loss",
+            "nll_loss",
+            "hinge_embedding_loss",
+            "kl_div",
+            "l1_loss",
+            "smooth_l1_loss",
+            "huber_loss",
+            "mse_loss",
+            "margin_ranking_loss",
+            "multilabel_margin_loss",
+            "soft_margin_loss",
+            "triplet_margin_loss",
+            "multi_margin_loss",
+            "binary_cross_entropy_with_logits",
+            "dist",
+            "pdist",
+            "cdist",
+            "renorm",
+            "logsumexp",
+            "softmax",
+            "log_softmax",
+            "sum",
+            "prod",
+            "cumsum",
+            "cumprod",
+        ],
+        "float32",
+    ),
+    **dict.fromkeys(
+        [
+            "addcdiv",
+            "addcmul",
+            "atan2",
+            "bilinear",
+            "cross",
+            "dot",
+            "vdot",
+            "grid_sample",
+            "index_put",
+            "scatter_add",
+            "tensordot",
+            "cat",
+            "stack",
+        ],
+        "widest",
+    ),
+    "cross_entropy": "cross_entropy",
+}
+
+
+def _autocast_enabled() -> bool:
+    try:
+        return torch.is_autocast_enabled("cuda")
+    except TypeError:  # pragma: no cover - PyTorch before 2.4 takes no device type
+        return torch.is_autocast_enabled()
+
+
+def _autocast_dtype() -> torch.dtype:
+    try:
+        return torch.get_autocast_dtype("cuda")
+    except AttributeError:  # pragma: no cover - PyTorch before 2.4
+        return torch.get_autocast_gpu_dtype()
+
+
+def _eligible(value: Any) -> bool:
+    return (
+        type(value) is RemoteTensor
+        and value.dtype.is_floating_point
+        and value.dtype is not torch.float64
+    )
+
+
+def _cross_entropy(func: Any, args: tuple, kwargs: dict) -> Any:
+    """``cross_entropy`` as CUDA autocast runs ``cross_entropy_loss``.
+
+    That operator has no autocast kernel of its own: ``log_softmax`` runs in the input's
+    dtype and ``nll_loss`` casts to float32. Probability targets, label smoothing and the
+    legacy reduction arguments take the float32 cast of the whole call instead.
+    """
+    bound = _CROSS_ENTROPY.bind(*args, **kwargs)
+    bound.apply_defaults()
+    given = bound.arguments
+    source, target = given["input"], given["target"]
+    if (
+        not _eligible(source)
+        or target.dtype.is_floating_point
+        or given["label_smoothing"]
+        or given["size_average"] is not None
+        or given["reduce"] is not None
+    ):
+        args, kwargs = _autocast("float32", args, kwargs)
+        return func(*args, **kwargs)
+    weight = given["weight"]
+    if _eligible(weight) and weight.dtype is not torch.float32:
+        weight = weight.to(torch.float32)
+    log_probabilities = torch.log_softmax(source, 1 if source.dim() > 1 else 0)
+    return torch.nn.functional.nll_loss(
+        log_probabilities.to(torch.float32),
+        target,
+        weight,
+        ignore_index=given["ignore_index"],
+        reduction=given["reduction"],
+    )
+
+
+def _autocast(policy: str, args: tuple, kwargs: dict) -> tuple[tuple, dict]:
+    """The arguments with autocast's casts for ``policy`` applied."""
+    found = [
+        leaf
+        for value in (*args, *kwargs.values())
+        for leaf in (value if isinstance(value, (list, tuple)) else (value,))
+        if _eligible(leaf)
+    ]
+    if not found:
+        return args, kwargs
+    if policy == "lower":
+        dtype = _autocast_dtype()
+    elif policy == "float32":
+        dtype = torch.float32
+    else:
+        dtype = max((leaf.dtype for leaf in found), key=lambda d: torch.finfo(d).bits)
+
+    def cast(value: Any) -> Any:
+        if _eligible(value) and value.dtype is not dtype:
+            return value.to(dtype)
+        if isinstance(value, (list, tuple)):
+            return type(value)(cast(item) for item in value)
+        return value
+
+    return tuple(cast(value) for value in args), {key: cast(v) for key, v in kwargs.items()}
+
+
+_BATCH_NORM = inspect.signature(torch.nn.functional.batch_norm)
+_ATTENTION = ("query", "key", "value", "attn_mask", "dropout_p", "is_causal", "scale", "enable_gqa")
+_ATTENTION_DEFAULTS = {
+    "attn_mask": None,
+    "dropout_p": 0.0,
+    "is_causal": False,
+    "scale": None,
+    "enable_gqa": False,
+}
+
+
+def _batch_norm(client: Client, args: tuple, kwargs: dict) -> Any:
+    """``batch_norm`` through ``aten.cudnn_batch_norm`` when the runtime picks cuDNN.
+
+    Returns NotImplemented for any other answer, which leaves the call on the ordinary path.
+    """
+    bound = _BATCH_NORM.bind(*args, **kwargs)
+    bound.apply_defaults()
+    given = bound.arguments
+    x, weight, bias = given["input"], given["weight"], given["bias"]
+    mean, var, training = given["running_mean"], given["running_var"], bool(given["training"])
+    if any(type(value) is not RemoteTensor for value in (x, weight, bias)):
+        return NotImplemented
+    if any(value is not None and type(value) is not RemoteTensor for value in (mean, var)):
+        return NotImplemented
+    if not training and (mean is None or var is None):
+        return NotImplemented
+    answer = client.kernel(
+        "batch_norm",
+        (x, weight, bias, mean, var),
+        {"training": training, "eps": float(given["eps"])},
+    )
+    if answer != "Cudnn":
+        return NotImplemented
+    if training:
+        torch.nn.functional._verify_batch_size(x.size())
+    momentum = given["momentum"]
+    return torch.ops.aten.cudnn_batch_norm.default(
+        x,
+        weight,
+        bias,
+        mean,
+        var,
+        training,
+        0.0 if momentum is None else float(momentum),
+        float(given["eps"]),
+    )[0]
+
+
+def _attention(client: Client, args: tuple, kwargs: dict) -> Any:
+    """Attention through the runtime's fused kernel when it picks one, else NotImplemented."""
+    given = dict(_ATTENTION_DEFAULTS)
+    given.update(zip(_ATTENTION, args, strict=False))
+    given.update(kwargs)
+    query, key, value, mask = given["query"], given["key"], given["value"], given["attn_mask"]
+    if any(type(tensor) is not RemoteTensor for tensor in (query, key, value)):
+        return NotImplemented
+    if mask is not None and type(mask) is not RemoteTensor:
+        return NotImplemented
+    if given["enable_gqa"]:
+        return NotImplemented
+    dropout, causal, scale = float(given["dropout_p"]), bool(given["is_causal"]), given["scale"]
+    flags = {"dropout_p": dropout, "is_causal": causal, "scale": scale, "enable_gqa": False}
+    answer = client.kernel("scaled_dot_product_attention", (query, key, value, mask), flags)
+    grads = torch.is_grad_enabled() and any(t.requires_grad for t in (query, key, value))
+    if answer == "FLASH_ATTENTION" and mask is None and query.shape[-1] % 8 == 0:
+        return torch.ops.aten._scaled_dot_product_flash_attention.default(
+            query, key, value, dropout, causal, False, scale=scale
+        )[0]
+    if answer == "EFFICIENT_ATTENTION":
+        return torch.ops.aten._scaled_dot_product_efficient_attention.default(
+            query, key, value, mask, grads, dropout, causal, scale=scale
+        )[0]
+    if answer == "CUDNN_ATTENTION":
+        return torch.ops.aten._scaled_dot_product_cudnn_attention.default(
+            query, key, value, mask, grads, dropout, causal, False, scale=scale
+        )[0]
+    return NotImplemented
+
+
+#: Functions whose kernel the runtime chooses, as spec "Kernel selection" describes.
+_SELECTED = {
+    torch.nn.functional.batch_norm: _batch_norm,
+    torch.nn.functional.scaled_dot_product_attention: _attention,
+}
+
+
 class CudaMode(TorchFunctionMode):
     """Rewrites CUDA devices in torch calls to the runtime's device."""
 
@@ -70,10 +372,24 @@ class CudaMode(TorchFunctionMode):
 
     def __torch_function__(self, func, types, args=(), kwargs=None):
         kwargs = kwargs or {}
+        if self.client.unfilled and func not in METADATA:
+            self.client.wait_used(args)
+            if kwargs:
+                self.client.wait_used(kwargs.values())
         if args and type(args[0]) is RemoteTensor:
             special = SPECIAL.get(func)
             if special is not None:
                 return special(*args, **kwargs)
+        policy = _AUTOCAST.get(getattr(func, "__name__", ""))
+        if policy is not None and _autocast_enabled():
+            if policy == "cross_entropy":
+                return _cross_entropy(func, args, kwargs)
+            args, kwargs = _autocast(policy, args, kwargs)
+        selected = _SELECTED.get(func)
+        if selected is not None and str(self.client.hello.get("device", "")).startswith("cuda"):
+            result = selected(self.client, args, kwargs)
+            if result is not NotImplemented:
+                return result
         rewritten = False
         device = kwargs.get("device")
         if device is not None:
@@ -280,6 +596,24 @@ def unmapped() -> Iterator[None]:
     finally:
         _CLIENTS.pop()
         _patch(originals)
+
+
+def _forget_in_child() -> None:
+    """Undo every active mapping in a process just forked, whose channel belongs to the parent."""
+    if not _ACTIVE:
+        return
+    _restore(_ORIGINALS)
+    for found in _foreach_types():
+        while RemoteTensor in found:
+            found.remove(RemoteTensor)
+    _ACTIVE.clear()
+    _CLIENTS.clear()
+    stack = torch._C._len_torch_function_stack
+    while stack() and isinstance(torch._C._get_function_stack_at(stack() - 1), CudaMode):
+        torch._C._pop_torch_function_stack()
+
+
+os.register_at_fork(after_in_child=_forget_in_child)
 
 
 #: torch.cuda as it was before any mapping, read once at import.

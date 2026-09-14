@@ -902,7 +902,10 @@ class FakeStrategy:
         unmet: str | None = None,
         probe_error: bool = False,
         probed: bool = True,
+        cancellable: bool = False,
     ):
+        import threading
+
         self.name = name
         self.probed = probed
         self.rank = rank
@@ -911,6 +914,11 @@ class FakeStrategy:
         self.error = error
         self.unmet = unmet
         self.probe_error = probe_error
+        #: Whether the delay ends early when the pipeline sets the attempt's cancel event.
+        self.cancellable = cancellable
+        self.cancelled = False
+        #: Set when an attempt returns or raises.
+        self.ended = threading.Event()
         self.attempts = 0
         self.assumed = 0
         self.links: list[FakeLink] = []
@@ -923,14 +931,24 @@ class FakeStrategy:
         self.links.append(link)
         return link
 
-    def attempt(self, target: Any) -> FakeLink:
+    def attempt(self, target: Any, cancel: Any = None) -> FakeLink:
         import time
 
+        from letify.transport import nat
+
         self.attempts += 1
-        time.sleep(self.delay)
-        if self.error:
-            raise OSError(self.error)
-        return self._link()
+        try:
+            if self.cancellable and cancel is not None:
+                if cancel.wait(self.delay):
+                    self.cancelled = True
+                    raise nat.Cancelled(f"{self.name} was cancelled")
+            else:
+                time.sleep(self.delay)
+            if self.error:
+                raise OSError(self.error)
+            return self._link()
+        finally:
+            self.ended.set()
 
     def assume(self, target: Any) -> FakeLink:
         self.assumed += 1

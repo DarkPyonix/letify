@@ -13,9 +13,12 @@ both ends.
 from __future__ import annotations
 
 import base64
+import functools
+import io
 import os
 import pickle
 import struct
+import sys
 import threading
 
 #: First two bytes of every frame.
@@ -40,6 +43,9 @@ CHUNK = 8 << 20
 
 #: A ``bytes`` value this large or larger travels as an out-of-band buffer.
 OUT_OF_BAND = 1 << 20
+
+#: A tensor this many bytes or larger travels as an out-of-band buffer.
+TENSOR_OUT_OF_BAND = 64 << 10
 
 #: Frames at most this large are written with their header in one call.
 _JOIN_LIMIT = 1 << 16
@@ -89,10 +95,82 @@ def _wrap(value: object, depth: int = 0) -> object:
     return value
 
 
+class _Reduced:
+    """An argument of a reduction that pickles as a reduction of its own."""
+
+    __slots__ = ("reduction",)
+
+    def __init__(self, reduction: tuple):
+        self.reduction = reduction
+
+    def __reduce_ex__(self, protocol: object) -> tuple:
+        return self.reduction
+
+
+def reduce_tensor(obj: object) -> object:
+    """A reduction that sends a CPU tensor's bytes as a buffer, or ``NotImplemented``.
+
+    ``Tensor.__reduce_ex__`` copies the whole storage into the pickle. This one rebuilds the
+    tensor with ``torch.frombuffer``, ``reshape`` and ``requires_grad_``, which a runtime
+    without letify can unpickle, as spec "Frames" describes.
+    """
+    torch = sys.modules.get("torch")
+    if torch is None:
+        return NotImplemented
+    kind = type(obj)
+    if kind is not torch.Tensor and kind is not torch.nn.Parameter:
+        return NotImplemented
+    tensor = obj  # type: ignore[assignment]
+    if (
+        tensor.device.type != "cpu"
+        or tensor.layout is not torch.strided
+        or not tensor.is_leaf
+        or tensor.is_quantized
+        or tensor.is_conj()
+        or tensor.is_neg()
+        or tensor.numel() == 0
+    ):
+        return NotImplemented
+    try:
+        import ctypes
+    except ImportError:  # pragma: no cover - CPython always has ctypes
+        return NotImplemented
+    data = tensor.detach()
+    if not data.is_contiguous():
+        data = data.contiguous()
+    size = data.numel() * data.element_size()
+    array = (ctypes.c_char * size).from_address(data.data_ptr())
+    # The array does not own the memory, so it holds the tensor for as long as a view does.
+    array.tensor = data
+    view = memoryview(array).cast("B")
+    payload = pickle.PickleBuffer(view) if size >= TENSOR_OUT_OF_BAND else bytearray(view)
+    flat = _Reduced((functools.partial(torch.frombuffer, dtype=data.dtype), (payload,)))
+    shaped = _Reduced((torch.Tensor.reshape, (flat, tuple(data.shape))))
+    if kind is torch.nn.Parameter:
+        return torch.nn.Parameter, (shaped, tensor.requires_grad)
+    if tensor.requires_grad:
+        return torch.Tensor.requires_grad_, (shaped,)
+    return shaped.reduction
+
+
+class _Pickler(pickle.Pickler):
+    def reducer_override(self, obj: object) -> object:
+        return reduce_tensor(obj)
+
+
+def pickle_parts(obj: object) -> tuple[bytes, list[pickle.PickleBuffer]]:
+    """Pickle ``obj`` with protocol 5 and the tensor reducer, keeping buffers apart."""
+    buffers: list[pickle.PickleBuffer] = []
+    if "torch" not in sys.modules:
+        return pickle.dumps(obj, protocol=5, buffer_callback=buffers.append), buffers
+    file = io.BytesIO()
+    _Pickler(file, protocol=5, buffer_callback=buffers.append).dump(obj)
+    return file.getvalue(), buffers
+
+
 def dumps(obj: object) -> tuple[bytes, list[memoryview]]:
     """Pickle ``obj`` with protocol 5, returning the pickle and its out-of-band buffers."""
-    buffers: list[pickle.PickleBuffer] = []
-    head = pickle.dumps(_wrap(obj), protocol=5, buffer_callback=buffers.append)
+    head, buffers = pickle_parts(_wrap(obj))
     return head, [buffer.raw() for buffer in buffers]
 
 

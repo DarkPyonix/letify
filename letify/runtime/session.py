@@ -41,6 +41,9 @@ if TYPE_CHECKING:
     from ..store.volume import Volume
     from .channel import Channel
 
+#: The total size of argument blob files kept under a persistent workspace root, 32 GiB.
+BLOB_DISK_LIMIT = 32 * 1024**3
+
 
 @dataclass
 class Runtime:
@@ -136,9 +139,25 @@ class Runtime:
             # Not retried, so nothing else would end this session.
             self.shutdown()
             raise
+        self.keep_blobs_on_disk()
         for volume in self.volumes:
             self.attach(volume)
         self.ready = True
+
+    def keep_blobs_on_disk(self) -> None:
+        """Have the worker write argument blobs under the workspace root on a persistent disk.
+
+        Spec "Argument blobs on a persistent disk". A later session on the same machine then
+        answers ``have`` from those files, so a repeated argument travels as its digest.
+        """
+        provider = self.provider
+        if not (provider.persistent and provider.prepares_workspace and self.persistent_channel):
+            return
+        root = self.workspace or provider.workspace_root
+        self.request(
+            {"op": "blob_dir", "path": f"{root.rstrip('/')}/blobs", "limit": BLOB_DISK_LIMIT},
+            timeout=120,
+        )
 
     def shutdown(self) -> None:
         """Stop everything that bills for this runtime."""
@@ -408,7 +427,10 @@ class Runtime:
         where = self.eval(bootstrap.probe_source(self.env, root), timeout=120)
         self.platform = where["platform"]
 
-        for volume in self.volumes:
+        # Spec "Volumes on a persistent runtime": the .venv is already on the runtime's
+        # disk, so an archive is neither restored nor packed there.
+        archives = () if self.provider.persistent else self.volumes
+        for volume in archives:
             digest = volume.cached_env(self.env, self.platform)
             if not digest:
                 continue
@@ -421,7 +443,11 @@ class Runtime:
                 break
 
         if self.env_source != "archive":
-            source = bootstrap.sync_source(self.env, files, root=root, name=self.name)
+            workspace = self.workspace or self.provider.workspace_root
+            cache = bootstrap.uv_cache_dir(workspace) if self.provider.persistent else None
+            source = bootstrap.sync_source(
+                self.env, files, root=root, name=self.name, cache_dir=cache
+            )
             try:
                 self.eval(source, timeout=3600)
             except RemoteError as exc:
@@ -430,10 +456,8 @@ class Runtime:
                     message.removeprefix("RuntimeError: "), stderr=exc.remote_traceback
                 ) from exc
             self.env_source = "sync"
-            if self.volumes:
-                self.volumes[0].cache_env_from(
-                    self, self.env, where["root"], platform=self.platform
-                )
+            if archives:
+                archives[0].cache_env_from(self, self.env, where["root"], platform=self.platform)
         self.python = where["python"]
         self.channel.switch_interpreter(where["python"])
 
@@ -493,10 +517,7 @@ class Runtime:
 
 def _pickled(value: Any, immutable: bool) -> dict[str, Any]:
     """A ``put_blob`` message for a value: its protocol 5 pickle and out-of-band buffers."""
-    import pickle
-
-    buffers: list[pickle.PickleBuffer] = []
-    head = pickle.dumps(value, protocol=5, buffer_callback=buffers.append)
+    head, buffers = protocol.wire.pickle_parts(value)
     return {"kind": "pickle", "immutable": immutable, "head": head, "buffers": buffers}
 
 

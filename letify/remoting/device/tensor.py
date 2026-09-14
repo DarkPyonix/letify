@@ -241,6 +241,11 @@ def _read_tensor(
     if view.nbytes <= INLINE_BYTES:
         blobs.append(bytes(view))
         return False
+    if host.data_ptr() == value.data_ptr():
+        # The write happens later on the sender thread, so the bytes are copied now and a
+        # change the caller makes to its tensor afterwards does not reach the runtime.
+        host = host.clone()
+        view = tensor_view(host)
     blobs.append(Big(view, host))
     return True
 
@@ -314,8 +319,21 @@ _SHAPES: dict[tuple, int] = {}
 _CACHE: dict[tuple, Plan] = {}
 _CACHE_LIMIT = 1 << 16
 
-#: The printable overload name of each operator, and whether its float scalars key metadata.
-_NAMES: dict[Any, tuple[str, bool]] = {}
+#: The printable overload name of each operator, whether its float scalars key metadata, and
+#: whether its argument storage offsets do.
+_NAMES: dict[Any, tuple[str, bool, bool]] = {}
+
+
+def _aliases(func: Any) -> bool:
+    """Whether any return of the operator's schema may alias an argument.
+
+    An operator whose returns carry no alias information returns new tensors, so the
+    storage offsets of its arguments do not change its output metadata.
+    """
+    try:
+        return any(ret.alias_info is not None for ret in func._schema.returns)
+    except AttributeError:  # pragma: no cover - an operator without a schema, or an old PyTorch
+        return True
 
 _NEW = 0
 _IN = 1
@@ -332,6 +350,113 @@ def _meta_like(shape: tuple, stride: tuple, offset: int, dtype: torch.dtype) -> 
     return base.as_strided(shape, stride, offset)
 
 
+#: Returned by ``Client.replay`` when an operator needs the full path.
+MISS = object()
+
+#: The client whose repetition of a captured step is running, set and cleared by that client.
+REPLAY: list[Client | None] = [None]
+
+_LITERAL_TYPES = (bool, str, torch.device, torch.dtype, torch.memory_format, torch.layout)
+
+
+def reader(args: tuple, kwargs: dict, floats_keyed: bool, offsets_keyed: bool = True) -> Any:
+    """A generated function checking arguments against these ones, per spec "Step capture".
+
+    It returns ``(tensors, scalars, key tail)`` for arguments with the same structure and
+    None otherwise. The key tail holds the offsets only when ``offsets_keyed``, as
+    ``dispatch`` builds the metadata key. ``reader`` itself returns None when an argument
+    has no exact check, such as a plain CPU or meta tensor.
+    """
+    lines = ["def read(a, k):"]
+    constants: dict[str, Any] = {"RT": RemoteTensor}
+    tensors: list[str] = []
+    scalars: list[str] = []
+    keyed: list[str] = []
+    counter = [0]
+
+    def name() -> str:
+        counter[0] += 1
+        return f"v{counter[0]}"
+
+    def constant(value: Any) -> str:
+        label = f"c{len(constants)}"
+        constants[label] = value
+        return label
+
+    def emit(expr: str, value: Any) -> bool:
+        kind = type(value)
+        if value is None:
+            lines.append(f"    if {expr} is not None: return None")
+            return True
+        var = name()
+        lines.append(f"    {var} = {expr}")
+        if kind is RemoteTensor:
+            form = constant(value._form)
+            lines.append(f"    if type({var}) is not RT or {var}._form != {form}: return None")
+            tensors.append(var)
+            return True
+        if kind is int or kind is float:
+            lines.append(f"    if type({var}) is not {kind.__name__}: return None")
+            scalars.append(var)
+            if kind is int or floats_keyed:
+                keyed.append(var)
+            return True
+        if kind is list or kind is tuple:
+            lines.append(
+                f"    if type({var}) is not {kind.__name__} or len({var}) != {len(value)}: "
+                "return None"
+            )
+            return all(emit(f"{var}[{index}]", item) for index, item in enumerate(value))
+        if kind in _LITERAL_TYPES:
+            lines.append(
+                f"    if type({var}) is not {constant(kind)} or {var} != {constant(value)}: "
+                "return None"
+            )
+            return True
+        return False
+
+    lines.append(f"    if len(a) != {len(args)}: return None")
+    if kwargs:
+        lines.append(f"    if tuple(k) != {constant(tuple(kwargs))}: return None")
+    else:
+        lines.append("    if k: return None")
+    for index, value in enumerate(args):
+        if not emit(f"a[{index}]", value):
+            return None
+    for key, value in kwargs.items():
+        if not emit(f"k[{key!r}]", value):
+            return None
+    tail = ([f"{var}._sig[2]" for var in tensors] if offsets_keyed else []) + keyed
+
+    def pack(names: list[str]) -> str:
+        return "(" + "".join(f"{item}, " for item in names) + ")"
+
+    lines.append(f"    return {pack(tensors)}, {pack(scalars)}, {pack(tail)}")
+    exec(compile("\n".join(lines), "letify-reader", "exec"), constants)
+    return constants["read"]
+
+
+def outputs(plan: Plan, client: Client, tensors: Any) -> tuple[Any, list]:
+    """Build an operator's results from its plan, and the new handle of each tensor output."""
+    outs: list = []
+    results: list = []
+    for leaf in plan.leaves:
+        tag = leaf[0]
+        if tag == _NEW:
+            handle = client._next_handle
+            client._next_handle = handle + 1
+            outs.append(handle)
+            results.append(RemoteTensor(leaf[1], Ref(client, handle)))
+        elif tag == _IN:
+            outs.append(None)
+            results.append(tensors[leaf[1]])
+        else:
+            results.append(leaf[1])
+    if plan.container is None:
+        return results[0], outs
+    return plan.container(results), outs
+
+
 def dispatch(func: Any, args: tuple, kwargs: dict, client: Client | None) -> Any:
     """Run one ATen operator: metadata here, values on the runtime."""
     if func is _DETACH or func is _ALIAS:
@@ -339,11 +464,17 @@ def dispatch(func: Any, args: tuple, kwargs: dict, client: Client | None) -> Any
         if type(source) is RemoteTensor:
             return RemoteTensor(source._sig, source._ref)
 
+    replaying = REPLAY[0]
+    if replaying is not None:
+        done = replaying.replay(func, args, kwargs, client)
+        if done is not MISS:
+            return done
+
     named = _NAMES.get(func)
     if named is None:
         name = str(func)
-        named = _NAMES[func] = (name, "_foreach_" not in name)
-    name, floats_keyed = named
+        named = _NAMES[func] = (name, "_foreach_" not in name, _aliases(func))
+    name, floats_keyed, offsets_keyed = named
 
     if func is _SCALAR and type(args[0]) is RemoteTensor:
         return args[0]._ref.client.read_value(args[0])
@@ -352,9 +483,16 @@ def dispatch(func: Any, args: tuple, kwargs: dict, client: Client | None) -> Any
         target = kwargs.get("device")
         if target is not None and torch.device(target).type == "cpu":
             dtype = kwargs.get("dtype")
+            if kwargs.get("non_blocking"):
+                return args[0]._ref.client.read_later(args[0], dtype)
             return args[0]._ref.client.fetch(args[0], None if dtype is None else _dtype_name(dtype))
 
     if func is _COPY and not isinstance(args[0], RemoteTensor) and type(args[1]) is RemoteTensor:
+        if (args[2] if len(args) > 2 else kwargs.get("non_blocking")) and args[0].shape == args[
+            1
+        ].shape:
+            args[1]._ref.client.read_later(args[1], None, args[0])
+            return args[0]
         args[0].copy_(args[1]._ref.client.fetch(args[1], None))
         return args[0]
 
@@ -373,6 +511,8 @@ def dispatch(func: Any, args: tuple, kwargs: dict, client: Client | None) -> Any
             return func(*args, **kwargs)
         client = tensors[0]._ref.client
     structure = tuple(parts)
+    if not offsets_keyed:
+        box = []
     if floats_keyed:
         key = (structure, *box, *scalars)
     else:
@@ -395,24 +535,9 @@ def dispatch(func: Any, args: tuple, kwargs: dict, client: Client | None) -> Any
     else:
         client.stats.cached += 1
 
-    outs: list = []
-    results: list = []
-    for leaf in plan.leaves:
-        tag = leaf[0]
-        if tag == _NEW:
-            handle = client._next_handle
-            client._next_handle = handle + 1
-            outs.append(handle)
-            results.append(RemoteTensor(leaf[1], Ref(client, handle)))
-        elif tag == _IN:
-            outs.append(None)
-            results.append(tensors[leaf[1]])
-        else:
-            results.append(leaf[1])
-    client.put(structure, name, args, kwargs, plan, tensors, scalars, blobs, outs, big)
-    if plan.container is None:
-        return results[0]
-    return plan.container(results)
+    result, outs = outputs(plan, client, tensors)
+    client.put(structure, name, args, kwargs, plan, tensors, scalars, blobs, outs, big, key)
+    return result
 
 
 def _plan(name: str, meta_out: Any, tensors: list) -> Plan:

@@ -31,12 +31,15 @@ class Step:
     where the output is a new handle.
     """
 
-    __slots__ = ("mutates", "news_before", "ops", "sid")
+    __slots__ = ("mutates", "news_before", "ops", "readers", "sid")
 
     def __init__(self, sid: int, ops: tuple):
         self.sid = sid
         self.ops = ops
         self.mutates = False
+        #: Per position, ``(overload, reader, plan, key tail, structure)`` once an operator
+        #: matched there, or ``(None,)`` where no reader can be generated.
+        self.readers: list[tuple | None] = [None] * len(ops)
         before = [0]
         for op in ops:
             before.append(before[-1] + sum(op[3]))

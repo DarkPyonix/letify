@@ -10,6 +10,7 @@ Spec sections pinned here: "Channels", "Call protocol", "Failure and retry", "Se
 
 from __future__ import annotations
 
+import os
 import shutil
 import subprocess
 import sys
@@ -31,6 +32,7 @@ from letify.declare.env import Env
 from letify.declare.instance import Instance
 from letify.errors import RuntimeFailure
 from letify.protocol.worker import BOOTSTRAP
+from letify.providers.local import Local
 from letify.runtime import bootstrap, telemetry
 from letify.runtime.channel import OneShotChannel, PersistentChannel
 from letify.runtime.lease import GRACE, INTERVAL, Lease
@@ -177,6 +179,62 @@ def test_a_call_that_outlives_its_timeout_is_a_failure(channel) -> None:
         channel.call(slow, (), {}, timeout=0.3)
 
 
+def test_a_body_can_start_forked_processes_while_the_worker_reads_frames(channel) -> None:
+    # multiprocessing closes sys.stdin in a forked child, which the frame reader thread is
+    # blocked reading at that moment. A DataLoader with num_workers > 0 forks the same way.
+    def forks() -> int:
+        import multiprocessing
+
+        context = multiprocessing.get_context("fork")
+        results = context.Queue()
+        children = [context.Process(target=results.put, args=(i,)) for i in range(2)]
+        for child in children:
+            child.start()
+        total = sum(results.get(timeout=20) for _ in children)
+        for child in children:
+            child.join(20)
+        return total
+
+    value, _logs = channel.call(forks, (), {}, timeout=60)
+    assert value == 1
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="parent death signal is Linux only")
+def test_no_forked_child_outlives_a_timed_out_call(channel, tmp_path) -> None:
+    marker = tmp_path / "child.pid"
+
+    def forks_and_hangs() -> None:
+        import os
+        import time
+
+        pid = os.fork()
+        if pid == 0:
+            time.sleep(120)
+            os._exit(0)
+        with open(str(marker), "w") as handle:
+            handle.write(str(pid))
+        time.sleep(120)
+
+    with pytest.raises(RuntimeFailure, match="exceeded"):
+        channel.call(forks_and_hangs, (), {}, timeout=3)
+    child = int(marker.read_text())
+    import time
+
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline:
+        try:
+            os.kill(child, 0)
+        except ProcessLookupError:
+            break
+        status = Path(f"/proc/{child}/stat")
+        if status.exists() and status.read_text().split()[2] == "Z":
+            break
+        time.sleep(0.1)
+    else:
+        os.kill(child, 9)
+        pytest.fail(f"forked child {child} outlived the timed-out call")
+
+
 def test_an_operation_the_worker_does_not_know_is_reported_by_name(channel) -> None:
     channel.start()
     with pytest.raises(letify.RemoteError, match="unknown op 'nonsense'"):
@@ -292,8 +350,9 @@ def test_a_synced_environment_is_archived_and_the_next_session_restores_it_inste
 ) -> None:
     # Spec "Materializing into a runtime": the first session that syncs packs its project
     # directory into its first volume, and a later session with the same key and platform
-    # unpacks that archive instead of running uv sync.
-    provider = provider_of(PreparingLocal, "lab")
+    # unpacks that archive instead of running uv sync. Spec "Volumes on a persistent
+    # runtime" limits this to an ephemeral provider.
+    provider = provider_of(PreparingLocal, "lab", persistent=False)
     volume = provider.volume(
         "cache", backend="filesystem", root=str(tmp_path / "store"), mount=str(tmp_path / "mount")
     )
@@ -318,6 +377,119 @@ def test_a_synced_environment_is_archived_and_the_next_session_restores_it_inste
         second.shutdown()
 
 
+def test_a_persistent_provider_syncs_every_session_and_never_archives_the_environment(
+    uv_project: Path, tmp_path: Path
+) -> None:
+    # Spec "Volumes on a persistent runtime": the .venv is already on the runtime's disk, so
+    # no archive is packed into the volume or restored from it.
+    provider = provider_of(PreparingLocal, "lab")
+    assert provider.persistent
+    volume = provider.volume(
+        "cache", backend="filesystem", root=str(tmp_path / "store"), mount=str(tmp_path / "mount")
+    )
+    env = Env()
+    instance = Instance(provider, gpu=None)._placed("remote")
+    for name in ("lab-1", "lab-2"):
+        runtime = provider.start(instance, env, name=name, volumes=(volume,))
+        try:
+            assert runtime.env_source == "sync"
+            platform = runtime.platform
+        finally:
+            runtime.shutdown()
+    assert volume.cached_env(env, platform) is None
+
+
+def counting_puts(monkeypatch) -> list[str]:
+    """Record the destination of every file written through the channel."""
+    from letify.runtime.session import Runtime
+
+    sent: list[str] = []
+    original = Runtime.put_bytes
+
+    def put_bytes(self, payload, path, **kwargs):
+        sent.append(path)
+        return original(self, payload, path, **kwargs)
+
+    monkeypatch.setattr(Runtime, "put_bytes", put_bytes)
+    return sent
+
+
+def test_a_persistent_runtime_is_sent_only_the_files_its_volume_directory_lacks(
+    tmp_path: Path, monkeypatch
+) -> None:
+    # Spec "Volumes on a persistent runtime": a later session holds what an earlier one
+    # received, so an unchanged file is not sent and a changed one is.
+    sent = counting_puts(monkeypatch)
+    provider = provider_of(Local, "lab")
+    mount = tmp_path / "mount"
+    volume = provider.volume(
+        "cache", backend="filesystem", root=str(tmp_path / "store"), mount=str(mount)
+    )
+    instance = Instance(provider, gpu=None)._placed("remote")
+    env = Env(lock=str(tmp_path / "absent.lock"))
+    first = volume.store.put_bytes(b"weights-1").digest
+    second = volume.store.put_bytes(b"tokens").digest
+    changed = volume.store.put_bytes(b"weights-2").digest
+
+    def session(name: str, digests: dict[str, str]) -> None:
+        runtime = provider.start(instance, env, name=name, volumes=(volume,))
+        try:
+            for path, digest in digests.items():
+                remote = volume.materialize(runtime, digest, path=str(mount / path))
+                assert Path(remote.path).read_bytes() == volume.store.get_bytes(digest)
+        finally:
+            runtime.shutdown()
+
+    session("lab-1", {"a.bin": first, "b.bin": second})
+    assert len(sent) == 2
+    session("lab-2", {"a.bin": first, "b.bin": second})
+    assert len(sent) == 2
+    session("lab-3", {"a.bin": changed, "b.bin": second})
+    assert sent[2:] == [str(mount / "a.bin")]
+
+
+def test_a_file_changed_on_the_runtime_is_sent_again(tmp_path: Path, monkeypatch) -> None:
+    # Spec "Volumes on a persistent runtime": the recorded size and time no longer match.
+    sent = counting_puts(monkeypatch)
+    provider = provider_of(Local, "lab")
+    mount = tmp_path / "mount"
+    volume = provider.volume(
+        "cache", backend="filesystem", root=str(tmp_path / "store"), mount=str(mount)
+    )
+    instance = Instance(provider, gpu=None)._placed("remote")
+    env = Env(lock=str(tmp_path / "absent.lock"))
+    digest = volume.store.put_bytes(b"weights").digest
+    for name in ("lab-1", "lab-2"):
+        runtime = provider.start(instance, env, name=name, volumes=(volume,))
+        try:
+            volume.materialize(runtime, digest, path=str(mount / "a.bin"))
+        finally:
+            runtime.shutdown()
+        (mount / "a.bin").write_bytes(b"edited on the runtime")
+    assert len(sent) == 2
+    assert (mount / "a.bin").read_bytes() == b"edited on the runtime"
+
+
+def test_an_ephemeral_runtime_is_sent_every_file_each_session(tmp_path: Path, monkeypatch) -> None:
+    # Spec "Volumes on a persistent runtime": an ephemeral disk is not trusted to keep them.
+    sent = counting_puts(monkeypatch)
+    provider = provider_of(Local, "lab", persistent=False)
+    mount = tmp_path / "mount"
+    volume = provider.volume(
+        "cache", backend="filesystem", root=str(tmp_path / "store"), mount=str(mount)
+    )
+    instance = Instance(provider, gpu=None)._placed("remote")
+    env = Env(lock=str(tmp_path / "absent.lock"))
+    digest = volume.store.put_bytes(b"weights").digest
+    for name in ("lab-1", "lab-2"):
+        runtime = provider.start(instance, env, name=name, volumes=(volume,))
+        try:
+            volume.materialize(runtime, digest, path=str(mount / "a.bin"))
+        finally:
+            runtime.shutdown()
+    assert len(sent) == 2
+
+
 def test_a_runtime_boots_its_channel_then_arms_its_lease(tmp_path: Path) -> None:
     # Spec "Sessions": open the channel, arm the lease, install the environment, attach
     # volumes. A session that could outlive this process gets the lease.
@@ -338,7 +510,7 @@ def test_a_runtime_boots_its_channel_then_arms_its_lease(tmp_path: Path) -> None
 def test_a_volume_with_no_cached_archive_is_passed_over(uv_project: Path, tmp_path: Path) -> None:
     # Spec "Blob granularity": the archive is keyed by the environment and the platform, so
     # a volume that does not hold this one is not the place to look.
-    provider = provider_of(PreparingLocal, "lab")
+    provider = provider_of(PreparingLocal, "lab", persistent=False)
     env = Env()
     instance = Instance(provider, gpu=None)._placed("remote")
     stocked = Volume(
@@ -426,6 +598,54 @@ def test_a_default_env_is_synced_with_uv_and_the_worker_runs_from_the_project_ve
         assert Path(imported).is_relative_to(venv)
         assert runtime.env_source == "sync"
         assert runtime.channel.python_version == LOCAL_PYTHON
+    finally:
+        runtime.shutdown()
+
+
+def test_a_persistent_provider_syncs_with_the_uv_cache_under_the_workspace_root(
+    uv_project: Path,
+) -> None:
+    # Spec "uv cache": UV_CACHE_DIR is <workspace root>/uv-cache, on the filesystem of the
+    # project .venv, so uv hard links the environment instead of copying it.
+    provider = provider_of(PreparingLocal, "lab")
+    assert provider.persistent
+    env = Env()
+    runtime = provider.start(remote_instance(provider), env, name="lab-1")
+    try:
+        cache = Path(bootstrap.DEFAULT_WORKSPACE_ROOT) / "uv-cache"
+        assert cache.is_dir()
+        venv = remote_projects() / env.key / ".venv"
+        site = [p for p in venv.rglob("*.py") if "site-packages" in p.parts]
+        # _virtualenv.py is written by uv venv itself, not installed from the cache.
+        installed = [p for p in site if p.name != "_virtualenv.py"]
+        assert installed and all(p.stat().st_nlink > 1 for p in installed)
+    finally:
+        runtime.shutdown()
+
+
+def test_an_ephemeral_provider_keeps_the_default_uv_cache(uv_project: Path) -> None:
+    # Spec "uv cache": an ephemeral runtime's disk goes with it, so nothing is moved.
+    provider = provider_of(PreparingLocal, "lab", persistent=False)
+    runtime = provider.start(remote_instance(provider), Env(), name="lab-1")
+    try:
+        assert runtime.env_source == "sync"
+        assert not (Path(bootstrap.DEFAULT_WORKSPACE_ROOT) / "uv-cache").exists()
+    finally:
+        runtime.shutdown()
+
+
+def test_an_env_variable_naming_the_uv_cache_wins_over_the_workspace_cache(
+    uv_project: Path, tmp_path: Path
+) -> None:
+    # Spec "uv cache": an Env.vars entry naming UV_CACHE_DIR wins over the rule.
+    chosen = tmp_path / "chosen-cache"
+    provider = provider_of(PreparingLocal, "lab")
+    runtime = provider.start(
+        remote_instance(provider), Env().vars(UV_CACHE_DIR=str(chosen)), name="lab-1"
+    )
+    try:
+        assert chosen.is_dir()
+        assert not (Path(bootstrap.DEFAULT_WORKSPACE_ROOT) / "uv-cache").exists()
     finally:
         runtime.shutdown()
 
@@ -553,6 +773,114 @@ def test_a_volume_materializes_under_the_expanded_workspace_root(tmp_path: Path)
         assert Path(remote.path).read_bytes() == b"weights"
     finally:
         runtime.shutdown()
+
+
+# -- Spec: Argument blobs on a persistent disk ---------------------------------
+
+
+def _counting_puts(runtime) -> list[str]:
+    """Record the digest of every put_blob the runtime sends."""
+    sent: list[str] = []
+    original = runtime.request
+
+    def request(message, *args, **kwargs):
+        if message.get("op") == "put_blob":
+            sent.append(message["digest"])
+        return original(message, *args, **kwargs)
+
+    runtime.request = request
+    return sent
+
+
+def _start_workspace_runtime(provider, tmp_path: Path, name: str):
+    instance = Instance(provider, gpu=None)._placed("remote")
+    return provider.start(instance, Env(lock=str(tmp_path / "absent.lock")), name=name)
+
+
+def test_a_persistent_runtime_receives_a_repeated_argument_from_an_earlier_session_as_a_digest(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "ws"
+    provider = provider_of(
+        WorkspaceLocal, "lab", python=sys.executable, workspace=str(root), persistent=True
+    )
+    payload = b"x" * (256 * 1024)
+    first = _start_workspace_runtime(provider, tmp_path, "lab-1")
+    try:
+        assert first.call(len, (payload,), {})[0] == len(payload)
+    finally:
+        first.shutdown()
+    assert [p for p in (root / "blobs").rglob("*") if p.is_file()], "no blob file was written"
+
+    second = _start_workspace_runtime(provider, tmp_path, "lab-2")
+    try:
+        sent = _counting_puts(second)
+        assert second.call(len, (payload,), {})[0] == len(payload)
+        assert sent == []
+    finally:
+        second.shutdown()
+
+
+def test_a_mutable_argument_blob_on_disk_still_arrives_as_a_fresh_copy(tmp_path: Path) -> None:
+    root = tmp_path / "ws"
+    provider = provider_of(
+        WorkspaceLocal, "lab", python=sys.executable, workspace=str(root), persistent=True
+    )
+    value = bytearray(b"y" * (256 * 1024))
+
+    def mutate(buffer: bytearray) -> int:
+        first = buffer[0]
+        buffer[0] = 0
+        return first
+
+    first = _start_workspace_runtime(provider, tmp_path, "lab-1")
+    try:
+        first.call(mutate, (value,), {})
+    finally:
+        first.shutdown()
+    second = _start_workspace_runtime(provider, tmp_path, "lab-2")
+    try:
+        sent = _counting_puts(second)
+        assert second.call(mutate, (value,), {})[0] == ord("y")
+        assert second.call(mutate, (value,), {})[0] == ord("y")
+        assert sent == []
+    finally:
+        second.shutdown()
+
+
+def test_an_ephemeral_runtime_writes_no_argument_blob_to_disk(tmp_path: Path) -> None:
+    root = tmp_path / "ws"
+    provider = provider_of(
+        WorkspaceLocal, "lab", python=sys.executable, workspace=str(root), persistent=False
+    )
+    runtime = _start_workspace_runtime(provider, tmp_path, "lab-1")
+    try:
+        runtime.call(len, (b"z" * (256 * 1024),), {})
+    finally:
+        runtime.shutdown()
+    assert not (root / "blobs").exists()
+
+
+def test_argument_blobs_on_disk_are_evicted_oldest_first_beyond_the_limit(
+    tmp_path: Path, monkeypatch
+) -> None:
+    from letify.runtime import session as session_module
+
+    monkeypatch.setattr(session_module, "BLOB_DISK_LIMIT", 600 * 1024, raising=False)
+    root = tmp_path / "ws"
+    provider = provider_of(
+        WorkspaceLocal, "lab", python=sys.executable, workspace=str(root), persistent=True
+    )
+    runtime = _start_workspace_runtime(provider, tmp_path, "lab-1")
+    try:
+        for fill in (b"a", b"b", b"c"):
+            runtime.call(len, (fill * (256 * 1024),), {})
+            time.sleep(0.05)
+    finally:
+        runtime.shutdown()
+    files = [p for p in (root / "blobs").rglob("*") if p.is_file()]
+    assert len(files) == 2
+    assert sorted(p.read_bytes()[:1] for p in files) == [b"b", b"c"]
 
 
 def test_modal_builds_the_project_environment_like_every_remote_runtime() -> None:

@@ -376,6 +376,8 @@ Streams multiplex the one pipe pair. Stream 0 carries `HELLO`, `STDOUT`, `STDERR
 
 A message is one Python object. It is pickled with protocol 5 and a `buffer_callback`, so every `PickleBuffer` inside it, such as a `bytearray`, a `bytes` value of 1 MiB or more at the top level or inside a list, tuple or dict, or a NumPy array, becomes an out-of-band buffer instead of being copied into the pickle. The head frame's payload is `<I>` buffer count, `<Q>` length of each buffer, then the pickle. The buffers follow in order as `DATA` frames of at most 8 MiB each. The sender writes each frame with `os.write` on a `memoryview` of the buffer, so no joined copy is made. The receiver preallocates one buffer per out-of-band buffer and fills it with `readinto`, then unpickles with `buffers=`. The high bit of a buffer's 8 byte length marks a buffer that unpickles as a `bytes` value. For such a buffer the receiver allocates an uninitialized `bytes` object of that length with `PyBytes_FromStringAndSize(NULL, n)` through `ctypes` and reads into it, so the unpickled value is that object and no copy is made. Where `ctypes` is unavailable it reads into a `bytearray` and `bytes()` copies it once. Any other buffer is read into a `bytearray`. Peak memory for a `bytes` value is therefore one copy on each side.
 
+A PyTorch tensor is pickled by letify's own reducer rather than by `Tensor.__reduce_ex__`, which copies the whole storage into the pickle. The reducer applies to an object of exact type `torch.Tensor` or `torch.nn.Parameter` on the CPU, with a strided layout, no autograd history of its own (a leaf) and at least one element. Such a tensor, made contiguous first when it is not, pickles as `torch.frombuffer` over its bytes, then `reshape` to its shape, then `requires_grad_` when it requires grad, and `Parameter` wraps it when it was one. Its bytes are a `PickleBuffer` when they are 64 KiB or more, so they travel as an out-of-band buffer written from the tensor's own memory, and a `bytearray` copied into the pickle otherwise. Every other tensor keeps PyTorch's own pickling. The reducer references PyTorch functions only, so a worker without letify unpickles it, and a message without tensors pays nothing for it. The same reducer is used by `wire.dumps`, by `codec.dumps_call_parts` on top of cloudpickle, and by the `put_blob` pickle of [argument addressing](#argument-addressing). A view is sent as the bytes it covers, not the whole storage it views, and two tensors that share one storage arrive as two separate tensors.
+
 On Linux both ends set every pipe they frame over to 1 MiB with `fcntl(F_SETPIPE_SZ)`, capped at `/proc/sys/fs/pipe-max-size`, so an 8 MiB chunk crosses in 8 writes instead of 128. A descriptor that is not a pipe, or a system that refuses, keeps its size.
 
 Frames of different streams interleave. A writer holds the write lock for one frame at a time, so a `stat` or `lease` request is sent between two 8 MiB chunks of a large upload, and a reply is not delayed behind another stream's data.
@@ -400,7 +402,9 @@ Nothing in this path runs per training step. A `print` inside a loop costs one p
 
 Any number of threads may send requests on one channel. Whichever waiting thread holds the read lock reads the next frame and hands it to the request it belongs to, so a `stat` or a lease renewal sent while a call runs gets its reply while the call is still running. On the worker, `stat` and `lease` are answered by the thread that reads frames. Every other request is queued and run in order on the worker's main thread, so user code runs on the main thread.
 
-A request that passes its timeout kills the worker process, which ends every read, and raises `RuntimeFailure`. A worker that closes its pipe fails every open request with `ProtocolError` quoting the last output.
+A request that passes its timeout kills the worker process, which ends every read, and raises `RuntimeFailure`.
+
+A body may fork, as `multiprocessing` and a `DataLoader` with `num_workers > 0` do. The thread that reads frames may hold the lock of `sys.stdin` at the fork, so every process forked from the worker replaces `sys.stdin` with `/dev/null` before anything else runs in it, and a child that closes `sys.stdin`, as `multiprocessing` does, never waits for that lock. On Linux each process forked from the worker asks for `SIGKILL` when the worker's main thread exits (`prctl(PR_SET_PDEATHSIG)`), so a worker killed by a timeout or closed with its session takes its forked children with it. A worker that closes its pipe fails every open request with `ProtocolError` quoting the last output.
 
 The worker never installs anything into the interpreter it starts on. Everything it runs before it moves to the project interpreter uses only the standard library: the ready line, workspace preparation, the environment build and the move itself. The worker imports cloudpickle only when it loads a call, so a system Python that lacks cloudpickle and refuses `pip install`, as an externally managed Python under PEP 668 does, still starts the worker. blake3 and letify are likewise imported only after the move, and blake3 falls back to blake2b where it is absent.
 
@@ -489,6 +493,16 @@ A `bytes` argument is hashed as it is. Any other argument is pickled with protoc
 The digest of an immutable argument is cached on the `Runtime` for the life of the session, so a repeated argument is not hashed again. Immutable means a `bytes` object, or an object that supports weak references and exposes a read-only buffer, such as a NumPy array with `writeable` set to `False`. A `bytes` entry holds a reference to its object so its id cannot be reused, and at most 16 such entries are kept, least recently used first out. Any other argument is pickled and hashed on every call, because it may have changed.
 
 The worker keeps the unpickled value of an immutable blob, so a repeated argument is not unpickled again either. For any other blob it keeps the pickle and the buffers, and unpickles a fresh copy for each call, so a call that mutates its argument does not change what the next call receives.
+
+### Argument blobs on a persistent disk <!-- id: persistent-argument-blobs -->
+
+> On a persistent provider an argument blob is also written under the workspace root, so a later session on the same machine receives the digest instead of the bytes.
+
+A session whose provider is persistent, prepares a workspace root and has a persistent channel sends `{"op": "blob_dir", "path": "<workspace root>/blobs", "limit": <bytes>}` once, after the interpreter check. From then on the worker writes every blob it receives with `put_blob` to `<workspace root>/blobs/<first two hex characters>/<digest>`, before it replies. A `bytes` blob is the file as it is. Any other blob goes to `<digest>.pickle`: the eight bytes `LTFYPKL1`, one byte that is 1 for an immutable value, a big-endian 32-bit part count, a big-endian 64-bit size per part, then the pickle and each buffer in order. A file is written to a name ending in `.partial.<pid>` and renamed, so a reader never sees half a blob.
+
+`have` reports a digest as held when it is in the worker's memory or its file exists, and sets that file's modification time to now. A call that names a blob the worker holds only on disk loads it into memory first. An ephemeral provider sends no `blob_dir`, so its worker writes nothing.
+
+After each write the worker lists the blob directory and removes files, oldest modification time first, until their total size is at most `limit`. `limit` is 32 GiB. The file just written is never removed by its own write.
 
 ### Failure and retry
 
@@ -617,6 +631,18 @@ The environment archive is automatic. The first session that runs `uv sync` for 
 
 A volume's files on a runtime live in its volume directory, `<workspace root>/volumes/<volume name>`. A blob materialized without a named destination is written to `<volume directory>/blobs/<first two hex characters>/<digest>`. The volume option `mount` names another directory for one volume; nothing else sets it. A restored `.venv/bin/python` that does not start is treated as no archive, and the session syncs. Nothing in the public surface names this step.
 
+### Volumes on a persistent runtime <!-- id: persistent-volumes -->
+
+> On a persistent provider the volume directory under the workspace root is the runtime's copy of the volume. A file is sent only when that copy does not already hold its digest, and no environment archive is packed or restored.
+
+A persistent runtime keeps `<workspace root>/volumes/<volume name>` between sessions, so a later session already holds what an earlier one received. The volume directory holds a manifest, `.letify-manifest.json`, mapping each materialized destination path to the digest, size in bytes and modification time in nanoseconds it had when it was written.
+
+Before a blob is written to a destination that is not unpacked, the local process asks the runtime for that manifest entry. When the entry names the same digest and the file on disk still has the recorded size and modification time, nothing is sent. Otherwise the blob is written as Materializing into a runtime describes, and the entry is recorded. A file changed on the runtime by anything other than letify fails the size or time comparison and is sent again. The manifest is replaced atomically, so a session that reads it while another writes sees one version or the other, and at worst sends a file twice.
+
+A persistent provider builds its environment with `uv sync` in `<workspace root>/project/<env key>` every session, and never packs the project directory into a volume or unpacks an archive from one. A sync over an existing `.venv` checks it and installs nothing, so it is faster than any archive transfer, and the `.venv` is already on the disk the archive would be unpacked to.
+
+An ephemeral provider keeps the behaviour of Materializing into a runtime: every file is sent each session, and the environment archive is packed and restored.
+
 Nothing hands a session to the caller. There is no call that returns one, no argument that takes one, and no way to hold the wrong one, because which session serves a call is the pool's answer to work out from the declaration.
 
 ### Project data <!-- id: project-data -->
@@ -707,6 +733,18 @@ Two declarations cannot diverge from the local process. Before any session start
 
 The worker looks for `uv` on `PATH`, then at `~/.local/bin/uv`. When neither exists it downloads `https://astral.sh/uv/install.sh` over HTTPS with the bootstrap interpreter's `urllib` and runs it with `sh`, with `UV_INSTALL_DIR=~/.local/bin` and `UV_NO_MODIFY_PATH=1`. That is the same as `curl -LsSf https://astral.sh/uv/install.sh | env UV_INSTALL_DIR="$HOME/.local/bin" UV_NO_MODIFY_PATH=1 sh`, without needing `curl`. It needs no root, because it writes only under the home directory. A failed download or a non-zero exit raises `EnvironmentFailure` saying `uv could not be installed on <runtime>` with the reason.
 
+### uv cache <!-- id: uv-cache -->
+
+> On a persistent provider the runtime's uv cache is `<workspace root>/uv-cache`, on the same filesystem as every project `.venv`, so a new env key is built from hard links. An ephemeral provider keeps uv's default cache.
+
+uv installs a package into a `.venv` by hard linking it from its cache, and falls back to a full copy when the cache is on another filesystem. A container's home directory is often an overlay while the workspace root is a mounted disk, so the default cache under `~/.cache/uv` makes every new env key copy the whole environment.
+
+The sync step sets `UV_CACHE_DIR=<workspace root>/uv-cache` for `uv sync` and `uv pip install` when the provider's `persistence` is `persistent`. On a runtime with a persistent workspace root the cache then outlives a container rebuild along with the projects built from it. An `Env.vars` entry naming `UV_CACHE_DIR` wins over this rule.
+
+An ephemeral provider sets nothing. Its disk is discarded with the runtime, so a cache there is filled once per runtime wherever it lives, and moving it only matters when the home directory and the project are on different filesystems.
+
+letify never deletes from the cache. The first sync on a runtime fills `<workspace root>/uv-cache` once, and a cache uv already had elsewhere is left in place. `uv cache prune` run with the same `UV_CACHE_DIR` removes entries no lock file needs any more; a file still hard linked from a `.venv` keeps its disk blocks until that `.venv` is removed as well.
+
 ### Interpreter check <!-- id: interpreter-check -->
 
 > A worker whose Python major.minor differs from the local process fails the session start with both versions named, before any call is sent.
@@ -767,7 +805,7 @@ A strategy that cannot carry the probe, such as the provider fallback, does not 
 
 Every connected strategy is probed: 30 round trips, then 2 s of transfer in each direction. A strategy whose throughput in either direction is below 25% of the fastest connected strategy in that direction is rejected. The lowest ranked strategy that remains is chosen. When only one strategy connects, it is chosen without comparison.
 
-Strategies that lose are closed, including one that connects after the choice is made.
+Strategies that lose are closed, including one that connects after the choice is made. Once the choice is made, every attempt still running is cancelled: the pipeline hands each attempt a cancel event and sets it, so a TCP punch stops waiting for its agreed start time and stops dialing within 0.1 s, and its attempt ends with a cancellation that is printed as cancelled rather than failed. An attempt that cannot observe the event, such as a provider call already in progress, runs to its end and is closed if it connects.
 
 When only one strategy is applicable there is nothing to choose between, so it is used directly: it is not raced, not probed and not cached, and a failure surfaces at its first use. When a race of two or more ends with one connected strategy, that strategy is still probed so the cache has throughput to compare against, but a failed probe does not reject it.
 
@@ -959,7 +997,9 @@ Everything letify writes on the runtime is under the root:
 |---|---|
 | `<workspace root>/project/<env key>` | the project files `uv sync` reads, and the `.venv` it builds |
 | `<workspace root>/project/.<digest>.tar.gz` | an environment archive while it is unpacked, removed once the `.venv` starts |
+| `<workspace root>/uv-cache` | uv's cache on a persistent provider, as uv cache describes |
 | `<workspace root>/volumes/<volume name>` | a volume's materialized blobs and project data |
+| `<workspace root>/blobs` | argument blobs on a persistent provider, as Argument blobs on a persistent disk describes |
 | `<workspace root>/tmp` | temporary files, including the archive `pack_dir` builds on a one-shot channel; `TMPDIR` points here |
 
 The worker's working directory is the root, so a relative path in user code resolves under it. The uv installer is the one exception to the root: uv goes to `~/.local/bin`, as uv on the runtime describes, because it is shared by every account on that home directory.
@@ -1128,7 +1168,7 @@ Inferred metadata is cached per operator. Every `RemoteTensor` carries its signa
 | scalars | the values of the `int` and `float` arguments, in order |
 | handles | the handles of the `RemoteTensor` arguments, in order |
 
-A batch slice taken at a new position each step changes only its offset, so it keeps its structure. The metadata key is the structure plus the offsets and the scalars, except that a float argument of a `_foreach_` operator is left out, because an optimizer passes per step values such as bias corrections there and they never change output metadata. A hit builds the outputs with `_make_wrapper_subclass` from the recorded signatures and returns an input where the first inference returned that input, so a training step that repeats its operators runs each meta kernel once. An operator whose arguments include a value that cannot be a key, such as a generator, is inferred every time.
+A batch slice taken at a new position each step changes only its offset, so it keeps its structure. The metadata key is the structure plus the offsets and the scalars, except that a float argument of a `_foreach_` operator is left out, because an optimizer passes per step values such as bias corrections there and they never change output metadata. The offsets are left out too for an operator none of whose schema returns carries alias information, because such an operator returns new tensors whose metadata does not depend on where its inputs start in their storage. A batch at a new position therefore reuses the metadata of `addmm`, `mm` or `mse_loss` inferred at an earlier position, and only its view operators, such as `slice` and `t`, are inferred again. A hit builds the outputs with `_make_wrapper_subclass` from the recorded signatures and returns an input where the first inference returned that input, so a training step that repeats its operators runs each meta kernel once. An operator whose arguments include a value that cannot be a key, such as a generator, is inferred every time.
 
 While forwarding is active, `RemoteTensor` is added to every `_foreach_supported_types` list PyTorch keeps, which in 2.5 is one in `torch.optim.optimizer` and one in `torch.utils._foreach_utils`, so an optimizer that picks its foreach path for CUDA tensors picks it here too and a step issues one operator per tensor list instead of one per parameter. A PyTorch without such a list keeps the per parameter path.
 
@@ -1137,6 +1177,20 @@ While forwarding is active, `RemoteTensor` is added to every `_foreach_supported
 A plain CPU tensor passed to an operator travels with it as a buffer and is a CPU tensor on the runtime, so a zero-dimensional CPU scalar mixes with device tensors as it does in PyTorch. A CPU tensor larger than 4 KiB flushes the queue immediately after its operator, so a later write to it in this process cannot change what the runtime received.
 
 When the meta operator raises, the operator is sent at once and executed on the runtime, and the reply carries its output metadata. That covers data-dependent shapes such as `nonzero` and `masked_select`, and reports a genuine error with the runtime's own message.
+
+### Kernel selection <!-- id: forwarding-kernel-selection -->
+
+> `batch_norm` and `scaled_dot_product_attention` on a `RemoteTensor` run the kernel the runtime's own CUDA dispatch chooses, not the one a meta tensor chooses.
+
+PyTorch picks the kernel for these two functions from the device when it dispatches. A meta tensor gets `native_batch_norm` and math attention. A CUDA tensor gets cuDNN batch norm, and flash, memory-efficient or cuDNN attention depending on shape, dtype and card. Those kernels give different values and use different memory.
+
+When the executor's hello reports a CUDA device, the `TorchFunctionMode` of [Mapping cuda](#mapping-cuda) asks the executor which backend applies, with a `letify.kernel` request, once per distinct signature, and caches the answer in the client. A signature is the function and, for every tensor argument, its shape, strides, dtype and whether it is None, plus `training` and `eps` for batch norm and `dropout_p`, `is_causal`, `scale` and `enable_gqa` for attention. The executor answers by calling `torch._C._select_batch_norm_backend` or `torch._fused_sdp_choice` on empty tensors of that signature on its own device. A PyTorch without the selector answers `Native` or `MATH`.
+
+Attention with `enable_gqa`, and flash attention for a head dimension that is not a multiple of 8, keep the ordinary path, because PyTorch reshapes or pads those before its fused kernel.
+
+The mode then calls the chosen ATen operator directly: `aten.cudnn_batch_norm` for `Cudnn`, and `aten._scaled_dot_product_flash_attention`, `aten._scaled_dot_product_efficient_attention` or `aten._scaled_dot_product_cudnn_attention` for the attention backends. Each of them has a meta kernel that infers its outputs and an autograd formula that records its backward, so it is dispatched and forwarded like any other operator. The function returns the operator's first output, the normalized or attended tensor, and `cudnn_batch_norm` updates the running statistics in place as `batch_norm` does.
+
+The ordinary path applies when the executor's device is CPU, when the runtime answers `Native` or math attention, or when an argument is not a `RemoteTensor`.
 
 ### Mapping cuda <!-- id: mapping-cuda -->
 
@@ -1168,6 +1222,25 @@ These `torch.cuda` functions are replaced while the function runs, and restored 
 
 No replaced function initializes CUDA in this process. A CUDA build of PyTorch on a machine with no NVIDIA driver raises `CUDA driver version is insufficient` from any call that does, and a training loop makes such calls without naming them: `Adam.step()` and `AdamW.step()` call `is_current_stream_capturing()`, and `torch.cuda.is_bf16_supported()`, which `autocast` reads for `bfloat16`, calls `get_device_properties()`.
 
+A process forked while forwarding is active, such as a `DataLoader` worker, starts with the mapping undone: `torch.cuda` holds PyTorch's own functions, the device rewrite is off and `current_client()` is None, so the worker's `torch.manual_seed` and its CPU tensors stay in that process. The client refuses to send from a process other than the one that connected it, raising `RuntimeLost` naming the fork, because the channel it would write to belongs to the parent. `DataLoader(pin_memory=True)` is not supported, because PyTorch pins through its own CUDA context in a thread letify does not map.
+### Autocast <!-- id: forwarding-autocast -->
+
+> Inside `torch.autocast("cuda")`, an operator on a `RemoteTensor` gets the argument casts CUDA autocast gives it, so a mixed precision loop computes in the same dtypes as on the runtime's own GPU.
+
+A `RemoteTensor` lives on the `meta` device, so PyTorch's own CUDA autocast, a dispatch key on CUDA tensors, never sees it. The `TorchFunctionMode` of [Mapping cuda](#mapping-cuda) applies the casts instead, above autograd as autocast does, so each cast is recorded as a differentiable `to(dtype)` and gradients reach the float32 parameters in float32.
+
+While `torch.is_autocast_enabled("cuda")` is true, a torch function named in one of three lists casts its floating point `RemoteTensor` arguments, top level or one list level down, other than `float64` ones, and then runs with autocast's casts applied. The lists follow PyTorch's CUDA autocast policy and are matched by the function's name:
+
+| Policy | Cast | Functions |
+|---|---|---|
+| lower precision | to `torch.get_autocast_dtype("cuda")` | `conv1d`, `conv2d`, `conv3d`, `conv_transpose1d`, `conv_transpose2d`, `conv_transpose3d`, `conv_tbc`, `prelu`, `addmm`, `addmv`, `addr`, `matmul`, `__matmul__`, `__rmatmul__`, `einsum`, `mm`, `mv`, `linear`, `bmm`, `baddbmm`, `addbmm`, `chain_matmul`, `multi_dot`, `scaled_dot_product_attention`, `lstm_cell`, `gru_cell`, `rnn_tanh_cell`, `rnn_relu_cell` |
+| float32 | to `float32` | `acos`, `asin`, `cosh`, `erfinv`, `exp`, `expm1`, `log`, `log10`, `log2`, `log1p`, `reciprocal`, `rsqrt`, `sinh`, `tan`, `pow`, `__pow__`, `softplus`, `layer_norm`, `group_norm`, `norm`, `cosine_similarity`, `poisson_nll_loss`, `cosine_embedding_loss`, `nll_loss`, `hinge_embedding_loss`, `kl_div`, `l1_loss`, `smooth_l1_loss`, `huber_loss`, `mse_loss`, `margin_ranking_loss`, `multilabel_margin_loss`, `soft_margin_loss`, `triplet_margin_loss`, `multi_margin_loss`, `binary_cross_entropy_with_logits`, `dist`, `pdist`, `cdist`, `renorm`, `logsumexp`, `softmax`, `log_softmax`, `sum`, `prod`, `cumsum`, `cumprod` |
+| widest | to the widest floating dtype among those arguments | `addcdiv`, `addcmul`, `atan2`, `bilinear`, `cross`, `dot`, `vdot`, `grid_sample`, `index_put`, `scatter_add`, `tensordot`, `cat`, `stack` |
+
+`cross_entropy` with class index targets and no label smoothing runs as CUDA's `cross_entropy_loss` does: `log_softmax` in its input's dtype, then `nll_loss` with that result cast to float32. With probability targets or label smoothing, its input is cast to float32.
+
+Every other function runs with its arguments as they are. A cast is not cached: a parameter used twice in one region is cast twice, which gives the same values as autocast's weight cache. `GradScaler` is PyTorch's own and is not covered.
+
 ### The device worker <!-- id: device-worker -->
 
 > One executor per session, running in a thread of the session's call worker, executing ATen operators on tensors keyed by integer handle.
@@ -1194,13 +1267,27 @@ The worker turns each definition into one generated Python function that builds 
 
 The queue is sent when it holds 256 entries, when its oldest entry has waited 2 ms, or at a synchronization. A send never waits for a reply.
 
-The dispatching thread appends an entry without taking a lock. When the queue is due, the dispatching thread pickles the batch and hands the bytes to a sender thread, which writes them. A full pipe or SSH buffer therefore blocks the sender thread, never the step, and the dispatching thread holds the GIL only for the pickling. A background thread sends only a queue that nothing has been added to for 50 ms, so operators do not wait behind idle time between steps, and it never sends the unfinished part of a captured step, which [Step capture](#forwarding-step-capture) leaves to the dispatching thread.
+The dispatching thread appends an entry without taking a lock. When the queue is due, the dispatching thread pickles the batch and hands the bytes to a sender thread, which writes them. A full pipe or SSH buffer therefore blocks the sender thread, never the step, and the dispatching thread holds the GIL only for the pickling. A synchronization is the exception: its batch is written by the waiting thread itself when no earlier batch is still queued for or being written by the sender thread, because that thread waits for the reply anyway and handing the batch over costs a thread wake per read. A background thread sends only a queue that nothing has been added to for 50 ms, so operators do not wait behind idle time between steps, and it never sends the unfinished part of a captured step, which [Step capture](#forwarding-step-capture) leaves to the dispatching thread.
 
-A synchronization is one round trip. These synchronize: `Tensor.item()`, `tolist()`, `cpu()` and `to("cpu")`, `bool()`, `int()` and `float()` of a tensor, which includes control flow on a tensor value, `repr()` and `str()` of a tensor, copying a device tensor into a CPU tensor, an operator whose meta inference raised, the `torch.cuda` queries in [Mapping cuda](#mapping-cuda), `torch.cuda.synchronize()`, and the end of the declared function.
+A synchronization is one round trip. These synchronize: `Tensor.item()`, `tolist()`, `cpu()` and `to("cpu")` without `non_blocking=True`, `bool()`, `int()` and `float()` of a tensor, which includes control flow on a tensor value, `repr()` and `str()` of a tensor, copying a device tensor into a CPU tensor, an operator whose meta inference raised, the `torch.cuda` queries in [Mapping cuda](#mapping-cuda), `torch.cuda.synchronize()`, and the end of the declared function.
 
 A read of one tensor's value sends only what that value depends on when that can be decided from the queue alone. When no repetition of a captured step is unfinished, if the tensor was created by a queued eager entry and no entry after it writes to an argument, the entries up to and including that one are sent with the read, and the rest stay queued in order. If the tensor was created before the queue and no queued entry writes to an argument, the read is sent alone. An operator writes to an argument when its schema marks one as written, which covers in-place operators, `out=` and the running statistics of batch norm. Otherwise the whole queue, the unfinished part of a captured step included, is sent with the read. `torch.cuda.synchronize()` and the end of the declared function always send everything.
 
 The client counts operators, queued entries, batches, round trips, released handles, metadata cache hits, templates, captured steps, replayed operators and fallbacks, and `Client.queued` is the number of entries not yet sent, so ops per round trip and synchronizations per step are read from the session rather than estimated. An operator is counted when it is dispatched, not when its batch is sent, and a replayed operator counts as an operator too. `letify.remoting.device.current_client()` returns the client of the innermost active forwarding, or None outside one, so code inside a `host="local"` function reads `current_client().stats`.
+
+### Reads without waiting <!-- id: forwarding-async-reads -->
+
+> A copy to the host with `non_blocking=True`, and `await letify.fetch(tensor)`, queue the read and return at once. The value is waited for only where it is used.
+
+`Tensor.to("cpu", non_blocking=True)` and `host.copy_(device_tensor, non_blocking=True)` of the same shape return a CPU tensor at once, with the shape and dtype the eager copy has, and queue a fetch entry. The fetch reads the device tensor at its place in the operator order, so a later in-place operator does not change it. Nothing is sent and nothing waits.
+
+Until the fetch's reply is applied, the CPU tensor is unfilled. A torch function called while forwarding is active with an unfilled tensor among its arguments, or one list level down, first waits for that tensor: the queue up to and including its fetch is sent, and replies are read until that fetch's reply is applied. That covers `item()`, `tolist()`, `numpy()`, `repr()`, indexing and arithmetic. Reading metadata, which is `shape`, `dtype`, `device`, `ndim`, `is_cuda`, `requires_grad`, `size()`, `dim()`, `numel()`, `stride()`, `element_size()` and `len()`, does not wait. Access that is not a torch function, such as the buffer of an array `numpy()` returned before the reply, does not wait.
+
+A batch that holds fetch entries asks for one reply, which carries every fetch in the batch in queue order. Replies are read in the order their batches were sent, by the thread that needs one, so a synchronization applies every earlier fetch reply before its own. `torch.cuda.synchronize()` and the end of the declared function therefore fill every unfilled tensor. A synchronization's batch is written by the waiting thread only when no earlier reply is still unread, as well as no batch queued for the sender thread. When 1024 replies are unread, the next non-blocking read first reads the oldest.
+
+`letify.fetch(tensor)` is the form for `async def` code. It queues the same fetch when called and returns an awaitable resolving to the CPU tensor, equal to `tensor.cpu()`. Awaiting it waits in a thread from `asyncio.to_thread`, so the event loop keeps running, and `asyncio.gather` over several fetches waits for all of them. Given a tensor that is not on the runtime, it resolves to `tensor.detach().cpu()` with no round trip. An `async def` declared with `host="local"` runs its coroutine to completion with `asyncio.run` in the thread its call runs in.
+
+A fetch skipped because an earlier operator failed raises `RemoteError` where its tensor is used or its awaitable is awaited. A failure carried by a reply that no synchronization waits for is kept, and the next synchronization raises it.
 
 ### Step capture <!-- id: forwarding-step-capture -->
 
@@ -1214,6 +1301,8 @@ A step is what a training loop repeats: forward, backward and the optimizer upda
 
 **Replay.** After a step is registered, each dispatched operator is compared with the step's next one. It matches when its template is the same, its output signatures from the metadata cache are the same, and each tensor argument was created at the expected offset in this repetition, or before this repetition began where the step expects `external`. A matching operator builds its outputs as eager dispatch does, taking handles from the same counter, so a repetition's new handles are one consecutive range, and it adds its external handles, scalars and blobs to the repetition. Nothing is queued per operator. When the last operator matches, one entry `(step, first handle, start, stop, externals, scalars, blobs)` is queued and the next repetition begins with the next operator.
 
+**Position readers.** The first time an operator matches at a step position, the client generates a Python function for that position from its arguments, unless an argument is a plain CPU or meta tensor. The function checks, without building the structure, that the overload is the same object, and that the arguments have the same count, container types and lengths, keyword names, tensor shapes, strides and dtypes, `int` and `float` types, and other values. It returns the tensor arguments, the scalars and the metadata key's offsets and scalars. A later operator at that position that passes the checks, and whose first tensor belongs to the same client, takes the position's recorded metadata when its key is the recorded one and the metadata cache entry for its key otherwise. It is then matched as **Replay** describes. A failed check or a cache miss sends the operator down the full path, which matches or falls back as above, so the entries queued and the values are the same with and without the reader.
+
 **Fallback.** An operator that does not match ends the repetition. The operators matched so far are queued as an entry with `stop` at the mismatch, and the mismatching operator is dispatched eagerly and starts a new trace. A shape that changes mid-run, a different operator, an argument from a different producer, and an inference that raises are all mismatches. The runtime has executed nothing of the repetition before its entry arrives, so a fallback runs every operator exactly once, in dispatch order, and values are the same as eager.
 
 **Partial sends.** A synchronization during a repetition, and a matched operator carrying a CPU tensor larger than 4 KiB, queue the repetition so far as an entry and send the queue; the repetition then continues with `start` at the next operator and the same first handle. A handle created in a repetition and released before its entry is queued stays in the release list until the entry is queued.
@@ -1226,11 +1315,15 @@ A step is what a training loop repeats: forward, backward and the optimizer upda
 
 A handle is an integer from a per-session counter. `RemoteTensor`s that share a handle, through `detach` or an in-place result, share one reference object, and when the last of them is collected its handle is appended to a release list. The list travels in the next batch, and a batch is sent early when it reaches 4096 handles. The worker applies a batch's releases after its operators, because an operator queued before its input was collected can travel in the same batch as that input's release.
 
+A release never reaches the worker ahead of an operator that uses the handle. A batch takes the release list before it takes entries from the queue, so every entry dispatched before a handle was collected is in that batch or an earlier one. A batch carries no releases when it leaves entries in the queue, as a read that sends only its dependencies does, or while a repetition has matched operators not yet queued, whose externals are not in the queue. Those releases stay in the list for a later batch. This holds whichever thread sends the batch: the dispatching thread, the idle sender, or a collection that runs mid-step.
+
 ### Transfers <!-- id: forwarding-transfers -->
 
 > A copy to the device and a copy to the host travel as out-of-band binary buffers, with no base64 and no copy beyond the one the kernel makes.
 
-A contiguous CPU tensor is sent as a view of its own memory, taken through `ctypes` from its data pointer, so no NumPy is needed. A non-contiguous one is made contiguous first. On the runtime the buffer is received into a `bytearray` and wrapped with `torch.frombuffer`. A copy to the host is made contiguous on the runtime, copied to CPU memory, sent as a view of that memory, received into a `bytearray` and wrapped with `torch.frombuffer`.
+A copy to the device returns before its bytes are written. `Tensor.cuda()`, `Tensor.to("cuda")` and a factory call with a CPU tensor argument queue their entry and hand it to the sender thread, and only a read of a value that depends on the entry waits for the bytes. The runtime receives the CPU tensor's values as they were at the call, not at the write, so a CPU tensor larger than 4 KiB is sent as a private copy of its bytes made at the call, blocking or not. The client does not ask whether the memory is pinned, because that query can initialize CUDA in this process, and the copy costs memory speed against a link about 100 times slower.
+
+A contiguous CPU tensor, or its private copy, is sent as a view of its memory, taken through `ctypes` from its data pointer, so no NumPy is needed. A non-contiguous one is made contiguous first. On the runtime the buffer is received into a `bytearray` and wrapped with `torch.frombuffer`. A copy to the host is made contiguous on the runtime, copied to CPU memory, sent as a view of that memory, received into a `bytearray` and wrapped with `torch.frombuffer`.
 
 ### Transport <!-- id: forwarding-transport -->
 
@@ -1247,7 +1340,7 @@ class Transport(Protocol):
 
 Both implementations put the frames of [Frames](#frames) on the wire: a message is a head frame, `REQUEST` from client to executor and `REPLY` back, whose payload is the buffer count, the buffer lengths and `head`, followed by the buffers as `DATA` frames written from the caller's memory and read into preallocated buffers. Device messages use stream 2, which no call uses because calls take odd stream ids.
 
-`ChannelTransport` implements it on a session's persistent channel, beside the calls. The channel's reader hands every stream 2 reply to the transport, and the call worker's frame reader hands every stream 2 request to the executor thread. `StreamTransport` implements it over a readable and a writable file descriptor, for an executor started by `connect`.
+`ChannelTransport` implements it on a session's persistent channel, beside the calls. The channel's reader hands every stream 2 reply to the transport, and the call worker's frame reader hands every stream 2 request to the executor thread. A thread waiting for a device reply polls the channel's read descriptor without blocking for up to 2 ms before it blocks in a read, because a dispatching thread that sleeps through the round trip resumes on a core that has left its fast state, which measured 1.1 ms of extra CPU per step on lab_docker with a read every step. `StreamTransport` implements it over a readable and a writable file descriptor, for an executor started by `connect`.
 
 ### Failure semantics <!-- id: forwarding-failure -->
 

@@ -23,6 +23,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from .. import protocol
 from .cas import Store
 
 if TYPE_CHECKING:
@@ -30,6 +31,54 @@ if TYPE_CHECKING:
     from ..protocol.handle import RemoteFile
     from ..providers.base import Provider
     from ..runtime.session import Runtime
+
+#: The file in a volume directory that records what a persistent runtime already holds.
+MANIFEST = ".letify-manifest.json"
+
+
+def _held_source(manifest: str, destination: str, digest: str) -> str:
+    """Source answering the destination's path and size when it still holds ``digest``.
+
+    Spec "Volumes on a persistent runtime": the manifest entry must name the digest, and
+    the file must still have the recorded size and modification time.
+    """
+    return (
+        "import json, os\n"
+        f"_path = os.path.expanduser({destination!r})\n"
+        "__letify_value__ = None\n"
+        "try:\n"
+        f"    with open(os.path.expanduser({manifest!r})) as _handle:\n"
+        "        _entry = json.load(_handle).get(_path)\n"
+        "    _stat = os.stat(_path)\n"
+        f"    if _entry and _entry['digest'] == {digest!r} and _entry['size'] == _stat.st_size"
+        " and _entry['mtime_ns'] == _stat.st_mtime_ns:\n"
+        "        __letify_value__ = {'path': _path, 'size': _stat.st_size}\n"
+        "except (OSError, ValueError, KeyError, TypeError):\n"
+        "    pass\n"
+    )
+
+
+def _record_source(manifest: str, destination: str, digest: str) -> str:
+    """Source recording a written destination in the manifest, replaced atomically."""
+    return (
+        "import json, os\n"
+        f"_path = os.path.expanduser({destination!r})\n"
+        f"_manifest = os.path.expanduser({manifest!r})\n"
+        "try:\n"
+        "    with open(_manifest) as _handle:\n"
+        "        _entries = json.load(_handle)\n"
+        "except (OSError, ValueError):\n"
+        "    _entries = {}\n"
+        "_stat = os.stat(_path)\n"
+        f"_entries[_path] = {{'digest': {digest!r}, 'size': _stat.st_size,"
+        " 'mtime_ns': _stat.st_mtime_ns}\n"
+        "os.makedirs(os.path.dirname(_manifest), exist_ok=True)\n"
+        "_temporary = '%s.%d' % (_manifest, os.getpid())\n"
+        "with open(_temporary, 'w') as _handle:\n"
+        "    json.dump(_entries, _handle)\n"
+        "os.replace(_temporary, _manifest)\n"
+    )
+
 
 #: Ref names letify itself uses. The rest of the namespace belongs to the user.
 ENV_REF = "env/{key}"
@@ -191,6 +240,21 @@ class Volume:
         directory = self.directory(runtime)
         destination = path or f"{directory.rstrip('/')}/blobs/{digest[:2]}/{digest}"
         into = target or directory
+        manifest = f"{directory.rstrip('/')}/{MANIFEST}"
+        tracked = self.provider.persistent and not unpack
+        if tracked:
+            held = runtime.eval(_held_source(manifest, destination, digest), timeout=120)
+            if held is not None:
+                return protocol.RemoteFile(path=held["path"], digest=digest, size=held["size"])
+        written = self._write(runtime, digest, destination, unpack, into, links)
+        if tracked:
+            runtime.eval(_record_source(manifest, destination, digest), timeout=120)
+        return written
+
+    def _write(
+        self, runtime: Runtime, digest: str, destination: str, unpack: bool, into: str, links: bool
+    ) -> RemoteFile:
+        """Send one blob to a destination, pulled by the runtime when the backend allows."""
         if runtime.persistent_channel:
             source = self.store.backend.pull_source(digest)
             if source is not None:
@@ -226,4 +290,4 @@ class Volume:
         return f"<Volume {self.key} on {self.provider.store_backend()}>"
 
 
-__all__ = ["CHECKPOINT_REF", "ENV_REF", "Volume"]
+__all__ = ["CHECKPOINT_REF", "ENV_REF", "MANIFEST", "Volume"]
