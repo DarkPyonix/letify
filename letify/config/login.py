@@ -21,6 +21,7 @@ session later reserves from that table is the inventory's business, not this mod
 from __future__ import annotations
 
 import getpass
+import json
 import subprocess
 import sys
 import tomllib
@@ -636,6 +637,136 @@ def colab_account(answers: Answers) -> dict[str, Any]:
     return options
 
 
+#: The prompt for a Kaggle API token, read with hidden input.
+KAGGLE_TOKEN_PROMPT = "Kaggle API token, or the path to kaggle.json: "
+
+#: The read-only Kaggle CLI call that proves a token works.
+KAGGLE_CHECK = ("quota", "--format", "json")
+
+#: Files a Kaggle login may write in the account directory.
+KAGGLE_ACCESS_TOKEN = "access_token"
+KAGGLE_JSON = "kaggle.json"
+KAGGLE_SESSION_URL = "jupyter_url"
+
+
+def read_kaggle_token(alias: str, given: str) -> tuple[str, str, list[str]]:
+    """Classify a Kaggle credential. Returns the file name, its content and the secrets in it.
+
+    A value starting with ``{`` is a ``kaggle.json`` body, a value naming an existing file is
+    that file's ``kaggle.json`` body, and anything else is an access token.
+    """
+    text = given.strip()
+    candidate = Path(text).expanduser()
+    if not text.startswith("{") and len(text) < 4096 and candidate.is_file():
+        try:
+            text = candidate.read_text(encoding="utf-8").strip()
+        except OSError as exc:
+            raise LoginError(f"{alias}: {candidate} could not be read: {exc}") from None
+    if not text.startswith("{"):
+        if not text or any(character.isspace() for character in text):
+            raise LoginError(f"{alias}: a Kaggle access token is one string with no spaces")
+        return KAGGLE_ACCESS_TOKEN, text, [text]
+    try:
+        body = json.loads(text)
+    except ValueError:
+        raise LoginError(f"{alias}: the kaggle.json given is not valid JSON") from None
+    if not isinstance(body, dict):
+        raise LoginError(f"{alias}: kaggle.json must be an object with username and key")
+    missing = [name for name in ("username", "key") if not body.get(name)]
+    if missing:
+        raise LoginError(f"{alias}: kaggle.json has no {' or '.join(missing)}")
+    content = json.dumps({"username": str(body["username"]), "key": str(body["key"])})
+    return KAGGLE_JSON, content, [str(body["key"])]
+
+
+def valid_session_url(alias: str, url: str) -> str:
+    """Return the Colab Compatible URL when it is an HTTP address, and refuse it otherwise."""
+    value = url.strip()
+    if not value.startswith(("https://", "http://")):
+        raise LoginError(
+            f"{alias}: --connect takes the Colab Compatible URL from Run, Kaggle Jupyter Server "
+            f"in the Kaggle editor, which starts with https://"
+        )
+    return value
+
+
+def redact(text: str, secrets_in_text: list[str]) -> str:
+    """Replace every occurrence of each secret with ``***``."""
+    for secret in secrets_in_text:
+        if secret:
+            text = text.replace(secret, "***")
+    return text
+
+
+def kaggle_account(answers: Answers) -> dict[str, Any]:
+    """Keep the Kaggle API token in the account directory and prove it with a read-only call.
+
+    The token file is written before the check, because the Kaggle CLI reads it from there.
+    A check that fails removes what this attempt wrote, so nothing is left behind.
+    """
+    from .. import tools
+
+    uv = tools.find_uv()
+    if uv is None:
+        raise LoginError(tools.missing_uv_message())
+    connect = answers.get("connect")
+    url = None
+    if isinstance(connect, str) and connect:
+        url = valid_session_url(answers.alias, connect)
+    given = answers.token or (read_password(KAGGLE_TOKEN_PROMPT) if answers.interactive else None)
+    if not given:
+        raise LoginError(
+            f"{answers.alias} needs a Kaggle API token from kaggle.com Settings, API. "
+            f"Pass --token or drop --no-input."
+        )
+    name, content, hidden = read_kaggle_token(answers.alias, given)
+    options: dict[str, Any] = {"kind": answers.kind}
+    record_workspace(answers, options)
+
+    directory = secrets.account_directory(answers.alias)
+    written = [name] if not (directory / name).exists() else []
+    store_secret(answers.alias, name, content)
+    try:
+        result = subprocess.run(
+            [*tools.command(tools.KAGGLE, uv), *KAGGLE_CHECK],
+            capture_output=True,
+            text=True,
+            timeout=120,
+            env=tools.kaggle_environment(answers.alias),
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        forget_files(answers.alias, written)
+        raise LoginError(
+            f"the Kaggle CLI could not be run, so nothing was written: {redact(str(exc), hidden)}"
+        ) from None
+    if result.returncode != 0:
+        forget_files(answers.alias, written)
+        detail = redact((result.stderr or result.stdout or "").strip()[-2000:], hidden)
+        raise LoginError(
+            f"the Kaggle token check exited {result.returncode}, so nothing was written: {detail}"
+        )
+    if url is not None:
+        store_secret(answers.alias, KAGGLE_SESSION_URL, url)
+    return options
+
+
+def forget_files(alias: str, names: list[str]) -> None:
+    """Remove files one login attempt created in the account directory."""
+    directory = secrets.account_directory(alias)
+    for name in names:
+        (directory / name).unlink(missing_ok=True)
+
+
+def register_session(answers: Answers, text: str) -> None:
+    """Replace the session URL of an already declared Kaggle account."""
+    entry = tomllib.loads(text).get(answers.alias, {})
+    if entry.get("kind", answers.kind) != "kaggle":
+        return
+    url = valid_session_url(answers.alias, str(answers.get("connect")))
+    store_secret(answers.alias, KAGGLE_SESSION_URL, url)
+    print(f"{answers.alias}: the Kaggle Jupyter Server session URL was replaced")
+
+
 #: The prompt for the token when ``--connect`` is not given.
 TOKEN_PROMPT = "Token printed by 'letify client shell connect': "
 
@@ -721,6 +852,7 @@ FLOWS = {
     "elice": elice_account,
     "colab": colab_account,
     "modal": modal_account,
+    "kaggle": kaggle_account,
 }
 
 
@@ -786,6 +918,8 @@ def log_in(answers: Answers, *, project: str | Path | None = None) -> tuple[bool
         devices = options.pop("devices", None)
         writer.update(home, answers.alias, options, private=True)
     else:
+        if answers.get("connect"):
+            register_session(answers, existing)
         if answers.get("workspace"):
             change_workspace(answers, existing, home)
         if answers.get("detect_devices"):

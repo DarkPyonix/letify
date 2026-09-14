@@ -911,6 +911,17 @@ An account that is already in the home file is not asked for again. `letify logi
 
 The account is written with `kind = "tunnel"`, `tailcat`, `tailcat_port`, `user`, `port` and `key` from the token and the options. It has no `address` unless the token or `--address` gives one, and `public_port` is written when the token or `--public-port` gives it. A value in the token wins over the option. Every login step still runs over Tailcat.
 
+`letify login kaggle <alias>` declares a Kaggle account from the API token made at kaggle.com under Settings, API. The token is `--token`, or with a terminal it is asked for with hidden input as `Kaggle API token, or the path to kaggle.json: `, and `--no-input` without `--token` refuses. Two forms are accepted:
+
+1. An access token, a single string. It is written to `~/.letify/accounts/<alias>/access_token`.
+2. The legacy `kaggle.json`, given as its JSON text or as the path to the file. It needs `username` and `key`, and is written to `~/.letify/accounts/<alias>/kaggle.json`.
+
+Both files are created with mode 0600. The token is then checked with `kaggle quota --format json`, a read-only call, run through `uv tool run --from kaggle kaggle`. The Kaggle CLI runs with `HOME` and `KAGGLE_CONFIG_DIR` set to the account directory, `KAGGLE_API_TOKEN` set to the path of `access_token` when that file exists, and `KAGGLE_USERNAME` and `KAGGLE_KEY` removed, so the CLI reads this account's token and no other. A check that exits non zero writes nothing to either `config.toml`, removes the token file the attempt wrote, and raises `LoginError` with the exit code and the CLI's error output with the token replaced by `***`. The token never appears in a command line letify builds, in `config.toml` or in output.
+
+`--connect <URL>` also records the Colab Compatible URL of a running Kaggle Jupyter Server session, copied from Run, Kaggle Jupyter Server in the Kaggle editor. It must start with `http://` or `https://`, and is written to `~/.letify/accounts/<alias>/jupyter_url` with mode 0600, because its query string carries the session token. On an account already in the home file, `letify login kaggle <alias> --connect <URL>` replaces only that file and asks for nothing else, which is how a new session is registered after the previous one ended.
+
+The home entry is `kind = "kaggle"`, plus `workspace` when `--workspace` is given.
+
 Credentials never enter either `config.toml`. A token goes to a file in the account directory. An SSH password is never stored at all, which the next section explains.
 
 ### Recording devices at login <!-- id: login-records-devices -->
@@ -966,6 +977,7 @@ One other approach is not the default. `sshpass` feeds a stored password to each
 | `elice` | endpoint, zone, machine, `workspace` when given | access token in `~/.letify/accounts/<alias>/access_token` |
 | `colab` | account email, `workspace` when given | the Colab CLI's token, written by its own sign in under `~/.letify/accounts/<alias>/` |
 | `modal` | `profile` and `workspace`, each when given | Modal's token, written by `modal token new` to `~/.letify/accounts/<alias>/modal.toml` |
+| `kaggle` | `workspace` when given | the Kaggle API token in `~/.letify/accounts/<alias>/access_token` or `kaggle.json`, and the session URL in `jupyter_url` when `--connect` is given |
 | `local` | nothing | none; this machine needs no declaration |
 
 For `colab` and `modal`, letify runs the vendor's sign in through uv and does not parse or refresh the token. The vendor's client reads and refreshes it from the account directory.
