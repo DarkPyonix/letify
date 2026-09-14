@@ -172,6 +172,8 @@ class Client:
         self.process = process
         self.name = name
         self.stats = Stats()
+        #: The process that connected, the only one that may write to the transport.
+        self._pid = os.getpid()
         #: Handles whose last RemoteTensor was collected, appended from ``Ref.__del__``.
         self.released: list[int] = []
         self._next_handle = 1
@@ -205,6 +207,8 @@ class Client:
         self._deferred: tuple | None = None
         self.hello: dict[str, Any] = {}
         self._sender: threading.Thread | None = None
+        #: The runtime's kernel choice for each signature it was asked about.
+        self._kernels: dict[tuple, str] = {}
 
     # -- lifecycle ------------------------------------------------------------------
 
@@ -741,6 +745,26 @@ class Client:
         results, _buffers = self._request((E_REQUEST, name, args, "value"))
         return results[-1]
 
+    def kernel(self, function: str, tensors: Sequence[Any], flags: dict) -> str:
+        """The backend the runtime's own dispatch picks for ``function``, asked once per signature.
+
+        ``tensors`` may hold None for an absent argument. The answer is a backend name, such
+        as ``Cudnn`` or ``Native`` for batch norm and ``FLASH_ATTENTION`` or ``MATH`` for
+        attention.
+        """
+        described = tuple(
+            None
+            if tensor is None
+            else (tuple(tensor.shape), tuple(tensor.stride()), str(tensor.dtype).split(".")[-1])
+            for tensor in tensors
+        )
+        key = (function, described, tuple(sorted(flags.items())))
+        answer = self._kernels.get(key)
+        if answer is None:
+            answer = self.call("letify.kernel", function, described, dict(flags))
+            self._kernels[key] = answer
+        return answer
+
     def live_handles(self) -> int:
         """How many tensors the executor holds, after sending pending releases."""
         with self._request_lock:
@@ -823,6 +847,11 @@ class Client:
         return RuntimeLost(f"{self.name}: the device worker was lost: {reason}{detail}")
 
     def _check_open(self) -> None:
+        if os.getpid() != self._pid:
+            raise RuntimeLost(
+                f"{self.name}: this process was forked from process {self._pid}, which owns "
+                f"the device worker's channel, so it cannot send on it"
+            )
         if self._closed:
             raise RuntimeLost(f"{self.name}: the device worker is closed")
         if self._lost is not None:

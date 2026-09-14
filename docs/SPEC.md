@@ -402,7 +402,9 @@ Nothing in this path runs per training step. A `print` inside a loop costs one p
 
 Any number of threads may send requests on one channel. Whichever waiting thread holds the read lock reads the next frame and hands it to the request it belongs to, so a `stat` or a lease renewal sent while a call runs gets its reply while the call is still running. On the worker, `stat` and `lease` are answered by the thread that reads frames. Every other request is queued and run in order on the worker's main thread, so user code runs on the main thread.
 
-A request that passes its timeout kills the worker process, which ends every read, and raises `RuntimeFailure`. A worker that closes its pipe fails every open request with `ProtocolError` quoting the last output.
+A request that passes its timeout kills the worker process, which ends every read, and raises `RuntimeFailure`.
+
+A body may fork, as `multiprocessing` and a `DataLoader` with `num_workers > 0` do. The thread that reads frames may hold the lock of `sys.stdin` at the fork, so every process forked from the worker replaces `sys.stdin` with `/dev/null` before anything else runs in it, and a child that closes `sys.stdin`, as `multiprocessing` does, never waits for that lock. On Linux each process forked from the worker asks for `SIGKILL` when the worker's main thread exits (`prctl(PR_SET_PDEATHSIG)`), so a worker killed by a timeout or closed with its session takes its forked children with it. A worker that closes its pipe fails every open request with `ProtocolError` quoting the last output.
 
 The worker never installs anything into the interpreter it starts on. Everything it runs before it moves to the project interpreter uses only the standard library: the ready line, workspace preparation, the environment build and the move itself. The worker imports cloudpickle only when it loads a call, so a system Python that lacks cloudpickle and refuses `pip install`, as an externally managed Python under PEP 668 does, still starts the worker. blake3 and letify are likewise imported only after the move, and blake3 falls back to blake2b where it is absent.
 
@@ -1176,6 +1178,20 @@ A plain CPU tensor passed to an operator travels with it as a buffer and is a CP
 
 When the meta operator raises, the operator is sent at once and executed on the runtime, and the reply carries its output metadata. That covers data-dependent shapes such as `nonzero` and `masked_select`, and reports a genuine error with the runtime's own message.
 
+### Kernel selection <!-- id: forwarding-kernel-selection -->
+
+> `batch_norm` and `scaled_dot_product_attention` on a `RemoteTensor` run the kernel the runtime's own CUDA dispatch chooses, not the one a meta tensor chooses.
+
+PyTorch picks the kernel for these two functions from the device when it dispatches. A meta tensor gets `native_batch_norm` and math attention. A CUDA tensor gets cuDNN batch norm, and flash, memory-efficient or cuDNN attention depending on shape, dtype and card. Those kernels give different values and use different memory.
+
+When the executor's hello reports a CUDA device, the `TorchFunctionMode` of [Mapping cuda](#mapping-cuda) asks the executor which backend applies, with a `letify.kernel` request, once per distinct signature, and caches the answer in the client. A signature is the function and, for every tensor argument, its shape, strides, dtype and whether it is None, plus `training` and `eps` for batch norm and `dropout_p`, `is_causal`, `scale` and `enable_gqa` for attention. The executor answers by calling `torch._C._select_batch_norm_backend` or `torch._fused_sdp_choice` on empty tensors of that signature on its own device. A PyTorch without the selector answers `Native` or `MATH`.
+
+Attention with `enable_gqa`, and flash attention for a head dimension that is not a multiple of 8, keep the ordinary path, because PyTorch reshapes or pads those before its fused kernel.
+
+The mode then calls the chosen ATen operator directly: `aten.cudnn_batch_norm` for `Cudnn`, and `aten._scaled_dot_product_flash_attention`, `aten._scaled_dot_product_efficient_attention` or `aten._scaled_dot_product_cudnn_attention` for the attention backends. Each of them has a meta kernel that infers its outputs and an autograd formula that records its backward, so it is dispatched and forwarded like any other operator. The function returns the operator's first output, the normalized or attended tensor, and `cudnn_batch_norm` updates the running statistics in place as `batch_norm` does.
+
+The ordinary path applies when the executor's device is CPU, when the runtime answers `Native` or math attention, or when an argument is not a `RemoteTensor`.
+
 ### Mapping cuda <!-- id: mapping-cuda -->
 
 > Code written with `"cuda"`, `.cuda()` and `torch.cuda.is_available()` runs unchanged under `host="local"`.
@@ -1206,6 +1222,17 @@ These `torch.cuda` functions are replaced while the function runs, and restored 
 
 No replaced function initializes CUDA in this process. A CUDA build of PyTorch on a machine with no NVIDIA driver raises `CUDA driver version is insufficient` from any call that does, and a training loop makes such calls without naming them: `Adam.step()` and `AdamW.step()` call `is_current_stream_capturing()`, and `torch.cuda.is_bf16_supported()`, which `autocast` reads for `bfloat16`, calls `get_device_properties()`.
 
+A process forked while forwarding is active, such as a `DataLoader` worker, starts with the mapping undone: `torch.cuda` holds PyTorch's own functions, the device rewrite is off and `current_client()` is None, so the worker's `torch.manual_seed` and its CPU tensors stay in that process. The client refuses to send from a process other than the one that connected it, raising `RuntimeLost` naming the fork, because the channel it would write to belongs to the parent. `DataLoader(pin_memory=True)` is not supported, because PyTorch pins through its own CUDA context in a thread letify does not map.
+
+### Compilation <!-- id: forwarding-compile -->
+
+> Under `host="local"`, `torch.compile` returns the function or module it is given, unchanged, and warns once that it runs eagerly, so a compiled training loop runs and computes what eager code computes.
+
+Inductor, the default backend, cannot compile here: before tracing it creates a CUDA tensor in this process to set up a device context, which needs a driver this process does not have. Dynamo with any backend also traces into `RemoteTensor` dispatch, which is letify's own Python, and recompiles it for every operator. A replayed step already sends the whole step as one entry, as [Step capture](#forwarding-step-capture) describes, so compiling on the client has nothing left to batch.
+
+While forwarding is active, `torch.compile(model, ...)` with any arguments returns `model` itself, and `torch.compile(...)` used as a decorator factory returns a decorator that returns the function itself. `Module.compile(...)` does nothing. The first such call in a process emits a `UserWarning` naming `host="local"` and eager execution. `torch.compile` and `Module.compile` are restored when forwarding ends and undone in a forked process, as the rest of the mapping is.
+
+`torch.cuda.get_rng_state` and `torch.cuda.set_rng_state` stay refused, so code that saves and restores the generator state names the gap instead of silently restoring a state that is not the runtime's.
 ### Autocast <!-- id: forwarding-autocast -->
 
 > Inside `torch.autocast("cuda")`, an operator on a `RemoteTensor` gets the argument casts CUDA autocast gives it, so a mixed precision loop computes in the same dtypes as on the runtime's own GPU.

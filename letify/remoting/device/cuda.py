@@ -10,7 +10,9 @@ from __future__ import annotations
 
 import contextlib
 import inspect
+import os
 import types
+import warnings
 from collections.abc import Iterator
 from typing import TYPE_CHECKING, Any
 
@@ -275,6 +277,93 @@ def _autocast(policy: str, args: tuple, kwargs: dict) -> tuple[tuple, dict]:
     return tuple(cast(value) for value in args), {key: cast(v) for key, v in kwargs.items()}
 
 
+_BATCH_NORM = inspect.signature(torch.nn.functional.batch_norm)
+_ATTENTION = ("query", "key", "value", "attn_mask", "dropout_p", "is_causal", "scale", "enable_gqa")
+_ATTENTION_DEFAULTS = {
+    "attn_mask": None,
+    "dropout_p": 0.0,
+    "is_causal": False,
+    "scale": None,
+    "enable_gqa": False,
+}
+
+
+def _batch_norm(client: Client, args: tuple, kwargs: dict) -> Any:
+    """``batch_norm`` through ``aten.cudnn_batch_norm`` when the runtime picks cuDNN.
+
+    Returns NotImplemented for any other answer, which leaves the call on the ordinary path.
+    """
+    bound = _BATCH_NORM.bind(*args, **kwargs)
+    bound.apply_defaults()
+    given = bound.arguments
+    x, weight, bias = given["input"], given["weight"], given["bias"]
+    mean, var, training = given["running_mean"], given["running_var"], bool(given["training"])
+    if any(type(value) is not RemoteTensor for value in (x, weight, bias)):
+        return NotImplemented
+    if any(value is not None and type(value) is not RemoteTensor for value in (mean, var)):
+        return NotImplemented
+    if not training and (mean is None or var is None):
+        return NotImplemented
+    answer = client.kernel(
+        "batch_norm",
+        (x, weight, bias, mean, var),
+        {"training": training, "eps": float(given["eps"])},
+    )
+    if answer != "Cudnn":
+        return NotImplemented
+    if training:
+        torch.nn.functional._verify_batch_size(x.size())
+    momentum = given["momentum"]
+    return torch.ops.aten.cudnn_batch_norm.default(
+        x,
+        weight,
+        bias,
+        mean,
+        var,
+        training,
+        0.0 if momentum is None else float(momentum),
+        float(given["eps"]),
+    )[0]
+
+
+def _attention(client: Client, args: tuple, kwargs: dict) -> Any:
+    """Attention through the runtime's fused kernel when it picks one, else NotImplemented."""
+    given = dict(_ATTENTION_DEFAULTS)
+    given.update(zip(_ATTENTION, args, strict=False))
+    given.update(kwargs)
+    query, key, value, mask = given["query"], given["key"], given["value"], given["attn_mask"]
+    if any(type(tensor) is not RemoteTensor for tensor in (query, key, value)):
+        return NotImplemented
+    if mask is not None and type(mask) is not RemoteTensor:
+        return NotImplemented
+    if given["enable_gqa"]:
+        return NotImplemented
+    dropout, causal, scale = float(given["dropout_p"]), bool(given["is_causal"]), given["scale"]
+    flags = {"dropout_p": dropout, "is_causal": causal, "scale": scale, "enable_gqa": False}
+    answer = client.kernel("scaled_dot_product_attention", (query, key, value, mask), flags)
+    grads = torch.is_grad_enabled() and any(t.requires_grad for t in (query, key, value))
+    if answer == "FLASH_ATTENTION" and mask is None and query.shape[-1] % 8 == 0:
+        return torch.ops.aten._scaled_dot_product_flash_attention.default(
+            query, key, value, dropout, causal, False, scale=scale
+        )[0]
+    if answer == "EFFICIENT_ATTENTION":
+        return torch.ops.aten._scaled_dot_product_efficient_attention.default(
+            query, key, value, mask, grads, dropout, causal, scale=scale
+        )[0]
+    if answer == "CUDNN_ATTENTION":
+        return torch.ops.aten._scaled_dot_product_cudnn_attention.default(
+            query, key, value, mask, grads, dropout, causal, False, scale=scale
+        )[0]
+    return NotImplemented
+
+
+#: Functions whose kernel the runtime chooses, as spec "Kernel selection" describes.
+_SELECTED = {
+    torch.nn.functional.batch_norm: _batch_norm,
+    torch.nn.functional.scaled_dot_product_attention: _attention,
+}
+
+
 class CudaMode(TorchFunctionMode):
     """Rewrites CUDA devices in torch calls to the runtime's device."""
 
@@ -297,6 +386,11 @@ class CudaMode(TorchFunctionMode):
             if policy == "cross_entropy":
                 return _cross_entropy(func, args, kwargs)
             args, kwargs = _autocast(policy, args, kwargs)
+        selected = _SELECTED.get(func)
+        if selected is not None and str(self.client.hello.get("device", "")).startswith("cuda"):
+            result = selected(self.client, args, kwargs)
+            if result is not NotImplemented:
+                return result
         rewritten = False
         device = kwargs.get("device")
         if device is not None:
@@ -417,6 +511,52 @@ def replacements(client: Client) -> dict[str, Any]:
 
 _MISSING = object()
 
+#: Whether this process has warned that ``torch.compile`` runs eagerly, as a mutable cell.
+_COMPILE_WARNED = [False]
+
+
+def _warn_compile() -> None:
+    if _COMPILE_WARNED[0]:
+        return
+    _COMPILE_WARNED[0] = True
+    warnings.warn(
+        "torch.compile runs eagerly under host='local': compilation needs a CUDA driver in "
+        "this process, and the runtime already receives each repeated step as one entry",
+        UserWarning,
+        stacklevel=3,
+    )
+
+
+def compile_replacements() -> dict[tuple[Any, str], Any]:
+    """``torch.compile`` and ``Module.compile`` as spec "Compilation" describes."""
+
+    def compile(model: Any = None, *args: Any, **kwargs: Any) -> Any:
+        _warn_compile()
+        if model is None:
+            return lambda function: function
+        return model
+
+    def module_compile(self: torch.nn.Module, *args: Any, **kwargs: Any) -> None:
+        _warn_compile()
+
+    return {(torch, "compile"): compile, (torch.nn.Module, "compile"): module_compile}
+
+
+def _patch_owned(table: dict[tuple[Any, str], Any]) -> dict[tuple[Any, str], Any]:
+    saved = {key: getattr(key[0], key[1], _MISSING) for key in table}
+    for (owner, name), value in table.items():
+        setattr(owner, name, value)
+    return saved
+
+
+def _restore_owned(saved: dict[tuple[Any, str], Any]) -> None:
+    for (owner, name), value in saved.items():
+        if value is _MISSING:
+            delattr(owner, name)
+        else:
+            setattr(owner, name, value)
+
+
 #: The torch.cuda attributes each active mapping replaced, innermost last.
 _ACTIVE: list[dict[str, Any]] = []
 
@@ -441,6 +581,7 @@ def mapped(client: Client) -> Iterator[None]:
     """Install the CUDA mapping for the duration of the block."""
     table = replacements(client)
     saved = _patch(table)
+    compiled_saved = _patch_owned(compile_replacements())
     _ACTIVE.append(table)
     _CLIENTS.append(client)
     registered = [found for found in _foreach_types() if RemoteTensor not in found]
@@ -454,6 +595,7 @@ def mapped(client: Client) -> Iterator[None]:
             found.remove(RemoteTensor)
         _CLIENTS.pop()
         _ACTIVE.pop()
+        _restore_owned(compiled_saved)
         _restore(saved)
 
 
@@ -495,14 +637,36 @@ def unmapped() -> Iterator[None]:
         yield
         return
     originals = {name: getattr(torch.cuda, name) for name in _ACTIVE[-1]}
+    compiled = {key: getattr(key[0], key[1]) for key in _COMPILE_ORIGINALS}
     _restore(_ORIGINALS)
+    _restore_owned(_COMPILE_ORIGINALS)
     _CLIENTS.append(None)
     try:
         with _pop_mode_temporarily():
             yield
     finally:
         _CLIENTS.pop()
+        _patch_owned(compiled)
         _patch(originals)
+
+
+def _forget_in_child() -> None:
+    """Undo every active mapping in a process just forked, whose channel belongs to the parent."""
+    if not _ACTIVE:
+        return
+    _restore(_ORIGINALS)
+    _restore_owned(_COMPILE_ORIGINALS)
+    for found in _foreach_types():
+        while RemoteTensor in found:
+            found.remove(RemoteTensor)
+    _ACTIVE.clear()
+    _CLIENTS.clear()
+    stack = torch._C._len_torch_function_stack
+    while stack() and isinstance(torch._C._get_function_stack_at(stack() - 1), CudaMode):
+        torch._C._pop_torch_function_stack()
+
+
+os.register_at_fork(after_in_child=_forget_in_child)
 
 
 #: torch.cuda as it was before any mapping, read once at import.
@@ -529,4 +693,9 @@ _ORIGINALS: dict[str, Any] = {
         "empty_cache",
         *REFUSED,
     )
+}
+
+#: torch.compile and Module.compile as they were before any mapping, read once at import.
+_COMPILE_ORIGINALS: dict[tuple[Any, str], Any] = {
+    key: getattr(key[0], key[1], _MISSING) for key in compile_replacements()
 }

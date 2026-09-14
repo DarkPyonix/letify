@@ -10,6 +10,7 @@ Spec sections pinned here: "Channels", "Call protocol", "Failure and retry", "Se
 
 from __future__ import annotations
 
+import os
 import shutil
 import subprocess
 import sys
@@ -176,6 +177,62 @@ def test_a_call_that_outlives_its_timeout_is_a_failure(channel) -> None:
 
     with pytest.raises(RuntimeFailure, match=r"exceeded 0\.3s"):
         channel.call(slow, (), {}, timeout=0.3)
+
+
+def test_a_body_can_start_forked_processes_while_the_worker_reads_frames(channel) -> None:
+    # multiprocessing closes sys.stdin in a forked child, which the frame reader thread is
+    # blocked reading at that moment. A DataLoader with num_workers > 0 forks the same way.
+    def forks() -> int:
+        import multiprocessing
+
+        context = multiprocessing.get_context("fork")
+        results = context.Queue()
+        children = [context.Process(target=results.put, args=(i,)) for i in range(2)]
+        for child in children:
+            child.start()
+        total = sum(results.get(timeout=20) for _ in children)
+        for child in children:
+            child.join(20)
+        return total
+
+    value, _logs = channel.call(forks, (), {}, timeout=60)
+    assert value == 1
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="parent death signal is Linux only")
+def test_no_forked_child_outlives_a_timed_out_call(channel, tmp_path) -> None:
+    marker = tmp_path / "child.pid"
+
+    def forks_and_hangs() -> None:
+        import os
+        import time
+
+        pid = os.fork()
+        if pid == 0:
+            time.sleep(120)
+            os._exit(0)
+        with open(str(marker), "w") as handle:
+            handle.write(str(pid))
+        time.sleep(120)
+
+    with pytest.raises(RuntimeFailure, match="exceeded"):
+        channel.call(forks_and_hangs, (), {}, timeout=3)
+    child = int(marker.read_text())
+    import time
+
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline:
+        try:
+            os.kill(child, 0)
+        except ProcessLookupError:
+            break
+        status = Path(f"/proc/{child}/stat")
+        if status.exists() and status.read_text().split()[2] == "Z":
+            break
+        time.sleep(0.1)
+    else:
+        os.kill(child, 9)
+        pytest.fail(f"forked child {child} outlived the timed-out call")
 
 
 def test_an_operation_the_worker_does_not_know_is_reported_by_name(channel) -> None:
