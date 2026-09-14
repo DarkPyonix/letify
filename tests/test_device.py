@@ -170,6 +170,91 @@ def test_a_structure_is_described_once_and_later_calls_carry_only_their_scalars(
     assert x.cpu().tolist() == [24.0, 24.0, 24.0, 24.0]
 
 
+# -- Spec: Kernel selection --------------------------------------------------------
+
+
+def _template_names(connected) -> set[str]:
+    return {str(key[0]) for key in connected._templates}
+
+
+def _batch_norm_arguments():
+    x = torch.randn(4, 3, 5, 5, device="cuda")
+    weight = torch.ones(3, device="cuda")
+    bias = torch.zeros(3, device="cuda")
+    mean = torch.zeros(3, device="cuda")
+    var = torch.ones(3, device="cuda")
+    return x, mean, var, weight, bias
+
+
+def test_on_a_cpu_executor_batch_norm_and_attention_keep_their_ordinary_kernels(client) -> None:
+    x, mean, var, weight, bias = _batch_norm_arguments()
+    q = torch.randn(2, 2, 4, 8, device="cuda")
+    client.synchronize()
+    before = client.stats.round_trips
+    normed = torch.nn.functional.batch_norm(x, mean, var, weight, bias, training=True)
+    attended = torch.nn.functional.scaled_dot_product_attention(q, q, q, is_causal=True)
+    assert client.stats.round_trips == before
+    names = _template_names(client)
+    assert "aten.native_batch_norm.default" in names
+    assert not any("cudnn" in name or "flash" in name or "efficient" in name for name in names)
+    assert normed.shape == x.shape and attended.shape == q.shape
+    torch.cuda.synchronize()
+
+
+def test_the_runtime_is_asked_for_a_kernel_once_per_signature(client) -> None:
+    first = _batch_norm_arguments()
+    second = _batch_norm_arguments()
+    client.synchronize()
+    before = client.stats.round_trips
+    answers = [
+        client.kernel("batch_norm", (x, weight, bias, mean, var), {"training": True})
+        for x, mean, var, weight, bias in (first, second)
+    ]
+    assert answers == ["Native", "Native"]
+    assert client.stats.round_trips == before + 1
+
+
+@pytest.fixture
+def unsent():
+    """A client whose queued operators are never executed, for kernels a CPU cannot run."""
+    connected = forwarding.connect(forwarding.worker_command(sys.executable), device="cpu")
+    try:
+        with connected.activate():
+            yield connected
+    finally:
+        connected.process.kill()
+        try:
+            connected.close()
+        except letify.RuntimeLost:
+            pass
+
+
+def test_a_cudnn_answer_forwards_cudnn_batch_norm(unsent, monkeypatch) -> None:
+    monkeypatch.setitem(unsent.hello, "device", "cuda")
+    monkeypatch.setattr(unsent, "kernel", lambda *args, **kwargs: "Cudnn")
+    x, mean, var, weight, bias = _batch_norm_arguments()
+    x.requires_grad_(True)
+    normed = torch.nn.functional.batch_norm(x, mean, var, weight, bias, training=True)
+    normed.sum().backward()
+    names = _template_names(unsent)
+    assert "aten.cudnn_batch_norm.default" in names
+    assert "aten.cudnn_batch_norm_backward.default" in names
+    assert "aten.native_batch_norm.default" not in names
+    assert normed.shape == x.shape and normed.dtype == x.dtype
+
+
+def test_a_flash_answer_forwards_flash_attention_and_its_backward(unsent, monkeypatch) -> None:
+    monkeypatch.setitem(unsent.hello, "device", "cuda")
+    monkeypatch.setattr(unsent, "kernel", lambda *args, **kwargs: "FLASH_ATTENTION")
+    q = torch.randn(2, 2, 16, 8, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    attended = torch.nn.functional.scaled_dot_product_attention(q, q, q, is_causal=True)
+    attended.float().sum().backward()
+    names = _template_names(unsent)
+    assert "aten._scaled_dot_product_flash_attention.default" in names
+    assert "aten._scaled_dot_product_flash_attention_backward.default" in names
+    assert attended.shape == q.shape and attended.dtype == q.dtype
+
+
 # -- Spec: Mapping cuda --------------------------------------------------------
 
 

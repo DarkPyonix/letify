@@ -362,7 +362,65 @@ class Executor:
             if self.device.type == "cuda":
                 torch.cuda.empty_cache()
             return None
+        if name == "letify.kernel":
+            return self.kernel(*args)
         raise ValueError(f"unknown request {name}")
+
+    def kernel(self, function, described, flags):
+        """The backend this device's dispatch picks for ``function`` on tensors of ``described``."""
+        torch = self.torch
+
+        def empty(entry):
+            if entry is None:
+                return None
+            shape, stride, dtype = entry
+            return torch.empty_strided(
+                shape, stride, dtype=getattr(torch, dtype), device=self.device
+            )
+
+        tensors = [empty(entry) for entry in described]
+        if function == "batch_norm":
+            select = getattr(torch._C, "_select_batch_norm_backend", None)
+            if select is None:
+                return "Native"
+            x, weight, bias, mean, var = tensors
+            backend = select(
+                x, weight, bias, mean, var, bool(flags["training"]), float(flags.get("eps", 1e-5))
+            )
+            return backend.name
+        if function == "scaled_dot_product_attention":
+            choose = getattr(torch, "_fused_sdp_choice", None)
+            if choose is None:
+                return "MATH"
+            from torch.nn.attention import SDPBackend
+
+            query, key, value, mask = tensors
+            choice = int(
+                choose(
+                    query,
+                    key,
+                    value,
+                    mask,
+                    float(flags["dropout_p"]),
+                    bool(flags["is_causal"]),
+                    flags.get("scale"),
+                    bool(flags.get("enable_gqa", False)),
+                )
+            )
+            names = (
+                "ERROR",
+                "MATH",
+                "FLASH_ATTENTION",
+                "EFFICIENT_ATTENTION",
+                "CUDNN_ATTENTION",
+                "OVERRIDEABLE",
+            )
+            for backend_name in names:
+                member = getattr(SDPBackend, backend_name, None)
+                if member is not None and int(member) == choice:
+                    return backend_name
+            return "MATH"
+        raise ValueError(f"no kernel selection for {function}")
 
 
 def serve_transport(device: str, transport) -> None:
