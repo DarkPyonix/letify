@@ -612,6 +612,87 @@ def _run(stream, request, settle):
     _reply(stream, outcome)
 
 
+_DATA_PREFIX = b"LETIFY-DATA "
+
+
+def _listen(stream, request):
+    """Answer a listen request, then wait for the data connection that carries the token.
+
+    Spec "Modal data channel". Returns the authenticated connection, with every later frame
+    already sent over it, or None when standard input became readable, the wait ended, or
+    the port could not be bound, so the caller keeps reading standard input.
+    """
+    import select
+    import socket
+
+    token = str(request["token"]).encode("ascii")
+    deadline = time.monotonic() + float(request.get("wait") or 60)
+    server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        server.bind(("0.0.0.0", int(request["port"])))
+        server.listen(4)
+    except OSError as exc:
+        server.close()
+        _reply(stream, {"ok": False, "error": "OSError: %s" % exc, "traceback": ""})
+        return None
+    _reply(stream, {"ok": True, "value": None})
+    stdin = sys.stdin.fileno()
+    try:
+        while True:
+            left = deadline - time.monotonic()
+            if left <= 0:
+                return None
+            ready = select.select([server, stdin], [], [], left)[0]
+            if stdin in ready:
+                return None
+            if server not in ready:
+                continue
+            connection, _address = server.accept()
+            if _authenticated(connection, token):
+                _use_connection(connection)
+                return connection
+            connection.close()
+    finally:
+        server.close()
+
+
+def _authenticated(connection, token):
+    """Whether the connection's first line is the data prefix and the expected token."""
+    import hmac
+
+    expected = _DATA_PREFIX + token + b"\n"
+    line = b""
+    try:
+        connection.settimeout(10)
+        while not line.endswith(b"\n") and len(line) < len(expected):
+            chunk = connection.recv(len(expected) - len(line))
+            if not chunk:
+                return False
+            line += chunk
+        connection.settimeout(None)
+    except OSError:
+        return False
+    return hmac.compare_digest(line, expected)
+
+
+def _use_connection(connection):
+    """Send hello, then every later frame, over the data connection as binary frames."""
+    global _SENDER
+    import socket
+
+    try:
+        connection.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+    except OSError:
+        pass
+    sender = Sender(connection.send)
+    old = _SENDER
+    # Under the old lock, so no frame is split between the two transports.
+    with old.lock:
+        sender.frame(HELLO, 0, ("%d.%d" % sys.version_info[:2]).encode("ascii"))
+        _SENDER = sender
+
+
 def _read():
     """Read frames, answer light requests, and queue the rest for the main thread."""
     receiver = Receiver(sys.stdin.buffer.readinto)
@@ -649,6 +730,12 @@ def _read():
         op = request.get("op") if isinstance(request, dict) else None
         if op in _LIGHT:
             _run(stream, request, False)
+            continue
+        if op == "listen":
+            connection = _listen(stream, request)
+            request = None
+            if connection is not None:
+                receiver = Receiver(connection.recv_into)
             continue
         _JOBS.put((stream, request))
         if op == "reexec":

@@ -13,8 +13,10 @@ what a caller observes instead of on which method was called.
 from __future__ import annotations
 
 import base64
+import contextlib
 import json
 import os
+import socket
 import subprocess
 import sys
 from dataclasses import dataclass, field
@@ -518,6 +520,125 @@ class FakeModalAdapter:
     def exit_on(self, *ops: str) -> None:
         self._monkeypatch.setenv("FAKE_MODAL_EXIT", ",".join(ops))
 
+    def tunnel_to(self, host: str, port: int, *, tls: bool) -> None:
+        """Answer ``tunnel`` with this address instead of the sandbox's own port."""
+        self._monkeypatch.setenv(
+            "FAKE_MODAL_TUNNEL", json.dumps({"host": host, "port": port, "tls": tls})
+        )
+
+
+class TlsProxy:
+    """A local TLS-terminating proxy, as a Modal encrypted port is, in front of a plain port.
+
+    One thread relays each connection with non-blocking sockets, so the proxy never uses its
+    own TLS object from two threads.
+    """
+
+    def __init__(self, cert: Path, key: Path):
+        import ssl
+
+        self.cert = cert
+        self._server_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        self._server_context.load_cert_chain(str(cert), str(key))
+        #: A client context that trusts the proxy's certificate for the name ``localhost``.
+        self.context = ssl.create_default_context(cafile=str(cert))
+
+    def start(self, target_port: int) -> int:
+        """Listen on a free port, relaying each connection to ``target_port``, and return it."""
+        import threading
+
+        server = socket.socket()
+        server.bind(("127.0.0.1", 0))
+        server.listen(8)
+        threading.Thread(target=self._accept, args=(server, target_port), daemon=True).start()
+        return server.getsockname()[1]
+
+    def _accept(self, server: socket.socket, target_port: int) -> None:
+        import threading
+
+        while True:
+            try:
+                raw, _ = server.accept()
+                tls = self._server_context.wrap_socket(raw, server_side=True)
+                upstream = socket.create_connection(("127.0.0.1", target_port))
+            except OSError:
+                continue
+            threading.Thread(target=_relay, args=(tls, upstream), daemon=True).start()
+
+
+def _relay(tls: Any, upstream: socket.socket) -> None:
+    import selectors
+    import ssl
+
+    selector = selectors.DefaultSelector()
+    tls.setblocking(False)
+    upstream.setblocking(False)
+    selector.register(tls, selectors.EVENT_READ)
+    selector.register(upstream, selectors.EVENT_READ)
+    to_upstream = bytearray()
+    to_tls = bytearray()
+    try:
+        while True:
+            for key, _ in selector.select(0.01):
+                sock = key.fileobj
+                try:
+                    data = sock.recv(1 << 16)
+                except (ssl.SSLWantReadError, ssl.SSLWantWriteError, BlockingIOError):
+                    continue
+                if not data:
+                    return
+                (to_upstream if sock is tls else to_tls).extend(data)
+            while tls.pending():
+                to_upstream.extend(tls.recv(tls.pending()))
+            for buffer, sock in ((to_upstream, upstream), (to_tls, tls)):
+                while buffer:
+                    try:
+                        sent = sock.send(buffer[: 1 << 16])
+                    except (ssl.SSLWantReadError, ssl.SSLWantWriteError, BlockingIOError):
+                        break
+                    del buffer[:sent]
+    except OSError:
+        return
+    finally:
+        for sock in (tls, upstream):
+            with contextlib.suppress(OSError):
+                sock.close()
+
+
+@pytest.fixture
+def tls_proxy(tmp_path: Path) -> TlsProxy:
+    """A TLS proxy with a certificate made for this test only, never stored in the repository."""
+    import shutil
+    import subprocess
+
+    openssl = shutil.which("openssl")
+    if openssl is None:
+        pytest.skip("openssl is needed to make a test certificate")
+    cert, key = tmp_path / "cert.pem", tmp_path / "key.pem"
+    subprocess.run(
+        [
+            openssl,
+            "req",
+            "-x509",
+            "-newkey",
+            "rsa:2048",
+            "-nodes",
+            "-days",
+            "1",
+            "-subj",
+            "/CN=localhost",
+            "-addext",
+            "subjectAltName=DNS:localhost",
+            "-keyout",
+            str(key),
+            "-out",
+            str(cert),
+        ],
+        check=True,
+        capture_output=True,
+    )
+    return TlsProxy(cert, key)
+
 
 @pytest.fixture
 def fake_modal(monkeypatch, tmp_path: Path) -> FakeModalAdapter:
@@ -534,6 +655,12 @@ def fake_modal(monkeypatch, tmp_path: Path) -> FakeModalAdapter:
     monkeypatch.setattr(
         tools, "modal_adapter_command", lambda uv: [sys.executable, str(FAKE_MODAL_ADAPTER)]
     )
+    from letify.providers import modal as modal_module
+
+    # The stand-in sandbox is a local process, so its data port is one free on this machine.
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", 0))
+        monkeypatch.setattr(modal_module, "DATA_PORT", probe.getsockname()[1])
     return FakeModalAdapter(monkeypatch, state)
 
 

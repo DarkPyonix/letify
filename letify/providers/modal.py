@@ -18,10 +18,15 @@ blob table to keep a large argument from travelling twice.
 from __future__ import annotations
 
 import base64
+import contextlib
 import json
 import os
+import secrets
 import signal
+import socket
+import ssl
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -64,6 +69,16 @@ WIRE_NAMES = {
     "A100_80GB": "A100-80GB",
     "RTX_PRO_6000": "RTX-PRO-6000",
 }
+
+#: The port the worker listens on inside a sandbox for the data channel, exposed with
+#: Modal ``encrypted_ports``.
+DATA_PORT = 8765
+
+#: Seconds the worker waits for the data connection after it answers ``listen``.
+LISTEN_WAIT = 60
+
+#: Seconds the channel allows for connecting through the tunnel and for the hello after it.
+DATA_CONNECT_TIMEOUT = 30
 
 #: Packages the sandbox image installs for the worker.
 WORKER_PACKAGES = ("cloudpickle", "blake3")
@@ -390,6 +405,7 @@ class Modal(Provider):
         # The workspace root is a Modal volume, so it outlives each sandbox. A mount path
         # has to be absolute inside the sandbox.
         volumes = {root: f"{app}-workspace"} if root.startswith("/") else {}
+        data_port = DATA_PORT if self.config.option("data_channel", True) is not False else None
         # Not `python3 -`: that reads standard input to the end before running anything, so
         # the requests that follow the source would be compiled as source too.
         created = adapter.request(
@@ -401,10 +417,11 @@ class Modal(Provider):
             gpu=self.wire_name(runtime.instance) or None,
             timeout=int(self.config.option("timeout", 3600)),
             idle_timeout=int(self.config.option("idle_timeout", IDLE_TIMEOUT)),
+            ports=[] if data_port is None else [data_port],
         )
         sandbox = str(created["sandbox"])
         self._sandboxes[runtime.name] = sandbox
-        return SandboxChannel(adapter, sandbox, name=runtime.name)
+        return SandboxChannel(adapter, sandbox, name=runtime.name, data_port=data_port)
 
     def stop(self, runtime: Runtime) -> None:
         sandbox = self._sandboxes.pop(runtime.name, None)
@@ -421,6 +438,116 @@ class Modal(Provider):
             pass
 
 
+#: The most plaintext one TLS write encrypts, so the socket order lock is never held long.
+TLS_WRITE = 1 << 20
+
+
+class TlsStream:
+    """TLS over a connected socket, for one reading thread and any number of writing threads.
+
+    Spec "Modal data channel": the TLS object works on two memory buffers. ``_state`` guards
+    the TLS object and both buffers, ``_wire`` orders encrypted bytes on the socket, and no
+    socket call is made while ``_state`` is held, so a write blocked on a full socket never
+    stops the reading thread from decrypting.
+    """
+
+    def __init__(self, sock: socket.socket, tls: Any, incoming: Any, outgoing: Any):
+        self._sock = sock
+        self._tls = tls
+        self._incoming = incoming
+        self._outgoing = outgoing
+        self._state = threading.Lock()
+        self._wire = threading.Lock()
+
+    @classmethod
+    def client(cls, sock: socket.socket, context: ssl.SSLContext, host: str) -> TlsStream:
+        """Complete a client handshake for ``host`` over ``sock`` and return the stream."""
+        incoming, outgoing = ssl.MemoryBIO(), ssl.MemoryBIO()
+        tls = context.wrap_bio(incoming, outgoing, server_hostname=host)
+        stream = cls(sock, tls, incoming, outgoing)
+        stream._handshake()
+        return stream
+
+    def _handshake(self) -> None:
+        while True:
+            with self._state:
+                try:
+                    self._tls.do_handshake()
+                    done = True
+                except ssl.SSLWantReadError:
+                    done = False
+                data = self._outgoing.read()
+            if data:
+                with self._wire:
+                    self._sock.sendall(data)
+            if done:
+                return
+            if not self._fill():
+                raise ConnectionResetError("the TLS peer closed the connection in the handshake")
+
+    def _fill(self) -> bool:
+        """Move received bytes into the TLS object's input. False at end of stream."""
+        data = self._sock.recv(1 << 20)
+        if not data:
+            return False
+        with self._state:
+            self._incoming.write(data)
+        return True
+
+    def send(self, data: Any) -> int:
+        """Encrypt at most ``TLS_WRITE`` bytes of ``data``, send them, and return the count."""
+        piece = memoryview(data).cast("B")[:TLS_WRITE]
+        with self._wire:
+            with self._state:
+                count = self._tls.write(piece)
+                # Also carries any bytes the reading thread's TLS work left behind, in order.
+                encrypted = self._outgoing.read()
+            self._sock.sendall(encrypted)
+        return count
+
+    def recv_into(self, view: memoryview) -> int:
+        """Fill ``view`` with decrypted bytes and return how many, 0 at end of stream."""
+        while True:
+            count = 0
+            closed = False
+            with self._state:
+                while count < view.nbytes:
+                    try:
+                        got = self._tls.read(view.nbytes - count, view[count:])
+                    except ssl.SSLWantReadError:
+                        break
+                    except (ssl.SSLZeroReturnError, ssl.SSLEOFError):
+                        closed = True
+                        break
+                    if not got:
+                        closed = True
+                        break
+                    count += got
+                pending = self._outgoing.pending
+            if pending:
+                self._flush()
+            if count:
+                return count
+            if closed or not self._fill():
+                return 0
+
+    def _flush(self) -> None:
+        """Send bytes the TLS object produced while reading, unless a writer is sending now.
+
+        A writer holding ``_wire`` sends them with its own bytes, so the reading thread never
+        waits for a blocked write.
+        """
+        if not self._wire.acquire(blocking=False):
+            return
+        try:
+            with self._state:
+                data = self._outgoing.read()
+            if data:
+                self._sock.sendall(data)
+        finally:
+            self._wire.release()
+
+
 class SandboxChannel(FramedChannel):
     """Carries the worker's frames over a sandbox's pipes, through the adapter.
 
@@ -428,34 +555,120 @@ class SandboxChannel(FramedChannel):
     plumbing differs: Modal returns a sandbox's output as text, so the worker writes each
     frame as a base64 line, a write is a ``write`` request, and each line is read with a
     ``read_until`` request.
+
+    With ``data_port`` set, the frames move to a TCP connection through the sandbox's
+    encrypted port after each hello, as spec "Modal data channel" describes, and standard
+    input and output carry only the worker source and the ``listen`` request.
     """
 
     text_frames = True
 
-    def __init__(self, adapter: Adapter, sandbox: str, *, name: str):
+    def __init__(self, adapter: Adapter, sandbox: str, *, name: str, data_port: int | None = None):
         self.adapter = adapter
         self.sandbox = sandbox
         self.name = name
+        self.data_port = data_port
+        #: The context a TLS tunnel is verified with. None uses the system's trusted roots.
+        self.tls_context: ssl.SSLContext | None = None
         self._connection = None
         self._closing = False
-
-    def _kill(self) -> None:
-        """End the sandbox from outside the adapter a blocked read may be holding."""
-        self.adapter.abort()
+        self._stdio: Connection | None = None
+        self._socket: socket.socket | None = None
 
     def start(self) -> None:
         if self._connection is not None:
             return
         self._raw = bytearray()
-        self._connection = Connection(
+        self._stdio = Connection(
             self.name,
             self._write,
             wire.chunks_readinto(self._read_chunks),
             self._emit,
-            death_detail=lambda: bytes(self._raw[-2000:]).decode("utf-8", "replace"),
+            death_detail=self._raw_text,
         )
+        self._connection = self._stdio
         self._send_worker()
         self._await_ready()
+
+    def _raw_text(self) -> str:
+        return bytes(self._raw[-2000:]).decode("utf-8", "replace")
+
+    def _send_worker(self) -> None:
+        # After a reexec the data connection is gone, so the source goes back over stdio.
+        if self._connection is not self._stdio:
+            self._close_socket()
+            self._connection = self._stdio
+        super()._send_worker()
+
+    def _await_ready(self) -> None:
+        super()._await_ready()
+        if self.data_port is None:
+            return
+        try:
+            self._connection = self._open_data(self.data_port)
+        except (LetifyError, OSError, ValueError, KeyError, TypeError) as exc:
+            self._close_socket()
+            print(
+                f"letify: {self.name}: the data channel did not open ({exc}); "
+                "frames stay on standard input and output",
+                file=sys.stderr,
+                flush=True,
+            )
+
+    def _open_data(self, port: int) -> Connection:
+        """Ask the worker to listen, connect through the tunnel, and wait for its hello."""
+        stdio = self._stdio
+        assert stdio is not None
+        token = secrets.token_hex(32)
+        stdio.request(
+            {"op": "listen", "port": port, "token": token, "wait": LISTEN_WAIT},
+            timeout=DATA_CONNECT_TIMEOUT + LISTEN_WAIT,
+            kill=self._kill,
+        )
+        tunnel = self.adapter.request("tunnel", sandbox=self.sandbox, port=port)
+        host = str(tunnel["host"])
+        raw = socket.create_connection((host, int(tunnel["port"])), timeout=DATA_CONNECT_TIMEOUT)
+        self._socket = raw
+        try:
+            raw.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            stream: Any = raw
+            if tunnel.get("tls"):
+                context = self.tls_context or ssl.create_default_context()
+                stream = TlsStream.client(raw, context, host)
+            hello = b"LETIFY-DATA " + token.encode("ascii") + b"\n"
+            view = memoryview(hello)
+            while view:
+                view = view[stream.send(view) :]
+            connection = Connection(
+                self.name, stream.send, stream.recv_into, self._emit, death_detail=self._raw_text
+            )
+            # The connect timeout still applies to the socket, so a missing hello fails here.
+            connection.wait_hello()
+        except BaseException:
+            self._close_socket()
+            raise
+        raw.settimeout(None)
+        return connection
+
+    def _close_socket(self) -> None:
+        sock, self._socket = self._socket, None
+        if sock is None:
+            return
+        with contextlib.suppress(OSError):
+            sock.shutdown(socket.SHUT_RDWR)
+        with contextlib.suppress(OSError):
+            sock.close()
+
+    def _kill(self) -> None:
+        """End the sandbox from outside the adapter a blocked read may be holding."""
+        # Terminate first: a blocked read on the data connection returns as soon as the socket
+        # is shut down, and the caller must not see that before the sandbox is gone.
+        try:
+            self.adapter.abort()
+        finally:
+            if self._socket is not None:
+                with contextlib.suppress(OSError):
+                    self._socket.shutdown(socket.SHUT_RDWR)
 
     def close(self) -> None:
         connection = self._connection
@@ -468,6 +681,7 @@ class SandboxChannel(FramedChannel):
             pass
         finally:
             self._closing = False
+        self._close_socket()
 
     #: The most bytes one write request carries. Modal refuses a sandbox stdin write that
     #: would buffer more than 2 MiB, so a larger frame goes out in several requests.
@@ -509,5 +723,6 @@ __all__ = [
     "Adapter",
     "Modal",
     "SandboxChannel",
+    "TlsStream",
     "VolumePathMissing",
 ]

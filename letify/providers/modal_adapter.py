@@ -113,6 +113,7 @@ class Adapter:
                 str(path): modal.Volume.from_name(str(name), create_if_missing=True)
                 for path, name in (request.get("volumes") or {}).items()
             },
+            encrypted_ports=[int(port) for port in request.get("ports") or []],
         )
         sandbox_id = str(getattr(sandbox, "object_id", "") or f"sandbox-{len(self.sandboxes) + 1}")
         self.sandboxes[sandbox_id] = SandboxStream(sandbox)
@@ -151,6 +152,12 @@ class Adapter:
         if stream is None:
             raise KeyError(f"no sandbox {sandbox_id!r} in this adapter")
         return stream
+
+    def op_tunnel(self, request: dict[str, Any]) -> Any:
+        """The TLS address of an encrypted port the sandbox was created with."""
+        stream = self._stream(request)
+        tunnel = stream.sandbox.tunnels(timeout=50)[int(request["port"])]
+        return {"host": str(tunnel.host), "port": int(tunnel.port), "tls": True}
 
     def op_write(self, request: dict[str, Any]) -> Any:
         stream = self._stream(request)

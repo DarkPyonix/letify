@@ -116,6 +116,13 @@ def handle(request: dict, sandboxes: dict[str, Sandbox]) -> object:
         with (STATE / "sandboxes.jsonl").open("a", encoding="utf-8") as log:
             log.write(json.dumps([sandbox_id, sandboxes[sandbox_id].process.pid]) + "\n")
         return {"sandbox": sandbox_id}
+    if op == "tunnel":
+        # FAKE_MODAL_TUNNEL names another address, such as a local TLS proxy in front of the
+        # port. Otherwise the sandbox is a local process and its port is reached directly.
+        tunnel = os.environ.get("FAKE_MODAL_TUNNEL")
+        if tunnel:
+            return json.loads(tunnel)
+        return {"host": "127.0.0.1", "port": int(request["port"]), "tls": False}
     if op == "write":
         sandboxes[request["sandbox"]].write(request["data"])
         return None

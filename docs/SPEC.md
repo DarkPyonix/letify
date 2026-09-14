@@ -427,7 +427,8 @@ The protocol is one JSON object per line. letify sends `{"id": <int>, "op": <nam
 | Op | Fields | Value |
 |---|---|---|
 | `hello` | none | `{"modal": <installed Modal version>}` |
-| `create` | `app`, `args`, `packages`, `gpu`, `timeout`, `idle_timeout` | `{"sandbox": <id>}`. Runs `app` as an ephemeral app on first use, builds `debian_slim` with `packages` installed, and starts `args` in a sandbox |
+| `create` | `app`, `args`, `packages`, `gpu`, `timeout`, `idle_timeout`, `volumes`, `ports` | `{"sandbox": <id>}`. Runs `app` as an ephemeral app on first use, builds `debian_slim` with `packages` installed, and starts `args` in a sandbox. Each port in `ports` is exposed with Modal `encrypted_ports` |
+| `tunnel` | `sandbox`, `port` | `{"host": <text>, "port": <int>, "tls": <bool>}`. The address that reaches `port` inside the sandbox, from `Sandbox.tunnels()`. `tls` is true when the connection has to be made with TLS, which an encrypted port needs |
 | `write` | `sandbox`, `data` | `null`. `data` is base64 of at most 1 MiB. Writes the decoded bytes to the sandbox's standard input and drains it. Modal refuses a write that would buffer more than 2 MiB, so the channel splits a larger frame into `write` requests of 1 MiB, in order |
 | `read_until` | `sandbox`, `prefixes` | `{"lines": [...], "eof": <bool>}`. The sandbox's stdout lines up to and including the first that starts with one of `prefixes`, or every line left when the stream ends |
 | `terminate` | `sandbox` | `null`. Also ends a sandbox this adapter did not create, found by id |
@@ -439,7 +440,7 @@ The protocol is one JSON object per line. letify sends `{"id": <int>, "op": <nam
 
 Every volume op creates the volume when it is missing, as version `version`.
 
-The persistent channel to a sandbox is that sandbox's standard input and output, carried by `write` and `read_until`. The sandbox runs the bootstrap stub `python3 -u -c BOOTSTRAP`, and the worker source goes out first as the byte count line and source described above. Modal returns a sandbox's standard output as text, so the source the channel sends sets `_LETIFY_TEXT_FRAMES = True` after the frame code, and that worker writes each frame as lines of base64 of the frame's bytes, each line encoding at most 36 KiB, so no line is longer than 48 KiB. Modal delivers a stdout line longer than 64 KiB as several lines, which are not base64 on their own, and ends the stream on a line of 768 KiB. Each line decodes on its own, because 36 KiB is a multiple of 3 bytes. The channel reads those lines with `read_until` and `prefixes` `[""]`, one line per request, and joins the decoded bytes back into frames. Frames sent to the sandbox are raw bytes, base64 encoded only inside the `write` request. A `read_until` that ends at end of stream without a reply raises `ProtocolError`.
+The persistent channel to a sandbox starts on that sandbox's standard input and output, carried by `write` and `read_until`. The sandbox runs the bootstrap stub `python3 -u -c BOOTSTRAP`, and the worker source goes out first as the byte count line and source described above. Modal returns a sandbox's standard output as text, so the source the channel sends sets `_LETIFY_TEXT_FRAMES = True` after the frame code, and that worker writes each frame as lines of base64 of the frame's bytes, each line encoding at most 36 KiB, so no line is longer than 48 KiB. Modal delivers a stdout line longer than 64 KiB as several lines, which are not base64 on their own, and ends the stream on a line of 768 KiB. Each line decodes on its own, because 36 KiB is a multiple of 3 bytes. The channel reads those lines with `read_until` and `prefixes` `[""]`, one line per request, and joins the decoded bytes back into frames. Frames sent to the sandbox are raw bytes, base64 encoded only inside the `write` request. A `read_until` that ends at end of stream without a reply raises `ProtocolError`.
 
 A missing uv raises `ProviderUnavailable` naming uv. A reply of kind `unavailable` raises `ProviderUnavailable` for `modal`. An adapter process that exits, or prints a line that is not the reply it was waiting for, raises `RuntimeFailure` carrying the adapter's standard error, because that is an infrastructure failure. A reply of kind `failure` raises `RuntimeFailure` with the adapter's message. One adapter process serves one provider or one backend and exits when its standard input closes.
 
@@ -457,6 +458,28 @@ A `read_until` blocks until the sandbox prints a line, and the adapter answers o
 - The adapter's `terminate` for an id it did not create finds the sandbox with `modal.Sandbox.from_id` and terminates it. A sandbox that is already gone is not an error.
 
 Modal also bounds a sandbox that nothing terminates. `create` passes `timeout`, the entry option `timeout`, 3600 s by default, as the sandbox's maximum lifetime. It passes `idle_timeout`, the entry option `idle_timeout`, 600 s by default, after which Modal terminates a sandbox that is idle.
+
+### Modal data channel <!-- id: modal-data-channel -->
+
+> Once the worker has said hello over the sandbox's standard input and output, the channel moves its frames to a TCP connection through a Modal encrypted port. Standard input and output stay the control path and the fallback.
+
+`Modal.open_channel` creates the sandbox with `ports` `[DATA_PORT]`, where `modal.DATA_PORT` is 8765. The provider option `data_channel = false` creates it with no port and keeps every frame on standard input and output.
+
+After each `HELLO` that arrives over standard input and output, the first and the one after every `reexec`, the channel opens the data channel:
+
+1. It makes a token of 32 random bytes with `secrets.token_hex(32)` and sends the request `{"op": "listen", "port": DATA_PORT, "token": <token>, "wait": 60}` over standard input and output.
+2. The worker's frame reader answers that request itself, before reading another frame. It binds `0.0.0.0:<port>` with `SO_REUSEADDR`, sends the reply, and accepts connections until one authenticates, `wait` seconds pass, or a byte arrives on standard input.
+3. The channel asks the adapter for `tunnel` on `DATA_PORT` and connects to that host and port with a 30 s timeout, wrapping the socket in TLS with the tunnel host as server name when `tls` is true. It sets `TCP_NODELAY` and writes the line `LETIFY-DATA <token>\n`.
+4. The worker reads that line within 10 s and compares the token with `hmac.compare_digest`. A connection that sends anything else is closed and the worker accepts again. On a match it closes the listener, sends `HELLO` on the connection, sends every later frame there as binary frames under the old sender's lock so no frame is split, and its frame reader reads frames from the connection instead of standard input.
+5. The channel waits for that `HELLO` and then carries every request over the connection.
+
+TLS comes from the Modal tunnel. The channel's side of TLS is an `ssl.SSLObject` over two `ssl.MemoryBIO` buffers, not an `ssl.SSLSocket`, because the thread reading frames and a thread writing a request run at the same time and OpenSSL does not allow two threads inside one TLS object. One lock guards the TLS object and its buffers. A second lock orders the encrypted bytes on the socket. Socket reads and writes happen outside the first lock, so a write blocked on a full socket never stops the reading thread from decrypting. Each write encrypts at most 1 MiB. The token is what stops another client of the public tunnel address from speaking the protocol, and it travels only over the adapter's authenticated control path.
+
+When any step fails, a `tunnel` failure, a connection that does not open, or no `HELLO` within 30 s, the channel prints one line on stderr, `letify: <runtime>: the data channel did not open (<reason>); frames stay on standard input and output`, and keeps using standard input and output. The worker returns to reading standard input when a byte arrives there or its `wait` ends without an authenticated connection, so a request the channel sends over standard input after a failure is answered without waiting for `wait`.
+
+A `reexec` request goes over the data connection. The worker replies there and replaces its process, which closes the connection. The channel then sends the worker source over standard input, waits for `HELLO` there, and opens the data channel again.
+
+Closing the channel sends `SHUTDOWN` over the connection that carries frames and closes the socket. A connection that ends while requests are open fails them with `ProtocolError`, as a closed pipe does. A request timeout closes the socket, which ends the blocked read.
 
 The adapter never deploys an app. `create` starts `modal.App(app).run()` the first time it sees an app name and holds that context for the adapter's lifetime. When standard input closes, the adapter terminates its remaining sandboxes and then leaves every app context, which stops the ephemeral app. An adapter that dies stops sending Modal's client heartbeat, and Modal stops the ephemeral app for it. So no app named `app` stays on the account after letify stops.
 
@@ -776,7 +799,7 @@ A package the lock file names is installed in the runtime and referenced by name
 
 > A `Shell` reaches its machine through a connection pipeline: several strategies are tried at once, the fastest acceptable one wins, and the winner is cached per account.
 
-`Modal` and `Local` are not part of this. Modal is reached through the Modal adapter, described in [Modal adapter](#modal-adapter), and Local starts its worker as a child process.
+`Modal` and `Local` are not part of this. Modal is reached through the Modal adapter, described in [Modal adapter](#modal-adapter), with frames on a TCP connection through a Modal encrypted port as [Modal data channel](#modal-data-channel) describes, and Local starts its worker as a child process.
 
 The measurements behind the order and the rules below are in [NETWORK.md](NETWORK.md#connection-pipeline-measurements).
 
