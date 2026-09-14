@@ -331,6 +331,48 @@ def test_a_blocked_write_holds_the_sender_thread_and_not_the_step(client, monkey
     assert x.sum().item() == 4.0
 
 
+def test_a_read_with_nothing_else_being_sent_is_written_by_the_waiting_thread(
+    client, monkeypatch
+) -> None:
+    import threading
+
+    x = torch.ones(4, device="cuda")
+    client.synchronize()
+    writers: list[bool] = []
+    original = client.transport.send
+
+    def recorded(head, buffers):
+        writers.append(threading.current_thread() is threading.main_thread())
+        original(head, buffers)
+
+    monkeypatch.setattr(client.transport, "send", recorded)
+    assert (x * 2).sum().item() == 8.0
+    assert writers and writers[-1] is True
+
+
+def test_a_read_behind_a_batch_still_being_written_goes_through_the_sender_thread(
+    client, monkeypatch
+) -> None:
+    import threading
+
+    gate = threading.Event()
+    writers: list[bool] = []
+    original = client.transport.send
+
+    def held(head, buffers):
+        writers.append(threading.current_thread() is threading.main_thread())
+        if len(writers) == 1:
+            gate.wait(10)
+        original(head, buffers)
+
+    monkeypatch.setattr(client.transport, "send", held)
+    x = torch.ones(4, device="cuda")
+    client._flush()
+    threading.Timer(0.2, gate.set).start()
+    assert x.sum().item() == 4.0
+    assert writers == [False, False]
+
+
 def test_a_read_sends_only_the_entries_its_value_depends_on(client, monkeypatch) -> None:
     from letify.remoting.device import client as client_module
 

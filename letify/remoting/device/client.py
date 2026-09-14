@@ -139,6 +139,8 @@ class Client:
         #: Held for a round trip, so replies are read in the order requests were sent.
         self._request_lock = threading.RLock()
         self._outbox: queue.SimpleQueue = queue.SimpleQueue()
+        #: Batches handed to the sender thread and not yet written, guarded by ``_flush_lock``.
+        self._unsent = 0
         self._waiting = threading.Event()
         #: Handles below this were created by an entry already sent, so they may be released.
         self._sent_upto = 1
@@ -173,7 +175,9 @@ class Client:
                 try:
                     self._cut()
                     self._flush()
-                    self._outbox.put((pickle.dumps({"close": True}, protocol=5), [], None))
+                    with self._flush_lock:
+                        self._unsent += 1
+                        self._outbox.put((pickle.dumps({"close": True}, protocol=5), [], None))
                 except (RuntimeLost, TransportClosed):
                     pass
             self._closed = True
@@ -391,7 +395,17 @@ class Client:
             head = pickle.dumps(
                 {"entries": entries, "release": released, "reply": reply}, protocol=5
             )
-            self._outbox.put((head, buffers, keep))
+            if reply and self._unsent == 0:
+                # The waiting thread writes its own synchronization, in order, because no
+                # earlier batch is queued for or being written by the sender thread.
+                try:
+                    self.transport.send(head, buffers)
+                except TransportClosed as exc:
+                    if self._lost is None:
+                        self._lost = str(exc)
+            else:
+                self._unsent += 1
+                self._outbox.put((head, buffers, keep))
             self.stats.batches += 1
             self.stats.released += len(released)
             self.stats.sent_bytes += len(head) + sum(view.nbytes for view in buffers)
@@ -422,6 +436,9 @@ class Client:
                 if self._lost is None:
                     self._lost = str(exc)
                 return
+            finally:
+                with self._flush_lock:
+                    self._unsent -= 1
             del item, keep, buffers
 
     # -- synchronization ---------------------------------------------------------------
