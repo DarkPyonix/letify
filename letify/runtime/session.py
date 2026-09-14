@@ -262,11 +262,15 @@ class Runtime:
         blobs = f"{root}/data/blobs"
         added = 0
         if collector.placed:
-            added = pathdata.send(self, collector, blobs)
+            if collector.inputs:
+                added = pathdata.send(self, collector, blobs)
             request["data"] = collector.request(blobs)
         self.last_used = time.monotonic()
         try:
-            return self.channel.request(request, timeout=timeout)
+            outcome = self.channel.request(request, timeout=timeout)
+            if collector.outputs:
+                added += pathdata.write_back(self, collector, blobs)
+            return outcome
         finally:
             if added:
                 pathdata.evict(self, blobs)
