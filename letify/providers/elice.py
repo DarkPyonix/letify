@@ -841,8 +841,16 @@ class Elice(Shell):
             time.sleep(POLL_SECONDS)
         raise RuntimeFailure(f"installing the key on Elice machine {address} failed", stderr=last)
 
-    def start(self, instance: Instance, env: Any, *, name: str, volumes: Any = ()) -> Runtime:
-        runtime = super().start(instance, env, name=name, volumes=volumes)
+    def start(
+        self,
+        instance: Instance,
+        env: Any,
+        *,
+        name: str,
+        volumes: Any = (),
+        held: tuple[int, ...] = (),
+    ) -> Runtime:
+        runtime = super().start(instance, env, name=name, volumes=volumes, held=held)
         runtime.external_id = self._pending_machine
         return runtime
 

@@ -2592,3 +2592,22 @@ def test_a_lane_whose_index_is_taken_is_closed_and_hello_waits_for_every_lane() 
         lane1.close()
     finally:
         channel.close()
+
+
+def test_every_provider_start_accepts_the_keywords_the_pool_passes() -> None:
+    # Spec "Provider model": the pool starts a runtime with name, volumes and held, so an
+    # override that drops one fails only when a live session starts.
+    import inspect
+
+    from letify.providers import base, elice, kaggle, local, modal, shell
+
+    wanted = {"name", "volumes", "held"}
+    classes = {base.Provider}
+    for module in (elice, kaggle, local, modal, shell):
+        for value in vars(module).values():
+            if isinstance(value, type) and issubclass(value, base.Provider):
+                classes.add(value)
+    for cls in classes:
+        parameters = inspect.signature(cls.start).parameters
+        missing = wanted - parameters.keys()
+        assert not missing, f"{cls.__name__}.start lacks {sorted(missing)}"
