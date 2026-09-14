@@ -146,6 +146,9 @@ Each file is hashed once and remembered by size, modification time and inode in 
 
 A changed file is sent again on its own; the rest is not. Each call that carries data prints one line, for example `letify: data 8 files 1024.0 MiB detected, 7 files 896.0 MiB already on the runtime, uploaded 1 files 128.0 MiB in 1.4 s (91.4 MiB/s)`.
 
+The runtime keeps these files under `<workspace root>/data/blobs` within a budget: 50 GiB or half of the disk space the cache could use, whichever is smaller, or `data_cache_gib = <GiB>` on the account. After a call that sent or wrote back new files, the least recently used files no running call uses are removed, and one line reports it, for example `letify: data cache evicted 120 files 4096.0 MiB in 0.1 s, 51200.0 MiB of 50.0 GiB in use`. A file used in the last 10 minutes is never removed, so the cache can stay over the budget for a while.
+
+`letify cache` shows the size of each persistent provider's runtime cache and prunes `~/.cache/letify/digests.json` of files that no longer exist. `letify cache clear <alias>` empties one provider's runtime cache. Ephemeral providers are listed as not kept between sessions.
 ### Files the call writes
 
 A directory and a path that does not exist yet are output locations. When the call returns, every file the body created or changed there is copied to the same relative path on the local disk.

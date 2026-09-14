@@ -115,6 +115,18 @@ class DigestCache:
         self._dirty = True
         return digest
 
+    def __len__(self) -> int:
+        return len(self._entries)
+
+    def prune(self) -> int:
+        """Drop entries whose file no longer exists, and answer how many were dropped."""
+        gone = [key for key in self._entries if not os.path.exists(key)]
+        for key in gone:
+            del self._entries[key]
+        if gone:
+            self._dirty = True
+        return len(gone)
+
     def record(self, file: Path, digest: str) -> None:
         """Remember the digest of a file this process has just written."""
         info = os.stat(file)
@@ -122,7 +134,8 @@ class DigestCache:
         self._dirty = True
 
     def save(self) -> None:
-        """Replace the cache file atomically when an entry was added or changed."""
+        """Replace the cache file atomically when an entry was added, changed or pruned."""
+        self.prune()
         if not self._dirty:
             return
         with _CACHE_LOCK:
@@ -328,8 +341,34 @@ class _Uploaded:
             self.progress.finish(self.base)
 
 
-def send(runtime: Runtime, collector: Collector, blobs: str) -> None:
-    """Make sure the runtime's file blob cache holds every digest the call needs."""
+def budget_bytes(provider: Provider) -> int | None:
+    """The account's ``data_cache_gib`` in bytes, or None for the worker's default."""
+    gib = provider.config.option("data_cache_gib")
+    if gib is None:
+        return None
+    return int(float(gib) * (1 << 30))
+
+
+def evict(runtime: Runtime, blobs: str) -> None:
+    """Keep the runtime's file blob cache within its budget, as spec describes."""
+    from .. import install
+
+    result = _worker(
+        runtime, {"op": "data_evict", "dir": blobs, "budget": budget_bytes(runtime.provider)}
+    )
+    if result and result["files"]:
+        install.log(
+            f"data cache evicted {result['files']} files {_mib(result['bytes'])} in "
+            f"{result['seconds']:.1f} s, {_mib(result['total'])} of "
+            f"{result['budget'] / (1 << 30):.1f} GiB in use"
+        )
+
+
+def send(runtime: Runtime, collector: Collector, blobs: str) -> int:
+    """Make sure the runtime's file blob cache holds every digest the call needs.
+
+    Answers how many blobs the runtime's cache received.
+    """
     from .. import install
 
     collector.cache.save()
@@ -394,6 +433,7 @@ def send(runtime: Runtime, collector: Collector, blobs: str) -> None:
         f"{detected_files - up_files} files {_mib(detected_bytes - up_bytes)} already on {where}, "
         f"uploaded {up_files} files {_mib(up_bytes)} in {elapsed:.1f} s ({rate:.1f} MiB/s)"
     )
+    return len(missing)
 
 
 def _put(
@@ -452,8 +492,10 @@ class _Downloaded(_Uploaded):
             self.progress = _Progress(f"{files} files", total, sys.stderr)
 
 
-def write_back(runtime: Runtime, collector: Collector, blobs: str) -> None:
+def write_back(runtime: Runtime, collector: Collector, blobs: str) -> int:
     """Copy what a returned call created or changed at its output locations to the client.
+
+    Answers how many files the runtime listed, each of which is now in its blob cache.
 
     Spec "Writing back".
     """
@@ -493,6 +535,7 @@ def write_back(runtime: Runtime, collector: Collector, blobs: str) -> None:
         f"data wrote back {sent_files} files {_mib(sent_bytes)} in {elapsed:.1f} s "
         f"({rate:.1f} MiB/s), {kept_files} files {_mib(kept_bytes)} already on the client"
     )
+    return sum(len(files) for _placed, files in plan)
 
 
 def _same(cache: DigestCache, target: Path, digest: str) -> bool:

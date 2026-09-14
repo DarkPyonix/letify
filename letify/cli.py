@@ -134,6 +134,11 @@ def build_parser() -> argparse.ArgumentParser:
     check = sub.add_parser("check", help="check that a provider answers")
     check.add_argument("alias", help="provider alias from the configuration")
 
+    cache = sub.add_parser("cache", help="show the data caches, or clear a provider's")
+    cache.add_argument("action", nargs="?", choices=("clear",), help="clear a runtime cache")
+    cache.add_argument("alias", nargs="?", help="provider alias whose runtime cache to clear")
+    cache.add_argument("--json", action="store_true", help="print the records unformatted")
+
     probe = sub.add_parser("probe", help="measure whether host='local' is worth using")
     probe.add_argument("host", nargs="?", help="host name to measure the round trip to")
     probe.add_argument("--json", action="store_true", help="print the record unformatted")
@@ -270,6 +275,94 @@ def _setup_tool(args: argparse.Namespace) -> int:
         _fail(f"{tool} was installed but letify cannot find it")
         return 1
     _say("ok", f"{tool} {version} at {found}")
+    return 0
+
+
+def _data_cache_request(let: Launcher, alias: str, clear: bool) -> dict:
+    """Ask a session on the provider's first instance about its file blob cache."""
+    from .declare import Env
+    from .store import pathdata
+
+    provider = let.provider(alias)
+    from . import remote
+
+    # The worker answers the request, so no PyTorch is needed on this side.
+    instance = next(iter(provider.instances.values()))._placed(remote)
+    with let.invocation():
+        runtime = let.pool.acquire(instance, Env())
+        try:
+            root = (runtime.workspace or provider.workspace_root).rstrip("/")
+            payload = {
+                "op": "data_cache",
+                "dir": f"{root}/data/blobs",
+                "budget": pathdata.budget_bytes(provider),
+                "clear": clear,
+            }
+            return runtime.request(payload, timeout=600)
+        finally:
+            let.pool.release(runtime)
+
+
+def _cache(let: Launcher, args: argparse.Namespace) -> int:
+    """Spec "The cache command"."""
+    from .store import pathdata
+
+    mib = 1 << 20
+    if args.action == "clear":
+        if not args.alias:
+            _fail("name the provider whose runtime cache to clear: letify cache clear <alias>")
+            return 1
+        result = _data_cache_request(let, args.alias, True)
+        if args.json:
+            return _json({"alias": args.alias, **result})
+        print(
+            f"{args.alias}: removed {result['removed']} files "
+            f"{result['removed_bytes'] / mib:.1f} MiB"
+        )
+        return 0
+    digests = pathdata.DigestCache()
+    pruned = digests.prune()
+    digests.save()
+    records: list[dict] = []
+    for alias in let.config.order:
+        try:
+            provider = let.provider(alias)
+            if not provider.persistent:
+                records.append({"alias": alias, "kept": False})
+                continue
+            result = _data_cache_request(let, alias, False)
+        except LetifyError as exc:
+            records.append({"alias": alias, "unavailable": str(exc)})
+            continue
+        records.append(
+            {
+                "alias": alias,
+                "kept": True,
+                "files": result["files"],
+                "bytes": result["bytes"],
+                "budget": result["budget"],
+            }
+        )
+    record = {"digests": {"entries": len(digests), "pruned": pruned}, "providers": records}
+    if args.json:
+        return _json(record)
+    print(f"digest cache: {len(digests)} entries, {pruned} pruned")
+    rows = []
+    for row in records:
+        if "unavailable" in row:
+            rows.append([row["alias"], f"unavailable: {row['unavailable']}", "", ""])
+        elif not row["kept"]:
+            rows.append([row["alias"], "not kept between sessions", "", ""])
+        else:
+            rows.append(
+                [
+                    row["alias"],
+                    str(row["files"]),
+                    f"{row['bytes'] / mib:.1f} MiB",
+                    f"{row['budget'] / (1 << 30):.1f} GiB",
+                ]
+            )
+    sys.stdout.write(render.table(["PROVIDER", "BLOBS", "SIZE", "BUDGET"], rows, _out()))
     return 0
 
 
@@ -454,6 +547,9 @@ def _dispatch(args: argparse.Namespace) -> int:
             return _json(rows)
         sys.stdout.write(render.utilization_blocks(rows, render.Style.for_stream(sys.stdout)))
         return 0
+
+    if args.command == "cache":
+        return _cache(let, args)
 
     if args.command == "check":
         provider = let.provider(args.alias)

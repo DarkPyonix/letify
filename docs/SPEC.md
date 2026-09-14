@@ -764,7 +764,7 @@ Nothing hands a session to the caller. There is no call that returns one, no arg
 
 ### Project data <!-- id: project-data -->
 
-> A call's data is found in the call itself. Every local `pathlib.Path` the function reaches is sent as content addressed file blobs, only the blobs the runtime or the account's bucket lacks travel, and the body sees a path on the runtime with the same layout. What the body writes into a detected directory or a path that did not exist comes back to the local path when the call returns.
+> A call's data is found in the call itself. Every local `pathlib.Path` the function reaches is sent as content addressed file blobs, only the blobs the runtime or the account's bucket lacks travel, and the body sees a path on the runtime with the same layout. What the body writes into a detected directory or a path that did not exist comes back to the local path when the call returns. The runtime's file blob cache is kept within a byte budget.
 
 The declared function is sent with cloudpickle, which serializes its closure variables, the globals it references, its default arguments and the call's arguments. letify's pickler intercepts every `os.PathLike` among them through `reducer_override`. Nothing is declared: the function's own references are the declaration.
 
@@ -841,6 +841,36 @@ On the local side, a listed file whose local copy exists with the same digest, b
 Concurrent calls that write back to the same local path take one local lock per resolved local path, held for the whole write-back of that output. So one call's files land after the other's, never interleaved inside one file, and the last call to return wins per file. Files only one of the calls wrote are all kept.
 
 A file placed as a hard link shares its inode with the cache file. When a body writes into such a file in place, which a process running as root can do despite the read-only mode, the cache file no longer matches its digest. After every call, whether it returned or raised, the worker compares each placed cache file's size and modification time with those recorded at placement and removes the cache file when they differ, so the next call receives the digest again.
+
+#### Runtime data cache budget <!-- id: project-data-cache-budget -->
+
+The file blob cache under `<workspace root>/data/blobs` is kept under a byte budget by evicting the least recently used blobs no running call links to.
+
+The budget is `data_cache_gib` on the account, in GiB, when it is set. Otherwise it is the smaller of 50 GiB and half of the cache's current size plus the free space of the file system holding it, measured by the worker when it checks.
+
+A blob's last use is its modification time. Committing a blob sets it, and the worker sets it to the current time for every digest a `data_have` request finds and every blob a call links or copies.
+
+After each call whose data sending uploaded or pulled at least one blob, or whose write-back listed at least one file, whether the call returned or raised, the local process sends one `data_evict` request after the write-back has finished, with the cache directory and `data_cache_gib` in bytes or none. When the cache total is over the budget, the worker removes blobs oldest last use first until the total is within it, skipping:
+
+1. a blob whose link count is above 1, because a running call's directory links it;
+2. a blob last used within the past 600 seconds, because a call may have been told the runtime holds it and not yet linked it;
+3. partial files.
+
+So the cache can stay over the budget while every remaining blob is linked or recent. When at least one blob was removed, the local process prints one line on standard error:
+
+`letify: data cache evicted <files> files <size> in <seconds> s, <size> of <budget> in use`
+
+Sizes are in MiB with one decimal and `<budget>` in GiB with one decimal.
+
+#### The cache command <!-- id: project-data-cache-command -->
+
+`letify cache` shows the client digest cache and each provider's runtime file blob cache. `letify cache clear <alias>` empties one provider's runtime cache.
+
+`letify cache` first removes every digest cache entry whose file no longer exists, then prints the digest cache's entry count and how many were removed. For each provider in the configuration whose runtime disk persists between sessions, it starts a session on the provider's first instance, asks the worker with one `data_cache` request, and prints the alias, the blob count, the total size and the budget. A provider whose runtime disk does not persist is listed with `not kept between sessions` and no session is started. `--json` prints the same records.
+
+`letify cache clear <alias>` starts a session on that provider and sends `data_cache` with `clear` set. The worker removes every committed blob whose link count is 1, ignoring the 600 second window, and the command prints `<alias>: removed <files> files <size>`.
+
+The digest cache also drops entries whose file no longer exists each time it is saved.
 
 
 ### Backends
@@ -1786,5 +1816,4 @@ Pushing a tag `v*` runs `.github/workflows/publish.yml`. It builds the sdist, th
 - **The connection pipeline is not exercised against live networks.** `Rendezvous`, `Strategy`, `Link`, `Probe`, `Pipeline`, `LinkCache` and the remote agent are implemented and tested over loopback sockets and faked commands. Installing and starting `sshd` on a Colab VM over `colab exec` is not yet checked against a live runtime.
 - **letify runs no command on an Elice machine through `eci`.** Elice's remote half runs over forward SSH to the machine's public IP, and the punch and Tailcat strategies need that SSH to succeed first.
 - **Orphan reconciliation is not implemented.** A session whose controlling machine was killed outright is released by the lease on the providers where the process is the cost. Where the platform bills for the machine and takes no deadline, nothing ends it: an Elice machine bills compute until it is stopped. The intended answer is that the next letify process asks the provider what is running under this project's name and ends what nothing is watching, with a command to do it on demand. Neither exists yet.
-- **The runtime's file blob cache is never evicted.** The cache under `<workspace root>/data/blobs` grows with every distinct file a call sends or writes back.
 - **Persistence detection is not implemented.** Deciding a machine's disk policy by writing a marker file and looking for it in a later runtime is a decision recorded here, not yet code.

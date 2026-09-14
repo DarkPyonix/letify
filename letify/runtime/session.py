@@ -260,15 +260,20 @@ class Runtime:
         head, buffers = protocol.dumps_call_parts(fn, args, kwargs, data=collector)
         request: dict[str, Any] = {"op": "call", "payload": head, "buffers": buffers}
         blobs = f"{root}/data/blobs"
+        added = 0
         if collector.placed:
             if collector.inputs:
-                pathdata.send(self, collector, blobs)
+                added = pathdata.send(self, collector, blobs)
             request["data"] = collector.request(blobs)
         self.last_used = time.monotonic()
-        outcome = self.channel.request(request, timeout=timeout)
-        if collector.outputs:
-            pathdata.write_back(self, collector, blobs)
-        return outcome
+        try:
+            outcome = self.channel.request(request, timeout=timeout)
+            if collector.outputs:
+                added += pathdata.write_back(self, collector, blobs)
+            return outcome
+        finally:
+            if added:
+                pathdata.evict(self, blobs)
 
     # -- content addressed arguments -----------------------------------------
 
