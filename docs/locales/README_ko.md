@@ -349,6 +349,16 @@ def train(lr): ...
 
 런타임은 볼륨을 여러분의 컴퓨터를 거치지 않고 버킷에서 바로 받습니다. 이때 로컬 로그인에서 잠시 빌린 짧은 수명의 토큰을 쓰므로, 원격에는 인증 정보가 남지 않습니다.
 
+학습 데이터는 선언할 필요가 없습니다. `pathlib.Path`를 인자로 넘기거나 전역 변수에서 읽으면, letify가 그 경로의 파일을 내용 주소 블롭으로 보냅니다. 함수 본문은 같은 구조를 가진 런타임 쪽 경로를 받습니다. persistent 머신은 블롭을 자기 디스크에 두므로 두 번째 세션의 업로드는 0바이트입니다. `bucket = "<이름>"`을 설정한 ephemeral 계정은 파일마다 버킷에 한 번만 올리고, 이후 런타임은 모두 버킷에서 받습니다.
+
+```python
+DATA = Path("data/imagenet-subset")
+
+@let.function(device=lab.A100, host=letify.remote)
+def train(lr):
+    for file in DATA.iterdir(): ...   # 이미 런타임 디스크에 있음
+```
+
 이 구조를 고른 이유입니다.
 
 | | 🐌 양방향 파일 동기화 | ⚡ 내용 주소 방식 |

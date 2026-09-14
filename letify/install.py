@@ -294,8 +294,9 @@ def asset_for(tool: str) -> Asset:
 class _Progress:
     """The download progress line of spec "Installing external tools", Download progress."""
 
-    def __init__(self, label: str, total: int | None, stream) -> None:
+    def __init__(self, label: str, total: int | None, stream, verb: str = "downloading") -> None:
         self.label = label
+        self.verb = verb
         self.total = total if total and total > 0 else None
         self.stream = stream
         self.terminal = render.color_enabled(stream) or _isatty(stream)
@@ -308,7 +309,7 @@ class _Progress:
         elapsed = max(time.monotonic() - self.started, 1e-6)
         rate = done / elapsed / (1 << 20)
         mib = done / (1 << 20)
-        head = f"letify: downloading {self.label} "
+        head = f"letify: {self.verb} {self.label} "
         if self.total is None:
             return f"{head}{mib:.1f} MiB {rate:.1f} MiB/s"
         fraction = done / self.total

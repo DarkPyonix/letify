@@ -223,6 +223,145 @@ def _reply(stream, outcome):
 
 
 def _op_call(request):
+    data = request.pop("data", None)
+    if data is None:
+        return _call(request)
+    _data_link(data)
+    try:
+        return _call(request)
+    finally:
+        import shutil
+        shutil.rmtree(data["dir"], ignore_errors=True)
+
+
+def _data_file(root, digest):
+    return os.path.join(root, digest[:2], digest)
+
+
+def _data_hasher():
+    try:
+        import blake3
+    except ImportError:
+        return None
+    return blake3.blake3(max_threads=blake3.blake3.AUTO)
+
+
+def _data_commit(partial, final, digest, hasher):
+    """Rename a received file into the cache once its digest matches, read-only."""
+    if hasher is not None:
+        found = hasher.hexdigest(length=16)
+        if found != digest:
+            os.remove(partial)
+            raise ValueError("file blob %s arrived with digest %s" % (digest, found))
+    try:
+        os.chmod(partial, 0o444)
+    except OSError:
+        pass
+    os.replace(partial, final)
+
+
+def _op_data_have(request):
+    """Which file blobs the cache holds with the expected size."""
+    held = []
+    for digest, size in request["digests"]:
+        try:
+            if os.stat(_data_file(request["dir"], digest)).st_size == size:
+                held.append(digest)
+        except OSError:
+            pass
+    return {"ok": True, "value": held}
+
+
+_DATA_OPEN = {}
+
+
+def _op_data_put(request):
+    """Append one piece of a file blob, and commit it after the last piece."""
+    digest = request["digest"]
+    final = _data_file(request["dir"], digest)
+    partial = "%s.partial.%d" % (final, os.getpid())
+    chunk = request.pop("chunk")
+    if request["offset"] == 0:
+        os.makedirs(os.path.dirname(final), exist_ok=True)
+        stale = _DATA_OPEN.pop(digest, None)
+        if stale is not None:
+            stale[0].close()
+        _DATA_OPEN[digest] = (open(partial, "wb"), _data_hasher())
+    handle, hasher = _DATA_OPEN[digest]
+    handle.write(chunk)
+    if hasher is not None:
+        hasher.update(chunk)
+    chunk = None
+    if request.get("last"):
+        del _DATA_OPEN[digest]
+        handle.close()
+        _data_commit(partial, final, digest, hasher)
+    return {"ok": True, "value": None}
+
+
+def _op_data_pull(request):
+    """Download file blobs from the bucket, eight at a time, then forget the headers."""
+    import urllib.request
+
+    headers = request.pop("headers", None) or {}
+    root = request["dir"]
+    items = list(request.pop("items"))
+    failures = []
+    lock = threading.Lock()
+
+    def fetch():
+        while True:
+            with lock:
+                if not items or failures:
+                    return
+                digest, url = items.pop()
+            final = _data_file(root, digest)
+            partial = "%s.partial.%d.%d" % (final, os.getpid(), threading.get_ident())
+            try:
+                os.makedirs(os.path.dirname(final), exist_ok=True)
+                hasher = _data_hasher()
+                wanted = urllib.request.Request(url, headers=headers)
+                with urllib.request.urlopen(wanted, timeout=3600) as response, \
+                        open(partial, "wb") as out:
+                    while True:
+                        piece = response.read(1 << 20)
+                        if not piece:
+                            break
+                        out.write(piece)
+                        if hasher is not None:
+                            hasher.update(piece)
+                _data_commit(partial, final, digest, hasher)
+            except BaseException as exc:
+                with lock:
+                    failures.append("%s: %s" % (digest, exc))
+                return
+
+    threads = [threading.Thread(target=fetch, daemon=True) for _ in range(8)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    headers = None
+    if failures:
+        raise RuntimeError("pulling file blobs failed: " + "; ".join(failures))
+    return {"ok": True, "value": None}
+
+
+def _data_link(data):
+    """Place each file of a call at its runtime path, a hard link to the cache or a copy."""
+    import shutil
+    for directory in data.get("dirs", ()):
+        os.makedirs(directory, exist_ok=True)
+    for path, digest in data.get("links", ()):
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        source = _data_file(data["blobs"], digest)
+        try:
+            os.link(source, path)
+        except OSError:
+            shutil.copyfile(source, path)
+
+
+def _call(request):
     fn, args, kwargs = _load_call(request)
     request.clear()
     args = _resolve(args)
@@ -572,6 +711,9 @@ def _op_lease(request):
 _OPS = {
     "call": _op_call,
     "have": _op_have,
+    "data_have": _op_data_have,
+    "data_put": _op_data_put,
+    "data_pull": _op_data_pull,
     "blob_dir": _op_blob_dir,
     "put_blob": _op_put_blob,
     "put_file": _op_put_file,

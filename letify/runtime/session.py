@@ -237,10 +237,34 @@ class Runtime:
         # cloudpickle and a process can hold declarations with different environments.
         if self.env.ship_modules:
             protocol.codec.ship_by_value(self.env.ship_modules)
-        if self.persistent_channel:
-            args, kwargs = self._externalize(args, kwargs)
+        if not self.persistent_channel:
+            self.last_used = time.monotonic()
+            return self.channel.call(fn, args, kwargs, timeout=timeout)
+        args, kwargs = self._externalize(args, kwargs)
+        return self._call_with_data(fn, args, kwargs, timeout)
+
+    def _call_with_data(
+        self, fn: Any, args: tuple, kwargs: dict, timeout: float | None
+    ) -> tuple[Any, str]:
+        """Pickle a call, replacing local data paths, and send their blobs before it.
+
+        Spec "Project data": the call carries the links the worker places before loading it.
+        """
+        import secrets
+
+        from ..store import pathdata
+
+        assert self.channel is not None
+        root = (self.workspace or self.provider.workspace_root).rstrip("/")
+        collector = pathdata.Collector(f"{root}/data/calls/{secrets.token_hex(8)}")
+        head, buffers = protocol.dumps_call_parts(fn, args, kwargs, data=collector)
+        request: dict[str, Any] = {"op": "call", "payload": head, "buffers": buffers}
+        if collector.placed:
+            blobs = f"{root}/data/blobs"
+            pathdata.send(self, collector, blobs)
+            request["data"] = collector.request(blobs)
         self.last_used = time.monotonic()
-        return self.channel.call(fn, args, kwargs, timeout=timeout)
+        return self.channel.request(request, timeout=timeout)
 
     # -- content addressed arguments -----------------------------------------
 

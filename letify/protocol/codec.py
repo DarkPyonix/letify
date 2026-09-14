@@ -67,22 +67,40 @@ def dumps_call(fn: Any, args: tuple, kwargs: dict) -> bytes:
     return cloudpickle.dumps((fn, args, kwargs), protocol=5)
 
 
-def dumps_call_parts(fn: Any, args: tuple, kwargs: dict) -> tuple[bytes, list[pickle.PickleBuffer]]:
-    """Serialize a call with its out-of-band buffers kept apart, for a binary channel."""
+def dumps_call_parts(
+    fn: Any, args: tuple, kwargs: dict, *, data: Any = None
+) -> tuple[bytes, list[pickle.PickleBuffer]]:
+    """Serialize a call with its out-of-band buffers kept apart, for a binary channel.
+
+    ``data``, when given, is a collector whose ``reduce`` replaces local paths, as spec
+    "Project data" describes.
+    """
     buffers: list[pickle.PickleBuffer] = []
     file = io.BytesIO()
-    _CallPickler(file, protocol=5, buffer_callback=buffers.append).dump((fn, args, kwargs))
+    pickler = _CallPickler(file, protocol=5, buffer_callback=buffers.append)
+    pickler.data = data
+    pickler.dump((fn, args, kwargs))
     return file.getvalue(), buffers
 
 
 class _CallPickler(cloudpickle.Pickler):
-    """cloudpickle with the tensor reducer of spec "Frames" consulted first."""
+    """cloudpickle with the tensor reducer of spec "Frames" and the data collector first."""
+
+    data: Any = None
 
     def reducer_override(self, obj: Any) -> Any:
         reduced = wire.reduce_tensor(obj)
-        if reduced is NotImplemented:
-            return super().reducer_override(obj)
-        return reduced
+        if reduced is not NotImplemented:
+            return reduced
+        if (
+            self.data is not None
+            and not isinstance(obj, (str, bytes))
+            and hasattr(type(obj), "__fspath__")
+        ):
+            reduced = self.data.reduce(obj)
+            if reduced is not NotImplemented:
+                return reduced
+        return super().reducer_override(obj)
 
 
 def _hasher() -> Any:
