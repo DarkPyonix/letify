@@ -97,6 +97,29 @@ _PUMPS = [_Pump(1, STDOUT), _Pump(2, STDERR)]
 for _pump in _PUMPS:
     _pump.start()
 
+
+def _forked_child():
+    """Detach a process the body forked from the worker's channel and tie it to the worker.
+
+    The frame reader thread may hold the lock of ``sys.stdin`` at the fork, and
+    multiprocessing closes ``sys.stdin`` in its children, so the child gets its own.
+    """
+    try:
+        sys.stdin = open(os.devnull)
+    except OSError:
+        pass
+    if sys.platform.startswith("linux"):
+        try:
+            import ctypes
+            import signal
+            ctypes.CDLL(None, use_errno=True).prctl(1, int(signal.SIGKILL), 0, 0, 0)
+        except (OSError, AttributeError):
+            pass
+
+
+if hasattr(os, "register_at_fork"):
+    os.register_at_fork(after_in_child=_forked_child)
+
 def _readable(fd):
     try:
         import select
