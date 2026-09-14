@@ -251,7 +251,7 @@ def test_a_platform_with_no_release_asset_fails_with_the_releases_page(
     releases, monkeypatch
 ) -> None:
     monkeypatch.setattr(install, "host", lambda: ("Plan9", "mips"))
-    with pytest.raises(install.InstallError, match="github.com/tailscale/tailcat/releases"):
+    with pytest.raises(install.InstallError, match=r"github\.com/tailscale/tailcat/releases"):
         install.install("tailcat")
 
 

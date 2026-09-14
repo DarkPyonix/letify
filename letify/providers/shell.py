@@ -141,7 +141,13 @@ class Shell(Provider):
 
     @property
     def tailcat_binary(self) -> str:
-        return str(self.config.option("tailcat_binary", "tailcat"))
+        """The account's ``tailcat_binary``, or the tool lookup's answer without asking."""
+        given = self.config.option("tailcat_binary")
+        if given:
+            return str(given)
+        from ..install import find
+
+        return find("tailcat") or "tailcat"
 
     def ssh_command(self, remote_command: str | None = None) -> list[str]:
         """Build the OpenSSH command line that reaches this machine's address directly."""

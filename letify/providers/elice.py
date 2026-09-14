@@ -163,12 +163,23 @@ def eci_install_message(system: str | None = None) -> str:
     )
 
 
-def find_eci(binary: str = "eci") -> str:
-    """The eci executable, or ``ProviderUnavailable`` carrying the install command."""
-    found = shutil.which(binary)
-    if found is None:
-        raise ProviderUnavailable("elice", eci_install_message())
-    return found
+def find_eci(binary: str = "eci", *, interactive: bool = False) -> str:
+    """The eci executable, or ``ProviderUnavailable`` carrying the install command.
+
+    The default name goes through the lookup of spec "Installing external tools", which
+    offers the install on a terminal when ``interactive``. Another name is run as written.
+    """
+    from .. import install
+
+    if binary != "eci":
+        found = shutil.which(binary)
+        if found is None:
+            raise ProviderUnavailable("elice", eci_install_message())
+        return found
+    try:
+        return install.ensure("eci", interactive=interactive, instructions=eci_install_message())
+    except install.InstallError as exc:
+        raise ProviderUnavailable("elice", str(exc)) from None
 
 
 def eci_environment(alias: str, token: str, endpoint: str, zone_id: str | None) -> dict[str, str]:
@@ -410,7 +421,7 @@ class Elice(Shell):
     # -- eci -------------------------------------------------------------------
 
     def _eci(self, args: list[str], *, parse: bool = True) -> Any:
-        binary = find_eci(self.eci_binary)
+        binary = find_eci(self.eci_binary, interactive=True)
         env = eci_environment(self.alias, self._token(), self.endpoint, self.zone_id)
         account_directory(self.alias).mkdir(parents=True, exist_ok=True)
         return eci(binary, args, env, parse=parse)
