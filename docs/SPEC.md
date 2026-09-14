@@ -889,7 +889,7 @@ The key is per session. letify generates a new ed25519 key pair for each session
 
 > Colab is a `Shell` whose rendezvous is `colab exec`. It has no forward SSH, and its fallback is `colab exec` with the Colab file API.
 
-The Colab CLI runs as `uv tool run --from google-colab-cli colab`, with `jupyter-kernel-client<1` pinned, because release 0.6.0 of the CLI calls an API that jupyter-kernel-client 1.0 removed. `colab new` and `colab stop` manage the session.
+The Colab CLI runs as `uv tool run --from google-colab-cli colab`, with `jupyter-kernel-client<1` pinned, because release 0.6.0 of the CLI calls an API that jupyter-kernel-client 1.0 removed. `colab new` and `colab stop` manage the session. `Colab.sessions()` reads `colab sessions` and returns the first word of each listing line. A line starting with `[colab]` is a message from the CLI, such as `[colab] No active sessions found on server.`, and names no session, so an account with no session returns an empty list.
 
 Colab limits outbound UDP to roughly 200 packets per second, so rank 3 is expected to lose the probe there. It stays in the list because the ratio rule removes it without a special case.
 

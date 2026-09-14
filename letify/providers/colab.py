@@ -274,7 +274,8 @@ class Colab(Shell):
         names = []
         for line in self._cli("sessions", timeout=120).splitlines():
             token = line.strip().split()[:1]
-            if token and not token[0].lower().startswith(("name", "session", "-")):
+            # A line starting with "[colab]" is the CLI's own message, not a session.
+            if token and not token[0].lower().startswith(("name", "session", "-", "[colab]")):
                 names.append(token[0])
         return names
 

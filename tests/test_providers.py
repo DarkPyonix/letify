@@ -469,6 +469,14 @@ def test_the_sessions_an_account_holds_are_read_from_the_cli(
     assert provider_of(Colab, "colab_a").sessions() == ["letify-g4-1", "letify-t4-2"]
 
 
+def test_an_account_with_no_colab_session_lists_none(isolated_home, patch_which, patch_run) -> None:
+    # Spec "Colab": the CLI's own message line names no session.
+    patch_which(tools_module, present=True)
+    listing = "[colab] No active sessions found on server.\n"
+    patch_run(colab_module, result=FakeCompleted(stdout=listing))
+    assert provider_of(Colab, "colab_a").sessions() == []
+
+
 def test_a_failing_cli_command_carries_the_command_and_the_error(
     isolated_home, patch_which, patch_run
 ) -> None:
