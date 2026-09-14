@@ -241,6 +241,11 @@ def _read_tensor(
     if view.nbytes <= INLINE_BYTES:
         blobs.append(bytes(view))
         return False
+    if host.data_ptr() == value.data_ptr():
+        # The write happens later on the sender thread, so the bytes are copied now and a
+        # change the caller makes to its tensor afterwards does not reach the runtime.
+        host = host.clone()
+        view = tensor_view(host)
     blobs.append(Big(view, host))
     return True
 
