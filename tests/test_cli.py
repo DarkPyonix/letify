@@ -76,7 +76,7 @@ def test_the_accelerators_every_provider_offers_are_listed(isolated_home, capsys
     (isolated_home / ".letify" / "config.toml").write_text(
         '[lab]\nkind = "shell"\naddress = "a"\ngpus = ["A100"]\n', encoding="utf-8"
     )
-    assert main(["devices"]) == 0
+    assert main(["devices", "--json"]) == 0
     table = json.loads(capsys.readouterr().out)
     assert table["lab"] == ["A100"]
     assert "CPU" in table["local"]
@@ -87,7 +87,7 @@ def test_a_configuration_file_can_be_named_explicitly(isolated_home, tmp_path, c
     elsewhere.write_text(
         '[lab]\nkind = "shell"\naddress = "a"\ngpus = ["H100"]\n', encoding="utf-8"
     )
-    assert main(["--config", str(elsewhere), "devices"]) == 0
+    assert main(["--config", str(elsewhere), "devices", "--json"]) == 0
     assert json.loads(capsys.readouterr().out)["lab"] == ["H100"]
 
 
@@ -96,7 +96,7 @@ def test_a_configuration_file_can_be_named_explicitly(isolated_home, tmp_path, c
 
 def test_the_capability_probe_is_on_the_command_line(isolated_home, capsys) -> None:
     # Whether forwarding can run here, and what it would cost.
-    assert main(["probe"]) == 0
+    assert main(["probe", "--json"]) == 0
     report = json.loads(capsys.readouterr().out)
     assert report["platform"]
     assert report["reason"]
