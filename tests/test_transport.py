@@ -101,6 +101,40 @@ def test_a_punch_that_meets_nobody_gives_up_at_the_end_of_its_window() -> None:
         nat.punch(free_port(), ("127.0.0.1", 9), b"t" * 16, initiator=False, start_at=0, window=0.3)
 
 
+def test_a_punch_waiting_for_its_start_time_ends_when_it_is_cancelled() -> None:
+    cancel = threading.Event()
+    threading.Timer(0.2, cancel.set).start()
+    began = time.monotonic()
+    with pytest.raises(nat.Cancelled):
+        nat.punch(
+            free_port(),
+            ("127.0.0.1", 9),
+            b"t" * 16,
+            initiator=True,
+            start_at=time.time() + 10,
+            window=15.0,
+            cancel=cancel,
+        )
+    assert time.monotonic() - began < 1.0
+
+
+def test_a_punch_that_is_dialing_ends_when_it_is_cancelled() -> None:
+    cancel = threading.Event()
+    threading.Timer(0.2, cancel.set).start()
+    began = time.monotonic()
+    with pytest.raises(nat.Cancelled):
+        nat.punch(
+            free_port(),
+            ("127.0.0.1", 9),
+            b"t" * 16,
+            initiator=False,
+            start_at=0,
+            window=15.0,
+            cancel=cancel,
+        )
+    assert time.monotonic() - began < 1.0
+
+
 def test_a_hello_with_the_wrong_token_is_not_the_connection() -> None:
     port = free_port()
     caught: list[BaseException] = []
@@ -248,6 +282,38 @@ def test_a_strategy_that_connects_after_the_choice_is_closed(isolated_home) -> N
     assert pipeline([late, punch], grace=0.1).connect().strategy == "tcp_punch"
     time.sleep(0.8)
     assert late.links and late.links[0].closed
+
+
+def test_an_attempt_still_running_when_the_choice_is_made_is_cancelled(isolated_home) -> None:
+    direct = FakeStrategy("direct_ssh", 1, result=result(10, 10))
+    punch = FakeStrategy("tcp_punch", 2, delay=20.0, result=result(10, 10), cancellable=True)
+    began = time.monotonic()
+    assert pipeline([direct, punch], grace=0.1).connect().strategy == "direct_ssh"
+    assert punch.ended.wait(1.0)
+    assert time.monotonic() - began < 2.0
+    assert punch.cancelled
+    assert punch.links == []
+
+
+def test_a_cancelled_attempt_is_printed_as_cancelled_not_failed(isolated_home) -> None:
+    lines: list[str] = []
+    direct = FakeStrategy("direct_ssh", 1, result=result(10, 10))
+    punch = FakeStrategy("tcp_punch", 2, delay=20.0, cancellable=True)
+    chosen = Pipeline(
+        [direct, punch],
+        target=None,
+        alias="lab",
+        probe=FakeProbe(),
+        fingerprint=fingerprint(),
+        grace=0.1,
+        timeout=5.0,
+        say=lines.append,
+    ).connect()
+    assert chosen.strategy == "direct_ssh"
+    assert punch.ended.wait(1.0)
+    time.sleep(0.05)
+    assert any("tcp_punch cancelled" in line for line in lines)
+    assert not any("tcp_punch failed" in line for line in lines)
 
 
 def test_a_lone_connected_strategy_is_chosen_even_when_its_probe_fails(isolated_home) -> None:

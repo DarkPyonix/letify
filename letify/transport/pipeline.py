@@ -262,10 +262,18 @@ class Pipeline:
         outcomes: dict[int, Any] = {}
         state: dict[str, Any] = {"decided": False, "first": None, "first_name": None}
         began = time.monotonic()
+        #: One event per attempt, set once the choice is made so running attempts stop.
+        cancels = [threading.Event() for _ in applicable]
 
         def run(index: int, strategy: Any) -> None:
             try:
-                outcome: Any = strategy.attempt(self.target)
+                outcome: Any = strategy.attempt(self.target, cancel=cancels[index])
+            except nat.Cancelled:
+                self._say(
+                    f"{strategy.name} cancelled after {time.monotonic() - began:.1f} s: "
+                    f"another strategy was chosen"
+                )
+                return
             except Exception as exc:
                 outcome = exc
             elapsed = time.monotonic() - began
@@ -307,6 +315,9 @@ class Pipeline:
                 condition.wait(limit - now)
             state["decided"] = True
             settled = dict(outcomes)
+        for index, event in enumerate(cancels):
+            if index not in settled:
+                event.set()
 
         connected = []
         for index, strategy in enumerate(applicable):

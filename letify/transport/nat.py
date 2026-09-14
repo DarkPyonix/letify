@@ -32,6 +32,10 @@ CHUNK = 64 * 1024
 ANSWER_MARKER = "LETIFY-ANSWER "
 
 
+class Cancelled(Exception):
+    """An attempt was abandoned because another strategy was already chosen."""
+
+
 # -- sockets ---------------------------------------------------------------------
 
 
@@ -151,15 +155,20 @@ def punch(
     initiator: bool,
     start_at: float,
     window: float = 15.0,
+    cancel: threading.Event | None = None,
 ) -> socket.socket:
     """Connect to ``peer`` from ``port`` while listening on it, and agree on one connection.
 
     The initiator takes the first connection that completes and writes the hello with the
-    token. The other side keeps the connection that the hello arrives on.
+    token. The other side keeps the connection that the hello arrives on. Setting
+    ``cancel`` ends the wait for ``start_at`` and the dialing loop with ``Cancelled``.
     """
     delay = start_at - time.time()
     if delay > 0:
-        time.sleep(delay)
+        if cancel is None:
+            time.sleep(delay)
+        elif cancel.wait(delay):
+            raise Cancelled(f"the punch to {peer[0]}:{peer[1]} was cancelled before it began")
     deadline = max(time.time(), start_at) + window
     listener = reusable_socket(port)
     listener.listen(8)
@@ -175,6 +184,9 @@ def punch(
                 sock.close()
 
     while time.time() < deadline:
+        if cancel is not None and cancel.is_set():
+            close_all(None)
+            raise Cancelled(f"the punch to {peer[0]}:{peer[1]} was cancelled")
         if connector is None and time.time() >= retry_at:
             connector = reusable_socket(port)
             connector.setblocking(False)
