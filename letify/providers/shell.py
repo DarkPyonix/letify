@@ -95,6 +95,25 @@ class Shell(Provider):
         return int(value) if isinstance(value, (int, str)) else 22
 
     @property
+    def direct_port(self) -> int:
+        """The port forward SSH dials at the address.
+
+        ``public_port`` is the port the machine publishes to the outside, such as Docker's
+        ``-p 30501:8022``. Without it forward SSH dials ``port``. Hole punching and Tailcat
+        always splice to ``port`` inside the machine.
+        """
+        value = self.config.option("public_port")
+        if isinstance(value, (int, str)) and str(value).isdigit():
+            return int(value)
+        return self.port
+
+    @property
+    def internal_port(self) -> int:
+        """The SSH server's port inside the machine, which the remote agent splices to."""
+        value = self.config.option("port", 22)
+        return int(value) if isinstance(value, (int, str)) else 22
+
+    @property
     def key_path(self) -> str | None:
         value = self.config.option("key")
         return value if isinstance(value, str) else None
@@ -119,7 +138,7 @@ class Shell(Provider):
         command = [
             "ssh",
             "-p",
-            str(self.port),
+            str(self.direct_port),
             "-o",
             "BatchMode=yes",
             "-o",
@@ -188,6 +207,8 @@ class Shell(Provider):
             alias=self.alias,
             address=address if isinstance(address, str) else None,
             direct_ssh=self.ssh_command if isinstance(address, str) else None,
+            direct_port=self.direct_port if isinstance(address, str) else None,
+            ssh_port=self.internal_port,
             user=self.user,
             key=self.key_path,
             remote_python=self.remote_python,

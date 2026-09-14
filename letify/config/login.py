@@ -681,6 +681,14 @@ def tunnel_account(answers: Answers) -> dict[str, Any]:
     if user:
         options["user"] = user
     options["port"] = port
+    # Forward SSH from outside, when the machine publishes its SSH server. Login itself
+    # still runs over Tailcat, so these are only recorded.
+    public_address = fields.get("address") or answers.get("address")
+    if isinstance(public_address, str) and public_address:
+        options["address"] = public_address
+    public_port = fields.get("public_port") or answers.get("public_port")
+    if public_port:
+        options["public_port"] = int(public_port)
     options["key"] = key_path
     if answers.get("persistent") is not None:
         options["persistent"] = bool(answers.get("persistent"))

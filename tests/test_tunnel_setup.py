@@ -19,7 +19,7 @@ from importlib import import_module
 from pathlib import Path
 
 import pytest
-from conftest import FakeCompleted, provider_of
+from conftest import FakeCompleted, FakeStrategy, provider_of
 
 from letify.cli import main
 from letify.config import login
@@ -28,7 +28,8 @@ from letify.providers.tunnel import Tunnel
 from letify.transport import agent as agent_module
 from letify.transport import setup
 from letify.transport import strategies as strategies_module
-from letify.transport.strategies import DirectSSH
+from letify.transport.pipeline import Pipeline
+from letify.transport.strategies import DirectSSH, Target
 
 link_module = import_module("letify.transport.link")
 
@@ -429,3 +430,82 @@ def test_letify_check_on_a_tunnel_account_runs_over_tailcat(
     assert "workspace ~/.letify-runtime: writable" in capsys.readouterr().out
     assert PROXY in answered.command
     assert not any("@None" in part or part == "None" for part in answered.command)
+
+
+# -- Spec: Connection strategies, the published SSH port ----------------------------------
+
+
+def test_forward_ssh_dials_the_public_port_when_the_account_sets_one() -> None:
+    provider = provider_of(
+        Tunnel, "box", address="203.0.113.9", port=8022, public_port=30501, user="researcher"
+    )
+    command = provider.ssh_command("true")
+    assert command[:3] == ["ssh", "-p", "30501"]
+    assert command[-2:] == ["researcher@203.0.113.9", "true"]
+
+
+def test_punch_and_tailcat_keep_the_internal_ssh_port() -> None:
+    provider = provider_of(Tunnel, "box", address="203.0.113.9", port=8022, public_port=30501)
+    target = provider.target()
+    assert target.ssh_port == 8022
+    assert target.direct_port == 30501
+
+
+class LabelledDirect(FakeStrategy):
+    """A fake forward SSH that names itself the way DirectSSH does."""
+
+    def label(self, target: Target) -> str:
+        return DirectSSH().label(target)
+
+
+def test_the_connection_log_names_the_port_forward_ssh_dials(isolated_home, capsys) -> None:
+    target = Target(alias="box", address="203.0.113.9", direct_port=30501)
+    Pipeline([LabelledDirect("direct_ssh", 1)], target=target, alias="box").connect()
+    err = capsys.readouterr().err
+    assert "letify: connecting to box" in err
+    assert "direct_ssh (203.0.113.9:30501)" in err
+
+
+def test_connect_puts_the_public_address_and_port_in_the_token(
+    patch_which, monkeypatch, capsys
+) -> None:
+    patch_which(setup, present=True)
+    monkeypatch.setattr(agent_module.Agent, "start_tailcat", lambda self: "tcAbc123")
+    monkeypatch.setattr(agent_module.Agent, "serve_forever", lambda self: None)
+    monkeypatch.setattr(setup, "local_user", lambda: "researcher")
+    port = banner_server()
+    argv = ["client", "shell", "connect", "--ssh-port", str(port), "--name", "home_box"]
+    argv += ["--public-address", "203.0.113.9", "--public-port", "30501"]
+    assert main(argv) == 0
+    line = next(x.strip() for x in capsys.readouterr().out.splitlines() if "--connect" in x)
+    fields = setup.decode_token(line.split("--connect ", 1)[1])
+    assert fields["address"] == "203.0.113.9"
+    assert fields["public_port"] == 30501
+    assert fields["port"] == port
+
+
+def test_a_tunnel_login_writes_the_address_and_public_port_from_the_token(
+    isolated_home, patch_which, patch_run
+) -> None:
+    patch_which(setup, present=True)
+    with_key()
+    patch_run(login, result=remote())
+    token = setup.encode_token({**TOKEN_FIELDS, "address": "203.0.113.9", "public_port": 30501})
+    assert main(["login", "tunnel", "home_box", "--connect", token, "--no-input"]) == 0
+    entry = home_config()["home_box"]
+    assert entry["address"] == "203.0.113.9"
+    assert entry["public_port"] == 30501
+    assert entry["port"] == 2222
+
+
+def test_a_tunnel_login_takes_the_address_and_public_port_from_options(
+    isolated_home, patch_which, patch_run
+) -> None:
+    patch_which(setup, present=True)
+    with_key()
+    patch_run(login, result=remote())
+    extra = ["--address", "203.0.113.9", "--public-port", "30501", "--no-input"]
+    assert main([*tunnel_login(), *extra]) == 0
+    entry = home_config()["home_box"]
+    assert entry["address"] == "203.0.113.9"
+    assert entry["public_port"] == 30501
