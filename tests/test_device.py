@@ -240,6 +240,105 @@ def test_the_cuda_functions_are_restored_when_forwarding_ends() -> None:
         connected.close()
 
 
+# -- Spec: Autocast ---------------------------------------------------------------
+
+
+def test_autocast_runs_a_linear_layer_in_the_autocast_dtype(client) -> None:
+    layer = torch.nn.Linear(4, 2).cuda()
+    with torch.autocast("cuda", dtype=torch.bfloat16):
+        out = layer(torch.ones(3, 4, device="cuda"))
+        conv = torch.nn.functional.conv2d(
+            torch.ones(1, 2, 5, 5, device="cuda"), torch.ones(3, 2, 3, 3, device="cuda")
+        )
+    assert out.dtype == torch.bfloat16
+    assert conv.dtype == torch.bfloat16
+    assert layer.weight.dtype == torch.float32
+    torch.cuda.synchronize()
+
+
+def test_autocast_runs_float32_functions_in_float32(client) -> None:
+    half = torch.ones(2, 4, device="cuda", dtype=torch.bfloat16)
+    with torch.autocast("cuda", dtype=torch.bfloat16):
+        normed = torch.nn.functional.layer_norm(half, (4,))
+        soft = half.softmax(dim=-1)
+        loss = torch.nn.functional.mse_loss(half, half)
+    assert normed.dtype == soft.dtype == loss.dtype == torch.float32
+
+
+def test_autocast_promotes_mixed_arguments_to_the_widest_dtype(client) -> None:
+    half = torch.ones(2, device="cuda", dtype=torch.bfloat16)
+    full = torch.ones(2, device="cuda")
+    with torch.autocast("cuda", dtype=torch.bfloat16):
+        joined = torch.cat([half, full])
+    assert joined.dtype == torch.float32
+    assert joined.cpu().tolist() == [1.0, 1.0, 1.0, 1.0]
+
+
+def test_autocast_cross_entropy_takes_log_softmax_in_the_input_dtype(client) -> None:
+    # CUDA's cross_entropy_loss runs log_softmax uncast and casts only nll_loss to float32.
+    torch.manual_seed(0)
+    logits = torch.randn(8, 10) * 3
+    target = torch.randint(0, 10, (8,))
+    with client.suspended():
+        half = logits.to(torch.bfloat16)
+        want = torch.nn.functional.nll_loss(torch.log_softmax(half, 1).float(), target)
+    with torch.autocast("cuda", dtype=torch.bfloat16):
+        got = torch.nn.functional.cross_entropy(logits.to(torch.bfloat16).cuda(), target.cuda())
+    assert got.dtype == torch.float32
+    assert got.cpu().item() == want.item()
+
+
+def test_autocast_does_not_widen_index_copy(client) -> None:
+    # CUDA autocast has no kernel for index_copy, so mixed dtypes raise there too.
+    base = torch.zeros(4, device="cuda", dtype=torch.bfloat16)
+    source = torch.ones(2, device="cuda")
+    index = torch.tensor([0, 2]).cuda()
+    with pytest.raises((RuntimeError, RemoteError)):
+        with torch.autocast("cuda", dtype=torch.bfloat16):
+            base.index_copy(0, index, source)
+        torch.cuda.synchronize()
+
+
+def test_operators_outside_an_autocast_region_keep_their_dtype(client) -> None:
+    layer = torch.nn.Linear(4, 2).cuda()
+    with torch.autocast("cuda", dtype=torch.bfloat16, enabled=False):
+        inside = layer(torch.ones(3, 4, device="cuda"))
+    after = layer(torch.ones(3, 4, device="cuda"))
+    assert inside.dtype == after.dtype == torch.float32
+
+
+def _mixed_step(to_device, autocast: bool):
+    """One step of a small model, under autocast or with autocast's casts written out."""
+    torch.manual_seed(0)
+    model = to_device(torch.nn.Sequential(torch.nn.Linear(8, 16), torch.nn.LayerNorm(16)))
+    head = to_device(torch.nn.Linear(16, 4))
+    data = to_device(torch.randn(6, 8))
+    target = to_device(torch.randn(6, 4))
+    if autocast:
+        with torch.autocast("cuda", dtype=torch.bfloat16):
+            loss = torch.nn.functional.mse_loss(head(model(data)), target)
+    else:
+        lin, norm = model
+        bf = torch.bfloat16
+        hidden = torch.nn.functional.linear(data.to(bf), lin.weight.to(bf), lin.bias.to(bf))
+        hidden = torch.nn.functional.layer_norm(hidden.float(), (16,), norm.weight, norm.bias)
+        out = torch.nn.functional.linear(hidden.to(bf), head.weight.to(bf), head.bias.to(bf))
+        loss = torch.nn.functional.mse_loss(out.float(), target)
+    loss.backward()
+    params = [*model.parameters(), *head.parameters()]
+    return float(loss), [p.grad.detach().cpu() for p in params]
+
+
+def test_an_autocast_step_matches_the_same_casts_written_out(client) -> None:
+    with client.suspended():
+        want_loss, want_grads = _mixed_step(lambda value: value, autocast=False)
+    got_loss, got_grads = _mixed_step(lambda value: value.cuda(), autocast=True)
+    assert got_loss == want_loss
+    for got, want in zip(got_grads, want_grads, strict=True):
+        assert got.dtype == torch.float32
+        assert torch.equal(got, want)
+
+
 # -- Spec: Batching and synchronization -----------------------------------------
 
 
