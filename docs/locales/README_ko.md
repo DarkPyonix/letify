@@ -449,6 +449,8 @@ letify check lab      # 이 머신이 응답하나?
 letify probe lab      # 호출 중계를 쓸 만큼 가까운가?
 ```
 
+`usage`, `utilization`, `status`에 `--json`을 붙이면 프로그램이 읽을 수 있는 출력이 나옵니다. [letify-ext/](../../letify-ext/)의 VS Code 확장이 이 출력으로 상태 표시줄에 사용량과 GPU 활동을 보여 줍니다.
+
 ---
 
 ## 📚 문서

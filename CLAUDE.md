@@ -131,6 +131,7 @@ letify/
   providers/        Provider base class and one module per provider
   remoting/         CUDA API forwarding, used only where a low-latency path exists
   _vendor/          Vendored third party code
+letify-ext/         VS Code extension (TypeScript) showing quota and GPU activity from the CLI's --json output
 ```
 
 Conventions:
