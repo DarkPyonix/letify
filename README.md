@@ -269,6 +269,7 @@ Measure your own `k` with `torch.cuda.set_sync_debug_mode("warn")` and your roun
 Provider
 ├── 💻 Local      your machine            persistent
 ├── ☁️  Modal      serverless GPU          persistent
+├── 🏅 Kaggle     Kaggle account          ephemeral, host=remote only
 └── 🐚 Shell      any remote machine      ephemeral by default
     ├── 📓 Colab   via the official CLI
     ├── 🕳️  Tunnel  a machine behind NAT
@@ -283,6 +284,9 @@ Provider
 | 🐚 `Shell` | overridable | lab and university servers |
 | 🕳️ `Tunnel` | overridable | a machine behind NAT you cannot port-forward |
 | 🇰🇷 `Elice` | persistent | Korean GPU cloud, per-second billing |
+| 🏅 `Kaggle` | ephemeral | free weekly GPU hours, `host=letify.remote` only |
+
+**Kaggle.** Make an API token at kaggle.com under Settings, API, then run `letify login kaggle kaggle_a`. The token is asked for without echo, and a `kaggle.json` path works too. letify keeps it in `~/.letify/accounts/kaggle_a/` and checks it with a read-only `kaggle quota` call. `letify usage kaggle_a` prints the GPU hours left this week. A Kaggle declaration must say `host=letify.remote`: Kaggle forbids tunnels, so `host=letify.local` is a type error and raises when the decorator runs. Running a function on a Kaggle session is not available yet.
 
 **letify finds the fastest way in.** For any `Shell`, letify tries several ways to reach the machine at once and keeps the fastest one that works:
 

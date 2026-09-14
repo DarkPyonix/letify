@@ -69,6 +69,7 @@ A declaration taking two cards halves the width on a four card machine, which is
 Provider (abstract)
 ├── Local                 persistent
 ├── Modal                 persistent, reached through the Modal adapter
+├── Kaggle                ephemeral, host="remote" only, account reached through the Kaggle CLI
 └── Shell                 ephemeral by default, reached through the connection pipeline
     ├── Colab             session created by the Colab CLI, rendezvous over colab exec
     ├── Tunnel            a machine behind NAT, rendezvous through letify client shell connect
@@ -99,6 +100,17 @@ A provider is built from one entry in the configuration file and reached by attr
 | `Shell` | ephemeral, overridable | yes | persistent | `filesystem` |
 | `Tunnel` | ephemeral, overridable | yes | persistent | `filesystem` |
 | `Elice` | persistent | yes | persistent | `filesystem` |
+| `Kaggle` | ephemeral | no | none yet; starting a session raises `UnsupportedMode` | `filesystem` |
+
+### Kaggle <!-- id: kaggle-provider -->
+
+> A Kaggle account is declared with its API token and reports its weekly quota. It never opens a tunnel, a port forward or a Tailcat link, and it cannot serve `host="local"`.
+
+These follow from the Kaggle Acceptable Use Policy, which forbids tools for circumvention, and from Kaggle staff saying port forwarding is unsupported. The evidence is in the pull request for branch `feat/kaggle-provider`.
+
+- No keep-alive request is ever sent, and accounts are never rotated.
+- The accelerators are `CPU`, `P100`, `T4` and `TPU_V3_8`, a fixed list read without a network call.
+- Running a declared function on a Kaggle Jupyter Server session, and batch runs through `kaggle kernels push`, are not implemented. `open_channel` raises `UnsupportedMode` saying so.
 
 `Shell` and its subclasses default to ephemeral because a machine's disk policy is not knowable in advance. Assuming ephemeral costs time, since letify rebuilds the environment each runtime and the work still succeeds; assuming persistent fails outright when the disk turns out to be wiped. A configuration entry overrides it with `persistent = true`.
 
