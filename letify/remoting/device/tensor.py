@@ -335,6 +335,7 @@ def _aliases(func: Any) -> bool:
     except AttributeError:  # pragma: no cover - an operator without a schema, or an old PyTorch
         return True
 
+
 _NEW = 0
 _IN = 1
 _VALUE = 2
