@@ -990,6 +990,8 @@ An operator is named by its overload, such as `aten.addmm.default`, and resolved
 
 The queue is sent when it holds 256 operators, when its oldest operator has waited 2 ms, or at a synchronization. A send never waits for a reply.
 
+The dispatching thread does the sending: it sends an aged queue when it queues the next operator. A background thread sends only a queue that nothing has been added to for 50 ms, so operators do not wait behind idle time between steps. Sending from a background thread on every age would take the GIL from the dispatching thread once per batch, and on a busy machine that doubled local dispatch time.
+
 A synchronization is one round trip. These synchronize: `Tensor.item()`, `tolist()`, `cpu()` and `to("cpu")`, `bool()`, `int()` and `float()` of a tensor, which includes control flow on a tensor value, `repr()` and `str()` of a tensor, copying a device tensor into a CPU tensor, an operator whose meta inference raised, the `torch.cuda` queries in [Mapping cuda](#mapping-cuda), `torch.cuda.synchronize()`, and the end of the declared function.
 
 The client counts operators, batches, round trips, released handles and metadata cache hits, so ops per round trip and synchronizations per step are read from the session rather than estimated. An operator is counted when it is dispatched, not when its batch is sent. `letify.remoting.device.current_client()` returns the client of the innermost active forwarding, or None outside one, so code inside a `host="local"` function reads `current_client().stats`.

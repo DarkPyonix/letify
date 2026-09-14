@@ -188,6 +188,41 @@ def test_queued_operators_travel_without_a_round_trip_until_a_value_is_read(
     assert delta.batches <= 3
 
 
+def test_an_aged_queue_is_sent_by_the_next_dispatch_rather_than_in_the_background(
+    client, monkeypatch
+) -> None:
+    from letify.remoting.device import client as client_module
+
+    monkeypatch.setattr(client_module, "IDLE_S", 60.0)
+    x = torch.ones(4, device="cuda")
+    client.synchronize()
+    before = client.stats.batches
+    x.add_(1.0)
+    import time
+
+    time.sleep(0.05)
+    assert client.stats.batches == before
+    x.add_(1.0)
+    assert client.stats.batches == before + 1
+
+
+def test_a_queue_with_nothing_after_it_is_sent_once_idle(client, monkeypatch) -> None:
+    from letify.remoting.device import client as client_module
+
+    monkeypatch.setattr(client_module, "IDLE_S", 0.05)
+    x = torch.ones(4, device="cuda")
+    client.synchronize()
+    before = client.stats.snapshot()
+    x.add_(1.0)
+    import time
+
+    deadline = time.monotonic() + 5.0
+    while client.stats.batches == before.batches and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert client.stats.batches == before.batches + 1
+    assert client.stats.round_trips == before.round_trips
+
+
 def test_item_and_cpu_are_synchronization_points(client) -> None:
     x = torch.full((3,), 2.5, device="cuda")
     before = client.stats.round_trips

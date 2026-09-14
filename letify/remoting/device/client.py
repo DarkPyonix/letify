@@ -30,8 +30,11 @@ from .guard import check_torch_version, check_worker_version
 #: A queue this long is sent without waiting for more.
 BATCH_OPS = 256
 
-#: A queued operator waits at most this long, in seconds, before the queue is sent.
+#: A queue whose oldest operator has waited this long, in seconds, is sent by the next dispatch.
 LINGER_S = 0.002
+
+#: A queue nothing has been added to for this long, in seconds, is sent by the background thread.
+IDLE_S = 0.05
 
 #: A release list this long is sent without waiting for an operator.
 BATCH_RELEASES = 4096
@@ -104,6 +107,7 @@ class Client:
         self._buffers: list[Any] = []
         self._keep: list[Any] = []
         self._first_at = 0.0
+        self._last_at = 0.0
         self._lock = threading.RLock()
         self._wake = threading.Condition(self._lock)
         self._closed = False
@@ -165,32 +169,40 @@ class Client:
             if state is not None and state.buffers:
                 self._buffers.extend(state.buffers)
                 self._keep.extend(state.keep)
+            now = time.monotonic()
             if not self._queue:
-                self._first_at = time.monotonic()
+                self._first_at = now
                 self._wake.notify()
+            self._last_at = now
             self._queue.append((*entry, base))
             self.stats.ops += 1
             if (
                 len(self._queue) >= BATCH_OPS
+                or now - self._first_at >= LINGER_S
                 or (state is not None and state.big)
                 or len(self.released) >= BATCH_RELEASES
             ):
                 self._flush(reply=False)
 
     def _linger(self) -> None:
+        """Send a queue that nothing has been added to for ``IDLE_S``.
+
+        The dispatching thread sends every other aged queue itself, so this thread wakes
+        only when dispatch has paused and does not take the GIL from a running step.
+        """
         while True:
             with self._lock:
                 while not self._queue and not self._closed:
                     self._wake.wait()
                 if self._closed:
                     return
-                wait = self._first_at + LINGER_S - time.monotonic()
+                wait = self._last_at + IDLE_S - time.monotonic()
             if wait > 0:
                 time.sleep(wait)
             with self._lock:
                 if self._closed or self._lost is not None:
                     return
-                if self._queue and time.monotonic() - self._first_at >= LINGER_S:
+                if self._queue and time.monotonic() - self._last_at >= IDLE_S:
                     try:
                         self._flush(reply=False)
                     except RuntimeLost:
