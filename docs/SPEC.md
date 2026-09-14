@@ -203,7 +203,7 @@ Colour is added only when standard output is a terminal and the `NO_COLOR` envir
 
 > letify finds, creates, starts and stops an Elice Cloud Infrastructure virtual machine through Elice's own `eci` command, so an account needs no machine made in the portal beforehand.
 
-`eci` is the standalone binary Elice publishes at github.com/elice-dev/eci-cli for macOS arm64, Linux x86_64 and Windows x86_64. letify runs it as a separate process and never installs it. When `eci` is not on `PATH`, or `eci_binary` names a program that is not, a login or a session start raises with the install command for this system:
+`eci` is the standalone binary Elice publishes at github.com/elice-dev/eci-cli for macOS arm64, Linux x86_64 and Windows x86_64. letify runs it as a separate process and never bundles or mirrors it. `eci` is found on `PATH`, then at the places Elice's installer puts it: `~/.local/bin/eci`, `/usr/local/bin/eci` and, on Windows, `%LOCALAPPDATA%\eci-cli\eci.exe`. When it is found nowhere, or `eci_binary` names a program that is not on `PATH`, a login or a session start offers Elice's own installer as [Installing external tools](#confirmed-tool-install) describes, and otherwise raises with the install command for this system:
 
 - macOS and Linux: `curl -fsSL https://raw.githubusercontent.com/elice-dev/eci-cli/main/scripts/install.sh | sh`
 - Windows: `powershell -c "irm https://eci.sh/install.ps1 | iex"`
@@ -977,7 +977,7 @@ Colab and Elice never need `letify client shell connect`. Their create and open 
 
 `letify client shell connect` is run once on a plain machine by its user. The agent needs letify installed on that machine. Before starting anything it checks two things, and each failure prints what to do and exits 1:
 
-1. `tailcat` is on `PATH`. Otherwise it prints the install command for the detected operating system and CPU architecture, for the Tailcat release pinned in `letify.transport.setup.TAILCAT_VERSION`: on Linux amd64, arm64 and armv7, `mkdir -p ~/.local/bin && curl -L <release tar.gz> | tar xz -C ~/.local/bin tailcat` with a note that `~/.local/bin` must be on `PATH`; on macOS, `brew install tailcat`; on Windows amd64 and arm64, the release zip and where to put `tailcat.exe`. Any other platform gets the releases page.
+1. `tailcat` is on `PATH` or in the install directory of [Installing external tools](#confirmed-tool-install). Otherwise a terminal is offered the install that section describes, and without a terminal, or after a `n` answer, it prints the install command for the detected operating system and CPU architecture, for the Tailcat release pinned in `letify.transport.setup.TAILCAT_VERSION`: on Linux amd64, arm64 and armv7, `mkdir -p ~/.local/bin && curl -L <release tar.gz> | tar xz -C ~/.local/bin tailcat` with a note that `~/.local/bin` must be on `PATH`; on macOS, `brew install tailcat`; on Windows amd64 and arm64, the release zip and where to put `tailcat.exe`. Any other platform gets the releases page. The instructions end with `letify setup tailcat --yes`.
 2. An SSH server answers on `--ssh-port`, default 22: a TCP connection to `127.0.0.1` on that port must send a line starting with `SSH-` within 3 s. Otherwise it prints how to install and start one, for a Debian or Ubuntu container `apt-get install -y openssh-server`, `mkdir -p /run/sshd` and `/usr/sbin/sshd`.
 
 It then starts the remote agent on a port the operating system chooses, starts `tailcat serve <agent port>` in front of it, and prints exactly one command for the user's own machine, `letify login tunnel <alias> --connect <token>`. The alias is `--name`, or this machine's host name with every character that is not a letter, digit or underscore replaced by `_`. The token is the URL-safe base64 encoding, without `=` padding, of the compact JSON object `{"tailcat": <address>, "tailcat_port": <agent port>, "user": <this machine's user name>, "port": <SSH port>}`. `--public-address` and `--public-port` add `"address"` and `"public_port"` to that object, for a machine whose SSH server is also reachable directly from outside under a published port. After the command it prints that the agent must keep running, how to keep it running with `tmux` or `nohup`, and that a restart prints a new address, so the login is run again with the new token.
@@ -1175,7 +1175,7 @@ After the sign in succeeds, the Colab login records `key`, the SSH private key w
 
 `letify login elice <alias>` checks the access token with `eci` before it writes anything, and needs no machine to exist. Every `eci` command runs as [Elice machines](#elice-machines) describes. The steps run in this order, and a failure at any step writes nothing: no `config.toml` entry and no file in the account directory.
 
-1. `eci` must be on `PATH`. Otherwise `LoginError` carries the install command.
+1. `eci` must be found as Elice machines describes. Otherwise a terminal login without `--no-input` is offered Elice's installer, and when it is refused, not offered or leaves no `eci` behind, `LoginError` carries the install command.
 2. The token comes from `--token`, or else from a hidden prompt, `Elice access token: `. `--no-input` without `--token` refuses.
 3. `eci zone list --format json`. `endpoint` is `--endpoint` or `https://portal.elice.cloud/api`. A non zero exit fails the login with `LoginError`, whose message starts with `Elice refused the access token`.
 4. The zone is `--zone-id`. Without it, a terminal is shown the listed zones, one numbered line each, `1. <name> (<id>)`, and asked `Elice zone [1-<n>]: `. A blank answer takes the only zone when there is exactly one. An answer that is not a listed number is refused and asked again. `--no-input` without `--zone-id` refuses, and so does an empty list.
@@ -1191,7 +1191,7 @@ The account is written with `kind = "elice"`, `zone_id`, `key`, `machine_id` and
 
 `letify login tunnel <alias> --connect <token>` declares a machine behind NAT from the command `letify client shell connect` printed on it. Without `--connect`, a terminal is asked `Token printed by 'letify client shell connect': `, and `--no-input` refuses. The steps run in this order, and a failure at any step writes nothing to either file and raises `LoginError` whose message starts with `tunnel login failed at <step>: `:
 
-1. `tailcat`: `tailcat` must be on the local `PATH`. Otherwise the message is the same install instructions `letify client shell connect` prints, for this machine's operating system and architecture.
+1. `tailcat`: `tailcat` must be on the local `PATH` or in the install directory. Otherwise a terminal login without `--no-input` is offered the install, and when it is refused or not offered the message is the same install instructions `letify client shell connect` prints, for this machine's operating system and architecture.
 2. `token`: the token is decoded. A token that is not the base64 JSON described under Rendezvous, or that lacks `tailcat` or `tailcat_port`, is refused.
 3. `key install`: the key is generated and installed as SSH authentication describes, over SSH with `-o ProxyCommand=tailcat <address> <agent port>`, logging in as the token's `user` on the token's `port`. `--skip-key-install` and `--key` work as for `shell`.
 4. `key confirmation`: the key is confirmed with `BatchMode=yes` over the same `ProxyCommand`.
@@ -1570,6 +1570,7 @@ Connection decision lines stay on standard error as `letify: <message>`, with th
 | `login` | `✓ <alias> declared in <home>`, or `! <alias> was already declared in <home>, so nothing was asked for`, then `✓ <alias> referenced in <project>, which is safe to commit` |
 | `logout` | `✓ <alias> removed from <home>`, then the note about the project reference, dim |
 | `stubs` | `✓ <path written>` |
+| `setup <tool>` | `✓ <tool> installed at <path>` or `✓ <tool> is already installed at <path>`, and the PATH warning, as Installing external tools describes |
 | `client shell connect` | `On your own machine, run:` bold, the login command plain so it can be copied, and the notes dim |
 
 A runtime block in `status` is:
@@ -1584,6 +1585,28 @@ run-1  lab.P100  busy
 ```
 
 The header ends `busy` while a call runs and `idle` otherwise. `cards` is left out where the provider assigns the device, `link` where there is none, and the round trip where it was not measured. The cost line needs a usage record with a rate, and is uptime times the rate, so it is an estimate and says `about`. The gauge and amount lines are the usage block's own lines for that record.
+
+### Installing external tools <!-- id: confirmed-tool-install -->
+
+> letify installs `tailcat` or `eci` only after the user says yes, and fetches each from its publisher, Tailscale or Elice, so neither binary is part of letify or covered by its license.
+
+A tool is offered when a command that needs it finds it missing: `letify client shell connect` and `letify login tunnel` for `tailcat`, `letify login elice` and an Elice session start for `eci`. The offer is a `[y/N]` question on standard error, asked only when standard input is a terminal and `CI` is unset or empty. Only `y` or `yes`, in any case, installs. Any other answer, or no terminal, installs nothing and fails with the install instructions followed by `letify setup <tool> --yes`. The Tailcat connection strategy never asks, because it runs inside a race; it is skipped with `tailcat is not on PATH; run 'letify setup tailcat'`.
+
+`letify setup tailcat` and `letify setup eci` install the tool. They ask the same question on a terminal, `--yes` skips it, and without a terminal and without `--yes` they fail as above. A tool that is already found prints `✓ <tool> is already installed at <path>` and installs nothing.
+
+**tailcat.** The question is `Install tailcat <version> from Tailscale's GitHub release into <directory>? tailcat is Tailscale's program, not part of letify. [y/N] `. The version is `TAILCAT_VERSION`. The install directory is `~/.local/bin`, and `%LOCALAPPDATA%\letify\bin` on Windows.
+
+1. On macOS, with `brew` on `PATH`, it runs `brew install tailcat`. Without `brew` it fails with the releases page, because the release publishes no macOS archive.
+2. On Linux amd64, arm64 and armv7 and Windows amd64 and arm64, it downloads `tailcat_<version>_<os>_<arch>.tar.gz` (`.zip` on Windows) and `checksums.txt` from `https://github.com/tailscale/tailcat/releases/download/v<version>/` with `urllib`.
+3. The archive's SHA-256 must equal the digest pinned in `letify.setup.TAILCAT_SHA256` for that asset, and the line naming the asset in `checksums.txt` must carry the same digest. A mismatch, or an asset with no pinned digest, fails with both digests and writes nothing.
+4. Only the member named `tailcat` (`tailcat.exe` on Windows) at the archive root or one directory down is read. A member that is not a regular file, or whose path is absolute or contains `..`, is refused.
+5. The binary is written to a temporary file in the install directory, set to mode 0755 and renamed onto `tailcat`, so a failed install leaves no partial file.
+
+Other platforms fail with the releases page.
+
+**eci.** The question is `eci is not installed. Run Elice's official installer (curl -fsSL https://raw.githubusercontent.com/elice-dev/eci-cli/main/scripts/install.sh | sh)? The script and eci come from Elice and are not part of letify. [y/N] `, with `powershell -c "irm https://eci.sh/install.ps1 | iex"` on Windows. letify downloads that script with `urllib` to a temporary file and runs `sh <file>`, or `powershell -NoProfile -ExecutionPolicy Bypass -File <file>` on Windows, with its output passed straight through. A non zero exit fails with the exit code. letify does not verify the script, because Elice publishes no digest for it; the script verifies its own download against Elice's `checksums.txt`.
+
+After either install, letify looks for the tool again. Found on `PATH`, it prints `✓ <tool> installed at <path>`. Found only in the install directory, it prints that line and `! <directory> is not on PATH; add it, or open a new shell`, and the command that asked goes on with the full path. Found nowhere, it fails naming the directories it looked in.
 
 ### Machine-readable output <!-- id: machine-readable-output -->
 
