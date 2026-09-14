@@ -172,6 +172,8 @@ class Client:
         self.process = process
         self.name = name
         self.stats = Stats()
+        #: The process that connected, the only one that may write to the transport.
+        self._pid = os.getpid()
         #: Handles whose last RemoteTensor was collected, appended from ``Ref.__del__``.
         self.released: list[int] = []
         self._next_handle = 1
@@ -823,6 +825,11 @@ class Client:
         return RuntimeLost(f"{self.name}: the device worker was lost: {reason}{detail}")
 
     def _check_open(self) -> None:
+        if os.getpid() != self._pid:
+            raise RuntimeLost(
+                f"{self.name}: this process was forked from process {self._pid}, which owns "
+                f"the device worker's channel, so it cannot send on it"
+            )
         if self._closed:
             raise RuntimeLost(f"{self.name}: the device worker is closed")
         if self._lost is not None:
