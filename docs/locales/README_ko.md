@@ -280,7 +280,9 @@ Provider
 | 🇰🇷 `Elice` | persistent | 한국 GPU 클라우드, 초 단위 과금 |
 | 🏅 `Kaggle` | ephemeral | 주간 무료 GPU 시간, `host=letify.remote` 전용 |
 
-**Kaggle.** kaggle.com의 Settings, API에서 API 토큰을 만든 뒤 `letify login kaggle kaggle_a`를 실행합니다. 토큰은 화면에 표시되지 않게 입력받고, `kaggle.json` 경로를 넣어도 됩니다. letify는 토큰을 `~/.letify/accounts/kaggle_a/`에 보관하고 읽기 전용인 `kaggle quota` 호출로 확인합니다. `letify usage kaggle_a`는 이번 주에 남은 GPU 시간을 보여 줍니다. Kaggle 선언에는 `host=letify.remote`를 써야 합니다. Kaggle은 터널을 금지하므로 `host=letify.local`은 타입 오류이고, 데코레이터가 실행될 때 예외가 납니다. Kaggle 세션에서 함수를 실행하는 기능은 아직 없습니다.
+**Kaggle.** kaggle.com의 Settings, API에서 API 토큰을 만든 뒤 `letify login kaggle kaggle_a`를 실행합니다. 토큰은 화면에 표시되지 않게 입력받고, `kaggle.json` 경로를 넣어도 됩니다. letify는 토큰을 `~/.letify/accounts/kaggle_a/`에 보관하고 읽기 전용인 `kaggle quota` 호출로 확인합니다. `letify usage kaggle_a`는 이번 주에 남은 GPU 시간을 보여 줍니다. Kaggle 선언에는 `host=letify.remote`를 써야 합니다. Kaggle은 터널을 금지하므로 `host=letify.local`은 타입 오류이고, 데코레이터가 실행될 때 예외가 납니다.
+
+실행 중인 세션에서 돌리려면 Kaggle 편집기에서 Run, Kaggle Jupyter Server로 세션을 시작하고, Colab Compatible URL을 복사한 뒤 `letify login kaggle kaggle_a --connect '<URL>'`을 실행합니다. letify는 세션의 GPU를 기록하고, Kaggle이 세션을 끝낼 때까지 호출을 그 세션에서 실행합니다. 세션은 20분 동안 쓰지 않거나 12시간이 지나면 끝납니다. 그러면 새 URL을 등록하라는 오류를 내고, 세션을 억지로 유지하지 않습니다. 등록된 세션이 없으면 호출 하나를 Kaggle 스크립트 커널 하나로 push해서 실행합니다. 이때 시간 제한이 걸리고(`batch_timeout`, 기본 1800초), Kaggle 이미지의 Python을 그대로 씁니다.
 
 **letify가 가장 빠른 연결 방법을 찾습니다.** `Shell` 계열 머신에 대해 letify는 여러 연결 방법을 동시에 시도하고, 성공한 것 중 가장 빠른 방법을 씁니다.
 

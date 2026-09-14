@@ -286,7 +286,9 @@ Provider
 | 🇰🇷 `Elice` | persistent | Korean GPU cloud, per-second billing |
 | 🏅 `Kaggle` | ephemeral | free weekly GPU hours, `host=letify.remote` only |
 
-**Kaggle.** Make an API token at kaggle.com under Settings, API, then run `letify login kaggle kaggle_a`. The token is asked for without echo, and a `kaggle.json` path works too. letify keeps it in `~/.letify/accounts/kaggle_a/` and checks it with a read-only `kaggle quota` call. `letify usage kaggle_a` prints the GPU hours left this week. A Kaggle declaration must say `host=letify.remote`: Kaggle forbids tunnels, so `host=letify.local` is a type error and raises when the decorator runs. Running a function on a Kaggle session is not available yet.
+**Kaggle.** Make an API token at kaggle.com under Settings, API, then run `letify login kaggle kaggle_a`. The token is asked for without echo, and a `kaggle.json` path works too. letify keeps it in `~/.letify/accounts/kaggle_a/` and checks it with a read-only `kaggle quota` call. `letify usage kaggle_a` prints the GPU hours left this week. A Kaggle declaration must say `host=letify.remote`: Kaggle forbids tunnels, so `host=letify.local` is a type error and raises when the decorator runs.
+
+To run on a live session, start one in the Kaggle editor with Run, Kaggle Jupyter Server, copy its Colab Compatible URL, and run `letify login kaggle kaggle_a --connect '<URL>'`. letify records the session's GPUs and runs calls there until Kaggle ends the session, after 20 minutes idle or 12 hours. Then it raises an error telling you to register a new URL, and it never keeps a session alive. With no session registered, each call runs as one pushed Kaggle script kernel with a hard timeout (`batch_timeout`, 1800 s by default), using the Kaggle image's own Python.
 
 **letify finds the fastest way in.** For any `Shell`, letify tries several ways to reach the machine at once and keeps the fastest one that works:
 
