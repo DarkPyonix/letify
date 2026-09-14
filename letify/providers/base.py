@@ -412,10 +412,10 @@ class Provider(abc.ABC):
 
         require_torch()
 
-    def device_command(self, runtime: Runtime) -> tuple[list[str], dict[str, str] | None]:
-        """The command that starts a PyTorch device worker for this runtime, and its environment.
+    def device_channel(self, runtime: Runtime) -> Channel:
+        """The persistent channel whose call worker hosts the PyTorch device executor.
 
-        A provider that cannot run a second process beside its call worker cannot serve
+        A provider whose channel cannot carry the device stream cannot serve
         ``host="local"``, and says so here.
         """
         raise UnsupportedMode(

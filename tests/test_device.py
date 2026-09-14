@@ -389,7 +389,7 @@ def test_a_repeated_training_step_is_captured_once_and_replayed(client) -> None:
     assert delta.replayed >= delta.ops // 2
 
 
-def test_a_replayed_repetition_is_one_entry_rather_than_one_per_operator(client, monkeypatch) -> None:
+def test_a_replayed_repetition_is_one_entry_not_one_per_operator(client, monkeypatch) -> None:
     from letify.remoting.device import client as client_module
 
     monkeypatch.setattr(client_module, "LINGER_S", 60.0)
@@ -399,7 +399,9 @@ def test_a_replayed_repetition_is_one_entry_rather_than_one_per_operator(client,
     client.synchronize()
     delta = client.stats.snapshot() - before
     eager = delta.ops - delta.replayed
-    repetitions = delta.replayed // (delta.ops // steps)
+    # Operators and reads both count in ops, so the step's own length divides replayed.
+    size = len(client.tracer.active.ops)
+    repetitions = -(-delta.replayed // size)
     assert repetitions >= steps // 2
     # Every eager operator is one entry, and every repetition adds one more.
     assert delta.entries <= eager + repetitions + 2
@@ -490,7 +492,10 @@ def test_detach_shares_the_handle_instead_of_sending_an_operator(client) -> None
 def test_a_buffer_travels_beside_the_head_rather_than_inside_it() -> None:
     read_a, write_a = os.pipe()
     sender = frames.StreamTransport(read_fd=None, write_fd=write_a)
-    receiver = frames.StreamTransport(read_fd=read_a, write_fd=None)
+    # The executor's end: the client sends REQUEST frames, so that is what this end reads.
+    from letify.protocol import wire
+
+    receiver = frames.StreamTransport(read_fd=read_a, write_fd=None, incoming=wire.REQUEST)
     payload = torch.arange(1 << 16, dtype=torch.int32)
     view = frames.tensor_view(payload)
     assert view.nbytes == payload.numel() * 4

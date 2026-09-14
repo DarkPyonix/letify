@@ -163,11 +163,11 @@ class Runtime:
     def device(self) -> Any:
         """The PyTorch device worker for host='local', started on first use."""
         if self.device_client is None:
-            from ..remoting.device.client import connect
+            from ..remoting.device.client import attach
 
-            command, env = self.provider.device_command(self)
+            channel = self.provider.device_channel(self)
             kind = "cuda" if self.instance.gpu else "cpu"
-            self.device_client = connect(command, device=kind, env=env, name=f"{self.name}-device")
+            self.device_client = attach(channel, device=kind, name=f"{self.name}-device")
         return self.device_client
 
     # -- requests ------------------------------------------------------------

@@ -1,10 +1,12 @@
-"""The PyTorch forwarding client: the operator queue, handles and synchronization.
+"""The PyTorch forwarding client: templates, the entry queue, handles and synchronization.
 
-This module owns one connection to a device worker: starting it, queueing operators and
-sending them in batches, assigning and releasing handles, answering synchronizations and
-turning a runtime failure into ``RemoteError``, as spec "Batching and synchronization",
-"Handles" and "Failure semantics" describe. It does not own how an operator's metadata is
-computed, which is ``tensor``, or which stream the bytes cross, which is a ``Transport``.
+This module owns one connection to a device executor: starting it, numbering templates,
+queueing entries and handing batches to a sender thread, replaying captured steps,
+assigning and releasing handles, answering reads with only what they depend on, and turning
+a runtime failure into ``RemoteError``, as spec "Operator templates", "Batching and
+synchronization", "Step capture", "Handles" and "Failure semantics" describe. It does not
+own how an operator's metadata is computed, which is ``tensor``, how a repeated sequence is
+detected, which is ``trace``, or which stream the bytes cross, which is a ``Transport``.
 """
 
 from __future__ import annotations
@@ -13,6 +15,7 @@ import collections
 import contextlib
 import os
 import pickle
+import queue
 import subprocess
 import threading
 import time
@@ -24,13 +27,16 @@ from typing import Any
 import torch
 
 from ...errors import RemoteError, RuntimeLost
-from .frames import StreamTransport, Transport, TransportClosed
+from .executor import E_DEFINE, E_OP, E_REQUEST, E_STEP, E_STEP_DEFINE
+from .frames import ChannelTransport, StreamTransport, Transport, TransportClosed
 from .guard import check_torch_version, check_worker_version
+from .tensor import Big, layout
+from .trace import Tracer
 
 #: A queue this long is sent without waiting for more.
 BATCH_OPS = 256
 
-#: A queue whose oldest operator has waited this long, in seconds, is sent by the next dispatch.
+#: A queue whose oldest entry has waited this long, in seconds, is sent by the next dispatch.
 LINGER_S = 0.002
 
 #: A queue nothing has been added to for this long, in seconds, is sent by the background thread.
@@ -49,19 +55,21 @@ BOOTSTRAP = (
 )
 
 
-def worker_source(device: str) -> bytes:
-    """The worker program: ``frames``, then ``executor``, then the serve call."""
+def worker_source(device: str | None) -> bytes:
+    """The executor program: ``wire``, ``frames``, ``executor``, then the serve call if any."""
     here = Path(__file__).parent
+    paths = [here.parent.parent / "protocol" / "wire.py", here / "frames.py", here / "executor.py"]
     parts = ["from __future__ import annotations\n"]
-    for name in ("frames.py", "executor.py"):
-        text = (here / name).read_text(encoding="utf-8")
+    for path in paths:
+        text = path.read_text(encoding="utf-8").replace("\r\n", "\n")
         parts.append(text.replace("from __future__ import annotations\n", ""))
-    parts.append(f"\nserve({device!r})\n")
+    if device is not None:
+        parts.append(f"\nserve({device!r})\n")
     return "".join(parts).encode()
 
 
 def worker_command(python: str) -> list[str]:
-    """The command that starts a device worker with this interpreter on this machine."""
+    """The command that starts a device executor process with this interpreter."""
     return [python, "-u", "-c", BOOTSTRAP]
 
 
@@ -69,14 +77,23 @@ def worker_command(python: str) -> list[str]:
 class Stats:
     """What one client has done, counted."""
 
-    #: Operators and requests dispatched, counted when queued rather than when sent.
+    #: Operators and requests dispatched, counted when dispatched rather than when sent.
     ops: int = 0
+    #: Eager operator, step and request entries queued. Definitions are not counted.
+    entries: int = 0
     batches: int = 0
     round_trips: int = 0
     released: int = 0
     sent_bytes: int = 0
     #: Operators whose output metadata came from the cache instead of a meta kernel.
     cached: int = 0
+    templates: int = 0
+    #: Steps registered with the worker.
+    steps: int = 0
+    #: Operators dispatched inside a repetition of a captured step.
+    replayed: int = 0
+    #: Repetitions ended by an operator that did not match.
+    fallbacks: int = 0
 
     def snapshot(self) -> Stats:
         return Stats(**{field.name: getattr(self, field.name) for field in fields(self)})
@@ -86,8 +103,19 @@ class Stats:
         return Stats(**{name: getattr(self, name) - getattr(other, name) for name in names})
 
 
+def _mutates(func: Any, name: str, kwargs: dict) -> bool:
+    """Whether an operator writes to an argument, from its schema where PyTorch has one."""
+    try:
+        return any(
+            argument.alias_info is not None and argument.alias_info.is_write
+            for argument in func._schema.arguments
+        )
+    except AttributeError:  # pragma: no cover - a PyTorch without alias information
+        return name.split(".")[1].endswith("_") or "out" in kwargs
+
+
 class Client:
-    """One connection to a device worker."""
+    """One connection to a device executor."""
 
     def __init__(
         self,
@@ -103,40 +131,56 @@ class Client:
         #: Handles whose last RemoteTensor was collected, appended from ``Ref.__del__``.
         self.released: list[int] = []
         self._next_handle = 1
-        self._queue: list[tuple] = []
-        self._buffers: list[Any] = []
-        self._keep: list[Any] = []
+        self._queue: collections.deque[tuple] = collections.deque()
         self._first_at = 0.0
         self._last_at = 0.0
-        self._lock = threading.RLock()
-        self._wake = threading.Condition(self._lock)
+        #: Held while a batch is taken from the queue, so batches leave in queue order.
+        self._flush_lock = threading.Lock()
+        #: Held for a round trip, so replies are read in the order requests were sent.
+        self._request_lock = threading.RLock()
+        self._outbox: queue.SimpleQueue = queue.SimpleQueue()
+        self._waiting = threading.Event()
+        #: Handles below this were created by an entry already sent, so they may be released.
+        self._sent_upto = 1
         self._closed = False
         self._lost: str | None = None
         self._stderr: collections.deque[str] = collections.deque(maxlen=40)
-        self._mapping: list[Any] = []
+        self._templates: dict[tuple, int] = {}
+        self._mutating: dict[int, bool] = {}
+        self._steps: dict[int, Any] = {}
+        self.tracer = Tracer()
         self.hello: dict[str, Any] = {}
+        self._sender: threading.Thread | None = None
 
     # -- lifecycle ------------------------------------------------------------------
 
     def start(self) -> None:
-        """Read the worker's first message, check its PyTorch, and start the linger thread."""
+        """Read the executor's first message, check its PyTorch, and start the threads."""
         head, _buffers = self._recv()
         self.hello = pickle.loads(head)
         check_worker_version(local=torch.__version__, remote=str(self.hello["torch"]))
+        self._sender = threading.Thread(
+            target=self._send_loop, name=f"{self.name}-send", daemon=True
+        )
+        self._sender.start()
         threading.Thread(target=self._linger, name=f"{self.name}-linger", daemon=True).start()
 
     def close(self) -> None:
-        with self._lock:
+        with self._request_lock:
             if self._closed:
                 return
             if self._lost is None:
                 try:
-                    self._flush(reply=False)
-                    self.transport.send(pickle.dumps({"close": True}, protocol=5), [])
+                    self._cut()
+                    self._flush()
+                    self._outbox.put((pickle.dumps({"close": True}, protocol=5), [], None))
                 except (RuntimeLost, TransportClosed):
                     pass
             self._closed = True
-            self._wake.notify_all()
+            self._waiting.set()
+            self._outbox.put(None)
+        if self._sender is not None:
+            self._sender.join(timeout=30)
         self.transport.close()
         if self.process is not None:
             for stream in (self.process.stdin, self.process.stdout):
@@ -159,30 +203,121 @@ class Client:
         self._next_handle += 1
         return handle
 
+    @property
+    def queued(self) -> int:
+        """Entries queued and not yet sent."""
+        return len(self._queue)
+
+    # -- templates ------------------------------------------------------------------
+
+    def _template(
+        self, structure: tuple, name: str, args: tuple, kwargs: dict, defer: list | None = None
+    ) -> int:
+        """The structure's template number, defining it first when it is new.
+
+        A definition is queued, or appended to ``defer`` for a request that carries it.
+        """
+        tid = self._templates.get(structure)
+        if tid is None:
+            tid = len(self._templates) + 1
+            self._templates[structure] = tid
+            self._mutating[tid] = _mutates(structure[0], name, kwargs)
+            definition = (E_DEFINE, tid, name, layout(args, kwargs))
+            if defer is not None:
+                defer.append(definition)
+            else:
+                self._enqueue(definition, check=False, counted=False)
+            self.stats.templates += 1
+        return tid
+
+    # -- dispatch -------------------------------------------------------------------
+
+    def put(
+        self,
+        structure: tuple,
+        name: str,
+        args: tuple,
+        kwargs: dict,
+        plan: Any,
+        tensors: list,
+        scalars: list,
+        blobs: list,
+        outs: list,
+        big: bool,
+    ) -> None:
+        """Queue or replay one operator whose outputs ``tensor.dispatch`` already built."""
+        if self._lost is not None or self._closed:
+            self._check_open()
+        tid = self._templates.get(structure)
+        if tid is None:
+            tid = self._template(structure, name, args, kwargs)
+        self.stats.ops += 1
+        handles = tuple([tensor._ref.handle for tensor in tensors])
+        tracer = self.tracer
+        if tracer.active is not None:
+            if tracer.match(tid, plan.shape_id, handles, scalars, blobs):
+                self.stats.replayed += 1
+                if tracer.pos == tracer.size:
+                    self._enqueue((E_STEP, *tracer.take()))  # type: ignore[misc]
+                    tracer.begin(tracer.active, self._next_handle)
+                    if big:
+                        self._flush()
+                elif big:
+                    self._enqueue((E_STEP, *tracer.take()))  # type: ignore[misc]
+                    self._flush()
+                return
+            self._fall_back()
+        self._enqueue((E_OP, tid, handles, tuple(scalars), tuple(blobs), tuple(outs), None))
+        found = tracer.record(tid, plan.shape_id, handles, outs)
+        if found is not None:
+            step, new = found
+            if new:
+                step.mutates = any(self._mutating[op[0]] for op in step.ops)
+                self._steps[step.sid] = step
+                ops = tuple((op[0], op[2], op[3]) for op in step.ops)
+                self._enqueue((E_STEP_DEFINE, step.sid, ops), check=False, counted=False)
+                self.stats.steps += 1
+            tracer.begin(step, self._next_handle)
+        if big:
+            self._flush()
+
+    def _fall_back(self) -> None:
+        tracer = self.tracer
+        if tracer.active is None:
+            return
+        entry = tracer.take()
+        if entry is not None:
+            self._enqueue((E_STEP, *entry))
+        if tracer.pos:
+            self.stats.fallbacks += 1
+        tracer.active = None
+        tracer.reset()
+
+    def _cut(self) -> None:
+        """Queue the matched part of an unfinished repetition, which then continues."""
+        entry = self.tracer.take()
+        if entry is not None:
+            self._enqueue((E_STEP, *entry), check=False)
+
     # -- queue ----------------------------------------------------------------------
 
-    def enqueue(self, entry: tuple, state: Any = None) -> None:
-        """Queue one operator. Sent when the batch is full, aged, or carries a large buffer."""
-        with self._lock:
-            self._check_open()
-            base = len(self._buffers)
-            if state is not None and state.buffers:
-                self._buffers.extend(state.buffers)
-                self._keep.extend(state.keep)
-            now = time.monotonic()
-            if not self._queue:
-                self._first_at = now
-                self._wake.notify()
-            self._last_at = now
-            self._queue.append((*entry, base))
-            self.stats.ops += 1
-            if (
-                len(self._queue) >= BATCH_OPS
-                or now - self._first_at >= LINGER_S
-                or (state is not None and state.big)
-                or len(self.released) >= BATCH_RELEASES
-            ):
-                self._flush(reply=False)
+    def _enqueue(self, entry: tuple, *, check: bool = True, counted: bool = True) -> None:
+        """Queue one entry. The queue is sent when it is full or aged."""
+        pending = self._queue
+        now = time.monotonic()
+        if not pending:
+            self._first_at = now
+            self._waiting.set()
+        pending.append(entry)
+        self._last_at = now
+        if counted:
+            self.stats.entries += 1
+        if check and (
+            len(pending) >= BATCH_OPS
+            or now - self._first_at >= LINGER_S
+            or len(self.released) >= BATCH_RELEASES
+        ):
+            self._flush()
 
     def _linger(self) -> None:
         """Send a queue that nothing has been added to for ``IDLE_S``.
@@ -191,54 +326,143 @@ class Client:
         only when dispatch has paused and does not take the GIL from a running step.
         """
         while True:
-            with self._lock:
-                while not self._queue and not self._closed:
-                    self._wake.wait()
-                if self._closed:
-                    return
-                wait = self._last_at + IDLE_S - time.monotonic()
+            self._waiting.wait()
+            if self._closed or self._lost is not None:
+                return
+            wait = self._last_at + IDLE_S - time.monotonic()
             if wait > 0:
                 time.sleep(wait)
-            with self._lock:
-                if self._closed or self._lost is not None:
+                continue
+            self._waiting.clear()
+            if self._queue:
+                try:
+                    self._flush()
+                except RuntimeLost:
                     return
-                if self._queue and time.monotonic() - self._last_at >= IDLE_S:
-                    try:
-                        self._flush(reply=False)
-                    except RuntimeLost:
-                        return
+                if self._queue:
+                    self._waiting.set()
 
-    def _flush(self, *, reply: bool) -> None:
-        if not self._queue and not self.released and not reply:
-            return
-        released = self.released[:]
-        del self.released[: len(released)]
-        ops, buffers, keep = self._queue, self._buffers, self._keep
-        self._queue, self._buffers, self._keep = [], [], []
-        head = pickle.dumps({"ops": ops, "release": released, "reply": reply}, protocol=5)
-        try:
-            self.transport.send(head, buffers)
-        except TransportClosed as exc:
-            raise self._lose(str(exc)) from exc
-        del keep
-        self.stats.batches += 1
-        self.stats.released += len(released)
-        self.stats.sent_bytes += len(head) + sum(memoryview(b).nbytes for b in buffers)
+    def _flush(
+        self, *, reply: bool = False, count: int | None = None, extra: Sequence[tuple] = ()
+    ) -> None:
+        """Take ``count`` entries, or all, plus ``extra``, and hand them to the sender thread."""
+        with self._flush_lock:
+            pending = self._queue
+            taken = len(pending) if count is None else count
+            entries = [pending.popleft() for _ in range(taken)]
+            entries.extend(extra)
+            buffers: list = []
+            keep: list = []
+            upto = self._sent_upto
+            located = False
+            for index in range(len(entries) - 1, -1, -1):
+                entry = entries[index]
+                kind = entry[0]
+                if kind == E_OP:
+                    if entry[4] and any(type(blob) is Big for blob in entry[4]):
+                        placed = self._place(entry[4], buffers, keep)
+                        entry = entries[index] = (*entry[:4], placed, *entry[5:])
+                    if not located:
+                        outs = entry[5]
+                        if type(outs) is int:
+                            upto, located = max(upto, outs + DESCRIBED_OUTPUTS), True
+                        else:
+                            made = [handle for handle in outs if handle is not None]
+                            if made:
+                                upto, located = max(upto, made[-1] + 1), True
+                elif kind == E_STEP:
+                    if entry[7] and any(type(blob) is Big for blob in entry[7]):
+                        entry = entries[index] = (*entry[:7], self._place(entry[7], buffers, keep))
+                    if not located:
+                        step = self._steps[entry[1]]
+                        made = entry[2] + step.news_before[entry[4]]
+                        upto, located = max(upto, made), True
+            self._sent_upto = upto
+            released: list[int] = []
+            if self.released:
+                taken_releases = self.released[:]
+                del self.released[: len(taken_releases)]
+                held = [handle for handle in taken_releases if handle >= upto]
+                released = [handle for handle in taken_releases if handle < upto]
+                if held:
+                    self.released.extend(held)
+            if not entries and not released and not reply:
+                return
+            head = pickle.dumps(
+                {"entries": entries, "release": released, "reply": reply}, protocol=5
+            )
+            self._outbox.put((head, buffers, keep))
+            self.stats.batches += 1
+            self.stats.released += len(released)
+            self.stats.sent_bytes += len(head) + sum(view.nbytes for view in buffers)
+            if pending:
+                self._first_at = time.monotonic()
+
+    def _place(self, blobs: tuple, buffers: list, keep: list) -> tuple:
+        placed = []
+        for blob in blobs:
+            if type(blob) is Big:
+                buffers.append(blob.view)
+                keep.append(blob.keep)
+                placed.append(len(buffers) - 1)
+            else:
+                placed.append(blob)
+        return tuple(placed)
+
+    def _send_loop(self) -> None:
+        """Write batches in the order they were handed over."""
+        while True:
+            item = self._outbox.get()
+            if item is None:
+                return
+            head, buffers, keep = item
+            try:
+                self.transport.send(head, buffers)
+            except TransportClosed as exc:
+                if self._lost is None:
+                    self._lost = str(exc)
+                return
+            del item, keep, buffers
 
     # -- synchronization ---------------------------------------------------------------
 
-    def request(self, entries: Sequence[tuple], state: Any = None) -> tuple[list, list]:
-        """Send the queue with these entries and wait for the reply. One round trip."""
-        with self._lock:
+    def _dependency_cut(self, handle: int) -> int | None:
+        """How many queued entries a read of ``handle`` needs, or None for all of them."""
+        entries = list(self._queue)
+        for index in range(len(entries) - 1, -1, -1):
+            entry = entries[index]
+            kind = entry[0]
+            if kind == E_OP:
+                if self._mutating[entry[1]]:
+                    return None
+                outs = entry[5]
+                if type(outs) is not int and handle in outs:
+                    return index + 1
+            elif kind == E_STEP:
+                step = self._steps[entry[1]]
+                if step.mutates:
+                    return None
+                if entry[2] <= handle < entry[2] + step.news_before[entry[4]]:
+                    return index + 1
+        return 0
+
+    def _request(
+        self, entry: tuple, *, handle: int | None = None, defines: Sequence[tuple] = ()
+    ) -> tuple[list, list]:
+        """Send what ``entry`` needs with it, and wait for the reply. One round trip.
+
+        ``defines`` are template definitions ``entry`` uses, sent just ahead of it.
+        """
+        with self._request_lock:
             self._check_open()
-            base = len(self._buffers)
-            if state is not None and state.buffers:
-                self._buffers.extend(state.buffers)
-                self._keep.extend(state.keep)
-            for entry in entries:
-                self._queue.append((*entry, base))
-            self.stats.ops += len(entries)
-            self._flush(reply=True)
+            count = None
+            if handle is not None and not self.tracer.unfinished:
+                count = self._dependency_cut(handle)
+            if count is None:
+                self._cut()
+            self.stats.ops += 1
+            self.stats.entries += 1
+            self._flush(reply=True, count=count, extra=[*defines, entry])
             head, buffers = self._recv()
             self.stats.round_trips += 1
         reply = pickle.loads(head)
@@ -250,28 +474,47 @@ class Client:
 
     def synchronize(self) -> None:
         """Wait for every queued operator, raising the first failure among them."""
-        self.request([])
+        self._request((E_REQUEST, "letify.live", (), None))
 
     def call(self, name: str, *args: Any, reply: bool = True) -> Any:
-        """A letify request to the worker, such as a seed or a memory query."""
+        """A letify request to the executor, such as a seed or a memory query."""
         if not reply:
-            self.enqueue((name, args, {}, None, None))
+            self._check_open()
+            self._cut()
+            self.stats.ops += 1
+            self._enqueue((E_REQUEST, name, args, None))
             return None
-        results, _buffers = self.request([(name, args, {}, None, "value")])
+        results, _buffers = self._request((E_REQUEST, name, args, "value"))
         return results[-1]
 
     def live_handles(self) -> int:
-        """How many tensors the worker holds, after sending pending releases."""
-        with self._lock:
+        """How many tensors the executor holds, after sending pending releases."""
+        with self._request_lock:
             self._check_open()
-            # Releases apply after their batch's operators, so they go in a batch of their own.
-            self._flush(reply=False)
+            self._cut()
+            # Releases apply after their batch's entries, so they go in a batch of their own.
+            self._flush()
         return int(self.call("letify.live"))
+
+    def read_value(self, tensor: Any) -> Any:
+        """``Tensor.item()`` and the reads built on it."""
+        from .tensor import _SCALAR
+
+        structure = (_SCALAR, tensor._form)
+        defines: list = []
+        name = "aten._local_scalar_dense.default"
+        tid = self._template(structure, name, (tensor,), {}, defines)
+        handle = tensor._ref.handle
+        entry = (E_OP, tid, (handle,), (), (), (), "value")
+        results, _buffers = self._request(entry, handle=handle, defines=defines)
+        return results[-1]
 
     def fetch(self, tensor: Any, dtype: str | None) -> torch.Tensor:
         """Copy a RemoteTensor's values into a new CPU tensor."""
         handle = tensor._ref.handle
-        results, buffers = self.request([("letify.fetch", (handle, dtype), {}, None, "fetch")])
+        results, buffers = self._request(
+            (E_REQUEST, "letify.fetch", (handle, dtype), "fetch"), handle=handle
+        )
         index, shape, got = results[-1]
         data = buffers[index]
         kind = getattr(torch, got)
@@ -279,18 +522,35 @@ class Client:
             return torch.empty(shape, dtype=kind)
         return torch.frombuffer(data, dtype=kind).reshape(shape)
 
-    def execute_now(self, name: str, args: Any, kwargs: dict, state: Any) -> Any:
+    def execute_now(
+        self,
+        structure: tuple,
+        name: str,
+        args: tuple,
+        kwargs: dict,
+        tensors: list,
+        scalars: list,
+        blobs: list,
+    ) -> Any:
         """Run an operator whose metadata could not be computed here, and describe it."""
         from .tensor import from_description
 
-        first = self._next_handle
-        self._next_handle += DESCRIBED_OUTPUTS
-        results, _buffers = self.request([(name, args, kwargs, first, "describe")], state)
+        self._check_open()
+        with self._request_lock:
+            self._fall_back()
+            self.tracer.reset()
+            defines: list = []
+            tid = self._template(structure, name, args, kwargs, defines)
+            first = self._next_handle
+            self._next_handle += DESCRIBED_OUTPUTS
+            handles = tuple(tensor._ref.handle for tensor in tensors)
+            entry = (E_OP, tid, handles, tuple(scalars), tuple(blobs), first, "describe")
+            results, _buffers = self._request(entry, defines=defines)
         return from_description(self, first, results[-1])
 
     # -- errors -------------------------------------------------------------------------
 
-    def _recv(self) -> tuple[bytes, list[bytearray]]:
+    def _recv(self) -> tuple[Any, list]:
         try:
             return self.transport.recv()
         except TransportClosed as exc:
@@ -298,6 +558,7 @@ class Client:
 
     def _lose(self, reason: str) -> RuntimeLost:
         self._lost = reason
+        self._waiting.set()
         if self.process is not None:
             try:
                 self.process.wait(timeout=2)
@@ -339,7 +600,7 @@ def connect(
     env: dict[str, str] | None = None,
     name: str = "device",
 ) -> Client:
-    """Start a device worker with this command and return a connected client."""
+    """Start a device executor as its own process with this command and return a client."""
     check_torch_version(torch.__version__)
     try:
         process = subprocess.Popen(
@@ -365,7 +626,7 @@ def connect(
         target=client._drain_stderr, args=(process.stderr,), name=f"{name}-stderr", daemon=True
     ).start()
     try:
-        transport._write_all([memoryview(b"%d\n" % len(source)), memoryview(source)])
+        transport.raw(b"%d\n" % len(source) + source)
         client.start()
     except (TransportClosed, RuntimeLost) as exc:
         process.kill()
@@ -376,4 +637,24 @@ def connect(
     return client
 
 
-__all__ = ["BOOTSTRAP", "Client", "Stats", "connect", "worker_command", "worker_source"]
+def attach(channel: Any, *, device: str, name: str = "device") -> Client:
+    """Start a device executor inside a persistent channel's call worker and return a client."""
+    check_torch_version(torch.__version__)
+    transport = ChannelTransport(channel.connection)
+    client = Client(transport, name=name)
+    channel.request(
+        {"op": "device", "device": device, "source": worker_source(None).decode()}, timeout=600
+    )
+    client.start()
+    return client
+
+
+__all__ = [
+    "BOOTSTRAP",
+    "Client",
+    "Stats",
+    "attach",
+    "connect",
+    "worker_command",
+    "worker_source",
+]

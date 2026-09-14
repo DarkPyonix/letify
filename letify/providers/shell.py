@@ -359,26 +359,17 @@ class Shell(Provider):
             name=runtime.name,
         )
 
-    def device_command(self, runtime: Runtime) -> tuple[list[str], dict[str, str] | None]:
-        """A PyTorch device worker over the account's link, in the session's interpreter."""
+    def device_channel(self, runtime: Runtime) -> Channel:
+        """The session's call channel, which hosts the PyTorch device executor."""
         from ..errors import UnsupportedMode
-        from ..remoting.device.client import BOOTSTRAP
 
-        link = self.link(runtime)
-        if not link.persistent:
+        channel = runtime.channel
+        if channel is None or not channel.persistent:
             raise UnsupportedMode(
                 f"{self.alias} is reached over a link that runs one command per call, so a "
                 f"PyTorch device worker cannot stay alive there. Use host='remote'."
             )
-        python = runtime.python or self.remote_python
-        visible = self.visible_devices(runtime.held_devices)
-        prefix = ""
-        if visible is not None:
-            prefix = (
-                f"env CUDA_VISIBLE_DEVICES={shlex.quote(visible)} CUDA_DEVICE_ORDER=PCI_BUS_ID "
-            )
-        command = f"{prefix}{shlex.quote(python)} -u -c {shlex.quote(BOOTSTRAP)}"
-        return link.ssh_command(command), None
+        return channel
 
 
 __all__ = ["Shell"]

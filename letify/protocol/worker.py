@@ -361,6 +361,22 @@ def _reexec(stream, request):
     os.execv(python, [python, "-u", "-c", request["bootstrap"]])
 
 
+#: The PyTorch device executor of this process: its request queue and its thread.
+_DEVICE = {}
+
+
+def _op_device(request):
+    """Start the PyTorch device executor in a thread, reading requests on the device stream."""
+    thread = _DEVICE.get("thread")
+    if thread is None or not thread.is_alive():
+        namespace = {"__name__": "letify_device"}
+        exec(compile(request["source"], "letify-device", "exec"), namespace)
+        inbox = queue.Queue()
+        _DEVICE["inbox"] = inbox
+        _DEVICE["thread"] = namespace["serve_channel"](request["device"], _SENDER, inbox)
+    return {"ok": True, "value": None}
+
+
 def _op_release(request):
     """Drop blobs the caller no longer needs."""
     for digest in request.get("blobs", ()):
@@ -419,6 +435,7 @@ _OPS = {
     "exec": _op_exec,
     "eval": _op_eval,
     "release": _op_release,
+    "device": _op_device,
     "stat": _op_stat,
     "lease": _op_lease,
 }
@@ -467,6 +484,12 @@ def _read():
             break
         if kind != REQUEST:
             continue
+        if stream == DEVICE_STREAM:
+            inbox = _DEVICE.get("inbox")
+            if inbox is not None:
+                inbox.put(value)
+            value = None
+            continue
         try:
             request = loads(value[0], value[1])
         except Exception:
@@ -484,6 +507,9 @@ def _read():
         _JOBS.put((stream, request))
         if op == "reexec":
             return
+    inbox = _DEVICE.get("inbox")
+    if inbox is not None:
+        inbox.put(None)
     _JOBS.put(None)
 
 
