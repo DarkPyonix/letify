@@ -226,12 +226,123 @@ def _op_call(request):
     data = request.pop("data", None)
     if data is None:
         return _call(request)
-    _data_link(data)
+    placed = _data_link(data)
     try:
-        return _call(request)
+        outcome = _call(request)
+        if data.get("outputs"):
+            _DATA_WRITTEN[data["dir"]] = _data_collect(data, placed)
+        return outcome
     finally:
         import shutil
+        _data_check_cache(data, placed)
         shutil.rmtree(data["dir"], ignore_errors=True)
+
+
+# Write-back lists of returned calls, by call directory, until data_written takes them.
+_DATA_WRITTEN = {}
+
+
+def _data_hash_file(path):
+    """The file digest of a file on the runtime: blake3 when present, else blake2b."""
+    hasher = _data_hasher()
+    if hasher is None:
+        hasher = hashlib.blake2b(digest_size=16)
+    with open(path, "rb") as handle:
+        while True:
+            piece = handle.read(1 << 22)
+            if not piece:
+                break
+            hasher.update(piece)
+    if hasher.name == "blake2b":
+        return hasher.hexdigest()
+    return hasher.hexdigest(length=16)
+
+
+def _data_collect(data, placed):
+    """Commit each file a returned call created or changed at an output into the cache."""
+    import stat
+    skipped = (".git", ".venv", "__pycache__")
+    written = {}
+    for output in data["outputs"]:
+        files = []
+        if os.path.isfile(output) and not os.path.islink(output):
+            candidates = [("", output)]
+        elif os.path.isdir(output) and not os.path.islink(output):
+            candidates = []
+            for directory, names, found in os.walk(output, followlinks=False):
+                names[:] = [name for name in names if name not in skipped]
+                for name in found:
+                    full = os.path.join(directory, name)
+                    rel = os.path.relpath(full, output).replace(os.sep, "/")
+                    candidates.append((rel, full))
+        else:
+            candidates = []
+        for rel, full in sorted(candidates):
+            try:
+                info = os.lstat(full)
+            except OSError:
+                continue
+            if not stat.S_ISREG(info.st_mode):
+                continue
+            known = placed.get(full)
+            if known is not None and known[1:] == (info.st_ino, info.st_size, info.st_mtime_ns):
+                continue
+            digest = _data_hash_file(full)
+            if known is not None and known[0] == digest:
+                continue
+            final = _data_file(data["blobs"], digest)
+            try:
+                held = os.stat(final).st_size == info.st_size
+            except OSError:
+                held = False
+            if not held:
+                os.makedirs(os.path.dirname(final), exist_ok=True)
+                if info.st_nlink > 1:
+                    # Still a link to another cache file, written in place: copy it out.
+                    import shutil
+                    partial = "%s.partial.%d" % (final, os.getpid())
+                    shutil.copyfile(full, partial)
+                    full = partial
+                try:
+                    os.chmod(full, 0o444)
+                except OSError:
+                    pass
+                os.replace(full, final)
+            files.append([rel, digest, info.st_size])
+        written[output] = files
+    return written
+
+
+def _data_check_cache(data, placed):
+    """Remove a cache file a body wrote into through its hard link."""
+    for _path, (digest, _ino, size, mtime, cached) in placed.items():
+        if cached is None:
+            continue
+        source = _data_file(data["blobs"], digest)
+        try:
+            info = os.stat(source)
+        except OSError:
+            continue
+        if (info.st_size, info.st_mtime_ns) != cached:
+            try:
+                os.remove(source)
+            except OSError:
+                pass
+
+
+def _op_data_written(request):
+    """The write-back list of a returned call, removed as it is answered."""
+    return {"ok": True, "value": _DATA_WRITTEN.pop(request["dir"], {})}
+
+
+def _op_data_get(request):
+    """One piece of a file blob, sent as an out-of-band buffer."""
+    with open(_data_file(request["dir"], request["digest"]), "rb") as handle:
+        handle.seek(request["offset"])
+        buffer = bytearray(request["length"])
+        count = handle.readinto(buffer)
+    del buffer[count:]
+    return {"ok": True, "value": pickle.PickleBuffer(buffer)}
 
 
 def _data_file(root, digest):
@@ -350,15 +461,25 @@ def _op_data_pull(request):
 def _data_link(data):
     """Place each file of a call at its runtime path, a hard link to the cache or a copy."""
     import shutil
+    placed = {}
     for directory in data.get("dirs", ()):
         os.makedirs(directory, exist_ok=True)
-    for path, digest in data.get("links", ()):
+    for path, digest, copy in data.get("links", ()):
         os.makedirs(os.path.dirname(path), exist_ok=True)
         source = _data_file(data["blobs"], digest)
-        try:
-            os.link(source, path)
-        except OSError:
+        linked = False
+        if not copy:
+            try:
+                os.link(source, path)
+                linked = True
+            except OSError:
+                pass
+        if not linked:
             shutil.copyfile(source, path)
+        info = os.stat(path)
+        cached = (info.st_size, info.st_mtime_ns) if linked else None
+        placed[path] = (digest, info.st_ino, info.st_size, info.st_mtime_ns, cached)
+    return placed
 
 
 def _call(request):
@@ -714,6 +835,8 @@ _OPS = {
     "data_have": _op_data_have,
     "data_put": _op_data_put,
     "data_pull": _op_data_pull,
+    "data_written": _op_data_written,
+    "data_get": _op_data_get,
     "blob_dir": _op_blob_dir,
     "put_blob": _op_put_blob,
     "put_file": _op_put_file,

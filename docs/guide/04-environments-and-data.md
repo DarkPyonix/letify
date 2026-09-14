@@ -134,7 +134,7 @@ def train(lr):
     files = sorted(DATA.rglob("*.bin"))   # a directory on the runtime
 ```
 
-What is detected: an existing file or directory under the project root, the nearest directory with a `pyproject.toml`, or under a directory listed in `[tool.letify] data_roots`. A path that does not exist, a path outside those roots, and the project root itself stay plain paths. `.git`, `.venv` and `__pycache__` inside a directory are skipped.
+What is detected: a file, a directory or a path that does not exist yet, under the project root, the nearest directory with a `pyproject.toml`, or under a directory listed in `[tool.letify] data_roots`. A path outside those roots and the project root itself stay plain paths. `.git`, `.venv` and `__pycache__` inside a directory are skipped.
 
 Each file is hashed once and remembered by size, modification time and inode in `~/.cache/letify/digests.json`, so an unchanged dataset is not read again. Where the bytes come from depends on the account:
 
@@ -146,7 +146,26 @@ Each file is hashed once and remembered by size, modification time and inode in 
 
 A changed file is sent again on its own; the rest is not. Each call that carries data prints one line, for example `letify: data 8 files 1024.0 MiB detected, 7 files 896.0 MiB already on the runtime, uploaded 1 files 128.0 MiB in 1.4 s (91.4 MiB/s)`.
 
-Files the call writes under a detected path are not copied back. Write results to a volume or return them.
+### Files the call writes
+
+A directory and a path that does not exist yet are output locations. When the call returns, every file the body created or changed there is copied to the same relative path on the local disk.
+
+```python
+RUN = Path("runs/exp1")
+
+@let.function(device=lab.A100, host=letify.remote)
+def train(epochs):
+    RUN.mkdir(parents=True, exist_ok=True)
+    torch.save(model.state_dict(), RUN / "model.pt")   # local runs/exp1/model.pt after the call
+```
+
+- A file whose contents did not change is not sent. A second call that only changes the logs receives only the logs.
+- A call that raised writes nothing back.
+- A file the body deleted on the runtime is not deleted locally.
+- Calls writing the same local path at the same time are applied one after the other, and for the same file the call that returned last wins. A file is never half from one call and half from another.
+- Files inside a directory are placed on the runtime as writable copies, so the body may overwrite an existing file.
+
+Each such call prints one more line, for example `letify: data wrote back 3 files 512.1 MiB in 2.4 s (213.4 MiB/s), 0 files 0.0 MiB already on the client`.
 
 ## Data that is too big to move
 
