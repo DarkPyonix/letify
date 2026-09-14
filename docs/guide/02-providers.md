@@ -166,7 +166,7 @@ Setup is two commands, one on each machine. Both machines need `tailcat`, and th
 letify client shell connect --name home_box
 ```
 
-If `tailcat` is missing and you are at a terminal, the command offers to install it. If you decline, run without a terminal, or the SSH server is missing, it prints the exact install steps for that machine and exits. Otherwise it prints one command to run on your own machine:
+If `tailcat` is missing, the command installs it as [Installing tailcat and eci](#installing-tailcat-and-eci) describes. If automatic install is turned off, or the SSH server is missing, it prints the exact install steps for that machine and exits. Otherwise it prints one command to run on your own machine:
 
 ```
 letify login tunnel home_box --connect eyJ0YWlsY2F0Ijoi...
@@ -226,10 +226,10 @@ spot_fallback = "ondemand"          # optional: none (default) or ondemand
 access_token_env = "ELICE_ACCESS_TOKEN"
 ```
 
-Targets Elice Cloud Infrastructure through `eci`, Elice's own command line. `letify login elice` offers to install it when it is missing, or install it yourself:
+Targets Elice Cloud Infrastructure through `eci`, Elice's own command line. letify installs it the first time it is needed, or install it ahead of time:
 
 ```bash
-letify setup eci                 # letify downloads Elice's release after you confirm
+letify setup eci                 # letify downloads Elice's release
 curl -fsSL https://raw.githubusercontent.com/elice-dev/eci-cli/main/scripts/install.sh | sh
 ```
 
@@ -322,15 +322,21 @@ letify check lab_a100
 
 ## Installing tailcat and eci
 
-letify runs two programs it does not ship: `tailcat`, from Tailscale, for Tunnel accounts, and `eci`, from Elice, for Elice accounts. Neither is part of letify or covered by its license. letify installs one only after you say yes:
+letify runs two programs it does not ship: `tailcat`, from Tailscale, for Tunnel accounts, and `eci`, from Elice, for Elice accounts. Neither is part of letify or covered by its license. When a command needs one and finds none, letify installs it and prints two lines on standard error:
 
-```bash
-letify setup tailcat          # asks first; --yes skips the question
-letify setup eci --yes        # for scripts and CI
-letify setup tailcat --where  # where it is and which copy letify uses
+```
+letify: installing tailcat 0.6.0 from https://github.com/tailscale/tailcat/releases/download/v0.6.0/tailcat_0.6.0_linux_amd64.tar.gz into ~/.letify/tools/tailcat/0.6.0
+letify: tailcat 0.6.0 verified sha256 f3597a9a..., linked at .venv/bin/tailcat
 ```
 
-The commands that need a tool ask the same question at a terminal. Without a terminal, in CI, or with `--no-input`, they never ask: they print the install steps and the `letify setup <tool> --yes` command.
+To install ahead of time, or to see what letify uses:
+
+```bash
+letify setup tailcat          # install now
+letify setup eci --where      # where it is and which copy letify uses
+```
+
+To turn automatic install off, put `auto_install = false` at the top of `~/.letify/config.toml`, or set `LETIFY_AUTO_INSTALL=0`. A missing tool then fails with the install steps and the `letify setup <tool>` command.
 
 What an install does:
 
