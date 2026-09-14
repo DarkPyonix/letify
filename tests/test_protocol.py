@@ -614,16 +614,19 @@ def test_a_segment_that_repeats_received_bytes_ends_the_stream() -> None:
         sock.close()
 
 
-def test_a_lane_that_closes_ends_the_stream_after_the_bytes_before_it() -> None:
+def test_bytes_still_arriving_on_one_lane_are_delivered_after_another_lane_ends() -> None:
+    # Spec "Parallel data streams", step 5: a worker replying to reexec closes every lane
+    # at once, and the reply may arrive after another lane's end of stream.
     import socket
+    import time
 
     sender, receiver, near, far = _striped_pair(2)
-    _send_all(sender, b"hello")
-    assert _read_exactly(receiver, 5) == b"hello"
     # Shut down first: close alone leaves the descriptor open under this end's blocked reader.
     near[1].sock.shutdown(socket.SHUT_RDWR)
-    near[1].sock.close()
+    time.sleep(0.2)
+    _send_all(sender, b"reply")
+    near[0].sock.shutdown(socket.SHUT_RDWR)
+    assert _read_exactly(receiver, 5) == b"reply"
     assert receiver.recv_into(memoryview(bytearray(8))) == 0
-    near[0].sock.close()
-    for sock in far:
+    for sock in [lane.sock for lane in near] + far:
         sock.close()
