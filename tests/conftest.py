@@ -456,6 +456,184 @@ def fake_elice():
     server.close()
 
 
+#: The stand-in for Elice's ``eci`` binary. It answers from a JSON state file and appends
+#: every call, with its arguments and the ECI_* variables it saw, to that file.
+FAKE_ECI_SOURCE = r"""
+import json, os, sys
+
+path = os.environ["FAKE_ECI_STATE"]
+with open(path, encoding="utf-8") as handle:
+    state = json.load(handle)
+argv = sys.argv[1:]
+state["calls"].append(
+    {"argv": argv, "env": {k: v for k, v in os.environ.items() if k.startswith("ECI_")}}
+)
+
+def save():
+    with open(path, "w", encoding="utf-8") as handle:
+        json.dump(state, handle)
+
+def done(body=None, code=0, err=""):
+    save()
+    if body is not None:
+        print(json.dumps(body))
+    if err:
+        print(err, file=sys.stderr)
+    sys.exit(code)
+
+def flag(name):
+    return argv[argv.index(name) + 1] if name in argv else None
+
+words = [a for a in argv if not a.startswith("--")]
+joined = " ".join(words)
+for prefix, failure in state.get("fail", {}).items():
+    if joined.startswith(prefix):
+        done(code=failure.get("code", 1), err=failure.get("stderr", "failed"))
+if os.environ.get("ECI_API_TOKEN") != state["token"]:
+    done(code=1, err="Error: 401 Unauthorized: invalid token")
+
+def vm(name):
+    return next((v for v in state["vms"] if name in (v["name"], v["id"])), None)
+
+if joined.startswith("config verify"):
+    done(code=0)
+if joined.startswith("zone list"):
+    done(state["zones"])
+if joined.startswith("instance-type list"):
+    done(state["instance_types"])
+if joined.startswith("pricing list"):
+    done(state["pricing"])
+if joined.startswith("org info"):
+    done(state["org"])
+if joined.startswith("compute vm list"):
+    done(state["vms"])
+if joined.startswith("compute vm get"):
+    found = vm(words[3])
+    queued = state.get("transitions", {}).get(words[3])
+    if found and queued:
+        found["status"] = queued.pop(0)
+    done(found) if found else done(code=1, err=f"Error: virtual machine {words[3]} not found")
+if joined.startswith("compute vm launch"):
+    number = len(state["vms"]) + 1
+    record = {
+        "id": f"vm-{number}",
+        "name": flag("--name"),
+        "status": "started",
+        "instance_type": flag("--instance-type"),
+        "pricing_type": flag("--price-type") or "ondemand",
+        "public_ip": f"203.0.113.{number}",
+    }
+    state["vms"].append(record)
+    done(record)
+if joined.startswith("compute vm start"):
+    vm(words[3])["status"] = "started"
+    done({})
+if joined.startswith("compute vm stop"):
+    vm(words[3])["status"] = "idle"
+    done({})
+done(code=2, err=f"fake eci does not know: {joined}")
+"""
+
+
+class FakeEci:
+    """Elice's ``eci`` command on PATH, answering from a state a test sets.
+
+    A real executable, so the subprocess call, the environment letify builds and the JSON
+    it parses are all exercised. Only the service behind the command is faked.
+    """
+
+    def __init__(self, directory: Path) -> None:
+        self.directory = directory
+        self.state_path = directory / "state.json"
+        binary = directory / "eci"
+        binary.write_text(f"#!{sys.executable}\n{FAKE_ECI_SOURCE}", encoding="utf-8")
+        binary.chmod(0o755)
+        self.write(
+            {
+                "token": "token-1",
+                "zones": [{"id": "zone-1", "name": "central-01-a"}],
+                "vms": [],
+                "instance_types": [
+                    {"id": "it-cpu", "name": "C-4", "cpu_vcore": 4, "devices": []},
+                    {"id": "it-cpu-small", "name": "C-2", "cpu_vcore": 2, "devices": []},
+                    {
+                        "id": "it-a100",
+                        "name": "G-A100-1",
+                        "cpu_vcore": 16,
+                        "devices": ["NVIDIA A100-SXM4-80GB"],
+                    },
+                    {
+                        "id": "it-a100x2",
+                        "name": "G-A100-2",
+                        "cpu_vcore": 32,
+                        "devices": ["NVIDIA A100-SXM4-80GB", "NVIDIA A100-SXM4-80GB"],
+                    },
+                ],
+                "pricing": [
+                    {"name": "G-A100-1", "pricing_type": "ondemand", "price_per_hour": "2500"},
+                    {"name": "G-A100-1", "pricing_type": "spot", "price_per_hour": "900"},
+                ],
+                "org": {"name_short": "lab", "resource_quota": {"compute": {"devices": 8}}},
+                "fail": {},
+                "calls": [],
+            }
+        )
+
+    def read(self) -> dict[str, Any]:
+        return json.loads(self.state_path.read_text(encoding="utf-8"))
+
+    def write(self, state: dict[str, Any]) -> None:
+        self.state_path.write_text(json.dumps(state), encoding="utf-8")
+
+    def set(self, **values: Any) -> None:
+        state = self.read()
+        state.update(values)
+        self.write(state)
+
+    def machine(self, name: str, **fields: Any) -> None:
+        """Change one listed machine, as Elice would behind letify's back."""
+        state = self.read()
+        for record in state["vms"]:
+            if record["name"] == name:
+                record.update(fields)
+        self.write(state)
+
+    def remove(self, name: str) -> None:
+        state = self.read()
+        state["vms"] = [record for record in state["vms"] if record["name"] != name]
+        self.write(state)
+
+    @property
+    def calls(self) -> list[dict[str, Any]]:
+        return self.read()["calls"]
+
+    def commands(self) -> list[str]:
+        """Each call's words, without flags or their values, joined by spaces."""
+        switches = {"--wait"}
+        found = []
+        for call in self.calls:
+            words, skip = [], False
+            for arg in call["argv"]:
+                if skip:
+                    skip = False
+                elif arg.startswith("--"):
+                    skip = arg not in switches
+                else:
+                    words.append(arg)
+            found.append(" ".join(words))
+        return found
+
+
+@pytest.fixture
+def fake_eci(tmp_path: Path, monkeypatch) -> FakeEci:
+    directory = tmp_path / "fake-eci-bin"
+    directory.mkdir()
+    fake = FakeEci(directory)
+    monkeypatch.setenv("FAKE_ECI_STATE", str(fake.state_path))
+    monkeypatch.setenv("PATH", f"{directory}{os.pathsep}{os.environ.get('PATH', '')}")
+    return fake
+
+
 @pytest.fixture
 def fake_google():
     """Google's OAuth token endpoint and Colab's ``ccu-info`` on loopback.

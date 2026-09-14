@@ -45,6 +45,8 @@ class Usage:
     #: Further allowances on the same account, each a dictionary with ``name``, ``unit``,
     #: ``remaining``, ``used``, ``limit`` and ``resets_at``.
     resources: tuple[dict[str, Any], ...] = field(default=())
+    #: The account's price type, ``ondemand`` or ``spot``, where the provider has one.
+    price_type: str | None = None
 
     @property
     def known(self) -> bool:
@@ -70,6 +72,7 @@ class Usage:
             "as_of": self.as_of,
             "note": self.note,
             "resources": [dict(resource) for resource in self.resources],
+            "price_type": self.price_type,
         }
 
 

@@ -69,6 +69,21 @@ class RuntimeLost(RuntimeFailure):
     """A runtime believed to be alive is gone. Always retryable."""
 
 
+class SpotPreempted(RuntimeLost):
+    """The provider stopped or deleted a spot machine that letify did not stop.
+
+    An infrastructure failure, so it is retried like any other. ``machine`` names the
+    machine, ``state`` is its last status or ``deleted``, and ``at`` is when it was seen, in
+    Unix seconds.
+    """
+
+    def __init__(self, message: str, *, machine: str, state: str, at: float):
+        self.machine = machine
+        self.state = state
+        self.at = at
+        super().__init__(message)
+
+
 class RemoteError(LetifyError):
     """The shipped function raised on the remote side. Carries its traceback."""
 

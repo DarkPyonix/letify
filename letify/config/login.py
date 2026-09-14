@@ -544,14 +544,23 @@ def shell_account(answers: Answers) -> dict[str, Any]:
     return options
 
 
-def elice_account(answers: Answers) -> dict[str, Any]:
-    """Check the access token, choose the zone and machine, and keep the token.
+#: The last line of the Elice machine menu, which records no machine.
+CREATE_MACHINE = "Create a new machine with letify"
 
-    Nothing is written until a read-only call has accepted the token, so a mistyped
-    token leaves no account and no secret file behind.
+
+def elice_account(answers: Answers) -> dict[str, Any]:
+    """Check the access token with eci, choose the zone and any machine, and keep the token.
+
+    Spec "Logging in". Nothing is written until eci has accepted the token and the zone,
+    so a mistyped token leaves no account and no secret file behind. No machine has to
+    exist: without one, letify creates its own on first use.
     """
     from ..providers import elice
 
+    try:
+        binary = elice.find_eci()
+    except LetifyError as exc:
+        raise LoginError(str(exc)) from None
     given = answers.get("endpoint")
     endpoint = given if isinstance(given, str) and given else elice.DEFAULT_ENDPOINT
     token = answers.token or (
@@ -559,28 +568,48 @@ def elice_account(answers: Answers) -> dict[str, Any]:
     )
     if not token:
         raise LoginError(f"{answers.alias} needs an access token. Pass --token or drop --no-input.")
+    unzoned = elice.eci_environment(answers.alias, token, endpoint, None)
     try:
-        organization = elice.request("GET", elice.ORGANIZATION_PATH, token=token, endpoint=endpoint)
+        zones = elice.items(elice.eci(binary, ["zone", "list"], unzoned))
     except LetifyError as exc:
         raise LoginError(f"Elice refused the access token, so nothing was written: {exc}") from None
 
-    def listing(path: str, params: dict[str, str] | None = None) -> list[dict[str, Any]]:
-        try:
-            body = elice.request("GET", path, token=token, endpoint=endpoint, params=params)
-        except LetifyError as exc:
-            raise LoginError(f"could not list Elice {path}: {exc}") from None
-        return elice.items(body)
+    zone = choose(answers, "zone_id", "zone", lambda: zones)
+    env = elice.eci_environment(answers.alias, token, endpoint, zone)
+    try:
+        elice.eci(binary, ["config", "verify"], env, parse=False)
+    except LetifyError as exc:
+        raise LoginError(f"eci config verify failed, so nothing was written: {exc}") from None
 
-    zone = choose(answers, "zone_id", "zone", lambda: listing(elice.ZONE_PATH))
-    machine = choose(
-        answers, "machine_id", "machine", lambda: listing(elice.VM_PATH, {"zone_id": zone})
-    )
-    options: dict[str, Any] = {"kind": answers.kind, "zone_id": zone, "machine_id": machine}
+    machine = answers.get("machine_id")
+    if not (isinstance(machine, str) and machine):
+        machine = None
+        try:
+            listed = [m for m in elice.items(elice.eci(binary, ["compute", "vm", "list"], env))]
+        except LetifyError as exc:
+            raise LoginError(f"could not list Elice machines: {exc}") from None
+        listed = [m for m in listed if m.get("id")]
+        if not listed:
+            print("Elice lists no machine; letify creates one on first use.")
+        elif answers.interactive:
+            machine = choose_machine(listed)
+
+    options: dict[str, Any] = {"kind": answers.kind, "zone_id": zone}
+    if machine:
+        options["machine_id"] = machine
+    price_type = answers.get("price_type")
+    if price_type:
+        options["price_type"] = price_type
     if endpoint != elice.DEFAULT_ENDPOINT:
         options["endpoint"] = endpoint
     short_name = answers.get("organization")
-    if not (isinstance(short_name, str) and short_name) and isinstance(organization, dict):
-        short_name = organization.get("name_short") or organization.get("nameShort")
+    if not (isinstance(short_name, str) and short_name):
+        try:
+            organization = elice.eci(binary, ["org", "info"], env)
+        except LetifyError:
+            organization = None
+        if isinstance(organization, dict):
+            short_name = organization.get("name_short") or organization.get("nameShort")
     if isinstance(short_name, str) and short_name:
         options["organization"] = short_name
     billing = ask(
@@ -588,9 +617,26 @@ def elice_account(answers: Answers) -> dict[str, Any]:
     )
     if billing:
         options["billing_endpoint"] = billing
+    key_path = str(answers.get("key") or DEFAULT_KEY)
+    ensure_key(key_path)
+    options["key"] = key_path
     record_workspace(answers, options)
     store_secret(answers.alias, "access_token", token)
     return options
+
+
+def choose_machine(listed: list[dict[str, Any]]) -> str | None:
+    """A listed machine's id picked by number, or None for the last choice, create one."""
+    for number, item in enumerate(listed, start=1):
+        print(f"{number}. {item.get('name') or item['id']} ({item['id']})")
+    last = len(listed) + 1
+    print(f"{last}. {CREATE_MACHINE}")
+    prompt = f"Elice machine [1-{last}]: "
+    while True:
+        answer = read_line(prompt)
+        if answer.isdigit() and 1 <= int(answer) <= last:
+            return None if int(answer) == last else str(listed[int(answer) - 1]["id"])
+        print(f"Enter a number from 1 to {last}.")
 
 
 def choose(

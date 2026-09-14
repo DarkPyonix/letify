@@ -34,9 +34,7 @@ from letify.providers.base import Provider
 from letify.providers.colab import ALIASES, Colab
 from letify.providers.elice import (
     ALLOCATION_PATH,
-    INSTANCE_TYPE_PATH,
     PRICING_PATH,
-    VM_PATH,
     Elice,
 )
 from letify.providers.local import Local
@@ -986,25 +984,26 @@ def test_colab_falls_back_to_exec_when_nothing_else_connects(
     assert recorder.command == [*COLAB_CLI, "exec", "-s", "letify-g4-1"]
 
 
-def test_elice_runs_its_remote_half_over_forward_ssh_to_the_allocated_machine() -> None:
+def test_elice_runs_its_remote_half_over_forward_ssh_to_the_started_machine() -> None:
+    # Spec "Elice machines": a launched machine is reached as root unless the account names
+    # another user.
     provider = provider_of(Elice, "e", zone_id="z", machine_id="m", address="gpu.elice.io")
     rendezvous = provider.rendezvous()
     assert isinstance(rendezvous, ShellCommandRendezvous)
-    assert rendezvous.ssh("python3 -")[-2:] == ["gpu.elice.io", "python3 -"]
+    assert rendezvous.ssh("python3 -")[-2:] == ["root@gpu.elice.io", "python3 -"]
     assert provider_of(Elice, "e", zone_id="z", machine_id="m").rendezvous() is None
 
 
 # -- Spec: Provider model, Elice -----------------------------------------------
 
 
-def test_elice_needs_a_zone_a_machine_and_a_token() -> None:
-    # letify allocates and releases a declared machine; it does not create one.
+def test_elice_needs_a_zone_and_a_token() -> None:
+    # A machine is optional: without machine_id letify creates one on first use.
     with pytest.raises(letify.ProviderUnavailable, match="no 'zone_id' field"):
         provider_of(Elice, "elice_a100").zone_id  # noqa: B018
-    with pytest.raises(letify.ProviderUnavailable, match="does not create it"):
-        provider_of(Elice, "elice_a100", zone_id="z").machine_id  # noqa: B018
+    assert provider_of(Elice, "elice_a100", zone_id="z").machine_id is None
     with pytest.raises(letify.ProviderUnavailable, match="access_token_env"):
-        provider_of(Elice, "elice_a100", zone_id="z").machines()
+        provider_of(Elice, "elice_a100", zone_id="z").pricing()
 
 
 def test_the_elice_endpoint_can_be_pointed_elsewhere() -> None:
@@ -1018,115 +1017,42 @@ def test_elice_is_reached_with_the_standard_library_alone(no_module, fake_elice)
     # Spec "Packaging": Elice uses the standard library HTTP client, so no HTTP package
     # has to be installed.
     no_module("httpx", "requests")
-    fake_elice.answer("GET", VM_PATH, FakeResponse(200, []))
+    fake_elice.answer("GET", PRICING_PATH, FakeResponse(200, []))
     provider = provider_of(Elice, "e", endpoint=fake_elice.endpoint, zone_id="z", access_token="t")
-    assert provider.machines() == []
+    assert provider.pricing() == []
 
 
-def test_an_elice_request_carries_the_token_and_the_zone(elice, fake_elice) -> None:
-    fake_elice.answer("GET", VM_PATH, FakeResponse(200, {"items": [{"id": "machine-1"}]}))
-    assert elice.machines() == [{"id": "machine-1"}]
+def test_an_elice_request_carries_the_token(elice, fake_elice) -> None:
+    fake_elice.answer("GET", PRICING_PATH, FakeResponse(200, {"items": [{"id": "p1"}]}))
+    assert elice.pricing() == [{"id": "p1"}]
     assert fake_elice.last["authorization"] == "Bearer token-1"
-    assert fake_elice.last["params"] == {"zone_id": "zone-1"}
 
 
 def test_anything_other_than_a_two_hundred_is_a_failure(elice, fake_elice) -> None:
     # This API answers 200 for every success.
-    fake_elice.answer("GET", VM_PATH, FakeResponse(403, {"message": "quota exceeded"}))
+    fake_elice.answer("GET", PRICING_PATH, FakeResponse(403, {"message": "quota exceeded"}))
     with pytest.raises(letify.RuntimeFailure, match="returned 403: quota exceeded"):
-        elice.machines()
+        elice.pricing()
 
 
 def test_a_failure_with_no_json_body_carries_the_text(elice, fake_elice) -> None:
-    fake_elice.answer("GET", VM_PATH, FakeResponse(502, None, text="<html>bad gateway</html>"))
+    fake_elice.answer("GET", PRICING_PATH, FakeResponse(502, None, text="<html>bad gateway</html>"))
     with pytest.raises(letify.RuntimeFailure, match="bad gateway"):
-        elice.machines()
+        elice.pricing()
 
 
 def test_a_response_may_be_a_bare_list_or_an_items_table(elice, fake_elice) -> None:
-    fake_elice.answer("GET", VM_PATH, FakeResponse(200, [{"id": "machine-1"}]))
-    assert elice.machines() == [{"id": "machine-1"}]
+    fake_elice.answer("GET", PRICING_PATH, FakeResponse(200, [{"id": "p1"}]))
+    assert elice.pricing() == [{"id": "p1"}]
 
 
-def test_the_instance_types_a_zone_offers_are_normalized(elice, fake_elice) -> None:
-    fake_elice.answer(
-        "GET",
-        INSTANCE_TYPE_PATH,
-        FakeResponse(
-            200,
-            {
-                "items": [
-                    {
-                        "gpu_model": "NVIDIA A100-SXM4-80GB",
-                        "cpu_count": 16,
-                        "memory_gb": 128,
-                        "gpu_memory_gb": 80,
-                    },
-                    {"name": "NVIDIA L40S"},
-                    {"description": "no name at all"},
-                ]
-            },
-        ),
-    )
-    table = elice.instances
-    assert sorted(table) == ["A100", "L40S"]
+def test_the_instance_types_eci_lists_are_normalized(isolated_home, fake_eci) -> None:
+    # Spec "Elice machines": instance types come from eci instance-type list.
+    provider = provider_of(Elice, "e", zone_id="zone-1", access_token="token-1")
+    table = provider.instances
+    assert sorted(table) == ["A100", "CPU"]
     assert table["A100"].cpus == 16
-    assert table["A100"].memory_gb == 128
-    assert table["A100"].vram_gb == 80
-
-
-def test_an_allocation_is_what_powers_a_declared_machine_on(elice, fake_elice) -> None:
-    # The virtual machine is the instance and the allocation is the runtime.
-    fake_elice.answer("POST", ALLOCATION_PATH, FakeResponse(200, {"id": "alloc-1"}))
-    elice.create_session(Instance(elice, gpu="A100"), "letify-a100-1")
-    assert elice._pending_allocation == "alloc-1"
-    assert fake_elice.last["json"] == {"zone_id": "zone-1", "machine_id": "machine-1"}
-
-
-def test_an_organization_is_named_in_the_allocation_when_declared(fake_elice) -> None:
-    provider = provider_of(
-        Elice,
-        "e",
-        endpoint=fake_elice.endpoint,
-        zone_id="z",
-        machine_id="m",
-        access_token="t",
-        organization_id="org-1",
-    )
-    fake_elice.answer("POST", ALLOCATION_PATH, FakeResponse(200, {"allocation_id": "alloc-2"}))
-    assert provider.allocate("m") == "alloc-2"
-    assert fake_elice.last["json"]["organization_id"] == "org-1"
-
-
-def test_an_allocation_with_no_id_is_a_failure(elice, fake_elice) -> None:
-    fake_elice.answer("POST", ALLOCATION_PATH, FakeResponse(200, {"state": "pending"}))
-    with pytest.raises(letify.RuntimeFailure, match="did not return an allocation id"):
-        elice.allocate("machine-1")
-
-
-def test_releasing_an_allocation_stops_compute_billing(elice, fake_elice) -> None:
-    elice.release("alloc-1")
-    assert fake_elice.last["method"] == "DELETE"
-    assert fake_elice.last["path"] == f"{ALLOCATION_PATH}/alloc-1"
-
-
-def test_releasing_an_allocation_that_is_already_gone_is_not_an_error(elice, fake_elice) -> None:
-    fake_elice.answer(
-        "DELETE", f"{ALLOCATION_PATH}/alloc-1", FakeResponse(404, {"message": "gone"})
-    )
-    assert elice.release("alloc-1") is None
-
-
-def test_stopping_an_elice_runtime_releases_its_allocation(elice, fake_elice) -> None:
-    runtime = type("R", (), {"external_id": "alloc-1", "name": "letify-a100-1"})()
-    elice.stop(runtime)
-    assert fake_elice.last["path"].endswith("alloc-1")
-
-
-def test_a_runtime_with_no_allocation_has_nothing_to_release(elice, fake_elice) -> None:
-    runtime = type("R", (), {"external_id": None, "name": "letify-a100-1"})()
-    assert elice.stop(runtime) is None
-    assert fake_elice.requests == []
+    assert fake_eci.commands() == ["instance-type list"]
 
 
 def test_the_zone_price_list_includes_any_preemptible_option(elice, fake_elice) -> None:

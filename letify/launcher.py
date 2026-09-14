@@ -471,6 +471,7 @@ class Launcher:
                     "accelerator": runtime.instance.accelerator,
                     "devices": list(runtime.held_devices) or runtime.instance.devices,
                     "placement": str(runtime.instance.placement),
+                    "price_type": runtime.provider.price_type_of(runtime.instance),
                     "busy": runtime.busy,
                     "persistent_channel": runtime.persistent_channel,
                     "idle_seconds": round(runtime.idle_for, 1),

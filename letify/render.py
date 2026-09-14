@@ -199,6 +199,8 @@ def usage_block(row: Mapping[str, Any], style: Style, now: float | None = None) 
     if "unavailable" in row:
         return f"{style.bold(alias)}\n{INDENT}unavailable: {row['unavailable']}\n"
     lines = [f"{style.bold(alias)}  {row.get('kind')}"]
+    if row.get("price_type"):
+        lines[0] += f"  price type {row['price_type']}"
     if row.get("unmetered"):
         return "\n".join([*lines, f"{INDENT}no quota, unmetered"]) + "\n"
     body = _allowance_lines(row, style, now, None)
@@ -309,6 +311,8 @@ def _runtime_block(runtime: Mapping[str, Any], style: Style, now: float) -> str:
     if isinstance(cards, (list, tuple)) and cards:
         where.append("cards " + ", ".join(str(card) for card in cards))
     where.append(f"host {runtime.get('placement')}")
+    if runtime.get("price_type"):
+        where.append(f"price {runtime['price_type']}")
     if runtime.get("link"):
         rtt = runtime.get("rtt_ms")
         where.append(
