@@ -11,7 +11,7 @@ import argparse
 import json
 import sys
 
-from . import __version__
+from . import __version__, render
 from .config import login
 from .errors import LetifyError
 from .launcher import Launcher
@@ -25,9 +25,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--config", help="a project .letify directory, or its config.toml")
     sub = parser.add_subparsers(dest="command", required=True)
 
-    sub.add_parser("providers", help="list declared providers and their storage")
-    sub.add_parser("devices", help="list the accelerators each provider offers")
-    sub.add_parser("status", help="show live runtimes and what they are costing")
+    providers_parser = sub.add_parser("providers", help="list declared providers and their storage")
+    providers_parser.add_argument(
+        "--json", action="store_true", help="print the records unformatted"
+    )
+    devices_parser = sub.add_parser("devices", help="list the accelerators each provider offers")
+    devices_parser.add_argument("--json", action="store_true", help="print the records unformatted")
+    status_parser = sub.add_parser("status", help="show live runtimes and what they are costing")
+    status_parser.add_argument("--json", action="store_true", help="print the records unformatted")
     sub.add_parser("stubs", help="write the provider types an editor completes")
 
     usage = sub.add_parser("usage", help="show what each account has left")
@@ -115,6 +120,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     probe = sub.add_parser("probe", help="measure whether host='local' is worth using")
     probe.add_argument("host", nargs="?", help="host name to measure the round trip to")
+    probe.add_argument("--json", action="store_true", help="print the record unformatted")
 
     efficiency = sub.add_parser(
         "efficiency", help="expected fraction of a direct run, from measured terms"
@@ -122,6 +128,7 @@ def build_parser() -> argparse.ArgumentParser:
     efficiency.add_argument("step_seconds", type=float, help="GPU time per step")
     efficiency.add_argument("syncs", type=int, help="host synchronizations per step")
     efficiency.add_argument("round_trip_ms", type=float, help="network round trip")
+    efficiency.add_argument("--json", action="store_true", help="print the record unformatted")
 
     client = sub.add_parser("client", help="run letify's side on a remote machine")
     client_sub = client.add_subparsers(dest="client_command", required=True)
@@ -158,10 +165,10 @@ def _client_shell_connect(args: argparse.Namespace) -> int:
     from .transport.agent import Agent
 
     if not setup.tailcat_on_path(args.tailcat):
-        print(setup.tailcat_install_instructions(), file=sys.stderr)
+        _fail(setup.tailcat_install_instructions())
         return 1
     if not setup.ssh_answers(args.ssh_port):
-        print(setup.sshd_missing_message(args.ssh_port), file=sys.stderr)
+        _fail(setup.sshd_missing_message(args.ssh_port))
         return 1
 
     agent = Agent(ssh=("127.0.0.1", args.ssh_port), tailcat=args.tailcat)
@@ -170,7 +177,7 @@ def _client_shell_connect(args: argparse.Namespace) -> int:
         address = agent.start_tailcat()
     except (OSError, RuntimeError) as exc:
         agent.close()
-        print(exc, file=sys.stderr)
+        _fail(str(exc))
         return 1
     fields = {
         "tailcat": address,
@@ -184,15 +191,20 @@ def _client_shell_connect(args: argparse.Namespace) -> int:
         fields["public_port"] = args.public_port
     token = setup.encode_token(fields)
     alias = args.name or setup.default_alias()
-    print("On your own machine, run:")
+    style = _out()
+    print(style.bold("On your own machine, run:"))
     print()
     print(f"  letify login tunnel {alias} --connect {token}")
     print()
-    print("Keep this agent running: every connection to this machine goes through it.")
-    print("To keep it running after you log out, start it inside tmux or with nohup:")
+    print(style.dim("Keep this agent running: every connection to this machine goes through it."))
+    print(style.dim("To keep it running after you log out, start it inside tmux or with nohup:"))
     print("  tmux new -s letify 'letify client shell connect'")
     print("  nohup letify client shell connect > letify-agent.log 2>&1 &")
-    print("A restart gets a new address, so run the login again with the new token it prints.")
+    print(
+        style.dim(
+            "A restart gets a new address, so run the login again with the new token it prints."
+        )
+    )
     sys.stdout.flush()
     try:
         agent.serve_forever()
@@ -210,13 +222,42 @@ def _describe_usage(row: dict) -> str:
     return describe_row(row)
 
 
+def _out() -> render.Style:
+    return render.Style.for_stream(sys.stdout)
+
+
+def _fail(message: str) -> None:
+    """One failure on standard error, marked as spec "Command line" says."""
+    style = render.Style.for_stream(sys.stderr)
+    print(f"{render.mark('fail', style)} {message}", file=sys.stderr)
+
+
+def _say(kind: str, message: str) -> None:
+    """One marked line on standard output."""
+    print(f"{render.mark(kind, _out())} {message}")
+
+
+def _json(value: object) -> int:
+    print(json.dumps(value, indent=2))
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    try:
+        return _dispatch(args)
+    except LetifyError as exc:
+        _fail(str(exc))
+        return 1
 
+
+def _dispatch(args: argparse.Namespace) -> int:
     if args.command == "efficiency":
         from .remoting import efficiency as compute
 
         share = compute(args.step_seconds, args.syncs, args.round_trip_ms)
+        if args.json:
+            return _json({"efficiency": share})
         print(f"{share * 100:.1f}% of a direct run")
         return 0
 
@@ -254,26 +295,27 @@ def main(argv: list[str] | None = None) -> int:
         try:
             fresh, home, project = login.log_in(answers, project=args.config)
         except LetifyError as exc:
-            print(exc, file=sys.stderr)
+            _fail(str(exc))
             return 1
         if fresh:
-            print(f"{alias} declared in {home}")
+            _say("ok", f"{alias} declared in {home}")
         else:
-            print(f"{alias} was already declared in {home}, so nothing was asked for")
-        print(f"{alias} referenced in {project}, which is safe to commit")
+            _say("warn", f"{alias} was already declared in {home}, so nothing was asked for")
+        _say("ok", f"{alias} referenced in {project}, which is safe to commit")
         return 0
 
     if args.command == "logout":
         removed, forgotten = login.log_out(args.alias)
         if not removed:
-            print(
-                f"{args.alias} is not declared in {login.home_path()}",
-                file=sys.stderr,
-            )
+            _fail(f"{args.alias} is not declared in {login.home_path()}")
             return 1
         detail = " and its account directory" if forgotten else ""
-        print(f"{args.alias} removed from {login.home_path()}{detail}")
-        print("The project reference is left alone, because this repository still needs it")
+        _say("ok", f"{args.alias} removed from {login.home_path()}{detail}")
+        print(
+            _out().dim(
+                "The project reference is left alone, because this repository still needs it"
+            )
+        )
         return 0
 
     let = Launcher(args.config, announce=False)
@@ -283,46 +325,69 @@ def main(argv: list[str] | None = None) -> int:
 
         written = stubs.write(let)
         if written is None:
-            print("generation is turned off by [tool.letify] typings = false", file=sys.stderr)
+            _fail("generation is turned off by [tool.letify] typings = false")
             return 1
-        print(written)
+        _say("ok", str(written))
         return 0
 
     if args.command == "providers":
+        records: list[dict[str, str]] = []
         for alias in let.config.order:
             try:
                 provider = let.provider(alias)
             except Exception as exc:
-                print(f"{alias:20} unavailable: {exc}")
+                records.append({"alias": alias, "unavailable": str(exc)})
                 continue
-            print(f"{alias:20} {provider.kind:10} {provider.persistence}")
+            records.append(
+                {"alias": alias, "kind": provider.kind, "persistence": str(provider.persistence)}
+            )
+        if args.json:
+            return _json(records)
+        style = _out()
+        rows = [
+            [r["alias"], r["kind"], r["persistence"]]
+            if "unavailable" not in r
+            else [r["alias"], f"{render.mark('fail', style)} unavailable: {r['unavailable']}", ""]
+            for r in records
+        ]
+        sys.stdout.write(render.table(["ALIAS", "KIND", "PERSISTENCE"], rows, style))
         return 0
 
     if args.command == "devices":
-        print(json.dumps(let.providers.devices, indent=2, sort_keys=True))
+        table = let.providers.devices
+        if args.json:
+            print(json.dumps(table, indent=2, sort_keys=True))
+            return 0
+        rows = [[alias, ", ".join(str(name) for name in names)] for alias, names in table.items()]
+        sys.stdout.write(render.table(["PROVIDER", "ACCELERATORS"], rows, _out()))
         return 0
 
     if args.command == "status":
-        print(json.dumps(let.status(), indent=2))
+        status = let.status()
+        if args.json:
+            return _json(status)
+        # A live runtime is what costs money, so only its account is asked what is left.
+        asked: dict[str, dict] = {}
+        for runtime in status.get("runtimes") or []:
+            alias = str(runtime["provider"])
+            if alias not in asked:
+                rows = let.usage(alias)
+                asked[alias] = rows[0] if rows else {}
+            runtime["usage"] = asked[alias] or None
+        sys.stdout.write(render.status_text(status, _out()))
         return 0
 
     if args.command == "usage":
         rows = let.usage(args.alias)
         if args.json:
-            print(json.dumps(rows, indent=2))
-            return 0
-        from . import render
-
+            return _json(rows)
         sys.stdout.write(render.usage_blocks(rows, render.Style.for_stream(sys.stdout)))
         return 0
 
     if args.command == "utilization":
         rows = let.utilization(args.alias)
         if args.json:
-            print(json.dumps(rows, indent=2))
-            return 0
-        from . import render
-
+            return _json(rows)
         sys.stdout.write(render.utilization_blocks(rows, render.Style.for_stream(sys.stdout)))
         return 0
 
@@ -330,29 +395,45 @@ def main(argv: list[str] | None = None) -> int:
         provider = let.provider(args.alias)
         checker = getattr(provider, "check", None)
         if checker is None:
-            print(f"{args.alias} has no check step", file=sys.stderr)
+            _fail(f"{args.alias} has no check step")
             return 1
-        print(checker())
+        answer = checker()
+        _say("ok", f"{args.alias} answers")
+        for line in str(answer).splitlines():
+            print(f"  {line}")
         return 0
 
     if args.command == "probe":
         from .remoting import probe as run_probe
 
         capability = run_probe(args.host)
-        print(
-            json.dumps(
-                {
-                    "platform": capability.platform,
-                    "core": capability.core,
-                    "agent": capability.agent,
-                    "round_trip_ms": capability.round_trip_ms,
-                    "usable": capability.usable,
-                    "costly": capability.costly,
-                    "reason": capability.explain(),
-                },
-                indent=2,
-            )
-        )
+        record = {
+            "platform": capability.platform,
+            "core": capability.core,
+            "agent": capability.agent,
+            "round_trip_ms": capability.round_trip_ms,
+            "usable": capability.usable,
+            "costly": capability.costly,
+            "reason": capability.explain(),
+        }
+        if args.json:
+            return _json(record)
+        if capability.usable and capability.costly:
+            _say("warn", "forwarding usable but costly")
+        elif capability.usable:
+            _say("ok", "forwarding usable")
+        else:
+            _say("fail", "forwarding not usable")
+        rtt = capability.round_trip_ms
+        pairs = [
+            ("platform", str(capability.platform)),
+            ("core", str(capability.core)),
+            ("agent", str(capability.agent)),
+            ("round trip", f"{rtt:.1f} ms" if rtt is not None else "not measured"),
+        ]
+        style = _out()
+        sys.stdout.write(render.fields(pairs, style))
+        print(style.dim(str(record["reason"])))
         return 0
 
     return 1

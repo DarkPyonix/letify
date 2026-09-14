@@ -1,7 +1,8 @@
 """Terminal rendering shared by the command line.
 
 This module owns how records look on a terminal: the style decision (colour, block
-characters, width), the gauge, relative times, and the usage block layout from spec
+characters, width), marks, tables, aligned fields, the gauge, relative times, the status
+layout from spec "Command line", and the usage block layout from spec
 "Remaining usage" and the utilization block layout from spec "GPU utilization". It does
 not read any provider and does not decide what a record
 contains, which belongs to the providers and to ``providers/usage.py``.
@@ -10,13 +11,12 @@ contains, which belongs to the providers and to ``providers/usage.py``.
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import time
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from typing import Any, TextIO
-
-from .providers.usage import format_amount
 
 #: The gauge is never narrower or wider than this many cells.
 GAUGE_MIN = 16
@@ -33,6 +33,9 @@ _YELLOW = "\x1b[33m"
 _RED = "\x1b[31m"
 _CYAN = "\x1b[36m"
 
+#: An escape sequence, which takes no column on a terminal.
+_ESCAPE = re.compile(r"\x1b\[[0-9;]*m")
+
 
 @dataclass(frozen=True, slots=True)
 class Style:
@@ -45,11 +48,7 @@ class Style:
     @classmethod
     def for_stream(cls, stream: TextIO) -> Style:
         """The style a stream supports: colour on a terminal without NO_COLOR, UTF-8 blocks."""
-        try:
-            tty = bool(stream.isatty())
-        except (AttributeError, ValueError):
-            tty = False
-        color = tty and not os.environ.get("NO_COLOR")
+        color = color_enabled(stream)
         encoding = (getattr(stream, "encoding", None) or "").lower().replace("-", "")
         width = shutil.get_terminal_size((80, 24)).columns
         return cls(width=width, color=color, unicode=encoding == "utf8")
@@ -62,6 +61,62 @@ class Style:
 
     def dim(self, text: str) -> str:
         return self.paint(text, _DIM)
+
+
+def format_amount(value: float, unit: str) -> str:
+    """The unit aware amount from ``providers/usage.py``, imported late to stay light."""
+    from .providers.usage import format_amount as formatted
+
+    return formatted(value, unit)
+
+
+def color_enabled(stream: TextIO) -> bool:
+    """Whether a stream gets colour: a terminal, with NO_COLOR unset or empty."""
+    try:
+        tty = bool(stream.isatty())
+    except (AttributeError, ValueError):
+        tty = False
+    return tty and not os.environ.get("NO_COLOR")
+
+
+#: Each mark's UTF-8 symbol, ASCII fallback and colour.
+_MARKS = {"ok": ("\u2713", "+", _GREEN), "fail": ("\u2717", "x", _RED), "warn": ("!", "!", _YELLOW)}
+
+
+def mark(kind: str, style: Style) -> str:
+    """The success, failure or warning symbol, as spec "Command line" lists them."""
+    utf8, ascii_, code = _MARKS[kind]
+    return style.paint(utf8 if style.unicode else ascii_, code)
+
+
+def visible_len(text: str) -> int:
+    """Columns a string takes on a terminal, not counting escape sequences."""
+    return len(_ESCAPE.sub("", text))
+
+
+def _pad(text: str, width: int) -> str:
+    return text + " " * (width - visible_len(text))
+
+
+def table(headers: list[str], rows: list[list[str]], style: Style) -> str:
+    """Columns left-aligned to their longest cell, two spaces apart, with a bold header."""
+    cells = [[str(cell) for cell in row] for row in rows]
+    widths = [
+        max(visible_len(row[column]) for row in [headers, *cells]) for column in range(len(headers))
+    ]
+
+    def line(row: list[str], bold: bool) -> str:
+        parts = [style.bold(cell) if bold else cell for cell in row]
+        padded = [_pad(part, widths[i]) for i, part in enumerate(parts[:-1])]
+        return "  ".join([*padded, parts[-1]]).rstrip() + "\n"
+
+    return line(headers, True) + "".join(line(row, False) for row in cells)
+
+
+def fields(pairs: list[tuple[str, str]], style: Style) -> str:
+    """Name and value lines with the values aligned."""
+    width = max((len(name) for name, _ in pairs), default=0)
+    return "".join(f"{name.ljust(width)}  {value}\n" for name, value in pairs)
 
 
 def share_color(remaining_share: float) -> str:
@@ -244,16 +299,83 @@ def utilization_blocks(rows: Iterable[Mapping[str, Any]], style: Style) -> str:
     return "\n".join(utilization_block(group, style) for group in groups.values())
 
 
+def _runtime_block(runtime: Mapping[str, Any], style: Style, now: float) -> str:
+    """One live runtime: where it runs, how it is reached, how long, and what it costs."""
+    state = "busy" if runtime.get("busy") else "idle"
+    where_to = f"{runtime.get('provider')}.{runtime.get('accelerator')}"
+    head = f"{style.bold(str(runtime.get('name')))}  {where_to}  {state}"
+    where = []
+    cards = runtime.get("devices")
+    if isinstance(cards, (list, tuple)) and cards:
+        where.append("cards " + ", ".join(str(card) for card in cards))
+    where.append(f"host {runtime.get('placement')}")
+    if runtime.get("link"):
+        rtt = runtime.get("rtt_ms")
+        where.append(
+            f"link {runtime['link']}" + (f", {float(rtt):.1f} ms" if rtt is not None else "")
+        )
+    uptime = float(runtime.get("uptime_seconds") or 0.0)
+    idle = float(runtime.get("idle_seconds") or 0.0)
+    lines = [head, "  ".join(where), f"up {relative(uptime)}  idle {relative(idle)}"]
+    usage = runtime.get("usage")
+    if isinstance(usage, Mapping):
+        unit = str(usage.get("unit") or "")
+        rate = usage.get("rate_per_hour")
+        if rate is not None:
+            spent = float(rate) * uptime / 3600
+            lines.append(
+                f"about {format_amount(spent, unit)} so far "
+                f"at {format_amount(float(rate), unit)}/hour"
+            )
+        lines.extend(_allowance_lines(usage, style, now, None))
+        if usage.get("note"):
+            lines.append(style.dim(str(usage["note"])))
+    return "\n".join([lines[0], *(INDENT + line for line in lines[1:])]) + "\n"
+
+
+def status_text(status: Mapping[str, Any], style: Style, now: float | None = None) -> str:
+    """``letify status``: the counts, each live runtime, and the inventory against reservations."""
+    now = time.time() if now is None else now
+    counts = f"{status.get('live', 0)} live, {status.get('busy', 0)} busy"
+    header = f"{style.bold(str(status.get('name')))}  {counts}\n"
+    parts = [header]
+    runtimes = status.get("runtimes") or []
+    if runtimes:
+        parts.extend(_runtime_block(runtime, style, now) for runtime in runtimes)
+    else:
+        parts.append(style.dim("no live session in this process") + "\n")
+    rows = [
+        [
+            alias,
+            name,
+            f"{entry.get('reserved', 0)}/{entry.get('count', 0)}",
+            ", ".join(str(index) for index in entry.get("indices") or ()),
+        ]
+        for alias, inventory in (status.get("devices") or {}).items()
+        for name, entry in inventory.items()
+    ]
+    if rows:
+        parts.append(table(["PROVIDER", "ACCELERATOR", "RESERVED", "INDICES"], rows, style))
+    return "\n".join(parts)
+
+
 __all__ = [
     "GAUGE_MAX",
     "GAUGE_MIN",
     "Style",
+    "color_enabled",
+    "fields",
+    "format_amount",
     "gauge",
     "gauge_cells",
+    "mark",
     "relative",
     "share_color",
+    "status_text",
+    "table",
     "usage_block",
     "usage_blocks",
     "utilization_block",
     "utilization_blocks",
+    "visible_len",
 ]

@@ -456,6 +456,8 @@ class Launcher:
         This process only, because the pool lives in the process that owns it. What a
         machine itself is doing is what ``letify utilization`` answers.
         """
+        import time
+
         live = list(self.pool.live)
         return {
             "name": self.name,
@@ -472,12 +474,24 @@ class Launcher:
                     "busy": runtime.busy,
                     "persistent_channel": runtime.persistent_channel,
                     "idle_seconds": round(runtime.idle_for, 1),
+                    "uptime_seconds": round(time.monotonic() - runtime.started, 1),
+                    **self._link_report(runtime),
                 }
                 for runtime in live
             ],
             "declared": [f.__name__ for f in self.functions],
             "config_sources": [str(p) for p in self.config.sources],
         }
+
+    @staticmethod
+    def _link_report(runtime: Any) -> dict[str, Any]:
+        """The strategy a runtime's provider connected over and its measured round trip."""
+        provider = runtime.provider
+        key_of = getattr(provider, "_link_key", None)
+        link = provider.__dict__.get("_links", {}).get(key_of(runtime)) if key_of else None
+        if link is None:
+            return {"link": None, "rtt_ms": None}
+        return {"link": link.strategy, "rtt_ms": getattr(link, "rtt_ms", None)}
 
     def _device_report(self) -> dict[str, Any]:
         """Each provider's inventory against what is reserved.

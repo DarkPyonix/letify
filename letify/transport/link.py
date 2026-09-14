@@ -32,6 +32,8 @@ class Link:
     def __init__(self, strategy: str, rank: int):
         self.strategy = strategy
         self.rank = rank
+        #: The round trip the pipeline measured over this link, when it measured one.
+        self.rtt_ms: float | None = None
 
     def probe_stream(self) -> object | None:
         """A stream the probe can run over, or None when this link cannot carry it."""
