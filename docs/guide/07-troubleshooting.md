@@ -239,7 +239,7 @@ Pulling 20 GB from a bucket next to the runtime is 40 to 60 seconds against 27 m
 
 ### Training is much slower than the same code run directly
 
-If `host="local"`, you are forwarding CUDA calls and paying a round trip per host synchronization. Measure both terms:
+If `host="local"`, you are forwarding PyTorch operators and paying a round trip per host synchronization. Measure both terms:
 
 ```bash
 letify probe gpu.lab.example.edu

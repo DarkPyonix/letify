@@ -1,6 +1,6 @@
 # 3️⃣ Choosing the execution mode
 
-> Ship the loop or forward the CUDA calls. When each wins, with the arithmetic.
+> Ship the loop or forward the PyTorch operators. When each wins, with the arithmetic.
 
 [← Providers](02-providers.md) · [Guides](README.md) · [Next: Environments and data →](04-environments-and-data.md)
 
@@ -8,12 +8,12 @@
 
 ## The two modes
 
-| | 📦 Function shipping | 🔌 Call forwarding |
+| | 📦 Function shipping | 🔌 PyTorch forwarding |
 |---|---|---|
 | Written as | `host="remote"` | `host="local"` |
 | Where Python runs | on the remote machine | in your process |
 | Where data has to be | on the remote machine | on your machine |
-| What crosses the network | the function, once | every CUDA call |
+| What crosses the network | the function, once | every PyTorch operator, queued and sent in batches |
 | What that costs | one transfer | one round trip per host synchronization |
 
 Neither name appears in your code. You say where the CPU side of the work lives, and letify picks the mechanism.
@@ -21,20 +21,23 @@ Neither name appears in your code. You say where the CPU side of the work lives,
 ```python
 @let.function(device=colab.G4, host="remote")                    # provider default
 @let.function(device=lab.A100, host="remote")      # ship the loop
-@let.function(device=lab.A100, host="remote", host="local")       # forward CUDA calls
+@let.function(device=lab.A100, host="local")       # forward PyTorch operators
 ```
 
 ## The formula
 
 ```
-efficiency = T / (T + k × RTT)
+efficiency = T / (T + n × d + k × RTT)
 ```
 
 - `T` is GPU time per step
+- `n` is how many PyTorch operators the step dispatches, and `d` is what dispatching one costs in your process
 - `k` is how many times in that step the host reads a value back from the device
 - `RTT` is the network round trip
 
-Function shipping runs the loop on the remote machine, so those reads are local there and `k × RTT` vanishes. Forwarding pays it on every one.
+`n × d` is paid in your process whatever the link, so a step made of many small operators loses more than one made of a few large ones.
+
+Function shipping runs the loop on the remote machine, so those reads are local there and both terms vanish. Forwarding pays `k × RTT` on every read and `n × d` on every step.
 
 ## Where the numbers land
 
@@ -76,7 +79,7 @@ torch.cuda.set_sync_debug_mode("warn")
 # run exactly one real training step and count the warnings
 ```
 
-This does not depend on where the GPU is, so it can be measured on any CUDA device, including a Colab runtime. With `k` measured and the round trip measured, the formula gives you a real answer instead of an estimate.
+This does not depend on where the GPU is, so it can be measured on any CUDA device, including a Colab runtime. Under `host="local"`, `letify.remoting.device.current_client().stats` counts it for you: `round_trips` is `k` and `ops` is `n`. With `k` measured and the round trip measured, the formula gives you a real answer instead of an estimate.
 
 ```bash
 letify probe gpu.lab.example.edu     # round trip, and whether forwarding is possible
@@ -118,7 +121,7 @@ run rather than after it.
 ## No silent fallback
 
 ```python
-@let.function(device=colab.G4, host="remote", host="local")
+@let.function(device=colab.G4, host="local")
 def train(lr): ...
 ```
 
@@ -136,13 +139,13 @@ letify raises rather than taking the slower path. A silent downgrade turns a fou
 
 **Ship the loop** for training, evaluation, batch inference, and anything where the work is a loop you can hand over whole. That is nearly everything, which is why it is the default.
 
-**Forward the calls** when the code is interactive and human paced, when the data has to stay on your machine, and when the machine is close. Exploratory notebook work is the honest use case: a person cannot feel 20 ms per cell, and the data stays where it already is.
+**Forward the operators** when the code is interactive and human paced, when the data has to stay on your machine, and when the machine is close. Exploratory notebook work is the honest use case: a person cannot feel 20 ms per cell, and the data stays where it already is.
 
 **Never forward a generation loop.** Ship the whole `generate` call instead and you get the card's real speed.
 
 ## A note on what is implemented
 
-Function shipping works today. Call forwarding is currently a capability probe: `letify.remoting.probe()` reports whether a layer 3 tunnel is possible, whether the letify-core is present and what the round trip is, and `require()` raises when forwarding would not pay off. The forwarding client itself is not written. See the known gaps at the end of [docs/SPEC.md](../SPEC.md).
+Both modes work. PyTorch forwarding supports PyTorch only: code written for `"cuda"` runs unchanged with any local PyTorch build, and the same torch major.minor version has to be in the project on both sides. It forwards to one device per session and has no CUDA streams, events or graphs. Measured numbers against a direct run are in [NETWORK.md](../NETWORK.md#pytorch-forwarding-on-dept_gpu), and the remaining gaps are at the end of [docs/SPEC.md](../SPEC.md).
 
 ---
 
