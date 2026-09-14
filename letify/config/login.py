@@ -688,6 +688,11 @@ def colab_account(answers: Answers) -> dict[str, Any]:
     )
     if result.returncode != 0:
         raise LoginError(f"the Colab sign in exited {result.returncode}, so nothing was written")
+    # The rendezvous installs this key's public half on each runtime, which is what lets
+    # tcp_punch log in. An existing key is reused, never regenerated.
+    key_path = str(answers.get("key") or DEFAULT_KEY)
+    ensure_key(key_path)
+    options["key"] = key_path
     return options
 
 
@@ -841,6 +846,8 @@ def log_in(answers: Answers, *, project: str | Path | None = None) -> tuple[bool
         devices = options.pop("devices", None)
         writer.update(home, answers.alias, options, private=True)
     else:
+        add_colab_key(answers, existing, home)
+        existing = home.read_text(encoding="utf-8")
         if answers.get("workspace"):
             change_workspace(answers, existing, home)
         if answers.get("detect_devices"):
@@ -862,6 +869,18 @@ def log_in(answers: Answers, *, project: str | Path | None = None) -> tuple[bool
 
 def devices_table(alias: str) -> str:
     return f"{alias}.devices"
+
+
+def add_colab_key(answers: Answers, text: str, home: Path) -> None:
+    """Give an already declared Colab account with no key the key the rendezvous needs."""
+    entry = tomllib.loads(text).get(answers.alias, {})
+    if entry.get("kind", answers.kind) != "colab" or entry.get("key"):
+        return
+    key_path = str(answers.get("key") or DEFAULT_KEY)
+    ensure_key(key_path)
+    body = {key: value for key, value in entry.items() if key != "devices"}
+    body["key"] = key_path
+    writer.update(home, answers.alias, body, private=True)
 
 
 def change_workspace(answers: Answers, text: str, home: Path) -> None:
