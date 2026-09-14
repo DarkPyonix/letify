@@ -163,8 +163,12 @@ def test_the_pool_key_names_provider_accelerator_placement_and_purchase(
     # so anything that makes two instances non-interchangeable belongs in it.
     provider = let.providers.local
     on_demand = Instance(provider, gpu="H100")._placed("remote")
-    assert on_demand.key == "local:H100:remote:x1:ondemand"
-    assert Instance(provider, gpu="H100", spot=True)._placed("remote").key.endswith(":spot")
+    # Spec "Price type": an instance naming no price type follows the account, so it is
+    # keyed apart from one that names ondemand or spot.
+    assert on_demand.key == "local:H100:remote:x1:default"
+    named = Instance(provider, gpu="H100").priced("ondemand")._placed("remote")
+    assert named.key.endswith(":ondemand")
+    assert Instance(provider, gpu="H100").priced("spot")._placed("remote").key.endswith(":spot")
     assert on_demand.key != Instance(provider, gpu="H100")._placed("local").key
 
 

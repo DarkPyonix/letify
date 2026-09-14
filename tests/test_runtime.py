@@ -17,6 +17,7 @@ import sys
 import threading
 import time
 from pathlib import Path
+from typing import ClassVar
 
 import pytest
 from conftest import (
@@ -1422,6 +1423,50 @@ def test_an_infrastructure_failure_is_retried_on_a_fresh_runtime(let, remote_cpu
     assert "local:cpu" in message
     assert ledger.read_text(encoding="utf-8").count("attempt") == 3
     # Each failed runtime is discarded rather than handed out again.
+    assert let.pool.live == []
+
+
+class DiagnosingLocal(Local):
+    """A local provider that reads every failure as a spot preemption, counting them."""
+
+    diagnosed: ClassVar[list[str]] = []
+
+    def diagnose(self, runtime, failure):
+        from letify.errors import SpotPreempted
+
+        type(self).diagnosed.append(str(failure))
+        return SpotPreempted("local-cpu was preempted", machine="local-cpu", state="idle", at=1.0)
+
+
+def test_a_diagnosed_failure_is_retried_and_raised_as_it_is_after_the_last_retry(
+    tmp_path, monkeypatch
+) -> None:
+    # Spec "Failure and retry": the provider may name the failure more precisely before the
+    # retry, and a SpotPreempted left after the last retry is not wrapped.
+    from letify import providers
+    from letify.errors import SpotPreempted
+
+    monkeypatch.setitem(providers.KINDS, "local", DiagnosingLocal)
+    DiagnosingLocal.diagnosed = []
+    project = tmp_path / "project" / ".letify"
+    project.mkdir(parents=True)
+    let = letify.Launcher(project, home=False, announce=False)
+    device = let.providers.local.CPU._placed("remote")
+    ledger = tmp_path / "attempts.txt"
+
+    @let.function(device=device, host="remote", retries=1)
+    def dies(path: str) -> None:
+        import os
+
+        with open(path, "a", encoding="utf-8") as handle:
+            handle.write("attempt\n")
+        os._exit(1)
+
+    with pytest.raises(SpotPreempted) as caught:
+        dies(path=str(ledger))
+    assert caught.value.machine == "local-cpu"
+    assert ledger.read_text(encoding="utf-8").count("attempt") == 2
+    assert len(DiagnosingLocal.diagnosed) == 2
     assert let.pool.live == []
 
 
