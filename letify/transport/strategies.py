@@ -20,7 +20,7 @@ from pathlib import Path
 from typing import Any
 
 from ..config.secrets import account_directory
-from . import nat
+from . import nat, sshopts
 from .link import Link, PunchedLink, SSHLink
 
 #: Seconds a single attempt may take before the strategy counts as failed.
@@ -67,6 +67,7 @@ class Target:
             "StrictHostKeyChecking=accept-new",
             "-o",
             f"UserKnownHostsFile={known_hosts}",
+            *sshopts.options(self.alias),
         ]
         if self.key:
             options += ["-i", self.key]

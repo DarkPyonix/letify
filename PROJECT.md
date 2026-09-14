@@ -109,7 +109,7 @@ Everything a user needs is on `letify` itself.
 Launcher(
     config=None,        # a .letify directory or its config.toml; defaults to the project and home ones
     name=None,          # session and app name; defaults to the pyproject project name
-    stream_logs=True,   # print remote stdout to stderr
+    stream_logs=True,   # write remote stdout and stderr live to the local ones
     announce=True,      # say when a session starts, because that is when money starts
     home=True,          # read ~/.letify/config.toml
 )

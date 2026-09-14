@@ -19,6 +19,7 @@ depends on what the provider charges for.
 from __future__ import annotations
 
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -83,6 +84,9 @@ class Runtime:
 
     #: Digests this runtime is known to hold, so an argument is sent once.
     _blobs: set[str] = field(default_factory=set, repr=False)
+
+    #: Digests of immutable arguments already hashed, so a repeated one is not hashed again.
+    _digests: protocol.DigestCache = field(default_factory=protocol.DigestCache, repr=False)
 
     # -- identity ------------------------------------------------------------
 
@@ -205,28 +209,43 @@ class Runtime:
     def _externalize(self, args: tuple, kwargs: dict) -> tuple[tuple, dict]:
         """Replace large arguments with blob references, uploading what is missing.
 
-        Hashing is effectively free next to the network: blake3 runs at gigabytes
-        per second where an uplink runs at megabytes per second. So every large
-        argument is hashed, the runtime is asked which digests it already holds,
-        and only the rest is sent.
+        Spec "Argument addressing". A ``bytes`` argument is hashed as it is, anything else
+        over its protocol 5 pickle and out-of-band buffers. The digest of an immutable
+        argument is cached, so repeating it costs neither hashing nor sending.
         """
-        import pickle
-
-        plan: dict[str, bytes] = {}
+        plan: dict[str, Callable[[], dict[str, Any]]] = {}
 
         def convert(value: Any) -> Any:
             if isinstance(value, protocol.Blob):
                 return value
+            if type(value) is bytes:
+                if len(value) < protocol.INLINE_LIMIT:
+                    return value
+                known = self._digests.get(value)
+                if known is None:
+                    known = (protocol.digest_parts((value,)), len(value))
+                    self._digests.put(value, *known)
+                plan[known[0]] = lambda value=value: {"kind": "bytes", "value": value}
+                return protocol.Blob(digest=known[0], size=known[1])
+            immutable = protocol.DigestCache.immutable(value)
+            known = self._digests.get(value) if immutable else None
+            if known is not None:
+                plan[known[0]] = lambda value=value: _pickled(value, True)
+                return protocol.Blob(digest=known[0], size=known[1])
             try:
-                payload = pickle.dumps(value, protocol=5)
+                message = _pickled(value, immutable)
             except Exception:
                 # Not plainly picklable, so leave it for cloudpickle to carry.
                 return value
-            if len(payload) < protocol.INLINE_LIMIT:
+            parts = [message["head"], *message["buffers"]]
+            size = sum(memoryview(part).nbytes for part in parts)
+            if size < protocol.INLINE_LIMIT:
                 return value
-            digest = protocol.digest_of(payload)
-            plan[digest] = payload
-            return protocol.Blob(digest=digest, size=len(payload))
+            digest = protocol.digest_parts(parts)
+            if immutable:
+                self._digests.put(value, digest, size)
+            plan[digest] = lambda message=message: message
+            return protocol.Blob(digest=digest, size=size)
 
         new_args = tuple(convert(v) for v in args)
         new_kwargs = {k: convert(v) for k, v in kwargs.items()}
@@ -234,23 +253,14 @@ class Runtime:
             self._upload_blobs(plan)
         return new_args, new_kwargs
 
-    def _upload_blobs(self, plan: dict[str, bytes]) -> None:
-        import base64
-
+    def _upload_blobs(self, plan: dict[str, Callable[[], dict[str, Any]]]) -> None:
         unknown = [d for d in plan if d not in self._blobs]
         if unknown:
             held = self.request({"op": "have", "digests": unknown}, timeout=120) or []
             self._blobs.update(held)
             unknown = [d for d in unknown if d not in self._blobs]
         for digest in unknown:
-            self.request(
-                {
-                    "op": "put_blob",
-                    "digest": digest,
-                    "payload": base64.b64encode(plan[digest]).decode(),
-                },
-                timeout=3600,
-            )
+            self.request({"op": "put_blob", "digest": digest, **plan[digest]()}, timeout=3600)
             self._blobs.add(digest)
 
     # -- files ---------------------------------------------------------------
@@ -265,13 +275,11 @@ class Runtime:
         links: bool = False,
     ) -> protocol.RemoteFile:
         """Write bytes to a path inside the runtime, optionally unpacking an archive."""
-        import base64
-
         value = self.request(
             {
                 "op": "put_file",
                 "path": path,
-                "payload": base64.b64encode(payload).decode(),
+                "payload": payload,
                 "unpack": unpack,
                 "target": target,
                 "links": links,
@@ -316,17 +324,13 @@ class Runtime:
 
     def get_bytes(self, path: str) -> tuple[bytes, str]:
         """Read a file out of the runtime, returning ``(payload, digest)``."""
-        import base64
-
         value = self.request({"op": "get_file", "path": path}, timeout=3600)
-        return base64.b64decode(value["payload"]), value["digest"]
+        return _payload(value["payload"]), value["digest"]
 
     def pack_dir(self, path: str) -> tuple[bytes, str]:
         """Pack a directory inside the runtime into one archive payload."""
-        import base64
-
         value = self.request({"op": "pack_dir", "path": path}, timeout=3600)
-        return base64.b64decode(value["payload"]), value["digest"]
+        return _payload(value["payload"]), value["digest"]
 
     # -- environment and volumes ---------------------------------------------
 
@@ -464,6 +468,24 @@ class Runtime:
     def __repr__(self) -> str:
         state = "ready" if self.ready else "starting"
         return f"<Runtime {self.name} {self.instance.accelerator} {state}>"
+
+
+def _pickled(value: Any, immutable: bool) -> dict[str, Any]:
+    """A ``put_blob`` message for a value: its protocol 5 pickle and out-of-band buffers."""
+    import pickle
+
+    buffers: list[pickle.PickleBuffer] = []
+    head = pickle.dumps(value, protocol=5, buffer_callback=buffers.append)
+    return {"kind": "pickle", "immutable": immutable, "head": head, "buffers": buffers}
+
+
+def _payload(value: Any) -> bytes:
+    """File bytes from a reply: raw from a binary channel, base64 text from a one-shot one."""
+    if isinstance(value, str):
+        import base64
+
+        return base64.b64decode(value)
+    return bytes(value)
 
 
 __all__ = ["Runtime"]

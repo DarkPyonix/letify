@@ -122,6 +122,9 @@ class Function(Generic[R]):
 
         for attempt in range(self.retries + 1):
             runtime = launcher.pool.acquire(instance, self.env, self.volumes)
+            if runtime.channel is not None:
+                # A persistent channel writes the body's output live, while the call runs.
+                runtime.channel.echo = launcher.stream_logs
             try:
                 value, logs = runtime.call(
                     self.fn,
@@ -149,7 +152,8 @@ class Function(Generic[R]):
                 raise
             else:
                 launcher.pool.release(runtime)
-                if logs.strip() and launcher.stream_logs:
+                # Output of a one-shot channel arrives only with the outcome.
+                if not runtime.persistent_channel and logs.strip() and launcher.stream_logs:
                     print(logs.rstrip(), file=sys.stderr)
                 return value
 

@@ -701,6 +701,32 @@ def test_the_ssh_command_names_the_port_the_user_and_the_key() -> None:
     assert command[-2:] == ["researcher@gpu.lab.example.edu", "uname -a"]
 
 
+@pytest.mark.parametrize("platform", ["posix", "nt"])
+def test_ssh_commands_share_one_connection_and_prefer_fast_ciphers(
+    isolated_home, monkeypatch, platform: str
+) -> None:
+    # Spec "SSH authentication": multiplexing where OpenSSH implements it, never on Windows.
+    from letify.transport import sshopts
+    from letify.transport.strategies import Target
+
+    monkeypatch.setattr(sshopts, "WINDOWS", platform == "nt")
+    provider = provider_of(Shell, "lab", address="gpu.lab.example.edu", user="researcher")
+    for command in (
+        provider.ssh_command("true"),
+        Target(alias="lab", user="researcher").forwarded_ssh(2200, "true"),
+    ):
+        assert "Ciphers=^aes128-gcm@openssh.com,chacha20-poly1305@openssh.com" in command
+        assert not any(part.startswith("Compression=yes") for part in command)
+        control = Path.home() / ".letify" / "accounts" / "lab" / "ssh-%C"
+        if platform == "nt":
+            assert not any(part.startswith("Control") for part in command)
+        else:
+            assert "ControlMaster=auto" in command
+            assert "ControlPersist=60" in command
+            assert f"ControlPath={control}" in command
+            assert control.parent.is_dir()
+
+
 def test_a_jump_host_is_used_before_any_tunnel() -> None:
     # Order of preference is a direct address, then a jump host, then a tunnel.
     provider = provider_of(Shell, "lab", address="gpu.internal", jump="bastion.example.edu")
@@ -775,7 +801,9 @@ def test_a_remote_worker_is_one_python_reading_framed_requests(patch_run) -> Non
     channel = provider.open_channel(runtime)
     assert isinstance(channel, PersistentChannel)
     assert channel.command[-1].startswith("python3.12 -u -c ")
-    assert "base64" in channel.command[-1]
+    # Spec "Channels": the stub reads a byte count line and raw source, with no base64.
+    assert "sys.stdin.buffer" in channel.command[-1]
+    assert "base64" not in channel.command[-1]
 
 
 # -- Spec: Transport, Connection strategies per provider --------------------------
@@ -1322,6 +1350,7 @@ def test_a_sandbox_channel_sends_the_worker_once_and_then_framed_requests(
     import base64
 
     from letify.protocol.worker import SOURCE
+    from letify.protocol.worker import source as worker_source
 
     provider = provider_of(Modal, "m")
     runtime = modal_runtime(provider)
@@ -1330,11 +1359,12 @@ def test_a_sandbox_channel_sends_the_worker_once_and_then_framed_requests(
         channel.start()
         channel.start()
         channel.call(len, ("abc",), {})
-        encoded = base64.b64encode(SOURCE.encode()).decode()
-        written = "".join(r["data"] for r in fake_modal.requests("write"))
-        # The worker source went out exactly once, length prefixed and base64 encoded for
-        # the bootstrap stub.
-        assert written.count(f"{len(encoded)}\n{encoded}") == 1
+        source = worker_source(text_frames=True).encode()
+        written = b"".join(base64.b64decode(r["data"]) for r in fake_modal.requests("write"))
+        # The worker source went out exactly once, behind its byte count line, with the flag
+        # that makes the sandbox write its frames as base64 lines.
+        assert written.count(b"%d\n" % len(source) + source) == 1
+        assert SOURCE.encode() not in written
     finally:
         provider.stop(runtime)
 
@@ -1364,9 +1394,15 @@ def test_closing_a_sandbox_channel_asks_the_worker_to_shut_down(isolated_home, f
     provider = provider_of(Modal, "m")
     runtime = modal_runtime(provider)
     channel = provider.open_channel(runtime)
+    channel.start()
     channel.close()
     provider.stop(runtime)
-    assert "__LETIFY_SHUTDOWN__" in "".join(r["data"] for r in fake_modal.requests("write"))
+    import base64
+
+    from letify.protocol import wire
+
+    written = b"".join(base64.b64decode(r["data"]) for r in fake_modal.requests("write"))
+    assert wire.HEADER.pack(wire.MAGIC, wire.SHUTDOWN, 0, 0, 0) in written
 
 
 def test_closing_a_sandbox_whose_adapter_is_already_gone_is_harmless(

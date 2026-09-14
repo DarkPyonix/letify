@@ -1,9 +1,10 @@
 """The worker that runs inside a runtime.
 
-This module holds source code as a string rather than code to import, because it
-has to run on the remote side where letify is not installed. The channel sends it
-once, the remote Python executes it, and from then on every call is a framed
-request over the same pipe.
+This module holds source code as a string rather than code to import, because it has to
+run on the remote side where letify is not installed. The channel sends it once, the
+remote Python executes it, and from then on every message is binary frames over the same
+pipes, as spec "Frames" describes. The frame code itself is ``wire.py``, sent ahead of the
+body, so both ends run one implementation.
 
 Keeping one process alive is what makes three features work.
 
@@ -18,38 +19,122 @@ worker answers which digests it already holds before the caller sends anything.
 Files written into the runtime survive between calls, so a volume can materialize
 an environment archive or a checkpoint and a later call can read it from disk.
 
-The framing is one base64 line per message. That survives an SSH channel, a
-WebSocket bridge and a plain pipe without any of them mangling it, which raw
-binary framing does not.
+The worker's file descriptors 1 and 2 are pipes drained by threads into ``STDOUT`` and
+``STDERR`` frames, as spec "Worker output" describes, so nothing the body prints can fill a
+pipe or mix with a reply.
 """
 
 from __future__ import annotations
 
-#: Written by the worker on the line before it starts reading requests.
-READY = "__LETIFY_WORKER_READY__"
+from pathlib import Path
+
+from . import wire as _wire
 
 #: Passed to ``python -c`` to get the worker running.
 #:
 #: ``python -`` cannot be used: it reads all of standard input to EOF before it
 #: compiles anything, and the pipe has to stay open for requests. So a stub small
-#: enough to survive shell quoting reads a length-prefixed base64 blob, execs it, and
-#: leaves standard input where it was.
+#: enough to survive shell quoting reads a byte count line and that many bytes of source,
+#: execs them, and leaves standard input where it was.
 BOOTSTRAP = (
-    "import sys,base64;"
-    "n=int(sys.stdin.readline());"
-    "exec(compile(base64.b64decode(sys.stdin.read(n)).decode(),'letify-worker','exec'))"
+    "import sys;"
+    "b=sys.stdin.buffer;"
+    "n=int(b.readline());"
+    "exec(compile(b.read(n).decode(),'letify-worker','exec'))"
 )
 
-#: Prefix of every response line. Anything without it is the user's own output.
-REPLY = "__LETIFY_REPLY__"
-
-SOURCE = r'''
-import base64, hashlib, io, os, pickle, sys, tarfile, traceback
-
-_READY = "__LETIFY_WORKER_READY__"
-_REPLY = "__LETIFY_REPLY__"
+_BODY = r'''
+import hashlib, io, queue, sys, tarfile, time, traceback
 
 _BLOBS = {}
+_SIZES = {}
+_READ_SIZE = 1 << 16
+
+# Frames go to a private copy of the pipe this process started on. Descriptors 1 and 2 are
+# pointed at pipes of their own before anything else can print, so output from C extensions
+# and from child processes arrives as frames too.
+_FRAME_FD = os.dup(1)
+_ERR_FD = os.dup(2)
+widen_pipe(0)
+widen_pipe(_FRAME_FD)
+_SENDER = (TextSender if _LETIFY_TEXT_FRAMES else Sender)(fd_writer(_FRAME_FD))
+
+
+class _Pump(threading.Thread):
+    """Reads one captured descriptor and sends what it reads as output frames."""
+
+    def __init__(self, fd, kind):
+        threading.Thread.__init__(self, daemon=True)
+        self.kind = kind
+        self.busy = False
+        self.read_fd, write_fd = os.pipe()
+        os.dup2(write_fd, fd)
+        os.close(write_fd)
+
+    def run(self):
+        while True:
+            try:
+                data = os.read(self.read_fd, _READ_SIZE)
+            except OSError:
+                break
+            if not data:
+                break
+            self.busy = True
+            try:
+                _SENDER.frame(self.kind, 0, data)
+            except OSError:
+                break
+            finally:
+                self.busy = False
+        os.close(self.read_fd)
+
+
+_PUMPS = [_Pump(1, STDOUT), _Pump(2, STDERR)]
+for _pump in _PUMPS:
+    _pump.start()
+
+def _readable(fd):
+    try:
+        import select
+        return bool(select.select([fd], [], [], 0)[0])
+    except (OSError, ValueError):
+        return False
+
+
+def _settle():
+    """Wait until what the body wrote has been sent, so it precedes the reply."""
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.flush()
+        except Exception:
+            pass
+    if os.name == "nt":
+        time.sleep(0.001)
+        return
+    deadline = time.monotonic() + 2.0
+    while time.monotonic() < deadline:
+        if not _pending():
+            # A pump that has just read may not have marked itself busy yet. Yielding once
+            # lets it run, so a second idle reading means nothing is left to send.
+            time.sleep(0)
+            if not _pending():
+                return
+        else:
+            time.sleep(0.0001)
+
+
+def _pending():
+    return any(pump.busy or _readable(pump.read_fd) for pump in _PUMPS)
+
+
+def _release_output():
+    """Give descriptors 1 and 2 back to the original pipes and let the pumps finish."""
+    _settle()
+    os.dup2(_FRAME_FD, 1)
+    os.dup2(_ERR_FD, 2)
+    for pump in _PUMPS:
+        pump.join(5)
+
 
 def _digest(payload):
     try:
@@ -60,13 +145,17 @@ def _digest(payload):
 
 
 def _resolve(value):
-    """Replace blob references with the payloads they name, recursively."""
+    """Replace blob references with the values they name, recursively."""
     kind = getattr(value, "__letify_kind__", None)
     if kind == "blob":
         try:
-            return pickle.loads(_BLOBS[value.digest])
+            entry = _BLOBS[value.digest]
         except KeyError:
             raise KeyError("blob %s was never sent to this runtime" % value.digest) from None
+        if entry[0] == "value":
+            return entry[1]
+        # A value that may be mutated is unpickled from a fresh copy for every call.
+        return pickle.loads(entry[1], buffers=[bytearray(b) for b in entry[2]])
     if isinstance(value, (list, tuple)):
         return type(value)(_resolve(v) for v in value)
     if isinstance(value, dict):
@@ -81,27 +170,35 @@ _NO_LETIFY = (
 )
 
 
-def _load_call(payload):
-    # Imported here, not at start, so the bootstrap interpreter needs only the standard
-    # library until the worker moves into the project .venv.
+def _load_call(request):
+    # Imported here, not at start: until the worker moves to the project's interpreter it
+    # runs on whatever python3 the machine has, and needs the standard library only.
     import cloudpickle
+
     try:
-        return cloudpickle.loads(base64.b64decode(payload))
+        return cloudpickle.loads(request["payload"], buffers=request.get("buffers") or ())
     except ModuleNotFoundError as exc:
         if (exc.name or "").split(".")[0] == "letify":
             raise ModuleNotFoundError(_NO_LETIFY, name=exc.name) from exc
         raise
 
 
-def _reply(payload):
-    sys.stdout.flush()
-    blob = pickle.dumps(payload, protocol=5)
-    sys.stdout.write(_REPLY + base64.b64encode(blob).decode() + "\n")
-    sys.stdout.flush()
+def _reply(stream, outcome):
+    try:
+        _SENDER.message(REPLY, stream, outcome)
+    except OSError:
+        os._exit(0)
+    except BaseException:
+        _SENDER.message(REPLY, stream, {
+            "ok": False,
+            "error": "the return value could not be serialized",
+            "traceback": traceback.format_exc(),
+        })
 
 
 def _op_call(request):
-    fn, args, kwargs = _load_call(request["payload"])
+    fn, args, kwargs = _load_call(request)
+    request.clear()
     args = _resolve(args)
     kwargs = _resolve(kwargs)
     try:
@@ -127,16 +224,30 @@ def _op_have(request):
 
 
 def _op_put_blob(request):
-    """Store a payload under its content address."""
-    payload = base64.b64decode(request["payload"])
-    digest = request.get("digest") or _digest(payload)
-    _BLOBS[digest] = payload
+    """Store a value under its content address.
+
+    An immutable value is kept unpickled, so a repeated argument is not unpickled again.
+    Anything else is kept as its pickle and buffers.
+    """
+    digest = request["digest"]
+    if request.get("kind") == "bytes":
+        value = request.pop("value")
+        _BLOBS[digest] = ("value", value)
+        _SIZES[digest] = len(value)
+        return {"ok": True, "value": digest}
+    head = bytes(request["head"])
+    buffers = list(request.get("buffers") or ())
+    _SIZES[digest] = len(head) + sum(memoryview(b).nbytes for b in buffers)
+    if request.get("immutable"):
+        _BLOBS[digest] = ("value", pickle.loads(head, buffers=buffers))
+    else:
+        _BLOBS[digest] = ("parts", head, buffers)
     return {"ok": True, "value": digest}
 
 
 def _op_put_file(request):
     """Write a payload to a path inside the runtime."""
-    payload = base64.b64decode(request["payload"])
+    payload = request["payload"]
     path = request["path"]
     directory = os.path.dirname(path)
     if directory:
@@ -145,7 +256,7 @@ def _op_put_file(request):
         handle.write(payload)
     if request.get("unpack"):
         _unpack(path, request.get("target") or os.path.dirname(path), request.get("links"))
-    return {"ok": True, "value": {"path": path, "size": len(payload)}}
+    return {"ok": True, "value": {"path": path, "size": memoryview(payload).nbytes}}
 
 
 def _unpack(path, target, links=False):
@@ -202,11 +313,7 @@ def _op_get_file(request):
         payload = handle.read()
     return {
         "ok": True,
-        "value": {
-            "payload": base64.b64encode(payload).decode(),
-            "digest": _digest(payload),
-            "size": len(payload),
-        },
+        "value": {"payload": payload, "digest": _digest(payload), "size": len(payload)},
     }
 
 
@@ -219,11 +326,7 @@ def _op_pack_dir(request):
     payload = buffer.getvalue()
     return {
         "ok": True,
-        "value": {
-            "payload": base64.b64encode(payload).decode(),
-            "digest": _digest(payload),
-            "size": len(payload),
-        },
+        "value": {"payload": payload, "digest": _digest(payload), "size": len(payload)},
     }
 
 
@@ -241,19 +344,20 @@ def _op_eval(request):
     return {"ok": True, "value": scope.pop("__letify_value__", None)}
 
 
-def _reexec(request):
+def _reexec(stream, request):
     """Reply, then replace this process with another interpreter on the same pipes.
 
-    The caller waits for the reply before it writes anything else, so nothing it sends is
-    left in this process's input buffer when the new interpreter starts reading.
+    The frame reader stopped after it queued this request, and the caller sends nothing
+    until it reads the reply, so no byte meant for the new interpreter is read here.
     """
     python = request["python"]
     if not os.access(python, os.X_OK):
-        _reply({"ok": False, "error": "%s is not an executable interpreter" % python,
-                "traceback": ""})
+        _reply(stream, {"ok": False, "error": "%s is not an executable interpreter" % python,
+                        "traceback": ""})
+        threading.Thread(target=_read, daemon=True).start()
         return
-    _reply({"ok": True, "value": None})
-    sys.stderr.flush()
+    _release_output()
+    _reply(stream, {"ok": True, "value": None})
     os.execv(python, [python, "-u", "-c", request["bootstrap"]])
 
 
@@ -261,17 +365,24 @@ def _op_release(request):
     """Drop blobs the caller no longer needs."""
     for digest in request.get("blobs", ()):
         _BLOBS.pop(digest, None)
+        _SIZES.pop(digest, None)
     return {"ok": True, "value": None}
 
 
 def _op_stat(request):
+    try:
+        import resource
+        maxrss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    except ImportError:
+        maxrss = None
     return {
         "ok": True,
         "value": {
             "blobs": len(_BLOBS),
-            "blob_bytes": sum(len(b) for b in _BLOBS.values()),
+            "blob_bytes": sum(_SIZES.values()),
             "pid": os.getpid(),
             "executable": sys.executable,
+            "maxrss": maxrss,
         },
     }
 
@@ -282,8 +393,6 @@ def _op_lease(request):
     The worker exits on its own if the caller stops renewing, so a crashed or
     killed local process cannot leave a paid session running.
     """
-    import threading, time
-
     state = globals().setdefault("_LEASE", {})
     state["deadline"] = time.time() + float(request["grace"])
 
@@ -314,46 +423,104 @@ _OPS = {
     "lease": _op_lease,
 }
 
+#: Answered by the frame reader at once, so they work while a call runs.
+_LIGHT = ("stat", "lease")
 
-def _serve():
-    # The version travels in the ready line, so the caller can refuse a worker whose
-    # interpreter cannot run the bytecode it is about to send.
-    sys.stdout.write(_READY + " %d.%d\n" % sys.version_info[:2])
-    sys.stdout.flush()
-    for line in sys.stdin:
-        line = line.strip()
-        if not line:
-            continue
-        if line == "__LETIFY_SHUTDOWN__":
-            return
+_JOBS = queue.Queue()
+
+
+def _run(stream, request, settle):
+    op = _OPS.get(request.get("op"))
+    if op is None:
+        outcome = {"ok": False, "error": "unknown op %r" % request.get("op"), "traceback": ""}
+    else:
         try:
-            # The line is dropped once decoded, so a pull token it carried lives only in
-            # the request, and the request is dropped once answered.
-            request, line = pickle.loads(base64.b64decode(line)), None
+            outcome = op(request)
+        except BaseException as exc:
+            outcome = {
+                "ok": False,
+                "error": "%s: %s" % (type(exc).__name__, exc),
+                "traceback": traceback.format_exc(),
+            }
+    # Dropped before replying, so a pull token the request carried lives no longer.
+    request = None
+    if settle:
+        _settle()
+    _reply(stream, outcome)
+
+
+def _read():
+    """Read frames, answer light requests, and queue the rest for the main thread."""
+    receiver = Receiver(sys.stdin.buffer.readinto)
+    while True:
+        try:
+            event = receiver.next_event()
+        except EOFError:
+            break
         except Exception:
-            _reply({
+            traceback.print_exc()
+            break
+        if event is None:
+            continue
+        kind, stream, value = event
+        if kind == SHUTDOWN:
+            break
+        if kind != REQUEST:
+            continue
+        try:
+            request = loads(value[0], value[1])
+        except Exception:
+            _reply(stream, {
                 "ok": False,
                 "error": "the request could not be decoded",
                 "traceback": traceback.format_exc(),
             })
             continue
+        value = None
+        op = request.get("op") if isinstance(request, dict) else None
+        if op in _LIGHT:
+            _run(stream, request, False)
+            continue
+        _JOBS.put((stream, request))
+        if op == "reexec":
+            return
+    _JOBS.put(None)
+
+
+def _serve():
+    # The version travels in the hello frame, so the caller can refuse a worker whose
+    # interpreter cannot run the bytecode it is about to send.
+    _SENDER.frame(HELLO, 0, ("%d.%d" % sys.version_info[:2]).encode("ascii"))
+    threading.Thread(target=_read, daemon=True).start()
+    while True:
+        job = _JOBS.get()
+        if job is None:
+            break
+        stream, request = job
+        job = None
         if request.get("op") == "reexec":
-            _reexec(request)
+            _reexec(stream, request)
             continue
-        op = _OPS.get(request.get("op"))
-        if op is None:
-            _reply({"ok": False, "error": "unknown op %r" % request.get("op"), "traceback": ""})
-            continue
-        try:
-            _reply(op(request))
-        except BaseException as exc:
-            _reply({
-                "ok": False,
-                "error": "%s: %s" % (type(exc).__name__, exc),
-                "traceback": traceback.format_exc(),
-            })
+        _run(stream, request, True)
         request = None
+    _release_output()
 
 
 _serve()
 '''
+
+
+def source(*, text_frames: bool = False) -> str:
+    """The worker program: the frame code, the transport flag, then the worker body.
+
+    ``text_frames`` makes the worker write each frame as a base64 line, for a transport
+    whose output is text, such as a Modal sandbox.
+    """
+    frames = Path(_wire.__file__).read_text(encoding="utf-8").replace("\r\n", "\n")
+    return f"{frames}\n_LETIFY_TEXT_FRAMES = {bool(text_frames)!r}\n{_BODY}"
+
+
+#: The worker program for a binary pipe.
+SOURCE = source()
+
+__all__ = ["BOOTSTRAP", "SOURCE", "source"]

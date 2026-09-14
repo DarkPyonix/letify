@@ -22,6 +22,7 @@ from typing import TYPE_CHECKING, Any
 
 from ..declare.instance import Instance
 from ..errors import ProviderUnavailable, RuntimeFailure
+from ..transport import sshopts
 from .base import Provider
 from .naming import gib_from_mib, normalize_gpu
 
@@ -123,6 +124,7 @@ class Shell(Provider):
             "BatchMode=yes",
             "-o",
             "ServerAliveInterval=30",
+            *sshopts.options(self.alias),
         ]
         if self.key_path:
             command += ["-i", self.key_path]

@@ -113,11 +113,20 @@ An instance carries no placement; `host=letify.local` or `letify.remote` on the 
 
 How letify talks to a session, and the reason some providers can do more than others.
 
-`PersistentChannel` keeps one worker process alive behind a pipe. Requests are framed lines, so the worker process with its session cache, the blob table and anything written to disk survive between calls. That is what makes a handle resolvable and a large argument sendable once.
+`PersistentChannel` keeps one worker process alive behind a pipe pair. Messages are binary frames, so the worker process with its session cache, the blob table and anything written to disk survive between calls. That is what makes a handle resolvable and a large argument sendable once.
 
 `OneShotChannel` can only run a command and collect its output. Every call starts a fresh process, so nothing persists, and it refuses the operations that need persistence rather than pretending.
 
-The worker cannot be sent as a script on standard input, because `python -` reads to end of file before compiling and the pipe has to stay open. A bootstrap stub passed with `-c` reads a length-prefixed blob, executes it, and leaves standard input where it was.
+The worker cannot be sent as a script on standard input, because `python -` reads to end of file before compiling and the pipe has to stay open. A bootstrap stub passed with `-c` reads a byte count line and that many bytes of source, executes them, and leaves standard input where it was.
+
+Four classes share the frame model:
+
+| Class | Owns |
+|---|---|
+| `wire.Sender`, `wire.Receiver` | The 16 byte frame header, a message as a protocol 5 pickle plus out-of-band buffers in 8 MiB `DATA` frames, and reassembly per stream. The same file runs inside the worker |
+| `Connection` | One pipe pair's open requests. Waiting threads take turns reading frames, so `stat` and `lease` are answered during a long call. Worker output is written live to this process's stdout and stderr |
+| `FramedChannel` | Sending the worker source, waiting for `HELLO`, the move to another interpreter, timeouts |
+| `PersistentChannel`, `SandboxChannel` | How the bytes move: a subprocess's pipes, or a Modal sandbox through the adapter as base64 lines |
 
 ## Runtime, Lease and RuntimePool
 
