@@ -252,11 +252,43 @@ Every provider that can start a session without an accelerator registers it as `
 
 > How hard each declared instance's accelerator is working right now, read from the machine that owns it.
 
-`letify utilization` reports one row per instance: the provider alias, the accelerator, and for each physical device its utilization percentage, memory used against memory total, temperature and power draw. `nvidia-smi --query-gpu` is the single source, because it is the only reading present on every machine letify reaches and it needs no framework loaded.
+`letify utilization` reports, for each physical device, its utilization percentage, memory used against memory total, temperature and power draw. `nvidia-smi --query-gpu` is the single source for those readings, because it is the only reading present on every machine letify reaches and it needs no framework loaded.
 
-Where the reading comes from depends on where the device is. An instance on the local provider is read by running `nvidia-smi` here. An instance on a remote provider is read inside its live session, by shipping the same reader function through the ordinary call protocol, so no new channel and no new remote dependency is involved.
+Where the reading comes from depends on whether the machine outlives a session.
 
-An instance with no live session reports no devices and says why, because starting a session to measure its load would cost money and change the answer. A machine without `nvidia-smi` reports no devices with that as the reason. Neither is an error: the table lists every declared instance either way.
+| Provider | Scope | Read from |
+|---|---|---|
+| `Local`, `Shell`, `Tunnel` | `machine` | The machine itself, with no session: `nvidia-smi` here for `Local`, and over the provider's link for `Shell` and `Tunnel`. One row per provider |
+| `Colab`, `Elice`, `Modal`, `Kaggle` | `session` | Inside the instance's live session, by shipping the same reader function through the ordinary call protocol. One row per instance |
+
+A `machine` reading is read-only. It runs the three `nvidia-smi` queries the busy check runs, starts no process on a card and reserves nothing. Each device in it also carries who holds the card:
+
+| `holder` | Means |
+|---|---|
+| `letify` | This process has reserved the index |
+| `others` | Another user is computing on it, by the busy check rule under Inventory. `users` names them |
+| `mine` | Only the login user's own processes, or this client's workers, are computing on it |
+| `free` | No compute process is on it |
+| `unknown` | The utilization was read but the owner query failed |
+
+The first row of that table that applies wins. A `session` device has `holder` set to `None`.
+
+A `session` instance with no live session reports no devices and says why, because starting a session to measure its load would cost money and change the answer. A machine without `nvidia-smi`, or one the link cannot reach, reports no devices with that as the reason. Neither is an error: every declared provider is listed either way. `--json` prints the rows with `alias`, `accelerator` (`None` for a `machine` row), `scope`, `devices` and `reason`.
+
+The command prints one block per provider, with the same header, indent, gauge characters, colour and width rules as `letify usage`:
+
+```
+dept_gpu  shell
+  gpu0  Tesla P100-PCIE-16GB  free
+    load   [████████░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░]  20%
+    memory [████░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░]  10%  1.6/16.0 GiB
+    41C  38W
+
+colab_pro_plus  colab
+  no live session, so nothing to measure
+```
+
+A card's header line is `gpu<index>  <name>  <holder text>`, where the holder text is `reserved by letify`, `busy: <users>`, `in use by your processes`, `free` or `holder unknown`, coloured cyan, red, yellow, green and not at all. The load line is left out when the card reports no utilization, the memory line when it reports no total, and the last line holds whichever of temperature and power the card reported. Each gauge is 16 to 40 cells: the terminal width minus 4 columns of indent, 7 of label, 2 brackets, 5 of percentage and 16 of memory text. Both gauges are coloured by the unused share with the thresholds `letify usage` uses. A `session` row's reason is printed as `<accelerator>: <reason>`, or once without the accelerator when every instance of the provider gives the same reason.
 
 The reading is taken at the moment it is asked for and carries no history. A load that has to be watched over time belongs in the caller's own loop, not in a CLI that shells out to `nvidia-smi` per poll.
 
