@@ -261,6 +261,23 @@ The first measurement on dept_gpu, before the metadata cache, the foreach regist
 
 The cache and foreach changes had already reduced operators per step from 52 to 31 on the CPU worker, the first because Adam's per parameter path issued 28 operators for four parameters and its foreach path issues 7. The table above is after those two; the send change moved the median from 3.81 ms to 3.45 ms and wall time from 6.36 ms to 5.17 ms.
 
+### With step capture
+
+> Reading the loss once every 50 steps, `host="local"` takes a median 1.31 ms per step against 1.72 ms directly, because a captured step is queued as one entry and sent without waiting. Measured on 2026-09-14 on branch `perf/torch-local-step`.
+
+Same model, client and card type as above. Direct is on card 6, which had no compute process, in the project `.venv` with torch 2.5.1 cu121.
+
+| Loop | Mode | Median step | p99 step | Wall per step | Ops per step | Batches per step | Round trips per step |
+|---|---|---|---|---|---|---|---|
+| `loss.item()` every 50 steps | direct | 1.72 ms | 2.14 ms | 1.99 ms | | | |
+| `loss.item()` every 50 steps | host=local | 1.31 ms | 4.71 ms | 1.55 ms | 31.0 | 0.375 | 0.022 |
+| `loss.item()` every step | direct | 1.78 ms | 2.33 ms | 1.81 ms | | | |
+| `loss.item()` every step | host=local | 4.94 ms | 5.71 ms | 4.95 ms | 32.0 | 1.005 | 1.002 |
+
+The median under `host="local"` is below direct because the step on the client only dispatches, while the GPU work runs asynchronously on the server; wall per step includes the final synchronization. A 256 MiB copy moved at 99 MiB/s up and 98 MiB/s down.
+
+Local dispatch cost per operator `d`, measured against a CPU executor on the client with `Linear 16->32->16`, batch 8, so the executor never lags: 97.5 us before and 40.3 us after with the loss read every 50 steps, and 95.8 us before and 53.6 us after with it read every step.
+
 ## PyTorch forwarding on lab_docker
 
 > Over a 69 ms Tailcat round trip, reading once every 50 steps keeps the median step at 3.7 ms, and reading every step costs 116 ms per step. Synchronizations per step decide this link, not operators. Measured on 2026-09-14.
