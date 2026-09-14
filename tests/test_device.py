@@ -968,6 +968,129 @@ def test_handles_created_in_repetitions_are_released(client) -> None:
     assert client.stats.replayed > 0
 
 
+def _executor_with_step():
+    """An in-process CPU executor holding one step of three operators.
+
+    Position 0 makes offset 0 from an external, position 1 makes offset 1 from offset 0, and
+    position 2 makes offset 2 from offset 1 and an external. Offsets 0 and 1 are last read at
+    positions 1 and 2, and offset 2, which nothing in the step reads, at position 2.
+    """
+    from letify.remoting.device import executor as executor_module
+
+    runner = executor_module.Executor("cpu")
+    runner.define(1, "aten.mul.Tensor", ([("h", 0), ("s", 0)], {}))
+    runner.define(2, "aten.add.Tensor", ([("h", 0), ("h", 1)], {}))
+    runner.define_step(7, ((1, (-1,), (True,)), (1, (0,), (True,)), (2, (1, -1), (True,))))
+    runner.tensors[1] = torch.ones(3)
+    return runner, executor_module
+
+
+def test_a_replayed_step_releases_a_temporary_after_its_last_use(client) -> None:
+    runner, module = _executor_with_step()
+    entry = (module.E_STEP, 7, 100, 0, 3, (1, 1), (2.0, 3.0), (), ())
+    runner.run({"entries": [entry]}, [])
+    assert 100 not in runner.tensors and 101 not in runner.tensors
+    assert 102 not in runner.tensors
+    assert runner.failure is None
+
+
+def test_a_kept_offset_outlives_its_last_use_in_the_step(client) -> None:
+    runner, module = _executor_with_step()
+    entry = (module.E_STEP, 7, 100, 0, 3, (1, 1), (2.0, 3.0), (), (2,))
+    runner.run({"entries": [entry]}, [])
+    assert set(runner.tensors) == {1, 102}
+    assert runner.tensors[102].tolist() == [7.0, 7.0, 7.0]
+
+
+def test_a_split_repetition_releases_an_offset_in_the_part_holding_its_last_use(client) -> None:
+    runner, module = _executor_with_step()
+    head = (module.E_STEP, 7, 100, 0, 2, (1,), (2.0, 3.0), (), ())
+    runner.run({"entries": [head]}, [])
+    assert 100 not in runner.tensors and 101 in runner.tensors
+    tail = (module.E_STEP, 7, 100, 2, 3, (1,), (), (), (2,))
+    runner.run({"entries": [tail]}, [])
+    assert set(runner.tensors) == {1, 102}
+
+
+def test_replayed_steps_release_temporaries_before_the_step_ends(client, monkeypatch) -> None:
+    import pickle
+
+    from letify.remoting.device import executor as executor_module
+
+    sent: list = []
+    original = client.transport.send
+
+    def spy(head, buffers):
+        sent.append(pickle.loads(head))
+        return original(head, buffers)
+
+    monkeypatch.setattr(client.transport, "send", spy)
+    with client.suspended():
+        local = _train(lambda value: value, steps=12)
+    remote = _train(lambda value: value.cuda(), steps=12)
+    _assert_same(remote, local)
+    steps = [
+        entry
+        for message in sent
+        for entry in message.get("entries", ())
+        if entry[0] == executor_module.E_STEP
+    ]
+    assert steps
+    released_early = 0
+    for entry in steps:
+        step = client._steps[entry[1]]
+        scheduled = sum(len(step.frees[index]) for index in range(entry[3], entry[4]))
+        released_early += scheduled - len(entry[8])
+    assert released_early > 0
+
+
+def test_a_release_is_applied_after_the_last_entry_of_its_batch_that_reads_it(client) -> None:
+    runner, module = _executor_with_step()
+    runner.tensors[2] = torch.ones(3)
+    live = (module.E_REQUEST, "letify.live", (), "value")
+    use = (module.E_OP, 1, (1,), (2.0,), (), (5,), None)
+    reply = runner.run({"entries": [live, use, live], "release": [1, 2], "reply": True}, [])
+    import pickle
+
+    results = pickle.loads(reply[0])["results"]
+    # Handle 2 is read by no entry, so it goes first; handle 1 goes after the entry reading it.
+    assert results == [1, 1]
+    assert set(runner.tensors) == {5}
+
+
+def test_a_handle_created_and_released_in_one_batch_is_not_kept(client) -> None:
+    runner, module = _executor_with_step()
+    make = (module.E_OP, 1, (1,), (2.0,), (), (5,), None)
+    runner.run({"entries": [make], "release": [5]}, [])
+    assert set(runner.tensors) == {1}
+
+
+def test_a_handle_read_by_a_later_entry_is_not_released_early(client, monkeypatch) -> None:
+    from letify.remoting.device import client as client_module
+
+    monkeypatch.setattr(client_module, "LINGER_S", 60.0)
+    monkeypatch.setattr(client_module, "IDLE_S", 60.0)
+    x = torch.ones(4, device="cuda")
+    client.synchronize()
+    last = x * 1.0
+    total = torch.zeros(4, device="cuda")
+    for _ in range(16):
+        carried = last * 1.0
+        last = None
+        gc.collect()
+        a = carried * 2.0
+        b = a + 1.0
+        c = b - 1.0
+        d = c * 0.5
+        e = d + 0.0
+        f = e * 1.0
+        total = total + f
+        last = f + 0.0
+    assert client.stats.replayed > 0
+    assert total.cpu().tolist() == [16.0] * 4
+    assert last.cpu().tolist() == [1.0] * 4
+
+
 def _loop(to_device, steps, *, on_step=None, flag_at=None):
     """A training loop on one model, with a batch slice, a float scalar and a literal per step.
 
