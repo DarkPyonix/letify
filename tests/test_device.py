@@ -175,7 +175,7 @@ def test_a_cuda_api_with_no_local_counterpart_names_itself(client) -> None:
 
 
 def _forbid_local_cuda(monkeypatch) -> None:
-    """Make any call that initializes CUDA in this process raise, as a driverless CUDA build does."""
+    """Make any call that initializes CUDA in this process raise, like a driverless CUDA build."""
 
     def no_driver(*args, **kwargs):
         raise RuntimeError("CUDA driver version is insufficient for CUDA runtime version")

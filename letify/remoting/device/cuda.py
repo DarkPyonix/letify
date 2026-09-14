@@ -220,15 +220,15 @@ def mapped(client: Client) -> Iterator[None]:
     saved = _patch(table)
     _ACTIVE.append(table)
     _CLIENTS.append(client)
-    registered = [types for types in _foreach_types() if RemoteTensor not in types]
-    for types in registered:
-        types.append(RemoteTensor)
+    registered = [found for found in _foreach_types() if RemoteTensor not in found]
+    for found in registered:
+        found.append(RemoteTensor)
     try:
         with CudaMode(client):
             yield
     finally:
-        for types in registered:
-            types.remove(RemoteTensor)
+        for found in registered:
+            found.remove(RemoteTensor)
         _CLIENTS.pop()
         _ACTIVE.pop()
         _restore(saved)

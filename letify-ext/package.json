@@ -2,7 +2,7 @@
   "name": "letify-status",
   "displayName": "letify Status",
   "description": "letify quota and GPU activity in the status bar, read from the letify CLI.",
-  "version": "0.1.0",
+  "version": "1.0.0",
   "publisher": "letify",
   "license": "SEE LICENSE IN LICENSE",
   "repository": {
@@ -12,23 +12,45 @@
   "engines": {
     "vscode": "^1.85.0"
   },
-  "categories": ["Other"],
-  "activationEvents": ["workspaceContains:.letify", "onStartupFinished"],
+  "categories": [
+    "Other"
+  ],
+  "activationEvents": [
+    "workspaceContains:.letify",
+    "onStartupFinished"
+  ],
   "main": "./out/src/extension.js",
   "contributes": {
     "commands": [
-      { "command": "letify.refresh", "title": "letify: Refresh" },
-      { "command": "letify.show", "title": "letify: Show Quota and GPU Activity" },
-      { "command": "letify.openSettings", "title": "letify: Open Settings" }
+      {
+        "command": "letify.refresh",
+        "title": "letify: Refresh"
+      },
+      {
+        "command": "letify.show",
+        "title": "letify: Show Quota and GPU Activity"
+      },
+      {
+        "command": "letify.openSettings",
+        "title": "letify: Open Settings"
+      }
     ],
     "viewsContainers": {
       "panel": [
-        { "id": "letify", "title": "letify", "icon": "media/icon.svg" }
+        {
+          "id": "letify",
+          "title": "letify",
+          "icon": "media/icon.svg"
+        }
       ]
     },
     "views": {
       "letify": [
-        { "type": "webview", "id": "letify.view", "name": "Quota and GPU" }
+        {
+          "type": "webview",
+          "id": "letify.view",
+          "name": "Quota and GPU"
+        }
       ]
     },
     "configuration": {

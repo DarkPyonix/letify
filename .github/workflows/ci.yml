@@ -19,6 +19,8 @@ jobs:
           python-version: "3.11"
       - name: Check every file carries the pyproject.toml version
         run: uv run --no-project python scripts/version.py check
+      - name: Lint
+        run: uv run ruff check letify tests
       - name: Test
         run: uv run pytest -q
 
