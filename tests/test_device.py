@@ -274,6 +274,31 @@ def test_autocast_promotes_mixed_arguments_to_the_widest_dtype(client) -> None:
     assert joined.cpu().tolist() == [1.0, 1.0, 1.0, 1.0]
 
 
+def test_autocast_cross_entropy_takes_log_softmax_in_the_input_dtype(client) -> None:
+    # CUDA's cross_entropy_loss runs log_softmax uncast and casts only nll_loss to float32.
+    torch.manual_seed(0)
+    logits = torch.randn(8, 10) * 3
+    target = torch.randint(0, 10, (8,))
+    with client.suspended():
+        half = logits.to(torch.bfloat16)
+        want = torch.nn.functional.nll_loss(torch.log_softmax(half, 1).float(), target)
+    with torch.autocast("cuda", dtype=torch.bfloat16):
+        got = torch.nn.functional.cross_entropy(logits.to(torch.bfloat16).cuda(), target.cuda())
+    assert got.dtype == torch.float32
+    assert got.cpu().item() == want.item()
+
+
+def test_autocast_does_not_widen_index_copy(client) -> None:
+    # CUDA autocast has no kernel for index_copy, so mixed dtypes raise there too.
+    base = torch.zeros(4, device="cuda", dtype=torch.bfloat16)
+    source = torch.ones(2, device="cuda")
+    index = torch.tensor([0, 2]).cuda()
+    with pytest.raises((RuntimeError, RemoteError)):
+        with torch.autocast("cuda", dtype=torch.bfloat16):
+            base.index_copy(0, index, source)
+        torch.cuda.synchronize()
+
+
 def test_operators_outside_an_autocast_region_keep_their_dtype(client) -> None:
     layer = torch.nn.Linear(4, 2).cuda()
     with torch.autocast("cuda", dtype=torch.bfloat16, enabled=False):
