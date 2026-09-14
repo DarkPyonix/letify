@@ -1223,6 +1223,16 @@ These `torch.cuda` functions are replaced while the function runs, and restored 
 No replaced function initializes CUDA in this process. A CUDA build of PyTorch on a machine with no NVIDIA driver raises `CUDA driver version is insufficient` from any call that does, and a training loop makes such calls without naming them: `Adam.step()` and `AdamW.step()` call `is_current_stream_capturing()`, and `torch.cuda.is_bf16_supported()`, which `autocast` reads for `bfloat16`, calls `get_device_properties()`.
 
 A process forked while forwarding is active, such as a `DataLoader` worker, starts with the mapping undone: `torch.cuda` holds PyTorch's own functions, the device rewrite is off and `current_client()` is None, so the worker's `torch.manual_seed` and its CPU tensors stay in that process. The client refuses to send from a process other than the one that connected it, raising `RuntimeLost` naming the fork, because the channel it would write to belongs to the parent. `DataLoader(pin_memory=True)` is not supported, because PyTorch pins through its own CUDA context in a thread letify does not map.
+
+### Compilation <!-- id: forwarding-compile -->
+
+> Under `host="local"`, `torch.compile` returns the function or module it is given, unchanged, and warns once that it runs eagerly, so a compiled training loop runs and computes what eager code computes.
+
+Inductor, the default backend, cannot compile here: before tracing it creates a CUDA tensor in this process to set up a device context, which needs a driver this process does not have. Dynamo with any backend also traces into `RemoteTensor` dispatch, which is letify's own Python, and recompiles it for every operator. A replayed step already sends the whole step as one entry, as [Step capture](#forwarding-step-capture) describes, so compiling on the client has nothing left to batch.
+
+While forwarding is active, `torch.compile(model, ...)` with any arguments returns `model` itself, and `torch.compile(...)` used as a decorator factory returns a decorator that returns the function itself. `Module.compile(...)` does nothing. The first such call in a process emits a `UserWarning` naming `host="local"` and eager execution. `torch.compile` and `Module.compile` are restored when forwarding ends and undone in a forked process, as the rest of the mapping is.
+
+`torch.cuda.get_rng_state` and `torch.cuda.set_rng_state` stay refused, so code that saves and restores the generator state names the gap instead of silently restoring a state that is not the runtime's.
 ### Autocast <!-- id: forwarding-autocast -->
 
 > Inside `torch.autocast("cuda")`, an operator on a `RemoteTensor` gets the argument casts CUDA autocast gives it, so a mixed precision loop computes in the same dtypes as on the runtime's own GPU.

@@ -12,6 +12,7 @@ import contextlib
 import inspect
 import os
 import types
+import warnings
 from collections.abc import Iterator
 from typing import TYPE_CHECKING, Any
 
@@ -510,6 +511,52 @@ def replacements(client: Client) -> dict[str, Any]:
 
 _MISSING = object()
 
+#: Whether this process has warned that ``torch.compile`` runs eagerly, as a mutable cell.
+_COMPILE_WARNED = [False]
+
+
+def _warn_compile() -> None:
+    if _COMPILE_WARNED[0]:
+        return
+    _COMPILE_WARNED[0] = True
+    warnings.warn(
+        "torch.compile runs eagerly under host='local': compilation needs a CUDA driver in "
+        "this process, and the runtime already receives each repeated step as one entry",
+        UserWarning,
+        stacklevel=3,
+    )
+
+
+def compile_replacements() -> dict[tuple[Any, str], Any]:
+    """``torch.compile`` and ``Module.compile`` as spec "Compilation" describes."""
+
+    def compile(model: Any = None, *args: Any, **kwargs: Any) -> Any:
+        _warn_compile()
+        if model is None:
+            return lambda function: function
+        return model
+
+    def module_compile(self: torch.nn.Module, *args: Any, **kwargs: Any) -> None:
+        _warn_compile()
+
+    return {(torch, "compile"): compile, (torch.nn.Module, "compile"): module_compile}
+
+
+def _patch_owned(table: dict[tuple[Any, str], Any]) -> dict[tuple[Any, str], Any]:
+    saved = {key: getattr(key[0], key[1], _MISSING) for key in table}
+    for (owner, name), value in table.items():
+        setattr(owner, name, value)
+    return saved
+
+
+def _restore_owned(saved: dict[tuple[Any, str], Any]) -> None:
+    for (owner, name), value in saved.items():
+        if value is _MISSING:
+            delattr(owner, name)
+        else:
+            setattr(owner, name, value)
+
+
 #: The torch.cuda attributes each active mapping replaced, innermost last.
 _ACTIVE: list[dict[str, Any]] = []
 
@@ -534,6 +581,7 @@ def mapped(client: Client) -> Iterator[None]:
     """Install the CUDA mapping for the duration of the block."""
     table = replacements(client)
     saved = _patch(table)
+    compiled_saved = _patch_owned(compile_replacements())
     _ACTIVE.append(table)
     _CLIENTS.append(client)
     registered = [found for found in _foreach_types() if RemoteTensor not in found]
@@ -547,6 +595,7 @@ def mapped(client: Client) -> Iterator[None]:
             found.remove(RemoteTensor)
         _CLIENTS.pop()
         _ACTIVE.pop()
+        _restore_owned(compiled_saved)
         _restore(saved)
 
 
@@ -588,13 +637,16 @@ def unmapped() -> Iterator[None]:
         yield
         return
     originals = {name: getattr(torch.cuda, name) for name in _ACTIVE[-1]}
+    compiled = {key: getattr(key[0], key[1]) for key in _COMPILE_ORIGINALS}
     _restore(_ORIGINALS)
+    _restore_owned(_COMPILE_ORIGINALS)
     _CLIENTS.append(None)
     try:
         with _pop_mode_temporarily():
             yield
     finally:
         _CLIENTS.pop()
+        _patch_owned(compiled)
         _patch(originals)
 
 
@@ -603,6 +655,7 @@ def _forget_in_child() -> None:
     if not _ACTIVE:
         return
     _restore(_ORIGINALS)
+    _restore_owned(_COMPILE_ORIGINALS)
     for found in _foreach_types():
         while RemoteTensor in found:
             found.remove(RemoteTensor)
@@ -640,4 +693,9 @@ _ORIGINALS: dict[str, Any] = {
         "empty_cache",
         *REFUSED,
     )
+}
+
+#: torch.compile and Module.compile as they were before any mapping, read once at import.
+_COMPILE_ORIGINALS: dict[tuple[Any, str], Any] = {
+    key: getattr(key[0], key[1], _MISSING) for key in compile_replacements()
 }
