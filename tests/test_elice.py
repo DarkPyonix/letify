@@ -139,7 +139,8 @@ def test_an_accelerator_no_instance_type_offers_lists_what_is_offered(account) -
 
 
 def test_a_second_start_reuses_the_machine_by_name_and_starts_it(account, fake_eci) -> None:
-    provider = account()
+    # A persistent account, whose session end stops the machine.
+    provider = account(persistent=True)
     instance = Instance(provider, gpu="A100")
     provider.create_session(instance, "letify-a100-1")
     provider.stop(runtime_on(provider, instance))
@@ -204,7 +205,8 @@ def test_a_declared_machine_is_started_and_never_launched(account, fake_eci) -> 
 
 
 def test_stopping_a_session_stops_the_machine_and_deletes_nothing(account, fake_eci) -> None:
-    provider = account()
+    # A persistent account, whose session end stops the machine.
+    provider = account(persistent=True)
     instance = Instance(provider, gpu="A100")
     provider.create_session(instance, "letify-a100-1")
     provider.stop(runtime_on(provider, instance))
@@ -215,7 +217,8 @@ def test_stopping_a_session_stops_the_machine_and_deletes_nothing(account, fake_
 
 
 def test_a_machine_another_runtime_is_on_is_not_stopped(account, fake_eci) -> None:
-    provider = account()
+    # A persistent account, whose session end stops the machine.
+    provider = account(persistent=True)
     instance = Instance(provider, gpu="A100")
     provider.create_session(instance, "letify-a100-1")
     first = runtime_on(provider, instance)
@@ -230,7 +233,8 @@ def test_a_machine_another_runtime_is_on_is_not_stopped(account, fake_eci) -> No
 def test_a_failed_stop_says_how_to_stop_by_hand_and_does_not_raise(
     account, fake_eci, capsys
 ) -> None:
-    provider = account()
+    # A persistent account, whose session end stops the machine.
+    provider = account(persistent=True)
     instance = Instance(provider, gpu="A100")
     provider.create_session(instance, "letify-a100-1")
     fake_eci.set(fail={"compute vm stop": {"stderr": "Error: 503 upstream"}})
@@ -606,3 +610,47 @@ def test_ssh_that_never_answers_raises_naming_the_address(account, monkeypatch) 
     provider = account()
     with pytest.raises(letify.RuntimeFailure, match=r"203\.0\.113\.1"):
         provider.create_session(Instance(provider, gpu="A100"), "letify-a100-1")
+
+
+# -- Spec: Elice machines, stop follows persistent -------------------------------------
+
+
+def test_a_session_end_on_a_non_persistent_account_deletes_the_launched_machine(
+    account, fake_eci
+) -> None:
+    provider = account(persistent=False)
+    instance = Instance(provider, gpu="A100")
+    provider.create_session(instance, "letify-a100-1")
+    provider.stop(runtime_on(provider, instance))
+    assert "compute vm delete letify-elice-a100" in fake_eci.commands()
+    delete = next(c["argv"] for c in fake_eci.calls if c["argv"][:3] == ["compute", "vm", "delete"])
+    assert "--cascade" in delete and "-y" in delete
+    assert "compute vm stop letify-elice-a100" not in fake_eci.commands()
+    assert fake_eci.read()["vms"] == []
+
+
+def test_an_elice_account_is_not_persistent_unless_it_says_so(account) -> None:
+    assert account().persistent is False
+
+
+def test_a_session_end_on_a_persistent_account_only_stops_the_machine(account, fake_eci) -> None:
+    provider = account(persistent=True)
+    instance = Instance(provider, gpu="A100")
+    provider.create_session(instance, "letify-a100-1")
+    provider.stop(runtime_on(provider, instance))
+    assert "compute vm stop letify-elice-a100" in fake_eci.commands()
+    assert not any(c.startswith("compute vm delete") for c in fake_eci.commands())
+
+
+def test_a_declared_machine_is_stopped_never_deleted_even_when_not_persistent(
+    account, fake_eci
+) -> None:
+    fake_eci.set(
+        vms=[{"id": "vm-7", "name": "my-vm", "status": "idle", "public_ip": "203.0.113.7"}]
+    )
+    provider = account(persistent=False, machine_id="my-vm")
+    instance = Instance(provider, gpu="A100")
+    provider.create_session(instance, "letify-a100-1")
+    provider.stop(runtime_on(provider, instance))
+    assert "compute vm stop my-vm" in fake_eci.commands()
+    assert not any(c.startswith("compute vm delete") for c in fake_eci.commands())
