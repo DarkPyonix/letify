@@ -262,3 +262,8 @@ letify/remoting/lib/
 # Artifacts the examples write where they run
 examples/**/sweep-report.json
 examples/**/.letify
+
+# letify-ext build output
+letify-ext/node_modules/
+letify-ext/out/
+*.vsix

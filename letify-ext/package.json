@@ -1,0 +1,95 @@
+{
+  "name": "letify-status",
+  "displayName": "letify Status",
+  "description": "letify quota and GPU activity in the status bar, read from the letify CLI.",
+  "version": "0.1.0",
+  "publisher": "letify",
+  "license": "SEE LICENSE IN LICENSE",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/darkpyonix/letify"
+  },
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": ["Other"],
+  "activationEvents": ["workspaceContains:.letify", "onStartupFinished"],
+  "main": "./out/src/extension.js",
+  "contributes": {
+    "commands": [
+      { "command": "letify.refresh", "title": "letify: Refresh" },
+      { "command": "letify.show", "title": "letify: Show Quota and GPU Activity" },
+      { "command": "letify.openSettings", "title": "letify: Open Settings" }
+    ],
+    "viewsContainers": {
+      "panel": [
+        { "id": "letify", "title": "letify", "icon": "media/icon.svg" }
+      ]
+    },
+    "views": {
+      "letify": [
+        { "type": "webview", "id": "letify.view", "name": "Quota and GPU" }
+      ]
+    },
+    "configuration": {
+      "title": "letify",
+      "properties": {
+        "letify.command": {
+          "type": "string",
+          "default": "uv run letify",
+          "description": "Command that runs the letify CLI, split on spaces. Runs in the first workspace folder."
+        },
+        "letify.usageIntervalSeconds": {
+          "type": "number",
+          "default": 60,
+          "minimum": 10,
+          "description": "Seconds between reads of letify usage."
+        },
+        "letify.utilizationIntervalSeconds": {
+          "type": "number",
+          "default": 10,
+          "minimum": 2,
+          "description": "Seconds between reads of letify utilization and status while the letify view is visible."
+        },
+        "letify.warningPercent": {
+          "type": "number",
+          "default": 20,
+          "description": "Share left, in percent, below which the quota item turns to the warning color."
+        },
+        "letify.errorPercent": {
+          "type": "number",
+          "default": 5,
+          "description": "Share left, in percent, below which the quota item turns to the error color."
+        },
+        "letify.busyPercent": {
+          "type": "number",
+          "default": 10,
+          "description": "Utilization, in percent, at or above which a GPU counts as busy."
+        },
+        "letify.showQuota": {
+          "type": "boolean",
+          "default": true,
+          "description": "Show the quota item in the status bar."
+        },
+        "letify.showGpu": {
+          "type": "boolean",
+          "default": true,
+          "description": "Show the GPU activity item in the status bar."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "build": "tsc -p .",
+    "watch": "tsc -w -p .",
+    "test": "vitest run",
+    "package": "npm run build && vsce package --out ../letify-ext.vsix"
+  },
+  "devDependencies": {
+    "@types/node": "^18.19.0",
+    "@types/vscode": "1.85.0",
+    "@vscode/vsce": "^2.32.0",
+    "typescript": "^5.6.3",
+    "vitest": "^2.1.9"
+  }
+}

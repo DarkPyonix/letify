@@ -450,6 +450,8 @@ letify probe lab              # is host=letify.local worth using here?
 letify efficiency 0.5 3 150   # the formula, from measured terms
 ```
 
+Add `--json` to `usage`, `utilization` or `status` for output a program can read. The VS Code extension in [letify-ext/](letify-ext/) uses it to show quota and GPU activity in the status bar.
+
 ---
 
 ## 📚 Documentation

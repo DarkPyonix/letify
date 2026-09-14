@@ -1326,6 +1326,48 @@ run-1  lab.P100  busy
 
 The header ends `busy` while a call runs and `idle` otherwise. `cards` is left out where the provider assigns the device, `link` where there is none, and the round trip where it was not measured. The cost line needs a usage record with a rate, and is uptime times the rate, so it is an estimate and says `about`. The gauge and amount lines are the usage block's own lines for that record.
 
+### Machine-readable output <!-- id: machine-readable-output -->
+
+> `letify usage --json`, `letify utilization --json` and `letify status --json` print JSON whose field names and types are a contract: a field may be added, but none is renamed, removed or retyped.
+
+Each command prints one JSON document on standard output and exits 0. An error that stops the command prints a message on standard error and exits non zero, with nothing on standard output. The formatting of the human output does not change the JSON.
+
+`letify usage --json` prints a list with one object per declared alias, in configuration order. A usage object carries every field of the `Usage` record under "Remaining usage", all keys always present:
+
+| Key | Type |
+|---|---|
+| `alias`, `kind`, `unit`, `source` | string |
+| `remaining`, `limit`, `used`, `rate_per_hour` | number or null |
+| `resets_at`, `as_of` | number of Unix seconds, or null |
+| `unmetered` | boolean |
+| `note` | string or null |
+| `resources` | list of `{"name", "unit"}` strings with `remaining`, `used`, `limit` and `resets_at` as number or null, empty when the account has no further allowance |
+
+An alias whose provider cannot be built prints `{"alias": <string>, "unavailable": <string>}` instead.
+
+`letify utilization --json` prints a list of rows as "GPU utilization" describes: one per `machine` provider and one per `session` instance with an accelerator. A row has `alias`, `kind` and `scope` (string), `accelerator` (string, or null on a `machine` row), `devices` (list) and `reason` (string or null, why `devices` is empty). A device object has `index` (integer), `name` (string), `utilization_percent`, `memory_used_gb`, `memory_total_gb`, `memory_percent`, `temperature_c`, `power_w` (number or null each), `holder` (one of `letify`, `others`, `mine`, `free`, `unknown`, or null on a `session` row), `users` (list of strings, the owners when `holder` is `others`) and `reserved` (boolean). An alias whose provider cannot be built prints `{"alias": <string>, "unavailable": <string>}`.
+
+`letify status --json` prints the `Launcher.status()` object described under "Status reporting": `name` (string), `live` and `busy` (integer), `devices` (object keyed by alias, then by accelerator, each `{"count": integer, "reserved": integer, "indices": [integer]}`), `runtimes` (list of `{"name", "provider", "accelerator", "placement"}` strings, `devices` list, `busy` and `persistent_channel` booleans, `idle_seconds` number), `declared` and `config_sources` (lists of strings). `letify status` without the flag prints the same document.
+
+### Editor extension <!-- id: editor-extension -->
+
+> `letify-ext/` is a VS Code extension that shows the remaining quota and GPU load in the status bar, read only through the JSON above.
+
+The extension runs `uv run letify <command> --json` in the first workspace folder. The command is the setting `letify.command`. It reads usage every `letify.usageIntervalSeconds`, 60 by default, and utilization and status every `letify.utilizationIntervalSeconds`, 10 by default while its view is visible and at the usage interval otherwise. It makes no network call of its own and writes no credential anywhere.
+
+The quota status bar item shows the account with the lowest remaining share, `remaining / limit`, as `<alias> <percent>% left`, with `(<time to reset>)` when `resets_at` is known. An account with no limit is ranked after every account with one. The item turns to the warning color when the share left is below `letify.warningPercent`, 20 by default, and to the error color below `letify.errorPercent`, 5 by default. The GPU item shows `GPU <free>/<total> free <mean>%` when any device reports a `holder`, where a device is free when its `holder` is `free`. When no device reports one it shows `GPU <busy>/<total> busy <mean>%`, where a device is busy at `letify.busyPercent`, 10 by default, or above. The mean is over devices that report utilization.
+
+Hovering either item shows its cards. Clicking one opens the letify view with the tabs Quota, GPU and Runtimes. A quota card shows a gauge of the share used, the reset time, the share of the period elapsed where the period length is known (7 days for `GPU hours`, the calendar month for `USD`), the projection `used / elapsed share` capped at 999 percent, and the hourly rate. Each record in `resources` adds a row under them: its `name`, the amount left of its limit, a gauge of the share used when the limit is known, and its reset time. A GPU card shows, per device, utilization and memory gauges, temperature, power and the holder label:
+
+| `holder` | Label |
+|---|---|
+| `letify` | `letify reserved` |
+| `others` | `other users: <users>` |
+| `mine` | `yours` |
+| `free` | `free` |
+| `unknown` | `unknown` |
+| null | `letify reserved` when `status` lists the index as reserved, nothing otherwise | Daily history is the mean GPU utilization and the quota spent per UTC day, kept by the extension in its own storage for 30 days from its own samples.
+
 ## Packaging
 
 > One install, `uv add letify`, with no extras. It installs cloudpickle and blake3 and nothing else.
