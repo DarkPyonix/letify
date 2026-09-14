@@ -405,6 +405,165 @@ class Receiver:
         return partial.kind, stream, (partial.head, partial.buffers)
 
 
+#: Frame type of a segment of a striped byte stream. It appears only on a lane.
+SEGMENT = 8
+
+#: A write this large or larger is split across every lane of a striped stream.
+STRIPE_MIN = 1 << 20
+
+#: Bytes a striped reader holds before a lane that is ahead of the next offset waits.
+STRIPE_HOLD = 64 << 20
+
+_OFFSET = struct.Struct("<Q")
+
+
+def _read_exact(readinto, view) -> None:
+    got = 0
+    while got < view.nbytes:
+        try:
+            count = readinto(view[got:])
+        except TimeoutError:
+            continue
+        if not count:
+            raise EOFError("a lane ended")
+        got += count
+
+
+class Striped:
+    """One byte stream carried as segments over several lanes, as spec "Parallel data
+    streams" describes.
+
+    ``writes`` and ``readintos`` hold one ``write`` and one ``readinto`` per lane. A reading
+    thread runs per lane from construction, and a sending thread per lane after the first.
+    """
+
+    def __init__(self, writes, readintos):
+        import queue
+
+        self._writes = list(writes)
+        self._lock = threading.Lock()
+        self._sent = 0
+        self._failure = None
+        self._queues = [queue.Queue() for _ in self._writes]
+        #: Seconds ``recv_into`` waits for bytes before raising ``TimeoutError``, or None.
+        self.timeout = None
+        self._cond = threading.Condition()
+        self._pieces = {}
+        self._next = 0
+        self._held = 0
+        self._head = memoryview(b"")
+        self._ended = False
+        for lane in range(1, len(self._writes)):
+            threading.Thread(target=self._lane_sender, args=(lane,), daemon=True).start()
+        for lane, readinto in enumerate(readintos):
+            threading.Thread(target=self._lane_reader, args=(lane, readinto), daemon=True).start()
+
+    # -- writing ---------------------------------------------------------------
+
+    def _segment(self, lane: int, offset: int, view) -> None:
+        head = HEADER.pack(MAGIC, SEGMENT, 0, lane, view.nbytes) + _OFFSET.pack(offset)
+        write = self._writes[lane]
+        pieces = [head + view.tobytes()] if view.nbytes <= _JOIN_LIMIT else [head, view]
+        for piece in pieces:
+            rest = memoryview(piece)
+            while rest:
+                rest = rest[write(rest) :]
+
+    def _lane_sender(self, lane: int) -> None:
+        while True:
+            offset, view, done = self._queues[lane].get()
+            try:
+                self._segment(lane, offset, view)
+            except BaseException as exc:
+                done[1] = exc
+            done[0].set()
+
+    def send(self, data) -> int:
+        """Send all of ``data`` and return its length."""
+        view = memoryview(data).cast("B")
+        lanes = len(self._writes)
+        with self._lock:
+            if self._failure is not None:
+                raise self._failure
+            offset = self._sent
+            self._sent += view.nbytes
+            if view.nbytes < STRIPE_MIN or lanes == 1:
+                self._segment(0, offset, view)
+                return view.nbytes
+            step = -(-view.nbytes // lanes)
+            waits = []
+            for lane in range(1, lanes):
+                piece = view[lane * step : (lane + 1) * step]
+                if piece.nbytes:
+                    done = [threading.Event(), None]
+                    self._queues[lane].put((offset + lane * step, piece, done))
+                    waits.append(done)
+            try:
+                self._segment(0, offset, view[:step])
+            finally:
+                for done in waits:
+                    done[0].wait()
+            for done in waits:
+                if done[1] is not None:
+                    self._failure = done[1]
+                    raise done[1]
+            return view.nbytes
+
+    # -- reading ---------------------------------------------------------------
+
+    def _end(self) -> None:
+        with self._cond:
+            self._ended = True
+            self._cond.notify_all()
+
+    def _lane_reader(self, lane: int, readinto) -> None:
+        header = bytearray(HEADER.size + _OFFSET.size)
+        try:
+            while True:
+                _read_exact(readinto, memoryview(header))
+                magic, kind, _flags, _lane, length = HEADER.unpack_from(header)
+                (offset,) = _OFFSET.unpack_from(header, HEADER.size)
+                if magic != MAGIC or kind != SEGMENT:
+                    return
+                with self._cond:
+                    while self._held > STRIPE_HOLD and offset != self._next and not self._ended:
+                        self._cond.wait()
+                    if offset < self._next or offset in self._pieces or self._ended:
+                        return
+                piece = bytearray(length)
+                _read_exact(readinto, memoryview(piece))
+                with self._cond:
+                    if offset < self._next or offset in self._pieces:
+                        return
+                    self._pieces[offset] = piece
+                    self._held += length
+                    self._cond.notify_all()
+        except (EOFError, OSError, ValueError):
+            return
+        finally:
+            self._end()
+
+    def recv_into(self, view) -> int:
+        """Fill ``view`` with the next bytes in offset order, 0 once the stream ended."""
+        with self._cond:
+            while not self._head:
+                piece = self._pieces.pop(self._next, None)
+                if piece is not None:
+                    self._head = memoryview(piece)
+                    self._next += len(piece)
+                    self._held -= len(piece)
+                    self._cond.notify_all()
+                    continue
+                if self._ended:
+                    return 0
+                if not self._cond.wait(self.timeout) and self.timeout is not None:
+                    raise TimeoutError("no bytes arrived on the striped stream in time")
+            count = min(view.nbytes, self._head.nbytes)
+            view[:count] = self._head[:count]
+            self._head = self._head[count:]
+            return count
+
+
 def chunks_readinto(read_chunks):
     """A ``readinto`` over a source of byte chunks, such as decoded base64 frame lines.
 
@@ -443,12 +602,16 @@ __all__ = [
     "PIPE_SIZE",
     "REPLY",
     "REQUEST",
+    "SEGMENT",
     "SHUTDOWN",
     "STDERR",
     "STDOUT",
+    "STRIPE_HOLD",
+    "STRIPE_MIN",
     "FrameError",
     "Receiver",
     "Sender",
+    "Striped",
     "TextSender",
     "chunks_readinto",
     "dumps",

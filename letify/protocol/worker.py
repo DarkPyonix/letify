@@ -614,6 +614,8 @@ def _listen(stream, request):
         _reply(stream, {"ok": False, "error": "OSError: %s" % exc, "traceback": ""})
         return None
     _reply(stream, {"ok": True, "value": None})
+    streams = int(request.get("streams") or 1)
+    lanes = {}
     stdin = sys.stdin.fileno()
     try:
         while True:
@@ -626,48 +628,82 @@ def _listen(stream, request):
             if server not in ready:
                 continue
             connection, _address = server.accept()
-            if _authenticated(connection, token):
-                _use_connection(connection)
-                return connection
-            connection.close()
+            lane = _authenticated(connection, token, streams)
+            if lane is None or lane in lanes:
+                connection.close()
+                continue
+            lanes[lane] = connection
+            if len(lanes) == streams:
+                ordered = [lanes[index] for index in range(streams)]
+                lanes = {}
+                return _use_connection(ordered)
     finally:
         server.close()
+        for connection in lanes.values():
+            connection.close()
 
 
-def _authenticated(connection, token):
-    """Whether the connection's first line is the data prefix and the expected token."""
+def _authenticated(connection, token, streams=1):
+    """The lane index the connection's first line names with the expected token, or None.
+
+    Spec "Parallel data streams": lane 0 sends ``LETIFY-DATA <token>`` and lane ``i`` sends
+    ``LETIFY-DATA <token> <i>``.
+    """
     import hmac
 
-    expected = _DATA_PREFIX + token + b"\n"
+    expected = _DATA_PREFIX + token
     line = b""
     try:
         connection.settimeout(10)
-        while not line.endswith(b"\n") and len(line) < len(expected):
-            chunk = connection.recv(len(expected) - len(line))
+        while not line.endswith(b"\n") and len(line) < len(expected) + 4:
+            chunk = connection.recv(1)
             if not chunk:
-                return False
+                return None
             line += chunk
         connection.settimeout(None)
     except OSError:
-        return False
-    return hmac.compare_digest(line, expected)
+        return None
+    if not line.endswith(b"\n"):
+        return None
+    head, rest = line[: len(expected)], line[len(expected) : -1]
+    if not hmac.compare_digest(head, expected):
+        return None
+    if not rest:
+        return 0
+    if rest[:1] != b" " or not rest[1:].isdigit():
+        return None
+    lane = int(rest[1:])
+    return lane if 0 < lane < streams else None
 
 
-def _use_connection(connection):
-    """Send hello, then every later frame, over the data connection as binary frames."""
+def _use_connection(connections):
+    """Send hello, then every later frame, over the data connections as binary frames.
+
+    Returns what the frame reader reads from: the one connection, or a ``Striped`` stream
+    over every lane.
+    """
     global _SENDER
     import socket
 
-    try:
-        connection.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-    except OSError:
-        pass
-    sender = Sender(connection.send)
+    for connection in connections:
+        try:
+            connection.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        except OSError:
+            pass
+    if len(connections) == 1:
+        carrier = connections[0]
+    else:
+        carrier = Striped(
+            [connection.send for connection in connections],
+            [connection.recv_into for connection in connections],
+        )
+    sender = Sender(carrier.send)
     old = _SENDER
     # Under the old lock, so no frame is split between the two transports.
     with old.lock:
         sender.frame(HELLO, 0, ("%d.%d" % sys.version_info[:2]).encode("ascii"))
         _SENDER = sender
+    return carrier
 
 
 def _read():

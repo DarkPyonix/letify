@@ -34,7 +34,13 @@ from typing import IO, TYPE_CHECKING, Any
 
 from ..config import ProviderConfig
 from ..declare.instance import Host, Instance
-from ..errors import LetifyError, ProviderUnavailable, RuntimeFailure, UnsupportedMode
+from ..errors import (
+    ConfigError,
+    LetifyError,
+    ProviderUnavailable,
+    RuntimeFailure,
+    UnsupportedMode,
+)
 from ..protocol import wire
 from ..runtime.channel import Connection, FramedChannel
 from .base import Provider
@@ -77,6 +83,11 @@ LISTEN_WAIT = 60
 
 #: Seconds the channel allows for connecting through the tunnel and for the hello after it.
 DATA_CONNECT_TIMEOUT = 30
+
+#: TCP connections the data channel opens when ``data_streams`` is not set, and the most
+#: it accepts. Spec "Parallel data streams".
+DATA_STREAMS = 8
+MAX_DATA_STREAMS = 16
 
 #: Packages the sandbox image installs for the worker.
 WORKER_PACKAGES = ("cloudpickle", "blake3")
@@ -329,6 +340,12 @@ class Modal(Provider):
         # has to be absolute inside the sandbox.
         volumes = {root: f"{app}-workspace"} if root.startswith("/") else {}
         data_port = DATA_PORT if self.config.option("data_channel", True) is not False else None
+        streams = self.config.option("data_streams", DATA_STREAMS)
+        if type(streams) is not int or not 1 <= streams <= MAX_DATA_STREAMS:
+            raise ConfigError(
+                f"{self.alias}: data_streams is {streams!r}, and it has to be an integer from 1 "
+                f"to {MAX_DATA_STREAMS}"
+            )
         # Not `python3 -`: that reads standard input to the end before running anything, so
         # the requests that follow the source would be compiled as source too.
         created = adapter.request(
@@ -343,7 +360,9 @@ class Modal(Provider):
         )
         sandbox = str(created["sandbox"])
         self._sandboxes[runtime.name] = sandbox
-        return SandboxChannel(adapter, sandbox, name=runtime.name, data_port=data_port)
+        return SandboxChannel(
+            adapter, sandbox, name=runtime.name, data_port=data_port, streams=streams
+        )
 
     def stop(self, runtime: Runtime) -> None:
         sandbox = self._sandboxes.pop(runtime.name, None)
@@ -481,16 +500,26 @@ class SandboxChannel(FramedChannel):
 
     text_frames = True
 
-    def __init__(self, adapter: Adapter, sandbox: str, *, name: str, data_port: int | None = None):
+    def __init__(
+        self,
+        adapter: Adapter,
+        sandbox: str,
+        *,
+        name: str,
+        data_port: int | None = None,
+        streams: int = 1,
+    ):
         self.adapter = adapter
         self.sandbox = sandbox
         self.name = name
         self.data_port = data_port
+        #: TCP connections the data channel carries its frames over.
+        self.streams = streams
+        self._sockets: list[socket.socket] = []
         #: The context a TLS tunnel is verified with. None uses the system's trusted roots.
         self.tls_context: ssl.SSLContext | None = None
         self._connection = None
         self._stdio: Connection | None = None
-        self._socket: socket.socket | None = None
 
     def start(self) -> None:
         if self._connection is not None:
@@ -537,50 +566,98 @@ class SandboxChannel(FramedChannel):
         stdio = self._stdio
         assert stdio is not None
         token = secrets.token_hex(32)
-        stdio.request(
-            {"op": "listen", "port": port, "token": token, "wait": LISTEN_WAIT},
-            timeout=DATA_CONNECT_TIMEOUT + LISTEN_WAIT,
-            kill=self._kill,
-        )
+        listen: dict[str, Any] = {"op": "listen", "port": port, "token": token}
+        listen["wait"] = LISTEN_WAIT
+        if self.streams > 1:
+            listen["streams"] = self.streams
+        stdio.request(listen, timeout=DATA_CONNECT_TIMEOUT + LISTEN_WAIT, kill=self._kill)
         tunnel = self.adapter.request("tunnel", sandbox=self.sandbox, port=port)
         host = str(tunnel["host"])
-        raw = socket.create_connection((host, int(tunnel["port"])), timeout=DATA_CONNECT_TIMEOUT)
-        self._socket = raw
+        address = (host, int(tunnel["port"]))
+        context = None
+        if tunnel.get("tls"):
+            context = self.tls_context or ssl.create_default_context()
+        lanes: list[Any] = [None] * self.streams
+        errors: list[BaseException] = []
+
+        def open_lane(index: int) -> None:
+            # Spec "Parallel data streams": every lane opens at the same time.
+            try:
+                raw = socket.create_connection(address, timeout=DATA_CONNECT_TIMEOUT)
+            except BaseException as exc:
+                errors.append(exc)
+                return
+            self._sockets.append(raw)
+            try:
+                raw.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+                stream: Any = raw
+                if context is not None:
+                    stream = TlsStream.client(raw, context, host)
+                suffix = b"" if index == 0 else b" %d" % index
+                view = memoryview(b"LETIFY-DATA " + token.encode("ascii") + suffix + b"\n")
+                while view:
+                    view = view[stream.send(view) :]
+                lanes[index] = stream
+            except BaseException as exc:
+                errors.append(exc)
+
         try:
-            raw.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-            stream: Any = raw
-            if tunnel.get("tls"):
-                context = self.tls_context or ssl.create_default_context()
-                stream = TlsStream.client(raw, context, host)
-            hello = b"LETIFY-DATA " + token.encode("ascii") + b"\n"
-            view = memoryview(hello)
-            while view:
-                view = view[stream.send(view) :]
+            if self.streams == 1:
+                open_lane(0)
+            else:
+                threads = [
+                    threading.Thread(target=open_lane, args=(index,), daemon=True)
+                    for index in range(self.streams)
+                ]
+                for thread in threads:
+                    thread.start()
+                for thread in threads:
+                    thread.join()
+            if errors:
+                raise errors[0]
+            if self.streams == 1:
+                carrier: Any = lanes[0]
+            else:
+                # Lane reading threads outlive the hello, so the sockets block without a
+                # limit and the hello wait is the striped stream's own timeout.
+                for sock in self._sockets:
+                    sock.settimeout(None)
+                carrier = wire.Striped(
+                    [lane.send for lane in lanes], [lane.recv_into for lane in lanes]
+                )
+                carrier.timeout = DATA_CONNECT_TIMEOUT
             connection = Connection(
-                self.name, stream.send, stream.recv_into, self._emit, death_detail=self._raw_text
+                self.name, carrier.send, carrier.recv_into, self._emit, death_detail=self._raw_text
             )
-            # The connect timeout still applies to the socket, so a missing hello fails here.
+            # The connect timeout still applies, so a missing hello fails here.
             connection.wait_hello()
         except BaseException:
             self._close_socket()
             raise
-        raw.settimeout(None)
+        for sock in self._sockets:
+            sock.settimeout(None)
+        if self.streams > 1:
+            carrier.timeout = None
         return connection
 
+    @property
+    def _socket(self) -> socket.socket | None:
+        """The first lane's socket, or None when no data connection is open."""
+        return self._sockets[0] if self._sockets else None
+
     def _close_socket(self) -> None:
-        sock, self._socket = self._socket, None
-        if sock is None:
-            return
-        with contextlib.suppress(OSError):
-            sock.shutdown(socket.SHUT_RDWR)
-        with contextlib.suppress(OSError):
-            sock.close()
+        sockets, self._sockets = self._sockets, []
+        for sock in sockets:
+            with contextlib.suppress(OSError):
+                sock.shutdown(socket.SHUT_RDWR)
+            with contextlib.suppress(OSError):
+                sock.close()
 
     def _kill(self) -> None:
-        # A blocked read on the data connection returns once the socket is shut down.
-        if self._socket is not None:
+        # A blocked read on the data connection returns once every lane is shut down.
+        for sock in list(self._sockets):
             with contextlib.suppress(OSError):
-                self._socket.shutdown(socket.SHUT_RDWR)
+                sock.shutdown(socket.SHUT_RDWR)
 
     def close(self) -> None:
         connection = self._connection
