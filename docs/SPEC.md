@@ -1349,6 +1349,23 @@ The Python code is pure and links no Python extension. letify-core binaries are 
 
 Linux wheels are built inside the `manylinux_2_28` containers, so the binaries need glibc 2.28 or newer. That covers RHEL 8, Debian 10 and Ubuntu 18.10 onward. The sdist carries no binaries, and an install from it has no letify-core.
 
+### Versioning and releases <!-- id: versioning -->
+
+> One version for everything, read from `pyproject.toml`, and a release is the push of the tag `v<version>`.
+
+`[project].version` in `pyproject.toml` is the source of truth. These carry the same value:
+
+| File | Field |
+|---|---|
+| `letify/__init__.py` | `__version__` |
+| `letify-core/Cargo.toml` | `[workspace.package].version`, and the `letify-wire`, `letify-driver` and `letify-agent` entries in `Cargo.lock` |
+| `letify-ext/package.json` | `version`, and `version` and `packages[""].version` in `package-lock.json`, when `letify-ext/` exists |
+| Git tag | `v<version>` |
+
+`python scripts/version.py set <version>` writes all of them and `python scripts/version.py check [--tag v<version>]` exits 1 naming each file that disagrees. The `ci` workflow runs the check on every push and pull request, and the `publish` workflow runs it with the pushed tag before building anything.
+
+Pushing a tag `v*` runs `.github/workflows/publish.yml`. It builds the sdist, the six platform wheels above and, when `letify-ext/` exists, the extension's `letify-ext-<version>.vsix` after its unit tests pass. It then creates the GitHub Release for the tag with every one of those files attached, and uploads the sdist and wheels to PyPI. The extension is not published to the VS Code Marketplace.
+
 ## Known gaps
 
 > Implemented and unimplemented, stated plainly so nobody builds on a promise.

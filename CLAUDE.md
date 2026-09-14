@@ -141,6 +141,10 @@ Conventions:
 - Errors distinguish infrastructure failure from user code failure. Infrastructure failure may be retried, user code failure never is.
 - Never fall back to local execution silently. Raise instead.
 
+## Versions and releases
+
+There is one version for the Python package, letify-core, the VS Code extension and the tag. `pyproject.toml` `[project].version` is the source of truth. Change it only with `python scripts/version.py set <version>`, commit that as `Chore: Set the version to <version>`, and tag `v<version>`. CI fails when any file or the tag disagrees. The files and the release workflow are in `docs/SPEC.md`, Versioning and releases, and the steps in `docs/guide/08-releasing.md`.
+
 ## Dependencies
 
 There is one install and no extras:
