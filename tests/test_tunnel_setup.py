@@ -444,6 +444,14 @@ def test_forward_ssh_dials_the_public_port_when_the_account_sets_one() -> None:
     assert command[-2:] == ["researcher@203.0.113.9", "true"]
 
 
+def test_forward_ssh_pins_the_host_key_in_the_account_known_hosts(isolated_home) -> None:
+    provider = provider_of(Tunnel, "box", address="203.0.113.9", public_port=30501)
+    command = provider.ssh_command("true")
+    assert "StrictHostKeyChecking=accept-new" in command
+    assert "HostKeyAlias=letify-box" in command
+    assert any(part.startswith("UserKnownHostsFile=") and "box" in part for part in command)
+
+
 def test_punch_and_tailcat_keep_the_internal_ssh_port() -> None:
     provider = provider_of(Tunnel, "box", address="203.0.113.9", port=8022, public_port=30501)
     target = provider.target()

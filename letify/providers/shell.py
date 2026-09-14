@@ -134,7 +134,12 @@ class Shell(Provider):
 
     def ssh_command(self, remote_command: str | None = None) -> list[str]:
         """Build the OpenSSH command line that reaches this machine's address directly."""
+        from ..config.secrets import account_directory
+
         target = f"{self.user}@{self.address}" if self.user else self.address
+        # ssh creates only ~/.ssh, so the account directory must exist to record the key.
+        directory = account_directory(self.alias)
+        directory.mkdir(mode=0o700, parents=True, exist_ok=True)
         command = [
             "ssh",
             "-p",
@@ -143,6 +148,12 @@ class Shell(Provider):
             "BatchMode=yes",
             "-o",
             "ServerAliveInterval=30",
+            "-o",
+            f"HostKeyAlias=letify-{self.alias}",
+            "-o",
+            "StrictHostKeyChecking=accept-new",
+            "-o",
+            f"UserKnownHostsFile={directory / 'known_hosts'}",
             *sshopts.options(self.alias),
         ]
         if self.key_path:
