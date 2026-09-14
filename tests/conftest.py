@@ -496,6 +496,22 @@ class FakeModalAdapter:
             return []
         return [json.loads(line) for line in log.read_text(encoding="utf-8").splitlines()]
 
+    def sandbox_pids(self) -> list[int]:
+        """The local process id behind each sandbox the stand-in started, in order."""
+        log = self.state / "sandboxes.jsonl"
+        if not log.is_file():
+            return []
+        return [json.loads(line)[1] for line in log.read_text(encoding="utf-8").splitlines()]
+
+    @staticmethod
+    def alive(pid: int) -> bool:
+        """Whether a sandbox process still runs. A zombie waiting to be reaped has ended."""
+        try:
+            stat = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
+        except OSError:
+            return False
+        return stat.rsplit(")", 1)[1].split()[0] != "Z"
+
     def fail(self, *ops: str) -> None:
         self._monkeypatch.setenv("FAKE_MODAL_FAIL", ",".join(ops))
 
