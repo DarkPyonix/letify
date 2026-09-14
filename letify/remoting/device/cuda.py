@@ -201,12 +201,28 @@ def mapped(client: Client) -> Iterator[None]:
     table = replacements(client)
     saved = _patch(table)
     _ACTIVE.append(table)
+    foreach_types = _foreach_types()
+    registered = foreach_types is not None and RemoteTensor not in foreach_types
+    if registered:
+        foreach_types.append(RemoteTensor)  # type: ignore[union-attr]
     try:
         with CudaMode(client):
             yield
     finally:
+        if registered:
+            foreach_types.remove(RemoteTensor)  # type: ignore[union-attr]
         _ACTIVE.pop()
         _restore(saved)
+
+
+def _foreach_types() -> list | None:
+    """The list optimizers read to decide whether a tensor type takes the foreach path."""
+    try:
+        from torch.utils import _foreach_utils
+    except ImportError:  # pragma: no cover - a PyTorch without the module
+        return None
+    found = getattr(_foreach_utils, "_foreach_supported_types", None)
+    return found if isinstance(found, list) else None
 
 
 @contextlib.contextmanager

@@ -96,7 +96,6 @@ def test_a_module_trained_with_adam_matches_a_local_cpu_run(client) -> None:
         assert torch.allclose(remote, local, rtol=1e-5, atol=1e-6)
 
 
-
 def test_a_repeated_operator_reuses_its_inferred_metadata(client) -> None:
     a = torch.ones(8, 4, device="cuda")
     b = torch.ones(4, device="cuda")
@@ -125,6 +124,7 @@ def test_an_optimizer_takes_its_foreach_path_on_remote_tensors(client) -> None:
     optimizer.step()
     # Four parameters: the per parameter path issues well over twenty operators.
     assert client.stats.ops - before < 20
+
 
 # -- Spec: Mapping cuda --------------------------------------------------------
 

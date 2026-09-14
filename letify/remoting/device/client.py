@@ -71,6 +71,8 @@ class Stats:
     round_trips: int = 0
     released: int = 0
     sent_bytes: int = 0
+    #: Operators whose output metadata came from the cache instead of a meta kernel.
+    cached: int = 0
 
     def snapshot(self) -> Stats:
         return Stats(**{field.name: getattr(self, field.name) for field in fields(self)})
