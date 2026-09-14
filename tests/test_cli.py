@@ -124,6 +124,7 @@ def test_every_subcommand_is_reachable_from_the_parser() -> None:
     parser = build_parser()
     actions = [a for a in parser._actions if a.dest == "command"]
     assert sorted(actions[0].choices) == [
+        "cache",
         "check",
         "client",
         "devices",

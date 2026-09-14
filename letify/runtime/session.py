@@ -259,12 +259,17 @@ class Runtime:
         collector = pathdata.Collector(f"{root}/data/calls/{secrets.token_hex(8)}")
         head, buffers = protocol.dumps_call_parts(fn, args, kwargs, data=collector)
         request: dict[str, Any] = {"op": "call", "payload": head, "buffers": buffers}
+        blobs = f"{root}/data/blobs"
+        added = 0
         if collector.placed:
-            blobs = f"{root}/data/blobs"
-            pathdata.send(self, collector, blobs)
+            added = pathdata.send(self, collector, blobs)
             request["data"] = collector.request(blobs)
         self.last_used = time.monotonic()
-        return self.channel.request(request, timeout=timeout)
+        try:
+            return self.channel.request(request, timeout=timeout)
+        finally:
+            if added:
+                pathdata.evict(self, blobs)
 
     # -- content addressed arguments -----------------------------------------
 

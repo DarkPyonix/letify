@@ -264,12 +264,109 @@ def _op_data_have(request):
     """Which file blobs the cache holds with the expected size."""
     held = []
     for digest, size in request["digests"]:
+        path = _data_file(request["dir"], digest)
         try:
-            if os.stat(_data_file(request["dir"], digest)).st_size == size:
+            if os.stat(path).st_size == size:
                 held.append(digest)
+                # Marks it used, so eviction leaves it alone until the call links it.
+                os.utime(path)
         except OSError:
             pass
     return {"ok": True, "value": held}
+
+
+# Spec "Runtime data cache budget".
+_DATA_DEFAULT_BUDGET = 50 << 30
+_DATA_RECENT_S = 600
+
+
+def _data_scan(root):
+    """Committed blobs as (last use, path, size, link count), and their total size."""
+    files = []
+    total = 0
+    if not os.path.isdir(root):
+        return files, total
+    for shard in os.scandir(root):
+        if not shard.is_dir(follow_symlinks=False):
+            continue
+        for entry in os.scandir(shard.path):
+            if ".partial." in entry.name:
+                continue
+            try:
+                info = entry.stat(follow_symlinks=False)
+            except OSError:
+                continue
+            files.append((info.st_mtime, entry.path, info.st_size, info.st_nlink))
+            total += info.st_size
+    return files, total
+
+
+def _data_budget(root, total, budget):
+    if budget is not None:
+        return int(budget)
+    probe = root
+    while probe and not os.path.isdir(probe):
+        parent = os.path.dirname(probe)
+        if parent == probe:
+            break
+        probe = parent
+    try:
+        info = os.statvfs(probe)
+        free = info.f_bavail * info.f_frsize
+    except (OSError, AttributeError):
+        return _DATA_DEFAULT_BUDGET
+    return min(_DATA_DEFAULT_BUDGET, (total + free) // 2)
+
+
+def _op_data_evict(request):
+    """Remove least recently used blobs no call links until the cache is within budget."""
+    started = time.monotonic()
+    root = os.path.expanduser(request["dir"])
+    files, total = _data_scan(root)
+    budget = _data_budget(root, total, request.get("budget"))
+    removed = freed = 0
+    if total > budget:
+        now = time.time()
+        files.sort()
+        for used, path, size, links in files:
+            if total <= budget:
+                break
+            if links > 1 or now - used < _DATA_RECENT_S:
+                continue
+            try:
+                os.remove(path)
+            except OSError:
+                continue
+            total -= size
+            removed += 1
+            freed += size
+    return {"ok": True, "value": {
+        "files": removed, "bytes": freed, "total": total, "budget": budget,
+        "seconds": time.monotonic() - started,
+    }}
+
+
+def _op_data_cache(request):
+    """The cache's blob count, size and budget, after removing unlinked blobs when clearing."""
+    root = os.path.expanduser(request["dir"])
+    files, total = _data_scan(root)
+    removed = freed = 0
+    if request.get("clear"):
+        for _used, path, size, links in files:
+            if links > 1:
+                continue
+            try:
+                os.remove(path)
+            except OSError:
+                continue
+            removed += 1
+            freed += size
+        files, total = _data_scan(root)
+    return {"ok": True, "value": {
+        "files": len(files), "bytes": total,
+        "budget": _data_budget(root, total, request.get("budget")),
+        "removed": removed, "removed_bytes": freed,
+    }}
 
 
 _DATA_OPEN = {}
@@ -355,6 +452,10 @@ def _data_link(data):
     for path, digest in data.get("links", ()):
         os.makedirs(os.path.dirname(path), exist_ok=True)
         source = _data_file(data["blobs"], digest)
+        try:
+            os.utime(source)
+        except OSError:
+            pass
         try:
             os.link(source, path)
         except OSError:
@@ -714,6 +815,8 @@ _OPS = {
     "data_have": _op_data_have,
     "data_put": _op_data_put,
     "data_pull": _op_data_pull,
+    "data_evict": _op_data_evict,
+    "data_cache": _op_data_cache,
     "blob_dir": _op_blob_dir,
     "put_blob": _op_put_blob,
     "put_file": _op_put_file,

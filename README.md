@@ -355,7 +355,7 @@ def train(lr): ...
 
 The runtime pulls the volume straight from the bucket, not through your machine. It uses a short-lived token borrowed from your own login, so no credential is left on the remote side.
 
-Training data needs no declaration at all. Pass a `pathlib.Path`, or read one from a global, and letify sends the files it names as content addressed blobs. The body receives a path on the runtime with the same layout. A persistent machine keeps the blobs on its own disk, so the second session uploads 0 bytes. An ephemeral account with `bucket = "<name>"` uploads each file to the bucket once, and every later runtime downloads it from there.
+Training data needs no declaration at all. Pass a `pathlib.Path`, or read one from a global, and letify sends the files it names as content addressed blobs. The body receives a path on the runtime with the same layout. A persistent machine keeps the blobs on its own disk, so the second session uploads 0 bytes. An ephemeral account with `bucket = "<name>"` uploads each file to the bucket once, and every later runtime downloads it from there. The runtime's copy is kept within a budget, 50 GiB by default or `data_cache_gib` on the account, and `letify cache` shows or clears it.
 
 ```python
 DATA = Path("data/imagenet-subset")

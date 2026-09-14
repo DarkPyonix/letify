@@ -296,3 +296,178 @@ def test_an_ephemeral_account_with_a_bucket_pulls_from_it_and_uploads_once(
     lines = data_lines(capsys.readouterr().err)
     assert "the bucket" in lines[1]
     assert uploaded_files(lines[1]) == 0
+
+
+# -- Spec: Runtime data cache budget -------------------------------------------------
+
+
+def blob_files() -> dict[str, int]:
+    root = Path.home() / ".letify-runtime" / "data" / "blobs"
+    return {p.name: p.stat().st_nlink for p in root.glob("*/*") if ".partial." not in p.name}
+
+
+def age_blobs(seconds: float) -> None:
+    import os
+    import time
+
+    past = time.time() - seconds
+    for path in (Path.home() / ".letify-runtime" / "data" / "blobs").glob("*/*"):
+        os.utime(path, (past, past))
+
+
+def evictions(err: str) -> list[str]:
+    return [line for line in err.splitlines() if line.startswith("letify: data cache evicted ")]
+
+
+def budget_launcher(launcher_from, gib: float):
+    return launcher_from(f'[lab]\nkind = "local"\ndata_cache_gib = {gib}\n')
+
+
+def test_old_blobs_are_evicted_when_a_call_takes_the_cache_over_its_budget(
+    launcher_from, project, capsys
+) -> None:
+    # 20 KiB of budget: two old 16 KiB files and one new one cannot all stay.
+    let = budget_launcher(launcher_from, 20 / (1 << 20))
+
+    @let.function(device=let.providers.lab.CPU, host=letify.remote)
+    def size(path: Path) -> int:
+        return path.stat().st_size
+
+    for name in ("a", "b"):
+        (project / f"{name}.bin").write_bytes(name.encode() * (16 << 10))
+        size(project / f"{name}.bin")
+    assert len(blob_files()) == 2
+    age_blobs(3600)
+    capsys.readouterr()
+    (project / "c.bin").write_bytes(b"c" * (16 << 10))
+    assert size(project / "c.bin") == 16 << 10
+    held = blob_files()
+    assert held == {pathdata.hash_file(project / "c.bin", 16 << 10): 1}
+    lines = evictions(capsys.readouterr().err)
+    assert len(lines) == 1
+    assert "evicted 2 files 0.0 MiB" in lines[0]
+    assert "0.0 GiB" in lines[0]
+
+
+def test_a_call_that_added_nothing_does_not_check_the_budget(
+    launcher_from, project, capsys
+) -> None:
+    let = budget_launcher(launcher_from, 20 / (1 << 20))
+
+    @let.function(device=let.providers.lab.CPU, host=letify.remote)
+    def size(path: Path) -> int:
+        return path.stat().st_size
+
+    for name in ("a", "b"):
+        (project / f"{name}.bin").write_bytes(name.encode() * (16 << 10))
+        size(project / f"{name}.bin")
+    age_blobs(3600)
+    capsys.readouterr()
+    size(project / "a.bin")
+    assert len(blob_files()) == 2
+    assert evictions(capsys.readouterr().err) == []
+
+
+def test_a_linked_or_recent_blob_is_not_evicted(launcher_from, project, tmp_path) -> None:
+    let = budget_launcher(launcher_from, 1 / (1 << 20))
+
+    @let.function(device=let.providers.lab.CPU, host=letify.remote)
+    def size(path: Path) -> int:
+        return path.stat().st_size
+
+    (project / "linked.bin").write_bytes(b"l" * 4096)
+    size(project / "linked.bin")
+    age_blobs(3600)
+    linked = pathdata.hash_file(project / "linked.bin", 4096)
+    # A running call's directory holds a hard link; this one stands in for it.
+    cache_file = Path.home() / ".letify-runtime" / "data" / "blobs" / linked[:2] / linked
+    (tmp_path / "running-call-link").hardlink_to(cache_file)
+    (project / "recent.bin").write_bytes(b"r" * 4096)
+    size(project / "recent.bin")
+    assert set(blob_files()) == {linked, pathdata.hash_file(project / "recent.bin", 4096)}
+
+
+def test_the_default_budget_evicts_nothing_from_a_small_cache(let, cpu, project, capsys) -> None:
+    @let.function(device=cpu, host=letify.remote)
+    def size(path: Path) -> int:
+        return path.stat().st_size
+
+    (project / "a.bin").write_bytes(b"a" * 4096)
+    size(project / "a.bin")
+    age_blobs(3600)
+    (project / "b.bin").write_bytes(b"b" * 4096)
+    size(project / "b.bin")
+    assert len(blob_files()) == 2
+    assert evictions(capsys.readouterr().err) == []
+
+
+# -- Spec: The cache command ---------------------------------------------------------
+
+
+def test_the_cache_command_shows_the_local_runtime_cache(let, cpu, project, capsys) -> None:
+    import json
+
+    from letify.cli import main
+
+    @let.function(device=cpu, host=letify.remote)
+    def size(path: Path) -> int:
+        return path.stat().st_size
+
+    (project / "a.bin").write_bytes(b"a" * 5000)
+    size(project / "a.bin")
+    capsys.readouterr()
+    assert main(["cache", "--json"]) == 0
+    record = json.loads(capsys.readouterr().out)
+    local = next(row for row in record["providers"] if row["alias"] == "local")
+    assert local.get("files") == 1, local
+    assert local["bytes"] == 5000
+    assert local["budget"] > 0
+
+
+def test_cache_clear_empties_a_providers_runtime_cache(let, cpu, project, capsys) -> None:
+    from letify.cli import main
+
+    @let.function(device=cpu, host=letify.remote)
+    def size(path: Path) -> int:
+        return path.stat().st_size
+
+    for name in ("a", "b"):
+        (project / f"{name}.bin").write_bytes(name.encode() * 5000)
+        size(project / f"{name}.bin")
+    capsys.readouterr()
+    assert main(["cache", "clear", "local"]) == 0, capsys.readouterr()
+    assert "local: removed 2 files" in capsys.readouterr().out
+    assert blob_files() == {}
+
+
+def test_digest_cache_entries_for_missing_files_are_pruned(project, capsys) -> None:
+    import json
+
+    from letify.cli import main
+
+    kept = project / "kept.bin"
+    gone = project / "gone.bin"
+    kept.write_bytes(b"k")
+    gone.write_bytes(b"g")
+    cache = pathdata.DigestCache()
+    cache.digest(kept)
+    cache.digest(gone)
+    cache.save()
+    gone.unlink()
+    assert main(["cache", "--json"]) == 0
+    record = json.loads(capsys.readouterr().out)
+    assert record["digests"] == {"entries": 1, "pruned": 1}
+    assert list(pathdata.DigestCache()._entries) == [str(kept)]
+
+
+def test_saving_the_digest_cache_drops_missing_files(project) -> None:
+    kept = project / "kept.bin"
+    gone = project / "gone.bin"
+    kept.write_bytes(b"k")
+    gone.write_bytes(b"g")
+    cache = pathdata.DigestCache()
+    cache.digest(kept)
+    cache.digest(gone)
+    gone.unlink()
+    cache.save()
+    assert list(pathdata.DigestCache()._entries) == [str(kept)]
