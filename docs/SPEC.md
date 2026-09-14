@@ -110,13 +110,13 @@ These follow from the Kaggle Acceptable Use Policy, which forbids tools for circ
 
 - No keep-alive request is ever sent, and accounts are never rotated.
 - The accelerators are `CPU`, `P100`, `T4` and `TPU_V3_8`, a fixed list read without a network call.
-- Batch runs through `kaggle kernels push` are not implemented.
+- An account with a registered `jupyter_url` runs on that session. An account without one runs in batch mode.
 
 #### Kaggle Jupyter Server session <!-- id: kaggle-session -->
 
 > A declared function runs on the Kaggle Jupyter Server session the user started, through the URL registered with `--connect`, one program per request over a one-shot channel.
 
-The user starts the session in the Kaggle editor with Run, Kaggle Jupyter Server, choosing the accelerator there, and registers its Colab Compatible URL. letify never starts, extends or stops that session, so `create_session` does nothing and `needs_lease` is false. An account with no `jupyter_url` raises `ConfigError` naming `letify login kaggle <alias> --connect <URL>` when a session would start.
+The user starts the session in the Kaggle editor with Run, Kaggle Jupyter Server, choosing the accelerator there, and registers its Colab Compatible URL. letify never starts, extends or stops that session, so `create_session` does nothing and `needs_lease` is false.
 
 The URL is split into the server base, the URL without its query string, and the token, the `token` query parameter when present. Every REST request goes to `<base>/api/...` with `token=<token>` in the query and `Authorization: token <token>`, through the standard library HTTP client. The full URL and the token never appear in a message, a log or a command line; a message names only the host.
 
@@ -127,6 +127,19 @@ The URL is split into the server base, the URL without its query string, and the
 5. **Environment.** The session builds the environment like any other runtime: uv is installed, and `uv sync` runs with this process's Python minor version, so the interpreter check compares like with like. The default workspace root is `/kaggle/working/letify`.
 
 No request is sent to keep the session alive. A session that Kaggle ends for being idle stays ended.
+
+#### Kaggle batch mode <!-- id: kaggle-batch -->
+
+> An account with no registered session runs each declared call as one Kaggle script kernel: one `kaggle kernels push` with a hard `--timeout`, status reads until it finishes, and one `kaggle kernels output`.
+
+Every command runs through `uv tool run --from kaggle kaggle` with the environment Logging in describes, in a temporary directory.
+
+1. **One push per call.** The batch channel holds back each program that returns no value, such as workspace preparation, and sends it with the next program that returns one, so a call is one push. A batch runtime builds no environment: `prepares_env` is false, the Kaggle image's own Python and packages are used, and the interpreter check is skipped. cloudpickle ships a function defined in `__main__` as bytecode, so that function needs the Kaggle image's Python minor version. File transfer, `put_file`, `get_file` and `pack_dir`, raises `UnsupportedMode` in batch mode, because a pushed script has no file API.
+2. **The kernel.** The directory holds `script.py` and `kernel-metadata.json` with `id` `<username>/<slug>`, `title` equal to the slug, `code_file` `script.py`, `language` `python`, `kernel_type` `script`, `is_private` true, `enable_internet` true, and `enable_gpu` and `enable_tpu` false. The slug is `letify-` followed by the runtime name lowercased, with every character other than a letter, digit or dash replaced by a dash. The username is `username` from `kaggle.json`, or else the `- username: <name>` line of `kaggle config view`, read once per provider.
+3. **Accelerator and timeout.** `kaggle kernels push -p <dir> --timeout <seconds>` carries `--accelerator NvidiaTeslaT4` for `T4`, `NvidiaTeslaP100` for `P100` and `Tpu1VmV38` for `TPU_V3_8`, and no flag for `CPU`. The timeout is the account's `batch_timeout` in seconds, 1800 when unset, or the call's own timeout when that is smaller.
+4. **Waiting.** `kaggle kernels status <id>` is read every 30 seconds. The quoted value after `has status` is compared without case: a value containing `complete` finishes the wait, one containing `error` or `cancel` raises `RuntimeFailure` with the `Failure message` line and the kernel log, and any other value keeps waiting. When the timeout plus 300 seconds has passed, `RuntimeFailure` is raised. letify never pushes the same call again and never pushes to keep an accelerator.
+5. **Output.** `kaggle kernels output <id> -p <dir> -o -q` downloads `<slug>.log`. The log is a JSON list of entries with `stream_name` and `data`. The program's standard output is the concatenated `data` of the `stdout` entries, and a log that is not JSON is used as it is.
+6. **Failure.** A push, status or output command that exits non zero raises `RuntimeFailure` naming the command, with the account's secrets replaced by `***`.
 
 #### Recording devices at login for Kaggle <!-- id: kaggle-login-devices -->
 
