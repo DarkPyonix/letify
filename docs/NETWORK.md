@@ -113,6 +113,49 @@ There is nothing to tunnel to and no device to forward calls at, so `Modal.has_f
 
 The local path is a pipe to the Modal adapter, a process letify starts with `uv run --no-project --with "modal>=1.0,<2"`. Modal's client inside it reaches Modal's API over HTTPS. Every worker request crosses that adapter twice, once as a `write` and once as a `read_until`, as spec "Modal adapter" describes. The round trip of that path has not been measured.
 
+## Call protocol throughput <!-- id: call-protocol-throughput -->
+
+> Binary frames move a large argument or result at the link's speed over direct SSH, and at 500 to 860 MiB/s through a local pipe. Measured on 2026-09-14.
+
+Base64 line framing cost more than the link. On the department server, an Intel Xeon E5-2650 v4, decoding base64 took about 2.3 s of CPU per 64 MiB, against 1.1 s on the wire. The frames of spec [Frames](SPEC.md#frames) carry pickle protocol 5 out-of-band buffers with no encoding, fill a received `bytes` value in place, and use 1 MiB pipes.
+
+Local pipe, client and `Local` worker on one Linux machine, Python 3.13, best of two:
+
+| Measurement | Base64 lines | Binary frames |
+|---|---|---|
+| Empty call round trip, median | 0.74 ms | 0.93 ms |
+| 64 MiB argument | 23 MiB/s | 488 MiB/s |
+| 64 MiB result | 46 MiB/s | 453 MiB/s |
+| 512 MiB argument | 27 MiB/s | 859 MiB/s |
+| 512 MiB result | 46 MiB/s | 525 MiB/s |
+| Worker peak memory, 512 MiB argument | 3699 MiB | 1691 MiB |
+| Call writing 1 MiB to stderr | hangs | completes |
+
+`dept_gpu`, a `Shell` account over direct SSH from a university network in Daejeon to a server with a Tesla P100, one reused session. The raw SSH figures pipe the same sizes through `cat` with no letify involved, measured the same hour:
+
+| Measurement | Base64 lines | Binary frames | Raw SSH |
+|---|---|---|---|
+| Command round trip | | | 48 ms |
+| Empty call round trip, median | 1.1 ms | 1.2 ms | |
+| 64 MiB argument, first send | 14.8 MiB/s | 70.4 MiB/s | 82 to 90 MiB/s |
+| 64 MiB argument, repeated | | from the blob table, under 1 ms | |
+| 64 MiB result, `os.urandom` on the server included | 34.0 MiB/s | 75.4 MiB/s | 93 to 94 MiB/s |
+| 256 MiB, steady | | | 106 MiB/s up, 90 to 94 MiB/s down |
+
+A first send of a 64 MiB argument costs three round trips on top of the bytes: `have`, `put_blob` and the call. At 35 to 48 ms each that is most of the gap to raw SSH.
+
+`lab_docker`, a Tunnel account reached over Tailcat, whose link measured 69 ms and about 2 MiB/s when this was written:
+
+| Measurement | Base64 lines | Raw SSH through Tailcat |
+|---|---|---|
+| Session start, environment build included | 42.65 s | |
+| Command round trip over a reused connection | | 436 ms |
+| Empty call round trip, median | 70.0 ms | |
+| 64 MiB argument | 1.3 MiB/s | 2.01 MiB/s |
+| 64 MiB result | 1.9 MiB/s | 2.59 MiB/s |
+
+Base64 lines reached 65% of raw SSH on the argument here, where the link rather than the CPU is the limit, and the 1.78 times inflation of base64 accounts for the rest. Binary frames on `lab_docker` were not measured: its one card was running someone else's training throughout, and letify does not start a session on a busy card.
+
 ## Connection pipeline measurements
 
 > The evidence for the strategy order and the rules in the spec's Transport section. Measured on 2026-09-13.

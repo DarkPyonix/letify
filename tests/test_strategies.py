@@ -197,6 +197,9 @@ def test_ssh_through_a_proxy_records_the_key_quietly_and_refuses_a_changed_one(
             assert result.returncode == 0, result.stderr
             assert "Failed to add" not in result.stderr
     finally:
+        # A shared connection outlives the command, and a new host key must meet a new
+        # connection, so the master verified against the first key is stopped here.
+        subprocess.run([*command[:-2], "-O", "exit", command[-2]], capture_output=True, timeout=30)
         server.kill()
         server.wait()
     known = tmp_path / ".letify" / "accounts" / "lab" / "known_hosts"

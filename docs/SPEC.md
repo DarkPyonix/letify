@@ -243,15 +243,65 @@ Decoding fails at any useful latency. A decode step for 4-bit weights on an RTX 
 
 > A channel is how letify talks to a runtime, and which kind a provider offers decides what letify can do there.
 
-A **persistent channel** keeps one worker process alive behind a pipe. Requests are framed lines, so the worker process with its session cache, the blob table and anything written to disk all survive between calls.
+A **persistent channel** keeps one worker process alive behind a pipe pair. Messages are binary frames, so the worker process with its session cache, the blob table and anything written to disk all survive between calls.
 
 A **one-shot channel** can only run a command and collect its output. Every call starts a fresh process, so nothing persists. It exists because some transports offer nothing more, and it refuses the operations that need persistence rather than pretending.
 
-Both hand back the user's own stdout separately from the outcome, because they share one stream.
+The worker source cannot be sent on standard input as a script, because `python -` reads to end of file before compiling anything and the pipe has to stay open for requests. A small bootstrap stub passed with `-c` reads one line holding a decimal byte count from `sys.stdin.buffer`, reads that many bytes of UTF-8 worker source, executes them, and leaves standard input where it was. From then on both pipes carry frames only.
 
-The worker source cannot be sent on standard input as a script, because `python -` reads to end of file before compiling anything and the pipe has to stay open for requests. A small bootstrap stub passed with `-c` reads a length-prefixed base64 blob, executes it, and leaves standard input where it was.
+### Frames <!-- id: frames -->
 
-The worker announces itself with one line, `__LETIFY_WORKER_READY__ <major>.<minor>`, naming the version of the interpreter it runs on. A worker asked to move to another interpreter replies, then replaces its process with `os.execv(<interpreter>, [<interpreter>, "-u", "-c", <bootstrap stub>])` on the same pipes, and the channel sends the worker source again and waits for the new ready line.
+> Every message on a persistent channel is a sequence of binary frames with a 16 byte header. Nothing is base64 encoded and no pipe is opened in text mode.
+
+A frame is a header followed by `length` payload bytes. The header is `struct.Struct("<2sBBIQ")`:
+
+| Field | Size | Value |
+|---|---|---|
+| magic | 2 bytes | `b"LF"`. Any other value is a `ProtocolError` |
+| type | 1 byte | the frame type below |
+| flags | 1 byte | 0, reserved |
+| stream | 4 bytes | the stream id, unsigned, little endian |
+| length | 8 bytes | payload bytes that follow, unsigned, little endian |
+
+| Type | Name | Direction | Payload |
+|---|---|---|---|
+| 1 | `HELLO` | worker to client | the interpreter's `<major>.<minor>` in ASCII |
+| 2 | `REQUEST` | client to worker | a message head |
+| 3 | `REPLY` | worker to client | a message head |
+| 4 | `DATA` | both | the next bytes of the out-of-band buffers of the message open on `stream` |
+| 5 | `STDOUT` | worker to client | raw bytes the worker wrote to file descriptor 1 |
+| 6 | `STDERR` | worker to client | raw bytes the worker wrote to file descriptor 2 |
+| 7 | `SHUTDOWN` | client to worker | empty. The worker exits |
+
+Streams multiplex the one pipe pair. Stream 0 carries `HELLO`, `STDOUT`, `STDERR` and `SHUTDOWN`. Each request takes the next odd stream id from 1 upward, and its `REQUEST`, its `REPLY` and the `DATA` frames of both use that id.
+
+A message is one Python object. It is pickled with protocol 5 and a `buffer_callback`, so every `PickleBuffer` inside it, such as a `bytearray`, a `bytes` value of 1 MiB or more at the top level or inside a list, tuple or dict, or a NumPy array, becomes an out-of-band buffer instead of being copied into the pickle. The head frame's payload is `<I>` buffer count, `<Q>` length of each buffer, then the pickle. The buffers follow in order as `DATA` frames of at most 8 MiB each. The sender writes each frame with `os.write` on a `memoryview` of the buffer, so no joined copy is made. The receiver preallocates one buffer per out-of-band buffer and fills it with `readinto`, then unpickles with `buffers=`. The high bit of a buffer's 8 byte length marks a buffer that unpickles as a `bytes` value. For such a buffer the receiver allocates an uninitialized `bytes` object of that length with `PyBytes_FromStringAndSize(NULL, n)` through `ctypes` and reads into it, so the unpickled value is that object and no copy is made. Where `ctypes` is unavailable it reads into a `bytearray` and `bytes()` copies it once. Any other buffer is read into a `bytearray`. Peak memory for a `bytes` value is therefore one copy on each side.
+
+On Linux both ends set every pipe they frame over to 1 MiB with `fcntl(F_SETPIPE_SZ)`, capped at `/proc/sys/fs/pipe-max-size`, so an 8 MiB chunk crosses in 8 writes instead of 128. A descriptor that is not a pipe, or a system that refuses, keeps its size.
+
+Frames of different streams interleave. A writer holds the write lock for one frame at a time, so a `stat` or `lease` request is sent between two 8 MiB chunks of a large upload, and a reply is not delayed behind another stream's data.
+
+The worker announces itself with a `HELLO` frame naming the version of the interpreter it runs on. A worker asked to move to another interpreter replies, then replaces its process with `os.execv(<interpreter>, [<interpreter>, "-u", "-c", <bootstrap stub>])` on the same pipes, and the channel sends the worker source again and waits for the new `HELLO`. No other request is sent between the `reexec` request and that `HELLO`.
+
+### Worker output <!-- id: worker-output -->
+
+> The worker's standard output and standard error are streamed to the client as they are written, and written live to the client's own standard output and standard error.
+
+Before it sends `HELLO`, the worker duplicates the pipe it was started on to a private descriptor for frames, and points file descriptors 1 and 2 at two new pipes with `os.dup2`. One thread per pipe reads up to 64 KiB at a time and sends each read as a `STDOUT` or `STDERR` frame. So `print`, `sys.stderr`, `logging`, warnings, tracebacks and output from C extensions all arrive the same way, and a `\r` progress bar arrives as the bytes it wrote.
+
+The client writes each `STDOUT` payload to its own `sys.stdout` and each `STDERR` payload to its own `sys.stderr` as it arrives, while the call is still running. `Launcher(stream_logs=False)` turns that off. The client keeps at most the last 64 KiB of output per request, which is what `Channel.request` returns as its logs and what a `ProtocolError` quotes when the worker dies. No output is held until a call returns.
+
+The client reads the process's own standard error, where SSH and the bootstrap stub report failures, on a thread that keeps the last 64 KiB. No pipe is left unread, so no amount of output can block the worker.
+
+Nothing in this path runs per training step. A `print` inside a loop costs one pipe write in the worker, and the loop does not wait for the client.
+
+### Waiting for a reply <!-- id: waiting-for-a-reply -->
+
+> Requests on one persistent channel may overlap. There is no lock across a whole call.
+
+Any number of threads may send requests on one channel. Whichever waiting thread holds the read lock reads the next frame and hands it to the request it belongs to, so a `stat` or a lease renewal sent while a call runs gets its reply while the call is still running. On the worker, `stat` and `lease` are answered by the thread that reads frames. Every other request is queued and run in order on the worker's main thread, so user code runs on the main thread.
+
+A request that passes its timeout kills the worker process, which ends every read, and raises `RuntimeFailure`. A worker that closes its pipe fails every open request with `ProtocolError` quoting the last output.
 
 The worker never installs anything into the interpreter it starts on. Everything it runs before it moves to the project interpreter uses only the standard library: the ready line, workspace preparation, the environment build and the move itself. The worker imports cloudpickle only when it loads a call, so a system Python that lacks cloudpickle and refuses `pip install`, as an externally managed Python under PEP 668 does, still starts the worker. blake3 and letify are likewise imported only after the move, and blake3 falls back to blake2b where it is absent.
 
@@ -275,7 +325,7 @@ The protocol is one JSON object per line. letify sends `{"id": <int>, "op": <nam
 |---|---|---|
 | `hello` | none | `{"modal": <installed Modal version>}` |
 | `create` | `app`, `args`, `packages`, `gpu`, `timeout` | `{"sandbox": <id>}`. Runs `app` as an ephemeral app on first use, builds `debian_slim` with `packages` installed, and starts `args` in a sandbox |
-| `write` | `sandbox`, `data` | `null`. Writes the text to the sandbox's standard input and drains it |
+| `write` | `sandbox`, `data` | `null`. `data` is base64. Writes the decoded bytes to the sandbox's standard input and drains it |
 | `read_until` | `sandbox`, `prefixes` | `{"lines": [...], "eof": <bool>}`. The sandbox's stdout lines up to and including the first that starts with one of `prefixes`, or every line left when the stream ends |
 | `terminate` | `sandbox` | `null` |
 | `volume_put` | `volume`, `version`, `path`, `data` | `null`. `data` is base64 |
@@ -285,7 +335,7 @@ The protocol is one JSON object per line. letify sends `{"id": <int>, "op": <nam
 
 Every volume op creates the volume when it is missing, as version `version`.
 
-The persistent channel to a sandbox is that sandbox's standard input and output, carried by `write` and `read_until`. The sandbox runs the bootstrap stub `python3 -u -c BOOTSTRAP`, and the worker source goes out first as the length-prefixed base64 blob described above. A `read_until` that ends at end of stream without a reply raises `ProtocolError`.
+The persistent channel to a sandbox is that sandbox's standard input and output, carried by `write` and `read_until`. The sandbox runs the bootstrap stub `python3 -u -c BOOTSTRAP`, and the worker source goes out first as the byte count line and source described above. Modal returns a sandbox's standard output as text, so the source the channel sends sets `_LETIFY_TEXT_FRAMES = True` after the frame code, and that worker writes each frame as one line holding the base64 of the frame's bytes. The channel reads those lines with `read_until` and `prefixes` `[""]`, one line per request, and decodes them back into frames. Frames sent to the sandbox are raw bytes, base64 encoded only inside the `write` request. A `read_until` that ends at end of stream without a reply raises `ProtocolError`.
 
 A missing uv raises `ProviderUnavailable` naming uv. A reply of kind `unavailable` raises `ProviderUnavailable` for `modal`. An adapter process that exits, or prints a line that is not the reply it was waiting for, raises `RuntimeFailure` carrying the adapter's standard error, because that is an infrastructure failure. A reply of kind `failure` raises `RuntimeFailure` with the adapter's message. One adapter process serves one provider or one backend and exits when its standard input closes.
 
@@ -295,9 +345,11 @@ The adapter never deploys an app. `create` starts `modal.App(app).run()` the fir
 
 > A call is a serialized function plus arguments, and the outcome comes back on the same channel.
 
-The local side pickles `(function, args, kwargs)` with cloudpickle and sends it as a framed request. Framing is one base64 line per message, which survives an SSH channel, a WebSocket bridge and a plain pipe without any of them mangling it.
+The local side pickles `(function, args, kwargs)` with cloudpickle, protocol 5 and a `buffer_callback`, and sends `{"op": "call", "payload": <pickle>, "buffers": [<out-of-band buffers>]}` as one message in [frames](#frames). The outcome comes back as the message `{"ok": True, "value": <value>}` or `{"ok": False, "error": <text>, "traceback": <text>}`, so a large returned value travels as out-of-band buffers too.
 
-On a one-shot channel the call travels inside a driver script that prints its outcome between `__LETIFY_RESULT_BEGIN__` and `__LETIFY_RESULT_END__`, so it can be found in a stream that also carries the user's prints. Absence of the marker is not a protocol quirk: it means the remote process died, and letify reports that as `ProtocolError` naming the likely causes.
+Base64 appears only where a transport carries text: the one-shot driver, the Colab contents API, and the JSON lines of the Modal adapter.
+
+On a one-shot channel the call travels inside a driver script that prints its base64 encoded outcome between `__LETIFY_RESULT_BEGIN__` and `__LETIFY_RESULT_END__`, so it can be found in a stream that also carries the user's prints. Absence of the marker is not a protocol quirk: it means the remote process died, and letify reports that as `ProtocolError` naming the likely causes.
 
 An `async def` body is awaited on the remote side, so it runs to completion there and can use `await` internally.
 
@@ -330,9 +382,13 @@ A returned value always comes back to the caller. There is no declaration argume
 
 > Large arguments are named by the hash of their contents, so the same value travels once.
 
-An argument above 64 KB is pickled and hashed, the runtime is asked which digests it already holds, and only the rest is sent. A later call carrying the same value sends a `Blob` reference instead of the bytes.
+A top-level argument whose serialized size is 64 KiB or more is replaced by a `Blob` reference. The runtime is asked which digests it already holds, and only the rest is sent with `put_blob`. A later call carrying the same value sends the reference instead of the bytes.
 
-Hashing is not a bottleneck at any link speed involved: blake3 runs at gigabytes per second where a home uplink runs at megabytes per second. blake2b from the standard library is the fallback.
+A `bytes` argument is hashed as it is. Any other argument is pickled with protocol 5 and a `buffer_callback`, and the digest is taken over the pickle and then each out-of-band buffer in order, with no joined copy. The digest is blake3 with 16 byte output, or blake2b from the standard library where blake3 is missing.
+
+The digest of an immutable argument is cached on the `Runtime` for the life of the session, so a repeated argument is not hashed again. Immutable means a `bytes` object, or an object that supports weak references and exposes a read-only buffer, such as a NumPy array with `writeable` set to `False`. A `bytes` entry holds a reference to its object so its id cannot be reused, and at most 16 such entries are kept, least recently used first out. Any other argument is pickled and hashed on every call, because it may have changed.
+
+The worker keeps the unpickled value of an immutable blob, so a repeated argument is not unpickled again either. For any other blob it keeps the pickle and the buffers, and unpickles a fresh copy for each call, so a call that mutates its argument does not change what the next call receives.
 
 ### Failure and retry
 
@@ -886,7 +942,16 @@ So `letify login shell` sets up key authentication and treats the password as a 
 4. The connection is confirmed with `BatchMode=yes`, which proves the key works before the alias is declared rather than at the first call.
 5. The machine's GPUs are detected over that confirmed connection, as described under Recording devices at login.
 
-Two other approaches were considered and are not the default. Connection multiplexing with `ControlMaster` authenticates once and reuses the socket, but Windows OpenSSH does not implement it and a dropped socket ends a long run. `sshpass` feeds a stored password to each connection, which needs the password kept somewhere and exposes it in the process arguments of every call. `sshpass` is available as `auth = "password"` for a machine whose administrator forbids key authentication, reading the password from `~/.letify/accounts/<alias>/password`, and it refuses on Windows, where the tool does not exist.
+Every SSH command letify builds also carries `-o ControlMaster=auto`, `-o ControlPersist=60` and `-o ControlPath=<control directory>/<tag>-%C`, so the worker channel, the busy card check and every later command to the same machine share one authenticated connection, instead of paying about 0.24 s for a new one each. On Windows, where OpenSSH does not implement connection multiplexing, the three options are left out and each command opens its own connection.
+
+Control sockets live in a short per-user directory, not under the home directory, because a Unix domain socket path is limited to 108 bytes on Linux and 104 bytes on macOS, including the terminating byte:
+
+- The control directory is `$XDG_RUNTIME_DIR/letify` when `XDG_RUNTIME_DIR` is set, and `/tmp/letify-<uid>` otherwise. It is created with mode 0700.
+- Before use, the directory is checked with `lstat`: it must be a directory, not a symbolic link, owned by the current user, and have no group or other permission bits. Any other state raises `ConfigError` and no SSH command is built.
+- `<tag>` is the first 8 hex digits of the SHA-256 of the account alias, so accounts that reach the same machine keep separate connections. `%C` expands to 40 hex digits.
+- The length checked is the path with `%C` expanded, plus the 17 bytes OpenSSH appends to name the temporary socket while it binds. If that reaches the platform limit, the three options are left out for that command and it opens its own connection. Every command also carries `-o Ciphers=^aes128-gcm@openssh.com,chacha20-poly1305@openssh.com`, which puts those two ciphers first in the client's default list, so a server that offers neither still connects. Compression stays off.
+
+One other approach is not the default. `sshpass` feeds a stored password to each connection, which needs the password kept somewhere and exposes it in the process arguments of every call. `sshpass` is available as `auth = "password"` for a machine whose administrator forbids key authentication, reading the password from `~/.letify/accounts/<alias>/password`, and it refuses on Windows, where the tool does not exist.
 
 ### What each kind asks for
 

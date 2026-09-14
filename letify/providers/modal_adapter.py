@@ -153,7 +153,7 @@ class Adapter:
 
     def op_write(self, request: dict[str, Any]) -> Any:
         stream = self._stream(request)
-        stream.sandbox.stdin.write(str(request["data"]).encode())
+        stream.sandbox.stdin.write(base64.b64decode(str(request["data"])))
         stream.sandbox.stdin.drain()
         return None
 
