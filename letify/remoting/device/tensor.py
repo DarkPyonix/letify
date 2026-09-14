@@ -314,8 +314,21 @@ _SHAPES: dict[tuple, int] = {}
 _CACHE: dict[tuple, Plan] = {}
 _CACHE_LIMIT = 1 << 16
 
-#: The printable overload name of each operator, and whether its float scalars key metadata.
-_NAMES: dict[Any, tuple[str, bool]] = {}
+#: The printable overload name of each operator, whether its float scalars key metadata, and
+#: whether its argument storage offsets do.
+_NAMES: dict[Any, tuple[str, bool, bool]] = {}
+
+
+def _aliases(func: Any) -> bool:
+    """Whether any return of the operator's schema may alias an argument.
+
+    An operator whose returns carry no alias information returns new tensors, so the
+    storage offsets of its arguments do not change its output metadata.
+    """
+    try:
+        return any(ret.alias_info is not None for ret in func._schema.returns)
+    except AttributeError:  # pragma: no cover - an operator without a schema, or an old PyTorch
+        return True
 
 _NEW = 0
 _IN = 1
@@ -341,12 +354,13 @@ REPLAY: list[Client | None] = [None]
 _LITERAL_TYPES = (bool, str, torch.device, torch.dtype, torch.memory_format, torch.layout)
 
 
-def reader(args: tuple, kwargs: dict, floats_keyed: bool) -> Any:
+def reader(args: tuple, kwargs: dict, floats_keyed: bool, offsets_keyed: bool = True) -> Any:
     """A generated function checking arguments against these ones, per spec "Step capture".
 
     It returns ``(tensors, scalars, key tail)`` for arguments with the same structure and
-    None otherwise. ``reader`` itself returns None when an argument has no exact check, such
-    as a plain CPU or meta tensor.
+    None otherwise. The key tail holds the offsets only when ``offsets_keyed``, as
+    ``dispatch`` builds the metadata key. ``reader`` itself returns None when an argument
+    has no exact check, such as a plain CPU or meta tensor.
     """
     lines = ["def read(a, k):"]
     constants: dict[str, Any] = {"RT": RemoteTensor}
@@ -407,7 +421,7 @@ def reader(args: tuple, kwargs: dict, floats_keyed: bool) -> Any:
     for key, value in kwargs.items():
         if not emit(f"k[{key!r}]", value):
             return None
-    tail = [f"{var}._sig[2]" for var in tensors] + keyed
+    tail = ([f"{var}._sig[2]" for var in tensors] if offsets_keyed else []) + keyed
 
     def pack(names: list[str]) -> str:
         return "(" + "".join(f"{item}, " for item in names) + ")"
@@ -454,8 +468,8 @@ def dispatch(func: Any, args: tuple, kwargs: dict, client: Client | None) -> Any
     named = _NAMES.get(func)
     if named is None:
         name = str(func)
-        named = _NAMES[func] = (name, "_foreach_" not in name)
-    name, floats_keyed = named
+        named = _NAMES[func] = (name, "_foreach_" not in name, _aliases(func))
+    name, floats_keyed, offsets_keyed = named
 
     if func is _SCALAR and type(args[0]) is RemoteTensor:
         return args[0]._ref.client.read_value(args[0])
@@ -485,6 +499,8 @@ def dispatch(func: Any, args: tuple, kwargs: dict, client: Client | None) -> Any
             return func(*args, **kwargs)
         client = tensors[0]._ref.client
     structure = tuple(parts)
+    if not offsets_keyed:
+        box = []
     if floats_keyed:
         key = (structure, *box, *scalars)
     else:

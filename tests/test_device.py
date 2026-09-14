@@ -107,6 +107,29 @@ def test_a_repeated_operator_reuses_its_inferred_metadata(client) -> None:
     assert torch.equal(second.cpu(), torch.full((8, 4), 2.0))
 
 
+def test_an_operator_returning_new_tensors_reuses_metadata_at_a_new_storage_offset(client) -> None:
+    data = torch.arange(48.0).reshape(12, 4).cuda()
+    weight = torch.ones(3, 4, device="cuda")
+    first = torch.mm(data[0:4], weight.t())
+    before = client.stats.cached
+    second = torch.mm(data[4:8], weight.t())
+    # slice is a view and is inferred again; t and mm come from the cache.
+    assert client.stats.cached == before + 2
+    assert second.shape == first.shape and second.stride() == first.stride()
+    assert second.storage_offset() == 0
+    expected = torch.arange(16.0, 32.0).reshape(4, 4).sum(dim=1, keepdim=True).expand(4, 3)
+    assert torch.equal(second.cpu(), expected)
+
+
+def test_a_view_at_a_new_storage_offset_reports_its_own_offset(client) -> None:
+    data = torch.arange(48.0).reshape(12, 4).cuda()
+    first = data[0:4].t()
+    second = data[4:8].t()
+    assert first.storage_offset() == 0
+    assert second.storage_offset() == 16
+    assert torch.equal(second.cpu(), torch.arange(16.0, 32.0).reshape(4, 4).t())
+
+
 def test_an_in_place_operator_served_from_the_cache_returns_its_input(client) -> None:
     a = torch.zeros(3, device="cuda")
     first = a.add_(1.0)
