@@ -759,3 +759,27 @@ def test_the_host_key_is_forgotten_for_an_alias_with_capitals(account) -> None:
     text = known.read_text(encoding="utf-8")
     assert "letify-brewbrew" not in text
     assert "other-host" in text
+
+
+def test_a_hashed_host_key_entry_for_the_alias_is_forgotten(account) -> None:
+    # Ubuntu's ssh_config sets HashKnownHosts yes, so the live entry was |1|salt|hash.
+    import base64
+    import hashlib
+    import hmac
+    import os as _os
+
+    salt = _os.urandom(20)
+    digest = hmac.new(salt, b"letify-brewbrew", hashlib.sha1).digest()
+    hashed = f"|1|{base64.b64encode(salt).decode()}|{base64.b64encode(digest).decode()}"
+    provider = account(alias="BrewBrew")
+    known = account_directory("BrewBrew") / "known_hosts"
+    known.parent.mkdir(parents=True, exist_ok=True)
+    known.write_text(
+        f"{hashed} ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOldOldOld\n"
+        "other-host ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIKeepKeepKeep\n",
+        encoding="utf-8",
+    )
+    provider.create_session(Instance(provider, gpu="A100"), "letify-a100-1")
+    text = known.read_text(encoding="utf-8")
+    assert hashed not in text
+    assert "other-host" in text

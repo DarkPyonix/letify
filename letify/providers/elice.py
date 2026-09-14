@@ -923,11 +923,25 @@ class Elice(Shell):
         # ssh records host names lower cased, so an alias with capitals is matched that way.
         name = f"letify-{self.alias}".lower()
 
-        def names(line: str) -> list[str]:
-            field = line.split(" ", 1)[0].lower()
-            return [part.strip("[]").split("]:")[0] for part in field.split(",")]
+        def recorded_for_alias(line: str) -> bool:
+            field = line.split(" ", 1)[0]
+            if field.startswith("|1|"):
+                # HashKnownHosts: |1|base64 salt|base64 HMAC-SHA1(salt, host name).
+                import base64
+                import hashlib
+                import hmac
 
-        kept = [line for line in lines if name not in names(line)]
+                try:
+                    _, _, salt, mac = field.split("|", 3)
+                    expected = base64.b64decode(mac)
+                    actual = hmac.new(base64.b64decode(salt), name.encode(), hashlib.sha1)
+                except (ValueError, TypeError):
+                    return False
+                return hmac.compare_digest(actual.digest(), expected)
+            hosts = [part.strip("[]").split("]:")[0] for part in field.lower().split(",")]
+            return name in hosts
+
+        kept = [line for line in lines if not recorded_for_alias(line)]
         if len(kept) != len(lines):
             known.write_text("".join(kept), encoding="utf-8")
         self.close_link()
