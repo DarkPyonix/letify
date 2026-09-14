@@ -402,7 +402,9 @@ Nothing in this path runs per training step. A `print` inside a loop costs one p
 
 Any number of threads may send requests on one channel. Whichever waiting thread holds the read lock reads the next frame and hands it to the request it belongs to, so a `stat` or a lease renewal sent while a call runs gets its reply while the call is still running. On the worker, `stat` and `lease` are answered by the thread that reads frames. Every other request is queued and run in order on the worker's main thread, so user code runs on the main thread.
 
-A request that passes its timeout kills the worker process, which ends every read, and raises `RuntimeFailure`. A worker that closes its pipe fails every open request with `ProtocolError` quoting the last output.
+A request that passes its timeout kills the worker process, which ends every read, and raises `RuntimeFailure`.
+
+A body may fork, as `multiprocessing` and a `DataLoader` with `num_workers > 0` do. The thread that reads frames may hold the lock of `sys.stdin` at the fork, so every process forked from the worker replaces `sys.stdin` with `/dev/null` before anything else runs in it, and a child that closes `sys.stdin`, as `multiprocessing` does, never waits for that lock. On Linux each process forked from the worker asks for `SIGKILL` when the worker's main thread exits (`prctl(PR_SET_PDEATHSIG)`), so a worker killed by a timeout or closed with its session takes its forked children with it. A worker that closes its pipe fails every open request with `ProtocolError` quoting the last output.
 
 The worker never installs anything into the interpreter it starts on. Everything it runs before it moves to the project interpreter uses only the standard library: the ready line, workspace preparation, the environment build and the move itself. The worker imports cloudpickle only when it loads a call, so a system Python that lacks cloudpickle and refuses `pip install`, as an externally managed Python under PEP 668 does, still starts the worker. blake3 and letify are likewise imported only after the move, and blake3 falls back to blake2b where it is absent.
 
@@ -1176,6 +1178,20 @@ A plain CPU tensor passed to an operator travels with it as a buffer and is a CP
 
 When the meta operator raises, the operator is sent at once and executed on the runtime, and the reply carries its output metadata. That covers data-dependent shapes such as `nonzero` and `masked_select`, and reports a genuine error with the runtime's own message.
 
+### Kernel selection <!-- id: forwarding-kernel-selection -->
+
+> `batch_norm` and `scaled_dot_product_attention` on a `RemoteTensor` run the kernel the runtime's own CUDA dispatch chooses, not the one a meta tensor chooses.
+
+PyTorch picks the kernel for these two functions from the device when it dispatches. A meta tensor gets `native_batch_norm` and math attention. A CUDA tensor gets cuDNN batch norm, and flash, memory-efficient or cuDNN attention depending on shape, dtype and card. Those kernels give different values and use different memory.
+
+When the executor's hello reports a CUDA device, the `TorchFunctionMode` of [Mapping cuda](#mapping-cuda) asks the executor which backend applies, with a `letify.kernel` request, once per distinct signature, and caches the answer in the client. A signature is the function and, for every tensor argument, its shape, strides, dtype and whether it is None, plus `training` and `eps` for batch norm and `dropout_p`, `is_causal`, `scale` and `enable_gqa` for attention. The executor answers by calling `torch._C._select_batch_norm_backend` or `torch._fused_sdp_choice` on empty tensors of that signature on its own device. A PyTorch without the selector answers `Native` or `MATH`.
+
+Attention with `enable_gqa`, and flash attention for a head dimension that is not a multiple of 8, keep the ordinary path, because PyTorch reshapes or pads those before its fused kernel.
+
+The mode then calls the chosen ATen operator directly: `aten.cudnn_batch_norm` for `Cudnn`, and `aten._scaled_dot_product_flash_attention`, `aten._scaled_dot_product_efficient_attention` or `aten._scaled_dot_product_cudnn_attention` for the attention backends. Each of them has a meta kernel that infers its outputs and an autograd formula that records its backward, so it is dispatched and forwarded like any other operator. The function returns the operator's first output, the normalized or attended tensor, and `cudnn_batch_norm` updates the running statistics in place as `batch_norm` does.
+
+The ordinary path applies when the executor's device is CPU, when the runtime answers `Native` or math attention, or when an argument is not a `RemoteTensor`.
+
 ### Mapping cuda <!-- id: mapping-cuda -->
 
 > Code written with `"cuda"`, `.cuda()` and `torch.cuda.is_available()` runs unchanged under `host="local"`.
@@ -1206,7 +1222,40 @@ These `torch.cuda` functions are replaced while the function runs, and restored 
 
 No replaced function initializes CUDA in this process. A CUDA build of PyTorch on a machine with no NVIDIA driver raises `CUDA driver version is insufficient` from any call that does, and a training loop makes such calls without naming them: `Adam.step()` and `AdamW.step()` call `is_current_stream_capturing()`, and `torch.cuda.is_bf16_supported()`, which `autocast` reads for `bfloat16`, calls `get_device_properties()`.
 
-A process forked while forwarding is active, such as a `DataLoader` worker, starts with the mapping undone: `torch.cuda` holds PyTorch's own functions, the device rewrite is off and `current_client()` is None, so the worker's `torch.manual_seed` and its CPU tensors stay in that process. The client refuses to send from a process other than the one that connected it, raising `RuntimeLost` naming the fork, because the channel it would write to belongs to the parent. `DataLoader(pin_memory=True)` is not supported, because PyTorch pins through its own CUDA context in a thread letify does not map.
+A process forked while forwarding is active, such as a `DataLoader` worker, starts with the mapping undone: `torch.cuda` holds PyTorch's own functions, the device rewrite is off and `current_client()` is None, so the worker's `torch.manual_seed` and its CPU tensors stay in that process. The client refuses to send from a process other than the one that connected it, raising `RuntimeLost` naming the fork, because the channel it would write to belongs to the parent.
+
+### Pinned memory <!-- id: forwarding-pinned-memory -->
+
+> Under `host="local"`, pinning host memory is a copy into ordinary memory that reports itself as pinned, so `DataLoader(pin_memory=True)` runs unchanged and never initializes CUDA in this process.
+
+Pinned memory exists so the CUDA driver can copy to the device asynchronously. No driver runs in this process, and an upload is already asynchronous, as [Transfers](#forwarding-transfers) describes, so pinning has nothing to speed up. While forwarding is active:
+
+| Function | Behaviour |
+|---|---|
+| `Tensor.pin_memory(device=None)` | A copy of the tensor in ordinary CPU memory, with the same shape, strides, dtype and values. A tensor that already reports itself pinned is returned as it is |
+| `Tensor.is_pinned(device=None)` | `True` for a tensor `pin_memory` returned, and PyTorch's own answer for any other tensor, which is `False` without a driver |
+| `torch.accelerator.is_available()` | `True` |
+| `torch.accelerator.current_device_index()` | `0` |
+| `torch.accelerator.set_device_index(i)`, `torch.accelerator.set_device_idx(i)` | Accepted for device 0, `UnsupportedMode` otherwise |
+
+The two `Tensor` methods are replaced on the class and the `torch.accelerator` functions on the module, not in the `TorchFunctionMode`, because the `DataLoader` pins in a thread of its own, where the mode is not active. They are restored when forwarding ends, and undone in a forked process as the rest of the mapping is. A pinned tensor uploaded with `non_blocking=True` takes the same queued, asynchronous path as any other upload.
+### Autocast <!-- id: forwarding-autocast -->
+
+> Inside `torch.autocast("cuda")`, an operator on a `RemoteTensor` gets the argument casts CUDA autocast gives it, so a mixed precision loop computes in the same dtypes as on the runtime's own GPU.
+
+A `RemoteTensor` lives on the `meta` device, so PyTorch's own CUDA autocast, a dispatch key on CUDA tensors, never sees it. The `TorchFunctionMode` of [Mapping cuda](#mapping-cuda) applies the casts instead, above autograd as autocast does, so each cast is recorded as a differentiable `to(dtype)` and gradients reach the float32 parameters in float32.
+
+While `torch.is_autocast_enabled("cuda")` is true, a torch function named in one of three lists casts its floating point `RemoteTensor` arguments, top level or one list level down, other than `float64` ones, and then runs with autocast's casts applied. The lists follow PyTorch's CUDA autocast policy and are matched by the function's name:
+
+| Policy | Cast | Functions |
+|---|---|---|
+| lower precision | to `torch.get_autocast_dtype("cuda")` | `conv1d`, `conv2d`, `conv3d`, `conv_transpose1d`, `conv_transpose2d`, `conv_transpose3d`, `conv_tbc`, `prelu`, `addmm`, `addmv`, `addr`, `matmul`, `__matmul__`, `__rmatmul__`, `einsum`, `mm`, `mv`, `linear`, `bmm`, `baddbmm`, `addbmm`, `chain_matmul`, `multi_dot`, `scaled_dot_product_attention`, `lstm_cell`, `gru_cell`, `rnn_tanh_cell`, `rnn_relu_cell` |
+| float32 | to `float32` | `acos`, `asin`, `cosh`, `erfinv`, `exp`, `expm1`, `log`, `log10`, `log2`, `log1p`, `reciprocal`, `rsqrt`, `sinh`, `tan`, `pow`, `__pow__`, `softplus`, `layer_norm`, `group_norm`, `norm`, `cosine_similarity`, `poisson_nll_loss`, `cosine_embedding_loss`, `nll_loss`, `hinge_embedding_loss`, `kl_div`, `l1_loss`, `smooth_l1_loss`, `huber_loss`, `mse_loss`, `margin_ranking_loss`, `multilabel_margin_loss`, `soft_margin_loss`, `triplet_margin_loss`, `multi_margin_loss`, `binary_cross_entropy_with_logits`, `dist`, `pdist`, `cdist`, `renorm`, `logsumexp`, `softmax`, `log_softmax`, `sum`, `prod`, `cumsum`, `cumprod` |
+| widest | to the widest floating dtype among those arguments | `addcdiv`, `addcmul`, `atan2`, `bilinear`, `cross`, `dot`, `vdot`, `grid_sample`, `index_put`, `scatter_add`, `tensordot`, `cat`, `stack` |
+
+`cross_entropy` with class index targets and no label smoothing runs as CUDA's `cross_entropy_loss` does: `log_softmax` in its input's dtype, then `nll_loss` with that result cast to float32. With probability targets or label smoothing, its input is cast to float32.
+
+Every other function runs with its arguments as they are. A cast is not cached: a parameter used twice in one region is cast twice, which gives the same values as autocast's weight cache. `GradScaler` is PyTorch's own and is not covered.
 
 ### The device worker <!-- id: device-worker -->
 

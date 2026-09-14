@@ -170,6 +170,98 @@ def test_a_structure_is_described_once_and_later_calls_carry_only_their_scalars(
     assert x.cpu().tolist() == [24.0, 24.0, 24.0, 24.0]
 
 
+# -- Spec: Kernel selection --------------------------------------------------------
+
+
+def _template_names(connected) -> set[str]:
+    return {str(key[0]) for key in connected._templates}
+
+
+def _batch_norm_arguments():
+    x = torch.randn(4, 3, 5, 5, device="cuda")
+    weight = torch.ones(3, device="cuda")
+    bias = torch.zeros(3, device="cuda")
+    mean = torch.zeros(3, device="cuda")
+    var = torch.ones(3, device="cuda")
+    return x, mean, var, weight, bias
+
+
+def test_on_a_cpu_executor_batch_norm_and_attention_keep_their_ordinary_kernels(client) -> None:
+    x, mean, var, weight, bias = _batch_norm_arguments()
+    q = torch.randn(2, 2, 4, 8, device="cuda")
+    client.synchronize()
+    before = client.stats.round_trips
+    normed = torch.nn.functional.batch_norm(x, mean, var, weight, bias, training=True)
+    attended = torch.nn.functional.scaled_dot_product_attention(q, q, q, is_causal=True)
+    assert client.stats.round_trips == before
+    names = _template_names(client)
+    assert "aten.native_batch_norm.default" in names
+    assert not any("cudnn" in name or "flash" in name or "efficient" in name for name in names)
+    assert normed.shape == x.shape and attended.shape == q.shape
+    torch.cuda.synchronize()
+
+
+def test_the_runtime_is_asked_for_a_kernel_once_per_signature(client) -> None:
+    first = _batch_norm_arguments()
+    second = _batch_norm_arguments()
+    client.synchronize()
+    before = client.stats.round_trips
+    answers = [
+        client.kernel("batch_norm", (x, weight, bias, mean, var), {"training": True})
+        for x, mean, var, weight, bias in (first, second)
+    ]
+    assert answers == ["Native", "Native"]
+    assert client.stats.round_trips == before + 1
+
+
+def test_the_runtime_answers_an_attention_kernel_request(client) -> None:
+    query = torch.randn(2, 2, 16, 8, device="cuda")
+    flags = {"dropout_p": 0.0, "is_causal": True, "scale": None, "enable_gqa": False}
+    answer = client.kernel("scaled_dot_product_attention", (query, query, query, None), flags)
+    assert answer in {"MATH", "FLASH_ATTENTION", "EFFICIENT_ATTENTION", "CUDNN_ATTENTION"}
+
+
+@pytest.fixture
+def unsent():
+    """A client whose queued operators are never executed, for kernels a CPU cannot run."""
+    connected = forwarding.connect(forwarding.worker_command(sys.executable), device="cpu")
+    try:
+        with connected.activate():
+            yield connected
+    finally:
+        connected.process.kill()
+        try:
+            connected.close()
+        except letify.RuntimeLost:
+            pass
+
+
+def test_a_cudnn_answer_forwards_cudnn_batch_norm(unsent, monkeypatch) -> None:
+    monkeypatch.setitem(unsent.hello, "device", "cuda")
+    monkeypatch.setattr(unsent, "kernel", lambda *args, **kwargs: "Cudnn")
+    x, mean, var, weight, bias = _batch_norm_arguments()
+    x.requires_grad_(True)
+    normed = torch.nn.functional.batch_norm(x, mean, var, weight, bias, training=True)
+    normed.sum().backward()
+    names = _template_names(unsent)
+    assert "aten.cudnn_batch_norm.default" in names
+    assert "aten.cudnn_batch_norm_backward.default" in names
+    assert "aten.native_batch_norm.default" not in names
+    assert normed.shape == x.shape and normed.dtype == x.dtype
+
+
+def test_a_flash_answer_forwards_flash_attention_and_its_backward(unsent, monkeypatch) -> None:
+    monkeypatch.setitem(unsent.hello, "device", "cuda")
+    monkeypatch.setattr(unsent, "kernel", lambda *args, **kwargs: "FLASH_ATTENTION")
+    q = torch.randn(2, 2, 16, 8, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    attended = torch.nn.functional.scaled_dot_product_attention(q, q, q, is_causal=True)
+    attended.float().sum().backward()
+    names = _template_names(unsent)
+    assert "aten._scaled_dot_product_flash_attention.default" in names
+    assert "aten._scaled_dot_product_flash_attention_backward.default" in names
+    assert attended.shape == q.shape and attended.dtype == q.dtype
+
+
 # -- Spec: Mapping cuda --------------------------------------------------------
 
 
@@ -251,6 +343,69 @@ def test_a_dataloader_with_forked_workers_leaves_the_session_usable(client) -> N
     assert total.cpu().tolist() == data.sum(dim=0).tolist()
 
 
+# -- Spec: Pinned memory ------------------------------------------------------------
+
+
+def _forbid_local_pinning(monkeypatch) -> None:
+    """Make PyTorch's own pinning raise, as it does on a CUDA build without a driver."""
+    _forbid_local_cuda(monkeypatch)
+
+    def no_driver(*args, **kwargs):
+        raise RuntimeError("Found no NVIDIA driver on your system")
+
+    monkeypatch.setattr(torch.Tensor, "pin_memory", no_driver)
+    monkeypatch.setattr(torch.accelerator, "current_device_index", no_driver)
+    monkeypatch.setattr(torch.accelerator, "set_device_index", no_driver)
+    monkeypatch.setattr(torch.accelerator, "is_available", lambda: False)
+
+
+def test_pinning_a_host_tensor_copies_it_and_reports_it_pinned(monkeypatch) -> None:
+    _forbid_local_pinning(monkeypatch)
+    connected = forwarding.connect(forwarding.worker_command(sys.executable), device="cpu")
+    try:
+        with connected.activate():
+            source = torch.arange(12.0).reshape(3, 4)
+            pinned = source.pin_memory()
+            assert pinned.device.type == "cpu"
+            assert pinned.is_pinned() and not source.is_pinned()
+            assert pinned.data_ptr() != source.data_ptr()
+            assert torch.equal(pinned, source)
+            assert pinned.pin_memory() is pinned
+            assert torch.accelerator.is_available()
+            assert torch.accelerator.current_device_index() == 0
+            with pytest.raises(UnsupportedMode):
+                torch.accelerator.set_device_index(1)
+    finally:
+        connected.close()
+    with pytest.raises(RuntimeError, match="no NVIDIA driver"):
+        torch.ones(2).pin_memory()
+
+
+def test_a_dataloader_with_pin_memory_feeds_non_blocking_uploads(monkeypatch) -> None:
+    _forbid_local_pinning(monkeypatch)
+    data = torch.arange(64.0).reshape(32, 2)
+    connected = forwarding.connect(forwarding.worker_command(sys.executable), device="cpu")
+    try:
+        with connected.activate():
+            for workers in (0, 2):
+                loader = torch.utils.data.DataLoader(
+                    torch.utils.data.TensorDataset(data),
+                    batch_size=8,
+                    num_workers=workers,
+                    pin_memory=True,
+                    timeout=60 if workers else 0,
+                )
+                total = torch.zeros(2, device="cuda")
+                before = connected.stats.round_trips
+                for (batch,) in loader:
+                    assert batch.is_pinned()
+                    total += batch.cuda(non_blocking=True).sum(dim=0)
+                assert connected.stats.round_trips == before
+                assert total.cpu().tolist() == data.sum(dim=0).tolist()
+    finally:
+        connected.close()
+
+
 def _child_view(queue) -> None:
     import torch
 
@@ -296,6 +451,105 @@ def test_a_client_refuses_to_send_from_a_forked_process(client) -> None:
     child.join(60)
     assert "forked" in message
     assert torch.ones(3, device="cuda").sum().item() == 3.0
+
+
+# -- Spec: Autocast ---------------------------------------------------------------
+
+
+def test_autocast_runs_a_linear_layer_in_the_autocast_dtype(client) -> None:
+    layer = torch.nn.Linear(4, 2).cuda()
+    with torch.autocast("cuda", dtype=torch.bfloat16):
+        out = layer(torch.ones(3, 4, device="cuda"))
+        conv = torch.nn.functional.conv2d(
+            torch.ones(1, 2, 5, 5, device="cuda"), torch.ones(3, 2, 3, 3, device="cuda")
+        )
+    assert out.dtype == torch.bfloat16
+    assert conv.dtype == torch.bfloat16
+    assert layer.weight.dtype == torch.float32
+    torch.cuda.synchronize()
+
+
+def test_autocast_runs_float32_functions_in_float32(client) -> None:
+    half = torch.ones(2, 4, device="cuda", dtype=torch.bfloat16)
+    with torch.autocast("cuda", dtype=torch.bfloat16):
+        normed = torch.nn.functional.layer_norm(half, (4,))
+        soft = half.softmax(dim=-1)
+        loss = torch.nn.functional.mse_loss(half, half)
+    assert normed.dtype == soft.dtype == loss.dtype == torch.float32
+
+
+def test_autocast_promotes_mixed_arguments_to_the_widest_dtype(client) -> None:
+    half = torch.ones(2, device="cuda", dtype=torch.bfloat16)
+    full = torch.ones(2, device="cuda")
+    with torch.autocast("cuda", dtype=torch.bfloat16):
+        joined = torch.cat([half, full])
+    assert joined.dtype == torch.float32
+    assert joined.cpu().tolist() == [1.0, 1.0, 1.0, 1.0]
+
+
+def test_autocast_cross_entropy_takes_log_softmax_in_the_input_dtype(client) -> None:
+    # CUDA's cross_entropy_loss runs log_softmax uncast and casts only nll_loss to float32.
+    torch.manual_seed(0)
+    logits = torch.randn(8, 10) * 3
+    target = torch.randint(0, 10, (8,))
+    with client.suspended():
+        half = logits.to(torch.bfloat16)
+        want = torch.nn.functional.nll_loss(torch.log_softmax(half, 1).float(), target)
+    with torch.autocast("cuda", dtype=torch.bfloat16):
+        got = torch.nn.functional.cross_entropy(logits.to(torch.bfloat16).cuda(), target.cuda())
+    assert got.dtype == torch.float32
+    assert got.cpu().item() == want.item()
+
+
+def test_autocast_does_not_widen_index_copy(client) -> None:
+    # CUDA autocast has no kernel for index_copy, so mixed dtypes raise there too.
+    base = torch.zeros(4, device="cuda", dtype=torch.bfloat16)
+    source = torch.ones(2, device="cuda")
+    index = torch.tensor([0, 2]).cuda()
+    with pytest.raises((RuntimeError, RemoteError)):
+        with torch.autocast("cuda", dtype=torch.bfloat16):
+            base.index_copy(0, index, source)
+        torch.cuda.synchronize()
+
+
+def test_operators_outside_an_autocast_region_keep_their_dtype(client) -> None:
+    layer = torch.nn.Linear(4, 2).cuda()
+    with torch.autocast("cuda", dtype=torch.bfloat16, enabled=False):
+        inside = layer(torch.ones(3, 4, device="cuda"))
+    after = layer(torch.ones(3, 4, device="cuda"))
+    assert inside.dtype == after.dtype == torch.float32
+
+
+def _mixed_step(to_device, autocast: bool):
+    """One step of a small model, under autocast or with autocast's casts written out."""
+    torch.manual_seed(0)
+    model = to_device(torch.nn.Sequential(torch.nn.Linear(8, 16), torch.nn.LayerNorm(16)))
+    head = to_device(torch.nn.Linear(16, 4))
+    data = to_device(torch.randn(6, 8))
+    target = to_device(torch.randn(6, 4))
+    if autocast:
+        with torch.autocast("cuda", dtype=torch.bfloat16):
+            loss = torch.nn.functional.mse_loss(head(model(data)), target)
+    else:
+        lin, norm = model
+        bf = torch.bfloat16
+        hidden = torch.nn.functional.linear(data.to(bf), lin.weight.to(bf), lin.bias.to(bf))
+        hidden = torch.nn.functional.layer_norm(hidden.float(), (16,), norm.weight, norm.bias)
+        out = torch.nn.functional.linear(hidden.to(bf), head.weight.to(bf), head.bias.to(bf))
+        loss = torch.nn.functional.mse_loss(out.float(), target)
+    loss.backward()
+    params = [*model.parameters(), *head.parameters()]
+    return float(loss), [p.grad.detach().cpu() for p in params]
+
+
+def test_an_autocast_step_matches_the_same_casts_written_out(client) -> None:
+    with client.suspended():
+        want_loss, want_grads = _mixed_step(lambda value: value, autocast=False)
+    got_loss, got_grads = _mixed_step(lambda value: value.cuda(), autocast=True)
+    assert got_loss == want_loss
+    for got, want in zip(got_grads, want_grads, strict=True):
+        assert got.dtype == torch.float32
+        assert torch.equal(got, want)
 
 
 # -- Spec: Batching and synchronization -----------------------------------------
