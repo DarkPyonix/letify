@@ -276,7 +276,11 @@ class Colab(Shell):
             token = line.strip().split()[:1]
             # A line starting with "[colab]" is the CLI's own message, not a session.
             if token and not token[0].lower().startswith(("name", "session", "-", "[colab]")):
-                names.append(token[0])
+                # The CLI prints a session as "[<name>] <id> | Hardware: ...".
+                word = token[0]
+                if word.startswith("[") and word.endswith("]"):
+                    word = word[1:-1]
+                names.append(word)
         return names
 
     # -- the pipeline ----------------------------------------------------------
