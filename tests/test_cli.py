@@ -414,9 +414,7 @@ def test_logging_in_to_colab_without_uv_says_how_to_get_it(
     assert "uv was not found" in capsys.readouterr().err
 
 
-def test_logging_out_takes_the_account_and_its_directory(
-    isolated_home, fake_elice, capsys
-) -> None:
+def test_logging_out_takes_the_account_and_its_directory(isolated_home, fake_elice, capsys) -> None:
     # The repository still needs the account, so the reference stays; this machine is what
     # stopped having it.
     main(
@@ -642,7 +640,9 @@ def test_an_elice_endpoint_is_recorded_only_when_it_is_not_the_default(
         )
         == 0
     )
-    assert fake_elice.endpoint in (Path.home() / ".letify" / "config.toml").read_text(encoding="utf-8")
+    assert fake_elice.endpoint in (Path.home() / ".letify" / "config.toml").read_text(
+        encoding="utf-8"
+    )
 
 
 # -- Spec: Logging in, the Elice login ------------------------------------------
@@ -734,7 +734,7 @@ def test_an_elice_zone_and_machine_are_chosen_from_the_listed_ones(
     assert "1. Seoul (zone-a)" in out
     assert "2. Busan (zone-b)" in out
     assert prompts[:3] == ["Elice zone [1-2]: ", "Elice zone [1-2]: ", "Elice machine [1-1]: "]
-    listing = [r for r in fake_elice.requests if r["path"] == VM_PATH][0]
+    listing = next(r for r in fake_elice.requests if r["path"] == VM_PATH)
     assert listing["params"] == {"zone_id": "zone-b"}
     entry = tomllib.loads((Path.home() / ".letify" / "config.toml").read_text(encoding="utf-8"))[
         "e"
