@@ -597,6 +597,17 @@ When only one strategy is applicable there is nothing to choose between, so it i
 
 A `Link` that cannot carry the probe, such as the provider fallback, is left out of the throughput comparison. It is chosen only when no probed strategy remains, and it is never written to the cache, so the next connection races again. A probe that fails on a strategy in a race of two or more rejects that strategy. When no strategy connects, the error names every strategy with the reason it failed or was skipped.
 
+Every connection decision is printed, one line per event, on stderr with the `letify: ` prefix the session start line uses, so the user's stdout stays clean. The lines are on by default. `Launcher(announce=False)` silences them together with the session start line. The wording is not fixed, but each line names the account and carries these facts:
+
+| Event | The line carries |
+|---|---|
+| Race start | the strategies attempted, each skipped strategy with its reason, and that the fallback is held back when it is applicable |
+| Lone strategy | the one strategy used without a race |
+| Strategy outcome | connected with the seconds since the race started, failed with the exception text, timed out, or connected after the choice and closed |
+| Probe | round trip in ms, upload and download in MiB/s, or the probe error |
+| Choice | the chosen strategy and why: the lowest rank within 25% of the fastest, the only one connected, or the fallback because no probed strategy connected. Each strategy rejected by the 25% rule is named with its upload and download against the fastest |
+| Switch | a strategy that connected first replaced by the chosen one, such as `tcp_punch` replacing `tailcat`, a link to the same account connected again after it was closed, with the old and new strategy, and a fall back to the provider's own path |
+
 ### Link cache <!-- id: link-cache -->
 
 > The winning strategy is remembered per account and per network, so the next connection starts with it alone.
@@ -604,6 +615,8 @@ A `Link` that cannot carry the probe, such as the provider fallback, is left out
 The cache lives in `~/.letify/accounts/<alias>/link.json`. It records the strategy, the probe results, and a network fingerprint: the local machine's public IP address and the name of its default route interface.
 
 On the next connection the cached strategy is attempted alone. When it connects and its probe is at least 50% of the cached throughput in both directions, it is used. Otherwise, or when the fingerprint differs, the full race runs and the cache is rewritten. A fingerprint whose public IP address could not be learned matches nothing, so the race runs.
+
+The cache's decisions are printed as the race's are, in [Choosing a link](#choosing-a-link): the cached strategy tried alone with its cached throughput, then accepted, or rejected with the reason (below 50% of the cached throughput with both numbers, failed to connect, probe failed, or the network fingerprint changed), and every rewrite of the cache with the strategy written.
 
 The public IP address is learned from the same STUN servers the punch uses. The default route interface is read from `/proc/net/route` on Linux, `route -n get default` on macOS and `Get-NetRoute` on Windows.
 
