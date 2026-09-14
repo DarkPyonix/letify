@@ -225,7 +225,8 @@ def no_project_environment(monkeypatch):
     from letify import install
 
     monkeypatch.setattr(install, "project_environment", lambda: None)
-    monkeypatch.setattr(install, "can_ask", lambda: False)
+    # Automatic install would reach GitHub; a test that installs serves a release locally.
+    monkeypatch.setenv("LETIFY_AUTO_INSTALL", "0")
 
 
 @pytest.fixture

@@ -118,6 +118,7 @@ def releases(monkeypatch, isolated_home):
     monkeypatch.setattr(install, "TAILCAT_RELEASE", server.url + "/v{version}")
     monkeypatch.setattr(install, "ECI_RELEASE", server.url + "/{version}")
     monkeypatch.setattr(install, "host", lambda: ("Linux", "x86_64"))
+    monkeypatch.delenv("LETIFY_AUTO_INSTALL", raising=False)
     yield server
     server.server.shutdown()
 
@@ -154,19 +155,6 @@ def nothing_on_path(patch_which):
     patch_which(install, present=False)
 
 
-def answer_with(monkeypatch, reply: str) -> list[str]:
-    """Make standard input a terminal that answers ``reply``; return the prompts asked."""
-    asked: list[str] = []
-
-    def read(prompt: str) -> str:
-        asked.append(prompt)
-        return reply
-
-    monkeypatch.setattr(install, "can_ask", lambda: True)
-    monkeypatch.setattr(install, "read_answer", read)
-    return asked
-
-
 def cached(tool: str, version: str) -> Path:
     return Path.home() / ".letify" / "tools" / tool / version / tool
 
@@ -178,7 +166,7 @@ def test_setup_tailcat_with_yes_installs_the_verified_binary_into_the_version_ca
     releases, monkeypatch, nothing_on_path, capsys
 ) -> None:
     publish_tailcat(monkeypatch, releases, tar_gz([("tailcat", FAKE_TAILCAT, "file")]))
-    assert main(["setup", "tailcat", "--yes"]) == 0
+    assert main(["setup", "tailcat"]) == 0
 
     binary = cached("tailcat", setup.TAILCAT_VERSION)
     assert binary.read_bytes() == FAKE_TAILCAT
@@ -193,7 +181,7 @@ def test_a_digest_that_differs_from_the_pinned_one_writes_nothing(
     archive = tar_gz([("tailcat", FAKE_TAILCAT, "file")])
     publish_tailcat(monkeypatch, releases, archive)
     monkeypatch.setattr(install, "TAILCAT_SHA256", {TAILCAT_ASSET: "0" * 64})
-    assert main(["setup", "tailcat", "--yes"]) == 1
+    assert main(["setup", "tailcat"]) == 1
 
     err = capsys.readouterr().err
     assert "0" * 64 in err and digest(archive) in err
@@ -210,7 +198,7 @@ def test_a_checksums_file_that_disagrees_with_the_pin_writes_nothing(
         checksums=f"{'1' * 64}  {TAILCAT_ASSET}\n",
     )
     monkeypatch.setattr(install, "TAILCAT_SHA256", {TAILCAT_ASSET: digest(archive)})
-    assert main(["setup", "tailcat", "--yes"]) == 1
+    assert main(["setup", "tailcat"]) == 1
     assert "1" * 64 in capsys.readouterr().err
     assert not cached("tailcat", setup.TAILCAT_VERSION).exists()
 
@@ -229,7 +217,7 @@ def test_an_archive_with_a_member_escaping_its_directory_is_refused(
     releases, monkeypatch, nothing_on_path, capsys, members
 ) -> None:
     publish_tailcat(monkeypatch, releases, tar_gz(members))
-    assert main(["setup", "tailcat", "--yes"]) == 1
+    assert main(["setup", "tailcat"]) == 1
     assert "refused" in capsys.readouterr().err
     assert not cached("tailcat", setup.TAILCAT_VERSION).exists()
     assert not (Path.home() / ".letify" / "escape").exists()
@@ -283,7 +271,7 @@ def test_the_cached_tailcat_is_hard_linked_into_the_project_environment_with_a_m
     releases, monkeypatch, nothing_on_path, venv
 ) -> None:
     publish_tailcat(monkeypatch, releases, tar_gz([("tailcat", FAKE_TAILCAT, "file")]))
-    assert main(["setup", "tailcat", "--yes"]) == 0
+    assert main(["setup", "tailcat"]) == 0
 
     link = venv / "bin" / "tailcat"
     assert link.samefile(cached("tailcat", setup.TAILCAT_VERSION))
@@ -300,7 +288,7 @@ def test_a_failed_hard_link_falls_back_to_a_copy_and_says_so(
         raise OSError(errno.EXDEV, "Invalid cross-device link")
 
     monkeypatch.setattr(install.os, "link", cross_device)
-    assert main(["setup", "tailcat", "--yes"]) == 0
+    assert main(["setup", "tailcat"]) == 0
 
     link = venv / "bin" / "tailcat"
     assert link.read_bytes() == FAKE_TAILCAT
@@ -314,7 +302,7 @@ def test_a_link_left_by_another_version_is_replaced(
     (venv / "bin" / "tailcat").write_bytes(b"old version")
     (venv / "bin" / ".letify-tailcat").write_text("0.5.0\n")
     publish_tailcat(monkeypatch, releases, tar_gz([("tailcat", FAKE_TAILCAT, "file")]))
-    assert main(["setup", "tailcat", "--yes"]) == 0
+    assert main(["setup", "tailcat"]) == 0
     assert (venv / "bin" / "tailcat").read_bytes() == FAKE_TAILCAT
 
 
@@ -337,7 +325,7 @@ def test_eci_is_linked_as_a_launcher_that_runs_the_cached_bundle(
     releases, monkeypatch, nothing_on_path, venv
 ) -> None:
     publish_eci(monkeypatch, releases)
-    assert main(["setup", "eci", "--yes"]) == 0
+    assert main(["setup", "eci"]) == 0
 
     launcher = venv / "bin" / "eci"
     ran = subprocess.run([str(launcher), "zone", "list"], capture_output=True, text=True)
@@ -378,76 +366,82 @@ def test_setup_where_prints_the_cache_the_link_path_and_the_choice(
     assert "uses" in out
 
 
-# -- Spec: Installing external tools, asking -------------------------------------------
+# -- Spec: Installing external tools, automatic install ------------------------------
 
 
-def test_a_yes_on_a_terminal_installs_and_returns_the_path(
-    releases, monkeypatch, nothing_on_path
+def test_a_missing_tool_is_installed_on_first_need_and_both_steps_are_logged(
+    releases, monkeypatch, nothing_on_path, venv, capsys
 ) -> None:
     publish_tailcat(monkeypatch, releases, tar_gz([("tailcat", FAKE_TAILCAT, "file")]))
-    asked = answer_with(monkeypatch, "Y")
-    path = install.ensure("tailcat", interactive=True, instructions="how to install")
-    assert path == str(cached("tailcat", setup.TAILCAT_VERSION))
-    assert "not part of letify" in asked[0] and "[y/N]" in asked[0]
+    path = install.ensure("tailcat", instructions="how to install")
+
+    assert path == str(venv / "bin" / "tailcat")
+    lines = [line for line in capsys.readouterr().err.splitlines() if line.startswith("letify: ")]
+    version = setup.TAILCAT_VERSION
+    assert len(lines) == 2
+    assert f"installing tailcat {version} from {releases.url}/v{version}/{TAILCAT_ASSET}" in lines[0]
+    assert str(cached("tailcat", version).parent) in lines[0]
+    archive_digest = install.TAILCAT_SHA256[TAILCAT_ASSET]
+    assert f"verified sha256 {archive_digest}, linked at {path}" in lines[1]
 
 
-def test_a_no_on_a_terminal_installs_nothing_and_names_the_setup_command(
-    releases, monkeypatch, nothing_on_path
+def test_auto_install_false_in_the_home_config_fails_with_the_setup_command(
+    releases, nothing_on_path
 ) -> None:
-    answer_with(monkeypatch, "")
+    (Path.home() / ".letify" / "config.toml").write_text("auto_install = false\n")
     with pytest.raises(install.InstallError) as raised:
-        install.ensure("tailcat", interactive=True, instructions="how to install")
+        install.ensure("tailcat", instructions="how to install")
     assert "how to install" in str(raised.value)
-    assert "letify setup tailcat --yes" in str(raised.value)
+    assert "letify setup tailcat" in str(raised.value)
     assert releases.requests == []
 
 
-def test_without_a_terminal_nothing_is_asked_or_installed(
+@pytest.mark.parametrize("value", ["0", "false", "no"])
+def test_letify_auto_install_off_in_the_environment_installs_nothing(
+    releases, monkeypatch, nothing_on_path, value
+) -> None:
+    monkeypatch.setenv("LETIFY_AUTO_INSTALL", value)
+    with pytest.raises(install.InstallError, match="letify setup eci"):
+        install.ensure("eci", instructions="how to install")
+    assert releases.requests == []
+
+
+def test_the_environment_variable_decides_over_the_home_config(
     releases, monkeypatch, nothing_on_path
 ) -> None:
-    def never(prompt: str) -> str:
-        raise AssertionError("asked without a terminal")
-
-    monkeypatch.setattr(install, "read_answer", never)
-    with pytest.raises(install.InstallError, match="letify setup tailcat --yes"):
-        install.ensure("tailcat", interactive=True, instructions="how to install")
-    assert releases.requests == []
-
-
-def test_no_input_never_asks_even_on_a_terminal(releases, monkeypatch, nothing_on_path) -> None:
-    asked = answer_with(monkeypatch, "y")
-    with pytest.raises(install.InstallError):
-        install.ensure("eci", interactive=False, instructions="how to install")
-    assert asked == []
-
-
-def test_setup_without_yes_and_without_a_terminal_fails_with_the_setup_command(
-    releases, nothing_on_path, capsys
-) -> None:
-    assert main(["setup", "eci"]) == 1
-    assert "letify setup eci --yes" in capsys.readouterr().err
-    assert releases.requests == []
-
-
-def test_the_eci_question_says_the_program_is_elices(
-    releases, monkeypatch, nothing_on_path
-) -> None:
+    (Path.home() / ".letify" / "config.toml").write_text("auto_install = false\n")
+    monkeypatch.setenv("LETIFY_AUTO_INSTALL", "1")
     publish_eci(monkeypatch, releases)
-    asked = answer_with(monkeypatch, "yes")
-    install.ensure("eci", interactive=True, instructions="how to install")
-    assert asked[0].startswith("eci is not installed.")
-    assert "Elice" in asked[0] and "not part of letify" in asked[0]
+    assert install.ensure("eci", instructions="how to install") == str(
+        cached("eci", install.ECI_VERSION)
+    )
+
+
+def test_setup_installs_even_when_automatic_install_is_off(
+    releases, monkeypatch, nothing_on_path
+) -> None:
+    monkeypatch.setenv("LETIFY_AUTO_INSTALL", "0")
+    publish_eci(monkeypatch, releases)
+    assert main(["setup", "eci"]) == 0
+    assert cached("eci", install.ECI_VERSION).is_file()
+
+
+def test_the_auto_install_setting_does_not_declare_a_provider(isolated_home) -> None:
+    from letify.config import load
+
+    (Path.home() / ".letify" / "config.toml").write_text("auto_install = false\n")
+    assert list(load().providers) == ["local"]
 
 
 # -- Spec: hooks in Rendezvous, Logging in and Elice machines --------------------------
 
 
-def test_connect_without_a_terminal_names_the_setup_command(
+def test_connect_with_automatic_install_off_names_the_setup_command(
     isolated_home, patch_which, capsys
 ) -> None:
     patch_which(setup, present=False)
     assert main(["client", "shell", "connect", "--ssh-port", "1"]) == 1
-    assert "letify setup tailcat --yes" in capsys.readouterr().err
+    assert "letify setup tailcat" in capsys.readouterr().err
 
 
 def test_the_elice_provider_finds_eci_in_the_cache(releases, monkeypatch, nothing_on_path) -> None:
