@@ -453,6 +453,9 @@ class Striped:
         self._held = 0
         self._head = memoryview(b"")
         self._ended = False
+        readintos = list(readintos)
+        #: Lanes whose reading thread is still running.
+        self._live = len(readintos)
         for lane in range(1, len(self._writes)):
             threading.Thread(target=self._lane_sender, args=(lane,), daemon=True).start()
         for lane, readinto in enumerate(readintos):
@@ -511,16 +514,22 @@ class Striped:
 
     # -- reading ---------------------------------------------------------------
 
-    def _end(self) -> None:
+    def _end(self, malformed: bool) -> None:
+        """A lane stopped reading. The stream ends at a malformed segment or the last lane."""
         with self._cond:
-            self._ended = True
+            self._live -= 1
+            if malformed or self._live <= 0:
+                self._ended = True
             self._cond.notify_all()
 
     def _lane_reader(self, lane: int, readinto) -> None:
         header = bytearray(HEADER.size + _OFFSET.size)
+        malformed = True
         try:
             while True:
+                malformed = False
                 _read_exact(readinto, memoryview(header))
+                malformed = True
                 magic, kind, _flags, _lane, length = HEADER.unpack_from(header)
                 (offset,) = _OFFSET.unpack_from(header, HEADER.size)
                 if magic != MAGIC or kind != SEGMENT:
@@ -531,9 +540,11 @@ class Striped:
                     if offset < self._next or offset in self._pieces or self._ended:
                         return
                 piece = bytearray(length)
+                malformed = False
                 _read_exact(readinto, memoryview(piece))
                 with self._cond:
                     if offset < self._next or offset in self._pieces:
+                        malformed = True
                         return
                     self._pieces[offset] = piece
                     self._held += length
@@ -541,7 +552,7 @@ class Striped:
         except (EOFError, OSError, ValueError):
             return
         finally:
-            self._end()
+            self._end(malformed)
 
     def recv_into(self, view) -> int:
         """Fill ``view`` with the next bytes in offset order, 0 once the stream ended."""
