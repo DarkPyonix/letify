@@ -1,27 +1,25 @@
-"""The Transport between a PyTorch forwarding client and its device worker.
+"""The Transport between a PyTorch forwarding client and its device executor.
 
-This module owns the ``Transport`` interface and ``StreamTransport``, which frames one
-message as a head plus out-of-band buffers over a pair of file descriptors, as spec
-"Transport" describes. It does not own what a message means: that is ``client`` and
-``executor``.
+This module owns the ``Transport`` interface and its implementations, as spec "Transport"
+describes: ``StreamTransport`` over a pair of file descriptors, ``ChannelTransport`` on a
+session's persistent channel, and ``QueueTransport``, the executor's end inside the call
+worker. All of them put the frames of ``protocol.wire`` on the wire, on stream 2. It does
+not own what a message means: that is ``client`` and ``executor``.
 
-It imports the standard library only, because its source is sent to the runtime ahead of
-the executor, where letify may be absent. ``tensor_view`` takes a tensor but uses only
-``ctypes`` on it.
+It imports the standard library only, beside ``wire``, because its source is sent to the
+runtime after ``wire`` and ahead of the executor, where letify may be absent.
+``tensor_view`` takes a tensor but uses only ``ctypes`` on it.
 """
 
 from __future__ import annotations
 
 import ctypes
-import os
-import struct
 from typing import Any, Protocol
 
-#: Head length and buffer count.
-_PREFIX = struct.Struct("<QI")
-
-#: At most this many views are passed to one ``os.writev`` call.
-_IOV_MAX = 512
+try:
+    from ...protocol.wire import DEVICE_STREAM, REPLY, REQUEST, Receiver, Sender
+except ImportError:  # pragma: no cover - the concatenated copy inside a worker
+    pass
 
 
 class TransportClosed(Exception):
@@ -33,18 +31,20 @@ class Transport(Protocol):
 
     def send(self, head: bytes, buffers: list[Any]) -> None: ...
 
-    def recv(self) -> tuple[bytes, list[bytearray]]: ...
+    def recv(self) -> tuple[Any, list]: ...
 
     def close(self) -> None: ...
 
 
-class StreamTransport:
-    """One message stream over a readable and a writable file descriptor.
+def _views(buffers: list[Any]) -> list[memoryview]:
+    return [memoryview(buffer).cast("B") for buffer in buffers]
 
-    A message is the head length (8 bytes), the buffer count (4 bytes), one 8 byte length
-    per buffer, the head and then each buffer, all little-endian. Buffers are written from
-    the caller's memory with ``os.writev`` and read into ``bytearray``s sized from the
-    lengths, so nothing is joined or copied in between.
+
+class StreamTransport:
+    """Device messages as frames over a readable and a writable file descriptor.
+
+    The client end sends ``REQUEST`` frames and reads ``REPLY`` frames; the executor's end
+    is made with ``outgoing=REPLY`` and ``incoming=REQUEST``.
     """
 
     def __init__(
@@ -54,72 +54,53 @@ class StreamTransport:
         *,
         readinto: Any = None,
         owns_fds: bool = True,
+        outgoing: int | None = None,
+        incoming: int | None = None,
     ):
+        import os
+
+        self._os = os
         self.owns_fds = owns_fds
         self.read_fd = read_fd
         self.write_fd = write_fd
-        if readinto is not None:
-            self._readinto = readinto
-        elif read_fd is not None:
+        self.outgoing = REQUEST if outgoing is None else outgoing
+        self.incoming = REPLY if incoming is None else incoming
+        if readinto is None and read_fd is not None:
             fd = read_fd
-            self._readinto = lambda view: os.readv(fd, [view])
-        else:
-            self._readinto = None
+            readinto = lambda view: os.readv(fd, [view])  # noqa: E731
+        self._receiver = Receiver(readinto) if readinto is not None else None
+        fd_out = write_fd
+        self._sender = Sender(lambda view: os.write(fd_out, view)) if write_fd is not None else None
 
-    def send(self, head: bytes, buffers: list[Any]) -> None:
-        if self.write_fd is None:
+    def raw(self, data: bytes) -> None:
+        """Write bytes that are not a frame, such as the source for the bootstrap stub."""
+        if self._sender is None:
             raise TransportClosed("this transport has no writable end")
-        views = [memoryview(buffer).cast("B") for buffer in buffers]
-        prefix = _PREFIX.pack(len(head), len(views))
-        if views:
-            prefix += struct.pack(f"<{len(views)}Q", *(view.nbytes for view in views))
-        self._write_all([memoryview(prefix), memoryview(head), *views])
-
-    def _write_all(self, views: list[memoryview]) -> None:
-        pending = [view for view in views if view.nbytes]
         try:
-            while pending:
-                written = os.writev(self.write_fd, pending[:_IOV_MAX])
-                while written and pending:
-                    first = pending[0]
-                    if written >= first.nbytes:
-                        written -= first.nbytes
-                        pending.pop(0)
-                    else:
-                        pending[0] = first[written:]
-                        written = 0
-        except (BrokenPipeError, ConnectionError, OSError) as exc:
+            self._sender.raw(data)
+        except OSError as exc:
             raise TransportClosed(f"the stream closed while writing: {exc}") from exc
 
-    def _exact(self, view: memoryview) -> None:
-        while view.nbytes:
-            try:
-                count = self._readinto(view)
-            except OSError as exc:
-                raise TransportClosed(f"the stream closed while reading: {exc}") from exc
-            if not count:
-                raise TransportClosed("the stream ended")
-            view = view[count:]
+    def send(self, head: bytes, buffers: list[Any]) -> None:
+        if self._sender is None or self.write_fd is None:
+            raise TransportClosed("this transport has no writable end")
+        try:
+            self._sender.parts(self.outgoing, DEVICE_STREAM, head, _views(buffers))
+        except OSError as exc:
+            raise TransportClosed(f"the stream closed while writing: {exc}") from exc
 
-    def recv(self) -> tuple[bytes, list[bytearray]]:
-        if self._readinto is None:
+    def recv(self) -> tuple[Any, list]:
+        if self._receiver is None:
             raise TransportClosed("this transport has no readable end")
-        fixed = bytearray(_PREFIX.size)
-        self._exact(memoryview(fixed))
-        head_length, count = _PREFIX.unpack(fixed)
-        lengths: tuple[int, ...] = ()
-        if count:
-            raw = bytearray(8 * count)
-            self._exact(memoryview(raw))
-            lengths = struct.unpack(f"<{count}Q", raw)
-        head = bytearray(head_length)
-        self._exact(memoryview(head))
-        buffers = []
-        for length in lengths:
-            buffer = bytearray(length)
-            self._exact(memoryview(buffer))
-            buffers.append(buffer)
-        return bytes(head), buffers
+        while True:
+            try:
+                event = self._receiver.next_event()
+            except EOFError as exc:
+                raise TransportClosed(str(exc)) from exc
+            except (OSError, ValueError, Exception) as exc:
+                raise TransportClosed(f"the stream closed while reading: {exc}") from exc
+            if event is not None and event[0] == self.incoming:
+                return event[2]
 
     def close(self) -> None:
         if not self.owns_fds:
@@ -127,10 +108,56 @@ class StreamTransport:
             return
         for fd in {self.read_fd, self.write_fd} - {None}:
             try:
-                os.close(fd)  # type: ignore[arg-type]
+                self._os.close(fd)  # type: ignore[arg-type]
             except OSError:
                 pass
         self.read_fd = self.write_fd = None
+
+
+class ChannelTransport:
+    """Device messages on stream 2 of a session's persistent channel, beside the calls."""
+
+    def __init__(self, connection: Any):
+        self.connection = connection
+        connection.open_device()
+
+    def send(self, head: bytes, buffers: list[Any]) -> None:
+        try:
+            self.connection.sender.parts(REQUEST, DEVICE_STREAM, head, _views(buffers))
+        except OSError as exc:
+            raise TransportClosed(f"the channel closed while writing: {exc}") from exc
+
+    def recv(self) -> tuple[Any, list]:
+        message = self.connection.device_reply()
+        if message is None:
+            raise TransportClosed(f"the channel closed: {self.connection.failure}")
+        return message
+
+    def close(self) -> None:
+        self.connection.close_device()
+
+
+class QueueTransport:
+    """The executor's end inside the call worker: requests from a queue, replies as frames."""
+
+    def __init__(self, sender: Any, inbox: Any):
+        self.sender = sender
+        self.inbox = inbox
+
+    def send(self, head: bytes, buffers: list[Any]) -> None:
+        try:
+            self.sender.parts(REPLY, DEVICE_STREAM, head, _views(buffers))
+        except OSError as exc:
+            raise TransportClosed(f"the channel closed while writing: {exc}") from exc
+
+    def recv(self) -> tuple[Any, list]:
+        message = self.inbox.get()
+        if message is None:
+            raise TransportClosed("the channel closed")
+        return message
+
+    def close(self) -> None:
+        pass
 
 
 def tensor_view(tensor: Any) -> memoryview:

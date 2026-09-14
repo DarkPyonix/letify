@@ -32,6 +32,9 @@ STDOUT = 5
 STDERR = 6
 SHUTDOWN = 7
 
+#: The stream that carries the PyTorch device executor's messages. Calls take odd ids.
+DEVICE_STREAM = 2
+
 #: The largest payload of one ``DATA`` frame, so other streams interleave between chunks.
 CHUNK = 8 << 20
 
@@ -180,6 +183,12 @@ class Sender:
             views[i].nbytes | _AS_BYTES if type(buffers[i].obj) is bytes else views[i].nbytes
             for i in range(len(views))
         ]
+        self.parts(kind, stream, head, views, marks)
+
+    def parts(self, kind: int, stream: int, head, views: list, marks: list | None = None) -> None:
+        """Send an already pickled head and its buffers, written from the caller's memory."""
+        if marks is None:
+            marks = [view.nbytes for view in views]
         lengths = struct.pack(f"<{len(views)}Q", *marks)
         self.frame(kind, stream, _COUNT.pack(len(views)) + lengths + head)
         for view in views:
@@ -339,6 +348,7 @@ def fd_writer(fd: int):
 __all__ = [
     "CHUNK",
     "DATA",
+    "DEVICE_STREAM",
     "HEADER",
     "HELLO",
     "MAGIC",

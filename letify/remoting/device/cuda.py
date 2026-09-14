@@ -16,7 +16,7 @@ import torch
 from torch.overrides import TorchFunctionMode
 
 from ...errors import UnsupportedMode
-from .tensor import META, FactoryMode, RemoteTensor
+from .tensor import META, SPECIAL, FactoryMode, RemoteTensor
 
 if TYPE_CHECKING:
     from .client import Client
@@ -69,6 +69,10 @@ class CudaMode(TorchFunctionMode):
 
     def __torch_function__(self, func, types, args=(), kwargs=None):
         kwargs = kwargs or {}
+        if args and type(args[0]) is RemoteTensor:
+            special = SPECIAL.get(func)
+            if special is not None:
+                return special(*args, **kwargs)
         rewritten = False
         device = kwargs.get("device")
         if device is not None:

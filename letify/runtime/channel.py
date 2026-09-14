@@ -21,6 +21,7 @@ this process's own streams. It does not own how the bytes move, which each
 from __future__ import annotations
 
 import abc
+import collections
 import contextlib
 import os
 import subprocess
@@ -234,6 +235,8 @@ class Connection:
         self._slots_lock = threading.Lock()
         self._next_stream = 1
         self._tail = _Tail()
+        #: Device executor messages that arrived on ``wire.DEVICE_STREAM``, or None when closed.
+        self._device: collections.deque | None = None
 
     # -- reading ---------------------------------------------------------------
 
@@ -260,6 +263,11 @@ class Connection:
         elif kind == wire.HELLO:
             with self._turn:
                 self.hello = value
+                self._turn.notify_all()
+        elif kind == wire.REPLY and stream == wire.DEVICE_STREAM:
+            with self._turn:
+                if self._device is not None:
+                    self._device.append(value)
                 self._turn.notify_all()
         elif kind == wire.REPLY:
             with self._slots_lock:
@@ -316,6 +324,32 @@ class Connection:
         if self.hello is None:
             raise ProtocolError(str(self.failure))
         return self.hello
+
+    # -- device stream ---------------------------------------------------------
+
+    def open_device(self) -> None:
+        """Keep the messages that arrive on the device stream for ``device_reply``."""
+        with self._turn:
+            self._device = collections.deque()
+
+    def close_device(self) -> None:
+        with self._turn:
+            self._device = None
+            self._turn.notify_all()
+
+    def device_reply(self) -> tuple | None:
+        """The next device stream message, reading frames when it is this thread's turn.
+
+        None when the connection failed or the device stream was closed.
+        """
+        self._wait(lambda: not self._device_open() or bool(self._device))
+        with self._turn:
+            if self._device:
+                return self._device.popleft()
+        return None
+
+    def _device_open(self) -> bool:
+        return self._device is not None
 
     # -- requests --------------------------------------------------------------
 
@@ -428,6 +462,11 @@ class FramedChannel(Channel):
             )
             self._send_worker()
             self._await_ready()
+
+    @property
+    def connection(self) -> Connection:
+        """The open connection, starting the worker first if it is not running."""
+        return self._require()
 
     def _require(self) -> Connection:
         if self._connection is None:

@@ -126,6 +126,27 @@ def test_an_optimizer_takes_its_foreach_path_on_remote_tensors(client) -> None:
     assert client.stats.ops - before < 20
 
 
+def test_a_tensor_method_enters_python_in_the_mode_only(client) -> None:
+    assert forwarding.RemoteTensor.__torch_function__ is torch._C._disabled_torch_function_impl
+    x = torch.zeros(2, device="cuda")
+    assert x.device == torch.device("cuda", 0)
+    assert x.is_cuda and x.get_device() == 0
+
+
+# -- Spec: Operator templates ------------------------------------------------------
+
+
+def test_a_structure_is_described_once_and_later_calls_carry_only_their_scalars(client) -> None:
+    x = torch.ones(4, device="cuda")
+    client.synchronize()
+    before = client.stats.templates
+    x.mul_(2.0)
+    x.mul_(3.0)
+    x.mul_(4.0)
+    assert client.stats.templates == before + 1
+    assert x.cpu().tolist() == [24.0, 24.0, 24.0, 24.0]
+
+
 # -- Spec: Mapping cuda --------------------------------------------------------
 
 
@@ -256,6 +277,194 @@ def test_an_operator_is_counted_when_dispatched_rather_than_when_sent(client, mo
     assert delta.batches == 0
 
 
+def test_a_blocked_write_holds_the_sender_thread_and_not_the_step(client, monkeypatch) -> None:
+    import threading
+    import time
+
+    gate = threading.Event()
+    original = client.transport.send
+
+    def held(head, buffers):
+        gate.wait(10)
+        original(head, buffers)
+
+    monkeypatch.setattr(client.transport, "send", held)
+    x = torch.ones(4, device="cuda")
+    started = time.monotonic()
+    for _ in range(400):
+        x = x * 1.0 + 0.0
+    elapsed = time.monotonic() - started
+    gate.set()
+    assert elapsed < 5.0
+    assert x.sum().item() == 4.0
+
+
+def test_a_read_sends_only_the_entries_its_value_depends_on(client, monkeypatch) -> None:
+    from letify.remoting.device import client as client_module
+
+    monkeypatch.setattr(client_module, "LINGER_S", 60.0)
+    monkeypatch.setattr(client_module, "IDLE_S", 60.0)
+    x = torch.ones(4, device="cuda")
+    client.synchronize()
+    total = (x * 2).sum()
+    later = x + 1
+    assert total.item() == 8.0
+    assert client.queued > 0
+    assert later.cpu().tolist() == [2.0, 2.0, 2.0, 2.0]
+    assert client.queued == 0
+
+
+def test_an_in_place_entry_after_the_producer_sends_the_whole_queue(client, monkeypatch) -> None:
+    from letify.remoting.device import client as client_module
+
+    monkeypatch.setattr(client_module, "LINGER_S", 60.0)
+    x = torch.ones(4, device="cuda")
+    client.synchronize()
+    total = x.sum()
+    x.add_(1.0)
+    assert total.item() == 4.0
+    assert client.queued == 0
+    assert x.cpu().tolist() == [2.0, 2.0, 2.0, 2.0]
+
+
+# -- Spec: Step capture -------------------------------------------------------------
+
+
+def _train(to_device, *, steps, batch=16, sizes=None, read_inside=False, optimizer="adam"):
+    """A small training loop, returning losses, parameters, gradients and optimizer state."""
+    torch.manual_seed(0)
+    data = to_device(torch.randn(256, 8))
+    model = to_device(
+        torch.nn.Sequential(torch.nn.Linear(8, 32), torch.nn.ReLU(), torch.nn.Linear(32, 8))
+    )
+    if optimizer == "adam":
+        opt = torch.optim.Adam(model.parameters(), lr=1e-2)
+    else:
+        opt = torch.optim.SGD(model.parameters(), lr=1e-2, momentum=0.9)
+    losses = []
+    for step in range(steps):
+        size = sizes(step) if sizes else batch
+        start = (step * 7) % (256 - size)
+        chunk = data[start : start + size]
+        loss = torch.nn.functional.mse_loss(model(chunk), chunk)
+        if read_inside:
+            losses.append(loss.item())
+        opt.zero_grad()
+        loss.backward()
+        opt.step()
+        if not read_inside:
+            losses.append(loss.detach())
+    losses = [float(value) for value in losses]
+    params = [p.detach().cpu() for p in model.parameters()]
+    grads = [p.grad.detach().cpu() for p in model.parameters()]
+    state = [
+        value.detach().cpu()
+        for p in model.parameters()
+        for value in opt.state[p].values()
+        if isinstance(value, torch.Tensor)
+    ]
+    return losses, params, grads, state
+
+
+def _assert_same(remote, local) -> None:
+    remote_losses, *remote_tensors = remote
+    local_losses, *local_tensors = local
+    assert remote_losses == pytest.approx(local_losses, rel=1e-5, abs=1e-6)
+    for remote_group, local_group in zip(remote_tensors, local_tensors, strict=True):
+        assert len(remote_group) == len(local_group)
+        for got, want in zip(remote_group, local_group, strict=True):
+            assert torch.allclose(got, want, rtol=1e-5, atol=1e-6)
+
+
+def test_a_repeated_training_step_is_captured_once_and_replayed(client) -> None:
+    with client.suspended():
+        local = _train(lambda value: value, steps=12)
+    before = client.stats.snapshot()
+    remote = _train(lambda value: value.cuda(), steps=12)
+    delta = client.stats.snapshot() - before
+    _assert_same(remote, local)
+    assert delta.steps == 1
+    assert delta.fallbacks == 0
+    # Steps one to three run eagerly: the first initializes Adam, the next two are detection.
+    assert delta.replayed >= delta.ops // 2
+
+
+def test_a_replayed_repetition_is_one_entry_not_one_per_operator(client, monkeypatch) -> None:
+    from letify.remoting.device import client as client_module
+
+    monkeypatch.setattr(client_module, "LINGER_S", 60.0)
+    steps = 20
+    before = client.stats.snapshot()
+    _train(lambda value: value.cuda(), steps=steps, optimizer="sgd")
+    client.synchronize()
+    delta = client.stats.snapshot() - before
+    eager = delta.ops - delta.replayed
+    # Operators and reads both count in ops, so the step's own length divides replayed.
+    size = len(client.tracer.active.ops)
+    repetitions = -(-delta.replayed // size)
+    assert repetitions >= steps // 2
+    # Every eager operator is one entry, and every repetition adds one more.
+    assert delta.entries <= eager + repetitions + 2
+
+
+def test_optimizer_state_advances_through_replayed_steps_as_it_does_eagerly(client) -> None:
+    with client.suspended():
+        local = _train(lambda value: value, steps=10, optimizer="sgd")
+    remote = _train(lambda value: value.cuda(), steps=10, optimizer="sgd")
+    _assert_same(remote, local)
+    assert client.stats.replayed > 0
+
+
+def test_a_step_whose_shape_changes_mid_run_falls_back_and_matches_eager(client) -> None:
+    def sizes(step):
+        return 24 if step in (7, 8) else 16
+
+    with client.suspended():
+        local = _train(lambda value: value, steps=16, sizes=sizes)
+    before = client.stats.snapshot()
+    remote = _train(lambda value: value.cuda(), steps=16, sizes=sizes)
+    delta = client.stats.snapshot() - before
+    _assert_same(remote, local)
+    assert delta.fallbacks >= 1
+    assert delta.replayed > 0
+
+
+def test_a_read_inside_a_repetition_sends_the_part_so_far_and_the_step_continues(client) -> None:
+    with client.suspended():
+        local = _train(lambda value: value, steps=12, read_inside=True)
+    before = client.stats.snapshot()
+    remote = _train(lambda value: value.cuda(), steps=12, read_inside=True)
+    delta = client.stats.snapshot() - before
+    _assert_same(remote, local)
+    assert delta.replayed > 0
+    assert delta.fallbacks == 0
+
+
+def test_an_error_inside_a_replayed_step_names_its_operator(client) -> None:
+    table = torch.arange(8.0).cuda()
+    total = torch.zeros((), device="cuda")
+    for step in range(12):
+        position = 50 if step == 10 else step % 8
+        picked = table[torch.tensor([position]).cuda()]
+        total = total + picked.sum() * 1.0 + 0.0
+        total = total * 1.0 - 0.0
+        total = total + 0.0
+    assert client.stats.replayed > 0
+    with pytest.raises(RemoteError, match=r"aten\.index"):
+        torch.cuda.synchronize()
+    assert table.cpu().tolist() == [float(value) for value in range(8)]
+
+
+def test_handles_created_in_repetitions_are_released(client) -> None:
+    _train(lambda value: value.cuda(), steps=4)
+    gc.collect()
+    first = client.live_handles()
+    _train(lambda value: value.cuda(), steps=16)
+    gc.collect()
+    assert client.live_handles() == first
+    assert client.stats.replayed > 0
+
+
 # -- Spec: Handles --------------------------------------------------------------
 
 
@@ -283,7 +492,10 @@ def test_detach_shares_the_handle_instead_of_sending_an_operator(client) -> None
 def test_a_buffer_travels_beside_the_head_rather_than_inside_it() -> None:
     read_a, write_a = os.pipe()
     sender = frames.StreamTransport(read_fd=None, write_fd=write_a)
-    receiver = frames.StreamTransport(read_fd=read_a, write_fd=None)
+    # The executor's end: the client sends REQUEST frames, so that is what this end reads.
+    from letify.protocol import wire
+
+    receiver = frames.StreamTransport(read_fd=read_a, write_fd=None, incoming=wire.REQUEST)
     payload = torch.arange(1 << 16, dtype=torch.int32)
     view = frames.tensor_view(payload)
     assert view.nbytes == payload.numel() * 4
@@ -367,6 +579,20 @@ def test_a_host_local_function_runs_here_and_computes_on_the_runtime(let, cpu) -
     pid, value = step()
     assert pid == os.getpid()
     assert value == 64.0
+
+
+def test_a_session_executor_rides_the_call_channel_with_buffers_beside_the_head(let, cpu) -> None:
+    @let.function(device=cpu, host="local")
+    def probe() -> tuple[str, bool, bool]:
+        client = forwarding.current_client()
+        data = torch.randn(1 << 20)
+        back = data.cuda().cpu()
+        return type(client.transport).__name__, client.process is None, torch.equal(back, data)
+
+    name, no_process, equal = probe()
+    assert name == "ChannelTransport"
+    assert no_process
+    assert equal
 
 
 def test_host_local_is_refused_without_torch(let, cpu, monkeypatch) -> None:

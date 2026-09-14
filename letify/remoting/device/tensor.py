@@ -1,9 +1,10 @@
 """RemoteTensor and operator dispatch.
 
 This module owns the local stand-in for a tensor on the runtime and turning each ATen
-operator into a queued request, as spec "Dispatch mechanism" describes: output metadata is
-computed locally on meta tensors, and only values travel. It does not own the queue or the
-wire, which are ``client``, or the mapping of ``"cuda"``, which is ``cuda``.
+operator into a structure, scalars, handles and blobs, as spec "Dispatch mechanism"
+describes: output metadata is computed locally on meta tensors, and only values travel. It
+does not own the queue, templates or step capture, which are ``client`` and ``trace``, or
+the mapping of ``"cuda"``, which is ``cuda``.
 """
 
 from __future__ import annotations
@@ -29,6 +30,13 @@ REPORTED = torch.device("cuda", 0)
 #: not flush the queue.
 INLINE_BYTES = 4096
 
+_DETACH = aten.detach.default
+_ALIAS = aten.alias.default
+_SCALAR = aten._local_scalar_dense.default
+_TO_COPY = aten._to_copy.default
+_COPY = aten.copy_.default
+_make_wrapper = torch.Tensor._make_wrapper_subclass  # type: ignore[attr-defined]
+
 
 class Ref:
     """One handle on the runtime, shared by every RemoteTensor that names it."""
@@ -46,45 +54,65 @@ class Ref:
             pass
 
 
-class RemoteTensor(torch.Tensor):
-    """A tensor whose values live on the runtime and whose metadata lives here."""
+class Big:
+    """A CPU tensor larger than ``INLINE_BYTES``, sent as an out-of-band buffer."""
 
-    _meta: torch.Tensor
+    __slots__ = ("keep", "view")
+
+    def __init__(self, view: memoryview, keep: torch.Tensor):
+        self.view = view
+        self.keep = keep
+
+
+class RemoteTensor(torch.Tensor):
+    """A tensor whose values live on the runtime and whose metadata lives here.
+
+    ``_sig`` is ``(shape, strides, storage offset, dtype)``. The meta tensor is built from it
+    only when an inference needs one.
+    """
+
+    _sig: tuple
     _ref: Ref
+    _m: torch.Tensor | None
 
     @staticmethod
-    def __new__(cls, meta: torch.Tensor, ref: Ref) -> RemoteTensor:
-        made = torch.Tensor._make_wrapper_subclass(  # type: ignore[attr-defined]
+    def __new__(cls, sig: tuple, ref: Ref) -> RemoteTensor:
+        made = _make_wrapper(
             cls,
-            meta.size(),
-            strides=meta.stride(),
-            storage_offset=meta.storage_offset(),
-            dtype=meta.dtype,
+            sig[0],
+            strides=sig[1],
+            storage_offset=sig[2],
+            dtype=sig[3],
             device=META,
             requires_grad=False,
         )
-        made._meta = meta
+        made._sig = sig
+        #: The signature without its storage offset, which a template and a step compare.
+        made._form = (sig[0], sig[1], sig[3])
         made._ref = ref
+        made._m = None
         return made
 
-    def __init__(self, meta: torch.Tensor, ref: Ref):
+    def __init__(self, sig: tuple, ref: Ref):
         pass
 
-    @classmethod
-    def __torch_function__(cls, func, types, args=(), kwargs=None):
-        kwargs = kwargs or {}
-        special = _SPECIAL.get(func)
-        if special is not None:
-            return special(*args, **kwargs)
-        with torch._C.DisableTorchFunctionSubclass():
-            return func(*args, **kwargs)
+    # Tensor methods enter Python once, in cuda.CudaMode, which answers the specials below.
+    __torch_function__ = torch._C._disabled_torch_function_impl  # type: ignore[assignment]
 
     @classmethod
     def __torch_dispatch__(cls, func, types, args=(), kwargs=None):
         return dispatch(func, args, kwargs or {}, None)
 
 
-# -- torch function specials -----------------------------------------------------
+def meta_of(tensor: RemoteTensor) -> torch.Tensor:
+    """The tensor's meta counterpart, built on first use."""
+    meta = tensor._m
+    if meta is None:
+        meta = tensor._m = _meta_like(*tensor._sig)
+    return meta
+
+
+# -- torch function specials, answered by cuda.CudaMode ------------------------------
 
 
 def _repr(self: RemoteTensor, *args: Any, **kwargs: Any) -> str:
@@ -98,11 +126,13 @@ def _set_data(self: RemoteTensor, value: Any) -> None:
     with torch._C.DisableTorchFunctionSubclass():
         torch.Tensor.data.__set__(self, value)  # type: ignore[attr-defined]
     if isinstance(value, RemoteTensor):
-        self._meta = value._meta
+        self._sig = value._sig
+        self._form = value._form
+        self._m = value._m
         self._ref = value._ref
 
 
-_SPECIAL = {
+SPECIAL = {
     torch.Tensor.device.__get__: lambda self: REPORTED,  # type: ignore[attr-defined]
     torch.Tensor.is_cuda.__get__: lambda self: True,  # type: ignore[attr-defined]
     torch.Tensor.is_meta.__get__: lambda self: False,  # type: ignore[attr-defined]
@@ -145,104 +175,151 @@ def _has_remote(values: Any) -> bool:
     return False
 
 
-class _Prepared:
-    """What one pass over an operator's arguments collected."""
-
-    __slots__ = ("big", "buffers", "client", "floats_keyed", "inputs", "keep", "key", "order")
-
-    def __init__(self, client: Client | None, floats_keyed: bool = True):
-        self.client = client
-        #: id of an input's meta tensor to its position in ``order``.
-        self.inputs: dict[int, int] = {}
-        #: The RemoteTensor inputs in the order they were met.
-        self.order: list[RemoteTensor] = []
-        self.buffers: list[memoryview] = []
-        self.keep: list[torch.Tensor] = []
-        self.key: list[Any] = []
-        self.big = False
-        self.floats_keyed = floats_keyed
-
-
-def _signature(tensor: torch.Tensor) -> tuple:
+def signature(tensor: torch.Tensor) -> tuple:
     return (tuple(tensor.shape), tensor.stride(), tensor.storage_offset(), tensor.dtype)
 
 
-def _prepare(value: Any, state: _Prepared) -> tuple[Any, Any]:
-    """Return ``(meta_value, encoded_value)`` for one argument, extending the cache key."""
+def _dtype_name(dtype: torch.dtype) -> str:
+    return str(dtype).split(".")[-1]
+
+
+def _read(
+    values: Any, parts: list, scalars: list, tensors: list, blobs: list, client_box: list
+) -> bool:
+    """Append one level of arguments to the structure, scalars, tensors and blobs.
+
+    ``client_box`` collects the storage offset of each tensor argument, which keys metadata
+    but not the template. Returns True when a CPU tensor larger than ``INLINE_BYTES`` was read.
+    """
+    big = False
+    for value in values:
+        kind = type(value)
+        if kind is RemoteTensor:
+            tensors.append(value)
+            parts.append(value._form)
+            client_box.append(value._sig[2])
+        elif kind is int or kind is float:
+            parts.append(kind)
+            scalars.append(value)
+        elif kind is list or kind is tuple:
+            parts.append((kind, len(value)))
+            big = _read(value, parts, scalars, tensors, blobs, client_box) or big
+        elif value is None or kind is bool or kind is str:
+            parts.append(value)
+        elif isinstance(value, torch.Tensor):
+            big = _read_tensor(value, parts, scalars, tensors, blobs, client_box) or big
+        elif kind is torch.device or kind in (torch.dtype, torch.memory_format, torch.layout):
+            parts.append(value)
+        else:
+            raise UnsupportedMode(
+                f"an argument of type {kind.__name__} cannot be forwarded to the runtime"
+            )
+    return big
+
+
+def _read_tensor(
+    value: torch.Tensor, parts: list, scalars: list, tensors: list, blobs: list, client_box: list
+) -> bool:
+    if isinstance(value, RemoteTensor):  # pragma: no cover - a subclass of RemoteTensor
+        cast = torch.Tensor.as_subclass(value, RemoteTensor)
+        cast._sig, cast._ref, cast._m = value._sig, value._ref, value._m
+        cast._form = value._form
+        return _read((cast,), parts, scalars, tensors, blobs, client_box)
+    if value.device.type == "meta":
+        # The autograd engine's zero gradient, built from the wrapper's metadata.
+        parts.append(("zeros", *signature(value)))
+        return False
+    if value.device.type != "cpu":
+        raise UnsupportedMode(
+            f"a tensor on {value.device} cannot be sent to the runtime, only CPU tensors can"
+        )
+    host = value.detach().contiguous()
+    parts.append(("cpu", tuple(host.shape), host.dtype))
+    from .frames import tensor_view
+
+    view = tensor_view(host)
+    if view.nbytes <= INLINE_BYTES:
+        blobs.append(bytes(view))
+        return False
+    blobs.append(Big(view, host))
+    return True
+
+
+def layout(args: tuple, kwargs: dict) -> tuple:
+    """The argument layout of a template: positions for handles, scalars and blobs."""
+    counters = [0, 0, 0]
+
+    def encode(value: Any) -> Any:
+        kind = type(value)
+        if isinstance(value, RemoteTensor):
+            counters[0] += 1
+            return ("h", counters[0] - 1)
+        if kind is int or kind is float:
+            counters[1] += 1
+            return ("s", counters[1] - 1)
+        if kind is list or kind is tuple:
+            return ("l" if kind is list else "t", [encode(item) for item in value])
+        if value is None or kind is bool or kind is str:
+            return value
+        if isinstance(value, torch.Tensor):
+            if value.device.type == "meta":
+                return ("z", tuple(value.shape), tuple(value.stride()), _dtype_name(value.dtype))
+            counters[2] += 1
+            return ("b", counters[2] - 1, _dtype_name(value.dtype), tuple(value.shape))
+        if kind is torch.device:
+            return ("dev", "remote") if value.type == "meta" else ("dev", str(value))
+        return ("a", _dtype_name(value))  # a dtype, memory format or layout
+
+    return [encode(value) for value in args], {key: encode(value) for key, value in kwargs.items()}
+
+
+def _meta_args(value: Any) -> Any:
     kind = type(value)
-    if value is None or kind is str:
-        state.key.append(value)
-        return value, value
-    if kind is int or kind is bool:
-        state.key.append((kind, value))
-        return value, value
-    if kind is float:
-        state.key.append((kind, value) if state.floats_keyed else kind)
-        return value, value
     if kind is RemoteTensor:
-        if state.client is None:
-            state.client = value._ref.client
-        meta = value._meta
-        state.inputs.setdefault(id(meta), len(state.order))
-        state.order.append(value)
-        state.key.append(_signature(meta))
-        return meta, ("h", value._ref.handle)
+        return meta_of(value)
     if kind is list or kind is tuple:
-        state.key.append((kind, len(value)))
-        metas = []
-        codes = []
-        for item in value:
-            meta, code = _prepare(item, state)
-            metas.append(meta)
-            codes.append(code)
-        return kind(metas), ("l" if kind is list else "t", codes)
+        return kind(_meta_args(item) for item in value)
     if isinstance(value, torch.Tensor):
         if isinstance(value, RemoteTensor):  # pragma: no cover - a subclass of RemoteTensor
-            return _prepare(torch.Tensor.as_subclass(value, RemoteTensor), state)
-        if value.device.type == "meta":
-            # The autograd engine's zero gradient, built from the wrapper's metadata.
-            state.key.append(("zeros", *_signature(value)))
-            dtype = str(value.dtype).split(".")[-1]
-            return value, ("z", tuple(value.shape), tuple(value.stride()), dtype)
-        if value.device.type != "cpu":
-            raise UnsupportedMode(
-                f"a tensor on {value.device} cannot be sent to the runtime, only CPU tensors can"
-            )
-        host = value.detach().contiguous()
-        meta = torch.empty_strided(host.shape, host.stride(), dtype=host.dtype, device=META)
-        state.key.append(("cpu", *_signature(host)))
-        dtype = str(host.dtype).split(".")[-1]
-        from .frames import tensor_view
-
-        view = tensor_view(host)
-        if view.nbytes <= INLINE_BYTES:
-            return meta, ("b", None, dtype, tuple(host.shape), bytes(view))
-        state.keep.append(host)
-        state.buffers.append(view)
-        state.big = True
-        return meta, ("b", len(state.buffers) - 1, dtype, tuple(host.shape), None)
-    if kind is torch.device:
-        state.key.append(value)
-        if value.type == "meta":
-            return value, ("dev", "remote")
-        return value, ("dev", str(value))
-    if kind in (torch.dtype, torch.memory_format, torch.layout):
-        state.key.append(value)
-        return value, ("a", str(value).split(".")[-1])
-    raise UnsupportedMode(f"an argument of type {kind.__name__} cannot be forwarded to the runtime")
+            return _meta_like(*value._sig)
+        if value.device.type == "cpu":
+            return torch.empty_strided(value.shape, value.stride(), dtype=value.dtype, device=META)
+    return value
 
 
-def _shared(func: Any) -> bool:
-    return func is aten.detach.default or func is aten.alias.default
+class Plan:
+    """An operator's outputs, so a later call with the same key can rebuild them."""
 
+    __slots__ = ("container", "leaves", "shape_id")
+
+    def __init__(self, container: type | None, leaves: tuple):
+        self.container = container
+        self.leaves = leaves
+        # Storage offsets are left out, so a slice at a new position each step keeps its id.
+        form = tuple(
+            (leaf[0], (leaf[1][0], leaf[1][1], leaf[1][3])) if leaf[0] == _NEW else leaf
+            for leaf in leaves
+        )
+        try:
+            self.shape_id = _SHAPES.setdefault(form, len(_SHAPES))
+        except TypeError:  # pragma: no cover - an output value that cannot be hashed
+            self.shape_id = -id(self)
+
+
+#: Output layouts numbered, so step capture compares one integer per operator.
+_SHAPES: dict[tuple, int] = {}
 
 #: Inferred output metadata by operator and argument key. Cleared when it grows past
 #: ``_CACHE_LIMIT`` entries, which a training loop with fixed shapes never reaches.
-_CACHE: dict[tuple, tuple] = {}
+_CACHE: dict[tuple, Plan] = {}
 _CACHE_LIMIT = 1 << 16
 
-#: The printable overload name of each operator, as the runtime resolves it.
-_NAMES: dict[Any, str] = {}
+#: The printable overload name of each operator, and whether its float scalars key metadata.
+_NAMES: dict[Any, tuple[str, bool]] = {}
+
+_NEW = 0
+_IN = 1
+_VALUE = 2
 
 
 def _meta_like(shape: tuple, stride: tuple, offset: int, dtype: torch.dtype) -> torch.Tensor:
@@ -257,99 +334,111 @@ def _meta_like(shape: tuple, stride: tuple, offset: int, dtype: torch.dtype) -> 
 
 def dispatch(func: Any, args: tuple, kwargs: dict, client: Client | None) -> Any:
     """Run one ATen operator: metadata here, values on the runtime."""
-    name = _NAMES.get(func)
-    if name is None:
-        name = _NAMES[func] = str(func)
-    state = _Prepared(client, floats_keyed="_foreach_" not in name)
-    meta_args, code_args = _prepare(args, state)
-    meta_kwargs = {}
-    code_kwargs = {}
-    for key, value in kwargs.items():
-        state.key.append(key)
-        meta_kwargs[key], code_kwargs[key] = _prepare(value, state)
-    client = state.client
-    if client is None:  # pragma: no cover - dispatch is only reached with a client
-        return func(*args, **kwargs)
-
-    if _shared(func) and isinstance(args[0], RemoteTensor):
+    if func is _DETACH or func is _ALIAS:
         source = args[0]
-        return RemoteTensor(func(source._meta), source._ref)
+        if type(source) is RemoteTensor:
+            return RemoteTensor(source._sig, source._ref)
 
-    if func is aten._local_scalar_dense.default:
-        results, _buffers = client.request([(name, code_args[1], code_kwargs, None, "value")])
-        return results[-1]
+    named = _NAMES.get(func)
+    if named is None:
+        name = str(func)
+        named = _NAMES[func] = (name, "_foreach_" not in name)
+    name, floats_keyed = named
 
-    if func is aten._to_copy.default:
+    if func is _SCALAR and type(args[0]) is RemoteTensor:
+        return args[0]._ref.client.read_value(args[0])
+
+    if func is _TO_COPY and type(args[0]) is RemoteTensor:
         target = kwargs.get("device")
         if target is not None and torch.device(target).type == "cpu":
             dtype = kwargs.get("dtype")
-            return client.fetch(args[0], None if dtype is None else str(dtype).split(".")[-1])
+            return args[0]._ref.client.fetch(args[0], None if dtype is None else _dtype_name(dtype))
 
-    copies_to_host = func is aten.copy_.default and not isinstance(args[0], RemoteTensor)
-    if copies_to_host and isinstance(args[1], RemoteTensor):
-        args[0].copy_(client.fetch(args[1], None))
+    if func is _COPY and not isinstance(args[0], RemoteTensor) and type(args[1]) is RemoteTensor:
+        args[0].copy_(args[1]._ref.client.fetch(args[1], None))
         return args[0]
 
-    cache_key = (func, *state.key)
+    parts: list = [func]
+    scalars: list = []
+    tensors: list = []
+    blobs: list = []
+    box: list = []
+    big = _read(args, parts, scalars, tensors, blobs, box)
+    if kwargs:
+        for key, value in kwargs.items():
+            parts.append(key)
+            big = _read((value,), parts, scalars, tensors, blobs, box) or big
+    if client is None:
+        if not tensors:  # pragma: no cover - dispatch is only reached with a client
+            return func(*args, **kwargs)
+        client = tensors[0]._ref.client
+    structure = tuple(parts)
+    if floats_keyed:
+        key = (structure, *box, *scalars)
+    else:
+        key = (structure, *box, *[value for value in scalars if type(value) is int])
     try:
-        plan = _CACHE.get(cache_key)
+        plan = _CACHE.get(key)
     except TypeError:  # pragma: no cover - an argument value that cannot be hashed
-        cache_key, plan = None, None
+        key, plan = None, None
 
     if plan is None:
         try:
-            meta_out = func(*meta_args, **meta_kwargs)
+            meta_out = func(*_meta_args(args), **{k: _meta_args(v) for k, v in kwargs.items()})
         except Exception:
-            return client.execute_now(name, code_args[1], code_kwargs, state)
-        plan = _plan(name, meta_out, state)
-        if cache_key is not None:
+            return client.execute_now(structure, name, args, kwargs, tensors, scalars, blobs)
+        plan = _plan(name, meta_out, tensors)
+        if key is not None:
             if len(_CACHE) >= _CACHE_LIMIT:
                 _CACHE.clear()
-            _CACHE[cache_key] = plan
+            _CACHE[key] = plan
     else:
         client.stats.cached += 1
 
-    container, leaves = plan
-    outs: list[int | None] = []
-    results: list[Any] = []
-    for leaf in leaves:
+    outs: list = []
+    results: list = []
+    for leaf in plan.leaves:
         tag = leaf[0]
-        if tag == "new":
-            handle = client.new_handle()
+        if tag == _NEW:
+            handle = client._next_handle
+            client._next_handle = handle + 1
             outs.append(handle)
-            results.append(RemoteTensor(_meta_like(*leaf[1:]), Ref(client, handle)))
-        elif tag == "in":
+            results.append(RemoteTensor(leaf[1], Ref(client, handle)))
+        elif tag == _IN:
             outs.append(None)
-            results.append(state.order[leaf[1]])
+            results.append(tensors[leaf[1]])
         else:
             results.append(leaf[1])
-    client.enqueue((name, code_args[1], code_kwargs, outs, None), state)
-    if container is None:
+    client.put(structure, name, args, kwargs, plan, tensors, scalars, blobs, outs, big)
+    if plan.container is None:
         return results[0]
-    return container(results)
+    return plan.container(results)
 
 
-def _plan(name: str, meta_out: Any, state: _Prepared) -> tuple:
-    """Describe an operator's outputs so a later call with the same key can rebuild them."""
+def _plan(name: str, meta_out: Any, tensors: list) -> Plan:
     container = type(meta_out) if isinstance(meta_out, (list, tuple)) else None
     leaves = meta_out if container is not None else (meta_out,)
+    positions: dict[int, int] = {}
+    for position, tensor in enumerate(tensors):
+        if tensor._m is not None:
+            positions.setdefault(id(tensor._m), position)
     planned: list[tuple] = []
     for leaf in leaves:
         if not isinstance(leaf, torch.Tensor):
-            planned.append(("value", leaf))
+            planned.append((_VALUE, leaf))
             continue
-        position = state.inputs.get(id(leaf))
+        position = positions.get(id(leaf))
         if position is None:
-            planned.append(("new", *_signature(leaf)))
+            planned.append((_NEW, signature(leaf)))
             continue
-        existing = state.order[position]
+        existing = tensors[position]
         if leaf.shape != existing.shape or leaf.stride() != existing.stride():
             raise UnsupportedMode(
                 f"{name} changed the shape of a tensor in place, which host='local' "
                 f"cannot mirror on the local wrapper"
             )
-        planned.append(("in", position))
-    return container, tuple(planned)
+        planned.append((_IN, position))
+    return Plan(container, tuple(planned))
 
 
 def from_description(client: Client, first: int, described: tuple) -> Any:
@@ -360,10 +449,8 @@ def from_description(client: Client, first: int, described: tuple) -> Any:
     for leaf in leaves:
         if leaf[0] == "t":
             _, size, stride, offset, dtype = leaf
-            meta = torch.empty_strided(size, stride, dtype=getattr(torch, dtype), device=META)
-            if offset:
-                meta = meta.as_strided(size, stride, offset)
-            results.append(RemoteTensor(meta, Ref(client, handle)))
+            sig = (tuple(size), tuple(stride), offset, getattr(torch, dtype))
+            results.append(RemoteTensor(sig, Ref(client, handle)))
             handle += 1
         else:
             results.append(leaf[1])
