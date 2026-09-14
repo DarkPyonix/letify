@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import sys
 from importlib import import_module
 from pathlib import Path
 
@@ -1140,14 +1141,14 @@ def test_modal_refuses_forwarding_because_there_is_no_device_to_forward_at() -> 
 def test_a_provider_without_a_fast_path_warns_with_its_round_trip_and_then_tries(
     isolated_home, patch_which, monkeypatch
 ) -> None:
-    # The warning carries the arithmetic. The refusal that follows is about letify-core
-    # being absent from this machine, not about the latency.
+    # The warning carries the arithmetic. The refusal that follows is about PyTorch being
+    # absent from this process, not about the latency.
     patch_which(tools_module, present=True)
-    monkeypatch.setattr(probe_module, "core_path", lambda: None)
+    monkeypatch.setitem(sys.modules, "torch", None)
     provider = provider_of(Colab, "colab_a")
     with (
         pytest.warns(UserWarning, match="round trip of about 175 ms"),
-        pytest.raises(letify.UnsupportedMode, match="letify-core"),
+        pytest.raises(letify.UnsupportedMode, match="PyTorch"),
     ):
         provider.check_mode(provider.G4._placed("local"))
 
@@ -1155,16 +1156,11 @@ def test_a_provider_without_a_fast_path_warns_with_its_round_trip_and_then_tries
 def test_a_provider_with_a_fast_path_does_not_warn(
     patch_run, recwarn, monkeypatch, tmp_path
 ) -> None:
-    # A letify-core build on the developer's machine must not decide this answer.
-    import importlib
-
-    probe_module = importlib.import_module("letify.remoting.probe")
-
-    monkeypatch.setattr(probe_module, "LIB_DIR", tmp_path)
-    monkeypatch.delenv("LETIFY_CORE_PATH", raising=False)
+    # Whether PyTorch is installed in the test environment must not decide this answer.
+    monkeypatch.setitem(sys.modules, "torch", None)
     patch_run(shell_module)
     provider = provider_of(Shell, "lab", address="gpu.example.edu", gpus=["A100"])
-    with pytest.raises(letify.UnsupportedMode, match="letify-core"):
+    with pytest.raises(letify.UnsupportedMode, match="PyTorch"):
         provider.check_mode(provider.A100._placed("local"))
     assert [w for w in recwarn if "round trip" in str(w.message)] == []
 

@@ -85,6 +85,12 @@ class Runtime:
     #: Digests this runtime is known to hold, so an argument is sent once.
     _blobs: set[str] = field(default_factory=set, repr=False)
 
+    #: The interpreter the session built or was given, once known. A device worker uses it.
+    python: str | None = None
+
+    #: The PyTorch device worker's client, started on the first host='local' call.
+    device_client: Any = field(default=None, repr=False)
+
     #: Digests of immutable arguments already hashed, so a repeated one is not hashed again.
     _digests: protocol.DigestCache = field(default_factory=protocol.DigestCache, repr=False)
 
@@ -137,6 +143,9 @@ class Runtime:
     def shutdown(self) -> None:
         """Stop everything that bills for this runtime."""
         self.ready = False
+        if self.device_client is not None:
+            client, self.device_client = self.device_client, None
+            client.close()
         if self.worker_pid is not None:
             self.provider.remove_worker_pid(self.worker_pid)
             self.worker_pid = None
@@ -150,6 +159,16 @@ class Runtime:
                 pass
             self.channel = None
         self.provider.stop(self)
+
+    def device(self) -> Any:
+        """The PyTorch device worker for host='local', started on first use."""
+        if self.device_client is None:
+            from ..remoting.device.client import connect
+
+            command, env = self.provider.device_command(self)
+            kind = "cuda" if self.instance.gpu else "cpu"
+            self.device_client = connect(command, device=kind, env=env, name=f"{self.name}-device")
+        return self.device_client
 
     # -- requests ------------------------------------------------------------
 
@@ -378,6 +397,7 @@ class Runtime:
         if not self.provider.prepares_env:
             return
         if self.provider.managed_python:
+            self.python = self.provider.managed_python
             self.require_cloudpickle()
             return
         from . import bootstrap
@@ -414,6 +434,7 @@ class Runtime:
                 self.volumes[0].cache_env_from(
                     self, self.env, where["root"], platform=self.platform
                 )
+        self.python = where["python"]
         self.channel.switch_interpreter(where["python"])
 
     def require_cloudpickle(self) -> None:

@@ -2,7 +2,7 @@
 
 Enough to answer what comes up before any code is written: which providers are declared,
 what they offer, what is running right now, whether a machine answers, and whether
-forwarding CUDA calls to it is worth doing.
+forwarding PyTorch operators to it is worth doing.
 """
 
 from __future__ import annotations

@@ -209,8 +209,8 @@ class Launcher:
 
         ``device`` carries the provider, the account and the accelerator, and the core
         count and memory come with it rather than being asked for. ``host`` says where the
-        host code runs: ``"local"``, the default, keeps Python here and forwards only CUDA
-        calls, and ``"remote"`` ships this function to the machine with the GPU.
+        host code runs: ``"local"``, the default, keeps Python here and forwards only PyTorch
+        operators, and ``"remote"`` ships this function to the machine with the GPU.
 
         There is no width argument. Concurrent calls run as wide as the provider has devices
         for, which the provider entry already says.

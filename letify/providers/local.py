@@ -127,6 +127,17 @@ class Local(Provider):
 
         return PersistentChannel([str(interpreter), "-u", "-c", BOOTSTRAP], name=runtime.name)
 
+    def device_command(self, runtime: Runtime) -> tuple[list[str], dict[str, str] | None]:
+        """A PyTorch device worker as a subprocess of this machine, seeing the session's cards."""
+        from ..remoting.device.client import worker_command
+
+        interpreter = str(self.config.option("python") or sys.executable)
+        visible = self.visible_devices(runtime.held_devices)
+        env = None
+        if visible is not None:
+            env = {"CUDA_VISIBLE_DEVICES": visible, "CUDA_DEVICE_ORDER": "PCI_BUS_ID"}
+        return worker_command(interpreter), env
+
 
 __all__ = ["Local"]
 

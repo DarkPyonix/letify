@@ -95,9 +95,9 @@ Many configurations are many calls. Inside `with let.keep_alive():`, `asyncio.ga
 
 `Env` is keyed by the hash of `uv.lock`. One lock file resolves for every platform, so a Windows or macOS client drives a Linux runtime. Packages in the lock file are installed remotely by name; the project's own code travels with the call.
 
-### CUDA call forwarding
+### PyTorch forwarding
 
-`host="local"` keeps Python here and forwards only driver calls, through [letify-core](letify-core/). Only a call whose result the host reads waits for an answer, so the round trip count is the number of host synchronizations rather than the number of calls.
+`host="local"` keeps Python, the data and the libraries here and runs PyTorch operators on the runtime's GPU, through PyTorch's own `__torch_dispatch__` extension point. Code written for `"cuda"` runs unchanged, with any local PyTorch build including a CPU one. Operators are queued and sent in batches and only a read of a value waits for the runtime, so the round trip count is the number of host synchronizations rather than the number of operators. `letify.remoting.device.current_client().stats` reports both counts from inside the function.
 
 ## Public API
 
@@ -134,7 +134,7 @@ Launcher(
 ```python
 @let.function(
     device=colab.G4,       # an Instance, carrying provider, account and accelerator
-    host="remote",         # letify.local forwards CUDA calls, letify.remote ships the function
+    host="remote",         # letify.local forwards PyTorch operators, letify.remote ships the function
     env=env,               # an Env; defaults to Env()
     volumes=[cache],       # volumes to attach
     timeout=None,          # seconds one call may take; no default deadline
@@ -285,7 +285,7 @@ uv add letify
 
 That is the only install. `letify` installs cloudpickle and blake3 and nothing else. Provider tools run out of process through uv, never in the user's `.venv`, so uv must be installed. letify finds it from the `UV` environment variable, then `PATH`, and raises a clear error if it is absent.
 
-`host="local"` additionally needs [letify-core](letify-core/) built with `python letify-core/build.py`, which requires a Rust toolchain.
+`host="local"` additionally needs PyTorch 2.1 or newer in the project, locally and in the runtime's environment, with the same major.minor version on both sides. letify never installs it: torch is the project's own dependency.
 
 ## How this project is built
 
@@ -295,7 +295,7 @@ Spec driven and test driven. [docs/SPEC.md](docs/SPEC.md) is the source of truth
 
 Stated plainly so nobody builds on a promise. The same list, with detail, is at the end of [docs/SPEC.md](docs/SPEC.md).
 
-- `letify-driver` covers the entry points a PyTorch process needs to start up and run one kernel. Anything else names itself and returns `CUDA_ERROR_NOT_SUPPORTED`.
+- `host="local"` forwards to one device per session and does not provide CUDA streams, events, graphs or generator state. Custom CUDA extensions compiled in this process cannot run on the runtime.
 - `Modal` and `Elice` follow each service's published interface but have not been run against the live services.
 - Whether `ssh -L` works over `colab ssh --proxy-mode` is unverified.
 - Persistence detection by marker file is a decision in the spec, not yet code.

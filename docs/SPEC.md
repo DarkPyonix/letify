@@ -199,15 +199,31 @@ The reading is taken at the moment it is asked for and carries no history. A loa
 
 **Function shipping** (`host="remote"`) serializes the declared function with cloudpickle and runs it inside the runtime. The whole loop executes there, so its host synchronizations never cross the network.
 
-**Call forwarding** (`host="local"`) keeps Python and the libraries in the local process and forwards only CUDA driver calls. Local data and the local environment stay in place, at the cost of one network round trip at every point where the host reads a value back from the device.
+**PyTorch forwarding** (`host="local"`) keeps Python, the data and the libraries in the local process and forwards PyTorch operators to a worker that holds the GPU. It supports PyTorch only. The local process needs any PyTorch build, a CPU build included, and the operators run on real CUDA tensors on the runtime. Local data and the local environment stay in place, at the cost of one network round trip at every point where the host reads a value back from the device. [PyTorch forwarding](#pytorch-forwarding) describes the mechanism.
 
-A provider refuses a mode only when it cannot serve it. `Modal` refuses `host="local"` because it exposes function calls into a container and there is no device to forward at. A provider without a fast path warns with its expected round trip and then runs, because the choice belongs to whoever wrote the declaration.
+The declared function runs in the calling process, inside a session whose device worker is started on first use. It is not retried: a failure part way through has already run the function's side effects here once.
+
+A provider refuses a mode only when it cannot serve it. `Modal` refuses `host="local"` because it exposes function calls into a container and there is no device to forward at. `host="local"` is refused with `UnsupportedMode` when PyTorch does not import in this process or is older than 2.1. A provider without a fast path warns with its expected round trip and then runs, because the choice belongs to whoever wrote the declaration.
 
 ### Efficiency model
 
-> Efficiency against a direct run is `T / (T + k * RTT)`, where `T` is GPU time per step and `k` is host synchronizations per step.
+> Time per step under forwarding is `T + n * d + k * RTT`, where `T` is GPU time per step, `n` is operators per step, `d` is the local dispatch cost per operator and `k` is host synchronizations per step. Efficiency against a direct run is `T / (T + n * d + k * RTT)`.
 
-Numbers for an RTX PRO 6000 with NVFP4, a 0.5 s micro step, at a 150 ms round trip:
+`n * d` is paid in the local process whether or not the link is fast. `k * RTT` is paid only at a synchronization, because every other operator is queued and sent without waiting. Batching makes the round trip count equal `k`, independent of `n`.
+
+The targets, for the benchmark model in [NETWORK.md](NETWORK.md#pytorch-forwarding-on-dept_gpu):
+
+| Quantity | Target |
+|---|---|
+| `d`, local dispatch per operator | at most 100 us |
+| Round trips per step with no host read | 0 |
+| Round trips per `loss.item()` | 1 |
+| Operators per round trip, reading once per 50 steps | at least 1000 |
+| Copies of 256 MiB each way | limited by the link, not by letify |
+
+`letify.remoting.efficiency(step_seconds, syncs, round_trip_ms)` computes the `k * RTT` part.
+
+The table below holds for workloads whose GPU step is long, where `n * d` is negligible against `T`. Numbers for an RTX PRO 6000 with NVFP4, a 0.5 s micro step, at a 150 ms round trip:
 
 | Workload | Function shipping | Forwarding, default settings | Forwarding, tuned |
 |---|---|---|---|
@@ -221,7 +237,7 @@ A faster GPU makes forwarding worse, because `T` shrinks while `RTT` does not. T
 
 Decoding fails at any useful latency. A decode step for 4-bit weights on an RTX PRO 6000 is 2 ms to 3 ms and synchronizes once or twice per token, so throughput is bounded near `1000 / (k * RTT)` tokens per second regardless of the card.
 
-`letify.remoting.efficiency(step_seconds, syncs, round_trip_ms)` computes this, and `letify efficiency` exposes it on the command line.
+`letify efficiency` exposes the formula on the command line.
 
 ## Channels
 
@@ -958,77 +974,139 @@ For `colab` and `modal`, letify runs the vendor's sign in through uv and does no
 
 Without `python`, a `shell`, `tunnel`, `colab` or `elice` account starts its bootstrap worker with `python3` and then runs the worker from the project `.venv`, as Building the environment on a runtime describes. With `python = "/path/to/python"`, the worker is started with that interpreter and stays on it: no project files are sent, no uv runs and no environment archive is read or written. That interpreter has to provide cloudpickle: letify installs nothing into it, and a session start on one that lacks it raises `ConfigError` naming the interpreter and `cloudpickle`. `ConfigError` is not retried, because a fresh runtime has the same interpreter. The interpreter check still applies. On `local`, `python` names the interpreter of the worker subprocess, which defaults to the interpreter running letify.
 
-## letify-core
+## PyTorch forwarding
 
-> The native component behind `host="local"`. A Rust workspace, built in CI and shipped inside platform wheels.
+> `host="local"` runs the user's PyTorch code here and executes its operators on the runtime's GPU, through PyTorch's own `__torch_dispatch__` extension point.
 
-The Python package is pure Python. Standing in for the CUDA driver cannot be done from Python, so that job lives in `letify-core/` as three crates.
+Five modules, all in `letify/remoting/device/`:
 
-| Crate | Holds |
+| Module | Holds |
 |---|---|
-| `letify-wire` | The protocol. Each request declares whether it needs a reply. |
-| `letify-driver` | A cdylib that stands in for the driver and forwards its calls. |
-| `letify-agent` | Holds the real device and executes what arrives. |
+| `tensor.py` | `RemoteTensor`, the local stand-in for a tensor on the runtime, and operator dispatch |
+| `cuda.py` | The mapping of `"cuda"` onto the runtime's device and the `torch.cuda` functions letify provides |
+| `client.py` | The operator queue, handles, synchronization and error reporting |
+| `frames.py` | The `Transport` interface and its stream implementation |
+| `executor.py` | The worker that runs operators on real tensors keyed by handle |
 
-`python letify-core/build.py` builds them and copies the library into `letify/remoting/lib/` under the name of the one it replaces: `nvcuda.dll` on Windows, `libcuda.so.1` on Linux and WSL2, `libletify_driver.dylib` on macOS. Being found before the real driver is the whole mechanism. The agent is copied beside it.
+`frames.py` and `executor.py` import the standard library and PyTorch only, because their source is sent to the runtime ahead of the worker start, where letify may be absent or older.
 
-letify looks for the library in `LETIFY_CORE_PATH`, then in `letify/remoting/lib/`. It looks for the agent in `letify/remoting/lib/`, then on `PATH`.
+### Dispatch mechanism <!-- id: dispatch-mechanism -->
 
-### Batching
+> A `RemoteTensor` is a wrapper subclass made with `torch.Tensor._make_wrapper_subclass` on the `meta` device, holding a handle to a tensor on the runtime and a local meta tensor.
 
-> Only a call whose result the host reads waits for an answer.
+The meta tensor carries shape, dtype, strides and storage offset, so every operator's output metadata is computed locally by running the same ATen operator on the meta tensors. Shape inference therefore never waits for the runtime.
 
-A launch, a copy to the device and an allocation change device state and return immediately, so they are queued. A copy back to the host, a stream synchronization and an elapsed time query cannot be, and each one is a round trip. That is why the round trip count is the number of host synchronizations rather than the number of calls, which is what makes the efficiency model hold for a step that issues thousands of calls.
+PrivateUse1 is not used. On torch 2.5.1 a wrapper tensor on a device renamed through `torch.utils.rename_privateuse1_backend` aborts the process in autograd, because no device guard can be registered from Python. On torch 2.14.0 `torch.utils.backend_registration._setup_privateuseone_for_python_backend` registers one, and backward still fails an internal assert in the autograd engine's device queues. A wrapper subclass reporting `cuda` aborts the same way on a CPU build. The meta wrapper runs forward and backward on both versions. The probe is in the pull request.
 
-### Framing
+The `meta` device is an implementation detail. Through `__torch_function__`, a `RemoteTensor` reports `device` as `cuda:0`, `is_cuda` as `True` and `get_device()` as `0`, which is what code written for CUDA reads.
 
-> Every message is an 8 byte little-endian length followed by that many bytes of body. The protocol version is 2.
+Autograd runs locally. Backward operators and optimizer steps reach `__torch_dispatch__` like forward ones, so they are queued and executed on the runtime the same way. A tensor that requires grad on the runtime never exists: the runtime holds values only.
 
-The body is a tag byte and then fixed-width fields. The length is 64 bits because a single copy to the device may exceed 4 GiB, and a 32 bit length would wrap without an error. A reader grows its buffer as bytes arrive rather than trusting the length up front, so a corrupt length ends the connection with an error instead of an allocation failure. The driver and the agent refuse each other when their protocol versions differ.
+Inferred metadata is cached per operator. The key is the overload, the shape, strides, storage offset and dtype of every tensor argument, and every other argument's value, except that a float argument of a `_foreach_` operator is keyed by its type, because an optimizer passes per step values such as bias corrections there and they never change output metadata. A hit builds the outputs with `torch.empty_strided` on meta and returns an input where the first inference returned that input, so a training step that repeats its operators runs each meta kernel once. An operator whose arguments include a value that cannot be a key, such as a generator, is inferred every time.
 
-### Copies to the device
+While forwarding is active, `RemoteTensor` is added to every `_foreach_supported_types` list PyTorch keeps, which in 2.5 is one in `torch.optim.optimizer` and one in `torch.utils._foreach_utils`, so an optimizer that picks its foreach path for CUDA tensors picks it here too and a step issues one operator per tensor list instead of one per parameter. A PyTorch without such a list keeps the per parameter path.
 
-> The bytes of a copy to the device are written from the caller's buffer and read into the agent's staging buffer, with no copy in between.
+`aten.detach` and `aten.alias` produce a new `RemoteTensor` sharing the same handle, with no operator sent. An in-place operator, or one writing to `out=`, returns the input it wrote to. Every other operator output gets a new handle.
 
-On the driver, `cuMemcpyHtoD_v2` writes the frame header and the fixed fields, then hands the caller's slice to `write_vectored`. A payload larger than the 8 KiB write buffer goes to the socket without being copied into it. On the agent, a `CopyToDevice` frame is recognised by its tag before its body is read, and the payload is read with `read_exact` into a staging buffer the session keeps and reuses, which is then passed to the real driver. Batching and `TCP_NODELAY` are the same as for every other request. Measured throughput is in [NETWORK.md](NETWORK.md#letify-core-copy-throughput).
+A plain CPU tensor passed to an operator travels with it as a buffer and is a CPU tensor on the runtime, so a zero-dimensional CPU scalar mixes with device tensors as it does in PyTorch. A CPU tensor larger than 4 KiB flushes the queue immediately after its operator, so a later write to it in this process cannot change what the runtime received.
 
-### Copies to the host
+When the meta operator raises, the operator is sent at once and executed on the runtime, and the reply carries its output metadata. That covers data-dependent shapes such as `nonzero` and `masked_select`, and reports a genuine error with the runtime's own message.
 
-> The bytes of a copy to the host are copied from the device into the agent's staging buffer, written from there, and read into the host buffer the caller passed, with no copy in between.
+### Mapping cuda <!-- id: mapping-cuda -->
 
-On the agent, `CopyToHost` copies device memory into a second staging buffer the session keeps and reuses, then writes the frame header and the fixed fields of `Reply::Payload` and hands the staged slice to `write_vectored`. On the driver, `cuMemcpyDtoH_v2` reads the reply tag before its body. A `Payload` whose length equals the requested byte count is read with `read_exact` straight into the caller's destination pointer. A `Payload` of any other length is read and discarded without being stored, so the stream stays in step, and the call returns `CUDA_ERROR_INVALID_VALUE`. The destination is never sized from a length on the wire, so a corrupt length cannot cause a large allocation. Any other reply, such as `Failed`, is decoded whole. A copy to the host is still a round trip: it flushes the queue first, as every request that needs a reply does. Measured throughput is in [NETWORK.md](NETWORK.md#letify-core-copy-throughput).
+> Code written with `"cuda"`, `.cuda()` and `torch.cuda.is_available()` runs unchanged under `host="local"`.
 
-### Virtual pointers
+While the declared function runs, a `TorchFunctionMode` rewrites a CUDA device in the `device` keyword of any torch function, and the positional device of `Tensor.to` and `Tensor.cuda`, to the runtime's device. A `cuda:N` with `N` other than 0 raises `UnsupportedMode`, because one session forwards to one device. A factory call, such as `torch.randn(..., device="cuda")`, runs on the runtime and its values are generated there.
 
-> An allocation returns a pointer immediately, and memory accounting stays local so that running out still fails at the call.
+`Module.cuda()` and `Module.to("cuda")` work, because they call `Tensor.cuda` and `Tensor.to` for each parameter. Assigning `tensor.data` between two `RemoteTensor`s moves the handle with the metadata.
 
-The local driver hands out pointers from a range no real device address falls in, records what they stand for, and lets the agent reconcile them in the background. Waiting for the agent would put a round trip in front of every allocation, and a caching allocator makes many.
+These `torch.cuda` functions are replaced while the function runs, and restored afterwards:
 
-The cost is honest failure. A caching allocator learns the device is full when the allocation call fails, frees its cache and retries. With a virtual pointer there is nothing to fail yet, so the local driver keeps its own accounting of device memory and refuses once the budget is gone, with a reserve held back for the driver's own context, library workspaces and fragmentation.
+| Function | Behaviour |
+|---|---|
+| `is_available()`, `is_initialized()` | `True` |
+| `init()` | Nothing |
+| `device_count()` | `1` |
+| `current_device()` | `0` |
+| `set_device(d)`, `device(d)` | Accepted for device 0, `UnsupportedMode` otherwise |
+| `get_device_name(d=None)` | The runtime's device name |
+| `synchronize(d=None)` | Flushes the queue and waits for the runtime, which surfaces a pending error |
+| `manual_seed(s)`, `manual_seed_all(s)` | Seeds the runtime's generator for its device |
+| `memory_allocated()`, `max_memory_allocated()`, `memory_reserved()` | The runtime's value, one round trip |
+| `empty_cache()` | Queued and executed on the runtime |
 
-### Module identity
+`Stream`, `Event`, `current_stream`, `stream`, `CUDAGraph`, `graph`, `get_rng_state` and `set_rng_state` raise `UnsupportedMode` naming the function, because a stream, an event, a graph or a generator state lives in the runtime's process and has no local counterpart here. Every other `torch.cuda` attribute is PyTorch's own and behaves as it does on a machine without CUDA.
 
-> A compiled module is named by its contents, so a fatbin the agent already holds is not sent again.
+### The device worker <!-- id: device-worker -->
 
-PyTorch loads the same modules on every process start and they are large. The agent keeps a table keyed by digest and answers with the handle it already has.
+> One Python process per session on the runtime, in the project's environment, executing ATen operators on tensors keyed by integer handle.
 
-`cuModuleLoadData` receives a pointer with no length, so the driver reads the size from the image itself and sends the whole image. A fatbinary is `fat_size` bytes, read from its header after the magic `0xBA55ED50`. An ELF object is `e_shoff + e_shentsize * e_shnum` bytes, or the end of its program headers when that is larger. Anything else is a PTX text image and runs to its terminating NUL, which is included.
+It is started with the interpreter the session built: the project `.venv` from [Building the environment on a runtime](#remote-uv-sync) on a remote machine, the account's `python` where one is named, and this interpreter on `Local`. The command is `python -u -c <stub>`, and the stub reads a length-prefixed source from standard input and executes it, as [Channels](#channels) describes for the call worker. The process sees only the session's cards, through `CUDA_VISIBLE_DEVICES`. It uses `cuda` where the instance has a GPU and `cpu` otherwise, so the same executor is exercised on a machine without one.
 
-### Loading
+On a `Shell` provider the worker runs over the account's link, as a second command beside the call worker. Standard output carries frames only: the worker moves Python's `sys.stdout` onto standard error before executing anything.
 
-> On Windows letify does the injection, because it has to happen before the first CUDA library is loaded.
+The worker's first message names its device, the device name, and its PyTorch version. The client refuses a worker whose PyTorch major.minor differs from its own, because ATen operator schemas change between minor versions.
 
-`letify.remoting.inject()` calls `os.add_dll_directory` on the library's directory, which puts it at the front of the loader's search order. It must be called before `import torch`, and it says so when torch is already imported.
+An operator is named by its overload, such as `aten.addmm.default`, and resolved on the runtime through `torch.ops` once per name.
 
-On Linux the equivalent is `LD_PRELOAD`, which cannot be set from inside a running process for libraries already resolved. So `inject()` reports the command to run rather than pretending it succeeded, because a silently ineffective injection would look like forwarding while the real driver was being used all along.
+### Batching and synchronization <!-- id: forwarding-batching -->
 
-### Unimplemented entry points
+> Operators are queued locally and sent without waiting. Only a read of a value waits for the runtime.
 
-> A missing entry point names itself and returns `CUDA_ERROR_NOT_SUPPORTED`.
+The queue is sent when it holds 256 operators, when its oldest operator has waited 2 ms, or at a synchronization. A send never waits for a reply.
 
-The implemented set is what a PyTorch process touches to start up and run one kernel: initialization, device queries, allocation and copies, module loading, launches, streams and events. Everything else reports its own name, so the way to find out what a real workload needs is to run one and read the list.
+The dispatching thread does the sending: it sends an aged queue when it queues the next operator. A background thread sends only a queue that nothing has been added to for 50 ms, so operators do not wait behind idle time between steps. Sending from a background thread on every age would take the GIL from the dispatching thread once per batch, and on a busy machine that doubled local dispatch time.
 
-Unified memory is the one exception that no amount of implementation removes. Managed memory works by letting the device fault into host pages, which needs one address space, and there is no such thing across a network. A paged optimizer cannot run under forwarding.
+A synchronization is one round trip. These synchronize: `Tensor.item()`, `tolist()`, `cpu()` and `to("cpu")`, `bool()`, `int()` and `float()` of a tensor, which includes control flow on a tensor value, `repr()` and `str()` of a tensor, copying a device tensor into a CPU tensor, an operator whose meta inference raised, the `torch.cuda` queries in [Mapping cuda](#mapping-cuda), `torch.cuda.synchronize()`, and the end of the declared function.
+
+The client counts operators, batches, round trips, released handles and metadata cache hits, so ops per round trip and synchronizations per step are read from the session rather than estimated. An operator is counted when it is dispatched, not when its batch is sent. `letify.remoting.device.current_client()` returns the client of the innermost active forwarding, or None outside one, so code inside a `host="local"` function reads `current_client().stats`.
+
+### Handles <!-- id: forwarding-handles -->
+
+> The client assigns handles, so creating a tensor needs no reply, and a dropped tensor's handle is released with the next batch.
+
+A handle is an integer from a per-session counter. `RemoteTensor`s that share a handle, through `detach` or an in-place result, share one reference object, and when the last of them is collected its handle is appended to a release list. The list travels in the next batch, and a batch is sent early when it reaches 4096 handles. The worker applies a batch's releases after its operators, because an operator queued before its input was collected can travel in the same batch as that input's release.
+
+### Transfers <!-- id: forwarding-transfers -->
+
+> A copy to the device and a copy to the host travel as out-of-band binary buffers, with no base64 and no copy beyond the one the kernel makes.
+
+A contiguous CPU tensor is sent as a view of its own memory, taken through `ctypes` from its data pointer, so no NumPy is needed. A non-contiguous one is made contiguous first. On the runtime the buffer is received into a `bytearray` and wrapped with `torch.frombuffer`. A copy to the host is made contiguous on the runtime, copied to CPU memory, sent as a view of that memory, received into a `bytearray` and wrapped with `torch.frombuffer`.
+
+### Transport <!-- id: forwarding-transport -->
+
+> The client and the worker talk through a `Transport` with three methods, so the stream underneath can be replaced without touching either.
+
+```python
+class Transport(Protocol):
+    def send(self, head: bytes, buffers: Sequence[memoryview]) -> None: ...
+    def recv(self) -> tuple[bytes, list[bytearray]]: ...
+    def close(self) -> None: ...
+```
+
+`head` is a pickled message whose tensors are replaced by buffer indices. `buffers` are written in order without being joined to the head.
+
+`StreamTransport` implements it over a readable and a writable file descriptor, such as the worker's pipes or an SSH command's. A message is an 8 byte little-endian head length, a 4 byte buffer count, an 8 byte length per buffer, the head, then the buffers. It is written with `os.writev` and read with `readinto` into buffers sized from the lengths.
+
+### Failure semantics <!-- id: forwarding-failure -->
+
+> An operator that raises on the runtime is reported at the next synchronization, with its overload name and the runtime's traceback, and the session stays usable.
+
+The worker records the first failure and skips the operators after it until a synchronization asks. The reply carries the failure, the client raises `RemoteError` whose message names the operator and whose `remote_traceback` is the runtime's, and the worker clears the failure. An operator that reads a handle whose producer failed or was skipped raises at the following synchronization, naming the handle. Tensors whose operators succeeded keep their values.
+
+A lost worker process or link raises `RuntimeLost`, and the session is discarded.
+
+### Version guards <!-- id: forwarding-versions -->
+
+> PyTorch 2.1 or newer is required locally and on the runtime.
+
+`_make_wrapper_subclass`, `TorchFunctionMode` and `torch.utils._pytree` are each present in 2.1. An older PyTorch raises `UnsupportedMode` naming the version found and the version needed.
+
+### The driver stand-in is retired <!-- id: letify-core -->
+
+> `host="local"` does not load letify-core. Standing in for the CUDA driver was replaced by operator forwarding.
+
+Measured on 2026-09-14 against a Tesla P100 server with torch 2.5.1 cu121: libcudart 12.1 resolves 425 driver symbols by name and the stand-in `libcuda.so.1` exports 20, so CUDA initialization fails with `cudaErrorInsufficientDriver`. The private `cuGetExportTable` blocks adding symbols one by one, and PyTorch kernels arrive through fatbinary registration that `cuModuleLoadData` does not see. Operator forwarding depends on PyTorch's public extension points instead of the driver's private ones. The Rust crates in `letify-core/` and `letify.remoting.probe` remain in the tree and the wheels, and nothing on the `host="local"` path calls them.
 
 ## Packaging
 
@@ -1055,11 +1133,11 @@ Linux wheels are built inside the `manylinux_2_28` containers, so the binaries n
 
 ## Known gaps
 
-- **host=local does not run PyTorch yet.** Measured on 2026-09-14 against a Tesla P100 server with torch 2.5.1 cu121: libcudart 12.1 resolves 425 driver symbols by name and the stand-in `libcuda.so.1` exports 20, so CUDA initialization fails with `cudaErrorInsufficientDriver` before any call reaches letify. The missing symbols include the context calls, `cuGetProcAddress` and the private `cuGetExportTable`, so adding a few exports does not close the gap, and PyTorch kernels arrive through fatbinary registration that `cuModuleLoadData` does not see. `LaunchKernel` also forwards argument pointers that name host memory the agent cannot read, and `cuMemHostAlloc` is not implemented. The forwarding path itself measured 0.7 us per queued call, 0.30 ms median round trip over an SSH forward (0.04 ms on the server loopback) with a 40 ms tail on 0.6% of synchronizations over the forward, and about 100 MiB/s for copies limited by SSH.
-
 > Implemented and unimplemented, stated plainly so nobody builds on a promise.
 
-- **`letify-driver` covers one milestone.** The entry points a PyTorch process needs to start up and run one kernel are forwarded and verified against a real GPU. Kernel argument marshalling reads the pointer list without knowing the kernel's signature, and fatbin size comes from a conservative window rather than the image header. Both need a real workload to shape them.
+- **PyTorch forwarding misses its step time on a short GPU step.** On dept_gpu the benchmark step takes a median 3.45 ms under `host="local"` against 1.70 ms directly, with a p99 near 20 ms, reading the loss once per 50 steps. The measurement is in [NETWORK.md](NETWORK.md#pytorch-forwarding-on-dept_gpu). The client was contended, so the dispatch cost `d` on an idle machine is not yet measured.
+- **The device worker has its own SSH process and does not ride the call channel's binary frames.** `StreamTransport` is written to the `Transport` interface so it can move onto a stream of the persistent channel without changing the client or the executor.
+- **PyTorch forwarding covers one device per session and no CUDA streams, events, graphs or generator state.** Custom CUDA extensions and Triton kernels compiled in this process cannot run, because nothing here compiles for the runtime's GPU. `torch.compile` is untested.
 - **`Modal` and `Elice` are not exercised against the live services.** Their code follows each service's published interface, and the Elice paths come from Elice's own Terraform provider, but neither has been run end to end. The Modal adapter's calls were checked against the signatures of Modal 1.5.5, and `letify login modal` has not been run against Modal's sign in.
 - **The connection pipeline is not exercised against live networks.** `Rendezvous`, `Strategy`, `Link`, `Probe`, `Pipeline`, `LinkCache` and the remote agent are implemented and tested over loopback sockets and faked commands. Installing and starting `sshd` on a Colab VM over `colab exec` is not yet checked against a live runtime.
 - **The Elice API runs no command on a machine.** The paths letify uses (virtual machine, allocation, instance type, pricing) create and power machines only, so Elice's remote half runs over forward SSH to the allocated machine, and the punch and Tailcat strategies need that SSH to succeed first.

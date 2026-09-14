@@ -23,7 +23,7 @@ if TYPE_CHECKING:
 class Host(StrEnum):
     """Where the host code runs, relative to this process.
 
-    ``local`` is the default. Python and the libraries stay here and only CUDA calls
+    ``local`` is the default. Python and the libraries stay here and only PyTorch operators
     cross the network, so the code and the data stay where they already are. The cost is
     one round trip at every point where the host reads a value back from the device.
 

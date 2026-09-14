@@ -118,6 +118,8 @@ class Function(Generic[R]):
     def _run(self, args: tuple, kwargs: dict) -> Any:
         launcher = self.launcher
         instance = launcher.resolve(self.device)
+        if instance.placement is Host.local:
+            return self._run_here(instance, args, kwargs)
         last: Exception | None = None
 
         for attempt in range(self.retries + 1):
@@ -159,6 +161,27 @@ class Function(Generic[R]):
 
         raise RuntimeLost(str(last))  # pragma: no cover
 
+    def _run_here(self, instance: Any, args: tuple, kwargs: dict) -> Any:
+        """Run the body in this process with its PyTorch operators on the runtime's device.
+
+        Not retried: the body has already run its side effects here once.
+        """
+        launcher = self.launcher
+        runtime = launcher.pool.acquire(instance, self.env, self.volumes)
+        try:
+            client = runtime.device()
+            with client.activate():
+                value = self.fn(*args, **kwargs)
+                client.synchronize()
+        except (RuntimeFailure, ProtocolError):
+            launcher.pool.discard(runtime)
+            raise
+        except BaseException:
+            launcher.pool.release(runtime)
+            raise
+        launcher.pool.release(runtime)
+        return value
+
     async def _run_async(self, args: tuple, kwargs: dict) -> Any:
         return await asyncio.to_thread(self._run, args, kwargs)
 
@@ -181,7 +204,7 @@ def _where(host: Host | str | None) -> Host:
     except ValueError:
         raise ValueError(
             f"host={host!r} is not a host placement. Use host='local' to keep Python "
-            f"here and forward CUDA calls, or host='remote' to ship the function to "
+            f"here and forward PyTorch operators, or host='remote' to ship the function to "
             f"the machine that holds the device."
         ) from None
 

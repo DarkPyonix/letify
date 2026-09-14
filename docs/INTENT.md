@@ -26,9 +26,9 @@ Each claim is one sentence to agree or disagree with. An experiment that tests o
 
 Sending a training or generation loop to the remote machine and running it there reaches at least 95 percent of the throughput of running on that machine directly, at a 150 ms round trip, because the loop's host synchronizations become local to the remote process.
 
-### N2. Forwarding CUDA calls is only viable at low latency and low synchronization count
+### N2. Forwarding PyTorch operators is only viable at low latency and low synchronization count
 
-Efficiency for call forwarding follows `T / (T + k * RTT)`, where `T` is GPU time per step and `k` is host synchronizations per step. It is therefore unusable for token by token decoding at any useful round trip, and it gets worse as the GPU gets faster.
+Efficiency for PyTorch forwarding follows `T / (T + n * d + k * RTT)`, where `T` is GPU time per step, `n` is operators per step, `d` is local dispatch cost per operator and `k` is host synchronizations per step. It is therefore unusable for token by token decoding at any useful round trip, and it gets worse as the GPU gets faster.
 
 ### N3. Pooling runtimes by declaration removes per-call setup cost
 
@@ -46,14 +46,14 @@ Two modes that differ by a factor of two in throughput and by a factor of fifty 
 
 A declaration that says where the accelerator is and where the host code runs, plus a `keep_alive` block for sessions to keep, is enough to place any supported workload, and a user never has to name a transport, a channel kind or a storage backend.
 
-### N7. Batching driver calls makes the round trip count the synchronization count
+### N7. Batching operators makes the round trip count the synchronization count
 
-Forwarding is viable only if a step that issues thousands of driver calls pays a handful of round trips. Queueing every call whose result the host does not read achieves that, so the efficiency model is `T / (T + k * RTT)` with `k` counting host synchronizations rather than calls.
+Forwarding is viable only if a step that dispatches dozens to thousands of operators pays a handful of round trips. Queueing every operator whose result the host does not read, and computing output shapes locally on meta tensors, achieves that, so the network term of the efficiency model is `k * RTT` with `k` counting host synchronizations rather than operators.
 
 ## Constraints
 
 - **The Python package is pure Python.** No compiled extension in `letify/`. A wheel that has to be built for each platform is a maintenance cost this project will not carry, and hashing and transfer are not CPU bound at the link speeds involved.
-- **One native component, built separately.** Standing in for the CUDA driver cannot be done from Python, so that job lives in `letify-core/` as a Rust workspace. Only whoever uses `host="local"` builds it, and the Python package works without it.
+- **No native component on the forwarding path.** `host="local"` forwards PyTorch operators through PyTorch's own extension points from Python, so it needs no build step. PyTorch is the project's own dependency and letify never installs it.
 - **The local process stays alive for the duration of a run.** letify does not offer detached execution. A detached run whose remote side is evicted loses its results, so the local process stays the owner and the durable artifacts are checkpoints in the store.
 - **Nothing is torn down by hand.** No release call and no shutdown call on the public surface. A call ends its own session, an idle one is reaped, and the lease covers a crash.
 - **No credential in a tracked file.** Accounts live in `~/.letify/config.toml`, and credentials live in the environment or in `~/.letify/accounts`.
@@ -71,9 +71,9 @@ Forwarding is viable only if a step that issues thousands of driver calls pays a
 Each of these would change a claim or a default. Answering one is a good first experiment.
 
 1. **How many concurrent sessions does one Colab account allow?** Undocumented, and it moves with tier, credit balance and demand. Until it is measured, a `devices` count in the provider entry is where the answer goes, so a user who has measured their own account is not overruled by a number letify guessed.
-2. **What is the real host synchronization count per step, `k`, for the target workload?** Measurable with `torch.cuda.set_sync_debug_mode("warn")`. This sets whether call forwarding is worth implementing at all.
+2. **What is the real host synchronization count per step, `k`, for the target workload?** Measurable with `torch.cuda.set_sync_debug_mode("warn")`. This sets whether PyTorch forwarding is worth using for that workload.
 3. **How often does TCP hole punching succeed on the networks researchers actually use?** It succeeded between a Colab VM and a university network in Korea, where both NATs preserved the port. Home routers, office networks and mobile tethering are unmeasured. This decides how often the pipeline falls to UDP or to the provider's own path.
 4. **Is NVFP4 reachable in a stock Colab runtime?** Needs the CUDA version, the compute capability and whether the quantization stack installs.
 5. **Is the Elice SSH port stable across a restart?** If it is not, the configuration needs a command that resolves the current port.
 6. **What does Elice spot pricing cost?** The API exposes a pricing id, which suggests preemptible instances are available. This is a direct cost lever.
-7. **Which driver entry points does a real NVFP4 fine-tune actually reach?** `letify-driver` implements what a PyTorch process needs to start up and run one kernel, and names anything else it is asked for. One real run produces the list of what to implement next, which is the only honest way to size the remaining work.
+7. **How many operators does a real NVFP4 fine-tune dispatch per step, and what is `d` on a researcher's laptop?** The benchmark model dispatches 31 operators per step. A transformer step dispatches thousands, where `n * d` may dominate `T`, and that decides whether operator forwarding needs a faster local dispatch path for large models.

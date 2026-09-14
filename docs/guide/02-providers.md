@@ -211,7 +211,7 @@ letify asks for an optional Modal profile, which names the Modal workspace to si
 
 Storage is persistent because a Modal volume is mounted from outside the container, so function shipping is the default and no separate cache tier is needed. letify's own files in the sandbox, the project `.venv` included, live under `/letify`, where a Modal volume named `<app>-workspace` is mounted, so the next sandbox finds them. `--workspace PATH` at login moves that mount.
 
-`host="local"` raises. Modal exposes function calls into a container, not a device to forward calls at.
+`host="local"` raises. Modal exposes function calls into a container, not a device to forward operators to.
 
 Modal's client runs in its own uv environment, with Modal pinned to `>=1.0,<2`, in a small adapter process that letify starts on the first call. The first start downloads Modal into uv's cache. A token in `MODAL_TOKEN_ID` or `MODAL_TOKEN_SECRET` in your shell is ignored, because the account's `modal.toml` decides which account acts.
 

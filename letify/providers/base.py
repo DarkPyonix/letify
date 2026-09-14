@@ -32,7 +32,7 @@ from typing import TYPE_CHECKING, Literal
 from ..config import ProviderConfig
 from ..config.inventory import Devices, read_table
 from ..declare.instance import Host, Instance
-from ..errors import ConfigError, LetifyError, UnknownInstance
+from ..errors import ConfigError, LetifyError, UnknownInstance, UnsupportedMode
 from .usage import Usage, from_command
 
 if TYPE_CHECKING:
@@ -408,9 +408,20 @@ class Provider(abc.ABC):
             return
         if not self.has_fast_path:
             self.warn_slow_forwarding()
-        from ..remoting import require
+        from ..remoting.device.guard import require_torch
 
-        require(self.forwarding_host(), remote=self.needs_remote_agent)
+        require_torch()
+
+    def device_command(self, runtime: Runtime) -> tuple[list[str], dict[str, str] | None]:
+        """The command that starts a PyTorch device worker for this runtime, and its environment.
+
+        A provider that cannot run a second process beside its call worker cannot serve
+        ``host="local"``, and says so here.
+        """
+        raise UnsupportedMode(
+            f"{self.kind} cannot start a PyTorch device worker, so host='local' cannot run "
+            f"on {self.alias}. Use host='remote'."
+        )
 
     #: Whether forwarding needs the agent installed on another machine. False only
     #: where the device is in this machine, so nothing has to be reached.

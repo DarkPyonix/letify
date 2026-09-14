@@ -46,7 +46,7 @@ class Shell(Provider):
     extra = "shell"
     default_persistence = "ephemeral"
 
-    #: A machine reached directly has a short round trip, so forwarding CUDA calls
+    #: A machine reached directly has a short round trip, so forwarding PyTorch operators
     #: is a real option here.
     has_fast_path = True
 
@@ -358,6 +358,27 @@ class Shell(Provider):
             link.ssh_command(f"{self.remote_python} -u -c {shlex.quote(BOOTSTRAP)}"),
             name=runtime.name,
         )
+
+    def device_command(self, runtime: Runtime) -> tuple[list[str], dict[str, str] | None]:
+        """A PyTorch device worker over the account's link, in the session's interpreter."""
+        from ..errors import UnsupportedMode
+        from ..remoting.device.client import BOOTSTRAP
+
+        link = self.link(runtime)
+        if not link.persistent:
+            raise UnsupportedMode(
+                f"{self.alias} is reached over a link that runs one command per call, so a "
+                f"PyTorch device worker cannot stay alive there. Use host='remote'."
+            )
+        python = runtime.python or self.remote_python
+        visible = self.visible_devices(runtime.held_devices)
+        prefix = ""
+        if visible is not None:
+            prefix = (
+                f"env CUDA_VISIBLE_DEVICES={shlex.quote(visible)} CUDA_DEVICE_ORDER=PCI_BUS_ID "
+            )
+        command = f"{prefix}{shlex.quote(python)} -u -c {shlex.quote(BOOTSTRAP)}"
+        return link.ssh_command(command), None
 
 
 __all__ = ["Shell"]
