@@ -234,3 +234,95 @@ def test_a_kaggle_login_records_the_workspace_without_a_remote_check(
     )
     assert code == 0
     assert home_config()["kaggle_a"]["workspace"] == "/kaggle/working/letify"
+
+
+# -- Spec: Remaining usage, Kaggle -------------------------------------------------
+
+QUOTA = """Warning: Looks like you're using an outdated API Version
+[
+  {"resource": "GPU", "used": "3.25h", "remaining": "26.75h", "total": "30.00h",
+   "refreshAt": "2026-09-19T00:00:00+00:00"},
+  {"resource": "TPU", "used": "0.00h", "remaining": "20.00h", "total": "20.00h",
+   "refreshAt": "2026-09-19T00:00:00+00:00"}
+]
+"""
+
+
+def kaggle_provider():
+    from conftest import provider_of
+
+    from letify.providers import Kaggle
+
+    return provider_of(Kaggle, "kaggle_a")
+
+
+def test_a_kaggle_account_is_a_known_provider_kind() -> None:
+    from letify.providers import KINDS, Kaggle
+
+    assert KINDS["kaggle"] is Kaggle
+
+
+def test_kaggle_usage_reads_the_weekly_gpu_quota(isolated_home, patch_which, patch_run) -> None:
+    from letify import tools
+    from letify.providers import kaggle as kaggle_module
+
+    patch_which(tools, present=True)
+    recorder = patch_run(kaggle_module, result=FakeCompleted(stdout=QUOTA))
+    usage = kaggle_provider().usage()
+
+    assert usage.unit == "GPU hours"
+    assert usage.used == 3.25
+    assert usage.remaining == 26.75
+    assert usage.limit == 30.0
+    assert "2026-09-19T00:00:00+00:00" in (usage.note or "")
+    assert "TPU 0 h used, 20 h left of 20" in (usage.note or "")
+    call = recorder.calls[-1]
+    assert call["command"][-3:] == ["quota", "--format", "json"]
+    assert call["env"]["KAGGLE_CONFIG_DIR"] == str(account("kaggle_a"))
+
+
+def test_a_failed_quota_call_is_an_infrastructure_error_without_the_token(
+    isolated_home, patch_which, patch_run
+) -> None:
+    import letify
+    from letify import tools
+    from letify.config.secrets import write_secret
+    from letify.providers import kaggle as kaggle_module
+
+    write_secret("kaggle_a", "access_token", ACCESS_TOKEN)
+    patch_which(tools, present=True)
+    patch_run(kaggle_module, result=FakeCompleted(returncode=1, stderr=f"401 {ACCESS_TOKEN}"))
+    with pytest.raises(letify.RuntimeFailure) as caught:
+        kaggle_provider().usage()
+    assert ACCESS_TOKEN not in str(caught.value)
+    assert "***" in str(caught.value)
+
+
+def test_quota_output_with_no_gpu_row_is_refused(isolated_home, patch_which, patch_run) -> None:
+    import letify
+    from letify import tools
+    from letify.providers import kaggle as kaggle_module
+
+    patch_which(tools, present=True)
+    patch_run(kaggle_module, result=FakeCompleted(stdout="No quota information available\n"))
+    with pytest.raises(letify.RuntimeFailure, match="GPU"):
+        kaggle_provider().usage()
+
+
+def test_every_kaggle_call_names_this_accounts_token_file_in_kaggle_api_token(
+    isolated_home, patch_which, patch_run, monkeypatch
+) -> None:
+    # The Kaggle CLI does not read access_token from KAGGLE_CONFIG_DIR, so the variable is what
+    # authenticates. It holds the file's path, which keeps the token out of the environment.
+    from letify import tools
+    from letify.config.secrets import write_secret
+    from letify.providers import kaggle as kaggle_module
+
+    monkeypatch.setenv("KAGGLE_API_TOKEN", "another-accounts-token")
+    path = write_secret("kaggle_a", "access_token", ACCESS_TOKEN)
+    patch_which(tools, present=True)
+    recorder = patch_run(kaggle_module, result=FakeCompleted(stdout=QUOTA))
+    kaggle_provider().usage()
+    env = recorder.calls[-1]["env"]
+    assert env["KAGGLE_API_TOKEN"] == str(path)
+    assert ACCESS_TOKEN not in env.values()

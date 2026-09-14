@@ -116,6 +116,9 @@ A provider reports what its service actually publishes:
 | `Elice` | KRW | not published | live allocations priced from the zone price list, which gives the rate and the spend, not the balance |
 | `Colab` | compute units | not published | the CLI has no balance command; the figure is in the web console |
 | `Modal` | USD | not published | the SDK exposes no workspace balance |
+| `Kaggle` | GPU hours | published | `kaggle quota --format json`, the weekly accelerator quota endpoint `/api/v1/kernels/quota` |
+
+`Kaggle` reports the GPU row of `kaggle quota --format json`, run through uv as the account as Logging in describes: `used`, `total` as the limit, and `remaining`, each read from a value such as `3.25h`. The note carries the reset time from `refreshAt` and, when the account has one, the TPU row as `TPU <used> h used, <remaining> h left of <total>`. A call that exits non zero, or output with no GPU row, raises `RuntimeFailure` naming the command, with the account's secrets replaced by `***`.
 | `Shell`, `Tunnel` | hours | not published | a machine letify only runs commands on has no account behind it |
 
 Where the service publishes nothing, a configuration entry supplies the number itself:
