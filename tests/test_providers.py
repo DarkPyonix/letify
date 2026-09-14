@@ -2151,6 +2151,103 @@ def test_every_shell_kind_reads_busy_cards_on_its_machine(cls, patch_run, monkey
     assert provider.busy() == (2,)
 
 
+# -- Modal: ending a sandbox while a request is blocked (spec "modal-abort") ----------
+
+
+def test_a_modal_call_past_its_timeout_leaves_no_sandbox_running(isolated_home, fake_modal) -> None:
+    import time
+
+    from letify.errors import ProtocolError, RuntimeFailure
+
+    provider = provider_of(Modal, "m")
+    runtime = modal_runtime(provider)
+    channel = provider.open_channel(runtime)
+    channel.start()
+    [pid] = fake_modal.sandbox_pids()
+    started = time.monotonic()
+    with pytest.raises((RuntimeFailure, ProtocolError)):
+        channel.call(time.sleep, (600,), {}, timeout=2)
+    assert time.monotonic() - started < 30
+    assert not fake_modal.alive(pid)
+    channel.close()
+    provider.stop(runtime)
+
+
+def test_a_modal_call_interrupted_while_blocked_leaves_no_sandbox_running(
+    isolated_home, fake_modal
+) -> None:
+    import signal
+    import time
+
+    provider = provider_of(Modal, "m")
+    runtime = modal_runtime(provider)
+    channel = provider.open_channel(runtime)
+    channel.start()
+    [pid] = fake_modal.sandbox_pids()
+
+    def interrupt(signum, frame):
+        raise KeyboardInterrupt
+
+    previous = signal.signal(signal.SIGALRM, interrupt)
+    signal.setitimer(signal.ITIMER_REAL, 2)
+    try:
+        with pytest.raises(KeyboardInterrupt):
+            channel.call(time.sleep, (600,), {})
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, previous)
+    started = time.monotonic()
+    channel.close()
+    provider.stop(runtime)
+    assert time.monotonic() - started < 30
+    assert not fake_modal.alive(pid)
+
+
+def test_a_request_on_an_adapter_out_of_step_fails_without_waiting(
+    isolated_home, fake_modal
+) -> None:
+    import signal
+    import time
+
+    from letify.errors import RuntimeFailure
+
+    provider = provider_of(Modal, "m")
+    runtime = modal_runtime(provider)
+    channel = provider.open_channel(runtime)
+    channel.start()
+
+    def interrupt(signum, frame):
+        raise KeyboardInterrupt
+
+    previous = signal.signal(signal.SIGALRM, interrupt)
+    signal.setitimer(signal.ITIMER_REAL, 2)
+    try:
+        with pytest.raises(KeyboardInterrupt):
+            channel.call(time.sleep, (600,), {})
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, previous)
+    started = time.monotonic()
+    with pytest.raises(RuntimeFailure, match="out of step"):
+        provider.adapter().request("hello")
+    assert time.monotonic() - started < 5
+    provider.stop(runtime)
+
+
+def test_a_modal_sandbox_is_created_with_a_lifetime_and_an_idle_limit(
+    isolated_home, fake_modal
+) -> None:
+    provider = provider_of(Modal, "m")
+    runtime = modal_runtime(provider)
+    provider.open_channel(runtime)
+    try:
+        [created] = fake_modal.requests("create")
+        assert created["timeout"] == 3600
+        assert created["idle_timeout"] == 600
+    finally:
+        provider.stop(runtime)
+
+
 # -- Modal data channel ----------------------------------------------------------
 
 

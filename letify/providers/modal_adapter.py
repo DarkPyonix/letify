@@ -108,6 +108,7 @@ class Adapter:
             image=image,
             gpu=request.get("gpu") or None,
             timeout=int(request["timeout"]),
+            idle_timeout=int(request["idle_timeout"]) if request.get("idle_timeout") else None,
             volumes={
                 str(path): modal.Volume.from_name(str(name), create_if_missing=True)
                 for path, name in (request.get("volumes") or {}).items()
@@ -177,9 +178,17 @@ class Adapter:
                 return {"lines": lines, "eof": False}
 
     def op_terminate(self, request: dict[str, Any]) -> Any:
-        stream = self.sandboxes.pop(str(request["sandbox"]), None)
+        sandbox_id = str(request["sandbox"])
+        stream = self.sandboxes.pop(sandbox_id, None)
         if stream is not None:
             stream.sandbox.terminate()
+            return None
+        # Another adapter process created it, one that is blocked or about to be killed.
+        modal = load_modal()
+        try:
+            modal.Sandbox.from_id(sandbox_id).terminate()
+        except not_found_errors(modal):
+            pass
         return None
 
     # -- billing -----------------------------------------------------------------

@@ -20,7 +20,9 @@ from __future__ import annotations
 import base64
 import contextlib
 import json
+import os
 import secrets
+import signal
 import socket
 import ssl
 import subprocess
@@ -93,8 +95,20 @@ MAX_DATA_STREAMS = 16
 WORKER_PACKAGES = ("cloudpickle", "blake3")
 
 
+#: Seconds ``Modal.stop`` and a channel's shutdown frame wait for a busy adapter.
+STOP_WAIT = 5.0
+
+#: Seconds a sandbox may be idle before Modal terminates it, unless the entry sets
+#: ``idle_timeout``.
+IDLE_TIMEOUT = 600
+
+
 class VolumePathMissing(RuntimeFailure):
     """The adapter answered that a volume path does not exist."""
+
+
+class AdapterUnreachable(RuntimeFailure):
+    """The adapter cannot take a request now: it is out of step, or busy past the wait."""
 
 
 def _close_process(process: subprocess.Popen[bytes], stderr: IO[bytes]) -> None:
@@ -133,6 +147,15 @@ class Adapter:
         self._lock = threading.Lock()
         self._next_id = 0
         self._closed = False
+        #: A request was interrupted between its line and its reply, so replies no longer
+        #: match requests.
+        self._out_of_step = False
+        #: Sandboxes this adapter created and has not yet terminated.
+        self._sandboxes: set[str] = set()
+
+    @property
+    def closed(self) -> bool:
+        return self._closed
 
     @classmethod
     def for_account(cls, alias: str) -> Adapter:
@@ -164,6 +187,9 @@ class Adapter:
                 stdout=subprocess.PIPE,
                 stderr=self._stderr,
                 env=env,
+                # Its own session, so ``abort`` can kill uv and the adapter it started as
+                # one process group, and a terminal's Ctrl+C reaches only letify.
+                start_new_session=True,
             )
         except OSError as exc:
             raise RuntimeFailure(
@@ -186,9 +212,19 @@ class Adapter:
         detail = f"\n--- adapter stderr ---\n{stderr}" if stderr.strip() else ""
         return RuntimeFailure(f"{self.alias}: the Modal adapter {what}.{detail}", stderr=stderr)
 
-    def request(self, op: str, **fields: Any) -> Any:
-        """Send one request and return its value, raising what the reply's kind means."""
-        with self._lock:
+    def request(self, op: str, *, wait: float | None = None, **fields: Any) -> Any:
+        """Send one request and return its value, raising what the reply's kind means.
+
+        ``wait`` bounds how long to wait for a request already in flight, in seconds.
+        """
+        if not self._lock.acquire(timeout=-1 if wait is None else wait):
+            raise AdapterUnreachable(f"{self.alias}: the Modal adapter is busy with a request")
+        try:
+            if self._out_of_step:
+                raise AdapterUnreachable(
+                    f"{self.alias}: the Modal adapter is out of step, because a request was "
+                    f"interrupted before its reply"
+                )
             process = self._start()
             assert process.stdin is not None and process.stdout is not None
             self._next_id += 1
@@ -203,9 +239,15 @@ class Adapter:
                 raw = process.stdout.readline()
             except (OSError, ValueError) as exc:
                 raise self._broken(f"stopped while answering {op!r}") from exc
+            except BaseException:
+                # KeyboardInterrupt or similar: the reply is still coming, for nobody.
+                self._out_of_step = True
+                raise
             if not raw:
                 process.wait()
                 raise self._broken(f"exited with {process.returncode} while answering {op!r}")
+        finally:
+            self._lock.release()
         try:
             reply = json.loads(raw)
         except ValueError as exc:
@@ -215,7 +257,12 @@ class Adapter:
         if not isinstance(reply, dict) or reply.get("id") != request_id:
             raise self._broken(f"answered {op!r} out of turn: {raw[:200]!r}")
         if reply.get("ok"):
-            return reply.get("value")
+            value = reply.get("value")
+            if op == "create" and isinstance(value, dict) and "sandbox" in value:
+                self._sandboxes.add(str(value["sandbox"]))
+            elif op == "terminate":
+                self._sandboxes.discard(str(fields.get("sandbox")))
+            return value
         kind = reply.get("kind")
         error = str(reply.get("error") or "no message")
         if kind == "unavailable":
@@ -230,6 +277,36 @@ class Adapter:
             self._closed = True
             if self._process is not None and self._stderr is not None:
                 _close_process(self._process, self._stderr)
+
+    def abort(self) -> None:
+        """Terminate this adapter's sandboxes from a second adapter, then kill this one.
+
+        Spec "Ending a sandbox while a request is blocked". It takes no lock, because the
+        request it has to get past may be holding it.
+        """
+        self._closed = True
+        sandboxes = sorted(self._sandboxes)
+        self._sandboxes.clear()
+        if sandboxes:
+            other = Adapter(self._command, self._env, name=self.alias)
+            try:
+                for sandbox in sandboxes:
+                    try:
+                        other.request("terminate", sandbox=sandbox)
+                    except (RuntimeFailure, ProviderUnavailable):
+                        pass
+            finally:
+                other.close()
+        process = self._process
+        if process is None or process.poll() is not None:
+            return
+        try:
+            if hasattr(os, "killpg"):
+                os.killpg(process.pid, signal.SIGKILL)
+            else:  # pragma: no cover - Windows has no process groups to kill
+                process.kill()
+        except OSError:
+            pass
 
 
 class Modal(Provider):
@@ -298,7 +375,7 @@ class Modal(Provider):
 
     def adapter(self) -> Adapter:
         """The adapter acting as this account, started on its first request."""
-        if self._adapter is None:
+        if self._adapter is None or self._adapter.closed:
             self._adapter = Adapter.for_account(self.alias)
         return self._adapter
 
@@ -360,6 +437,7 @@ class Modal(Provider):
             packages=list(WORKER_PACKAGES),
             gpu=self.wire_name(runtime.instance) or None,
             timeout=int(self.config.option("timeout", 3600)),
+            idle_timeout=int(self.config.option("idle_timeout", IDLE_TIMEOUT)),
             ports=[] if data_port is None else [data_port],
         )
         sandbox = str(created["sandbox"])
@@ -372,8 +450,12 @@ class Modal(Provider):
         sandbox = self._sandboxes.pop(runtime.name, None)
         if sandbox is None:
             return
+        adapter = self.adapter()
         try:
-            self.adapter().request("terminate", sandbox=sandbox)
+            adapter.request("terminate", sandbox=sandbox, wait=STOP_WAIT)
+        except AdapterUnreachable:
+            # A blocked request holds this adapter, so the sandbox ends from another one.
+            adapter.abort()
         except (RuntimeFailure, ProviderUnavailable):
             # Terminating is best effort. A sandbox that is already gone is fine.
             pass
@@ -524,6 +606,7 @@ class SandboxChannel(FramedChannel):
         self.tls_context: ssl.SSLContext | None = None
         self._connection = None
         self._stdio: Connection | None = None
+        self._closing = False
 
     def start(self) -> None:
         if self._connection is not None:
@@ -658,19 +741,27 @@ class SandboxChannel(FramedChannel):
                 sock.close()
 
     def _kill(self) -> None:
-        # A blocked read on the data connection returns once every lane is shut down.
-        for sock in list(self._sockets):
-            with contextlib.suppress(OSError):
-                sock.shutdown(socket.SHUT_RDWR)
+        """End the sandbox from outside the adapter a blocked read may be holding."""
+        # Terminate first: a blocked read on the data connection returns as soon as every lane
+        # is shut down, and the caller must not see that before the sandbox is gone.
+        try:
+            self.adapter.abort()
+        finally:
+            for sock in list(self._sockets):
+                with contextlib.suppress(OSError):
+                    sock.shutdown(socket.SHUT_RDWR)
 
     def close(self) -> None:
         connection = self._connection
         if connection is None:
             return
+        self._closing = True
         try:
             connection.sender.frame(wire.SHUTDOWN, 0)
         except Exception:
             pass
+        finally:
+            self._closing = False
         self._close_socket()
 
     #: The most bytes one write request carries. Modal refuses a sandbox stdin write that
@@ -680,7 +771,8 @@ class SandboxChannel(FramedChannel):
     def _write(self, view: memoryview) -> int:
         piece = view[: self.WRITE_LIMIT]
         data = base64.b64encode(piece).decode("ascii")
-        self.adapter.request("write", sandbox=self.sandbox, data=data)
+        wait = STOP_WAIT if self._closing else None
+        self.adapter.request("write", sandbox=self.sandbox, data=data, wait=wait)
         return piece.nbytes
 
     def _read_chunks(self) -> list[bytes]:
