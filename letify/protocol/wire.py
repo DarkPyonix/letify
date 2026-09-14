@@ -275,14 +275,23 @@ class Sender:
 
 
 class TextSender(Sender):
-    """Writes each frame as one line of base64, for a transport that carries text only."""
+    """Writes each frame as lines of base64, for a transport that carries text only.
+
+    Modal breaks a stdout line longer than 64 KiB into pieces that are not base64 on their
+    own, so each line encodes at most ``LINE_BYTES``. That is a multiple of 3, so every line
+    decodes by itself and the reader joins the decoded bytes.
+    """
+
+    #: Bytes encoded per line: 36 KiB, which is 48 KiB of base64.
+    LINE_BYTES = 36 << 10
 
     def frame(self, kind: int, stream: int, payload=b"") -> None:
         view = memoryview(payload).cast("B")
-        header = HEADER.pack(MAGIC, kind, 0, stream, view.nbytes)
-        line = base64.b64encode(header + view.tobytes()) + b"\n"
+        data = HEADER.pack(MAGIC, kind, 0, stream, view.nbytes) + view.tobytes()
+        step = self.LINE_BYTES
         with self.lock:
-            self._all(line)
+            for offset in range(0, len(data), step):
+                self._all(base64.b64encode(data[offset : offset + step]) + b"\n")
 
 
 class _Partial:

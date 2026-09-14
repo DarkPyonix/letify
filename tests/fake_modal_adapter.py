@@ -44,12 +44,16 @@ class Sandbox:
         self.process.stdin.write(base64.b64decode(data))
         self.process.stdin.flush()
 
+    #: Modal breaks a sandbox stdout line longer than this into pieces that are not base64
+    #: on their own, and ends the stream on a longer one. The stand-in ends the stream.
+    OUTPUT_LINE = 64 * 1024
+
     def read_until(self, prefixes: list[str]) -> dict[str, object]:
         assert self.process.stdout is not None
         lines: list[str] = []
         while True:
             raw = self.process.stdout.readline()
-            if not raw:
+            if not raw or len(raw.rstrip(b"\n")) > self.OUTPUT_LINE:
                 return {"lines": lines, "eof": True}
             line = raw.decode()
             lines.append(line)
