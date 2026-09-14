@@ -469,6 +469,26 @@ def test_the_sessions_an_account_holds_are_read_from_the_cli(
     assert provider_of(Colab, "colab_a").sessions() == ["letify-g4-1", "letify-t4-2"]
 
 
+def test_an_account_with_no_colab_session_lists_none(isolated_home, patch_which, patch_run) -> None:
+    # Spec "Colab": the CLI's own message line names no session.
+    patch_which(tools_module, present=True)
+    listing = "[colab] No active sessions found on server.\n"
+    patch_run(colab_module, result=FakeCompleted(stdout=listing))
+    assert provider_of(Colab, "colab_a").sessions() == []
+
+
+def test_a_colab_session_listed_in_brackets_is_named_without_them(
+    isolated_home, patch_which, patch_run
+) -> None:
+    # Spec "Colab": the listing line the CLI printed for a live CPU session.
+    patch_which(tools_module, present=True)
+    listing = (
+        "[letify-cpu-514e8c] m-s-kkb-ase1a1-32hpj198ieqis | Hardware: CPU | Variant: DEFAULT\n"
+    )
+    patch_run(colab_module, result=FakeCompleted(stdout=listing))
+    assert provider_of(Colab, "colab_a").sessions() == ["letify-cpu-514e8c"]
+
+
 def test_a_failing_cli_command_carries_the_command_and_the_error(
     isolated_home, patch_which, patch_run
 ) -> None:
@@ -1410,6 +1430,43 @@ def test_a_sandbox_started_the_way_modal_starts_it_answers_requests(
     try:
         assert channel.call(len, ([1, 2, 3],), {})[0] == 3
         assert channel.call(sum, ([1, 2, 3],), {})[0] == 6
+    finally:
+        channel.close()
+        provider.stop(runtime)
+
+
+def test_a_sandbox_channel_sends_an_argument_larger_than_modal_stdin_buffer(
+    isolated_home, fake_modal
+) -> None:
+    # Spec "Modal adapter", op write: a frame above Modal's 2 MiB stdin buffer goes out as
+    # write requests of at most 1 MiB, so a 16 MiB argument arrives whole.
+    import base64
+
+    provider = provider_of(Modal, "m")
+    runtime = modal_runtime(provider)
+    channel = provider.open_channel(runtime)
+    try:
+        payload = bytes(range(256)) * (16 * 1024 * 1024 // 256)
+        assert channel.call(len, (payload,), {})[0] == len(payload)
+        sizes = [len(base64.b64decode(r["data"])) for r in fake_modal.requests("write")]
+        assert max(sizes) <= 1024 * 1024
+    finally:
+        channel.close()
+        provider.stop(runtime)
+
+
+def test_a_sandbox_channel_reads_a_result_longer_than_a_modal_output_line(
+    isolated_home, fake_modal
+) -> None:
+    # Spec "Modal adapter": Modal splits a stdout line above 64 KiB, so a frame line stays
+    # below that and a 1 MiB result arrives whole.
+    import os
+
+    provider = provider_of(Modal, "m")
+    runtime = modal_runtime(provider)
+    channel = provider.open_channel(runtime)
+    try:
+        assert len(channel.call(os.urandom, (1 << 20,), {})[0]) == 1 << 20
     finally:
         channel.close()
         provider.stop(runtime)
