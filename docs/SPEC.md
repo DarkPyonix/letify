@@ -1206,6 +1206,22 @@ These `torch.cuda` functions are replaced while the function runs, and restored 
 
 No replaced function initializes CUDA in this process. A CUDA build of PyTorch on a machine with no NVIDIA driver raises `CUDA driver version is insufficient` from any call that does, and a training loop makes such calls without naming them: `Adam.step()` and `AdamW.step()` call `is_current_stream_capturing()`, and `torch.cuda.is_bf16_supported()`, which `autocast` reads for `bfloat16`, calls `get_device_properties()`.
 
+### Autocast <!-- id: forwarding-autocast -->
+
+> Inside `torch.autocast("cuda")`, an operator on a `RemoteTensor` gets the argument casts CUDA autocast gives it, so a mixed precision loop computes in the same dtypes as on the runtime's own GPU.
+
+A `RemoteTensor` lives on the `meta` device, so PyTorch's own CUDA autocast, a dispatch key on CUDA tensors, never sees it. The `TorchFunctionMode` of [Mapping cuda](#mapping-cuda) applies the casts instead, above autograd as autocast does, so each cast is recorded as a differentiable `to(dtype)` and gradients reach the float32 parameters in float32.
+
+While `torch.is_autocast_enabled("cuda")` is true, a torch function named in one of three lists casts its floating point `RemoteTensor` arguments, top level or one list level down, other than `float64` ones, and then runs with autocast's casts applied. The lists follow PyTorch's CUDA autocast policy and are matched by the function's name:
+
+| Policy | Cast | Functions |
+|---|---|---|
+| lower precision | to `torch.get_autocast_dtype("cuda")` | `conv1d`, `conv2d`, `conv3d`, `conv_transpose1d`, `conv_transpose2d`, `conv_transpose3d`, `conv_tbc`, `prelu`, `addmm`, `addmv`, `addr`, `matmul`, `__matmul__`, `__rmatmul__`, `einsum`, `mm`, `mv`, `linear`, `bmm`, `baddbmm`, `addbmm`, `chain_matmul`, `multi_dot`, `scaled_dot_product_attention`, `lstm_cell`, `gru_cell`, `rnn_tanh_cell`, `rnn_relu_cell` |
+| float32 | to `float32` | `acos`, `asin`, `cosh`, `erfinv`, `exp`, `expm1`, `log`, `log10`, `log2`, `log1p`, `reciprocal`, `rsqrt`, `sinh`, `tan`, `pow`, `__pow__`, `softplus`, `layer_norm`, `group_norm`, `norm`, `cosine_similarity`, `poisson_nll_loss`, `cosine_embedding_loss`, `nll_loss`, `hinge_embedding_loss`, `kl_div`, `l1_loss`, `smooth_l1_loss`, `huber_loss`, `mse_loss`, `margin_ranking_loss`, `multilabel_margin_loss`, `soft_margin_loss`, `triplet_margin_loss`, `multi_margin_loss`, `binary_cross_entropy_with_logits`, `cross_entropy`, `dist`, `pdist`, `cdist`, `renorm`, `logsumexp`, `softmax`, `log_softmax`, `sum`, `prod`, `cumsum`, `cumprod` |
+| widest | to the widest floating dtype among those arguments | `addcdiv`, `addcmul`, `atan2`, `bilinear`, `cross`, `dot`, `vdot`, `grid_sample`, `index_put`, `scatter_add`, `tensordot`, `cat`, `stack`, `index_copy` |
+
+Every other function runs with its arguments as they are. A cast is not cached: a parameter used twice in one region is cast twice, which gives the same values as autocast's weight cache. `GradScaler` is PyTorch's own and is not covered.
+
 ### The device worker <!-- id: device-worker -->
 
 > One executor per session, running in a thread of the session's call worker, executing ATen operators on tensors keyed by integer handle.
