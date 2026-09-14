@@ -172,6 +172,8 @@ class Function(Generic[R]):
             client = runtime.device()
             with client.activate():
                 value = self.fn(*args, **kwargs)
+                if inspect.iscoroutine(value):
+                    value = asyncio.run(value)
                 client.synchronize()
         except (RuntimeFailure, ProtocolError):
             launcher.pool.discard(runtime)

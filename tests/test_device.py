@@ -424,6 +424,163 @@ def test_an_in_place_entry_after_the_producer_sends_the_whole_queue(client, monk
     assert x.cpu().tolist() == [2.0, 2.0, 2.0, 2.0]
 
 
+# -- Spec: Reads without waiting ---------------------------------------------------
+
+
+def _hold_queue(monkeypatch) -> None:
+    from letify.remoting.device import client as client_module
+
+    monkeypatch.setattr(client_module, "LINGER_S", 60.0)
+    monkeypatch.setattr(client_module, "IDLE_S", 60.0)
+
+
+def test_a_non_blocking_copy_to_the_host_returns_without_a_round_trip(client, monkeypatch) -> None:
+    _hold_queue(monkeypatch)
+    x = torch.ones(4, device="cuda")
+    client.synchronize()
+    before = client.stats.snapshot()
+    total = (x * 2).sum()
+    host = total.to("cpu", non_blocking=True)
+    also = x.to("cpu", non_blocking=True)
+    assert type(host) is torch.Tensor and type(also) is torch.Tensor
+    assert host.shape == () and host.dtype == torch.float32
+    assert also.shape == (4,)
+    assert (client.stats.snapshot() - before).round_trips == 0
+    assert client.queued > 0
+    assert host.item() == 8.0
+    assert also.tolist() == [1.0, 1.0, 1.0, 1.0]
+
+
+def test_a_non_blocking_copy_holds_the_value_at_its_place_in_the_operator_order(client) -> None:
+    x = torch.ones(3, device="cuda")
+    early = x.to("cpu", non_blocking=True)
+    x.add_(1.0)
+    assert early.tolist() == [1.0, 1.0, 1.0]
+    assert x.cpu().tolist() == [2.0, 2.0, 2.0]
+
+
+def test_a_non_blocking_copy_into_a_host_tensor_fills_it_where_it_is_used(client) -> None:
+    x = torch.arange(4.0).cuda()
+    target = torch.zeros(4, dtype=torch.float64)
+    returned = target.copy_(x * 2, non_blocking=True)
+    assert returned is target
+    assert target.tolist() == [0.0, 2.0, 4.0, 6.0]
+
+
+def test_using_an_unfilled_tensor_waits_only_for_its_own_read(client, monkeypatch) -> None:
+    _hold_queue(monkeypatch)
+    x = torch.ones(4, device="cuda")
+    client.synchronize()
+    host = (x * 3).to("cpu", non_blocking=True)
+    later = x + 1
+    assert host.sum().item() == 12.0
+    assert client.queued > 0
+    assert later.cpu().tolist() == [2.0, 2.0, 2.0, 2.0]
+
+
+def test_reads_queued_together_come_back_in_one_reply(client, monkeypatch) -> None:
+    _hold_queue(monkeypatch)
+    x = torch.ones(4, device="cuda")
+    client.synchronize()
+    replies: list[int] = []
+    original = client.transport.recv
+
+    def counted():
+        replies.append(1)
+        return original()
+
+    monkeypatch.setattr(client.transport, "recv", counted)
+    hosts = [(x * float(k)).sum().to("cpu", non_blocking=True) for k in range(3)]
+    torch.cuda.synchronize()
+    assert len(replies) == 1
+    assert [host.item() for host in hosts] == [0.0, 4.0, 8.0]
+    assert len(replies) == 1
+
+
+def test_a_training_loop_logging_with_non_blocking_copies_matches_eager(client) -> None:
+    def train(to_device):
+        torch.manual_seed(0)
+        data = to_device(torch.randn(128, 8))
+        model = to_device(torch.nn.Sequential(torch.nn.Linear(8, 16), torch.nn.Linear(16, 8)))
+        opt = torch.optim.Adam(model.parameters(), lr=1e-2)
+        logged, previous = [], None
+        for step in range(20):
+            if previous is not None:
+                logged.append(previous.item())
+            chunk = data[step : step + 16]
+            loss = torch.nn.functional.mse_loss(model(chunk), chunk)
+            opt.zero_grad()
+            loss.backward()
+            opt.step()
+            previous = loss.detach().to("cpu", non_blocking=True)
+        logged.append(previous.item())
+        return logged
+
+    with client.suspended():
+        local = train(lambda value: value)
+    before = client.stats.snapshot()
+    remote = train(lambda value: value.cuda())
+    delta = client.stats.snapshot() - before
+    assert remote == pytest.approx(local, rel=1e-5, abs=1e-6)
+    assert delta.replayed > 0
+
+
+def test_fetch_awaits_a_value_while_the_event_loop_keeps_running(client, monkeypatch) -> None:
+    import asyncio
+    import time
+
+    x = torch.arange(3.0).cuda()
+    original = client.transport.recv
+
+    def slow():
+        time.sleep(0.2)
+        return original()
+
+    monkeypatch.setattr(client.transport, "recv", slow)
+
+    async def main():
+        ticks = 0
+
+        async def tick():
+            nonlocal ticks
+            while True:
+                ticks += 1
+                await asyncio.sleep(0.01)
+
+        ticker = asyncio.create_task(tick())
+        first = letify.fetch(x * 2)
+        x.add_(1.0)
+        values = await asyncio.gather(first, letify.fetch(x))
+        ticker.cancel()
+        return ticks, [value.tolist() for value in values]
+
+    ticks, values = asyncio.run(main())
+    assert values == [[0.0, 2.0, 4.0], [1.0, 2.0, 3.0]]
+    assert ticks >= 5
+
+
+def test_fetch_of_a_tensor_not_on_the_runtime_resolves_without_a_round_trip(client) -> None:
+    import asyncio
+
+    before = client.stats.round_trips
+    got = asyncio.run(_await(letify.fetch(torch.ones(2))))
+    assert got.tolist() == [1.0, 1.0]
+    assert client.stats.round_trips == before
+
+
+async def _await(awaitable):
+    return await awaitable
+
+
+def test_a_failed_non_blocking_read_raises_where_its_tensor_is_used(client) -> None:
+    good = torch.ones(3, device="cuda")
+    picked = good[torch.tensor([5]).cuda()]
+    host = picked.to("cpu", non_blocking=True)
+    with pytest.raises(RemoteError, match=r"aten\.index"):
+        host.tolist()
+    assert good.cpu().tolist() == [1.0, 1.0, 1.0]
+
+
 # -- Spec: Step capture -------------------------------------------------------------
 
 
@@ -811,6 +968,17 @@ def test_a_session_executor_rides_the_call_channel_with_buffers_beside_the_head(
     assert name == "ChannelTransport"
     assert no_process
     assert equal
+
+
+def test_an_async_host_local_function_awaits_its_reads(let, cpu) -> None:
+    import asyncio
+
+    @let.function(device=cpu, host="local")
+    async def step() -> list[float]:
+        x = torch.ones(3, device="cuda")
+        return (await letify.fetch(x * 2)).tolist()
+
+    assert asyncio.run(step()) == [2.0, 2.0, 2.0]
 
 
 def test_host_local_is_refused_without_torch(let, cpu, monkeypatch) -> None:
