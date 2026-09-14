@@ -336,6 +336,11 @@ class Provider(abc.ABC):
     #: Whether a session boot expands, creates and enters the workspace root on the runtime.
     prepares_workspace: bool = True
 
+    #: Where the project directory and its ``.venv`` live instead of the workspace root, with
+    #: uv's default cache. None keeps them under the workspace root. Spec "Environment on the
+    #: sandbox disk".
+    env_root: str | None = None
+
     @property
     def workspace_root(self) -> str:
         """Where letify may write on the runtime, before ``~`` is expanded there.

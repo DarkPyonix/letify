@@ -287,6 +287,10 @@ class Modal(Provider):
     #: A sandbox loses its disk, so the root is a Modal volume mounted at this path.
     default_workspace = "/letify"
 
+    #: A cold import from the volume reads thousands of small files over the network, so the
+    #: project ``.venv`` is built on the sandbox's own disk.
+    env_root = "/root/.letify-env"
+
     def __init__(self, config: ProviderConfig):
         super().__init__(config)
         self._sandboxes: dict[str, str] = {}
