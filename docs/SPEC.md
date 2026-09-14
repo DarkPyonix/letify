@@ -1250,7 +1250,9 @@ A release never reaches the worker ahead of an operator that uses the handle. A 
 
 > A copy to the device and a copy to the host travel as out-of-band binary buffers, with no base64 and no copy beyond the one the kernel makes.
 
-A contiguous CPU tensor is sent as a view of its own memory, taken through `ctypes` from its data pointer, so no NumPy is needed. A non-contiguous one is made contiguous first. On the runtime the buffer is received into a `bytearray` and wrapped with `torch.frombuffer`. A copy to the host is made contiguous on the runtime, copied to CPU memory, sent as a view of that memory, received into a `bytearray` and wrapped with `torch.frombuffer`.
+A copy to the device returns before its bytes are written. `Tensor.cuda()`, `Tensor.to("cuda")` and a factory call with a CPU tensor argument queue their entry and hand it to the sender thread, and only a read of a value that depends on the entry waits for the bytes. The runtime receives the CPU tensor's values as they were at the call, not at the write, so a CPU tensor larger than 4 KiB is sent as a private copy of its bytes made at the call, blocking or not. The client does not ask whether the memory is pinned, because that query can initialize CUDA in this process, and the copy costs memory speed against a link about 100 times slower.
+
+A contiguous CPU tensor, or its private copy, is sent as a view of its memory, taken through `ctypes` from its data pointer, so no NumPy is needed. A non-contiguous one is made contiguous first. On the runtime the buffer is received into a `bytearray` and wrapped with `torch.frombuffer`. A copy to the host is made contiguous on the runtime, copied to CPU memory, sent as a view of that memory, received into a `bytearray` and wrapped with `torch.frombuffer`.
 
 ### Transport <!-- id: forwarding-transport -->
 
