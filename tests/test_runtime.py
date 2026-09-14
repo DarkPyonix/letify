@@ -430,6 +430,54 @@ def test_a_default_env_is_synced_with_uv_and_the_worker_runs_from_the_project_ve
         runtime.shutdown()
 
 
+def test_a_persistent_provider_syncs_with_the_uv_cache_under_the_workspace_root(
+    uv_project: Path,
+) -> None:
+    # Spec "uv cache": UV_CACHE_DIR is <workspace root>/uv-cache, on the filesystem of the
+    # project .venv, so uv hard links the environment instead of copying it.
+    provider = provider_of(PreparingLocal, "lab")
+    assert provider.persistent
+    env = Env()
+    runtime = provider.start(remote_instance(provider), env, name="lab-1")
+    try:
+        cache = Path(bootstrap.DEFAULT_WORKSPACE_ROOT) / "uv-cache"
+        assert cache.is_dir()
+        venv = remote_projects() / env.key / ".venv"
+        site = [p for p in venv.rglob("*.py") if "site-packages" in p.parts]
+        # _virtualenv.py is written by uv venv itself, not installed from the cache.
+        installed = [p for p in site if p.name != "_virtualenv.py"]
+        assert installed and all(p.stat().st_nlink > 1 for p in installed)
+    finally:
+        runtime.shutdown()
+
+
+def test_an_ephemeral_provider_keeps_the_default_uv_cache(uv_project: Path) -> None:
+    # Spec "uv cache": an ephemeral runtime's disk goes with it, so nothing is moved.
+    provider = provider_of(PreparingLocal, "lab", persistent=False)
+    runtime = provider.start(remote_instance(provider), Env(), name="lab-1")
+    try:
+        assert runtime.env_source == "sync"
+        assert not (Path(bootstrap.DEFAULT_WORKSPACE_ROOT) / "uv-cache").exists()
+    finally:
+        runtime.shutdown()
+
+
+def test_an_env_variable_naming_the_uv_cache_wins_over_the_workspace_cache(
+    uv_project: Path, tmp_path: Path
+) -> None:
+    # Spec "uv cache": an Env.vars entry naming UV_CACHE_DIR wins over the rule.
+    chosen = tmp_path / "chosen-cache"
+    provider = provider_of(PreparingLocal, "lab")
+    runtime = provider.start(
+        remote_instance(provider), Env().vars(UV_CACHE_DIR=str(chosen)), name="lab-1"
+    )
+    try:
+        assert chosen.is_dir()
+        assert not (Path(bootstrap.DEFAULT_WORKSPACE_ROOT) / "uv-cache").exists()
+    finally:
+        runtime.shutdown()
+
+
 def test_the_sync_is_frozen_skips_the_project_and_always_names_the_local_python(
     uv_project: Path,
 ) -> None:
