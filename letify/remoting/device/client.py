@@ -30,7 +30,7 @@ from ...errors import RemoteError, RuntimeLost
 from .executor import E_DEFINE, E_OP, E_REQUEST, E_STEP, E_STEP_DEFINE
 from .frames import ChannelTransport, StreamTransport, Transport, TransportClosed
 from .guard import check_torch_version, check_worker_version
-from .tensor import _CACHE, MISS, REPLAY, Big, layout, outputs, reader
+from .tensor import _CACHE, _NAMES, MISS, REPLAY, Big, layout, outputs, reader
 from .trace import Tracer
 
 #: A queue this long is sent without waiting for more.
@@ -303,7 +303,8 @@ class Client:
         """The reader entry of a step position, as spec "Step capture" describes."""
         if key is None or len(key) < 1 or key[0] is not structure:
             return (None,)
-        read = reader(args, kwargs, "_foreach_" not in name)
+        _name, floats_keyed, offsets_keyed = _NAMES[structure[0]]
+        read = reader(args, kwargs, floats_keyed, offsets_keyed)
         if read is None:
             return (None,)
         return (structure[0], read, plan, key[1:], structure)
