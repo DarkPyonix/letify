@@ -119,6 +119,20 @@ def test_a_tcp_punch_over_loopback_carries_the_probe_and_then_ssh(stun_server) -
     link.close()
 
 
+def test_a_tcp_punch_cancelled_during_its_lead_time_stops_without_waiting_for_it(
+    stun_server,
+) -> None:
+    rendezvous = LoopbackRendezvous()
+    rendezvous.lead_seconds = 10.0
+    target = Target(alias="lab", rendezvous=rendezvous, stun=stun_server.address, user="root")
+    cancel = threading.Event()
+    threading.Timer(0.5, cancel.set).start()
+    began = time.monotonic()
+    with pytest.raises(nat.Cancelled):
+        TCPPunch().attempt(target, cancel=cancel)
+    assert time.monotonic() - began < 3.0
+
+
 # -- Spec: Transport, Rendezvous: known hosts ---------------------------------------
 
 

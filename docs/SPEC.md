@@ -665,7 +665,7 @@ A strategy that cannot carry the probe, such as the provider fallback, does not 
 
 Every connected strategy is probed: 30 round trips, then 2 s of transfer in each direction. A strategy whose throughput in either direction is below 25% of the fastest connected strategy in that direction is rejected. The lowest ranked strategy that remains is chosen. When only one strategy connects, it is chosen without comparison.
 
-Strategies that lose are closed, including one that connects after the choice is made.
+Strategies that lose are closed, including one that connects after the choice is made. Once the choice is made, every attempt still running is cancelled: the pipeline hands each attempt a cancel event and sets it, so a TCP punch stops waiting for its agreed start time and stops dialing within 0.1 s, and its attempt ends with a cancellation that is printed as cancelled rather than failed. An attempt that cannot observe the event, such as a provider call already in progress, runs to its end and is closed if it connects.
 
 When only one strategy is applicable there is nothing to choose between, so it is used directly: it is not raced, not probed and not cached, and a failure surfaces at its first use. When a race of two or more ends with one connected strategy, that strategy is still probed so the cache has throughput to compare against, but a failed probe does not reject it.
 

@@ -13,6 +13,7 @@ import secrets
 import shutil
 import subprocess
 import tempfile
+import threading
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -99,8 +100,9 @@ class Strategy:
         """What is missing for this strategy, or None when it can be attempted."""
         raise NotImplementedError
 
-    def attempt(self, target: Target) -> Link:
-        """Connect, or raise."""
+    def attempt(self, target: Target, cancel: threading.Event | None = None) -> Link:
+        """Connect, or raise. A strategy that can stop early raises ``nat.Cancelled`` once
+        ``cancel`` is set."""
         raise NotImplementedError
 
     def assume(self, target: Target) -> Link:
@@ -143,7 +145,7 @@ class DirectSSH(Strategy):
         # error says what went wrong.
         return SSHLink(self.name, self.rank, target.direct_ssh, remote_python=target.remote_python)  # type: ignore[arg-type]
 
-    def attempt(self, target: Target) -> Link:
+    def attempt(self, target: Target, cancel: threading.Event | None = None) -> Link:
         _verify(target.direct_ssh("exit 0"))  # type: ignore[misc]
         return self.assume(target)
 
@@ -157,16 +159,16 @@ class TCPPunch(Strategy):
     def needs(self, target: Target) -> str | None:
         return _rendezvous_unmet(target)
 
-    def attempt(self, target: Target) -> Link:
+    def attempt(self, target: Target, cancel: threading.Event | None = None) -> Link:
         return PunchedLink(
             self.name,
             self.rank,
-            self._punch(target),
+            self._punch(target, cancel),
             target.forwarded_ssh,
             lambda: self._punch(target),
         )
 
-    def _punch(self, target: Target):
+    def _punch(self, target: Target, cancel: threading.Event | None = None):
         holder = nat.reusable_socket(0)
         port = holder.getsockname()[1]
         try:
@@ -185,7 +187,12 @@ class TCPPunch(Strategy):
                 CONNECT_TIMEOUT,
             )
             return nat.punch(
-                port, tuple(answer["mapping"]), token, initiator=True, start_at=start_at
+                port,
+                tuple(answer["mapping"]),
+                token,
+                initiator=True,
+                start_at=start_at,
+                cancel=cancel,
             )
         finally:
             holder.close()
@@ -202,7 +209,7 @@ class TailcatUDP(Strategy):
             return f"{target.tailcat} is not on PATH"
         return _rendezvous_unmet(target)
 
-    def attempt(self, target: Target) -> Link:
+    def attempt(self, target: Target, cancel: threading.Event | None = None) -> Link:
         address, port = target.rendezvous.tailcat_endpoint(target.ssh_port, CONNECT_TIMEOUT)
         proxy = f"{target.tailcat} {address} {port}"
 
@@ -258,7 +265,7 @@ class ReverseSSH(Strategy):
             return "no reverse_ssh entry"
         return _rendezvous_unmet(target)
 
-    def attempt(self, target: Target) -> Link:
+    def attempt(self, target: Target, cancel: threading.Event | None = None) -> Link:
         keys = self.keys or AuthorizedKeys()
         keys.purge(target.alias)
         directory = Path(tempfile.mkdtemp(prefix="letify-reverse-"))
@@ -331,7 +338,7 @@ class ProviderFallback(Strategy):
     def needs(self, target: Target) -> str | None:
         return None if target.fallback is not None else "no provider fallback"
 
-    def attempt(self, target: Target) -> Link:
+    def attempt(self, target: Target, cancel: threading.Event | None = None) -> Link:
         link = target.fallback()  # type: ignore[misc]
         link.rank = self.rank
         return link
