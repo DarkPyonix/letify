@@ -191,3 +191,121 @@ def test_a_configured_plan_limit_fills_a_limit_the_service_did_not_state() -> No
 
     usage = provider_of(_Balance, "c", usage_limit=100).usage()
     assert (usage.limit, usage.used, usage.remaining) == (100.0, 60.0, 40.0)
+
+
+# -- Spec: GPU utilization -----------------------------------------------------
+
+
+def _card(**fields: object) -> dict:
+    base = {
+        "index": 0,
+        "name": "Tesla P100",
+        "utilization_percent": 20.0,
+        "memory_used_gb": 1.6,
+        "memory_total_gb": 16.0,
+        "temperature_c": 41.0,
+        "power_w": 38.0,
+        "holder": "free",
+        "users": [],
+    }
+    base.update(fields)
+    return base
+
+
+def test_a_machine_block_prints_each_card_with_gauges_and_its_holder() -> None:
+    row = {
+        "alias": "dept_gpu",
+        "kind": "shell",
+        "scope": "machine",
+        "accelerator": None,
+        "devices": [_card()],
+        "reason": None,
+    }
+    style = render.Style(width=80, color=False, unicode=False)
+    assert render.utilization_blocks([row], style) == (
+        "dept_gpu  shell\n"
+        "  gpu0  Tesla P100  free\n"
+        "    load   [########--------------------------------]  20%\n"
+        "    memory [####------------------------------------]  10%  1.6/16.0 GiB\n"
+        "    41C  38W\n"
+    )
+
+
+@pytest.mark.parametrize(
+    ("fields", "text"),
+    [
+        ({"holder": "letify"}, "reserved by letify"),
+        ({"holder": "others", "users": ["alice", "bob"]}, "busy: alice, bob"),
+        ({"holder": "mine"}, "in use by your processes"),
+        ({"holder": "unknown"}, "holder unknown"),
+    ],
+)
+def test_a_card_header_names_who_holds_it(fields: dict, text: str) -> None:
+    row = {"alias": "m", "kind": "shell", "scope": "machine", "devices": [_card(**fields)]}
+    assert f"  gpu0  Tesla P100  {text}\n" in render.utilization_blocks([row], PLAIN)
+
+
+def test_a_card_prints_only_the_readings_it_reported() -> None:
+    card = _card(utilization_percent=None, memory_total_gb=None, temperature_c=None, power_w=None)
+    row = {"alias": "m", "kind": "shell", "scope": "machine", "devices": [card]}
+    assert render.utilization_blocks([row], PLAIN) == "m  shell\n  gpu0  Tesla P100  free\n"
+
+
+def test_session_rows_with_one_reason_print_it_once() -> None:
+    rows = [
+        {
+            "alias": "c",
+            "kind": "colab",
+            "scope": "session",
+            "accelerator": g,
+            "devices": [],
+            "reason": "no live session, so nothing to measure",
+        }
+        for g in ("T4", "A100")
+    ]
+    assert render.utilization_blocks(rows, PLAIN) == (
+        "c  colab\n  no live session, so nothing to measure\n"
+    )
+
+
+def test_session_rows_with_different_reasons_name_the_accelerator() -> None:
+    rows = [
+        {
+            "alias": "c",
+            "kind": "colab",
+            "scope": "session",
+            "accelerator": "T4",
+            "devices": [],
+            "reason": "no live session, so nothing to measure",
+        },
+        {
+            "alias": "c",
+            "kind": "colab",
+            "scope": "session",
+            "accelerator": "A100",
+            "devices": [_card(holder=None)],
+            "reason": None,
+        },
+    ]
+    out = render.utilization_blocks(rows, PLAIN)
+    assert "  T4: no live session, so nothing to measure\n" in out
+    assert "  gpu0  Tesla P100\n" in out
+
+
+def test_a_busy_card_header_is_red_and_a_reserved_one_cyan() -> None:
+    colored = render.Style(width=80, color=True, unicode=True)
+    busy = {
+        "alias": "m",
+        "kind": "shell",
+        "scope": "machine",
+        "devices": [_card(holder="others", users=["a"])],
+    }
+    mine = {"alias": "m", "kind": "shell", "scope": "machine", "devices": [_card(holder="letify")]}
+    assert "\x1b[31mbusy: a" in render.utilization_blocks([busy], colored)
+    assert "\x1b[36mreserved by letify" in render.utilization_blocks([mine], colored)
+
+
+def test_an_unavailable_provider_prints_its_reason_in_utilization() -> None:
+    assert render.utilization_blocks([{"alias": "x", "unavailable": "no"}], PLAIN) == (
+        "x\n  unavailable: no\n"
+    )
