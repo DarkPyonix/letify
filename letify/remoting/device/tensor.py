@@ -332,12 +332,124 @@ def _meta_like(shape: tuple, stride: tuple, offset: int, dtype: torch.dtype) -> 
     return base.as_strided(shape, stride, offset)
 
 
+#: Returned by ``Client.replay`` when an operator needs the full path.
+MISS = object()
+
+#: The client whose repetition of a captured step is running, set and cleared by that client.
+REPLAY: list[Client | None] = [None]
+
+_LITERAL_TYPES = (bool, str, torch.device, torch.dtype, torch.memory_format, torch.layout)
+
+
+def reader(args: tuple, kwargs: dict, floats_keyed: bool) -> Any:
+    """A generated function checking arguments against these ones, per spec "Step capture".
+
+    It returns ``(tensors, scalars, key tail)`` for arguments with the same structure and
+    None otherwise. ``reader`` itself returns None when an argument has no exact check, such
+    as a plain CPU or meta tensor.
+    """
+    lines = ["def read(a, k):"]
+    constants: dict[str, Any] = {"RT": RemoteTensor}
+    tensors: list[str] = []
+    scalars: list[str] = []
+    keyed: list[str] = []
+    counter = [0]
+
+    def name() -> str:
+        counter[0] += 1
+        return f"v{counter[0]}"
+
+    def constant(value: Any) -> str:
+        label = f"c{len(constants)}"
+        constants[label] = value
+        return label
+
+    def emit(expr: str, value: Any) -> bool:
+        kind = type(value)
+        if value is None:
+            lines.append(f"    if {expr} is not None: return None")
+            return True
+        var = name()
+        lines.append(f"    {var} = {expr}")
+        if kind is RemoteTensor:
+            form = constant(value._form)
+            lines.append(f"    if type({var}) is not RT or {var}._form != {form}: return None")
+            tensors.append(var)
+            return True
+        if kind is int or kind is float:
+            lines.append(f"    if type({var}) is not {kind.__name__}: return None")
+            scalars.append(var)
+            if kind is int or floats_keyed:
+                keyed.append(var)
+            return True
+        if kind is list or kind is tuple:
+            lines.append(
+                f"    if type({var}) is not {kind.__name__} or len({var}) != {len(value)}: "
+                "return None"
+            )
+            return all(emit(f"{var}[{index}]", item) for index, item in enumerate(value))
+        if kind in _LITERAL_TYPES:
+            lines.append(
+                f"    if type({var}) is not {constant(kind)} or {var} != {constant(value)}: "
+                "return None"
+            )
+            return True
+        return False
+
+    lines.append(f"    if len(a) != {len(args)}: return None")
+    if kwargs:
+        lines.append(f"    if tuple(k) != {constant(tuple(kwargs))}: return None")
+    else:
+        lines.append("    if k: return None")
+    for index, value in enumerate(args):
+        if not emit(f"a[{index}]", value):
+            return None
+    for key, value in kwargs.items():
+        if not emit(f"k[{key!r}]", value):
+            return None
+    tail = [f"{var}._sig[2]" for var in tensors] + keyed
+
+    def pack(names: list[str]) -> str:
+        return "(" + "".join(f"{item}, " for item in names) + ")"
+
+    lines.append(f"    return {pack(tensors)}, {pack(scalars)}, {pack(tail)}")
+    exec(compile("\n".join(lines), "letify-reader", "exec"), constants)  # noqa: S102
+    return constants["read"]
+
+
+def outputs(plan: Plan, client: Client, tensors: Any) -> tuple[Any, list]:
+    """Build an operator's results from its plan, and the new handle of each tensor output."""
+    outs: list = []
+    results: list = []
+    for leaf in plan.leaves:
+        tag = leaf[0]
+        if tag == _NEW:
+            handle = client._next_handle
+            client._next_handle = handle + 1
+            outs.append(handle)
+            results.append(RemoteTensor(leaf[1], Ref(client, handle)))
+        elif tag == _IN:
+            outs.append(None)
+            results.append(tensors[leaf[1]])
+        else:
+            results.append(leaf[1])
+    if plan.container is None:
+        return results[0], outs
+    return plan.container(results), outs
+
+
 def dispatch(func: Any, args: tuple, kwargs: dict, client: Client | None) -> Any:
     """Run one ATen operator: metadata here, values on the runtime."""
     if func is _DETACH or func is _ALIAS:
         source = args[0]
         if type(source) is RemoteTensor:
             return RemoteTensor(source._sig, source._ref)
+
+    replaying = REPLAY[0]
+    if replaying is not None:
+        done = replaying.replay(func, args, kwargs, client)
+        if done is not MISS:
+            return done
 
     named = _NAMES.get(func)
     if named is None:
@@ -395,24 +507,9 @@ def dispatch(func: Any, args: tuple, kwargs: dict, client: Client | None) -> Any
     else:
         client.stats.cached += 1
 
-    outs: list = []
-    results: list = []
-    for leaf in plan.leaves:
-        tag = leaf[0]
-        if tag == _NEW:
-            handle = client._next_handle
-            client._next_handle = handle + 1
-            outs.append(handle)
-            results.append(RemoteTensor(leaf[1], Ref(client, handle)))
-        elif tag == _IN:
-            outs.append(None)
-            results.append(tensors[leaf[1]])
-        else:
-            results.append(leaf[1])
-    client.put(structure, name, args, kwargs, plan, tensors, scalars, blobs, outs, big)
-    if plan.container is None:
-        return results[0]
-    return plan.container(results)
+    result, outs = outputs(plan, client, tensors)
+    client.put(structure, name, args, kwargs, plan, tensors, scalars, blobs, outs, big, key)
+    return result
 
 
 def _plan(name: str, meta_out: Any, tensors: list) -> Plan:

@@ -539,6 +539,81 @@ def test_handles_created_in_repetitions_are_released(client) -> None:
     assert client.stats.replayed > 0
 
 
+def _loop(to_device, steps, *, on_step=None, flag_at=None):
+    """A training loop on one model, with a batch slice, a float scalar and a literal per step.
+
+    ``on_step(step)`` runs before each step. ``flag_at`` is the step whose ``keepdim`` literal
+    differs from every other step's.
+    """
+    torch.manual_seed(0)
+    data = to_device(torch.randn(256, 8))
+    model = to_device(
+        torch.nn.Sequential(torch.nn.Linear(8, 32), torch.nn.ReLU(), torch.nn.Linear(32, 8))
+    )
+    opt = torch.optim.Adam(model.parameters(), lr=1e-2)
+    losses = []
+    for step in range(steps):
+        if on_step is not None:
+            on_step(step)
+        # Four batch offsets in turn, so every metadata key has been seen by step 12.
+        start = (step % 4) * 7
+        chunk = data[start : start + 16]
+        out = model(chunk)
+        total = out.sum(dim=0, keepdim=step == flag_at).sum()
+        loss = torch.nn.functional.mse_loss(out, chunk) + total * (1e-3 / (1 + step % 3))
+        opt.zero_grad()
+        loss.backward()
+        opt.step()
+        losses.append(loss.detach())
+    params = [p.detach().cpu() for p in model.parameters()]
+    return [float(value) for value in losses], params
+
+
+def test_an_operator_at_a_replayed_position_is_read_without_the_full_argument_walk(
+    client, monkeypatch
+) -> None:
+    from letify.remoting.device import tensor as tensor_module
+
+    walks = []
+    full = tensor_module._read
+
+    def counting(values, *rest):
+        walks.append(step_now[0])
+        return full(values, *rest)
+
+    step_now = [0]
+
+    def on_step(step):
+        step_now[0] = step
+
+    monkeypatch.setattr(tensor_module, "_read", counting)
+    with client.suspended():
+        local = _loop(lambda value: value, 24)
+    walks.clear()
+    before = client.stats.snapshot()
+    remote = _loop(lambda value: value.cuda(), 24, on_step=on_step)
+    delta = client.stats.snapshot() - before
+    assert remote[0] == pytest.approx(local[0], rel=1e-5, abs=1e-6)
+    for got, want in zip(remote[1], local[1], strict=True):
+        assert torch.allclose(got, want, rtol=1e-5, atol=1e-6)
+    assert delta.fallbacks == 0
+    assert delta.replayed > 0
+    # The float scalar cycles through three values, so from step 12 every key has been seen.
+    assert [step for step in walks if step >= 12] == []
+
+
+def test_a_literal_that_changes_at_a_replayed_position_takes_the_full_path(client) -> None:
+    with client.suspended():
+        local = _loop(lambda value: value, 16, flag_at=12)
+    before = client.stats.snapshot()
+    remote = _loop(lambda value: value.cuda(), 16, flag_at=12)
+    delta = client.stats.snapshot() - before
+    assert remote[0] == pytest.approx(local[0], rel=1e-5, abs=1e-6)
+    for got, want in zip(remote[1], local[1], strict=True):
+        assert torch.allclose(got, want, rtol=1e-5, atol=1e-6)
+    assert delta.fallbacks >= 1
+
+
 # -- Spec: Handles --------------------------------------------------------------
 
 
