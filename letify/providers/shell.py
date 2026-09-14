@@ -25,6 +25,7 @@ from ..errors import ProviderUnavailable, RuntimeFailure
 from ..transport import sshopts
 from .base import Provider
 from .naming import gib_from_mib, normalize_gpu
+from .usage import Usage
 
 if TYPE_CHECKING:
     from ..runtime.channel import Channel
@@ -51,7 +52,17 @@ class Shell(Provider):
     has_fast_path = True
 
     #: A machine letify only runs commands on has no account behind it to meter.
-    usage_source = "a machine reached by SSH has no account behind it"
+    usage_source = "no quota: a machine reached by SSH has no account behind it"
+
+    def report_usage(self) -> Usage:
+        """No quota. Subclasses with an account behind them read it instead."""
+        return Usage(
+            alias=self.alias,
+            kind=self.kind,
+            unit=self.usage_unit,
+            source=self.usage_source,
+            unmetered=True,
+        )
 
     #: Whether connection decisions are printed. The Launcher sets its own announce flag here.
     announce = True

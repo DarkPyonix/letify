@@ -104,21 +104,37 @@ A provider is built from one entry in the configuration file and reached by attr
 
 ### Remaining usage
 
-> Every provider is asked the same question, and a provider that cannot answer says so instead of guessing.
+> Every provider is asked what is left on its account, reads the answer from the service itself, and says why when it cannot.
 
-`Provider.usage()` returns a `Usage` record: the alias, the unit the account is metered in, how much is left, how much is spent, the ceiling, the hourly rate of what is running now, when the figure was taken, and where it came from. Every field except the alias, the unit and the source may be `None`, because a missing number is information and a fabricated one is not.
+`Provider.usage()` returns a `Usage` record with these fields:
 
-A provider reports what its service actually publishes:
+| Field | Means |
+|---|---|
+| `alias`, `kind` | The account and its provider kind |
+| `unit` | What the account is metered in: `compute units`, `KRW`, `USD` or `GPU hours` |
+| `source` | Where the figure came from, or why there is none |
+| `remaining` | How much is left, in `unit` |
+| `used`, `limit` | How much of the current allowance is spent, and the allowance, when the service states them |
+| `rate_per_hour` | What is running now costs per hour, in `unit` |
+| `resets_at` | When the allowance renews, as Unix seconds, when it renews on a schedule |
+| `unmetered` | True when there is no quota at all |
+| `as_of` | When the figure was read, as Unix seconds |
+| `note` | Why a figure is missing, in one line |
 
-| Provider | Unit | Remaining | Comes from |
-|---|---|---|---|
-| `Local` | hours | unmetered | nothing to ask; this machine bills nobody |
-| `Elice` | KRW | not published | live allocations priced from the zone price list, which gives the rate and the spend, not the balance |
-| `Colab` | compute units | not published | the CLI has no balance command; the figure is in the web console |
-| `Modal` | USD | not published | the SDK exposes no workspace balance |
-| `Shell`, `Tunnel` | hours | not published | a machine letify only runs commands on has no account behind it |
+Every field except `alias`, `kind`, `unit` and `source` may be `None`. A provider that cannot be read returns a record with `remaining` set to `None` and the reason in `note`. It does not raise.
 
-Where the service publishes nothing, a configuration entry supplies the number itself:
+Each provider reads its own service. Every call is read-only: none creates a runtime, a sandbox or a session.
+
+| Provider | Unit | Remaining comes from |
+|---|---|---|
+| `Colab` | compute units | `GET https://colab.research.google.com/tun/m/ccu-info?authuser=0`, the call the Colab web page makes. `remaining` is `currentBalance` and `rate_per_hour` is `consumptionRateHourly`. The OAuth token is the Colab CLI's `.config/colab-cli/token.json` in the account directory. An expired token is refreshed in memory at its `token_uri` and the file is not rewritten |
+| `Elice` | KRW | `GET <billing_endpoint>/stats` with the account's bearer token and, when `organization` is set, the `x-elice-org-name-short` header. `remaining` is `total_credit_remaining_amount`, sent as a number or as `"<amount> <currency>"`. `rate_per_hour` prices the live allocations against the zone price list. `billing_endpoint` is the Elice billing API base URL. The portal takes it from its runtime settings, so it is a configuration field, and without it `note` says so |
+| `Modal` | USD | The Modal adapter op `billing_summary`, which calls `modal.Workspace.billing.summary()` for the current month. `used` is the month's metered cost and `limit` is the monthly credit, `monthly_credit` in the entry or 30 USD, the Starter plan credit. `remaining` is `limit - used`, not below 0. `resets_at` is 00:00 UTC on the first of next month |
+| `Kaggle` | GPU hours | The weekly GPU quota the Kaggle provider reads. `remaining`, `used` and `limit` are hours, and `resets_at` is the weekly renewal |
+| `Local` | hours | unmetered: this machine bills nobody |
+| `Shell`, `Tunnel` | hours | unmetered: a machine reached by SSH has no quota and no account behind it |
+
+A configured command replaces the provider's own reading:
 
 ```toml
 [colab_a]
@@ -128,9 +144,21 @@ usage_unit = "compute units"
 usage_limit = 100.0
 ```
 
-The last number in the command's output is read as the remaining amount. This exists because the alternative is letify inventing an endpoint, and a wrong balance is worse than an absent one. The command runs only when usage is asked for, never during a call.
+The last number in the command's output is read as the remaining amount. The command runs only when usage is asked for, never during a call.
 
-`letify usage` prints one row per declared provider, and `letify usage <alias>` one provider. A provider whose optional dependency or setting is missing is reported as unavailable rather than skipped, so the table always lists every alias.
+`Launcher.usage()` asks every provider at once, one thread each, and waits at most `usage_timeout` seconds per provider, 20 by default. A provider that has not answered by then, or that raised, gets a row with `remaining` set to `None` and the reason in `note`. The other rows are unaffected.
+
+`letify usage` prints one row per declared provider, and `letify usage <alias>` one provider. A provider whose optional dependency or setting is missing is reported as unavailable rather than skipped, so the table always lists every alias. `letify usage --json` prints the records unformatted. The table formats amounts by unit:
+
+| Unit | Printed as |
+|---|---|
+| `KRW` | `12,345 KRW`, whole won with thousands separators |
+| `USD` | `$29.50` |
+| `compute units` | `99.93 compute units`, two decimals |
+| `GPU hours` | `12.5 GPU hours`, one decimal |
+| any other | the number as given, then the unit |
+
+A row prints `<remaining> left`, then `of <limit>` when the limit is known, then `resets <YYYY-MM-DD HH:MM UTC>` when `resets_at` is known, then the hourly rate when it is known. An unmetered row prints `no quota, unmetered`. A row with no figure prints `not reported` with the note or the source.
 
 ### Inventory
 
@@ -328,6 +356,7 @@ The protocol is one JSON object per line. letify sends `{"id": <int>, "op": <nam
 | `write` | `sandbox`, `data` | `null`. `data` is base64. Writes the decoded bytes to the sandbox's standard input and drains it |
 | `read_until` | `sandbox`, `prefixes` | `{"lines": [...], "eof": <bool>}`. The sandbox's stdout lines up to and including the first that starts with one of `prefixes`, or every line left when the stream ends |
 | `terminate` | `sandbox` | `null` |
+| `billing_summary` | none | `{"metered_cost": <text>, "billed_cost": <text>, "credits": <text>, "start": <Unix seconds>, "end": <Unix seconds>}` for the current month, from `modal.Workspace.billing.summary()`. Amounts are decimal text in USD. `credits` is the `Credits` adjustment, negative when credit was applied |
 | `volume_put` | `volume`, `version`, `path`, `data` | `null`. `data` is base64 |
 | `volume_get` | `volume`, `version`, `path` | base64 of the file |
 | `volume_list` | `volume`, `version`, `path` | the paths under `path`, recursively |

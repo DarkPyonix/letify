@@ -417,8 +417,10 @@ class FakeEliceServer:
                 "method": method,
                 "path": path,
                 "params": dict(urllib.parse.parse_qsl(parsed.query)) or None,
-                "json": json.loads(body) if body else None,
+                "json": _json_or_none(body),
+                "form": dict(urllib.parse.parse_qsl(body.decode(errors="replace"))) or None,
                 "authorization": handler.headers.get("Authorization"),
+                "org": handler.headers.get("x-elice-org-name-short"),
             }
         )
         response = self.responses.get((method, path), self.default)
@@ -433,8 +435,32 @@ class FakeEliceServer:
         handler.wfile.write(payload)
 
 
+def _json_or_none(body: bytes) -> Any:
+    """A request body decoded as JSON, or None when it is empty or form encoded."""
+    import json
+
+    if not body:
+        return None
+    try:
+        return json.loads(body)
+    except ValueError:
+        return None
+
+
 @pytest.fixture
 def fake_elice():
+    server = FakeEliceServer()
+    yield server
+    server.close()
+
+
+@pytest.fixture
+def fake_google():
+    """Google's OAuth token endpoint and Colab's ``ccu-info`` on loopback.
+
+    The same recording server as the Elice stand-in, because both are plain HTTP answered
+    from a table. Paths are below ``/api``.
+    """
     server = FakeEliceServer()
     yield server
     server.close()

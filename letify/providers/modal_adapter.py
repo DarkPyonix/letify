@@ -175,6 +175,24 @@ class Adapter:
             stream.sandbox.terminate()
         return None
 
+    # -- billing -----------------------------------------------------------------
+
+    def op_billing_summary(self, request: dict[str, Any]) -> Any:
+        """This month's workspace cost. Read-only: it starts no app and no sandbox."""
+        modal = load_modal()
+        summary = modal.Workspace.from_context().billing.summary()
+        credits = sum(
+            (value for key, value in summary.adjustments.items() if key.lower() == "credits"),
+            start=0,
+        )
+        return {
+            "metered_cost": str(summary.metered_cost),
+            "billed_cost": str(summary.billed_cost),
+            "credits": str(credits),
+            "start": summary.start.timestamp(),
+            "end": summary.end.timestamp(),
+        }
+
     # -- volumes -----------------------------------------------------------------
 
     def _volume(self, request: dict[str, Any]) -> tuple[Any, Any]:

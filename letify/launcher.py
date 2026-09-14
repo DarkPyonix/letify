@@ -54,6 +54,9 @@ if TYPE_CHECKING:
 
 R = TypeVar("R")
 
+#: Seconds ``Launcher.usage`` waits for one provider, unless its entry sets usage_timeout.
+USAGE_TIMEOUT = 20.0
+
 
 class Providers:
     """Attribute access over the providers the configuration declared."""
@@ -276,17 +279,60 @@ class Launcher:
         Every declared alias is listed, including one whose provider could not even be
         built, because an account missing from a table reads as an account with nothing
         left on it.
+
+        Providers are asked at once, one daemon thread each, and each is waited on for its
+        ``usage_timeout`` seconds at most. A provider that is late or raises gets a row
+        with the reason in its note, and the others are unaffected.
         """
+        import time
+
+        from .providers.usage import Usage
+
         wanted = [alias] if alias else list(self.config.order)
-        rows: list[dict[str, Any]] = []
-        for name in wanted:
+        rows: list[dict[str, Any] | None] = [None] * len(wanted)
+        answers: dict[int, dict[str, Any]] = {}
+        asked: list[tuple[int, Provider, threading.Thread, float]] = []
+
+        def failed(provider: Provider, note: str) -> dict[str, Any]:
+            return Usage(
+                alias=provider.alias,
+                kind=provider.kind,
+                unit=provider.usage_unit,
+                source=provider.usage_source,
+                as_of=time.time(),
+                note=note,
+            ).to_dict()
+
+        def ask(index: int, provider: Provider) -> None:
+            try:
+                answers[index] = provider.usage().to_dict()
+            except Exception as exc:
+                answers[index] = failed(provider, f"could not be read: {type(exc).__name__}: {exc}")
+
+        for index, name in enumerate(wanted):
             try:
                 provider = self.provider(name)
             except LetifyError as exc:
-                rows.append({"alias": name, "unavailable": str(exc)})
+                rows[index] = {"alias": name, "unavailable": str(exc)}
                 continue
-            rows.append(provider.usage().to_dict())
-        return rows
+            limit = provider.config.option("usage_timeout", USAGE_TIMEOUT)
+            timeout = float(limit) if isinstance(limit, (int, float)) else USAGE_TIMEOUT
+            thread = threading.Thread(
+                target=ask, args=(index, provider), name=f"letify-usage-{name}", daemon=True
+            )
+            thread.start()
+            asked.append((index, provider, thread, timeout))
+
+        started = time.monotonic()
+        for index, provider, thread, timeout in asked:
+            thread.join(max(0.0, started + timeout - time.monotonic()))
+            answer = answers.get(index)
+            rows[index] = (
+                answer
+                if answer is not None
+                else failed(provider, f"no answer within {timeout:g} s")
+            )
+        return [row for row in rows if row is not None]
 
     def utilization(self, alias: str | None = None) -> list[dict[str, Any]]:
         """How hard each declared instance's accelerator is working right now.
