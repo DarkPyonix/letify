@@ -27,7 +27,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     sub.add_parser("providers", help="list declared providers and their storage")
     sub.add_parser("devices", help="list the accelerators each provider offers")
-    sub.add_parser("status", help="show live runtimes and what they are costing")
+    status = sub.add_parser("status", help="show live runtimes and what they are costing")
+    status.add_argument("--json", action="store_true", help="print the record as JSON, as it is")
     sub.add_parser("stubs", help="write the provider types an editor completes")
 
     usage = sub.add_parser("usage", help="show what each account has left")
