@@ -75,9 +75,7 @@ def test_a_module_trained_with_adam_matches_a_local_cpu_run(client) -> None:
     def train(to_device):
         torch.manual_seed(0)
         data = torch.randn(64, 8)
-        model = torch.nn.Sequential(
-            torch.nn.Linear(8, 32), torch.nn.ReLU(), torch.nn.Linear(32, 8)
-        )
+        model = torch.nn.Sequential(torch.nn.Linear(8, 32), torch.nn.ReLU(), torch.nn.Linear(32, 8))
         model = to_device(model)
         data = to_device(data)
         optimizer = torch.optim.Adam(model.parameters(), lr=1e-2)
@@ -116,12 +114,12 @@ def test_code_written_for_cuda_runs_unchanged(client) -> None:
 
 
 def test_a_second_cuda_device_is_refused(client) -> None:
-    with pytest.raises(UnsupportedMode, match="cuda:1"):
+    with pytest.raises(UnsupportedMode, match=r"cuda:1"):
         torch.zeros(1, device="cuda:1")
 
 
 def test_a_cuda_api_with_no_local_counterpart_names_itself(client) -> None:
-    with pytest.raises(UnsupportedMode, match="torch.cuda.Stream"):
+    with pytest.raises(UnsupportedMode, match=r"torch\.cuda\.Stream"):
         torch.cuda.Stream()
 
 
@@ -139,7 +137,14 @@ def test_the_cuda_functions_are_restored_when_forwarding_ends() -> None:
 # -- Spec: Batching and synchronization -----------------------------------------
 
 
-def test_queued_operators_travel_without_a_round_trip_until_a_value_is_read(client) -> None:
+def test_queued_operators_travel_without_a_round_trip_until_a_value_is_read(
+    client, monkeypatch
+) -> None:
+    # A long linger leaves only the size rule and the synchronization to send the queue,
+    # so the batch count does not depend on how fast this machine dispatches.
+    from letify.remoting.device import client as client_module
+
+    monkeypatch.setattr(client_module, "LINGER_S", 60.0)
     x = torch.ones(16, device="cuda")
     before = client.stats.snapshot()
     for _ in range(100):
@@ -239,7 +244,7 @@ def test_a_remote_operator_error_reports_the_operator_name(client) -> None:
     index = torch.tensor([7]).cuda()
     table = torch.zeros(3, device="cuda")
     table.index_fill_(0, index, 1.0)
-    with pytest.raises(RemoteError, match="aten.index_fill_"):
+    with pytest.raises(RemoteError, match=r"aten\.index_fill_"):
         torch.cuda.synchronize()
     assert table.sum().item() == 0.0
 
@@ -254,7 +259,7 @@ def test_an_old_torch_is_refused_with_the_version_it_needs() -> None:
 
 
 def test_a_worker_on_another_torch_minor_is_refused() -> None:
-    with pytest.raises(UnsupportedMode, match="2.4"):
+    with pytest.raises(UnsupportedMode, match=r"2\.4"):
         forwarding.check_worker_version(local="2.5.1", remote="2.4.0+cu121")
     forwarding.check_worker_version(local="2.5.1+cpu", remote="2.5.1+cu121")
 
