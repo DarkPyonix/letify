@@ -332,6 +332,163 @@ def test_the_cuda_functions_are_restored_when_forwarding_ends() -> None:
         connected.close()
 
 
+def test_a_dataloader_with_forked_workers_leaves_the_session_usable(client) -> None:
+    data = torch.arange(64.0).reshape(32, 2)
+    loader = torch.utils.data.DataLoader(
+        torch.utils.data.TensorDataset(data), batch_size=8, num_workers=2, timeout=60
+    )
+    total = torch.zeros(2, device="cuda")
+    for (batch,) in loader:
+        total += batch.cuda().sum(dim=0)
+    assert total.cpu().tolist() == data.sum(dim=0).tolist()
+
+
+def _child_view(queue) -> None:
+    import torch
+
+    from letify.remoting.device import current_client
+
+    torch.manual_seed(1)
+    queue.put((current_client() is None, torch.cuda.manual_seed_all.__module__))
+
+
+def test_a_process_forked_inside_forwarding_sees_plain_torch_cuda(client) -> None:
+    import multiprocessing
+
+    context = multiprocessing.get_context("fork")
+    queue = context.Queue()
+    child = context.Process(target=_child_view, args=(queue,))
+    child.start()
+    no_client, module = queue.get(timeout=60)
+    child.join(60)
+    assert child.exitcode == 0
+    assert no_client
+    assert module == "torch.cuda.random"
+    assert torch.ones(2, device="cuda").sum().item() == 2.0
+
+
+def test_a_client_refuses_to_send_from_a_forked_process(client) -> None:
+    import multiprocessing
+
+    from letify.errors import RuntimeLost
+
+    def attempt(queue) -> None:
+        try:
+            client.call("letify.seed", 1)
+        except RuntimeLost as exc:
+            queue.put(str(exc))
+        else:
+            queue.put("sent")
+
+    context = multiprocessing.get_context("fork")
+    queue = context.Queue()
+    child = context.Process(target=attempt, args=(queue,))
+    child.start()
+    message = queue.get(timeout=60)
+    child.join(60)
+    assert "forked" in message
+    assert torch.ones(3, device="cuda").sum().item() == 3.0
+
+
+# -- Spec: Autocast ---------------------------------------------------------------
+
+
+def test_autocast_runs_a_linear_layer_in_the_autocast_dtype(client) -> None:
+    layer = torch.nn.Linear(4, 2).cuda()
+    with torch.autocast("cuda", dtype=torch.bfloat16):
+        out = layer(torch.ones(3, 4, device="cuda"))
+        conv = torch.nn.functional.conv2d(
+            torch.ones(1, 2, 5, 5, device="cuda"), torch.ones(3, 2, 3, 3, device="cuda")
+        )
+    assert out.dtype == torch.bfloat16
+    assert conv.dtype == torch.bfloat16
+    assert layer.weight.dtype == torch.float32
+    torch.cuda.synchronize()
+
+
+def test_autocast_runs_float32_functions_in_float32(client) -> None:
+    half = torch.ones(2, 4, device="cuda", dtype=torch.bfloat16)
+    with torch.autocast("cuda", dtype=torch.bfloat16):
+        normed = torch.nn.functional.layer_norm(half, (4,))
+        soft = half.softmax(dim=-1)
+        loss = torch.nn.functional.mse_loss(half, half)
+    assert normed.dtype == soft.dtype == loss.dtype == torch.float32
+
+
+def test_autocast_promotes_mixed_arguments_to_the_widest_dtype(client) -> None:
+    half = torch.ones(2, device="cuda", dtype=torch.bfloat16)
+    full = torch.ones(2, device="cuda")
+    with torch.autocast("cuda", dtype=torch.bfloat16):
+        joined = torch.cat([half, full])
+    assert joined.dtype == torch.float32
+    assert joined.cpu().tolist() == [1.0, 1.0, 1.0, 1.0]
+
+
+def test_autocast_cross_entropy_takes_log_softmax_in_the_input_dtype(client) -> None:
+    # CUDA's cross_entropy_loss runs log_softmax uncast and casts only nll_loss to float32.
+    torch.manual_seed(0)
+    logits = torch.randn(8, 10) * 3
+    target = torch.randint(0, 10, (8,))
+    with client.suspended():
+        half = logits.to(torch.bfloat16)
+        want = torch.nn.functional.nll_loss(torch.log_softmax(half, 1).float(), target)
+    with torch.autocast("cuda", dtype=torch.bfloat16):
+        got = torch.nn.functional.cross_entropy(logits.to(torch.bfloat16).cuda(), target.cuda())
+    assert got.dtype == torch.float32
+    assert got.cpu().item() == want.item()
+
+
+def test_autocast_does_not_widen_index_copy(client) -> None:
+    # CUDA autocast has no kernel for index_copy, so mixed dtypes raise there too.
+    base = torch.zeros(4, device="cuda", dtype=torch.bfloat16)
+    source = torch.ones(2, device="cuda")
+    index = torch.tensor([0, 2]).cuda()
+    with pytest.raises((RuntimeError, RemoteError)):
+        with torch.autocast("cuda", dtype=torch.bfloat16):
+            base.index_copy(0, index, source)
+        torch.cuda.synchronize()
+
+
+def test_operators_outside_an_autocast_region_keep_their_dtype(client) -> None:
+    layer = torch.nn.Linear(4, 2).cuda()
+    with torch.autocast("cuda", dtype=torch.bfloat16, enabled=False):
+        inside = layer(torch.ones(3, 4, device="cuda"))
+    after = layer(torch.ones(3, 4, device="cuda"))
+    assert inside.dtype == after.dtype == torch.float32
+
+
+def _mixed_step(to_device, autocast: bool):
+    """One step of a small model, under autocast or with autocast's casts written out."""
+    torch.manual_seed(0)
+    model = to_device(torch.nn.Sequential(torch.nn.Linear(8, 16), torch.nn.LayerNorm(16)))
+    head = to_device(torch.nn.Linear(16, 4))
+    data = to_device(torch.randn(6, 8))
+    target = to_device(torch.randn(6, 4))
+    if autocast:
+        with torch.autocast("cuda", dtype=torch.bfloat16):
+            loss = torch.nn.functional.mse_loss(head(model(data)), target)
+    else:
+        lin, norm = model
+        bf = torch.bfloat16
+        hidden = torch.nn.functional.linear(data.to(bf), lin.weight.to(bf), lin.bias.to(bf))
+        hidden = torch.nn.functional.layer_norm(hidden.float(), (16,), norm.weight, norm.bias)
+        out = torch.nn.functional.linear(hidden.to(bf), head.weight.to(bf), head.bias.to(bf))
+        loss = torch.nn.functional.mse_loss(out.float(), target)
+    loss.backward()
+    params = [*model.parameters(), *head.parameters()]
+    return float(loss), [p.grad.detach().cpu() for p in params]
+
+
+def test_an_autocast_step_matches_the_same_casts_written_out(client) -> None:
+    with client.suspended():
+        want_loss, want_grads = _mixed_step(lambda value: value, autocast=False)
+    got_loss, got_grads = _mixed_step(lambda value: value.cuda(), autocast=True)
+    assert got_loss == want_loss
+    for got, want in zip(got_grads, want_grads, strict=True):
+        assert got.dtype == torch.float32
+        assert torch.equal(got, want)
+
+
 # -- Spec: Batching and synchronization -----------------------------------------
 
 
@@ -809,6 +966,129 @@ def test_handles_created_in_repetitions_are_released(client) -> None:
     gc.collect()
     assert client.live_handles() == first
     assert client.stats.replayed > 0
+
+
+def _executor_with_step():
+    """An in-process CPU executor holding one step of three operators.
+
+    Position 0 makes offset 0 from an external, position 1 makes offset 1 from offset 0, and
+    position 2 makes offset 2 from offset 1 and an external. Offsets 0 and 1 are last read at
+    positions 1 and 2, and offset 2, which nothing in the step reads, at position 2.
+    """
+    from letify.remoting.device import executor as executor_module
+
+    runner = executor_module.Executor("cpu")
+    runner.define(1, "aten.mul.Tensor", ([("h", 0), ("s", 0)], {}))
+    runner.define(2, "aten.add.Tensor", ([("h", 0), ("h", 1)], {}))
+    runner.define_step(7, ((1, (-1,), (True,)), (1, (0,), (True,)), (2, (1, -1), (True,))))
+    runner.tensors[1] = torch.ones(3)
+    return runner, executor_module
+
+
+def test_a_replayed_step_releases_a_temporary_after_its_last_use(client) -> None:
+    runner, module = _executor_with_step()
+    entry = (module.E_STEP, 7, 100, 0, 3, (1, 1), (2.0, 3.0), (), ())
+    runner.run({"entries": [entry]}, [])
+    assert 100 not in runner.tensors and 101 not in runner.tensors
+    assert 102 not in runner.tensors
+    assert runner.failure is None
+
+
+def test_a_kept_offset_outlives_its_last_use_in_the_step(client) -> None:
+    runner, module = _executor_with_step()
+    entry = (module.E_STEP, 7, 100, 0, 3, (1, 1), (2.0, 3.0), (), (2,))
+    runner.run({"entries": [entry]}, [])
+    assert set(runner.tensors) == {1, 102}
+    assert runner.tensors[102].tolist() == [7.0, 7.0, 7.0]
+
+
+def test_a_split_repetition_releases_an_offset_in_the_part_holding_its_last_use(client) -> None:
+    runner, module = _executor_with_step()
+    head = (module.E_STEP, 7, 100, 0, 2, (1,), (2.0, 3.0), (), ())
+    runner.run({"entries": [head]}, [])
+    assert 100 not in runner.tensors and 101 in runner.tensors
+    tail = (module.E_STEP, 7, 100, 2, 3, (1,), (), (), (2,))
+    runner.run({"entries": [tail]}, [])
+    assert set(runner.tensors) == {1, 102}
+
+
+def test_replayed_steps_release_temporaries_before_the_step_ends(client, monkeypatch) -> None:
+    import pickle
+
+    from letify.remoting.device import executor as executor_module
+
+    sent: list = []
+    original = client.transport.send
+
+    def spy(head, buffers):
+        sent.append(pickle.loads(head))
+        return original(head, buffers)
+
+    monkeypatch.setattr(client.transport, "send", spy)
+    with client.suspended():
+        local = _train(lambda value: value, steps=12)
+    remote = _train(lambda value: value.cuda(), steps=12)
+    _assert_same(remote, local)
+    steps = [
+        entry
+        for message in sent
+        for entry in message.get("entries", ())
+        if entry[0] == executor_module.E_STEP
+    ]
+    assert steps
+    released_early = 0
+    for entry in steps:
+        step = client._steps[entry[1]]
+        scheduled = sum(len(step.frees[index]) for index in range(entry[3], entry[4]))
+        released_early += scheduled - len(entry[8])
+    assert released_early > 0
+
+
+def test_a_release_is_applied_after_the_last_entry_of_its_batch_that_reads_it(client) -> None:
+    runner, module = _executor_with_step()
+    runner.tensors[2] = torch.ones(3)
+    live = (module.E_REQUEST, "letify.live", (), "value")
+    use = (module.E_OP, 1, (1,), (2.0,), (), (5,), None)
+    reply = runner.run({"entries": [live, use, live], "release": [1, 2], "reply": True}, [])
+    import pickle
+
+    results = pickle.loads(reply[0])["results"]
+    # Handle 2 is read by no entry, so it goes first; handle 1 goes after the entry reading it.
+    assert results == [1, 1]
+    assert set(runner.tensors) == {5}
+
+
+def test_a_handle_created_and_released_in_one_batch_is_not_kept(client) -> None:
+    runner, module = _executor_with_step()
+    make = (module.E_OP, 1, (1,), (2.0,), (), (5,), None)
+    runner.run({"entries": [make], "release": [5]}, [])
+    assert set(runner.tensors) == {1}
+
+
+def test_a_handle_read_by_a_later_entry_is_not_released_early(client, monkeypatch) -> None:
+    from letify.remoting.device import client as client_module
+
+    monkeypatch.setattr(client_module, "LINGER_S", 60.0)
+    monkeypatch.setattr(client_module, "IDLE_S", 60.0)
+    x = torch.ones(4, device="cuda")
+    client.synchronize()
+    last = x * 1.0
+    total = torch.zeros(4, device="cuda")
+    for _ in range(16):
+        carried = last * 1.0
+        last = None
+        gc.collect()
+        a = carried * 2.0
+        b = a + 1.0
+        c = b - 1.0
+        d = c * 0.5
+        e = d + 0.0
+        f = e * 1.0
+        total = total + f
+        last = f + 0.0
+    assert client.stats.replayed > 0
+    assert total.cpu().tolist() == [16.0] * 4
+    assert last.cpu().tolist() == [1.0] * 4
 
 
 def _loop(to_device, steps, *, on_step=None, flag_at=None):

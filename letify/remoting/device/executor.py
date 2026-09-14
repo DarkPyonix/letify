@@ -146,11 +146,25 @@ class Executor:
     def define_step(self, sid: int, ops) -> None:
         compiled = []
         before = [0]
-        for tid, wiring, news in ops:
+        last: dict = {}
+        made = 0
+        for index, (tid, wiring, news) in enumerate(ops):
             fn, builder, name, scalars, blobs = self._templates[tid]
             compiled.append((fn, builder, name, scalars, blobs, tuple(wiring), tuple(news)))
-            before.append(before[-1] + sum(news))
-        self._steps[sid] = (compiled, before)
+            for offset in wiring:
+                if offset >= 0:
+                    last[offset] = index
+            for flag in news:
+                if flag:
+                    last[made] = index
+                    made += 1
+            before.append(made)
+        # The offsets last read at each position, released after it as spec "Step capture",
+        # **Early release**, describes; the client computes the same schedule in ``trace``.
+        frees: list = [[] for _ in ops]
+        for offset, index in last.items():
+            frees[index].append(offset)
+        self._steps[sid] = (compiled, before, tuple(tuple(sorted(group)) for group in frees))
 
     # -- execution ---------------------------------------------------------------
 
@@ -174,7 +188,51 @@ class Executor:
         results: list = []
         out_buffers: list = []
         keep: list = []
-        for entry in message.get("entries", ()):
+        entries = message.get("entries", ())
+        tensors = self.tensors
+        # Each release is applied after the last entry of this batch that reads the handle,
+        # and at once when none does, as spec "Handles" describes.
+        after: dict = {}
+        release = message.get("release", ())
+        if release:
+            wanted = set(release)
+            last: dict = {}
+            # Entries from which every handle at or above a bound may be read or created: a
+            # step entry and an entry whose outputs the runtime describes.
+            open_from: list = []
+            for index, entry in enumerate(entries):
+                kind = entry[0]
+                if kind == E_OP:
+                    touched = list(entry[2])
+                    outs = entry[5]
+                    if type(outs) is int:
+                        open_from.append((index, outs))
+                    elif outs:
+                        touched.extend(handle for handle in outs if handle is not None)
+                elif kind == E_STEP:
+                    touched = entry[5]
+                    open_from.append((index, entry[2]))
+                elif kind == E_REQUEST and entry[1] == "letify.fetch":
+                    touched = (entry[2][0],)
+                else:
+                    continue
+                for handle in touched:
+                    if handle in wanted:
+                        last[handle] = index
+            for index, bound in open_from:
+                for handle in release:
+                    if handle >= bound and last.get(handle, -1) < index:
+                        last[handle] = index
+            for handle in release:
+                index = last.get(handle)
+                if index is None:
+                    tensors.pop(handle, None)
+                else:
+                    after.setdefault(index, []).append(handle)
+        for index, entry in enumerate(entries):
+            if after and index - 1 in after:
+                for handle in after.pop(index - 1):
+                    tensors.pop(handle, None)
             kind = entry[0]
             if kind == E_DEFINE:
                 try:
@@ -222,11 +280,9 @@ class Executor:
             if want:
                 results.append(value)
         self._buffers = []
-        # Released after the entries, because an operator queued before its input's last
-        # RemoteTensor was collected travels in the same batch as that release.
-        tensors = self.tensors
-        for handle in message.get("release", ()):
-            tensors.pop(handle, None)
+        for handles in after.values():
+            for handle in handles:
+                tensors.pop(handle, None)
         if not message.get("reply"):
             return None
         failure, self.failure = self.failure, None
@@ -271,8 +327,10 @@ class Executor:
         return value if want == "value" else None
 
     def replay(self, entry) -> None:
-        _, sid, first, start, stop, externals, scalars, blobs = entry
-        ops, before = self._steps[sid]
+        _, sid, first, start, stop, externals, scalars, blobs, keep = entry
+        ops, before, frees = self._steps[sid]
+        if len(keep) > 8:
+            keep = frozenset(keep)
         table = self.tensors
         torch_tensor = self.torch.Tensor
         handle = first + before[start]
@@ -310,6 +368,13 @@ class Executor:
                         if flag:
                             table[handle] = leaf
                             handle += 1
+            value = None
+            inputs = None
+            drop = frees[index]
+            if drop:
+                for offset in drop:
+                    if offset not in keep:
+                        table.pop(first + offset, None)
 
     def _describe(self, value):
         torch = self.torch

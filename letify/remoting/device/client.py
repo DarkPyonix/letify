@@ -147,6 +147,21 @@ class Stats:
         return Stats(**{name: getattr(self, name) - getattr(other, name) for name in names})
 
 
+#: Collected handles remembered for early release before the set is trimmed.
+DEAD_LIMIT = 1 << 17
+
+
+def _reads(entry: tuple, into: set[int]) -> None:
+    """Add the handles a queued entry reads from outside itself to ``into``."""
+    kind = entry[0]
+    if kind == E_OP:
+        into.update(entry[2])
+    elif kind == E_STEP:
+        into.update(entry[5])
+    elif kind == E_REQUEST and entry[1] == "letify.fetch":
+        into.add(entry[2][0])
+
+
 def _mutates(func: Any, name: str, kwargs: dict) -> bool:
     """Whether an operator writes to an argument, from its schema where PyTorch has one."""
     try:
@@ -172,6 +187,8 @@ class Client:
         self.process = process
         self.name = name
         self.stats = Stats()
+        #: The process that connected, the only one that may write to the transport.
+        self._pid = os.getpid()
         #: Handles whose last RemoteTensor was collected, appended from ``Ref.__del__``.
         self.released: list[int] = []
         self._next_handle = 1
@@ -207,6 +224,9 @@ class Client:
         self._sender: threading.Thread | None = None
         #: The runtime's kernel choice for each signature it was asked about.
         self._kernels: dict[tuple, str] = {}
+        #: Handles whose last RemoteTensor was collected, as taken by a batch. Updated only
+        #: under ``_flush_lock``, so a batch reads a consistent set.
+        self._dead: set[int] = set()
 
     # -- lifecycle ------------------------------------------------------------------
 
@@ -491,6 +511,7 @@ class Client:
             taken_releases = self.released[:]
             if taken_releases:
                 del self.released[: len(taken_releases)]
+                self._dead.update(taken_releases)
             pending = self._queue
             if through is not None:
                 count = 0
@@ -526,11 +547,13 @@ class Client:
                                 upto, located = max(upto, made[-1] + 1), True
                 elif kind == E_STEP:
                     if entry[7] and any(type(blob) is Big for blob in entry[7]):
-                        entry = entries[index] = (*entry[:7], self._place(entry[7], buffers, keep))
+                        placed = self._place(entry[7], buffers, keep)
+                        entry = entries[index] = (*entry[:7], placed, entry[8])
                     if not located:
                         step = self._steps[entry[1]]
                         made = entry[2] + step.news_before[entry[4]]
                         upto, located = max(upto, made), True
+            self._keep(entries, pending)
             self._sent_upto = upto
             released: list[int] = []
             if taken_releases:
@@ -579,6 +602,41 @@ class Client:
             self.stats.sent_bytes += len(head) + sum(view.nbytes for view in buffers)
             if pending:
                 self._first_at = time.monotonic()
+
+    def _keep(self, entries: list, pending: collections.deque) -> None:
+        """Fill ``keep`` in the batch's step entries, as spec "Step capture" describes.
+
+        An offset released at a position the entry runs is kept when its handle is not in
+        ``_dead``, or when an entry after it in this batch, a queued entry or the unfinished
+        repetition reads the handle. Called under ``_flush_lock``.
+        """
+        if not any(entry[0] == E_STEP and entry[8] is None for entry in entries):
+            return
+        dead = self._dead
+        read: set[int] = set(self.tracer.externals)
+        for queued in pending:
+            _reads(queued, read)
+        lowest = self.tracer.first if self.tracer.active is not None else self._next_handle
+        for index in range(len(entries) - 1, -1, -1):
+            entry = entries[index]
+            if entry[0] == E_STEP:
+                first = entry[2]
+                lowest = min(lowest, first)
+                if entry[8] is None:
+                    frees = self._steps[entry[1]].frees
+                    kept = tuple(
+                        offset
+                        for position in range(entry[3], entry[4])
+                        for offset in frees[position]
+                        if first + offset not in dead or first + offset in read
+                    )
+                    entries[index] = (*entry[:8], kept)
+            _reads(entry, read)
+        if len(dead) > DEAD_LIMIT:
+            for queued in pending:
+                if queued[0] == E_STEP:
+                    lowest = min(lowest, queued[2])
+            self._dead = {handle for handle in dead if handle >= lowest}
 
     def _place(self, blobs: tuple, buffers: list, keep: list) -> tuple:
         placed = []
@@ -845,6 +903,11 @@ class Client:
         return RuntimeLost(f"{self.name}: the device worker was lost: {reason}{detail}")
 
     def _check_open(self) -> None:
+        if os.getpid() != self._pid:
+            raise RuntimeLost(
+                f"{self.name}: this process was forked from process {self._pid}, which owns "
+                f"the device worker's channel, so it cannot send on it"
+            )
         if self._closed:
             raise RuntimeLost(f"{self.name}: the device worker is closed")
         if self._lost is not None:
