@@ -440,7 +440,11 @@ class Runtime:
                 break
 
         if self.env_source != "archive":
-            source = bootstrap.sync_source(self.env, files, root=root, name=self.name)
+            workspace = self.workspace or self.provider.workspace_root
+            cache = bootstrap.uv_cache_dir(workspace) if self.provider.persistent else None
+            source = bootstrap.sync_source(
+                self.env, files, root=root, name=self.name, cache_dir=cache
+            )
             try:
                 self.eval(source, timeout=3600)
             except RemoteError as exc:
