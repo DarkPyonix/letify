@@ -994,7 +994,7 @@ The client counts operators, batches, round trips and released handles, so ops p
 
 > The client assigns handles, so creating a tensor needs no reply, and a dropped tensor's handle is released with the next batch.
 
-A handle is an integer from a per-session counter. `RemoteTensor`s that share a handle, through `detach` or an in-place result, share one reference object, and when the last of them is collected its handle is appended to a release list. The list travels in the next batch, and a batch is sent early when it reaches 4096 handles.
+A handle is an integer from a per-session counter. `RemoteTensor`s that share a handle, through `detach` or an in-place result, share one reference object, and when the last of them is collected its handle is appended to a release list. The list travels in the next batch, and a batch is sent early when it reaches 4096 handles. The worker applies a batch's releases after its operators, because an operator queued before its input was collected can travel in the same batch as that input's release.
 
 ### Transfers <!-- id: forwarding-transfers -->
 
