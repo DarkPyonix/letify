@@ -323,7 +323,7 @@ class Elice(Shell):
 
     kind = "elice"
     extra = "shell"
-    default_persistence = "persistent"
+    default_persistence = "ephemeral"
     has_fast_path = True
     offers_spot = True
     #: Its machine lives only as long as a session, so utilization is read inside one.
@@ -900,7 +900,12 @@ class Elice(Shell):
         return runtime
 
     def stop(self, runtime: Runtime) -> None:
-        """Stop the machine once no other runtime is on it. Nothing is ever deleted."""
+        """Stop or delete the machine once no other runtime is on it. Spec "Elice machines", Stop.
+
+        A persistent account keeps the machine stopped. Otherwise a machine letify launched is
+        deleted with its disk, network interface and public IP; a declared ``machine_id`` is
+        only stopped.
+        """
         machine = runtime.external_id
         if not machine:
             return
@@ -912,6 +917,17 @@ class Elice(Shell):
         if machine in self._preempted:
             return
         self._stopped.add(machine)
+        if not self.persistent and not self.machine_id:
+            command = ["compute", "vm", "delete", machine, "--cascade", "-y"]
+            try:
+                self._eci(command, parse=False)
+            except LetifyError as exc:
+                reason = str(exc).splitlines()[0]
+                self._say(
+                    f"could not delete {machine}: {reason}. "
+                    f"Run 'eci compute vm delete {machine} --cascade -y'"
+                )
+            return
         try:
             self._eci(["compute", "vm", "stop", machine], parse=False)
         except LetifyError as exc:

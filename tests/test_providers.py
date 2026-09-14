@@ -159,7 +159,7 @@ def test_a_modal_provider_without_uv_says_uv_is_needed(isolated_home, patch_whic
         (Colab, "ephemeral", False, True),
         (Shell, "ephemeral", True, True),
         (Tunnel, "ephemeral", True, True),
-        (Elice, "persistent", True, True),
+        (Elice, "ephemeral", True, True),
     ],
 )
 def test_each_provider_declares_the_properties_the_spec_table_gives_it(

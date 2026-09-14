@@ -547,6 +547,11 @@ if joined.startswith("compute vm start"):
 if joined.startswith("compute vm stop"):
     vm(words[3])["status"] = "idle"
     done({})
+if joined.startswith("compute vm delete"):
+    if "--cascade" not in argv or "-y" not in argv:
+        done(code=1, err="aborted: stdin is not a TTY")
+    state["vms"] = [v for v in state["vms"] if v["name"] != words[3]]
+    done({"status": "deleted"})
 done(code=2, err=f"fake eci does not know: {joined}")
 """
 

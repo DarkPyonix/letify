@@ -98,7 +98,7 @@ A provider is built from one entry in the configuration file and reached by attr
 | `Colab` | ephemeral | no | persistent, or one-shot by configuration | `gcs` |
 | `Shell` | ephemeral, overridable | yes | persistent | `filesystem` |
 | `Tunnel` | ephemeral, overridable | yes | persistent | `filesystem` |
-| `Elice` | persistent | yes | persistent | `filesystem` |
+| `Elice` | ephemeral | yes | persistent | `filesystem` |
 
 `Shell` and its subclasses default to ephemeral because a machine's disk policy is not knowable in advance. Assuming ephemeral costs time, since letify rebuilds the environment each runtime and the work still succeeds; assuming persistent fails outright when the disk turns out to be wiped. A configuration entry overrides it with `persistent = true`.
 
@@ -232,7 +232,7 @@ The token is never an argument and never printed. Reads pass `--format json`. A 
 
 The runtime's `external_id` is the machine name, and the session runs over forward SSH to the address.
 
-**Stop.** Ending a session runs `eci compute vm stop <name>` once no other runtime of this provider is on that machine. An idle machine bills no compute, while its disk and public IP keep billing. letify never deletes a machine, its disk, its network interface or its public IP. A stop that fails prints `letify: could not stop <name>: <reason>. Run 'eci compute vm stop <name>'` and does not raise, because the session is already ending. `eci compute vm delete <name> --cascade` removes a machine and everything attached to it; without `--cascade` the disk, network interface and public IP remain and keep billing. `letify logout` deletes nothing on Elice.
+**Stop.** Ending a session acts once no other runtime of this provider is on the machine, and follows the account's `persistent` setting, default `false` for Elice. On a persistent account letify runs `eci compute vm stop <name>`: an idle machine bills no compute, while its disk and public IP keep billing, and the next session starts the same machine with its disk. On an account that is not persistent a machine letify launched is deleted with `eci compute vm delete <name> --cascade -y`, which removes its disk, network interface and public IP, so nothing keeps billing, and the next session launches a new machine. A machine the account names with `machine_id` is never deleted; it is stopped. A stop or delete that fails prints `letify: could not stop <name>: <reason>. Run 'eci compute vm stop <name>'` or `letify: could not delete <name>: <reason>. Run 'eci compute vm delete <name> --cascade -y'` and does not raise, because the session is already ending. `letify logout` deletes nothing on Elice.
 
 #### Price type <!-- id: elice-price-type -->
 
