@@ -694,7 +694,7 @@ def test_a_cached_environment_is_pulled_and_unpacked_by_the_runtime(
 
     from letify.runtime import bootstrap
 
-    provider = provider_of(PreparingLocal, "lab")
+    provider = provider_of(PreparingLocal, "lab", persistent=False)
     env = letify.Env()
     mount = tmp_path / "mount"
     volume = provider.volume(
