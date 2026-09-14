@@ -990,7 +990,7 @@ def test_elice_runs_its_remote_half_over_forward_ssh_to_the_started_machine() ->
     provider = provider_of(Elice, "e", zone_id="z", machine_id="m", address="gpu.elice.io")
     rendezvous = provider.rendezvous()
     assert isinstance(rendezvous, ShellCommandRendezvous)
-    assert rendezvous.ssh("python3 -")[-2:] == ["root@gpu.elice.io", "python3 -"]
+    assert rendezvous.ssh("python3 -")[-2:] == ["ubuntu@gpu.elice.io", "python3 -"]
     assert provider_of(Elice, "e", zone_id="z", machine_id="m").rendezvous() is None
 
 

@@ -514,6 +514,8 @@ if joined.startswith("config verify"):
 if joined.startswith("zone list"):
     done(state["zones"])
 if joined.startswith("instance-type list"):
+    if "--activated" in argv:
+        done(code=2, err="Error: No such option: --activated")
     done(state["instance_types"])
 if joined.startswith("pricing list"):
     done(state["pricing"])
@@ -574,13 +576,22 @@ class FakeEci:
                         "id": "it-a100",
                         "name": "G-A100-1",
                         "cpu_vcore": 16,
-                        "devices": ["NVIDIA A100-SXM4-80GB"],
+                        "devices": ["nvidia_a100_80gb_pcie"],
+                        "activated": True,
                     },
                     {
                         "id": "it-a100x2",
                         "name": "G-A100-2",
                         "cpu_vcore": 32,
-                        "devices": ["NVIDIA A100-SXM4-80GB", "NVIDIA A100-SXM4-80GB"],
+                        "devices": ["nvidia_a100_80gb_pcie", "nvidia_a100_80gb_pcie"],
+                        "activated": True,
+                    },
+                    {
+                        "id": "it-h100-retired",
+                        "name": "G-NHHS-80-OLD",
+                        "cpu_vcore": 24,
+                        "devices": ["nvidia_h100_80gb_sxm"],
+                        "activated": False,
                     },
                 ],
                 "pricing": [
@@ -623,7 +634,7 @@ class FakeEci:
 
     def commands(self) -> list[str]:
         """Each call's words, without flags or their values, joined by spaces."""
-        switches = {"--wait"}
+        switches = {"--wait", "--no-spec"}
         found = []
         for call in self.calls:
             words, skip = [], False

@@ -81,7 +81,7 @@ DEFAULT_KEY = "~/.ssh/id_letify"
 
 #: The user a launched machine is reached as. The documentation calls the launch password
 #: the root password.
-DEFAULT_USER = "root"
+DEFAULT_USER = "ubuntu"
 
 INSTALL_UNIX = (
     "curl -fsSL https://raw.githubusercontent.com/elice-dev/eci-cli/main/scripts/install.sh | sh"
@@ -96,6 +96,24 @@ PASSWORD_SYMBOLS = "!@#%^*_=+"
 
 
 # -- the HTTP API, for billing -------------------------------------------------
+
+
+#: Vendor prefixes on the device ids eci lists, such as ``nvidia_a100_80gb_pcie``.
+DEVICE_VENDORS = ("nvidia", "amd", "intel", "furiosaai", "rebellions")
+
+
+def accelerator_label(device: str) -> str:
+    """The accelerator label other providers use for an eci device id or a product name.
+
+    ``nvidia_a100_80gb_pcie`` becomes ``A100`` and ``furiosaai_warboy`` becomes ``WARBOY``,
+    the label ``normalize_gpu`` gives ``NVIDIA A100-SXM4-80GB``.
+    """
+    if " " in device or "-" in device or not device.islower():
+        return normalize_gpu(device)
+    parts = [part for part in device.split("_") if part]
+    if parts and parts[0] in DEVICE_VENDORS:
+        parts = parts[1:]
+    return parts[0].upper() if parts else normalize_gpu(device)
 
 
 def request(
@@ -459,7 +477,7 @@ class Elice(Shell):
         table: dict[str, Instance] = {}
         for row in self._instance_types():
             devices = row.get("devices") or []
-            label = normalize_gpu(str(devices[0])) if devices else "CPU"
+            label = accelerator_label(str(devices[0])) if devices else "CPU"
             if label in table:
                 continue
             table[label] = Instance(
@@ -471,7 +489,9 @@ class Elice(Shell):
         return table
 
     def _instance_types(self) -> list[dict[str, Any]]:
-        return items(self._eci(["instance-type", "list", "--activated", "true"]))
+        rows = items(self._eci(["instance-type", "list"]))
+        # eci has no option to filter activated types, so the flag each row carries is read.
+        return [row for row in rows if row.get("activated") is not False]
 
     def instance_type_for(self, instance: Instance) -> dict[str, Any]:
         """The instance type a launch uses for this instance. Spec "Elice machines"."""
@@ -490,7 +510,7 @@ class Elice(Shell):
                 r
                 for r in rows
                 if len(r.get("devices") or []) == instance.devices
-                and all(normalize_gpu(str(d)) == instance.gpu for d in r.get("devices") or [])
+                and all(accelerator_label(str(d)) == instance.gpu for d in r.get("devices") or [])
             ]
         if not matches:
             offered = ", ".join(str(r.get("name")) for r in rows) or "none"
@@ -727,6 +747,7 @@ class Elice(Shell):
             "--password",
             password,
             "--wait",
+            "--no-spec",
         ]
         if price_type == "spot":
             args += ["--price-type", "spot"]
