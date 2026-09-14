@@ -55,6 +55,8 @@ _READ_SIZE = 1 << 16
 # and from child processes arrives as frames too.
 _FRAME_FD = os.dup(1)
 _ERR_FD = os.dup(2)
+widen_pipe(0)
+widen_pipe(_FRAME_FD)
 _SENDER = (TextSender if _LETIFY_TEXT_FRAMES else Sender)(fd_writer(_FRAME_FD))
 
 
@@ -109,15 +111,20 @@ def _settle():
     if os.name == "nt":
         time.sleep(0.001)
         return
-    quiet = 0
     deadline = time.monotonic() + 2.0
-    while quiet < 2 and time.monotonic() < deadline:
-        if any(pump.busy or _readable(pump.read_fd) for pump in _PUMPS):
-            quiet = 0
+    while time.monotonic() < deadline:
+        if not _pending():
+            # A pump that has just read may not have marked itself busy yet. Yielding once
+            # lets it run, so a second idle reading means nothing is left to send.
+            time.sleep(0)
+            if not _pending():
+                return
         else:
-            quiet += 1
-        if quiet < 2:
             time.sleep(0.0001)
+
+
+def _pending():
+    return any(pump.busy or _readable(pump.read_fd) for pump in _PUMPS)
 
 
 def _release_output():

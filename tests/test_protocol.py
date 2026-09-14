@@ -8,6 +8,7 @@ does with it, and the markers and the decoder are then the real ones.
 
 from __future__ import annotations
 
+import os
 import pickle
 import subprocess
 import sys
@@ -480,3 +481,36 @@ def test_a_declaration_ships_what_its_environment_asked_for(let, cpu, tmp_path) 
             return module.score(x) + 1
 
         assert scored(x=5) == 16
+
+
+def test_a_large_bytes_value_is_read_into_the_object_it_becomes() -> None:
+    # Spec "Frames": a buffer marked as bytes is filled in place, so no copy follows the read.
+    payload = os.urandom(2 << 20)
+    written = bytearray()
+    wire.Sender(lambda view: written.extend(view) or view.nbytes).message(
+        wire.REPLY, 1, {"ok": True, "value": payload}
+    )
+    receiver = wire.Receiver(_reader(bytes(written), step=1 << 20))
+    event = None
+    while event is None:
+        event = receiver.next_event()
+    head, buffers = event[2]
+    assert [type(buffer) for buffer in buffers] == [bytes]
+    value = wire.loads(head, buffers)["value"]
+    assert value is buffers[0]
+    assert value == payload
+    assert hash(value) == hash(payload)
+
+
+def test_a_bytearray_value_still_arrives_as_a_bytearray() -> None:
+    # Only buffers marked as bytes are filled in place; a bytearray keeps its own type.
+    written = bytearray()
+    wire.Sender(lambda view: written.extend(view) or view.nbytes).message(
+        wire.REPLY, 1, {"ok": True, "value": bytearray(b"y" * (2 << 20))}
+    )
+    receiver = wire.Receiver(_reader(bytes(written)))
+    event = None
+    while event is None:
+        event = receiver.next_event()
+    value = wire.loads(*event[2])["value"]
+    assert type(value) is bytearray and value == bytearray(b"y" * (2 << 20))

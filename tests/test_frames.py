@@ -114,12 +114,17 @@ def test_a_64_mib_value_moves_at_least_300_mib_per_second_each_way_on_this_machi
     # down here and binary frames about 1000 MiB/s, so 300 MiB/s keeps a wide margin for a
     # loaded CI machine. LETIFY_THROUGHPUT_FLOOR lowers it where a runner is slower still.
     floor = float(os.environ.get("LETIFY_THROUGHPUT_FLOOR", "300"))
-    noop, take, _give = _declare(let, cpu)
+    noop, _take, _give = _declare(let, cpu)
 
     @let.function(device=cpu, host=letify.remote)
     def filled(size: int, byte: int) -> bytes:
         # Cheap to build, unlike os.urandom, so the download time is the wire's own.
         return bytes([byte]) * size
+
+    @let.function(device=cpu, host=letify.remote)
+    def length(payload: bytes) -> int:
+        # Only the length, so the upload time is not spent hashing on the worker.
+        return len(payload)
 
     with let.keep_alive():
         noop()
@@ -128,7 +133,7 @@ def test_a_64_mib_value_moves_at_least_300_mib_per_second_each_way_on_this_machi
             # A fresh value each time, so the upload is not answered from the blob table.
             payload = os.urandom(64 * MiB)
             start = time.perf_counter()
-            assert take(payload)[0] == 64 * MiB
+            assert length(payload) == 64 * MiB
             best_up = max(best_up, 64 / (time.perf_counter() - start))
             start = time.perf_counter()
             assert len(filled(64 * MiB, attempt)) == 64 * MiB
@@ -367,3 +372,17 @@ def test_a_mutable_argument_is_hashed_again_and_a_mutation_does_not_leak(let, cp
         assert scribble(value) == 0
         value[0] = 9
         assert scribble(value) == 9
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="F_SETPIPE_SZ is Linux only")
+def test_the_pipes_of_a_local_channel_hold_a_mebibyte(let, cpu) -> None:
+    # Spec "Frames": larger pipe writes, so an 8 MiB chunk is 8 handoffs rather than 128.
+    import fcntl
+
+    noop, _take, _give = _declare(let, cpu)
+    with let.keep_alive():
+        noop()
+        [runtime] = let.pool.live
+        process = runtime.channel._process
+        for stream in (process.stdin, process.stdout):
+            assert fcntl.fcntl(stream.fileno(), fcntl.F_GETPIPE_SZ) >= 1 << 20

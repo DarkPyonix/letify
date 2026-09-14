@@ -46,6 +46,12 @@ _WALK_LIMIT = 64
 
 _COUNT = struct.Struct("<I")
 
+#: High bit of a buffer length in a head: the buffer unpickles as ``bytes``, filled in place.
+_AS_BYTES = 1 << 63
+
+#: The pipe size both ends ask for on Linux.
+PIPE_SIZE = 1 << 20
+
 if __name__.startswith("letify."):
     from ..errors import ProtocolError as FrameError
 else:  # pragma: no cover - the copy that runs inside a worker
@@ -91,6 +97,54 @@ def loads(head: bytes | bytearray | memoryview, buffers: list) -> object:
     return pickle.loads(head, buffers=buffers)
 
 
+def _bytes_allocator():
+    """A function returning ``(bytes object, writable view of its contents)``, or None.
+
+    The object comes from ``PyBytes_FromStringAndSize(NULL, n)``, so reading into the view
+    fills the value a buffer unpickles as, with no zeroing and no copy afterwards. It is
+    checked once on a small object, and None where ctypes or that layout is not available.
+    """
+    try:
+        import ctypes
+
+        new = ctypes.pythonapi.PyBytes_FromStringAndSize
+        new.restype = ctypes.py_object
+        new.argtypes = (ctypes.c_void_p, ctypes.c_ssize_t)
+        offset = bytes.__basicsize__ - 1
+
+        def allocate(size: int):
+            obj = new(None, size)
+            array = (ctypes.c_char * size).from_address(id(obj) + offset)
+            return obj, memoryview(array).cast("B")
+
+        probe, view = allocate(8)
+        view[:] = b"letify!!"
+        del view
+        if probe != b"letify!!" or hash(probe) != hash(b"letify!!"):
+            return None
+        return allocate
+    except Exception:
+        return None
+
+
+_new_bytes = _bytes_allocator()
+
+
+def widen_pipe(fd: int) -> None:
+    """Ask for a 1 MiB pipe on Linux, or the largest the system allows. Anything else is kept."""
+    try:
+        import fcntl
+
+        setting = getattr(fcntl, "F_SETPIPE_SZ", 1031)
+        try:
+            fcntl.fcntl(fd, setting, PIPE_SIZE)
+        except OSError:
+            with open("/proc/sys/fs/pipe-max-size") as limit:
+                fcntl.fcntl(fd, setting, min(PIPE_SIZE, int(limit.read())))
+    except (ImportError, OSError, ValueError):
+        pass
+
+
 class Sender:
     """Writes frames through ``write``, one frame at a time under a lock."""
 
@@ -122,7 +176,11 @@ class Sender:
         """Send one object: a head frame, then its buffers as ``DATA`` frames."""
         head, buffers = dumps(obj)
         views = [memoryview(buffer).cast("B") for buffer in buffers]
-        lengths = struct.pack(f"<{len(views)}Q", *[view.nbytes for view in views])
+        marks = [
+            views[i].nbytes | _AS_BYTES if type(buffers[i].obj) is bytes else views[i].nbytes
+            for i in range(len(views))
+        ]
+        lengths = struct.pack(f"<{len(views)}Q", *marks)
         self.frame(kind, stream, _COUNT.pack(len(views)) + lengths + head)
         for view in views:
             for offset in range(0, view.nbytes, CHUNK):
@@ -143,24 +201,35 @@ class TextSender(Sender):
 class _Partial:
     """A message whose head arrived and whose buffers are still being filled."""
 
-    __slots__ = ("buffers", "head", "index", "kind", "offset")
+    __slots__ = ("buffers", "head", "index", "kind", "offset", "views")
 
     def __init__(self, kind: int, head: memoryview, lengths: tuple):
         self.kind = kind
         self.head = head
-        self.buffers = [bytearray(length) for length in lengths]
+        #: What ``loads`` receives, and the writable view each is filled through.
+        self.buffers: list = []
+        self.views: list = []
+        for length in lengths:
+            size = length & ~_AS_BYTES
+            if length & _AS_BYTES and size and _new_bytes is not None:
+                obj, view = _new_bytes(size)
+            else:
+                obj = bytearray(size)
+                view = memoryview(obj)
+            self.buffers.append(obj)
+            self.views.append(view)
         self.index = 0
         self.offset = 0
         self._skip_empty()
 
     def _skip_empty(self) -> None:
-        while self.index < len(self.buffers) and self.offset == len(self.buffers[self.index]):
+        while self.index < len(self.views) and self.offset == self.views[self.index].nbytes:
             self.index += 1
             self.offset = 0
 
     @property
     def complete(self) -> bool:
-        return self.index == len(self.buffers)
+        return self.index == len(self.views)
 
 
 class Receiver:
@@ -215,6 +284,7 @@ class Receiver:
         lengths = struct.unpack_from(f"<{count}Q", view, _COUNT.size)
         partial = _Partial(kind, view[_COUNT.size + 8 * count :], lengths)
         if partial.complete:
+            partial.views = []
             return kind, stream, (partial.head, partial.buffers)
         self._open[stream] = partial
         return None
@@ -226,15 +296,16 @@ class Receiver:
         while length:
             if partial.complete:
                 raise FrameError(f"stream {stream} sent more data than its message declared")
-            buffer = partial.buffers[partial.index]
-            take = min(len(buffer) - partial.offset, length)
-            self._exact(memoryview(buffer)[partial.offset : partial.offset + take])
+            view = partial.views[partial.index]
+            take = min(view.nbytes - partial.offset, length)
+            self._exact(view[partial.offset : partial.offset + take])
             partial.offset += take
             length -= take
             partial._skip_empty()
         if not partial.complete:
             return None
         del self._open[stream]
+        partial.views = []
         return partial.kind, stream, (partial.head, partial.buffers)
 
 
@@ -272,6 +343,7 @@ __all__ = [
     "HELLO",
     "MAGIC",
     "OUT_OF_BAND",
+    "PIPE_SIZE",
     "REPLY",
     "REQUEST",
     "SHUTDOWN",
@@ -285,4 +357,5 @@ __all__ = [
     "dumps",
     "fd_writer",
     "loads",
+    "widen_pipe",
 ]

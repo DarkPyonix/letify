@@ -483,6 +483,8 @@ class PersistentChannel(FramedChannel):
                 ) from exc
             assert process.stdin is not None and process.stdout is not None
             self._process = process
+            wire.widen_pipe(process.stdin.fileno())
+            wire.widen_pipe(process.stdout.fileno())
             # Read on a thread from the start, so SSH or the stub can never fill this pipe.
             self._stderr = _Tail()
             self._stderr_reader = threading.Thread(
