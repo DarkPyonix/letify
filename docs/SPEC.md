@@ -634,6 +634,18 @@ Two declarations cannot diverge from the local process. Before any session start
 
 The worker looks for `uv` on `PATH`, then at `~/.local/bin/uv`. When neither exists it downloads `https://astral.sh/uv/install.sh` over HTTPS with the bootstrap interpreter's `urllib` and runs it with `sh`, with `UV_INSTALL_DIR=~/.local/bin` and `UV_NO_MODIFY_PATH=1`. That is the same as `curl -LsSf https://astral.sh/uv/install.sh | env UV_INSTALL_DIR="$HOME/.local/bin" UV_NO_MODIFY_PATH=1 sh`, without needing `curl`. It needs no root, because it writes only under the home directory. A failed download or a non-zero exit raises `EnvironmentFailure` saying `uv could not be installed on <runtime>` with the reason.
 
+### uv cache <!-- id: uv-cache -->
+
+> On a persistent provider the runtime's uv cache is `<workspace root>/uv-cache`, on the same filesystem as every project `.venv`, so a new env key is built from hard links. An ephemeral provider keeps uv's default cache.
+
+uv installs a package into a `.venv` by hard linking it from its cache, and falls back to a full copy when the cache is on another filesystem. A container's home directory is often an overlay while the workspace root is a mounted disk, so the default cache under `~/.cache/uv` makes every new env key copy the whole environment.
+
+The sync step sets `UV_CACHE_DIR=<workspace root>/uv-cache` for `uv sync` and `uv pip install` when the provider's `persistence` is `persistent`. On a runtime with a persistent workspace root the cache then outlives a container rebuild along with the projects built from it. An `Env.vars` entry naming `UV_CACHE_DIR` wins over this rule.
+
+An ephemeral provider sets nothing. Its disk is discarded with the runtime, so a cache there is filled once per runtime wherever it lives, and moving it only matters when the home directory and the project are on different filesystems.
+
+letify never deletes from the cache. The first sync on a runtime fills `<workspace root>/uv-cache` once, and a cache uv already had elsewhere is left in place. `uv cache prune` run with the same `UV_CACHE_DIR` removes entries no lock file needs any more; a file still hard linked from a `.venv` keeps its disk blocks until that `.venv` is removed as well.
+
 ### Interpreter check <!-- id: interpreter-check -->
 
 > A worker whose Python major.minor differs from the local process fails the session start with both versions named, before any call is sent.
@@ -886,6 +898,7 @@ Everything letify writes on the runtime is under the root:
 |---|---|
 | `<workspace root>/project/<env key>` | the project files `uv sync` reads, and the `.venv` it builds |
 | `<workspace root>/project/.<digest>.tar.gz` | an environment archive while it is unpacked, removed once the `.venv` starts |
+| `<workspace root>/uv-cache` | uv's cache on a persistent provider, as uv cache describes |
 | `<workspace root>/volumes/<volume name>` | a volume's materialized blobs and project data |
 | `<workspace root>/tmp` | temporary files, including the archive `pack_dir` builds on a one-shot channel; `TMPDIR` points here |
 
