@@ -38,6 +38,41 @@ def test_a_frame_header_is_sixteen_bytes_of_magic_type_flags_stream_and_length()
     assert (wire.STDOUT, wire.STDERR, wire.SHUTDOWN) == (5, 6, 7)
 
 
+# -- Spec: PyTorch forwarding, Transport ------------------------------------------
+
+
+def test_a_device_reply_is_polled_for_before_the_reading_thread_blocks_in_a_read() -> None:
+    import select
+
+    from letify.runtime.channel import Connection
+
+    read_fd, write_fd = os.pipe()
+    blocking_reads: list[bool] = []
+
+    def readinto(view: memoryview) -> int:
+        blocking_reads.append(not select.select([read_fd], [], [], 0)[0])
+        return os.readv(read_fd, [view])
+
+    connection = Connection(
+        "lab", lambda view: len(view), readinto, lambda stream, data: None, poll_fd=read_fd
+    )
+    connection.poll_s = 5.0
+    connection.open_device()
+    sender = wire.Sender(lambda view: os.write(write_fd, view))
+    threading.Timer(0.05, lambda: sender.parts(wire.REPLY, wire.DEVICE_STREAM, b"x", [])).start()
+    head, buffers = connection.device_reply()
+    assert bytes(head) == b"x" and buffers == []
+    assert blocking_reads and not any(blocking_reads)
+    os.close(read_fd)
+    os.close(write_fd)
+
+
+def test_a_device_reply_is_polled_for_two_milliseconds_by_default() -> None:
+    from letify.runtime import channel
+
+    assert channel.DEVICE_POLL_S == 0.002
+
+
 def test_a_large_bytes_value_travels_out_of_band_without_a_copy() -> None:
     payload = os.urandom(2 * MiB)
     head, buffers = wire.dumps({"op": "call", "payload": payload})
