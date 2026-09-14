@@ -14,6 +14,7 @@ the test suite's CPU worker, parameterized by device.
 
 from __future__ import annotations
 
+import collections
 import os
 import pickle
 import sys
@@ -32,6 +33,9 @@ E_DEFINE = 1
 E_REQUEST = 2
 E_STEP_DEFINE = 3
 E_STEP = 4
+
+#: Bytes of recent uploads the executor keeps by digest and length, least recently used out.
+UPLOAD_CACHE_BYTES = 1 << 30
 
 
 class MissingHandle(Exception):
@@ -62,6 +66,10 @@ class Executor:
         self._steps: dict = {}
         self._buffers: list = []
         self._current = ""
+        #: Received upload bytes by ``(digest, length)``, least recently used first.
+        self._uploads: collections.OrderedDict = collections.OrderedDict()
+        self._upload_bytes = 0
+        self._upload_budget = UPLOAD_CACHE_BYTES
 
     # -- identity ----------------------------------------------------------------
 
@@ -168,13 +176,63 @@ class Executor:
 
         return read
 
+    def _evict_uploads(self) -> None:
+        uploads = self._uploads
+        while self._upload_bytes > self._upload_budget:
+            _key, data = uploads.popitem(last=False)
+            self._upload_bytes -= len(data)
+
+    def _resolve(self, blobs, buffers: list):
+        """Turn upload cache markers into buffer indices, updating the table in order."""
+        resolved = []
+        uploads = self._uploads
+        for blob in blobs:
+            if type(blob) is not tuple:
+                resolved.append(blob)
+            elif blob[0] == "p":
+                _, index, key = blob
+                if key not in uploads:
+                    uploads[key] = buffers[index]
+                    self._upload_bytes += key[1]
+                uploads.move_to_end(key)
+                self._evict_uploads()
+                resolved.append(index)
+            else:
+                key = blob[1]
+                uploads.move_to_end(key)
+                buffers.append(uploads[key])
+                resolved.append(len(buffers) - 1)
+        return tuple(resolved)
+
+    def _apply_uploads(self, message: dict, buffers: list) -> list:
+        """Apply a batch's upload cache updates before any of its entries runs."""
+        budget = message.get("cache_bytes")
+        if budget is not None:
+            self._upload_budget = budget
+            self._evict_uploads()
+        entries = message.get("entries", ())
+        rebuilt = None
+        for position, entry in enumerate(entries):
+            kind = entry[0]
+            at = 4 if kind == E_OP else 7 if kind == E_STEP else None
+            if at is None or not entry[at]:
+                continue
+            if not any(type(blob) is tuple for blob in entry[at]):
+                continue
+            if rebuilt is None:
+                rebuilt = list(entries)
+            rebuilt[position] = (*entry[:at], self._resolve(entry[at], buffers), *entry[at + 1 :])
+        return entries if rebuilt is None else rebuilt
+
     def run(self, message: dict, buffers: list):
         """Execute one batch. Return ``(head, buffers, keep)`` when it asks for a reply."""
+        buffers = list(buffers)
+        entries = self._apply_uploads(message, buffers)
         self._buffers = buffers
         results: list = []
         out_buffers: list = []
         keep: list = []
-        for entry in message.get("entries", ()):
+        for entry in entries:
             kind = entry[0]
             if kind == E_DEFINE:
                 try:
