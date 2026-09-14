@@ -649,6 +649,52 @@ def test_dropped_tensors_release_their_remote_handles(client) -> None:
     assert client.live_handles() == base
 
 
+def test_an_external_collected_mid_repetition_is_released_after_its_step_entry(
+    client, monkeypatch
+) -> None:
+    from letify.remoting.device import client as client_module
+
+    monkeypatch.setattr(client_module, "LINGER_S", 60.0)
+    monkeypatch.setattr(client_module, "IDLE_S", 60.0)
+    inputs = [torch.full((4,), float(i)).cuda() for i in range(12)]
+    client.synchronize()
+    total = torch.zeros(4, device="cuda")
+    for i in range(12):
+        x, inputs[i] = inputs[i], None
+        a = x * 2.0
+        b = a + 1.0
+        del x
+        gc.collect()
+        # What the idle sender thread or a collection on another thread does mid-step.
+        client._flush()
+        c = b * 3.0
+        d = c - 1.0
+        e = d + 0.5
+        f = e * 1.0
+        g = f + 0.0
+        total = total + g
+    assert client.stats.replayed > 0
+    assert total.cpu().tolist() == [sum(6.0 * i + 2.5 for i in range(12))] * 4
+
+
+def test_a_tensor_used_by_an_entry_a_read_leaves_queued_is_not_released_early(
+    client, monkeypatch
+) -> None:
+    from letify.remoting.device import client as client_module
+
+    monkeypatch.setattr(client_module, "LINGER_S", 60.0)
+    monkeypatch.setattr(client_module, "IDLE_S", 60.0)
+    x = torch.ones(4, device="cuda")
+    client.synchronize()
+    total = (x * 2).sum()
+    later = x + 1
+    del x
+    gc.collect()
+    assert total.item() == 8.0
+    assert client.queued > 0
+    assert later.cpu().tolist() == [2.0, 2.0, 2.0, 2.0]
+
+
 def test_detach_shares_the_handle_instead_of_sending_an_operator(client) -> None:
     x = torch.zeros(4, device="cuda")
     before = client.stats.ops

@@ -423,6 +423,11 @@ class Client:
     ) -> None:
         """Take ``count`` entries, or all, plus ``extra``, and hand them to the sender thread."""
         with self._flush_lock:
+            # Releases are taken before entries, so every entry dispatched before one of
+            # these handles was collected is taken below or was sent by an earlier batch.
+            taken_releases = self.released[:]
+            if taken_releases:
+                del self.released[: len(taken_releases)]
             pending = self._queue
             taken = len(pending) if count is None else count
             entries = [pending.popleft() for _ in range(taken)]
@@ -455,13 +460,16 @@ class Client:
                         upto, located = max(upto, made), True
             self._sent_upto = upto
             released: list[int] = []
-            if self.released:
-                taken_releases = self.released[:]
-                del self.released[: len(taken_releases)]
-                held = [handle for handle in taken_releases if handle >= upto]
-                released = [handle for handle in taken_releases if handle < upto]
-                if held:
-                    self.released.extend(held)
+            if taken_releases:
+                tracer = self.tracer
+                if pending or (tracer.active is not None and tracer.pos > tracer.start):
+                    # An entry left queued, or matched operators not yet queued, may still
+                    # use a released handle, so every release waits for a later batch.
+                    self.released.extend(taken_releases)
+                else:
+                    released = [handle for handle in taken_releases if handle < upto]
+                    if len(released) < len(taken_releases):
+                        self.released.extend(h for h in taken_releases if h >= upto)
             if not entries and not released and not reply:
                 return
             head = pickle.dumps(
