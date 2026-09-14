@@ -284,6 +284,91 @@ def test_the_cpu_shape_is_not_asked_how_busy_its_accelerator_is(
     assert all(row["accelerator"] != "CPU" for row in rows)
 
 
+# -- Spec: Machine-readable output ---------------------------------------------
+
+USAGE_KEYS = {
+    "alias",
+    "kind",
+    "unit",
+    "source",
+    "remaining",
+    "limit",
+    "used",
+    "rate_per_hour",
+    "resets_at",
+    "unmetered",
+    "as_of",
+    "note",
+}
+
+DEVICE_KEYS = {
+    "index",
+    "name",
+    "utilization_percent",
+    "memory_used_gb",
+    "memory_total_gb",
+    "memory_percent",
+    "temperature_c",
+    "power_w",
+}
+
+
+def test_usage_json_carries_every_key_the_editor_extension_reads(isolated_home, capsys) -> None:
+    (isolated_home / ".letify" / "config.toml").write_text(
+        '[lab]\nkind = "shell"\naddress = "gpu.example.edu"\n'
+        'usage_command = "echo 12.5"\nusage_unit = "GPU hours"\nusage_limit = 40.0\n'
+        '[odd]\nkind = "vastai"\n',
+        encoding="utf-8",
+    )
+    assert main(["usage", "--json"]) == 0
+    rows = {row["alias"]: row for row in json.loads(capsys.readouterr().out)}
+    lab = rows["lab"]
+    assert set(lab) >= USAGE_KEYS
+    assert isinstance(lab["unmetered"], bool)
+    assert all(isinstance(lab[key], str) for key in ("alias", "kind", "unit", "source"))
+    assert all(
+        lab[key] is None or isinstance(lab[key], int | float)
+        for key in ("remaining", "limit", "used", "rate_per_hour", "resets_at", "as_of")
+    )
+    assert isinstance(rows["odd"]["unavailable"], str)
+
+
+def test_utilization_json_carries_every_row_key_the_editor_extension_reads(
+    isolated_home, capsys
+) -> None:
+    (isolated_home / ".letify" / "config.toml").write_text(
+        '[lab]\nkind = "shell"\naddress = "gpu.example.edu"\ngpus = ["A100"]\n',
+        encoding="utf-8",
+    )
+    assert main(["utilization", "lab", "--json"]) == 0
+    row = json.loads(capsys.readouterr().out)[0]
+    assert set(row) >= {"alias", "accelerator", "devices", "reason"}
+    assert isinstance(row["devices"], list)
+
+
+def test_a_device_record_carries_every_key_the_editor_extension_reads() -> None:
+    # The utilization rows hold exactly these dictionaries, so pinning the record pins the
+    # JSON without needing a card on the machine running the suite.
+    line = "0, NVIDIA RTX PRO 6000, 87, 40960, 98304, 61, [Not Supported]\n"
+    device = json.loads(json.dumps(telemetry.parse_smi(line)[0].to_dict()))
+    assert set(device) >= DEVICE_KEYS
+    assert isinstance(device["index"], int)
+    assert device["utilization_percent"] == 87
+    assert device["temperature_c"] == 61
+    assert device["power_w"] is None
+
+
+def test_status_accepts_json_and_prints_the_documented_keys(isolated_home, capsys) -> None:
+    assert main(["status", "--json"]) == 0
+    report = json.loads(capsys.readouterr().out)
+    assert set(report) >= {"name", "live", "busy", "devices", "runtimes", "declared"}
+    assert isinstance(report["live"], int)
+    assert isinstance(report["runtimes"], list)
+    for accelerators in report["devices"].values():
+        for entry in accelerators.values():
+            assert set(entry) >= {"count", "reserved", "indices"}
+
+
 # -- Spec: Logging in ----------------------------------------------------------
 
 
