@@ -10,7 +10,6 @@ Spec sections pinned here: "Channels", "Call protocol", "Failure and retry", "Se
 
 from __future__ import annotations
 
-import base64
 import shutil
 import subprocess
 import sys
@@ -649,9 +648,10 @@ def test_the_worker_reaches_the_project_interpreter_without_cloudpickle_or_pip(
     uv_project: Path, tmp_path: Path
 ) -> None:
     # The lab_docker case: a system Python with no cloudpickle that refuses pip install.
-    # Ready line, workspace, environment build and the move all run on the standard library.
-    from letify.protocol import framing
-    from letify.protocol.worker import SOURCE
+    # Hello, workspace, environment build and the move all run on the standard library.
+    # Driven through the real PersistentChannel, so the source hand-off and the frames are
+    # the ones a runtime receives, and a failed request raises instead of returning.
+    import os
 
     modules, binaries, marker = without_cloudpickle_or_pip(tmp_path)
     uv = binaries / "uv"
@@ -660,56 +660,32 @@ def test_the_worker_reaches_the_project_interpreter_without_cloudpickle_or_pip(
         encoding="utf-8",
     )
     uv.chmod(0o755)
-    import os
-
     env = {
         **os.environ,
         "PYTHONPATH": str(modules),
         "PATH": f"{binaries}{os.pathsep}{os.environ['PATH']}",
     }
-    worker = subprocess.Popen(
-        [sys.executable, "-u", "-c", BOOTSTRAP],
-        stdin=subprocess.PIPE,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        env=env,
+    channel = PersistentChannel(
+        [sys.executable, "-u", "-c", BOOTSTRAP], name="no-cloudpickle", env=env
     )
-    assert worker.stdin is not None and worker.stdout is not None
-
-    def send_source() -> str:
-        encoded = base64.b64encode(SOURCE.encode()).decode()
-        worker.stdin.write(f"{len(encoded)}\n{encoded}")
-        worker.stdin.flush()
-        return worker.stdout.readline()
-
-    def request(message: dict) -> dict:
-        worker.stdin.write(framing.encode_request(message) + "\n")
-        worker.stdin.flush()
-        while True:
-            line = worker.stdout.readline()
-            assert line, worker.stderr.read() if worker.poll() is not None else "no reply"
-            if framing.is_reply(line):
-                return framing.decode_reply(line)
-
+    version = "{}.{}".format(*sys.version_info[:2])
     try:
-        assert framing.is_ready(send_source())
+        channel.start()
+        assert channel.python_version == version
         workspace = tmp_path / "workspace"
-        reply = request({"op": "eval", "source": bootstrap.workspace_source(str(workspace))})
-        assert reply["ok"], reply
+        channel.eval(bootstrap.workspace_source(str(workspace)), timeout=60)
         env_ = Env()
         root = str(workspace / "project" / env_.key)
         files = bootstrap.project_files(env_)
-        reply = request({"op": "eval", "source": bootstrap.sync_source(env_, files, root=root)})
-        assert reply["ok"], reply
-        python = reply["value"]["python"]
-        reply = request({"op": "reexec", "python": python, "bootstrap": BOOTSTRAP})
-        assert reply["ok"], reply
-        assert framing.is_ready(send_source())
-        assert request({"op": "stat"})["ok"]
+        synced = channel.eval(bootstrap.sync_source(env_, files, root=root), timeout=120)
+        python = synced["python"]
+        assert Path(python).parent == Path(root) / ".venv" / "bin"
+        channel.switch_interpreter(python, timeout=60)
+        assert channel.eval("import sys\n__letify_value__ = sys.executable") == python
+        channel.request({"op": "stat"}, timeout=60)
     finally:
-        worker.kill()
-        _, stderr = worker.communicate(timeout=60)
+        channel.close()
+    stderr = channel._stderr.text()
     assert not marker.exists()
     assert "pip" not in stderr
 
