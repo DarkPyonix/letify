@@ -120,6 +120,7 @@ A provider is built from one entry in the configuration file and reached by attr
 | `unmetered` | True when there is no quota at all |
 | `as_of` | When the figure was read, as Unix seconds |
 | `note` | Why a figure is missing, in one line |
+| `resources` | Further allowances on the same account, such as Kaggle's TPU hours beside its GPU hours. A list of records with `name`, `unit`, `remaining`, `used`, `limit` and `resets_at`, empty when there are none |
 
 Every field except `alias`, `kind`, `unit` and `source` may be `None`. A provider that cannot be read returns a record with `remaining` set to `None` and the reason in `note`. It does not raise.
 
@@ -146,19 +147,57 @@ usage_limit = 100.0
 
 The last number in the command's output is read as the remaining amount. The command runs only when usage is asked for, never during a call.
 
+`usage_limit` without `usage_command` is the plan allowance for the provider's own reading. It fills `limit` only when the service did not state one, and `used` becomes `limit - remaining`, not below 0. Colab reports a balance and no allowance, so this is how a Colab row gets a percentage.
+
 `Launcher.usage()` asks every provider at once, one thread each, and waits at most `usage_timeout` seconds per provider, 20 by default. A provider that has not answered by then, or that raised, gets a row with `remaining` set to `None` and the reason in `note`. The other rows are unaffected.
 
-`letify usage` prints one row per declared provider, and `letify usage <alias>` one provider. A provider whose optional dependency or setting is missing is reported as unavailable rather than skipped, so the table always lists every alias. `letify usage --json` prints the records unformatted. The table formats amounts by unit:
+`letify usage` prints one block per declared provider, and `letify usage <alias>` one provider. A provider whose optional dependency or setting is missing is reported as unavailable rather than skipped, so the output always lists every alias. `letify usage --json` prints the records unformatted.
+
+Amounts are formatted by unit:
 
 | Unit | Printed as |
 |---|---|
 | `KRW` | `12,345 KRW`, whole won with thousands separators |
 | `USD` | `$29.50` |
 | `compute units` | `99.93 compute units`, two decimals |
-| `GPU hours` | `12.5 GPU hours`, one decimal |
+| a unit ending in `hours`, such as `GPU hours` | `12.5 GPU hours`, one decimal |
 | any other | the number as given, then the unit |
 
-A row prints `<remaining> left`, then `of <limit>` when the limit is known, then `resets <YYYY-MM-DD HH:MM UTC>` when `resets_at` is known, then the hourly rate when it is known. An unmetered row prints `no quota, unmetered`. A row with no figure prints `not reported` with the note or the source.
+A block is a header line, `<alias>  <kind>`, followed by lines indented by 2 spaces:
+
+```
+colab_a  colab
+  [████████████████░░░░░░░░░░░░░░░░░░░░░░░░] 40% used
+  60.00 compute units left of 100.00
+  1.96 compute units/hour running now, about 1 d 6 h at this rate
+
+kaggle  kaggle
+  [████████████████████████░░░░░░░░░░░░░░░░] 60% used
+  12.0 GPU hours left of 30.0
+  resets in 4 d 6 h (2026-09-18 12:00 UTC)
+  TPU [████░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░] 10% used
+      18.0 TPU hours left of 20.0
+
+lab  shell
+  no quota, unmetered
+```
+
+| Line | Printed when | Content |
+|---|---|---|
+| Gauge | `limit` is known and above 0 | `[<filled><empty>] <p>% used`, where `p` is `used / limit` rounded to a whole percent, with `used` taken as `limit - remaining` when the service did not state it |
+| Amount | `remaining` is known | `<remaining> left`, then ` of <limit>` when the limit is known. With no limit the line ends `, limit unknown` and no gauge or percentage is printed |
+| Reset | `resets_at` is known | `resets in <relative> (<YYYY-MM-DD HH:MM UTC>)`, or `reset due (<date>)` once the time has passed |
+| Rate | `rate_per_hour` is known | `<rate>/hour running now`, then `, about <relative> at this rate` when the rate is above 0 and `remaining` is known |
+| No quota | `unmetered` is true | `no quota, unmetered`, and no other line |
+| Not reported | neither `remaining` nor `rate_per_hour` is known | `not reported` |
+| Note | `note` is set | the note |
+| Unavailable | the provider could not be built | `unavailable: <reason>` |
+
+A relative time uses the two largest units of days, hours and minutes, as `4 d 6 h`, `3 h 12 min` or `45 min`. Each record in `resources` prints its own gauge, amount and reset lines under the account's lines. Its gauge line starts with its `name` and its other lines are indented to the gauge's bracket.
+
+The gauge is 16 to 40 cells wide. Its width is the terminal width from `shutil.get_terminal_size`, minus the 2 space indent, the 2 brackets and 10 columns for the percentage text, then clamped to that range. A further allowance's gauge is also shorter by its name and a space, with the same 16 cell minimum, so a narrow terminal still gets a 16 cell gauge. A filled cell is `█` and an empty cell is `░` when the standard output encoding is UTF-8. Otherwise they are `#` and `-`.
+
+Colour is added only when standard output is a terminal and the `NO_COLOR` environment variable is unset or empty. The gauge and its percentage are green while more than 50% of the allowance remains, yellow from 20% to 50%, and red below 20%. The header's alias is bold. Without colour no escape sequence is written.
 
 ### Inventory
 
