@@ -2474,3 +2474,95 @@ def test_a_tls_data_connection_carries_overlapping_requests_during_large_transfe
         stop.set()
         channel.close()
         provider.stop(runtime)
+
+
+# -- parallel data streams: spec "Parallel data streams" ----------------------------------
+
+
+def _count_connections(monkeypatch) -> list[object]:
+    import socket
+
+    opened: list[object] = []
+    real = socket.create_connection
+
+    def counting(address, *args, **kwargs):
+        opened.append(address)
+        return real(address, *args, **kwargs)
+
+    monkeypatch.setattr(modal_module.socket, "create_connection", counting)
+    return opened
+
+
+def test_a_modal_channel_opens_one_connection_per_data_stream(
+    isolated_home, fake_modal, monkeypatch
+) -> None:
+    import os
+
+    opened = _count_connections(monkeypatch)
+    provider = provider_of(Modal, "m", data_streams=3)
+    runtime = modal_runtime(provider)
+    channel = provider.open_channel(runtime)
+    try:
+        channel.start()
+        assert len(opened) == 3
+        payload = os.urandom(24 << 20)
+        assert channel.call(len, (payload,), {})[0] == len(payload)
+        assert channel.call(bytes, (payload,), {})[0] == payload
+    finally:
+        channel.close()
+        provider.stop(runtime)
+
+
+def test_the_data_streams_default_is_four(isolated_home, fake_modal, monkeypatch) -> None:
+    opened = _count_connections(monkeypatch)
+    provider = provider_of(Modal, "m")
+    runtime = modal_runtime(provider)
+    channel = provider.open_channel(runtime)
+    try:
+        channel.start()
+        assert len(opened) == 4
+    finally:
+        channel.close()
+        provider.stop(runtime)
+
+
+@pytest.mark.parametrize("value", [0, 17, "4", True])
+def test_a_data_streams_value_out_of_range_is_refused(isolated_home, fake_modal, value) -> None:
+    provider = provider_of(Modal, "m", data_streams=value)
+    runtime = modal_runtime(provider)
+    with pytest.raises(letify.ConfigError, match="data_streams"):
+        provider.open_channel(runtime)
+
+
+def test_a_lane_whose_index_is_taken_is_closed_and_hello_waits_for_every_lane() -> None:
+    # Spec "Parallel data streams", step 1, through the real worker.
+    import socket
+    import sys
+
+    from letify.protocol import wire
+    from letify.protocol.worker import BOOTSTRAP
+    from letify.runtime.channel import PersistentChannel
+
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", 0))
+        port = probe.getsockname()[1]
+    channel = PersistentChannel([sys.executable, "-u", "-c", BOOTSTRAP], name="w")
+    channel.start()
+    token = "ab" * 32
+    channel.request({"op": "listen", "port": port, "token": token, "wait": 20, "streams": 2})
+    try:
+        lane0 = _connect(port)
+        lane0.sendall(b"LETIFY-DATA " + token.encode() + b"\n")
+        again = _connect(port)
+        again.sendall(b"LETIFY-DATA " + token.encode() + b"\n")
+        assert again.recv(16) == b""
+        again.close()
+        lane1 = _connect(port)
+        lane1.sendall(b"LETIFY-DATA " + token.encode() + b" 1\n")
+        stream = wire.Striped([lane0.send, lane1.send], [lane0.recv_into, lane1.recv_into])
+        kind, _stream, _value = wire.Receiver(stream.recv_into).next_event()
+        assert kind == wire.HELLO
+        lane0.close()
+        lane1.close()
+    finally:
+        channel.close()
