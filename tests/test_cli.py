@@ -164,6 +164,14 @@ def test_a_machine_reached_by_ssh_is_printed_as_having_no_quota(isolated_home, c
     assert "no quota" in out
 
 
+def test_the_usage_command_prints_one_block_per_account(isolated_home, capsys) -> None:
+    (isolated_home / ".letify" / "config.toml").write_text(
+        '[lab]\nkind = "shell"\naddress = "gpu.example.edu"\n', encoding="utf-8"
+    )
+    assert main(["usage", "lab"]) == 0
+    assert capsys.readouterr().out == "lab  shell\n  no quota, unmetered\n"
+
+
 def _row(**fields: object) -> dict:
     return {"alias": "a", "kind": "k", "source": "s", **fields}
 
