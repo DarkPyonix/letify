@@ -1042,12 +1042,17 @@ These `torch.cuda` functions are replaced while the function runs, and restored 
 | `current_device()` | `0` |
 | `set_device(d)`, `device(d)` | Accepted for device 0, `UnsupportedMode` otherwise |
 | `get_device_name(d=None)` | The runtime's device name |
+| `get_device_properties(d=None)` | An object with the runtime's device `name`, `major`, `minor` and `total_memory` in bytes, read from the executor's hello |
+| `get_device_capability(d=None)` | `(major, minor)` of the runtime's device, from the same hello, `(0, 0)` for a CPU executor |
+| `is_current_stream_capturing()` | `False`, because a CUDA graph cannot be captured under `host="local"` |
 | `synchronize(d=None)` | Flushes the queue and waits for the runtime, which surfaces a pending error |
 | `manual_seed(s)`, `manual_seed_all(s)` | Seeds the runtime's generator for its device |
 | `memory_allocated()`, `max_memory_allocated()`, `memory_reserved()` | The runtime's value, one round trip |
 | `empty_cache()` | Queued and executed on the runtime |
 
 `Stream`, `Event`, `current_stream`, `stream`, `CUDAGraph`, `graph`, `get_rng_state` and `set_rng_state` raise `UnsupportedMode` naming the function, because a stream, an event, a graph or a generator state lives in the runtime's process and has no local counterpart here. Every other `torch.cuda` attribute is PyTorch's own and behaves as it does on a machine without CUDA.
+
+No replaced function initializes CUDA in this process. A CUDA build of PyTorch on a machine with no NVIDIA driver raises `CUDA driver version is insufficient` from any call that does, and a training loop makes such calls without naming them: `Adam.step()` and `AdamW.step()` call `is_current_stream_capturing()`, and `torch.cuda.is_bf16_supported()`, which `autocast` reads for `bfloat16`, calls `get_device_properties()`.
 
 ### The device worker <!-- id: device-worker -->
 

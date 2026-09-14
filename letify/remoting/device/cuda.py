@@ -9,6 +9,7 @@ provides or refuses, as spec "Mapping cuda" describes. It does not own dispatch,
 from __future__ import annotations
 
 import contextlib
+import types
 from collections.abc import Iterator
 from typing import TYPE_CHECKING, Any
 
@@ -154,6 +155,16 @@ def replacements(client: Client) -> dict[str, Any]:
         index = device if isinstance(device, int) else _cuda_index(device)
         _check_index(-1 if index is None else index)
 
+    # Answered from the executor's hello, so no query here initializes CUDA in this process.
+    hello = client.hello
+    capability = tuple(hello.get("capability", (0, 0)))
+    properties = types.SimpleNamespace(
+        name=hello["name"],
+        major=capability[0],
+        minor=capability[1],
+        total_memory=hello.get("total_memory", 0),
+    )
+
     table: dict[str, Any] = {
         "is_available": lambda: True,
         "is_initialized": lambda: True,
@@ -163,6 +174,9 @@ def replacements(client: Client) -> dict[str, Any]:
         "set_device": set_device,
         "device": _Device,
         "get_device_name": lambda device=None: client.hello["name"],
+        "get_device_properties": lambda device=None: properties,
+        "get_device_capability": lambda device=None: capability,
+        "is_current_stream_capturing": lambda: False,
         "synchronize": lambda device=None: client.synchronize(),
         "manual_seed": lambda seed: client.call("letify.seed", int(seed)),
         "manual_seed_all": lambda seed: client.call("letify.seed", int(seed)),
@@ -280,6 +294,9 @@ _ORIGINALS: dict[str, Any] = {
         "set_device",
         "device",
         "get_device_name",
+        "get_device_properties",
+        "get_device_capability",
+        "is_current_stream_capturing",
         "synchronize",
         "manual_seed",
         "manual_seed_all",

@@ -174,6 +174,38 @@ def test_a_cuda_api_with_no_local_counterpart_names_itself(client) -> None:
         torch.cuda.Stream()
 
 
+def _forbid_local_cuda(monkeypatch) -> None:
+    """Make any call that initializes CUDA in this process raise, as a driverless CUDA build does."""
+
+    def no_driver(*args, **kwargs):
+        raise RuntimeError("CUDA driver version is insufficient for CUDA runtime version")
+
+    monkeypatch.setattr(torch.backends.cuda, "is_built", lambda: True)
+    monkeypatch.setattr(torch.cuda, "_lazy_init", no_driver)
+    monkeypatch.setattr(torch.cuda.graphs, "_cuda_isCurrentStreamCapturing", no_driver)
+
+
+def test_an_adam_step_never_initializes_cuda_in_this_process(client, monkeypatch) -> None:
+    _forbid_local_cuda(monkeypatch)
+    model = torch.nn.Linear(4, 2).cuda()
+    for make in (torch.optim.Adam, torch.optim.AdamW):
+        opt = make(model.parameters(), lr=1e-2)
+        model(torch.ones(3, 4, device="cuda")).sum().backward()
+        opt.step()
+    assert torch.cuda.is_current_stream_capturing() is False
+    torch.cuda.synchronize()
+
+
+def test_device_capability_and_properties_are_the_runtimes(client, monkeypatch) -> None:
+    _forbid_local_cuda(monkeypatch)
+    assert torch.cuda.get_device_capability() == tuple(client.hello["capability"])
+    properties = torch.cuda.get_device_properties(0)
+    assert (properties.major, properties.minor) == tuple(client.hello["capability"])
+    assert properties.name == client.hello["name"]
+    assert properties.total_memory == client.hello["total_memory"]
+    assert isinstance(torch.cuda.is_bf16_supported(including_emulation=False), bool)
+
+
 def test_the_cuda_functions_are_restored_when_forwarding_ends() -> None:
     original = torch.cuda.is_available
     connected = forwarding.connect(forwarding.worker_command(sys.executable), device="cpu")
