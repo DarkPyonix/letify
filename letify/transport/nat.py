@@ -324,7 +324,7 @@ def begin(request: dict):
     if request.get("authorized_key"):
         _authorize(request["authorized_key"])
     if request.get("start_sshd"):
-        _start_sshd()
+        _start_sshd(int(request.get("ssh_port", 22)))
     if kind == "tcp_punch":
         holder = reusable_socket(0)
         port = holder.getsockname()[1]
@@ -410,17 +410,37 @@ def _authorize(public_key: str) -> None:
     path.chmod(0o600)
 
 
-def _start_sshd() -> None:  # pragma: no cover - installs a system package on the remote VM
-    """Install and start an SSH server, for a machine such as a Colab VM that has none."""
-    if not Path("/usr/sbin/sshd").exists():
+#: The SSH server binary the remote half starts on a machine that has none on the port.
+SSHD = "/usr/sbin/sshd"
+
+
+def _ssh_answers(port: int, timeout: float = 3.0) -> bool:
+    """Whether a line starting with ``SSH-`` arrives from ``127.0.0.1:<port>``."""
+    try:
+        with socket.create_connection(("127.0.0.1", port), timeout=timeout) as conn:
+            conn.settimeout(timeout)
+            return conn.recv(4) == b"SSH-"
+    except OSError:
+        return False
+
+
+def _start_sshd(port: int = 22) -> None:
+    """Start an SSH server on ``127.0.0.1:<port>`` unless one already answers there.
+
+    The port is named on the command line because a Colab image ships sshd configured for
+    127.0.0.1:2222, so starting it with its own configuration leaves the splice port closed.
+    """
+    if _ssh_answers(port):
+        return
+    if not Path(SSHD).exists():  # pragma: no cover - installs a system package on the VM
         subprocess.run(["apt-get", "update", "-qq"], check=False)
         subprocess.run(
             ["apt-get", "install", "-y", "-qq", "openssh-server"],
             check=True,
             env={**os.environ, "DEBIAN_FRONTEND": "noninteractive"},
         )
-    Path("/run/sshd").mkdir(parents=True, exist_ok=True)
-    subprocess.run(["/usr/sbin/sshd"], check=False)
+    subprocess.run(["mkdir", "-p", "/run/sshd"], check=False)
+    subprocess.run([SSHD, "-p", str(port), "-o", "ListenAddress=127.0.0.1"], check=False)
 
 
 def run_detached(request_json: str, source: str) -> None:  # pragma: no cover - remote entry
