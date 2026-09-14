@@ -46,6 +46,12 @@ def build_parser() -> argparse.ArgumentParser:
     log_in.add_argument("--address", help="machine address, for shell and tunnel")
     log_in.add_argument("--user", help="SSH user")
     log_in.add_argument("--port", type=int, help="SSH port")
+    log_in.add_argument(
+        "--public-port",
+        dest="public_port",
+        type=int,
+        help="port forward SSH dials at --address when it differs from --port, for tunnel",
+    )
     log_in.add_argument("--key", help="SSH private key path")
     log_in.add_argument(
         "--auth",
@@ -127,6 +133,17 @@ def build_parser() -> argparse.ArgumentParser:
     connect.add_argument(
         "--ssh-port", dest="ssh_port", type=int, default=22, help="this machine's SSH server"
     )
+    connect.add_argument(
+        "--public-address",
+        dest="public_address",
+        help="the address this machine's SSH server is reachable at from outside",
+    )
+    connect.add_argument(
+        "--public-port",
+        dest="public_port",
+        type=int,
+        help="the port published for this machine's SSH server, such as Docker's -p host port",
+    )
     connect.add_argument("--tailcat", default="tailcat", help="the tailcat command")
     connect.add_argument(
         "--name", help="the alias the printed login command names; defaults to the host name"
@@ -155,14 +172,17 @@ def _client_shell_connect(args: argparse.Namespace) -> int:
         agent.close()
         print(exc, file=sys.stderr)
         return 1
-    token = setup.encode_token(
-        {
-            "tailcat": address,
-            "tailcat_port": port,
-            "user": setup.local_user(),
-            "port": args.ssh_port,
-        }
-    )
+    fields = {
+        "tailcat": address,
+        "tailcat_port": port,
+        "user": setup.local_user(),
+        "port": args.ssh_port,
+    }
+    if args.public_address:
+        fields["address"] = args.public_address
+    if args.public_port:
+        fields["public_port"] = args.public_port
+    token = setup.encode_token(fields)
     alias = args.name or setup.default_alias()
     print("On your own machine, run:")
     print()
@@ -240,6 +260,7 @@ def main(argv: list[str] | None = None) -> int:
                 "address": args.address,
                 "user": args.user,
                 "port": args.port,
+                "public_port": args.public_port,
                 "key": args.key,
                 "auth": args.auth,
                 "persistent": args.persistent,
