@@ -514,3 +514,116 @@ def test_a_bytearray_value_still_arrives_as_a_bytearray() -> None:
         event = receiver.next_event()
     value = wire.loads(*event[2])["value"]
     assert type(value) is bytearray and value == bytearray(b"y" * (2 << 20))
+
+
+# -- striped byte stream: spec "Parallel data streams" ------------------------------------
+
+
+class _CountingLane:
+    """One end of a socket pair whose writes are recorded by size."""
+
+    def __init__(self, sock):
+        self.sock = sock
+        self.segments: list[int] = []
+
+    def send(self, view) -> int:
+        count = self.sock.send(view)
+        self.segments.append(count)
+        return count
+
+
+def _striped_pair(lanes: int):
+    import socket
+
+    pairs = [socket.socketpair() for _ in range(lanes)]
+    near = [_CountingLane(a) for a, _ in pairs]
+    far = [b for _, b in pairs]
+    sender = wire.Striped([lane.send for lane in near], [lane.sock.recv_into for lane in near])
+    receiver = wire.Striped([sock.send for sock in far], [sock.recv_into for sock in far])
+    return sender, receiver, near, far
+
+
+def _close_all(near, far) -> None:
+    for sock in [lane.sock for lane in near] + list(far):
+        sock.close()
+
+
+def _read_exactly(stream, size: int) -> bytes:
+    out = bytearray()
+    buffer = bytearray(1 << 20)
+    while len(out) < size:
+        count = stream.recv_into(memoryview(buffer))
+        if not count:
+            break
+        out.extend(buffer[:count])
+    return bytes(out)
+
+
+def _send_all(stream, data: bytes) -> None:
+    view = memoryview(data)
+    while view:
+        view = view[stream.send(view) :]
+
+
+def test_a_striped_stream_delivers_interleaved_writes_in_order() -> None:
+    import threading
+
+    sender, receiver, near, far = _striped_pair(4)
+    writes = [os.urandom(size) for size in (10, 3 << 20, 1, (1 << 20) - 1, 9 << 20 | 7, 100)]
+    expected = b"".join(writes)
+    got: list[bytes] = []
+    reader = threading.Thread(target=lambda: got.append(_read_exactly(receiver, len(expected))))
+    reader.start()
+    for data in writes:
+        _send_all(sender, data)
+    reader.join(60)
+    assert got == [expected]
+    _close_all(near, far)
+
+
+def test_a_write_of_one_mib_or_more_uses_every_lane_and_a_smaller_one_only_lane_zero() -> None:
+    import threading
+
+    sender, receiver, near, far = _striped_pair(4)
+    size = 100 + wire.STRIPE_MIN * 4
+    got: list[bytes] = []
+    reader = threading.Thread(target=lambda: got.append(_read_exactly(receiver, size)))
+    reader.start()
+    _send_all(sender, b"x" * 100)
+    assert [bool(lane.segments) for lane in near] == [True, False, False, False]
+    _send_all(sender, os.urandom(wire.STRIPE_MIN * 4))
+    assert all(lane.segments for lane in near)
+    reader.join(60)
+    assert len(got[0]) == size
+    _close_all(near, far)
+
+
+def test_a_segment_that_repeats_received_bytes_ends_the_stream() -> None:
+    import socket
+
+    a, b = socket.socketpair()
+    c, d = socket.socketpair()
+    receiver = wire.Striped([b.send, d.send], [b.recv_into, d.recv_into])
+    first = wire.HEADER.pack(wire.MAGIC, wire.SEGMENT, 0, 0, 4) + (0).to_bytes(8, "little")
+    a.sendall(first + b"abcd")
+    assert _read_exactly(receiver, 4) == b"abcd"
+    again = wire.HEADER.pack(wire.MAGIC, wire.SEGMENT, 0, 1, 4) + (2).to_bytes(8, "little")
+    c.sendall(again + b"cdef")
+    assert receiver.recv_into(memoryview(bytearray(16))) == 0
+    for sock in (a, b, c, d):
+        sock.close()
+
+
+def test_a_lane_that_closes_ends_the_stream_after_the_bytes_before_it() -> None:
+    import socket
+
+    sender, receiver, near, far = _striped_pair(2)
+    _send_all(sender, b"hello")
+    assert _read_exactly(receiver, 5) == b"hello"
+    # Shut down first: close alone leaves the descriptor open under this end's blocked reader.
+    near[1].sock.shutdown(socket.SHUT_RDWR)
+    near[1].sock.close()
+    assert receiver.recv_into(memoryview(bytearray(8))) == 0
+    near[0].sock.close()
+    for sock in far:
+        sock.close()
