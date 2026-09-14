@@ -9,6 +9,7 @@ provides or refuses, as spec "Mapping cuda" describes. It does not own dispatch,
 from __future__ import annotations
 
 import contextlib
+import inspect
 import os
 import types
 from collections.abc import Iterator
@@ -80,6 +81,9 @@ def _check_index(index: int) -> None:
             f"device, which is cuda:0"
         )
 
+
+#: The signature ``_cross_entropy`` binds a call's arguments against.
+_CROSS_ENTROPY = inspect.signature(torch.nn.functional.cross_entropy)
 
 #: CUDA autocast policy by function name, as spec "Autocast" lists it.
 _AUTOCAST: dict[str, str] = {
@@ -154,7 +158,6 @@ _AUTOCAST: dict[str, str] = {
             "triplet_margin_loss",
             "multi_margin_loss",
             "binary_cross_entropy_with_logits",
-            "cross_entropy",
             "dist",
             "pdist",
             "cdist",
@@ -184,10 +187,10 @@ _AUTOCAST: dict[str, str] = {
             "tensordot",
             "cat",
             "stack",
-            "index_copy",
         ],
         "widest",
     ),
+    "cross_entropy": "cross_entropy",
 }
 
 
@@ -210,6 +213,39 @@ def _eligible(value: Any) -> bool:
         type(value) is RemoteTensor
         and value.dtype.is_floating_point
         and value.dtype is not torch.float64
+    )
+
+
+def _cross_entropy(func: Any, args: tuple, kwargs: dict) -> Any:
+    """``cross_entropy`` as CUDA autocast runs ``cross_entropy_loss``.
+
+    That operator has no autocast kernel of its own: ``log_softmax`` runs in the input's
+    dtype and ``nll_loss`` casts to float32. Probability targets, label smoothing and the
+    legacy reduction arguments take the float32 cast of the whole call instead.
+    """
+    bound = _CROSS_ENTROPY.bind(*args, **kwargs)
+    bound.apply_defaults()
+    given = bound.arguments
+    source, target = given["input"], given["target"]
+    if (
+        not _eligible(source)
+        or target.dtype.is_floating_point
+        or given["label_smoothing"]
+        or given["size_average"] is not None
+        or given["reduce"] is not None
+    ):
+        args, kwargs = _autocast("float32", args, kwargs)
+        return func(*args, **kwargs)
+    weight = given["weight"]
+    if _eligible(weight) and weight.dtype is not torch.float32:
+        weight = weight.to(torch.float32)
+    log_probabilities = torch.log_softmax(source, 1 if source.dim() > 1 else 0)
+    return torch.nn.functional.nll_loss(
+        log_probabilities.to(torch.float32),
+        target,
+        weight,
+        ignore_index=given["ignore_index"],
+        reduction=given["reduction"],
     )
 
 
@@ -259,6 +295,8 @@ class CudaMode(TorchFunctionMode):
                 return special(*args, **kwargs)
         policy = _AUTOCAST.get(getattr(func, "__name__", ""))
         if policy is not None and _autocast_enabled():
+            if policy == "cross_entropy":
+                return _cross_entropy(func, args, kwargs)
             args, kwargs = _autocast(policy, args, kwargs)
         rewritten = False
         device = kwargs.get("device")
