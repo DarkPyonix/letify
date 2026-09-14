@@ -215,6 +215,19 @@ def no_uv_variable(monkeypatch):
     monkeypatch.delenv("UV", raising=False)
 
 
+@pytest.fixture(autouse=True)
+def no_project_environment(monkeypatch):
+    """Hide the virtual environment the suite runs in from the tool lookup.
+
+    Spec "Installing external tools" links tools into the project environment, which for
+    the suite would be the repository's own .venv. A test that needs one creates it.
+    """
+    from letify import install
+
+    monkeypatch.setattr(install, "project_environment", lambda: None)
+    monkeypatch.setattr(install, "can_ask", lambda: False)
+
+
 @pytest.fixture
 def patch_which(monkeypatch):
     """Decide what is on PATH for one module, without touching the real PATH."""
