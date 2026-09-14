@@ -73,6 +73,10 @@ POLL_SECONDS = 10.0
 IDLE_WAIT_SECONDS = 300.0
 START_WAIT_SECONDS = 600.0
 
+#: A machine reports started before its SSH server accepts connections.
+SSH_WAIT_SECONDS = 300.0
+SSH_POLL_SECONDS = 5.0
+
 #: What ``spot_fallback`` accepts. Spec "Spot preemption".
 SPOT_FALLBACKS = ("none", "ondemand")
 
@@ -100,6 +104,17 @@ PASSWORD_SYMBOLS = "!@#%^*_=+"
 
 #: Vendor prefixes on the device ids eci lists, such as ``nvidia_a100_80gb_pcie``.
 DEVICE_VENDORS = ("nvidia", "amd", "intel", "furiosaai", "rebellions")
+
+
+def port_open(host: str, port: int) -> bool:
+    """Whether a TCP connection to ``host:port`` is accepted within 5 seconds."""
+    import socket
+
+    try:
+        with socket.create_connection((host, port), timeout=5):
+            return True
+    except OSError:
+        return False
 
 
 def accelerator_label(device: str) -> str:
@@ -703,6 +718,7 @@ class Elice(Shell):
             if record is None:
                 password = self._launch(instance, machine, price_type)
                 record = self.get_machine(machine) or {}
+        already_started = password is None and str(record.get("status") or "") == "started"
         record = self._ensure_started(machine, record)
         address = public_address(record)
         if not address:
@@ -710,6 +726,8 @@ class Elice(Shell):
                 self.kind,
                 f"Elice machine {machine} has no public IP, so letify cannot reach it over SSH",
             )
+        if not already_started:
+            self._wait_for_ssh(machine, address)
         if self._machine_address and self._machine_address != address:
             self.close_link()
         self._machine_address = address
@@ -768,6 +786,22 @@ class Elice(Shell):
             self._wait_for(machine, "idle", IDLE_WAIT_SECONDS)
         self._eci(["compute", "vm", "start", machine], parse=False)
         return self._wait_for(machine, "started", START_WAIT_SECONDS)
+
+    def _wait_for_ssh(self, machine: str, address: str) -> None:
+        """Wait until the machine's SSH server accepts. Spec "Elice machines", step 5."""
+        port = self.direct_port
+        deadline = time.monotonic() + SSH_WAIT_SECONDS
+        said = False
+        while not port_open(address, port):
+            if not said:
+                self._say(f"{machine}: waiting for SSH on {address}")
+                said = True
+            if time.monotonic() >= deadline:
+                raise RuntimeFailure(
+                    f"SSH on {address}:{port} did not answer within {SSH_WAIT_SECONDS:.0f} s "
+                    f"after Elice machine {machine} started"
+                )
+            time.sleep(SSH_POLL_SECONDS)
 
     def _wait_for(self, machine: str, wanted: str, limit: float) -> dict[str, Any]:
         deadline = time.monotonic() + limit
