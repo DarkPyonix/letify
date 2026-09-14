@@ -188,7 +188,51 @@ class Executor:
         results: list = []
         out_buffers: list = []
         keep: list = []
-        for entry in message.get("entries", ()):
+        entries = message.get("entries", ())
+        tensors = self.tensors
+        # Each release is applied after the last entry of this batch that reads the handle,
+        # and at once when none does, as spec "Handles" describes.
+        after: dict = {}
+        release = message.get("release", ())
+        if release:
+            wanted = set(release)
+            last: dict = {}
+            # Entries from which every handle at or above a bound may be read or created: a
+            # step entry and an entry whose outputs the runtime describes.
+            open_from: list = []
+            for index, entry in enumerate(entries):
+                kind = entry[0]
+                if kind == E_OP:
+                    touched = list(entry[2])
+                    outs = entry[5]
+                    if type(outs) is int:
+                        open_from.append((index, outs))
+                    elif outs:
+                        touched.extend(handle for handle in outs if handle is not None)
+                elif kind == E_STEP:
+                    touched = entry[5]
+                    open_from.append((index, entry[2]))
+                elif kind == E_REQUEST and entry[1] == "letify.fetch":
+                    touched = (entry[2][0],)
+                else:
+                    continue
+                for handle in touched:
+                    if handle in wanted:
+                        last[handle] = index
+            for index, bound in open_from:
+                for handle in release:
+                    if handle >= bound and last.get(handle, -1) < index:
+                        last[handle] = index
+            for handle in release:
+                index = last.get(handle)
+                if index is None:
+                    tensors.pop(handle, None)
+                else:
+                    after.setdefault(index, []).append(handle)
+        for index, entry in enumerate(entries):
+            if after and index - 1 in after:
+                for handle in after.pop(index - 1):
+                    tensors.pop(handle, None)
             kind = entry[0]
             if kind == E_DEFINE:
                 try:
@@ -236,11 +280,9 @@ class Executor:
             if want:
                 results.append(value)
         self._buffers = []
-        # Released after the entries, because an operator queued before its input's last
-        # RemoteTensor was collected travels in the same batch as that release.
-        tensors = self.tensors
-        for handle in message.get("release", ()):
-            tensors.pop(handle, None)
+        for handles in after.values():
+            for handle in handles:
+                tensors.pop(handle, None)
         if not message.get("reply"):
             return None
         failure, self.failure = self.failure, None

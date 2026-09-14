@@ -1044,6 +1044,27 @@ def test_replayed_steps_release_temporaries_before_the_step_ends(client, monkeyp
     assert released_early > 0
 
 
+def test_a_release_is_applied_after_the_last_entry_of_its_batch_that_reads_it(client) -> None:
+    runner, module = _executor_with_step()
+    runner.tensors[2] = torch.ones(3)
+    live = (module.E_REQUEST, "letify.live", (), "value")
+    use = (module.E_OP, 1, (1,), (2.0,), (), (5,), None)
+    reply = runner.run({"entries": [live, use, live], "release": [1, 2], "reply": True}, [])
+    import pickle
+
+    results = pickle.loads(reply[0])["results"]
+    # Handle 2 is read by no entry, so it goes first; handle 1 goes after the entry reading it.
+    assert results == [1, 1]
+    assert set(runner.tensors) == {5}
+
+
+def test_a_handle_created_and_released_in_one_batch_is_not_kept(client) -> None:
+    runner, module = _executor_with_step()
+    make = (module.E_OP, 1, (1,), (2.0,), (), (5,), None)
+    runner.run({"entries": [make], "release": [5]}, [])
+    assert set(runner.tensors) == {1}
+
+
 def test_a_handle_read_by_a_later_entry_is_not_released_early(client, monkeypatch) -> None:
     from letify.remoting.device import client as client_module
 
