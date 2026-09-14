@@ -45,7 +45,7 @@ class Shell(Provider):
     extra = "shell"
     default_persistence = "ephemeral"
 
-    #: A machine reached directly has a short round trip, so forwarding CUDA calls
+    #: A machine reached directly has a short round trip, so forwarding PyTorch operators
     #: is a real option here.
     has_fast_path = True
 

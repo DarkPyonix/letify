@@ -200,7 +200,7 @@ def _where(host: Host | str | None) -> Host:
     except ValueError:
         raise ValueError(
             f"host={host!r} is not a host placement. Use host='local' to keep Python "
-            f"here and forward CUDA calls, or host='remote' to ship the function to "
+            f"here and forward PyTorch operators, or host='remote' to ship the function to "
             f"the machine that holds the device."
         ) from None
 

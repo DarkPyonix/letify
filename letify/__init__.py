@@ -15,7 +15,7 @@ Declare what a function needs and it runs there:
 
 A declaration places two things. ``device`` says where the device is, carrying the provider
 and the account with it. ``host`` says where the host code runs: ``local``, the default,
-keeps Python here and forwards only CUDA calls, and ``remote`` ships the function to the
+keeps Python here and forwards only PyTorch operators, and ``remote`` ships the function to the
 machine that holds the device.
 
 A session ends with the call that needed it. ``with let.keep_alive():`` keeps sessions for the

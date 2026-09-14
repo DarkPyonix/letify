@@ -253,7 +253,7 @@ class Modal(Provider):
         if instance.placement is Host.local:
             raise UnsupportedMode(
                 "Modal cannot serve host='local'. It exposes function calls into a "
-                "container, so there is no device to forward CUDA calls to. This is a "
+                "container, so there is no device to forward PyTorch operators to. This is a "
                 "limit of the service, not a speed judgement. Use host='remote'."
             )
 
