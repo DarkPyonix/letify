@@ -240,6 +240,64 @@ def test_the_cuda_functions_are_restored_when_forwarding_ends() -> None:
         connected.close()
 
 
+def test_a_dataloader_with_forked_workers_leaves_the_session_usable(client) -> None:
+    data = torch.arange(64.0).reshape(32, 2)
+    loader = torch.utils.data.DataLoader(
+        torch.utils.data.TensorDataset(data), batch_size=8, num_workers=2, timeout=60
+    )
+    total = torch.zeros(2, device="cuda")
+    for (batch,) in loader:
+        total += batch.cuda().sum(dim=0)
+    assert total.cpu().tolist() == data.sum(dim=0).tolist()
+
+
+def _child_view(queue) -> None:
+    import torch
+
+    from letify.remoting.device import current_client
+
+    torch.manual_seed(1)
+    queue.put((current_client() is None, torch.cuda.manual_seed_all.__module__))
+
+
+def test_a_process_forked_inside_forwarding_sees_plain_torch_cuda(client) -> None:
+    import multiprocessing
+
+    context = multiprocessing.get_context("fork")
+    queue = context.Queue()
+    child = context.Process(target=_child_view, args=(queue,))
+    child.start()
+    no_client, module = queue.get(timeout=60)
+    child.join(60)
+    assert child.exitcode == 0
+    assert no_client
+    assert module == "torch.cuda.random"
+    assert torch.ones(2, device="cuda").sum().item() == 2.0
+
+
+def test_a_client_refuses_to_send_from_a_forked_process(client) -> None:
+    import multiprocessing
+
+    from letify.errors import RuntimeLost
+
+    def attempt(queue) -> None:
+        try:
+            client.call("letify.seed", 1)
+        except RuntimeLost as exc:
+            queue.put(str(exc))
+        else:
+            queue.put("sent")
+
+    context = multiprocessing.get_context("fork")
+    queue = context.Queue()
+    child = context.Process(target=attempt, args=(queue,))
+    child.start()
+    message = queue.get(timeout=60)
+    child.join(60)
+    assert "forked" in message
+    assert torch.ones(3, device="cuda").sum().item() == 3.0
+
+
 # -- Spec: Batching and synchronization -----------------------------------------
 
 
