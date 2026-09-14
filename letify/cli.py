@@ -72,6 +72,12 @@ def build_parser() -> argparse.ArgumentParser:
     log_in.add_argument("--zone-id", dest="zone_id", help="Elice zone id")
     log_in.add_argument("--machine-id", dest="machine_id", help="Elice machine id")
     log_in.add_argument("--endpoint", help="API endpoint, where it is not the default")
+    log_in.add_argument(
+        "--organization", help="Elice organization short name, sent as x-elice-org-name-short"
+    )
+    log_in.add_argument(
+        "--billing-endpoint", dest="billing_endpoint", help="Elice billing API base URL"
+    )
     log_in.add_argument("--account", help="account email, for Colab")
     log_in.add_argument(
         "--workspace",
@@ -281,6 +287,8 @@ def _dispatch(args: argparse.Namespace) -> int:
                 "zone_id": args.zone_id,
                 "machine_id": args.machine_id,
                 "endpoint": args.endpoint,
+                "organization": args.organization,
+                "billing_endpoint": args.billing_endpoint,
                 "account": args.account,
                 "workspace": args.workspace,
                 "profile": args.profile,
