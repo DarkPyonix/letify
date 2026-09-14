@@ -48,6 +48,10 @@ import hashlib, io, queue, sys, tarfile, time, traceback
 
 _BLOBS = {}
 _SIZES = {}
+# Set by blob_dir on a persistent provider: where argument blobs are also written, and the
+# total size the directory is kept under.
+_DISK = {}
+_PICKLE_MAGIC = b"LTFYPKL1"
 _READ_SIZE = 1 << 16
 
 # Frames go to a private copy of the pipe this process started on. Descriptors 1 and 2 are
@@ -148,10 +152,9 @@ def _resolve(value):
     """Replace blob references with the values they name, recursively."""
     kind = getattr(value, "__letify_kind__", None)
     if kind == "blob":
-        try:
-            entry = _BLOBS[value.digest]
-        except KeyError:
-            raise KeyError("blob %s was never sent to this runtime" % value.digest) from None
+        entry = _BLOBS.get(value.digest) or _disk_load(value.digest)
+        if entry is None:
+            raise KeyError("blob %s was never sent to this runtime" % value.digest)
         if entry[0] == "value":
             return entry[1]
         # A value that may be mutated is unpickled from a fresh copy for every call.
@@ -217,9 +220,123 @@ def _op_call(request):
     return {"ok": True, "value": value}
 
 
+def _disk_path(digest, pickled):
+    name = digest + (".pickle" if pickled else "")
+    return os.path.join(_DISK["path"], digest[:2], name)
+
+
+def _disk_find(digest):
+    """The file holding a digest on disk, or None. Only complete files have these names."""
+    if not _DISK:
+        return None
+    for pickled in (False, True):
+        path = _disk_path(digest, pickled)
+        if os.path.isfile(path):
+            return path
+    return None
+
+
+def _disk_write(digest, parts, pickled, immutable):
+    """Write a blob under the blob directory by rename, then keep the directory in its limit."""
+    import struct
+
+    path = _disk_path(digest, pickled)
+    if os.path.isfile(path):
+        return
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    partial = "%s.partial.%d" % (path, os.getpid())
+    with open(partial, "wb") as handle:
+        if pickled:
+            handle.write(_PICKLE_MAGIC + bytes([1 if immutable else 0]))
+            handle.write(struct.pack(">I", len(parts)))
+            for part in parts:
+                handle.write(struct.pack(">Q", memoryview(part).nbytes))
+        for part in parts:
+            handle.write(part)
+    os.replace(partial, path)
+    _disk_evict(path)
+
+
+def _disk_evict(keep):
+    """Remove blob files, oldest modification time first, until the total is within limit."""
+    files = []
+    total = 0
+    for shard in os.scandir(_DISK["path"]):
+        if not shard.is_dir():
+            continue
+        for entry in os.scandir(shard.path):
+            if ".partial." in entry.name or not entry.is_file():
+                continue
+            info = entry.stat()
+            files.append((info.st_mtime_ns, entry.path, info.st_size))
+            total += info.st_size
+    files.sort()
+    for _mtime, path, size in files:
+        if total <= _DISK["limit"]:
+            break
+        if path == keep:
+            continue
+        try:
+            os.remove(path)
+            total -= size
+        except OSError:
+            pass
+
+
+def _disk_load(digest):
+    """Load a blob held only on disk into the blob table, or answer None."""
+    import struct
+
+    path = _disk_find(digest)
+    if path is None:
+        return None
+    with open(path, "rb") as handle:
+        payload = handle.read()
+    if not path.endswith(".pickle"):
+        entry = ("value", payload)
+        _SIZES[digest] = len(payload)
+    else:
+        view = memoryview(payload)
+        immutable = view[8] == 1
+        count = struct.unpack(">I", view[9:13])[0]
+        sizes = struct.unpack(">%dQ" % count, view[13 : 13 + 8 * count])
+        offset = 13 + 8 * count
+        parts = []
+        for size in sizes:
+            parts.append(bytes(view[offset : offset + size]))
+            offset += size
+        head, buffers = parts[0], parts[1:]
+        _SIZES[digest] = sum(sizes)
+        if immutable:
+            entry = ("value", pickle.loads(head, buffers=buffers))
+        else:
+            entry = ("parts", head, buffers)
+    _BLOBS[digest] = entry
+    return entry
+
+
+def _op_blob_dir(request):
+    """Write argument blobs under this directory too, kept within limit bytes."""
+    os.makedirs(request["path"], exist_ok=True)
+    _DISK["path"] = request["path"]
+    _DISK["limit"] = int(request["limit"])
+    return {"ok": True, "value": None}
+
+
 def _op_have(request):
-    """Report which of these digests the runtime already holds."""
-    held = [d for d in request["digests"] if d in _BLOBS]
+    """Report which of these digests the runtime already holds, in memory or on disk."""
+    held = []
+    for digest in request["digests"]:
+        if digest in _BLOBS:
+            held.append(digest)
+            continue
+        path = _disk_find(digest)
+        if path is not None:
+            try:
+                os.utime(path)
+            except OSError:
+                continue
+            held.append(digest)
     return {"ok": True, "value": held}
 
 
@@ -227,17 +344,22 @@ def _op_put_blob(request):
     """Store a value under its content address.
 
     An immutable value is kept unpickled, so a repeated argument is not unpickled again.
-    Anything else is kept as its pickle and buffers.
+    Anything else is kept as its pickle and buffers. With a blob directory set, the blob is
+    written there as well before the reply.
     """
     digest = request["digest"]
     if request.get("kind") == "bytes":
         value = request.pop("value")
         _BLOBS[digest] = ("value", value)
         _SIZES[digest] = len(value)
+        if _DISK:
+            _disk_write(digest, [value], False, True)
         return {"ok": True, "value": digest}
     head = bytes(request["head"])
     buffers = list(request.get("buffers") or ())
     _SIZES[digest] = len(head) + sum(memoryview(b).nbytes for b in buffers)
+    if _DISK:
+        _disk_write(digest, [head, *buffers], True, bool(request.get("immutable")))
     if request.get("immutable"):
         _BLOBS[digest] = ("value", pickle.loads(head, buffers=buffers))
     else:
@@ -427,6 +549,7 @@ def _op_lease(request):
 _OPS = {
     "call": _op_call,
     "have": _op_have,
+    "blob_dir": _op_blob_dir,
     "put_blob": _op_put_blob,
     "put_file": _op_put_file,
     "pull": _op_pull,
