@@ -419,9 +419,10 @@ def test_the_environment_variable_decides_over_the_home_config(
 ) -> None:
     (Path.home() / ".letify" / "config.toml").write_text("auto_install = false\n")
     monkeypatch.setenv("LETIFY_AUTO_INSTALL", "1")
-    publish_eci(monkeypatch, releases)
-    assert install.ensure("eci", instructions="how to install") == str(
-        cached("eci", install.ECI_VERSION)
+    # tailcat, because eci installs only after a yes whatever this setting says.
+    publish_tailcat(monkeypatch, releases, tar_gz([("tailcat", FAKE_TAILCAT, "file")]))
+    assert install.ensure("tailcat", instructions="how to install") == str(
+        cached("tailcat", setup.TAILCAT_VERSION)
     )
 
 
@@ -554,3 +555,65 @@ def test_a_download_with_no_size_shows_bytes_and_rate_without_a_percent(monkeypa
     lines = stream.getvalue().splitlines()
     assert len(lines) == 1
     assert "%" not in lines[0] and "MiB/s" in lines[0]
+
+
+# -- Spec: Elice machines, eci installed only after the user says yes -----------------
+
+
+def test_eci_is_not_installed_without_a_yes_even_with_automatic_install_on(
+    releases, monkeypatch, nothing_on_path
+) -> None:
+    publish_eci(monkeypatch, releases)
+    with pytest.raises(install.InstallError, match="letify setup eci"):
+        install.ensure("eci", instructions="how to install eci")
+    with pytest.raises(install.InstallError, match="letify setup eci"):
+        install.ensure("eci", instructions="how to install eci", confirm=lambda: False)
+    assert releases.requests == []
+    assert not cached("eci", install.ECI_VERSION).exists()
+
+
+def test_eci_is_installed_when_the_user_says_yes(releases, monkeypatch, nothing_on_path) -> None:
+    publish_eci(monkeypatch, releases)
+    asked: list[bool] = []
+    path = install.ensure(
+        "eci", instructions="how to install eci", confirm=lambda: asked.append(True) or True
+    )
+    assert asked == [True]
+    assert path == str(cached("eci", install.ECI_VERSION))
+
+
+def test_tailcat_still_installs_without_asking(releases, monkeypatch, nothing_on_path) -> None:
+    publish_tailcat(monkeypatch, releases, tar_gz([("tailcat", FAKE_TAILCAT, "file")]))
+    path = install.ensure("tailcat", instructions="how to install tailcat")
+    assert path == str(cached("tailcat", setup.TAILCAT_VERSION))
+
+
+def test_an_elice_login_asks_and_stops_on_no_writing_nothing(
+    isolated_home, monkeypatch, nothing_on_path
+) -> None:
+    from letify.config import login
+
+    monkeypatch.setattr(install, "find", lambda tool, **kw: None)
+    installs: list[str] = []
+    monkeypatch.setattr(install, "install_and_link", lambda tool, **kw: installs.append(tool))
+    prompts: list[str] = []
+    monkeypatch.setattr(login, "read_line", lambda prompt: prompts.append(prompt) or "n")
+    assert main(["login", "elice", "elice_a"]) != 0
+    assert prompts and "Install it now? [y/N]" in prompts[0]
+    assert "Elice's software, not part of letify" in prompts[0]
+    assert installs == []
+    assert not (Path.home() / ".letify" / "accounts" / "elice_a").exists()
+
+
+def test_an_elice_login_with_no_input_does_not_ask_or_install(
+    isolated_home, monkeypatch, nothing_on_path, capsys
+) -> None:
+    from letify.config import login
+
+    monkeypatch.setattr(install, "find", lambda tool, **kw: None)
+    monkeypatch.setattr(login, "read_line", lambda prompt: pytest.fail("asked without a terminal"))
+    installs: list[str] = []
+    monkeypatch.setattr(install, "install_and_link", lambda tool, **kw: installs.append(tool))
+    assert main(["login", "elice", "elice_a", "--no-input", "--token", "t"]) != 0
+    assert installs == []
+    assert "letify setup eci" in capsys.readouterr().err

@@ -540,11 +540,29 @@ def install_and_link(tool: str, *, say: Say = _say) -> str:
     return path
 
 
-def ensure(tool: str, *, instructions: str, say: Say = _say) -> str:
-    """The command to run ``tool`` by, installing it first when automatic install is on."""
+#: Tools whose release carries no license, installed only after the user says yes.
+ASK_FIRST = frozenset({"eci"})
+
+
+def ensure(
+    tool: str,
+    *,
+    instructions: str,
+    say: Say = _say,
+    confirm: Callable[[], bool] | None = None,
+) -> str:
+    """The command to run ``tool`` by, installing it first when that is allowed.
+
+    ``tailcat`` installs when automatic install is on. ``eci`` installs only when
+    ``confirm`` is given and returns true, which a login asks on a terminal.
+    """
     found = find(tool, say=say)
     if found is not None:
         return found
+    if tool in ASK_FIRST:
+        if confirm is None or not confirm():
+            raise InstallError(f"{instructions}\n\n{setup_hint(tool)}")
+        return install_and_link(tool, say=say)
     if not auto_install_enabled():
         raise InstallError(f"{instructions}\n\n{setup_hint(tool)}")
     return install_and_link(tool, say=say)
