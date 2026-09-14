@@ -9,6 +9,7 @@ provides or refuses, as spec "Mapping cuda" describes. It does not own dispatch,
 from __future__ import annotations
 
 import contextlib
+import os
 import types
 from collections.abc import Iterator
 from typing import TYPE_CHECKING, Any
@@ -465,6 +466,24 @@ def unmapped() -> Iterator[None]:
     finally:
         _CLIENTS.pop()
         _patch(originals)
+
+
+def _forget_in_child() -> None:
+    """Undo every active mapping in a process just forked, whose channel belongs to the parent."""
+    if not _ACTIVE:
+        return
+    _restore(_ORIGINALS)
+    for found in _foreach_types():
+        while RemoteTensor in found:
+            found.remove(RemoteTensor)
+    _ACTIVE.clear()
+    _CLIENTS.clear()
+    stack = torch._C._len_torch_function_stack
+    while stack() and isinstance(torch._C._get_function_stack_at(stack() - 1), CudaMode):
+        torch._C._pop_torch_function_stack()
+
+
+os.register_at_fork(after_in_child=_forget_in_child)
 
 
 #: torch.cuda as it was before any mapping, read once at import.
