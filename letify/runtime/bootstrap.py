@@ -75,6 +75,13 @@ TAIL_LINES = 40
 VERSION_SOURCE = "import sys\n__letify_value__ = '%d.%d' % sys.version_info[:2]\n"
 
 
+def user_agent() -> str:
+    """The User-Agent a runtime sends when it downloads the uv installer."""
+    from .. import __version__
+
+    return f"letify/{__version__}"
+
+
 def local_python() -> str:
     """The major.minor of the interpreter running letify, such as ``"3.12"``."""
     return f"{sys.version_info[0]}.{sys.version_info[1]}"
@@ -222,7 +229,10 @@ def sync_source(
         "if _letify_uv is None:",
         "    _letify_text = ''",
         "    try:",
-        f"        with urllib.request.urlopen({installer!r}, timeout=300) as _letify_response:",
+        # astral.sh answers Python's default urllib agent with 403, so letify names itself.
+        f"        _letify_request = urllib.request.Request({installer!r}, "
+        f"headers={{'User-Agent': {user_agent()!r}}})",
+        "        with urllib.request.urlopen(_letify_request, timeout=300) as _letify_response:",
         "            _letify_script = _letify_response.read()",
         "        _letify_done = subprocess.run(['sh'], input=_letify_script, capture_output=True,",
         "            env=dict(os.environ, UV_INSTALL_DIR=_letify_bin, UV_NO_MODIFY_PATH='1'))",

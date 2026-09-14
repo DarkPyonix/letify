@@ -1846,3 +1846,50 @@ def test_only_modal_sets_an_env_root() -> None:
 
     assert Provider.env_root is None
     assert Modal.env_root == "/root/.letify-env"
+
+
+def test_the_uv_installer_is_fetched_with_a_user_agent_a_cdn_accepts(
+    uv_project: Path, tmp_path: Path
+) -> None:
+    # Spec "Environment on the runtime": astral.sh answers Python's default urllib agent
+    # with 403, as a live Elice machine showed, so the download names letify instead.
+    import threading
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    home = tmp_path / "home"
+    script = (
+        'mkdir -p "$UV_INSTALL_DIR"\n'
+        "cat > \"$UV_INSTALL_DIR/uv\" <<'EOF'\n"
+        "#!/bin/sh\n"
+        f"{sys.executable} -m venv --without-pip .venv\n"
+        "EOF\n"
+        'chmod +x "$UV_INSTALL_DIR/uv"\n'
+    ).encode()
+    agents: list[str] = []
+
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, *args: object) -> None:
+            pass
+
+        def do_GET(self) -> None:
+            agent = self.headers.get("User-Agent", "")
+            agents.append(agent)
+            if agent.startswith("Python-urllib"):
+                self.send_response(403)
+                self.end_headers()
+                return
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(script)))
+            self.end_headers()
+            self.wfile.write(script)
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        url = f"http://127.0.0.1:{server.server_address[1]}/uv/install.sh"
+        source = bootstrap.sync_source(Env(), bootstrap.project_files(Env()), installer=url)
+        result = run_without_uv(source, home)
+    finally:
+        server.shutdown()
+    assert result.returncode == 0, result.stderr
+    assert agents and agents[0].startswith("letify/")
