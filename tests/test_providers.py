@@ -2599,11 +2599,11 @@ def test_every_provider_start_accepts_the_keywords_the_pool_passes() -> None:
     # override that drops one fails only when a live session starts.
     import inspect
 
-    from letify.providers import base, elice, kaggle, local, modal, shell
+    from letify.providers import base, colab, elice, local, modal, shell, tunnel
 
     wanted = {"name", "volumes", "held"}
     classes = {base.Provider}
-    for module in (elice, kaggle, local, modal, shell):
+    for module in (colab, elice, local, modal, shell, tunnel):
         for value in vars(module).values():
             if isinstance(value, type) and issubclass(value, base.Provider):
                 classes.add(value)
