@@ -363,6 +363,37 @@ def test_device_capability_and_properties_are_the_runtimes(client, monkeypatch) 
     assert isinstance(torch.cuda.is_bf16_supported(including_emulation=False), bool)
 
 
+def test_memory_statistics_are_the_runtimes_and_never_initialize_cuda_here(
+    client, monkeypatch
+) -> None:
+    _forbid_local_cuda(monkeypatch)
+    x = torch.ones(1024, device="cuda")
+    for device in (None, 0, "cuda", "cuda:0", torch.device("cuda:0"), x.device):
+        torch.cuda.reset_peak_memory_stats(device)
+        torch.cuda.reset_max_memory_allocated(device)
+        torch.cuda.reset_max_memory_cached(device)
+        torch.cuda.reset_accumulated_memory_stats(device)
+        assert torch.cuda.memory_allocated(device) == 0
+        assert torch.cuda.max_memory_allocated(device) == 0
+        assert torch.cuda.memory_reserved(device) == 0
+        assert torch.cuda.max_memory_reserved(device) == 0
+        assert torch.cuda.memory_cached(device) == 0
+        assert torch.cuda.max_memory_cached(device) == 0
+        assert torch.cuda.memory_stats(device) == {}
+        assert torch.cuda.mem_get_info(device) == (0, client.hello["total_memory"])
+        torch.cuda.synchronize(device)
+    torch.cuda.reset_peak_memory_stats()
+    torch.cuda.empty_cache()
+    assert torch.cuda.memory.max_memory_allocated() == 0
+    torch.cuda.memory.reset_peak_memory_stats()
+    assert x.cpu().sum().item() == 1024.0
+
+
+def test_memory_statistics_of_a_second_device_are_refused(client) -> None:
+    with pytest.raises(UnsupportedMode, match=r"cuda:1"):
+        torch.cuda.max_memory_allocated("cuda:1")
+
+
 def test_the_cuda_functions_are_restored_when_forwarding_ends() -> None:
     original = torch.cuda.is_available
     connected = forwarding.connect(forwarding.worker_command(sys.executable), device="cpu")

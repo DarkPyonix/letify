@@ -1444,7 +1444,8 @@ These `torch.cuda` functions are replaced while the function runs, and restored 
 | `is_current_stream_capturing()` | `False`, because a CUDA graph cannot be captured under `host="local"` |
 | `synchronize(d=None)` | Flushes the queue and waits for the runtime, which surfaces a pending error |
 | `manual_seed(s)`, `manual_seed_all(s)` | Seeds the runtime's generator for its device |
-| `memory_allocated()`, `max_memory_allocated()`, `memory_reserved()` | The runtime's value, one round trip |
+| `memory_allocated(d=None)`, `max_memory_allocated(d=None)`, `memory_reserved(d=None)`, `max_memory_reserved(d=None)`, `memory_cached(d=None)`, `max_memory_cached(d=None)`, `memory_stats(d=None)`, `mem_get_info(d=None)` | The runtime's value for its device, one round trip. A CPU executor answers `0`, `{}` and `(0, 0)` |
+| `reset_peak_memory_stats(d=None)`, `reset_max_memory_allocated(d=None)`, `reset_max_memory_cached(d=None)`, `reset_accumulated_memory_stats(d=None)` | Resets the runtime's counters for its device, one round trip |
 | `empty_cache()` | Queued and executed on the runtime |
 
 `Stream`, `Event`, `current_stream`, `stream`, `CUDAGraph`, `graph`, `get_rng_state` and `set_rng_state` raise `UnsupportedMode` naming the function, because a stream, an event, a graph or a generator state lives in the runtime's process and has no local counterpart here. Every other `torch.cuda` attribute is PyTorch's own and behaves as it does on a machine without CUDA.

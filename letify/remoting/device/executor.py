@@ -420,9 +420,13 @@ class Executor:
                 torch.manual_seed(args[0])
             return None
         if name == "letify.memory":
-            if self.device.type != "cuda":
-                return 0
-            return getattr(torch.cuda, args[0])(self.device)
+            if self.device.type == "cuda":
+                return getattr(torch.cuda, args[0])(self.device)
+            if args[0] == "memory_stats":
+                return {}
+            if args[0] == "mem_get_info":
+                return (0, 0)
+            return None if args[0].startswith("reset_") else 0
         if name == "letify.empty_cache":
             if self.device.type == "cuda":
                 torch.cuda.empty_cache()
