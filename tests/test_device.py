@@ -389,6 +389,61 @@ def test_memory_statistics_are_the_runtimes_and_never_initialize_cuda_here(
     assert x.cpu().sum().item() == 1024.0
 
 
+# -- Spec: Tensor subclasses ---------------------------------------------------------
+
+
+class _Packed(torch.Tensor):
+    """A wrapper subclass built the way torchao builds a quantized weight.
+
+    Its device is its inner tensor's device, its detach aliases storage through
+    ``return_and_correct_aliasing``, and every other operator runs on the unpacked value.
+    """
+
+    @staticmethod
+    def __new__(cls, inner):
+        return torch.Tensor._make_wrapper_subclass(
+            cls, inner.shape, dtype=inner.dtype, device=inner.device, requires_grad=False
+        )
+
+    def __init__(self, inner):
+        self.inner = inner
+
+    def __tensor_flatten__(self):
+        return ["inner"], None
+
+    @staticmethod
+    def __tensor_unflatten__(inner_tensors, meta, outer_size, outer_stride):
+        return _Packed(inner_tensors["inner"])
+
+    __torch_function__ = torch._C._disabled_torch_function_impl
+
+    @classmethod
+    def __torch_dispatch__(cls, func, types, args=(), kwargs=None):
+        from torch.utils import _pytree
+        from torch.utils._python_dispatch import return_and_correct_aliasing
+
+        kwargs = kwargs or {}
+        if func is torch.ops.aten.detach.default:
+            out = _Packed(args[0].inner.detach())
+            return return_and_correct_aliasing(func, args, kwargs, out)
+        unpacked = _pytree.tree_map_only(_Packed, lambda packed: packed.inner * 2, args)
+        return func(*unpacked, **kwargs)
+
+
+def test_a_wrapper_subclass_around_a_remote_tensor_runs_like_a_cuda_tensor(client) -> None:
+    values = torch.arange(12, dtype=torch.float32).reshape(3, 4)
+    x = torch.ones(2, 4)
+    expected = torch.nn.functional.linear(x, values * 2)
+    packed = _Packed(values.cuda())
+    weight = torch.nn.Parameter(packed, requires_grad=False)
+    assert type(weight) is _Packed
+    assert weight.device == torch.device("cuda", 0)
+    assert weight.is_cuda
+    out = torch.nn.functional.linear(x.cuda(), weight)
+    assert out.device.type == "cuda"
+    assert torch.equal(out.cpu(), expected)
+
+
 def test_memory_statistics_of_a_second_device_are_refused(client) -> None:
     with pytest.raises(UnsupportedMode, match=r"cuda:1"):
         torch.cuda.max_memory_allocated("cuda:1")

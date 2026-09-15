@@ -364,6 +364,45 @@ _SELECTED = {
 }
 
 
+#: The specials a wrapper subclass holding a RemoteTensor answers, as spec "Tensor subclasses".
+_SUBCLASS_SPECIAL = {
+    func: SPECIAL[func]
+    for func in (
+        torch.Tensor.device.__get__,  # type: ignore[attr-defined]
+        torch.Tensor.is_cuda.__get__,  # type: ignore[attr-defined]
+        torch.Tensor.is_meta.__get__,  # type: ignore[attr-defined]
+        torch.Tensor.get_device,
+    )
+}
+
+
+def _wraps_remote(value: Any) -> bool:
+    """Whether ``value`` is a wrapper subclass on meta holding a RemoteTensor inside."""
+    kind = type(value)
+    if kind is torch.Tensor or kind is RemoteTensor or not isinstance(value, torch.Tensor):
+        return False
+    flatten = getattr(value, "__tensor_flatten__", None)
+    if flatten is None or not value.is_meta:
+        return False
+    names, _context = flatten()
+    return any(type(getattr(value, name, None)) is RemoteTensor for name in names)
+
+
+#: torch.Tensor._make_wrapper_subclass as it was at import.
+_MAKE_WRAPPER = torch.Tensor._make_wrapper_subclass  # type: ignore[attr-defined]
+
+
+def _make_wrapper_subclass(cls: type, *args: Any, **kwargs: Any) -> torch.Tensor:
+    """``_make_wrapper_subclass`` with a CUDA device made ``meta``, as spec "Tensor subclasses"."""
+    device = kwargs.get("device")
+    if device is not None:
+        index = _cuda_index(device)
+        if index is not None:
+            _check_index(index)
+            kwargs["device"] = META
+    return _MAKE_WRAPPER(cls, *args, **kwargs)
+
+
 class CudaMode(TorchFunctionMode):
     """Rewrites CUDA devices in torch calls to the runtime's device."""
 
@@ -381,6 +420,8 @@ class CudaMode(TorchFunctionMode):
             special = SPECIAL.get(func)
             if special is not None:
                 return special(*args, **kwargs)
+        elif args and func in _SUBCLASS_SPECIAL and _wraps_remote(args[0]):
+            return _SUBCLASS_SPECIAL[func](*args, **kwargs)
         policy = _AUTOCAST.get(getattr(func, "__name__", ""))
         if policy is not None and _autocast_enabled():
             if policy == "cross_entropy":
@@ -563,7 +604,11 @@ def _host_owners() -> list[tuple[Any, str]]:
     That is pinning and ``torch.accelerator`` from spec "Pinned memory", and the
     ``torch.cuda.memory`` copies of the memory statistics from spec "Mapping cuda".
     """
-    found: list[tuple[Any, str]] = [(torch.Tensor, "pin_memory"), (torch.Tensor, "is_pinned")]
+    found: list[tuple[Any, str]] = [
+        (torch.Tensor, "pin_memory"),
+        (torch.Tensor, "is_pinned"),
+        (torch.Tensor, "_make_wrapper_subclass"),
+    ]
     found.extend((torch.cuda.memory, name) for name in MEMORY if hasattr(torch.cuda.memory, name))
     accelerator = getattr(torch, "accelerator", None)
     if accelerator is not None:
@@ -600,6 +645,7 @@ def host_replacements() -> dict[tuple[Any, str], Any]:
     table: dict[tuple[Any, str], Any] = {
         (torch.Tensor, "pin_memory"): pin_memory,
         (torch.Tensor, "is_pinned"): pinned,
+        (torch.Tensor, "_make_wrapper_subclass"): staticmethod(_make_wrapper_subclass),
     }
     values = {
         "is_available": lambda: True,

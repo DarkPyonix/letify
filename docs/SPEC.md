@@ -1394,6 +1394,14 @@ PrivateUse1 is not used. On torch 2.5.1 a wrapper tensor on a device renamed thr
 
 The `meta` device is an implementation detail. The `TorchFunctionMode` of [Mapping cuda](#mapping-cuda) answers `device` as `cuda:0`, `is_cuda` as `True` and `get_device()` as `0` for a `RemoteTensor`, which is what code written for CUDA reads. `RemoteTensor` disables its own `__torch_function__`, so a tensor method enters Python once, in the mode, instead of twice.
 
+#### Tensor subclasses <!-- id: forwarding-tensor-subclasses -->
+
+> A wrapper tensor subclass whose inner tensors are `RemoteTensor`s, such as a torchao quantized weight, is created on the `meta` device and reads as `cuda:0`, so its own `__torch_dispatch__` runs here and each operator on its inner tensors is forwarded.
+
+While forwarding is active, `torch.Tensor._make_wrapper_subclass` is replaced. A call naming a CUDA device, which is what a subclass reads from a `RemoteTensor`'s `device`, makes the wrapper on `meta` instead, and `cuda:N` with `N` other than 0 raises `UnsupportedMode`. So a wrapper built while the mapping answers `cuda:0` and one built inside a `__torch_dispatch__`, where it answers `meta`, are on the same device, and `return_and_correct_aliasing` can alias their storage. The function is restored when forwarding ends and undone in a forked child.
+
+For a tensor on `meta` whose type is neither `torch.Tensor` nor `RemoteTensor` and whose `__tensor_flatten__` names at least one `RemoteTensor`, the `TorchFunctionMode` of [Mapping cuda](#mapping-cuda) answers `device`, `is_cuda`, `is_meta` and `get_device()` as it does for a `RemoteTensor`. A tensor on `meta` holding no `RemoteTensor` keeps PyTorch's answers, so a model built on the `meta` device is still on `meta`.
+
 Autograd runs locally. Backward operators and optimizer steps reach `__torch_dispatch__` like forward ones, so they are queued and executed on the runtime the same way. A tensor that requires grad on the runtime never exists: the runtime holds values only.
 
 Inferred metadata is cached per operator. Every `RemoteTensor` carries its signature, the shape, strides, storage offset and dtype, and builds its meta tensor only when an inference needs one. One pass over an operator's arguments reads three things:

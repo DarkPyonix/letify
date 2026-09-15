@@ -101,6 +101,11 @@ class RemoteTensor(torch.Tensor):
 
     @classmethod
     def __torch_dispatch__(cls, func, types, args=(), kwargs=None):
+        for kind in types:
+            if kind is not RemoteTensor:
+                # Another wrapper subclass, such as a torchao weight, unpacks itself first,
+                # as spec "Tensor subclasses" describes.
+                return NotImplemented
         return dispatch(func, args, kwargs or {}, None)
 
 
