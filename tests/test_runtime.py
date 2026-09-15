@@ -1893,3 +1893,42 @@ def test_the_uv_installer_is_fetched_with_a_user_agent_a_cdn_accepts(
         server.shutdown()
     assert result.returncode == 0, result.stderr
     assert agents and agents[0].startswith("letify/")
+
+
+# -- Spec: Child processes of a call -----------------------------------------------
+
+_MAIN_SCRIPT = """
+import multiprocessing
+
+
+class Offset:
+    def __init__(self, by):
+        self.by = by
+
+
+def square(rank, offset, queue):
+    queue.put((rank, rank * rank + offset.by))
+
+
+@let.function(device=let.providers.local.CPU, host=letify.remote)
+def spawn_two():
+    context = multiprocessing.get_context("spawn")
+    queue = context.Queue()
+    children = [
+        context.Process(target=square, args=(rank, Offset(10), queue)) for rank in range(2)
+    ]
+    for child in children:
+        child.start()
+    results = sorted(queue.get(timeout=60) for _ in children)
+    for child in children:
+        child.join(60)
+    return results, [child.exitcode for child in children]
+"""
+
+
+def test_a_spawned_child_inside_a_call_runs_a_target_defined_in_the_callers_main(let) -> None:
+    # The script's functions and classes belong to __main__, which cloudpickle ships by value
+    # and which the worker does not have as a module, as in a user's script.
+    namespace = {"__name__": "__main__", "let": let, "letify": letify}
+    exec(compile(_MAIN_SCRIPT, "user_script.py", "exec"), namespace)
+    assert namespace["spawn_two"]() == ([(0, 10), (1, 11)], [0, 0])
