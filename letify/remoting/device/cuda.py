@@ -465,6 +465,48 @@ class _Device(contextlib.AbstractContextManager):
         return None
 
 
+#: The torch.cuda memory statistics the runtime answers, as spec "Mapping cuda" lists.
+MEMORY = (
+    "memory_allocated",
+    "max_memory_allocated",
+    "memory_reserved",
+    "max_memory_reserved",
+    "memory_cached",
+    "max_memory_cached",
+    "memory_stats",
+    "mem_get_info",
+    "reset_peak_memory_stats",
+    "reset_max_memory_allocated",
+    "reset_max_memory_cached",
+    "reset_accumulated_memory_stats",
+)
+
+
+def _check_device(device: Any) -> None:
+    """Accept None or any spelling of cuda:0 as a device argument, refuse another device."""
+    if device is None:
+        return
+    index = _cuda_index(device)
+    _check_index(-1 if index is None else index)
+
+
+def _on_device(function: Any) -> Any:
+    def call(device: Any = None) -> Any:
+        _check_device(device)
+        return function()
+
+    return call
+
+
+def _memory_query(client: Client, name: str) -> Any:
+    def query(device: Any = None) -> Any:
+        _check_device(device)
+        value = client.call("letify.memory", name)
+        return tuple(value) if name == "mem_get_info" else value
+
+    return query
+
+
 def replacements(client: Client) -> dict[str, Any]:
     """The torch.cuda attributes set while forwarding is active."""
 
@@ -494,16 +536,13 @@ def replacements(client: Client) -> dict[str, Any]:
         "get_device_properties": lambda device=None: properties,
         "get_device_capability": lambda device=None: capability,
         "is_current_stream_capturing": lambda: False,
-        "synchronize": lambda device=None: client.synchronize(),
         "manual_seed": lambda seed: client.call("letify.seed", int(seed)),
         "manual_seed_all": lambda seed: client.call("letify.seed", int(seed)),
-        "memory_allocated": lambda device=None: client.call("letify.memory", "memory_allocated"),
-        "max_memory_allocated": lambda device=None: client.call(
-            "letify.memory", "max_memory_allocated"
-        ),
-        "memory_reserved": lambda device=None: client.call("letify.memory", "memory_reserved"),
         "empty_cache": lambda: client.call("letify.empty_cache", reply=False),
     }
+    table["synchronize"] = _on_device(client.synchronize)
+    for name in MEMORY:
+        table[name] = _memory_query(client, name)
     for name in REFUSED:
         table[name] = _refuse(name)
     return table
@@ -519,8 +558,13 @@ _ACCELERATOR_NAMES = ("is_available", "current_device_index", "set_device_index"
 
 
 def _host_owners() -> list[tuple[Any, str]]:
-    """Every ``(owner, name)`` spec "Pinned memory" replaces in this PyTorch."""
+    """Every ``(owner, name)`` replaced outside ``torch.cuda`` in this PyTorch.
+
+    That is pinning and ``torch.accelerator`` from spec "Pinned memory", and the
+    ``torch.cuda.memory`` copies of the memory statistics from spec "Mapping cuda".
+    """
     found: list[tuple[Any, str]] = [(torch.Tensor, "pin_memory"), (torch.Tensor, "is_pinned")]
+    found.extend((torch.cuda.memory, name) for name in MEMORY if hasattr(torch.cuda.memory, name))
     accelerator = getattr(torch, "accelerator", None)
     if accelerator is not None:
         names = [name for name in _ACCELERATOR_NAMES if hasattr(accelerator, name)]
@@ -564,7 +608,7 @@ def host_replacements() -> dict[tuple[Any, str], Any]:
         "set_device_idx": set_device_index,
     }
     for owner, name in _host_owners():
-        if owner is not torch.Tensor:
+        if owner is not torch.Tensor and owner is not torch.cuda.memory:
             table[(owner, name)] = values[name]
     return table
 
@@ -643,6 +687,7 @@ def mapped(client: Client) -> Iterator[None]:
     table = replacements(client)
     saved = _patch(table)
     host = host_replacements()
+    host.update({key: table[key[1]] for key in _host_owners() if key[0] is torch.cuda.memory})
     host_saved = _patch_host(host)
     compiled_saved = _patch_host(compile_replacements())
     _ACTIVE.append(table)
@@ -758,10 +803,8 @@ _ORIGINALS: dict[str, Any] = {
         "synchronize",
         "manual_seed",
         "manual_seed_all",
-        "memory_allocated",
-        "max_memory_allocated",
-        "memory_reserved",
         "empty_cache",
+        *MEMORY,
         *REFUSED,
     )
 }
