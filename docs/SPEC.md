@@ -576,6 +576,16 @@ On a one-shot channel the call travels inside a driver script that prints its ba
 
 An `async def` body is awaited on the remote side, so it runs to completion there and can use `await` internally.
 
+### Child processes of a call <!-- id: call-child-processes -->
+
+> A process the body starts with `multiprocessing` or `torch.multiprocessing`, with the `spawn` or `forkserver` start method, can run a function or class the user's script defined.
+
+cloudpickle ships what the script's `__main__` defines by value, so in the worker such a function has `__module__` `"__main__"` but the worker's own `__main__` holds no attribute of that name. Standard pickling saves a function or a class by module and name, so without help a child's target fails with `PicklingError: attribute lookup ... on __main__ failed`.
+
+When the worker loads its first call it sets `reducer_override` on `multiprocessing.reduction.ForkingPickler`, the pickler `multiprocessing` uses for a process object, a queue and a pipe. For a function or a class whose `__module__` is `"__main__"` and which `sys.modules["__main__"]` does not hold under its qualified name, it returns `cloudpickle.loads` applied to `cloudpickle.dumps` of the object, so the child rebuilds it by value. Every other object keeps the reduction it had. The child imports cloudpickle from the runtime's environment, which includes it because letify depends on it.
+
+The `fork` start method copies the worker's memory and pickles no target, so it needs nothing.
+
 ### Session cache <!-- id: handles -->
 
 > `letify.session_cache(key, factory)` returns the value stored under `key` in the current session, building it with `factory()` on first use. A call always returns its value.

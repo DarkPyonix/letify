@@ -196,11 +196,43 @@ _NO_LETIFY = (
 )
 
 
+def _ship_main_to_children(cloudpickle):
+    """Let a child process the body spawns rebuild what the caller's __main__ defined.
+
+    Spec "Child processes of a call". Set once, on the pickler multiprocessing uses.
+    """
+    try:
+        from multiprocessing.reduction import ForkingPickler
+    except ImportError:
+        return
+    if getattr(ForkingPickler, "_letify_ships_main", False):
+        return
+    import types
+
+    previous = getattr(ForkingPickler, "reducer_override", None)
+
+    def reducer_override(self, obj):
+        defined = isinstance(obj, (types.FunctionType, type))
+        if defined and getattr(obj, "__module__", None) == "__main__":
+            found = sys.modules.get("__main__")
+            for part in getattr(obj, "__qualname__", "").split("."):
+                found = getattr(found, part, None)
+            if found is not obj:
+                return cloudpickle.loads, (cloudpickle.dumps(obj),)
+        if previous is not None:
+            return previous(self, obj)
+        return NotImplemented
+
+    ForkingPickler.reducer_override = reducer_override
+    ForkingPickler._letify_ships_main = True
+
+
 def _load_call(request):
     # Imported here, not at start: until the worker moves to the project's interpreter it
     # runs on whatever python3 the machine has, and needs the standard library only.
     import cloudpickle
 
+    _ship_main_to_children(cloudpickle)
     try:
         return cloudpickle.loads(request["payload"], buffers=request.get("buffers") or ())
     except ModuleNotFoundError as exc:
