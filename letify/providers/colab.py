@@ -70,6 +70,11 @@ ALIASES = {
     "H100_80GB": "H100",
 }
 
+#: Where a Colab VM keeps its GPU driver libraries. Only the notebook kernel's own
+#: environment names it, so a worker started over SSH has to be given it or it finds no
+#: libnvidia-ml.so and no libcuda.so on a session that holds a GPU. Spec "Colab".
+DRIVER_LIBRARY_PATH = "/usr/lib64-nvidia"
+
 #: The compute unit balance, as the Colab web page asks for it.
 CCU_INFO_URL = "https://colab.research.google.com/tun/m/ccu-info?authuser=0"
 
@@ -321,6 +326,17 @@ class Colab(Shell):
             target.host_key_alias = f"letify-{self.alias}-{runtime.name}"
         return target
 
+    def remote_command(self, command: str) -> str:
+        """Name the driver library directory the notebook kernel's environment names.
+
+        A login shell on the VM does not, so without this the worker sees no CUDA device.
+        A path the machine already set is kept after it.
+        """
+        return (
+            f"LD_LIBRARY_PATH={DRIVER_LIBRARY_PATH}"
+            "${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH} " + command
+        )
+
     def _link_key(self, runtime: Runtime | None) -> str:
         return runtime.name if runtime is not None else ""
 
@@ -363,4 +379,4 @@ class Colab(Shell):
         return super().open_channel(runtime)
 
 
-__all__ = ["ALIASES", "GPUS", "TPUS", "Colab"]
+__all__ = ["ALIASES", "DRIVER_LIBRARY_PATH", "GPUS", "TPUS", "Colab"]

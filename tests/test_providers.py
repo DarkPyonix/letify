@@ -364,6 +364,21 @@ def test_colab_reports_its_round_trip_rather_than_refusing() -> None:
     assert provider.expected_round_trip_ms == 175.0
 
 
+def test_a_colab_worker_started_over_ssh_is_given_the_driver_library_path(
+    isolated_home,
+) -> None:
+    # Spec "Colab": only the kernel's environment names /usr/lib64-nvidia, so a worker
+    # started over SSH without it sees no CUDA device on a session that holds a GPU.
+    from conftest import FakeLink
+
+    provider = provider_of(Colab, "colab_a")
+    runtime = type("R", (), {"name": "letify-l4-1"})()
+    provider.__dict__["_links"] = {"letify-l4-1": FakeLink("tcp_punch", 2)}
+    channel = provider.open_channel(runtime)
+    assert isinstance(channel, PersistentChannel)
+    assert "LD_LIBRARY_PATH=/usr/lib64-nvidia" in " ".join(channel.command)
+
+
 COLAB_CLI = [
     "/usr/bin/uv",
     "tool",
