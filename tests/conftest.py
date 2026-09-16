@@ -78,16 +78,21 @@ def launcher_from(config_file):
 
 @pytest.fixture
 def isolated_home(monkeypatch, tmp_path: Path) -> Path:
-    """Point Path.home and the working directory at empty directories.
+    """Point Path.home, "~" expansion and the working directory at empty directories.
 
     The command line entry point reads ~/.letify and ./.letify, so a test that goes
-    through it has to be moved off the developer's own files.
+    through it has to be moved off the developer's own files. HOME is set as well as
+    Path.home, because Path.expanduser reads the environment rather than Path.home, and
+    login expands the default key path "~/.ssh/id_letify". Without it a test would see
+    the developer's own key and behave differently on a machine that has none.
     """
     home = tmp_path / "home"
     (home / ".letify").mkdir(parents=True)
     project = tmp_path / "project"
     (project / ".letify").mkdir(parents=True)
     monkeypatch.setattr(Path, "home", classmethod(lambda cls: home))
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("USERPROFILE", str(home))
     monkeypatch.chdir(project)
     return project
 
