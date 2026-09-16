@@ -76,7 +76,7 @@ def test_the_accelerators_every_provider_offers_are_listed(isolated_home, capsys
     (isolated_home / ".letify" / "config.toml").write_text(
         '[lab]\nkind = "shell"\naddress = "a"\ngpus = ["A100"]\n', encoding="utf-8"
     )
-    assert main(["devices"]) == 0
+    assert main(["devices", "--json"]) == 0
     table = json.loads(capsys.readouterr().out)
     assert table["lab"] == ["A100"]
     assert "CPU" in table["local"]
@@ -87,7 +87,7 @@ def test_a_configuration_file_can_be_named_explicitly(isolated_home, tmp_path, c
     elsewhere.write_text(
         '[lab]\nkind = "shell"\naddress = "a"\ngpus = ["H100"]\n', encoding="utf-8"
     )
-    assert main(["--config", str(elsewhere), "devices"]) == 0
+    assert main(["--config", str(elsewhere), "devices", "--json"]) == 0
     assert json.loads(capsys.readouterr().out)["lab"] == ["H100"]
 
 
@@ -96,7 +96,7 @@ def test_a_configuration_file_can_be_named_explicitly(isolated_home, tmp_path, c
 
 def test_the_capability_probe_is_on_the_command_line(isolated_home, capsys) -> None:
     # Whether forwarding can run here, and what it would cost.
-    assert main(["probe"]) == 0
+    assert main(["probe", "--json"]) == 0
     report = json.loads(capsys.readouterr().out)
     assert report["platform"]
     assert report["reason"]
@@ -124,6 +124,7 @@ def test_every_subcommand_is_reachable_from_the_parser() -> None:
     parser = build_parser()
     actions = [a for a in parser._actions if a.dest == "command"]
     assert sorted(actions[0].choices) == [
+        "cache",
         "check",
         "client",
         "devices",
@@ -132,6 +133,7 @@ def test_every_subcommand_is_reachable_from_the_parser() -> None:
         "logout",
         "probe",
         "providers",
+        "setup",
         "status",
         "stubs",
         "usage",
@@ -155,14 +157,84 @@ def test_the_usage_table_lists_every_declared_alias(isolated_home, capsys) -> No
     assert "unavailable" in out
 
 
-def test_an_unreported_balance_says_where_it_would_have_come_from(isolated_home, capsys) -> None:
+def test_a_machine_reached_by_ssh_is_printed_as_having_no_quota(isolated_home, capsys) -> None:
     (isolated_home / ".letify" / "config.toml").write_text(
         '[lab]\nkind = "shell"\naddress = "gpu.example.edu"\n', encoding="utf-8"
     )
     assert main(["usage", "lab"]) == 0
     out = capsys.readouterr().out
-    assert "not reported" in out
-    assert "no account behind it" in out
+    assert "no quota" in out
+
+
+def test_the_usage_command_prints_one_block_per_account(isolated_home, capsys) -> None:
+    (isolated_home / ".letify" / "config.toml").write_text(
+        '[lab]\nkind = "shell"\naddress = "gpu.example.edu"\n', encoding="utf-8"
+    )
+    assert main(["usage", "lab"]) == 0
+    assert capsys.readouterr().out == "lab  shell\n  no quota, unmetered\n"
+
+
+def _row(**fields: object) -> dict:
+    return {"alias": "a", "kind": "k", "source": "s", **fields}
+
+
+@pytest.mark.parametrize(
+    ("row", "expected"),
+    [
+        (_row(unit="KRW", remaining=12345.4), "12,345 KRW left"),
+        (_row(unit="USD", remaining=25.5, limit=30.0), "$25.50 left of $30.00"),
+        (_row(unit="compute units", remaining=99.93343), "99.93 compute units left"),
+        (_row(unit="GPU hours", remaining=12.54, limit=30.0), "12.5 GPU hours left of 30.0"),
+    ],
+)
+def test_amounts_are_formatted_by_their_unit(row: dict, expected: str) -> None:
+    from letify.cli import _describe_usage
+
+    assert _describe_usage(row).startswith(expected)
+
+
+def test_a_row_with_a_renewal_prints_when_it_resets() -> None:
+    from letify.cli import _describe_usage
+
+    row = _row(unit="GPU hours", remaining=3.0, limit=30.0, resets_at=1790812800.0)
+    assert "resets 2026-10-01 00:00 UTC" in _describe_usage(row)
+
+
+def test_a_row_with_no_figure_prints_its_note(isolated_home) -> None:
+    from letify.cli import _describe_usage
+
+    row = _row(unit="KRW", note="set billing_endpoint")
+    assert _describe_usage(row) == "not reported (set billing_endpoint)"
+
+
+def test_usage_asks_every_provider_at_once_and_a_slow_one_does_not_hold_the_others(
+    launcher_from, monkeypatch
+) -> None:
+    import time as _time
+
+    from letify.providers.local import Local
+
+    real = Local.usage
+
+    def usage(self):
+        if self.alias == "slow":
+            _time.sleep(3)
+        if self.alias == "broken":
+            raise RuntimeError("service down")
+        return real(self)
+
+    monkeypatch.setattr(Local, "usage", usage)
+    let = launcher_from(
+        '[slow]\nkind = "local"\nusage_timeout = 0.5\n'
+        '[broken]\nkind = "local"\n[fine]\nkind = "local"\n'
+    )
+    started = _time.monotonic()
+    rows = {row["alias"]: row for row in let.usage()}
+    assert _time.monotonic() - started < 2.5
+    assert rows["fine"]["unmetered"] is True
+    assert rows["slow"]["remaining"] is None
+    assert "0.5 s" in rows["slow"]["note"]
+    assert "service down" in rows["broken"]["note"]
 
 
 def test_a_configured_command_is_what_the_table_prints(isolated_home, capsys) -> None:
@@ -182,34 +254,79 @@ def test_a_configured_command_is_what_the_table_prints(isolated_home, capsys) ->
 # -- Spec: GPU utilization -----------------------------------------------------
 
 
-def test_an_instance_with_no_live_session_is_listed_with_its_reason(isolated_home, capsys) -> None:
+def test_a_session_instance_with_no_live_session_is_listed_with_its_reason(
+    isolated_home, capsys
+) -> None:
     # Starting a session to measure its load would cost money and change the answer.
     (isolated_home / ".letify" / "config.toml").write_text(
-        '[lab]\nkind = "shell"\naddress = "gpu.example.edu"\ngpus = ["A100"]\n',
-        encoding="utf-8",
+        '[e]\nkind = "elice"\nzone_id = "z"\ngpus = ["A100"]\n', encoding="utf-8"
     )
-    assert main(["utilization", "lab", "--json"]) == 0
+    assert main(["utilization", "e", "--json"]) == 0
     rows = json.loads(capsys.readouterr().out)
     assert rows[0]["accelerator"] == "A100"
+    assert rows[0]["scope"] == "session"
     assert rows[0]["devices"] == []
     assert "no live session" in rows[0]["reason"]
+
+
+def test_a_machine_reached_by_ssh_is_read_over_its_link_without_a_session(
+    isolated_home, capsys, monkeypatch
+) -> None:
+    from letify.providers import shell as shell_module
+    from letify.providers.shell import Shell
+
+    (isolated_home / ".letify" / "config.toml").write_text(
+        '[lab]\nkind = "shell"\naddress = "gpu.example.edu"\ngpus = ["P100"]\n',
+        encoding="utf-8",
+    )
+    link = type("L", (), {"ssh_command": lambda self, remote=None: ["ssh", "h", remote]})()
+    monkeypatch.setattr(Shell, "link", lambda self, runtime=None: link)
+    asked: list[str] = []
+
+    def run(command, **kwargs):
+        remote = command[-1]
+        asked.append(remote)
+        if "--query-gpu=index,uuid" in remote:
+            return FakeCompleted(stdout="0, GPU-aaa\n1, GPU-bbb\n")
+        if "--query-compute-apps" in remote:
+            return FakeCompleted(stdout="GPU-bbb, 42\n#owners\n42 alice\n#login\nbrew\n")
+        return FakeCompleted(
+            stdout="0, Tesla P100, 20, 1638, 16384, 41, 38\n"
+            "1, Tesla P100, 99, 8192, 16384, 70, 200\n"
+        )
+
+    monkeypatch.setattr(shell_module.subprocess, "run", run)
+    assert main(["utilization", "lab", "--json"]) == 0
+    rows = json.loads(capsys.readouterr().out)
+    assert len(rows) == 1
+    assert (rows[0]["scope"], rows[0]["accelerator"]) == ("machine", None)
+    holders = [(d["index"], d["holder"], d["users"]) for d in rows[0]["devices"]]
+    assert holders == [(0, "free", []), (1, "others", ["alice"])]
+    assert all("nvidia-smi" in remote for remote in asked)
 
 
 def test_a_device_reading_is_printed_with_the_fields_the_card_reported(
     isolated_home, capsys, monkeypatch
 ) -> None:
     # A card that reports neither power nor temperature is printed without them rather
-    # than with a zero.
+    # than with a zero. Local is read as a machine, so this holds on a machine with no GPU.
     monkeypatch.setattr(
         telemetry,
         "read_smi",
         lambda: "0, NVIDIA RTX PRO 6000, 87, 40960, 98304, [N/A], [Not Supported]\n",
     )
+    owners = {
+        telemetry.UUID_COMMAND: "0, GPU-a\n",
+        telemetry.OWNERS_COMMAND: "#owners\n#login\nbrew\n",
+    }
+    monkeypatch.setattr(telemetry, "_run", lambda command: owners.get(command, ""))
+    monkeypatch.setenv("COLUMNS", "80")
     assert main(["utilization", "local"]) == 0
     out = capsys.readouterr().out
-    assert "87% busy" in out
-    assert "40.0/96.0 GiB" in out
-    assert "W" not in out
+    assert "  gpu0  NVIDIA RTX PRO 6000  free\n" in out
+    assert "]  87%\n" in out
+    assert "]  42%  40.0/96.0 GiB\n" in out
+    assert "W" not in out.replace("NVIDIA RTX PRO 6000", "")
 
 
 def test_the_cpu_shape_is_not_asked_how_busy_its_accelerator_is(
@@ -220,6 +337,97 @@ def test_the_cpu_shape_is_not_asked_how_busy_its_accelerator_is(
     assert main(["utilization", "local", "--json"]) == 0
     rows = json.loads(capsys.readouterr().out)
     assert all(row["accelerator"] != "CPU" for row in rows)
+
+
+# -- Spec: Machine-readable output ---------------------------------------------
+
+USAGE_KEYS = {
+    "alias",
+    "kind",
+    "unit",
+    "source",
+    "remaining",
+    "limit",
+    "used",
+    "rate_per_hour",
+    "resets_at",
+    "unmetered",
+    "as_of",
+    "note",
+    "resources",
+}
+
+DEVICE_KEYS = {
+    "index",
+    "name",
+    "utilization_percent",
+    "memory_used_gb",
+    "memory_total_gb",
+    "memory_percent",
+    "temperature_c",
+    "power_w",
+}
+
+
+def test_usage_json_carries_every_key_the_editor_extension_reads(isolated_home, capsys) -> None:
+    (isolated_home / ".letify" / "config.toml").write_text(
+        '[lab]\nkind = "shell"\naddress = "gpu.example.edu"\n'
+        'usage_command = "echo 12.5"\nusage_unit = "GPU hours"\nusage_limit = 40.0\n'
+        '[odd]\nkind = "vastai"\n',
+        encoding="utf-8",
+    )
+    assert main(["usage", "--json"]) == 0
+    rows = {row["alias"]: row for row in json.loads(capsys.readouterr().out)}
+    lab = rows["lab"]
+    assert set(lab) >= USAGE_KEYS
+    assert isinstance(lab["unmetered"], bool)
+    assert all(isinstance(lab[key], str) for key in ("alias", "kind", "unit", "source"))
+    assert all(
+        lab[key] is None or isinstance(lab[key], int | float)
+        for key in ("remaining", "limit", "used", "rate_per_hour", "resets_at", "as_of")
+    )
+    assert isinstance(lab["resources"], list)
+    assert isinstance(rows["odd"]["unavailable"], str)
+
+
+def test_utilization_json_carries_every_row_key_the_editor_extension_reads(
+    isolated_home, capsys
+) -> None:
+    (isolated_home / ".letify" / "config.toml").write_text(
+        '[lab]\nkind = "shell"\naddress = "gpu.example.edu"\ngpus = ["A100"]\n',
+        encoding="utf-8",
+    )
+    assert main(["utilization", "lab", "--json"]) == 0
+    row = json.loads(capsys.readouterr().out)[0]
+    assert set(row) >= {"alias", "kind", "scope", "accelerator", "devices", "reason"}
+    assert isinstance(row["devices"], list)
+    for device in row["devices"]:
+        assert device["holder"] in {"letify", "others", "mine", "free", "unknown"}
+        assert isinstance(device["users"], list)
+        assert isinstance(device["reserved"], bool)
+
+
+def test_a_device_record_carries_every_key_the_editor_extension_reads() -> None:
+    # The utilization rows hold exactly these dictionaries, so pinning the record pins the
+    # JSON without needing a card on the machine running the suite.
+    line = "0, NVIDIA RTX PRO 6000, 87, 40960, 98304, 61, [Not Supported]\n"
+    device = json.loads(json.dumps(telemetry.parse_smi(line)[0].to_dict()))
+    assert set(device) >= DEVICE_KEYS
+    assert isinstance(device["index"], int)
+    assert device["utilization_percent"] == 87
+    assert device["temperature_c"] == 61
+    assert device["power_w"] is None
+
+
+def test_status_accepts_json_and_prints_the_documented_keys(isolated_home, capsys) -> None:
+    assert main(["status", "--json"]) == 0
+    report = json.loads(capsys.readouterr().out)
+    assert set(report) >= {"name", "live", "busy", "devices", "runtimes", "declared"}
+    assert isinstance(report["live"], int)
+    assert isinstance(report["runtimes"], list)
+    for accelerators in report["devices"].values():
+        for entry in accelerators.values():
+            assert set(entry) >= {"count", "reserved", "indices"}
 
 
 # -- Spec: Logging in ----------------------------------------------------------
@@ -283,9 +491,10 @@ def test_a_reserved_alias_is_refused_before_anything_is_written(isolated_home, c
 
 
 def test_an_elice_token_goes_to_the_account_directory_and_not_the_config(
-    isolated_home, capsys
+    isolated_home, fake_eci, elice_key, capsys
 ) -> None:
     # A token in a file is a token in a backup, so the file gets the pointer only.
+    fake_eci.set(token="secret-token")
     code = main(
         [
             "login",
@@ -293,8 +502,8 @@ def test_an_elice_token_goes_to_the_account_directory_and_not_the_config(
             "elice_a100",
             "--zone-id",
             "zone-1",
-            "--machine-id",
-            "machine-1",
+            "--key",
+            elice_key,
             "--token",
             "secret-token",
             "--no-input",
@@ -340,6 +549,64 @@ def test_a_colab_login_that_fails_writes_nothing(
     assert not (Path.home() / ".letify" / "config.toml").exists()
 
 
+def test_a_declared_colab_account_without_a_key_gets_one_on_a_new_login(
+    isolated_home, patch_which, patch_run, monkeypatch
+) -> None:
+    from letify import tools
+
+    monkeypatch.setenv("HOME", str(Path.home()))
+    (Path.home() / ".letify" / "config.toml").write_text(
+        '[colab_a]\nkind = "colab"\n', encoding="utf-8"
+    )
+    patch_which(tools, present=True)
+    recorder = patch_run(login, result=FakeCompleted())
+    assert main(["login", "colab", "colab_a", "--no-input"]) == 0
+    assert len([c for c in recorder.commands if c and c[0] == "ssh-keygen"]) == 1
+    assert home_config()["colab_a"]["key"] == "~/.ssh/id_letify"
+    assert home_config()["colab_a"]["kind"] == "colab"
+
+
+def test_a_colab_login_generates_and_records_the_letify_key(
+    isolated_home, patch_which, patch_run, monkeypatch
+) -> None:
+    # Without a key the Colab rendezvous is unavailable, so tcp_punch never runs.
+    from letify import tools
+
+    monkeypatch.setenv("HOME", str(Path.home()))
+    patch_which(tools, present=True)
+    recorder = patch_run(login, result=FakeCompleted())
+    assert main(["login", "colab", "colab_a", "--no-input"]) == 0
+    generated = [c for c in recorder.commands if c and c[0] == "ssh-keygen"]
+    assert len(generated) == 1
+    assert generated[0][-1] == str(Path.home() / ".ssh" / "id_letify")
+    assert home_config()["colab_a"]["key"] == "~/.ssh/id_letify"
+
+
+def test_a_colab_login_reuses_an_existing_key_without_regenerating_it(
+    isolated_home, patch_which, patch_run
+) -> None:
+    from letify import tools
+
+    patch_which(tools, present=True)
+    existing = Path.home() / ".ssh" / "id_mine"
+    existing.parent.mkdir(parents=True, exist_ok=True)
+    existing.write_text("user key", encoding="utf-8")
+    recorder = patch_run(login, result=FakeCompleted())
+    assert main(["login", "colab", "colab_a", "--no-input", "--key", str(existing)]) == 0
+    assert [c for c in recorder.commands if c and c[0] == "ssh-keygen"] == []
+    assert existing.read_text(encoding="utf-8") == "user key"
+    assert home_config()["colab_a"]["key"] == str(existing)
+
+
+def test_a_failed_colab_login_generates_no_key(isolated_home, patch_which, patch_run) -> None:
+    from letify import tools
+
+    patch_which(tools, present=True)
+    recorder = patch_run(login, result=FakeCompleted(returncode=1))
+    assert main(["login", "colab", "colab_a", "--no-input"]) == 1
+    assert [c for c in recorder.commands if c and c[0] == "ssh-keygen"] == []
+
+
 def test_logging_in_to_colab_without_uv_says_how_to_get_it(
     isolated_home, patch_which, capsys
 ) -> None:
@@ -350,23 +617,12 @@ def test_logging_in_to_colab_without_uv_says_how_to_get_it(
     assert "uv was not found" in capsys.readouterr().err
 
 
-def test_logging_out_takes_the_account_and_its_directory(isolated_home, capsys) -> None:
+def test_logging_out_takes_the_account_and_its_directory(
+    isolated_home, fake_eci, elice_key, capsys
+) -> None:
     # The repository still needs the account, so the reference stays; this machine is what
     # stopped having it.
-    main(
-        [
-            "login",
-            "elice",
-            "e",
-            "--zone-id",
-            "z",
-            "--machine-id",
-            "m",
-            "--token",
-            "t",
-            "--no-input",
-        ]
-    )
+    assert main(elice_login_argv(elice_key, "--zone-id", "zone-1", "--no-input")) == 0
     assert main(["logout", "e"]) == 0
     assert "[e]" not in (Path.home() / ".letify" / "config.toml").read_text(encoding="utf-8")
     assert not (Path.home() / ".letify" / "accounts" / "e").exists()
@@ -552,27 +808,165 @@ def test_the_optional_fields_reach_the_file_when_they_are_given(isolated_home, p
     assert "persistent = true" in home_file
 
 
-def test_an_elice_endpoint_is_recorded_only_when_it_is_not_the_default(isolated_home) -> None:
-    assert (
-        main(
-            [
-                "login",
-                "elice",
-                "e",
-                "--zone-id",
-                "z",
-                "--machine-id",
-                "m",
-                "--token",
-                "t",
-                "--endpoint",
-                "https://portal.example/api",
-                "--no-input",
-            ]
-        )
-        == 0
+def test_an_elice_endpoint_is_recorded_only_when_it_is_not_the_default(
+    isolated_home, fake_eci, elice_key
+) -> None:
+    public = "https://portal.gov.elice.cloud/api"
+    argv = elice_login_argv(elice_key, "--zone-id", "zone-1", "--endpoint", public, "--no-input")
+    assert main(argv) == 0
+    assert all(c["env"]["ECI_API_ENDPOINT"] == public for c in fake_eci.calls)
+    assert elice_entry()["endpoint"] == public
+
+
+# -- Spec: Logging in, the Elice login ------------------------------------------
+
+
+@pytest.fixture
+def elice_key(isolated_home) -> str:
+    """An existing key, so an Elice login never runs ssh-keygen."""
+    key = Path.home() / ".ssh" / "id_test"
+    key.parent.mkdir(parents=True, exist_ok=True)
+    key.write_text("private", encoding="utf-8")
+    key.with_suffix(".pub").write_text("ssh-ed25519 AAAA test", encoding="utf-8")
+    return str(key)
+
+
+def elice_login_argv(key: str, *extra: str) -> list[str]:
+    return ["login", "elice", "e", "--token", "token-1", "--key", key, *extra]
+
+
+def elice_entry() -> dict:
+    return tomllib.loads((Path.home() / ".letify" / "config.toml").read_text(encoding="utf-8"))["e"]
+
+
+def test_an_elice_login_verifies_the_token_with_eci_and_records_the_account(
+    isolated_home, fake_eci, elice_key, capsys
+) -> None:
+    argv = elice_login_argv(
+        elice_key,
+        "--zone-id",
+        "zone-1",
+        "--machine-id",
+        "vm-1",
+        "--price-type",
+        "spot",
+        "--billing-endpoint",
+        "https://billing.example/api",
+        "--no-input",
     )
-    assert "portal.example" in (Path.home() / ".letify" / "config.toml").read_text(encoding="utf-8")
+    assert main(argv) == 0
+    assert fake_eci.commands()[0] == "zone list"
+    verify = next(c for c in fake_eci.calls if c["argv"][:2] == ["config", "verify"])
+    assert verify["env"]["ECI_ZONE_ID"] == "zone-1"
+    for call in fake_eci.calls:
+        assert "token-1" not in call["argv"]
+        assert call["env"]["ECI_API_TOKEN"] == "token-1"
+    entry = elice_entry()
+    assert entry["kind"] == "elice"
+    assert entry["zone_id"] == "zone-1"
+    assert entry["machine_id"] == "vm-1"
+    assert entry["price_type"] == "spot"
+    assert entry["organization"] == "lab"
+    assert entry["billing_endpoint"] == "https://billing.example/api"
+    assert entry["key"] == elice_key
+    token_file = Path.home() / ".letify" / "accounts" / "e" / "access_token"
+    assert token_file.read_text(encoding="utf-8") == "token-1"
+    if sys.platform != "win32":
+        assert token_file.stat().st_mode & 0o777 == 0o600
+
+
+def test_a_rejected_elice_token_writes_nothing(isolated_home, fake_eci, elice_key, capsys) -> None:
+    fake_eci.set(token="another-token")
+    argv = elice_login_argv(elice_key, "--zone-id", "z", "--no-input")
+    assert main(argv) == 1
+    assert "Elice refused the access token" in capsys.readouterr().err
+    assert not (Path.home() / ".letify" / "config.toml").exists()
+    assert not (Path.home() / ".letify" / "accounts" / "e").exists()
+
+
+def test_an_elice_login_without_eci_prints_the_install_command_and_writes_nothing(
+    isolated_home, elice_key, patch_which, capsys
+) -> None:
+    from letify.providers import elice as elice_module
+
+    patch_which(elice_module, False)
+    assert main(elice_login_argv(elice_key, "--zone-id", "z", "--no-input")) == 1
+    assert "eci-cli/main/scripts/install.sh" in capsys.readouterr().err
+    assert not (Path.home() / ".letify" / "config.toml").exists()
+
+
+def test_a_failed_eci_verify_writes_nothing(isolated_home, fake_eci, elice_key, capsys) -> None:
+    fake_eci.set(fail={"config verify": {"stderr": "zone: invalid"}})
+    assert main(elice_login_argv(elice_key, "--zone-id", "zone-9", "--no-input")) == 1
+    assert "zone: invalid" in capsys.readouterr().err
+    assert not (Path.home() / ".letify" / "config.toml").exists()
+
+
+def scripted(monkeypatch, *replies: str) -> list[str]:
+    answers = iter(replies)
+    prompts: list[str] = []
+
+    def read_line(prompt: str) -> str:
+        prompts.append(prompt)
+        return next(answers)
+
+    monkeypatch.setattr(login, "read_line", read_line)
+    return prompts
+
+
+def test_an_elice_login_with_no_machines_asks_no_machine_question(
+    isolated_home, fake_eci, elice_key, monkeypatch, capsys
+) -> None:
+    # The account that failed live: one zone, no machine. letify creates one on first use.
+    prompts = scripted(monkeypatch, "", "")
+    assert main(elice_login_argv(elice_key)) == 0
+    assert prompts == ["Elice zone [1-1]: ", "Elice billing API base URL (blank to skip): "]
+    assert "Elice lists no machine; letify creates one on first use." in capsys.readouterr().out
+    entry = elice_entry()
+    assert entry["zone_id"] == "zone-1"
+    assert "machine_id" not in entry
+
+
+def test_an_elice_login_offers_listed_machines_and_the_choice_to_create_one(
+    isolated_home, fake_eci, elice_key, monkeypatch, capsys
+) -> None:
+    fake_eci.set(
+        zones=[{"id": "zone-a", "name": "Seoul"}, {"id": "zone-b", "name": "Busan"}],
+        vms=[{"id": "vm-9", "name": "a100", "status": "idle"}],
+    )
+    prompts = scripted(monkeypatch, "7", "2", "", "1", "")
+    assert main(elice_login_argv(elice_key)) == 0
+    out = capsys.readouterr().out
+    assert "1. Seoul (zone-a)" in out
+    assert "2. Busan (zone-b)" in out
+    assert "1. a100 (vm-9)" in out
+    assert "2. Create a new machine with letify" in out
+    assert prompts[:5] == [
+        "Elice zone [1-2]: ",
+        "Elice zone [1-2]: ",
+        "Elice machine [1-2]: ",
+        "Elice machine [1-2]: ",
+        "Elice billing API base URL (blank to skip): ",
+    ]
+    entry = elice_entry()
+    assert entry["zone_id"] == "zone-b"
+    assert entry["machine_id"] == "vm-9"
+    assert "organization" in entry
+
+
+def test_choosing_to_create_a_machine_records_none(
+    isolated_home, fake_eci, elice_key, monkeypatch
+) -> None:
+    fake_eci.set(vms=[{"id": "vm-9", "name": "a100", "status": "idle"}])
+    scripted(monkeypatch, "", "2", "")
+    assert main(elice_login_argv(elice_key)) == 0
+    assert "machine_id" not in elice_entry()
+
+
+def test_an_elice_login_without_input_needs_no_machine(isolated_home, fake_eci, elice_key) -> None:
+    fake_eci.set(vms=[{"id": "vm-9", "name": "a100", "status": "idle"}])
+    assert main(elice_login_argv(elice_key, "--zone-id", "zone-1", "--no-input")) == 0
+    assert "machine_id" not in elice_entry()
 
 
 def modal_sign_in(monkeypatch, *, returncode: int = 0, writes: bool = True) -> list[dict]:

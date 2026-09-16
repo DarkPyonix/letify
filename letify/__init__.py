@@ -44,6 +44,7 @@ from .errors import (
     RemoteError,
     RuntimeFailure,
     RuntimeLost,
+    SpotPreempted,
     UnknownInstance,
     UnknownProvider,
     UnsupportedMode,
@@ -62,6 +63,18 @@ remote: Final = Host.remote
 del Host
 
 __version__ = "1.0.0"
+
+
+def fetch(tensor):  # type: ignore[no-untyped-def]
+    """Queue a read of ``tensor`` and return an awaitable resolving to its CPU copy.
+
+    Under ``host="local"`` the read is queued at the call and awaiting it does not block the
+    event loop. A tensor not on the runtime resolves to ``tensor.detach().cpu()``.
+    """
+    from .remoting.device.client import fetch as queue_fetch
+
+    return queue_fetch(tensor)
+
 
 __all__ = [
     "AnyInstance",
@@ -82,6 +95,7 @@ __all__ = [
     "RemoteFile",
     "RuntimeFailure",
     "RuntimeLost",
+    "SpotPreempted",
     "UnknownInstance",
     "UnknownProvider",
     "UnsupportedMode",

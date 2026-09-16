@@ -75,6 +75,13 @@ TAIL_LINES = 40
 VERSION_SOURCE = "import sys\n__letify_value__ = '%d.%d' % sys.version_info[:2]\n"
 
 
+def user_agent() -> str:
+    """The User-Agent a runtime sends when it downloads the uv installer."""
+    from .. import __version__
+
+    return f"letify/{__version__}"
+
+
 def local_python() -> str:
     """The major.minor of the interpreter running letify, such as ``"3.12"``."""
     return f"{sys.version_info[0]}.{sys.version_info[1]}"
@@ -89,6 +96,11 @@ def major_minor(version: str) -> str:
 def env_archive_path(mount: str, digest: str) -> str:
     """Where a cached blob is written in the content addressed layout."""
     return f"{mount.rstrip('/')}/blobs/{digest[:2]}/{digest}"
+
+
+def uv_cache_dir(workspace_root: str) -> str:
+    """The uv cache a persistent provider syncs with, before ``~`` is expanded there."""
+    return f"{workspace_root.rstrip('/')}/uv-cache"
 
 
 def project_dir(workspace_root: str, env: Env) -> str:
@@ -189,8 +201,13 @@ def sync_source(
     root: str | None = None,
     name: str = "this runtime",
     installer: str = UV_INSTALLER,
+    cache_dir: str | None = None,
 ) -> str:
     """Source that writes the project files, finds or installs uv, and runs the sync.
+
+    ``cache_dir`` becomes ``UV_CACHE_DIR`` for the uv commands only, unless the declared
+    variables already name one. Spec "uv cache": a persistent provider passes
+    ``<workspace root>/uv-cache`` so uv hard links into the project ``.venv``.
 
     It raises ``RuntimeError`` with ``uv could not be installed on <name>`` or ``uv sync
     failed on <name>`` so the local side can name the step that failed.
@@ -212,7 +229,10 @@ def sync_source(
         "if _letify_uv is None:",
         "    _letify_text = ''",
         "    try:",
-        f"        with urllib.request.urlopen({installer!r}, timeout=300) as _letify_response:",
+        # astral.sh answers Python's default urllib agent with 403, so letify names itself.
+        f"        _letify_request = urllib.request.Request({installer!r}, "
+        f"headers={{'User-Agent': {user_agent()!r}}})",
+        "        with urllib.request.urlopen(_letify_request, timeout=300) as _letify_response:",
         "            _letify_script = _letify_response.read()",
         "        _letify_done = subprocess.run(['sh'], input=_letify_script, capture_output=True,",
         "            env=dict(os.environ, UV_INSTALL_DIR=_letify_bin, UV_NO_MODIFY_PATH='1'))",
@@ -227,9 +247,14 @@ def sync_source(
         f"        raise RuntimeError('uv could not be installed on {name} from {installer}: '"
         f" + {tail})",
         "    _letify_uv = os.path.join(_letify_bin, 'uv')",
+        "_letify_uv_env = dict(os.environ)",
+    ]
+    if cache_dir and "UV_CACHE_DIR" not in dict(env.variables):
+        lines.append(f"_letify_uv_env['UV_CACHE_DIR'] = os.path.expanduser({cache_dir!r})")
+    lines += [
         f"_letify_command = [_letify_uv] + {sync_args!r}",
         "_letify_done = subprocess.run(_letify_command, cwd=_letify_root, capture_output=True,"
-        " text=True)",
+        " text=True, env=_letify_uv_env)",
         "if _letify_done.returncode != 0:",
         "    _letify_text = _letify_done.stderr",
         f"    raise RuntimeError('uv sync failed on {name}\\ncommand: ' + ' '.join(_letify_command)"
@@ -240,7 +265,7 @@ def sync_source(
             "_letify_command = [_letify_uv, 'pip', 'install', '--python', _letify_python]"
             f" + {list(env.packages)!r}",
             "_letify_done = subprocess.run(_letify_command, cwd=_letify_root,"
-            " capture_output=True, text=True)",
+            " capture_output=True, text=True, env=_letify_uv_env)",
             "if _letify_done.returncode != 0:",
             "    _letify_text = _letify_done.stderr",
             f"    raise RuntimeError('uv pip install failed on {name}\\ncommand: '"
@@ -263,5 +288,6 @@ __all__ = [
     "project_files",
     "sync_command",
     "sync_source",
+    "uv_cache_dir",
     "venv_check_source",
 ]

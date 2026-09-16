@@ -1,16 +1,13 @@
 """What is left on an account, asked the same way of every provider.
 
 A researcher renting cheap GPU time runs out of it, so the question that decides what to
-run next is how much is left. Each service answers differently, and most of them do not
-answer at all: Colab keeps the compute unit balance in its web console, Modal exposes no
-workspace balance through its SDK, and a machine reached over SSH has no account behind
-it.
+run next is how much is left. This module owns the record every provider answers with,
+the configured command that can replace a provider's own reading, and the way a record is
+printed. It does not own how each service is asked, which lives in each provider module.
 
-So this module is built around the missing answer. Every field except the alias, the unit
-and the source may be None, because a gap is information and a fabricated balance is not:
-a researcher spends against a number letify prints. Where a service publishes nothing, a
-configuration entry names a command that prints the figure, which keeps the table useful
-without letify inventing an endpoint.
+Every field except the alias, the kind, the unit and the source may be None, because a
+gap is information and a fabricated balance is not: a researcher spends against a number
+letify prints.
 """
 
 from __future__ import annotations
@@ -18,7 +15,8 @@ from __future__ import annotations
 import re
 import subprocess
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from typing import Any
 
 #: The last number in a command's output is the remaining amount, so a command that
 #: prints a sentence around it still works.
@@ -40,9 +38,15 @@ class Usage:
     limit: float | None = None
     used: float | None = None
     rate_per_hour: float | None = None
+    resets_at: float | None = None
     unmetered: bool = False
     as_of: float | None = None
     note: str | None = None
+    #: Further allowances on the same account, each a dictionary with ``name``, ``unit``,
+    #: ``remaining``, ``used``, ``limit`` and ``resets_at``.
+    resources: tuple[dict[str, Any], ...] = field(default=())
+    #: The account's price type, ``ondemand`` or ``spot``, where the provider has one.
+    price_type: str | None = None
 
     @property
     def known(self) -> bool:
@@ -51,17 +55,7 @@ class Usage:
 
     def describe(self) -> str:
         """One line for the table, saying plainly when there is no number."""
-        if self.unmetered:
-            return "unmetered"
-        parts = []
-        if self.remaining is not None:
-            left = f"{self.remaining:g} {self.unit} left"
-            if self.limit:
-                left += f" of {self.limit:g}"
-            parts.append(left)
-        if self.rate_per_hour is not None:
-            parts.append(f"{self.rate_per_hour:g} {self.unit}/hour running now")
-        return ", ".join(parts) or "not reported"
+        return describe_row(self.to_dict())
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -73,10 +67,52 @@ class Usage:
             "limit": self.limit,
             "used": self.used,
             "rate_per_hour": self.rate_per_hour,
+            "resets_at": self.resets_at,
             "unmetered": self.unmetered,
             "as_of": self.as_of,
             "note": self.note,
+            "resources": [dict(resource) for resource in self.resources],
+            "price_type": self.price_type,
         }
+
+
+def _number(value: float, unit: str) -> str:
+    """The amount alone, at the precision its unit is spent in."""
+    if unit == "KRW":
+        return f"{value:,.0f}"
+    if unit == "USD":
+        return f"${value:,.2f}"
+    if unit == "compute units":
+        return f"{value:,.2f}"
+    if unit.endswith("hours"):
+        return f"{value:,.1f}"
+    return f"{value:g}"
+
+
+def format_amount(value: float, unit: str) -> str:
+    """An amount with its unit: ``12,345 KRW``, ``$29.50``, ``12.5 GPU hours``."""
+    number = _number(value, unit)
+    return number if unit == "USD" else f"{number} {unit}".rstrip()
+
+
+def describe_row(row: dict[str, Any]) -> str:
+    """One line for a usage record given as a dictionary, as ``--json`` prints it."""
+    if row.get("unmetered"):
+        return "no quota, unmetered"
+    unit = str(row.get("unit") or "")
+    parts = []
+    remaining = row.get("remaining")
+    if remaining is not None:
+        left = f"{format_amount(float(remaining), unit)} left"
+        if row.get("limit") is not None:
+            left += f" of {_number(float(row['limit']), unit)}"
+        if row.get("resets_at") is not None:
+            stamp = time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime(float(row["resets_at"])))
+            left += f", resets {stamp}"
+        parts.append(left)
+    if row.get("rate_per_hour") is not None:
+        parts.append(f"{format_amount(float(row['rate_per_hour']), unit)}/hour running now")
+    return ", ".join(parts) or f"not reported ({row.get('note') or row.get('source')})"
 
 
 def read_number(text: str) -> float | None:
@@ -128,4 +164,11 @@ def from_command(alias: str, kind: str, command: str, unit: str, limit: float | 
     )
 
 
-__all__ = ["COMMAND_TIMEOUT", "Usage", "from_command", "read_number"]
+__all__ = [
+    "COMMAND_TIMEOUT",
+    "Usage",
+    "describe_row",
+    "format_amount",
+    "from_command",
+    "read_number",
+]

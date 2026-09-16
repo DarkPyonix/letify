@@ -355,6 +355,18 @@ def train(lr): ...
 
 런타임은 볼륨을 여러분의 컴퓨터를 거치지 않고 버킷에서 바로 받습니다. 이때 로컬 로그인에서 잠시 빌린 짧은 수명의 토큰을 쓰므로, 원격에는 인증 정보가 남지 않습니다.
 
+학습 데이터는 선언할 필요가 없습니다. `pathlib.Path`를 인자로 넘기거나 전역 변수에서 읽으면, letify가 그 경로의 파일을 내용 주소 블롭으로 보냅니다. 함수 본문은 같은 구조를 가진 런타임 쪽 경로를 받습니다. persistent 머신은 블롭을 자기 디스크에 두므로 두 번째 세션의 업로드는 0바이트입니다. `bucket = "<이름>"`을 설정한 ephemeral 계정은 파일마다 버킷에 한 번만 올리고, 이후 런타임은 모두 버킷에서 받습니다. 런타임에 둔 사본은 예산 안에서 보관하며(기본 50 GiB, 계정의 `data_cache_gib`로 변경), `letify cache`로 보거나 비울 수 있습니다.
+
+결과도 같은 방식으로 돌아옵니다. 아직 없는 `Path`나 디렉터리는 출력 위치이기도 합니다. 함수 본문이 그곳에 만들거나 바꾼 파일은 호출이 끝나면 로컬 경로로 복사되고, 로컬에 이미 같은 내용이 있는 파일은 보내지 않습니다. 그래서 `Path("runs/exp1")` 아래에 저장한 체크포인트와 로그는 호출이 끝나면 프로젝트에 들어와 있습니다.
+
+```python
+DATA = Path("data/imagenet-subset")
+
+@let.function(device=lab.A100, host=letify.remote)
+def train(lr):
+    for file in DATA.iterdir(): ...   # 이미 런타임 디스크에 있음
+```
+
 이 구조를 고른 이유입니다.
 
 | | 🐌 양방향 파일 동기화 | ⚡ 내용 주소 방식 |
@@ -446,6 +458,7 @@ def test_train_returns_a_loss():
 letify login shell lab # 계정을 등록하고, 이 저장소에서 참조
 letify logout lab     # 이 머신에서 계정 제거
 letify client shell connect  # NAT 뒤 원격 머신에서 실행해, letify가 접속할 수 있게 함
+letify setup tailcat  # 배포처에서 tailcat 또는 eci를 미리 설치
 letify providers      # 선언된 프로바이더, 저장소 수명, 기본 배치
 letify devices           # 각자 제공하는 GPU
 letify status         # 지금 돌고 있는 것
@@ -454,6 +467,8 @@ letify utilization    # 인스턴스별 GPU가 얼마나 바쁜가
 letify check lab      # 이 머신이 응답하나?
 letify probe lab      # 호출 중계를 쓸 만큼 가까운가?
 ```
+
+`usage`, `utilization`, `status`에 `--json`을 붙이면 프로그램이 읽을 수 있는 출력이 나옵니다. [letify-ext/](../../letify-ext/)의 VS Code 확장이 이 출력으로 상태 표시줄에 사용량과 GPU 활동을 보여 줍니다.
 
 ---
 

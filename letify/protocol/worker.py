@@ -48,6 +48,10 @@ import hashlib, io, queue, sys, tarfile, time, traceback
 
 _BLOBS = {}
 _SIZES = {}
+# Set by blob_dir on a persistent provider: where argument blobs are also written, and the
+# total size the directory is kept under.
+_DISK = {}
+_PICKLE_MAGIC = b"LTFYPKL1"
 _READ_SIZE = 1 << 16
 
 # Frames go to a private copy of the pipe this process started on. Descriptors 1 and 2 are
@@ -92,6 +96,29 @@ class _Pump(threading.Thread):
 _PUMPS = [_Pump(1, STDOUT), _Pump(2, STDERR)]
 for _pump in _PUMPS:
     _pump.start()
+
+
+def _forked_child():
+    """Detach a process the body forked from the worker's channel and tie it to the worker.
+
+    The frame reader thread may hold the lock of ``sys.stdin`` at the fork, and
+    multiprocessing closes ``sys.stdin`` in its children, so the child gets its own.
+    """
+    try:
+        sys.stdin = open(os.devnull)
+    except OSError:
+        pass
+    if sys.platform.startswith("linux"):
+        try:
+            import ctypes
+            import signal
+            ctypes.CDLL(None, use_errno=True).prctl(1, int(signal.SIGKILL), 0, 0, 0)
+        except (OSError, AttributeError):
+            pass
+
+
+if hasattr(os, "register_at_fork"):
+    os.register_at_fork(after_in_child=_forked_child)
 
 def _readable(fd):
     try:
@@ -148,10 +175,9 @@ def _resolve(value):
     """Replace blob references with the values they name, recursively."""
     kind = getattr(value, "__letify_kind__", None)
     if kind == "blob":
-        try:
-            entry = _BLOBS[value.digest]
-        except KeyError:
-            raise KeyError("blob %s was never sent to this runtime" % value.digest) from None
+        entry = _BLOBS.get(value.digest) or _disk_load(value.digest)
+        if entry is None:
+            raise KeyError("blob %s was never sent to this runtime" % value.digest)
         if entry[0] == "value":
             return entry[1]
         # A value that may be mutated is unpickled from a fresh copy for every call.
@@ -170,11 +196,43 @@ _NO_LETIFY = (
 )
 
 
+def _ship_main_to_children(cloudpickle):
+    """Let a child process the body spawns rebuild what the caller's __main__ defined.
+
+    Spec "Child processes of a call". Set once, on the pickler multiprocessing uses.
+    """
+    try:
+        from multiprocessing.reduction import ForkingPickler
+    except ImportError:
+        return
+    if getattr(ForkingPickler, "_letify_ships_main", False):
+        return
+    import types
+
+    previous = getattr(ForkingPickler, "reducer_override", None)
+
+    def reducer_override(self, obj):
+        defined = isinstance(obj, (types.FunctionType, type))
+        if defined and getattr(obj, "__module__", None) == "__main__":
+            found = sys.modules.get("__main__")
+            for part in getattr(obj, "__qualname__", "").split("."):
+                found = getattr(found, part, None)
+            if found is not obj:
+                return cloudpickle.loads, (cloudpickle.dumps(obj),)
+        if previous is not None:
+            return previous(self, obj)
+        return NotImplemented
+
+    ForkingPickler.reducer_override = reducer_override
+    ForkingPickler._letify_ships_main = True
+
+
 def _load_call(request):
     # Imported here, not at start: until the worker moves to the project's interpreter it
     # runs on whatever python3 the machine has, and needs the standard library only.
     import cloudpickle
 
+    _ship_main_to_children(cloudpickle)
     try:
         return cloudpickle.loads(request["payload"], buffers=request.get("buffers") or ())
     except ModuleNotFoundError as exc:
@@ -197,6 +255,367 @@ def _reply(stream, outcome):
 
 
 def _op_call(request):
+    data = request.pop("data", None)
+    if data is None:
+        return _call(request)
+    placed = _data_link(data)
+    try:
+        outcome = _call(request)
+        if data.get("outputs"):
+            _DATA_WRITTEN[data["dir"]] = _data_collect(data, placed)
+        return outcome
+    finally:
+        import shutil
+        _data_check_cache(data, placed)
+        shutil.rmtree(data["dir"], ignore_errors=True)
+
+
+# Write-back lists of returned calls, by call directory, until data_written takes them.
+_DATA_WRITTEN = {}
+
+
+def _data_hash_file(path):
+    """The file digest of a file on the runtime: blake3 when present, else blake2b."""
+    hasher = _data_hasher()
+    if hasher is None:
+        hasher = hashlib.blake2b(digest_size=16)
+    with open(path, "rb") as handle:
+        while True:
+            piece = handle.read(1 << 22)
+            if not piece:
+                break
+            hasher.update(piece)
+    if hasher.name == "blake2b":
+        return hasher.hexdigest()
+    return hasher.hexdigest(length=16)
+
+
+def _data_collect(data, placed):
+    """Commit each file a returned call created or changed at an output into the cache."""
+    import stat
+    skipped = (".git", ".venv", "__pycache__")
+    written = {}
+    for output in data["outputs"]:
+        files = []
+        if os.path.isfile(output) and not os.path.islink(output):
+            candidates = [("", output)]
+        elif os.path.isdir(output) and not os.path.islink(output):
+            candidates = []
+            for directory, names, found in os.walk(output, followlinks=False):
+                names[:] = [name for name in names if name not in skipped]
+                for name in found:
+                    full = os.path.join(directory, name)
+                    rel = os.path.relpath(full, output).replace(os.sep, "/")
+                    candidates.append((rel, full))
+        else:
+            candidates = []
+        for rel, full in sorted(candidates):
+            try:
+                info = os.lstat(full)
+            except OSError:
+                continue
+            if not stat.S_ISREG(info.st_mode):
+                continue
+            known = placed.get(full)
+            if known is not None and known[1:] == (info.st_ino, info.st_size, info.st_mtime_ns):
+                continue
+            digest = _data_hash_file(full)
+            if known is not None and known[0] == digest:
+                continue
+            final = _data_file(data["blobs"], digest)
+            try:
+                held = os.stat(final).st_size == info.st_size
+            except OSError:
+                held = False
+            if not held:
+                os.makedirs(os.path.dirname(final), exist_ok=True)
+                if info.st_nlink > 1:
+                    # Still a link to another cache file, written in place: copy it out.
+                    import shutil
+                    partial = "%s.partial.%d" % (final, os.getpid())
+                    shutil.copyfile(full, partial)
+                    full = partial
+                try:
+                    os.chmod(full, 0o444)
+                except OSError:
+                    pass
+                os.replace(full, final)
+            files.append([rel, digest, info.st_size])
+        written[output] = files
+    return written
+
+
+def _data_check_cache(data, placed):
+    """Remove a cache file a body wrote into through its hard link."""
+    for _path, (digest, _ino, size, mtime, cached) in placed.items():
+        if cached is None:
+            continue
+        source = _data_file(data["blobs"], digest)
+        try:
+            info = os.stat(source)
+        except OSError:
+            continue
+        if (info.st_size, info.st_mtime_ns) != cached:
+            try:
+                os.remove(source)
+            except OSError:
+                pass
+
+
+def _op_data_written(request):
+    """The write-back list of a returned call, removed as it is answered."""
+    return {"ok": True, "value": _DATA_WRITTEN.pop(request["dir"], {})}
+
+
+def _op_data_get(request):
+    """One piece of a file blob, sent as an out-of-band buffer."""
+    with open(_data_file(request["dir"], request["digest"]), "rb") as handle:
+        handle.seek(request["offset"])
+        buffer = bytearray(request["length"])
+        count = handle.readinto(buffer)
+    del buffer[count:]
+    return {"ok": True, "value": pickle.PickleBuffer(buffer)}
+
+
+def _data_file(root, digest):
+    return os.path.join(root, digest[:2], digest)
+
+
+def _data_hasher():
+    try:
+        import blake3
+    except ImportError:
+        return None
+    return blake3.blake3(max_threads=blake3.blake3.AUTO)
+
+
+def _data_commit(partial, final, digest, hasher):
+    """Rename a received file into the cache once its digest matches, read-only."""
+    if hasher is not None:
+        found = hasher.hexdigest(length=16)
+        if found != digest:
+            os.remove(partial)
+            raise ValueError("file blob %s arrived with digest %s" % (digest, found))
+    try:
+        os.chmod(partial, 0o444)
+    except OSError:
+        pass
+    os.replace(partial, final)
+
+
+def _op_data_have(request):
+    """Which file blobs the cache holds with the expected size."""
+    held = []
+    for digest, size in request["digests"]:
+        path = _data_file(request["dir"], digest)
+        try:
+            if os.stat(path).st_size == size:
+                held.append(digest)
+                # Marks it used, so eviction leaves it alone until the call links it.
+                os.utime(path)
+        except OSError:
+            pass
+    return {"ok": True, "value": held}
+
+
+# Spec "Runtime data cache budget".
+_DATA_DEFAULT_BUDGET = 50 << 30
+_DATA_RECENT_S = 600
+
+
+def _data_scan(root):
+    """Committed blobs as (last use, path, size, link count), and their total size."""
+    files = []
+    total = 0
+    if not os.path.isdir(root):
+        return files, total
+    for shard in os.scandir(root):
+        if not shard.is_dir(follow_symlinks=False):
+            continue
+        for entry in os.scandir(shard.path):
+            if ".partial." in entry.name:
+                continue
+            try:
+                info = entry.stat(follow_symlinks=False)
+            except OSError:
+                continue
+            files.append((info.st_mtime, entry.path, info.st_size, info.st_nlink))
+            total += info.st_size
+    return files, total
+
+
+def _data_budget(root, total, budget):
+    if budget is not None:
+        return int(budget)
+    probe = root
+    while probe and not os.path.isdir(probe):
+        parent = os.path.dirname(probe)
+        if parent == probe:
+            break
+        probe = parent
+    try:
+        info = os.statvfs(probe)
+        free = info.f_bavail * info.f_frsize
+    except (OSError, AttributeError):
+        return _DATA_DEFAULT_BUDGET
+    return min(_DATA_DEFAULT_BUDGET, (total + free) // 2)
+
+
+def _op_data_evict(request):
+    """Remove least recently used blobs no call links until the cache is within budget."""
+    started = time.monotonic()
+    root = os.path.expanduser(request["dir"])
+    files, total = _data_scan(root)
+    budget = _data_budget(root, total, request.get("budget"))
+    removed = freed = 0
+    if total > budget:
+        now = time.time()
+        files.sort()
+        for used, path, size, links in files:
+            if total <= budget:
+                break
+            if links > 1 or now - used < _DATA_RECENT_S:
+                continue
+            try:
+                os.remove(path)
+            except OSError:
+                continue
+            total -= size
+            removed += 1
+            freed += size
+    return {"ok": True, "value": {
+        "files": removed, "bytes": freed, "total": total, "budget": budget,
+        "seconds": time.monotonic() - started,
+    }}
+
+
+def _op_data_cache(request):
+    """The cache's blob count, size and budget, after removing unlinked blobs when clearing."""
+    root = os.path.expanduser(request["dir"])
+    files, total = _data_scan(root)
+    removed = freed = 0
+    if request.get("clear"):
+        for _used, path, size, links in files:
+            if links > 1:
+                continue
+            try:
+                os.remove(path)
+            except OSError:
+                continue
+            removed += 1
+            freed += size
+        files, total = _data_scan(root)
+    return {"ok": True, "value": {
+        "files": len(files), "bytes": total,
+        "budget": _data_budget(root, total, request.get("budget")),
+        "removed": removed, "removed_bytes": freed,
+    }}
+
+
+_DATA_OPEN = {}
+
+
+def _op_data_put(request):
+    """Append one piece of a file blob, and commit it after the last piece."""
+    digest = request["digest"]
+    final = _data_file(request["dir"], digest)
+    partial = "%s.partial.%d" % (final, os.getpid())
+    chunk = request.pop("chunk")
+    if request["offset"] == 0:
+        os.makedirs(os.path.dirname(final), exist_ok=True)
+        stale = _DATA_OPEN.pop(digest, None)
+        if stale is not None:
+            stale[0].close()
+        _DATA_OPEN[digest] = (open(partial, "wb"), _data_hasher())
+    handle, hasher = _DATA_OPEN[digest]
+    handle.write(chunk)
+    if hasher is not None:
+        hasher.update(chunk)
+    chunk = None
+    if request.get("last"):
+        del _DATA_OPEN[digest]
+        handle.close()
+        _data_commit(partial, final, digest, hasher)
+    return {"ok": True, "value": None}
+
+
+def _op_data_pull(request):
+    """Download file blobs from the bucket, eight at a time, then forget the headers."""
+    import urllib.request
+
+    headers = request.pop("headers", None) or {}
+    root = request["dir"]
+    items = list(request.pop("items"))
+    failures = []
+    lock = threading.Lock()
+
+    def fetch():
+        while True:
+            with lock:
+                if not items or failures:
+                    return
+                digest, url = items.pop()
+            final = _data_file(root, digest)
+            partial = "%s.partial.%d.%d" % (final, os.getpid(), threading.get_ident())
+            try:
+                os.makedirs(os.path.dirname(final), exist_ok=True)
+                hasher = _data_hasher()
+                wanted = urllib.request.Request(url, headers=headers)
+                with urllib.request.urlopen(wanted, timeout=3600) as response, \
+                        open(partial, "wb") as out:
+                    while True:
+                        piece = response.read(1 << 20)
+                        if not piece:
+                            break
+                        out.write(piece)
+                        if hasher is not None:
+                            hasher.update(piece)
+                _data_commit(partial, final, digest, hasher)
+            except BaseException as exc:
+                with lock:
+                    failures.append("%s: %s" % (digest, exc))
+                return
+
+    threads = [threading.Thread(target=fetch, daemon=True) for _ in range(8)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    headers = None
+    if failures:
+        raise RuntimeError("pulling file blobs failed: " + "; ".join(failures))
+    return {"ok": True, "value": None}
+
+
+def _data_link(data):
+    """Place each file of a call at its runtime path, a hard link to the cache or a copy."""
+    import shutil
+    placed = {}
+    for directory in data.get("dirs", ()):
+        os.makedirs(directory, exist_ok=True)
+    for path, digest, copy in data.get("links", ()):
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        source = _data_file(data["blobs"], digest)
+        try:
+            os.utime(source)
+        except OSError:
+            pass
+        linked = False
+        if not copy:
+            try:
+                os.link(source, path)
+                linked = True
+            except OSError:
+                pass
+        if not linked:
+            shutil.copyfile(source, path)
+        info = os.stat(path)
+        cached = (info.st_size, info.st_mtime_ns) if linked else None
+        placed[path] = (digest, info.st_ino, info.st_size, info.st_mtime_ns, cached)
+    return placed
+
+
+def _call(request):
     fn, args, kwargs = _load_call(request)
     request.clear()
     args = _resolve(args)
@@ -217,9 +636,123 @@ def _op_call(request):
     return {"ok": True, "value": value}
 
 
+def _disk_path(digest, pickled):
+    name = digest + (".pickle" if pickled else "")
+    return os.path.join(_DISK["path"], digest[:2], name)
+
+
+def _disk_find(digest):
+    """The file holding a digest on disk, or None. Only complete files have these names."""
+    if not _DISK:
+        return None
+    for pickled in (False, True):
+        path = _disk_path(digest, pickled)
+        if os.path.isfile(path):
+            return path
+    return None
+
+
+def _disk_write(digest, parts, pickled, immutable):
+    """Write a blob under the blob directory by rename, then keep the directory in its limit."""
+    import struct
+
+    path = _disk_path(digest, pickled)
+    if os.path.isfile(path):
+        return
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    partial = "%s.partial.%d" % (path, os.getpid())
+    with open(partial, "wb") as handle:
+        if pickled:
+            handle.write(_PICKLE_MAGIC + bytes([1 if immutable else 0]))
+            handle.write(struct.pack(">I", len(parts)))
+            for part in parts:
+                handle.write(struct.pack(">Q", memoryview(part).nbytes))
+        for part in parts:
+            handle.write(part)
+    os.replace(partial, path)
+    _disk_evict(path)
+
+
+def _disk_evict(keep):
+    """Remove blob files, oldest modification time first, until the total is within limit."""
+    files = []
+    total = 0
+    for shard in os.scandir(_DISK["path"]):
+        if not shard.is_dir():
+            continue
+        for entry in os.scandir(shard.path):
+            if ".partial." in entry.name or not entry.is_file():
+                continue
+            info = entry.stat()
+            files.append((info.st_mtime_ns, entry.path, info.st_size))
+            total += info.st_size
+    files.sort()
+    for _mtime, path, size in files:
+        if total <= _DISK["limit"]:
+            break
+        if path == keep:
+            continue
+        try:
+            os.remove(path)
+            total -= size
+        except OSError:
+            pass
+
+
+def _disk_load(digest):
+    """Load a blob held only on disk into the blob table, or answer None."""
+    import struct
+
+    path = _disk_find(digest)
+    if path is None:
+        return None
+    with open(path, "rb") as handle:
+        payload = handle.read()
+    if not path.endswith(".pickle"):
+        entry = ("value", payload)
+        _SIZES[digest] = len(payload)
+    else:
+        view = memoryview(payload)
+        immutable = view[8] == 1
+        count = struct.unpack(">I", view[9:13])[0]
+        sizes = struct.unpack(">%dQ" % count, view[13 : 13 + 8 * count])
+        offset = 13 + 8 * count
+        parts = []
+        for size in sizes:
+            parts.append(bytes(view[offset : offset + size]))
+            offset += size
+        head, buffers = parts[0], parts[1:]
+        _SIZES[digest] = sum(sizes)
+        if immutable:
+            entry = ("value", pickle.loads(head, buffers=buffers))
+        else:
+            entry = ("parts", head, buffers)
+    _BLOBS[digest] = entry
+    return entry
+
+
+def _op_blob_dir(request):
+    """Write argument blobs under this directory too, kept within limit bytes."""
+    os.makedirs(request["path"], exist_ok=True)
+    _DISK["path"] = request["path"]
+    _DISK["limit"] = int(request["limit"])
+    return {"ok": True, "value": None}
+
+
 def _op_have(request):
-    """Report which of these digests the runtime already holds."""
-    held = [d for d in request["digests"] if d in _BLOBS]
+    """Report which of these digests the runtime already holds, in memory or on disk."""
+    held = []
+    for digest in request["digests"]:
+        if digest in _BLOBS:
+            held.append(digest)
+            continue
+        path = _disk_find(digest)
+        if path is not None:
+            try:
+                os.utime(path)
+            except OSError:
+                continue
+            held.append(digest)
     return {"ok": True, "value": held}
 
 
@@ -227,17 +760,22 @@ def _op_put_blob(request):
     """Store a value under its content address.
 
     An immutable value is kept unpickled, so a repeated argument is not unpickled again.
-    Anything else is kept as its pickle and buffers.
+    Anything else is kept as its pickle and buffers. With a blob directory set, the blob is
+    written there as well before the reply.
     """
     digest = request["digest"]
     if request.get("kind") == "bytes":
         value = request.pop("value")
         _BLOBS[digest] = ("value", value)
         _SIZES[digest] = len(value)
+        if _DISK:
+            _disk_write(digest, [value], False, True)
         return {"ok": True, "value": digest}
     head = bytes(request["head"])
     buffers = list(request.get("buffers") or ())
     _SIZES[digest] = len(head) + sum(memoryview(b).nbytes for b in buffers)
+    if _DISK:
+        _disk_write(digest, [head, *buffers], True, bool(request.get("immutable")))
     if request.get("immutable"):
         _BLOBS[digest] = ("value", pickle.loads(head, buffers=buffers))
     else:
@@ -427,6 +965,14 @@ def _op_lease(request):
 _OPS = {
     "call": _op_call,
     "have": _op_have,
+    "data_have": _op_data_have,
+    "data_put": _op_data_put,
+    "data_pull": _op_data_pull,
+    "data_evict": _op_data_evict,
+    "data_cache": _op_data_cache,
+    "data_written": _op_data_written,
+    "data_get": _op_data_get,
+    "blob_dir": _op_blob_dir,
     "put_blob": _op_put_blob,
     "put_file": _op_put_file,
     "pull": _op_pull,
@@ -466,6 +1012,123 @@ def _run(stream, request, settle):
     _reply(stream, outcome)
 
 
+_DATA_PREFIX = b"LETIFY-DATA "
+
+
+def _listen(stream, request):
+    """Answer a listen request, then wait for the data connection that carries the token.
+
+    Spec "Modal data channel". Returns the authenticated connection, with every later frame
+    already sent over it, or None when standard input became readable, the wait ended, or
+    the port could not be bound, so the caller keeps reading standard input.
+    """
+    import select
+    import socket
+
+    token = str(request["token"]).encode("ascii")
+    deadline = time.monotonic() + float(request.get("wait") or 60)
+    server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        server.bind(("0.0.0.0", int(request["port"])))
+        server.listen(4)
+    except OSError as exc:
+        server.close()
+        _reply(stream, {"ok": False, "error": "OSError: %s" % exc, "traceback": ""})
+        return None
+    _reply(stream, {"ok": True, "value": None})
+    streams = int(request.get("streams") or 1)
+    lanes = {}
+    stdin = sys.stdin.fileno()
+    try:
+        while True:
+            left = deadline - time.monotonic()
+            if left <= 0:
+                return None
+            ready = select.select([server, stdin], [], [], left)[0]
+            if stdin in ready:
+                return None
+            if server not in ready:
+                continue
+            connection, _address = server.accept()
+            lane = _authenticated(connection, token, streams)
+            if lane is None or lane in lanes:
+                connection.close()
+                continue
+            lanes[lane] = connection
+            if len(lanes) == streams:
+                ordered = [lanes[index] for index in range(streams)]
+                lanes = {}
+                return _use_connection(ordered)
+    finally:
+        server.close()
+        for connection in lanes.values():
+            connection.close()
+
+
+def _authenticated(connection, token, streams=1):
+    """The lane index the connection's first line names with the expected token, or None.
+
+    Spec "Parallel data streams": lane 0 sends ``LETIFY-DATA <token>`` and lane ``i`` sends
+    ``LETIFY-DATA <token> <i>``.
+    """
+    import hmac
+
+    expected = _DATA_PREFIX + token
+    line = b""
+    try:
+        connection.settimeout(10)
+        while not line.endswith(b"\n") and len(line) < len(expected) + 4:
+            chunk = connection.recv(1)
+            if not chunk:
+                return None
+            line += chunk
+        connection.settimeout(None)
+    except OSError:
+        return None
+    if not line.endswith(b"\n"):
+        return None
+    head, rest = line[: len(expected)], line[len(expected) : -1]
+    if not hmac.compare_digest(head, expected):
+        return None
+    if not rest:
+        return 0
+    if rest[:1] != b" " or not rest[1:].isdigit():
+        return None
+    lane = int(rest[1:])
+    return lane if 0 < lane < streams else None
+
+
+def _use_connection(connections):
+    """Send hello, then every later frame, over the data connections as binary frames.
+
+    Returns what the frame reader reads from: the one connection, or a ``Striped`` stream
+    over every lane.
+    """
+    global _SENDER
+    import socket
+
+    for connection in connections:
+        try:
+            connection.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        except OSError:
+            pass
+    if len(connections) == 1:
+        carrier = connections[0]
+    else:
+        carrier = Striped(
+            [connection.send for connection in connections],
+            [connection.recv_into for connection in connections],
+        )
+    sender = Sender(carrier.send)
+    old = _SENDER
+    # Under the old lock, so no frame is split between the two transports.
+    with old.lock:
+        sender.frame(HELLO, 0, ("%d.%d" % sys.version_info[:2]).encode("ascii"))
+        _SENDER = sender
+    return carrier
+
+
 def _read():
     """Read frames, answer light requests, and queue the rest for the main thread."""
     receiver = Receiver(sys.stdin.buffer.readinto)
@@ -503,6 +1166,12 @@ def _read():
         op = request.get("op") if isinstance(request, dict) else None
         if op in _LIGHT:
             _run(stream, request, False)
+            continue
+        if op == "listen":
+            connection = _listen(stream, request)
+            request = None
+            if connection is not None:
+                receiver = Receiver(connection.recv_into)
             continue
         _JOBS.put((stream, request))
         if op == "reexec":

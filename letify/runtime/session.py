@@ -41,6 +41,9 @@ if TYPE_CHECKING:
     from ..store.volume import Volume
     from .channel import Channel
 
+#: The total size of argument blob files kept under a persistent workspace root, 32 GiB.
+BLOB_DISK_LIMIT = 32 * 1024**3
+
 
 @dataclass
 class Runtime:
@@ -136,9 +139,25 @@ class Runtime:
             # Not retried, so nothing else would end this session.
             self.shutdown()
             raise
+        self.keep_blobs_on_disk()
         for volume in self.volumes:
             self.attach(volume)
         self.ready = True
+
+    def keep_blobs_on_disk(self) -> None:
+        """Have the worker write argument blobs under the workspace root on a persistent disk.
+
+        Spec "Argument blobs on a persistent disk". A later session on the same machine then
+        answers ``have`` from those files, so a repeated argument travels as its digest.
+        """
+        provider = self.provider
+        if not (provider.persistent and provider.prepares_workspace and self.persistent_channel):
+            return
+        root = self.workspace or provider.workspace_root
+        self.request(
+            {"op": "blob_dir", "path": f"{root.rstrip('/')}/blobs", "limit": BLOB_DISK_LIMIT},
+            timeout=120,
+        )
 
     def shutdown(self) -> None:
         """Stop everything that bills for this runtime."""
@@ -218,10 +237,43 @@ class Runtime:
         # cloudpickle and a process can hold declarations with different environments.
         if self.env.ship_modules:
             protocol.codec.ship_by_value(self.env.ship_modules)
-        if self.persistent_channel:
-            args, kwargs = self._externalize(args, kwargs)
+        if not self.persistent_channel:
+            self.last_used = time.monotonic()
+            return self.channel.call(fn, args, kwargs, timeout=timeout)
+        args, kwargs = self._externalize(args, kwargs)
+        return self._call_with_data(fn, args, kwargs, timeout)
+
+    def _call_with_data(
+        self, fn: Any, args: tuple, kwargs: dict, timeout: float | None
+    ) -> tuple[Any, str]:
+        """Pickle a call, replacing local data paths, and send their blobs before it.
+
+        Spec "Project data": the call carries the links the worker places before loading it.
+        """
+        import secrets
+
+        from ..store import pathdata
+
+        assert self.channel is not None
+        root = (self.workspace or self.provider.workspace_root).rstrip("/")
+        collector = pathdata.Collector(f"{root}/data/calls/{secrets.token_hex(8)}")
+        head, buffers = protocol.dumps_call_parts(fn, args, kwargs, data=collector)
+        request: dict[str, Any] = {"op": "call", "payload": head, "buffers": buffers}
+        blobs = f"{root}/data/blobs"
+        added = 0
+        if collector.placed:
+            if collector.inputs:
+                added = pathdata.send(self, collector, blobs)
+            request["data"] = collector.request(blobs)
         self.last_used = time.monotonic()
-        return self.channel.call(fn, args, kwargs, timeout=timeout)
+        try:
+            outcome = self.channel.request(request, timeout=timeout)
+            if collector.outputs:
+                added += pathdata.write_back(self, collector, blobs)
+            return outcome
+        finally:
+            if added:
+                pathdata.evict(self, blobs)
 
     # -- content addressed arguments -----------------------------------------
 
@@ -404,11 +456,17 @@ class Runtime:
 
         assert self.channel is not None
         files = bootstrap.project_files(self.env)
-        root = bootstrap.project_dir(self.workspace or self.provider.workspace_root, self.env)
+        env_root = self.provider.env_root
+        root = bootstrap.project_dir(
+            env_root or self.workspace or self.provider.workspace_root, self.env
+        )
         where = self.eval(bootstrap.probe_source(self.env, root), timeout=120)
         self.platform = where["platform"]
 
-        for volume in self.volumes:
+        # Spec "Volumes on a persistent runtime": the .venv is already on the runtime's
+        # disk, so an archive is neither restored nor packed there.
+        archives = () if self.provider.persistent else self.volumes
+        for volume in archives:
             digest = volume.cached_env(self.env, self.platform)
             if not digest:
                 continue
@@ -421,7 +479,13 @@ class Runtime:
                 break
 
         if self.env_source != "archive":
-            source = bootstrap.sync_source(self.env, files, root=root, name=self.name)
+            workspace = self.workspace or self.provider.workspace_root
+            # Spec "Environment on the sandbox disk": an env root keeps uv's default cache.
+            persistent_cache = self.provider.persistent and env_root is None
+            cache = bootstrap.uv_cache_dir(workspace) if persistent_cache else None
+            source = bootstrap.sync_source(
+                self.env, files, root=root, name=self.name, cache_dir=cache
+            )
             try:
                 self.eval(source, timeout=3600)
             except RemoteError as exc:
@@ -430,10 +494,8 @@ class Runtime:
                     message.removeprefix("RuntimeError: "), stderr=exc.remote_traceback
                 ) from exc
             self.env_source = "sync"
-            if self.volumes:
-                self.volumes[0].cache_env_from(
-                    self, self.env, where["root"], platform=self.platform
-                )
+            if archives:
+                archives[0].cache_env_from(self, self.env, where["root"], platform=self.platform)
         self.python = where["python"]
         self.channel.switch_interpreter(where["python"])
 
@@ -493,10 +555,7 @@ class Runtime:
 
 def _pickled(value: Any, immutable: bool) -> dict[str, Any]:
     """A ``put_blob`` message for a value: its protocol 5 pickle and out-of-band buffers."""
-    import pickle
-
-    buffers: list[pickle.PickleBuffer] = []
-    head = pickle.dumps(value, protocol=5, buffer_callback=buffers.append)
+    head, buffers = protocol.wire.pickle_parts(value)
     return {"kind": "pickle", "immutable": immutable, "head": head, "buffers": buffers}
 
 

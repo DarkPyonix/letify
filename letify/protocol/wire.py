@@ -13,9 +13,12 @@ both ends.
 from __future__ import annotations
 
 import base64
+import functools
+import io
 import os
 import pickle
 import struct
+import sys
 import threading
 
 #: First two bytes of every frame.
@@ -40,6 +43,9 @@ CHUNK = 8 << 20
 
 #: A ``bytes`` value this large or larger travels as an out-of-band buffer.
 OUT_OF_BAND = 1 << 20
+
+#: A tensor this many bytes or larger travels as an out-of-band buffer.
+TENSOR_OUT_OF_BAND = 64 << 10
 
 #: Frames at most this large are written with their header in one call.
 _JOIN_LIMIT = 1 << 16
@@ -89,10 +95,82 @@ def _wrap(value: object, depth: int = 0) -> object:
     return value
 
 
+class _Reduced:
+    """An argument of a reduction that pickles as a reduction of its own."""
+
+    __slots__ = ("reduction",)
+
+    def __init__(self, reduction: tuple):
+        self.reduction = reduction
+
+    def __reduce_ex__(self, protocol: object) -> tuple:
+        return self.reduction
+
+
+def reduce_tensor(obj: object) -> object:
+    """A reduction that sends a CPU tensor's bytes as a buffer, or ``NotImplemented``.
+
+    ``Tensor.__reduce_ex__`` copies the whole storage into the pickle. This one rebuilds the
+    tensor with ``torch.frombuffer``, ``reshape`` and ``requires_grad_``, which a runtime
+    without letify can unpickle, as spec "Frames" describes.
+    """
+    torch = sys.modules.get("torch")
+    if torch is None:
+        return NotImplemented
+    kind = type(obj)
+    if kind is not torch.Tensor and kind is not torch.nn.Parameter:
+        return NotImplemented
+    tensor = obj  # type: ignore[assignment]
+    if (
+        tensor.device.type != "cpu"
+        or tensor.layout is not torch.strided
+        or not tensor.is_leaf
+        or tensor.is_quantized
+        or tensor.is_conj()
+        or tensor.is_neg()
+        or tensor.numel() == 0
+    ):
+        return NotImplemented
+    try:
+        import ctypes
+    except ImportError:  # pragma: no cover - CPython always has ctypes
+        return NotImplemented
+    data = tensor.detach()
+    if not data.is_contiguous():
+        data = data.contiguous()
+    size = data.numel() * data.element_size()
+    array = (ctypes.c_char * size).from_address(data.data_ptr())
+    # The array does not own the memory, so it holds the tensor for as long as a view does.
+    array.tensor = data
+    view = memoryview(array).cast("B")
+    payload = pickle.PickleBuffer(view) if size >= TENSOR_OUT_OF_BAND else bytearray(view)
+    flat = _Reduced((functools.partial(torch.frombuffer, dtype=data.dtype), (payload,)))
+    shaped = _Reduced((torch.Tensor.reshape, (flat, tuple(data.shape))))
+    if kind is torch.nn.Parameter:
+        return torch.nn.Parameter, (shaped, tensor.requires_grad)
+    if tensor.requires_grad:
+        return torch.Tensor.requires_grad_, (shaped,)
+    return shaped.reduction
+
+
+class _Pickler(pickle.Pickler):
+    def reducer_override(self, obj: object) -> object:
+        return reduce_tensor(obj)
+
+
+def pickle_parts(obj: object) -> tuple[bytes, list[pickle.PickleBuffer]]:
+    """Pickle ``obj`` with protocol 5 and the tensor reducer, keeping buffers apart."""
+    buffers: list[pickle.PickleBuffer] = []
+    if "torch" not in sys.modules:
+        return pickle.dumps(obj, protocol=5, buffer_callback=buffers.append), buffers
+    file = io.BytesIO()
+    _Pickler(file, protocol=5, buffer_callback=buffers.append).dump(obj)
+    return file.getvalue(), buffers
+
+
 def dumps(obj: object) -> tuple[bytes, list[memoryview]]:
     """Pickle ``obj`` with protocol 5, returning the pickle and its out-of-band buffers."""
-    buffers: list[pickle.PickleBuffer] = []
-    head = pickle.dumps(_wrap(obj), protocol=5, buffer_callback=buffers.append)
+    head, buffers = pickle_parts(_wrap(obj))
     return head, [buffer.raw() for buffer in buffers]
 
 
@@ -197,14 +275,23 @@ class Sender:
 
 
 class TextSender(Sender):
-    """Writes each frame as one line of base64, for a transport that carries text only."""
+    """Writes each frame as lines of base64, for a transport that carries text only.
+
+    Modal breaks a stdout line longer than 64 KiB into pieces that are not base64 on their
+    own, so each line encodes at most ``LINE_BYTES``. That is a multiple of 3, so every line
+    decodes by itself and the reader joins the decoded bytes.
+    """
+
+    #: Bytes encoded per line: 36 KiB, which is 48 KiB of base64.
+    LINE_BYTES = 36 << 10
 
     def frame(self, kind: int, stream: int, payload=b"") -> None:
         view = memoryview(payload).cast("B")
-        header = HEADER.pack(MAGIC, kind, 0, stream, view.nbytes)
-        line = base64.b64encode(header + view.tobytes()) + b"\n"
+        data = HEADER.pack(MAGIC, kind, 0, stream, view.nbytes) + view.tobytes()
+        step = self.LINE_BYTES
         with self.lock:
-            self._all(line)
+            for offset in range(0, len(data), step):
+                self._all(base64.b64encode(data[offset : offset + step]) + b"\n")
 
 
 class _Partial:
@@ -318,6 +405,176 @@ class Receiver:
         return partial.kind, stream, (partial.head, partial.buffers)
 
 
+#: Frame type of a segment of a striped byte stream. It appears only on a lane.
+SEGMENT = 8
+
+#: A write this large or larger is split across every lane of a striped stream.
+STRIPE_MIN = 1 << 20
+
+#: Bytes a striped reader holds before a lane that is ahead of the next offset waits.
+STRIPE_HOLD = 64 << 20
+
+_OFFSET = struct.Struct("<Q")
+
+
+def _read_exact(readinto, view) -> None:
+    got = 0
+    while got < view.nbytes:
+        try:
+            count = readinto(view[got:])
+        except TimeoutError:
+            continue
+        if not count:
+            raise EOFError("a lane ended")
+        got += count
+
+
+class Striped:
+    """One byte stream carried as segments over several lanes, as spec "Parallel data
+    streams" describes.
+
+    ``writes`` and ``readintos`` hold one ``write`` and one ``readinto`` per lane. A reading
+    thread runs per lane from construction, and a sending thread per lane after the first.
+    """
+
+    def __init__(self, writes, readintos):
+        import queue
+
+        self._writes = list(writes)
+        self._lock = threading.Lock()
+        self._sent = 0
+        self._failure = None
+        self._queues = [queue.Queue() for _ in self._writes]
+        #: Seconds ``recv_into`` waits for bytes before raising ``TimeoutError``, or None.
+        self.timeout = None
+        self._cond = threading.Condition()
+        self._pieces = {}
+        self._next = 0
+        self._held = 0
+        self._head = memoryview(b"")
+        self._ended = False
+        readintos = list(readintos)
+        #: Lanes whose reading thread is still running.
+        self._live = len(readintos)
+        for lane in range(1, len(self._writes)):
+            threading.Thread(target=self._lane_sender, args=(lane,), daemon=True).start()
+        for lane, readinto in enumerate(readintos):
+            threading.Thread(target=self._lane_reader, args=(lane, readinto), daemon=True).start()
+
+    # -- writing ---------------------------------------------------------------
+
+    def _segment(self, lane: int, offset: int, view) -> None:
+        head = HEADER.pack(MAGIC, SEGMENT, 0, lane, view.nbytes) + _OFFSET.pack(offset)
+        write = self._writes[lane]
+        pieces = [head + view.tobytes()] if view.nbytes <= _JOIN_LIMIT else [head, view]
+        for piece in pieces:
+            rest = memoryview(piece)
+            while rest:
+                rest = rest[write(rest) :]
+
+    def _lane_sender(self, lane: int) -> None:
+        while True:
+            offset, view, done = self._queues[lane].get()
+            try:
+                self._segment(lane, offset, view)
+            except BaseException as exc:
+                done[1] = exc
+            done[0].set()
+
+    def send(self, data) -> int:
+        """Send all of ``data`` and return its length."""
+        view = memoryview(data).cast("B")
+        lanes = len(self._writes)
+        with self._lock:
+            if self._failure is not None:
+                raise self._failure
+            offset = self._sent
+            self._sent += view.nbytes
+            if view.nbytes < STRIPE_MIN or lanes == 1:
+                self._segment(0, offset, view)
+                return view.nbytes
+            step = -(-view.nbytes // lanes)
+            waits = []
+            for lane in range(1, lanes):
+                piece = view[lane * step : (lane + 1) * step]
+                if piece.nbytes:
+                    done = [threading.Event(), None]
+                    self._queues[lane].put((offset + lane * step, piece, done))
+                    waits.append(done)
+            try:
+                self._segment(0, offset, view[:step])
+            finally:
+                for done in waits:
+                    done[0].wait()
+            for done in waits:
+                if done[1] is not None:
+                    self._failure = done[1]
+                    raise done[1]
+            return view.nbytes
+
+    # -- reading ---------------------------------------------------------------
+
+    def _end(self, malformed: bool) -> None:
+        """A lane stopped reading. The stream ends at a malformed segment or the last lane."""
+        with self._cond:
+            self._live -= 1
+            if malformed or self._live <= 0:
+                self._ended = True
+            self._cond.notify_all()
+
+    def _lane_reader(self, lane: int, readinto) -> None:
+        header = bytearray(HEADER.size + _OFFSET.size)
+        malformed = True
+        try:
+            while True:
+                malformed = False
+                _read_exact(readinto, memoryview(header))
+                malformed = True
+                magic, kind, _flags, _lane, length = HEADER.unpack_from(header)
+                (offset,) = _OFFSET.unpack_from(header, HEADER.size)
+                if magic != MAGIC or kind != SEGMENT:
+                    return
+                with self._cond:
+                    while self._held > STRIPE_HOLD and offset != self._next and not self._ended:
+                        self._cond.wait()
+                    if offset < self._next or offset in self._pieces or self._ended:
+                        return
+                piece = bytearray(length)
+                malformed = False
+                _read_exact(readinto, memoryview(piece))
+                with self._cond:
+                    if offset < self._next or offset in self._pieces:
+                        malformed = True
+                        return
+                    self._pieces[offset] = piece
+                    self._held += length
+                    self._cond.notify_all()
+        except (EOFError, OSError, ValueError):
+            return
+        finally:
+            self._end(malformed)
+
+    def recv_into(self, view) -> int:
+        """Fill ``view`` with the next bytes in offset order, 0 once the stream ended."""
+        with self._cond:
+            while not self._head:
+                piece = self._pieces.pop(self._next, None)
+                if piece is not None:
+                    self._head = memoryview(piece)
+                    self._next += len(piece)
+                    self._held -= len(piece)
+                    self._cond.notify_all()
+                    continue
+                if self._ended:
+                    return 0
+                if not self._cond.wait(self.timeout) and self.timeout is not None:
+                    raise TimeoutError("no bytes arrived on the striped stream in time")
+            count = min(view.nbytes, self._head.nbytes)
+            view[:count] = self._head[:count]
+            self._head = self._head[count:]
+            return count
+
+
 def chunks_readinto(read_chunks):
     """A ``readinto`` over a source of byte chunks, such as decoded base64 frame lines.
 
@@ -356,12 +613,16 @@ __all__ = [
     "PIPE_SIZE",
     "REPLY",
     "REQUEST",
+    "SEGMENT",
     "SHUTDOWN",
     "STDERR",
     "STDOUT",
+    "STRIPE_HOLD",
+    "STRIPE_MIN",
     "FrameError",
     "Receiver",
     "Sender",
+    "Striped",
     "TextSender",
     "chunks_readinto",
     "dumps",

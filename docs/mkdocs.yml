@@ -51,6 +51,7 @@ nav:
       - Concurrency and capacity: 05-concurrency.md
       - Cost control: 06-cost.md
       - Troubleshooting: 07-troubleshooting.md
+      - Releasing: 08-releasing.md
   - 한국어:
       - 가이드: ko/README.md
       - 시작하기: ko/01-시작하기.md
@@ -60,6 +61,7 @@ nav:
       - 동시 실행과 용량: ko/05-동시-실행.md
       - 비용 관리: ko/06-비용.md
       - 문제 해결: ko/07-문제-해결.md
+      - 릴리스: ko/08-릴리스.md
 
 # The guides link to design documents that live on develop only, so those links are reported
 # rather than failing the build.

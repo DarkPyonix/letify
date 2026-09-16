@@ -24,9 +24,11 @@ import abc
 import collections
 import contextlib
 import os
+import select
 import subprocess
 import sys
 import threading
+import time
 from collections.abc import Callable, Iterator
 from typing import IO, Any
 
@@ -42,6 +44,9 @@ STARTUP_TIMEOUT = 120.0
 
 #: Output kept per request, and per channel for error messages.
 TAIL_BYTES = 64 << 10
+
+#: Seconds a thread waiting for a device reply polls the read descriptor before blocking.
+DEVICE_POLL_S = 0.002
 
 
 class Channel(abc.ABC):
@@ -219,9 +224,16 @@ class Connection:
         emit: Callable[[str, bytes], None],
         *,
         death_detail: Callable[[], str] = lambda: "",
+        poll_fd: int | None = None,
     ):
         self.name = name
         self.sender = wire.Sender(write)
+        #: How long a device reply is polled for before a blocking read, in seconds.
+        self.poll_s = DEVICE_POLL_S
+        self._poller: Any = None
+        if poll_fd is not None and hasattr(select, "poll"):
+            self._poller = select.poll()
+            self._poller.register(poll_fd, select.POLLIN)
         self.gate = _Gate()
         self.hello: str | None = None
         self.failure: ProtocolError | None = None
@@ -297,9 +309,10 @@ class Connection:
                 slot.event.set()
             self._turn.notify_all()
 
-    def _wait(self, done: Callable[[], bool]) -> None:
+    def _wait(self, done: Callable[[], bool], *, poll: bool = False) -> None:
         """Return once ``done()`` holds or the connection failed, reading frames when it is
-        this thread's turn."""
+        this thread's turn. With ``poll``, each read is preceded by polling for up to
+        ``poll_s``."""
         with self._turn:
             while True:
                 if done() or self.failure is not None:
@@ -310,6 +323,8 @@ class Connection:
                 self._turn.wait()
         try:
             while True:
+                if poll:
+                    self._poll_ready()
                 self._pump()
                 with self._turn:
                     if done() or self.failure is not None:
@@ -342,7 +357,7 @@ class Connection:
 
         None when the connection failed or the device stream was closed.
         """
-        self._wait(lambda: not self._device_open() or bool(self._device))
+        self._wait(lambda: not self._device_open() or bool(self._device), poll=True)
         with self._turn:
             if self._device:
                 return self._device.popleft()
@@ -350,6 +365,16 @@ class Connection:
 
     def _device_open(self) -> bool:
         return self._device is not None
+
+    def _poll_ready(self) -> None:
+        """Poll the read descriptor without blocking until it is readable or ``poll_s`` ends."""
+        poller = self._poller
+        if poller is None:
+            return
+        end = time.perf_counter() + self.poll_s
+        while not poller.poll(0):
+            if time.perf_counter() >= end:
+                return
 
     # -- requests --------------------------------------------------------------
 
@@ -536,6 +561,7 @@ class PersistentChannel(FramedChannel):
                 process.stdout.readinto,  # type: ignore[attr-defined]
                 self._emit,
                 death_detail=self._stderr_text,
+                poll_fd=process.stdout.fileno(),
             )
             self._send_worker()
             self._await_ready()

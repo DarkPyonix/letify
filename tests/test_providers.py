@@ -12,6 +12,7 @@ line, the request and the instance table letify builds, which is what a caller o
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import sys
 from importlib import import_module
@@ -33,9 +34,7 @@ from letify.providers.base import Provider
 from letify.providers.colab import ALIASES, Colab
 from letify.providers.elice import (
     ALLOCATION_PATH,
-    INSTANCE_TYPE_PATH,
     PRICING_PATH,
-    VM_PATH,
     Elice,
 )
 from letify.providers.local import Local
@@ -160,7 +159,7 @@ def test_a_modal_provider_without_uv_says_uv_is_needed(isolated_home, patch_whic
         (Colab, "ephemeral", False, True),
         (Shell, "ephemeral", True, True),
         (Tunnel, "ephemeral", True, True),
-        (Elice, "persistent", True, True),
+        (Elice, "ephemeral", True, True),
     ],
 )
 def test_each_provider_declares_the_properties_the_spec_table_gives_it(
@@ -466,6 +465,26 @@ def test_the_sessions_an_account_holds_are_read_from_the_cli(
     listing = "NAME        STATE\n-------     -----\nletify-g4-1  running\nletify-t4-2  idle\n"
     patch_run(colab_module, result=FakeCompleted(stdout=listing))
     assert provider_of(Colab, "colab_a").sessions() == ["letify-g4-1", "letify-t4-2"]
+
+
+def test_an_account_with_no_colab_session_lists_none(isolated_home, patch_which, patch_run) -> None:
+    # Spec "Colab": the CLI's own message line names no session.
+    patch_which(tools_module, present=True)
+    listing = "[colab] No active sessions found on server.\n"
+    patch_run(colab_module, result=FakeCompleted(stdout=listing))
+    assert provider_of(Colab, "colab_a").sessions() == []
+
+
+def test_a_colab_session_listed_in_brackets_is_named_without_them(
+    isolated_home, patch_which, patch_run
+) -> None:
+    # Spec "Colab": the listing line the CLI printed for a live CPU session.
+    patch_which(tools_module, present=True)
+    listing = (
+        "[letify-cpu-514e8c] m-s-kkb-ase1a1-32hpj198ieqis | Hardware: CPU | Variant: DEFAULT\n"
+    )
+    patch_run(colab_module, result=FakeCompleted(stdout=listing))
+    assert provider_of(Colab, "colab_a").sessions() == ["letify-cpu-514e8c"]
 
 
 def test_a_failing_cli_command_carries_the_command_and_the_error(
@@ -965,25 +984,26 @@ def test_colab_falls_back_to_exec_when_nothing_else_connects(
     assert recorder.command == [*COLAB_CLI, "exec", "-s", "letify-g4-1"]
 
 
-def test_elice_runs_its_remote_half_over_forward_ssh_to_the_allocated_machine() -> None:
+def test_elice_runs_its_remote_half_over_forward_ssh_to_the_started_machine() -> None:
+    # Spec "Elice machines": a launched machine is reached as root unless the account names
+    # another user.
     provider = provider_of(Elice, "e", zone_id="z", machine_id="m", address="gpu.elice.io")
     rendezvous = provider.rendezvous()
     assert isinstance(rendezvous, ShellCommandRendezvous)
-    assert rendezvous.ssh("python3 -")[-2:] == ["gpu.elice.io", "python3 -"]
+    assert rendezvous.ssh("python3 -")[-2:] == ["ubuntu@gpu.elice.io", "python3 -"]
     assert provider_of(Elice, "e", zone_id="z", machine_id="m").rendezvous() is None
 
 
 # -- Spec: Provider model, Elice -----------------------------------------------
 
 
-def test_elice_needs_a_zone_a_machine_and_a_token() -> None:
-    # letify allocates and releases a declared machine; it does not create one.
+def test_elice_needs_a_zone_and_a_token() -> None:
+    # A machine is optional: without machine_id letify creates one on first use.
     with pytest.raises(letify.ProviderUnavailable, match="no 'zone_id' field"):
         provider_of(Elice, "elice_a100").zone_id  # noqa: B018
-    with pytest.raises(letify.ProviderUnavailable, match="does not create it"):
-        provider_of(Elice, "elice_a100", zone_id="z").machine_id  # noqa: B018
+    assert provider_of(Elice, "elice_a100", zone_id="z").machine_id is None
     with pytest.raises(letify.ProviderUnavailable, match="access_token_env"):
-        provider_of(Elice, "elice_a100", zone_id="z").machines()
+        provider_of(Elice, "elice_a100", zone_id="z").pricing()
 
 
 def test_the_elice_endpoint_can_be_pointed_elsewhere() -> None:
@@ -997,115 +1017,42 @@ def test_elice_is_reached_with_the_standard_library_alone(no_module, fake_elice)
     # Spec "Packaging": Elice uses the standard library HTTP client, so no HTTP package
     # has to be installed.
     no_module("httpx", "requests")
-    fake_elice.answer("GET", VM_PATH, FakeResponse(200, []))
+    fake_elice.answer("GET", PRICING_PATH, FakeResponse(200, []))
     provider = provider_of(Elice, "e", endpoint=fake_elice.endpoint, zone_id="z", access_token="t")
-    assert provider.machines() == []
+    assert provider.pricing() == []
 
 
-def test_an_elice_request_carries_the_token_and_the_zone(elice, fake_elice) -> None:
-    fake_elice.answer("GET", VM_PATH, FakeResponse(200, {"items": [{"id": "machine-1"}]}))
-    assert elice.machines() == [{"id": "machine-1"}]
+def test_an_elice_request_carries_the_token(elice, fake_elice) -> None:
+    fake_elice.answer("GET", PRICING_PATH, FakeResponse(200, {"items": [{"id": "p1"}]}))
+    assert elice.pricing() == [{"id": "p1"}]
     assert fake_elice.last["authorization"] == "Bearer token-1"
-    assert fake_elice.last["params"] == {"zone_id": "zone-1"}
 
 
 def test_anything_other_than_a_two_hundred_is_a_failure(elice, fake_elice) -> None:
     # This API answers 200 for every success.
-    fake_elice.answer("GET", VM_PATH, FakeResponse(403, {"message": "quota exceeded"}))
+    fake_elice.answer("GET", PRICING_PATH, FakeResponse(403, {"message": "quota exceeded"}))
     with pytest.raises(letify.RuntimeFailure, match="returned 403: quota exceeded"):
-        elice.machines()
+        elice.pricing()
 
 
 def test_a_failure_with_no_json_body_carries_the_text(elice, fake_elice) -> None:
-    fake_elice.answer("GET", VM_PATH, FakeResponse(502, None, text="<html>bad gateway</html>"))
+    fake_elice.answer("GET", PRICING_PATH, FakeResponse(502, None, text="<html>bad gateway</html>"))
     with pytest.raises(letify.RuntimeFailure, match="bad gateway"):
-        elice.machines()
+        elice.pricing()
 
 
 def test_a_response_may_be_a_bare_list_or_an_items_table(elice, fake_elice) -> None:
-    fake_elice.answer("GET", VM_PATH, FakeResponse(200, [{"id": "machine-1"}]))
-    assert elice.machines() == [{"id": "machine-1"}]
+    fake_elice.answer("GET", PRICING_PATH, FakeResponse(200, [{"id": "p1"}]))
+    assert elice.pricing() == [{"id": "p1"}]
 
 
-def test_the_instance_types_a_zone_offers_are_normalized(elice, fake_elice) -> None:
-    fake_elice.answer(
-        "GET",
-        INSTANCE_TYPE_PATH,
-        FakeResponse(
-            200,
-            {
-                "items": [
-                    {
-                        "gpu_model": "NVIDIA A100-SXM4-80GB",
-                        "cpu_count": 16,
-                        "memory_gb": 128,
-                        "gpu_memory_gb": 80,
-                    },
-                    {"name": "NVIDIA L40S"},
-                    {"description": "no name at all"},
-                ]
-            },
-        ),
-    )
-    table = elice.instances
-    assert sorted(table) == ["A100", "L40S"]
+def test_the_instance_types_eci_lists_are_normalized(isolated_home, fake_eci) -> None:
+    # Spec "Elice machines": instance types come from eci instance-type list.
+    provider = provider_of(Elice, "e", zone_id="zone-1", access_token="token-1")
+    table = provider.instances
+    assert sorted(table) == ["A100", "CPU"]
     assert table["A100"].cpus == 16
-    assert table["A100"].memory_gb == 128
-    assert table["A100"].vram_gb == 80
-
-
-def test_an_allocation_is_what_powers_a_declared_machine_on(elice, fake_elice) -> None:
-    # The virtual machine is the instance and the allocation is the runtime.
-    fake_elice.answer("POST", ALLOCATION_PATH, FakeResponse(200, {"id": "alloc-1"}))
-    elice.create_session(Instance(elice, gpu="A100"), "letify-a100-1")
-    assert elice._pending_allocation == "alloc-1"
-    assert fake_elice.last["json"] == {"zone_id": "zone-1", "machine_id": "machine-1"}
-
-
-def test_an_organization_is_named_in_the_allocation_when_declared(fake_elice) -> None:
-    provider = provider_of(
-        Elice,
-        "e",
-        endpoint=fake_elice.endpoint,
-        zone_id="z",
-        machine_id="m",
-        access_token="t",
-        organization_id="org-1",
-    )
-    fake_elice.answer("POST", ALLOCATION_PATH, FakeResponse(200, {"allocation_id": "alloc-2"}))
-    assert provider.allocate("m") == "alloc-2"
-    assert fake_elice.last["json"]["organization_id"] == "org-1"
-
-
-def test_an_allocation_with_no_id_is_a_failure(elice, fake_elice) -> None:
-    fake_elice.answer("POST", ALLOCATION_PATH, FakeResponse(200, {"state": "pending"}))
-    with pytest.raises(letify.RuntimeFailure, match="did not return an allocation id"):
-        elice.allocate("machine-1")
-
-
-def test_releasing_an_allocation_stops_compute_billing(elice, fake_elice) -> None:
-    elice.release("alloc-1")
-    assert fake_elice.last["method"] == "DELETE"
-    assert fake_elice.last["path"] == f"{ALLOCATION_PATH}/alloc-1"
-
-
-def test_releasing_an_allocation_that_is_already_gone_is_not_an_error(elice, fake_elice) -> None:
-    fake_elice.answer(
-        "DELETE", f"{ALLOCATION_PATH}/alloc-1", FakeResponse(404, {"message": "gone"})
-    )
-    assert elice.release("alloc-1") is None
-
-
-def test_stopping_an_elice_runtime_releases_its_allocation(elice, fake_elice) -> None:
-    runtime = type("R", (), {"external_id": "alloc-1", "name": "letify-a100-1"})()
-    elice.stop(runtime)
-    assert fake_elice.last["path"].endswith("alloc-1")
-
-
-def test_a_runtime_with_no_allocation_has_nothing_to_release(elice, fake_elice) -> None:
-    runtime = type("R", (), {"external_id": None, "name": "letify-a100-1"})()
-    assert elice.stop(runtime) is None
-    assert fake_elice.requests == []
+    assert fake_eci.commands() == ["instance-type list"]
 
 
 def test_the_zone_price_list_includes_any_preemptible_option(elice, fake_elice) -> None:
@@ -1252,16 +1199,22 @@ class Image:
     def pip_install(self, *packages):
         return self
 
+class _Tunnel:
+    host = "r7.modal.host"
+    port = 443
+
 class _Sandbox:
     object_id = None
     stdout = ()
     def terminate(self):
         _log("terminate")
+    def tunnels(self, timeout=50):
+        return {8765: _Tunnel()}
 
 class Sandbox:
     @staticmethod
     def create(*args, app=None, **kwargs):
-        _log("create", app.name)
+        _log("create", app.name, list(kwargs.get("encrypted_ports") or []))
         return _Sandbox()
 """
 
@@ -1288,6 +1241,7 @@ def test_the_modal_adapter_runs_sandboxes_in_an_ephemeral_app_it_stops_on_exit(
     adapter.close()
 
     events = [tuple(json.loads(line)) for line in log.read_text("utf-8").splitlines()]
+    events = [e[:2] if e[0] == "create" else e for e in events]
     assert ("lookup", "study") not in events
     assert events[0] == ("run_start", "study")
     assert events[-1] == ("run_stop", "study")
@@ -1414,6 +1368,43 @@ def test_a_sandbox_started_the_way_modal_starts_it_answers_requests(
         provider.stop(runtime)
 
 
+def test_a_sandbox_channel_sends_an_argument_larger_than_modal_stdin_buffer(
+    isolated_home, fake_modal
+) -> None:
+    # Spec "Modal adapter", op write: a frame above Modal's 2 MiB stdin buffer goes out as
+    # write requests of at most 1 MiB, so a 16 MiB argument arrives whole.
+    import base64
+
+    provider = provider_of(Modal, "m", data_channel=False)
+    runtime = modal_runtime(provider)
+    channel = provider.open_channel(runtime)
+    try:
+        payload = bytes(range(256)) * (16 * 1024 * 1024 // 256)
+        assert channel.call(len, (payload,), {})[0] == len(payload)
+        sizes = [len(base64.b64decode(r["data"])) for r in fake_modal.requests("write")]
+        assert max(sizes) <= 1024 * 1024
+    finally:
+        channel.close()
+        provider.stop(runtime)
+
+
+def test_a_sandbox_channel_reads_a_result_longer_than_a_modal_output_line(
+    isolated_home, fake_modal
+) -> None:
+    # Spec "Modal adapter": Modal splits a stdout line above 64 KiB, so a frame line stays
+    # below that and a 1 MiB result arrives whole.
+    import os
+
+    provider = provider_of(Modal, "m", data_channel=False)
+    runtime = modal_runtime(provider)
+    channel = provider.open_channel(runtime)
+    try:
+        assert len(channel.call(os.urandom, (1 << 20,), {})[0]) == 1 << 20
+    finally:
+        channel.close()
+        provider.stop(runtime)
+
+
 def test_a_sandbox_channel_sends_the_worker_once_and_then_framed_requests(
     isolated_home, fake_modal
 ) -> None:
@@ -1461,7 +1452,7 @@ def test_a_sandbox_that_stops_without_replying_is_a_protocol_error(
 
 
 def test_closing_a_sandbox_channel_asks_the_worker_to_shut_down(isolated_home, fake_modal) -> None:
-    provider = provider_of(Modal, "m")
+    provider = provider_of(Modal, "m", data_channel=False)
     runtime = modal_runtime(provider)
     channel = provider.open_channel(runtime)
     channel.start()
@@ -1604,15 +1595,131 @@ def test_a_provider_names_itself_by_alias_and_persistence(let: letify.Launcher) 
 # -- Spec: Remaining usage ----------------------------------------------------
 
 
-def test_a_provider_that_cannot_report_a_balance_says_so_instead_of_guessing() -> None:
-    # A fabricated balance is worse than an absent one, because a researcher spends
-    # against it. Every field but the alias, the unit and the source may be None.
+def _modal_billing(monkeypatch, **summary: object) -> None:
+    monkeypatch.setenv("FAKE_MODAL_BILLING", json.dumps(summary))
+
+
+def test_modal_counts_the_months_metered_cost_against_the_monthly_credit(
+    isolated_home, fake_modal, monkeypatch
+) -> None:
+    # Modal publishes the month's spend, not a balance, so the balance is the plan credit
+    # minus that spend, renewed at the start of the next month.
+    _modal_billing(
+        monkeypatch,
+        metered_cost="4.50000000",
+        billed_cost="0",
+        credits="-4.5",
+        start=1788220800.0,
+        end=1790812800.0,
+    )
     usage = provider_of(Modal, "m").usage()
-    assert usage.alias == "m"
-    assert usage.remaining is None
     assert usage.unit == "USD"
-    assert "no workspace balance" in usage.source
-    assert usage.unmetered is False
+    assert usage.used == 4.5
+    assert usage.limit == 30.0
+    assert usage.remaining == 25.5
+    assert usage.resets_at == 1790812800.0
+    assert usage.note is None
+    assert [r["op"] for r in fake_modal.requests()] == ["billing_summary"]
+
+
+def test_a_declared_monthly_credit_replaces_the_starter_plan_credit(
+    isolated_home, fake_modal, monkeypatch
+) -> None:
+    _modal_billing(monkeypatch, metered_cost="120", billed_cost="20", credits="-100", end=1.0)
+    usage = provider_of(Modal, "m", monthly_credit=100.0).usage()
+    assert usage.limit == 100.0
+    # Spend past the credit leaves nothing, not a negative balance.
+    assert usage.remaining == 0.0
+
+
+def test_a_modal_billing_failure_is_a_note_rather_than_an_error(isolated_home, fake_modal) -> None:
+    # FAKE_MODAL_BILLING is unset, so the adapter answers the op with a failure.
+    usage = provider_of(Modal, "m").usage()
+    assert usage.remaining is None
+    assert "billing" in (usage.note or "")
+
+
+def _colab_token(home: Path, alias: str, token_uri: str, expiry: str) -> Path:
+    path = home / ".letify" / "accounts" / alias / ".config" / "colab-cli" / "token.json"
+    path.parent.mkdir(parents=True)
+    path.write_text(
+        json.dumps(
+            {
+                "token": "stale-token",
+                "refresh_token": "refresh-1",
+                "client_id": "client-1",
+                "client_secret": "secret-1",
+                "token_uri": token_uri,
+                "expiry": expiry,
+            }
+        ),
+        encoding="utf-8",
+    )
+    return path
+
+
+def test_colab_reads_the_compute_unit_balance_the_web_page_reads(
+    isolated_home, fake_google, monkeypatch
+) -> None:
+    # An expired token is refreshed in memory and the CLI's file is left as it was.
+    home = Path.home()
+    token = _colab_token(home, "colab_a", f"{fake_google.endpoint}/token", "2000-01-01T00:00:00Z")
+    before = token.read_text(encoding="utf-8")
+    monkeypatch.setattr(colab_module, "CCU_INFO_URL", f"{fake_google.endpoint}/ccu-info")
+    fake_google.answer("POST", "/token", FakeResponse(200, {"access_token": "fresh-token"}))
+    fake_google.answer(
+        "GET",
+        "/ccu-info",
+        FakeResponse(200, text=')]}\'\n{"currentBalance": 99.93, "consumptionRateHourly": 1.5}'),
+    )
+    usage = provider_of(Colab, "colab_a").usage()
+    assert usage.unit == "compute units"
+    assert usage.remaining == 99.93
+    assert usage.rate_per_hour == 1.5
+    assert fake_google.requests[0]["form"]["refresh_token"] == "refresh-1"
+    assert fake_google.last["authorization"] == "Bearer fresh-token"
+    assert token.read_text(encoding="utf-8") == before
+
+
+def test_a_colab_account_that_never_signed_in_says_how_to(isolated_home) -> None:
+    usage = provider_of(Colab, "colab_a").usage()
+    assert usage.remaining is None
+    assert "letify login colab colab_a" in (usage.note or "")
+
+
+def test_elice_reads_the_remaining_credit_from_the_billing_api(fake_google) -> None:
+    provider = provider_of(
+        Elice,
+        "e",
+        endpoint=fake_google.endpoint,
+        billing_endpoint=f"{fake_google.endpoint}/billing",
+        organization="lab",
+        access_token="token-1",
+    )
+    fake_google.answer(
+        "GET", "/billing/stats", FakeResponse(200, {"total_credit_remaining_amount": "12345 KRW"})
+    )
+    usage = provider.usage()
+    assert usage.unit == "KRW"
+    assert usage.remaining == 12345.0
+    stats = next(r for r in fake_google.requests if r["path"] == "/billing/stats")
+    assert stats["authorization"] == "Bearer token-1"
+    assert stats["org"] == "lab"
+
+
+def test_elice_without_a_billing_endpoint_names_the_missing_field(elice, fake_elice) -> None:
+    fake_elice.answer("GET", ALLOCATION_PATH, FakeResponse(200, {"items": []}))
+    fake_elice.answer("GET", PRICING_PATH, FakeResponse(200, {"items": []}))
+    usage = elice.usage()
+    assert usage.remaining is None
+    assert "billing_endpoint" in (usage.note or "")
+
+
+def test_a_machine_reached_by_ssh_has_no_quota() -> None:
+    usage = provider_of(Shell, "lab", address="gpu.example.edu").usage()
+    assert usage.unmetered is True
+    assert "no quota" in usage.source
+    assert provider_of(Tunnel, "t", address="10.0.0.1").usage().unmetered is True
 
 
 def test_this_machine_is_reported_as_unmetered_rather_than_unknown() -> None:
@@ -1968,3 +2075,539 @@ def test_every_shell_kind_reads_busy_cards_on_its_machine(cls, patch_run, monkey
     link = type("L", (), {"ssh_command": lambda self, remote=None: ["ssh", "h", remote]})()
     monkeypatch.setattr(provider, "link", lambda runtime=None: link)
     assert provider.busy() == (2,)
+
+
+# -- Modal: ending a sandbox while a request is blocked (spec "modal-abort") ----------
+
+
+def test_a_modal_call_past_its_timeout_leaves_no_sandbox_running(isolated_home, fake_modal) -> None:
+    import time
+
+    from letify.errors import ProtocolError, RuntimeFailure
+
+    provider = provider_of(Modal, "m")
+    runtime = modal_runtime(provider)
+    channel = provider.open_channel(runtime)
+    channel.start()
+    [pid] = fake_modal.sandbox_pids()
+    started = time.monotonic()
+    with pytest.raises((RuntimeFailure, ProtocolError)):
+        channel.call(time.sleep, (600,), {}, timeout=2)
+    assert time.monotonic() - started < 30
+    assert not fake_modal.alive(pid)
+    channel.close()
+    provider.stop(runtime)
+
+
+def test_a_modal_call_interrupted_while_blocked_leaves_no_sandbox_running(
+    isolated_home, fake_modal
+) -> None:
+    import signal
+    import time
+
+    provider = provider_of(Modal, "m")
+    runtime = modal_runtime(provider)
+    channel = provider.open_channel(runtime)
+    channel.start()
+    [pid] = fake_modal.sandbox_pids()
+
+    def interrupt(signum, frame):
+        raise KeyboardInterrupt
+
+    previous = signal.signal(signal.SIGALRM, interrupt)
+    signal.setitimer(signal.ITIMER_REAL, 2)
+    try:
+        with pytest.raises(KeyboardInterrupt):
+            channel.call(time.sleep, (600,), {})
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, previous)
+    started = time.monotonic()
+    channel.close()
+    provider.stop(runtime)
+    assert time.monotonic() - started < 30
+    assert not fake_modal.alive(pid)
+
+
+def test_a_request_on_an_adapter_out_of_step_fails_without_waiting(
+    isolated_home, fake_modal
+) -> None:
+    import signal
+    import time
+
+    from letify.errors import RuntimeFailure
+
+    # Spec "modal-abort": an adapter falls out of step when a request on its standard input
+    # and output is interrupted, so the call has to travel there rather than over the data
+    # channel, where an interrupted call leaves the adapter idle.
+    provider = provider_of(Modal, "m", data_channel=False)
+    runtime = modal_runtime(provider)
+    channel = provider.open_channel(runtime)
+    channel.start()
+
+    def interrupt(signum, frame):
+        raise KeyboardInterrupt
+
+    previous = signal.signal(signal.SIGALRM, interrupt)
+    signal.setitimer(signal.ITIMER_REAL, 2)
+    try:
+        with pytest.raises(KeyboardInterrupt):
+            channel.call(time.sleep, (600,), {})
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, previous)
+    started = time.monotonic()
+    with pytest.raises(RuntimeFailure, match="out of step"):
+        provider.adapter().request("hello")
+    assert time.monotonic() - started < 5
+    provider.stop(runtime)
+
+
+def test_a_modal_sandbox_is_created_with_a_lifetime_and_an_idle_limit(
+    isolated_home, fake_modal
+) -> None:
+    provider = provider_of(Modal, "m")
+    runtime = modal_runtime(provider)
+    provider.open_channel(runtime)
+    try:
+        [created] = fake_modal.requests("create")
+        assert created["timeout"] == 3600
+        assert created["idle_timeout"] == 600
+    finally:
+        provider.stop(runtime)
+
+
+# -- Modal data channel ----------------------------------------------------------
+
+
+def test_the_real_modal_adapter_exposes_encrypted_ports_and_resolves_their_tunnel(
+    tmp_path: Path,
+) -> None:
+    # Spec "Modal adapter", ops create and tunnel.
+    import json
+    import os
+    import sys
+
+    site = tmp_path / "site" / "modal"
+    site.mkdir(parents=True)
+    (site / "__init__.py").write_text(STUB_MODAL, encoding="utf-8")
+    log = tmp_path / "modal.log"
+    script = Path(modal_module.__file__).with_name("modal_adapter.py")
+    env = {**os.environ, "PYTHONPATH": str(tmp_path / "site"), "STUB_MODAL_LOG": str(log)}
+    adapter = Adapter([sys.executable, "-P", str(script)], env=env, name="m")
+    try:
+        fields = {"app": "study", "args": ["python3"], "packages": [], "gpu": None, "timeout": 60}
+        sandbox = adapter.request("create", ports=[8765], **fields)["sandbox"]
+        tunnel = adapter.request("tunnel", sandbox=sandbox, port=8765)
+    finally:
+        adapter.close()
+    assert tunnel == {"host": "r7.modal.host", "port": 443, "tls": True}
+    events = [json.loads(line) for line in log.read_text("utf-8").splitlines()]
+    assert ["create", "study", [8765]] in events
+
+
+def test_a_modal_sandbox_is_created_with_the_data_port_exposed(isolated_home, fake_modal) -> None:
+    provider = provider_of(Modal, "m")
+    runtime = modal_runtime(provider)
+    provider.open_channel(runtime)
+    try:
+        [created] = fake_modal.requests("create")
+        assert created["ports"] == [modal_module.DATA_PORT]
+    finally:
+        provider.stop(runtime)
+
+
+def test_a_modal_sandbox_without_the_data_channel_exposes_no_port(
+    isolated_home, fake_modal
+) -> None:
+    provider = provider_of(Modal, "m", data_channel=False)
+    runtime = modal_runtime(provider)
+    provider.open_channel(runtime)
+    try:
+        [created] = fake_modal.requests("create")
+        assert created["ports"] == []
+    finally:
+        provider.stop(runtime)
+
+
+def test_a_sandbox_channel_carries_frames_over_the_data_connection(
+    isolated_home, fake_modal
+) -> None:
+    # Spec "Modal data channel": after hello, frames leave standard input and output, so a
+    # result far above what Modal's stdout carried arrives with no further stdio request.
+    import os
+
+    provider = provider_of(Modal, "m")
+    runtime = modal_runtime(provider)
+    channel = provider.open_channel(runtime)
+    try:
+        channel.start()
+        assert [r["port"] for r in fake_modal.requests("tunnel")] == [modal_module.DATA_PORT]
+        reads = len(fake_modal.requests("read_until"))
+        writes = len(fake_modal.requests("write"))
+        payload = os.urandom(8 << 20)
+        assert channel.call(len, (payload,), {})[0] == len(payload)
+        assert len(channel.call(os.urandom, (32 << 20,), {})[0]) == 32 << 20
+        assert len(fake_modal.requests("read_until")) == reads
+        assert len(fake_modal.requests("write")) == writes
+    finally:
+        channel.close()
+        provider.stop(runtime)
+
+
+def test_worker_output_arrives_over_the_data_connection(isolated_home, fake_modal) -> None:
+    provider = provider_of(Modal, "m")
+    runtime = modal_runtime(provider)
+    channel = provider.open_channel(runtime)
+    seen: list[bytes] = []
+    channel.on_output = lambda stream, data: seen.append(data)
+    try:
+        channel.start()
+        reads = len(fake_modal.requests("read_until"))
+        channel.request({"op": "exec", "source": "print('hello from the sandbox', flush=True)"})
+        assert b"hello from the sandbox" in b"".join(seen)
+        assert len(fake_modal.requests("read_until")) == reads
+    finally:
+        channel.close()
+        provider.stop(runtime)
+
+
+def test_a_sandbox_whose_tunnel_fails_keeps_frames_on_standard_io(
+    isolated_home, fake_modal, capfd
+) -> None:
+    # Spec "Modal data channel": a failure is reported in one line and stdio carries on,
+    # without waiting for the worker's listen window to end.
+    import time
+
+    fake_modal.fail("tunnel")
+    provider = provider_of(Modal, "m")
+    runtime = modal_runtime(provider)
+    channel = provider.open_channel(runtime)
+    try:
+        started = time.monotonic()
+        channel.start()
+        assert channel.call(sum, ([1, 2, 3],), {})[0] == 6
+        assert time.monotonic() - started < 30
+        err = capfd.readouterr().err
+        assert "the data channel did not open" in err
+        assert "frames stay on standard input and output" in err
+    finally:
+        channel.close()
+        provider.stop(runtime)
+
+
+def test_switching_the_interpreter_reopens_the_data_channel(isolated_home, fake_modal) -> None:
+    import sys
+
+    provider = provider_of(Modal, "m")
+    runtime = modal_runtime(provider)
+    channel = provider.open_channel(runtime)
+    try:
+        channel.start()
+        channel.switch_interpreter(sys.executable)
+        assert channel.call(len, (b"x" * (4 << 20),), {})[0] == 4 << 20
+        assert len(fake_modal.requests("tunnel")) == 2
+    finally:
+        channel.close()
+        provider.stop(runtime)
+
+
+def _listening_worker():
+    """A local worker whose frame reader was asked to listen, its port, and its token."""
+    import socket
+    import sys
+
+    from letify.protocol.worker import BOOTSTRAP
+    from letify.runtime.channel import PersistentChannel
+
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", 0))
+        port = probe.getsockname()[1]
+    channel = PersistentChannel([sys.executable, "-u", "-c", BOOTSTRAP], name="w")
+    channel.start()
+    token = "ab" * 32
+    channel.request({"op": "listen", "port": port, "token": token, "wait": 20})
+    return channel, port, token
+
+
+def _connect(port: int):
+    import socket
+    import time
+
+    for _ in range(100):
+        try:
+            return socket.create_connection(("127.0.0.1", port), timeout=10)
+        except OSError:
+            time.sleep(0.05)
+    raise AssertionError("the worker never listened")
+
+
+def test_a_data_connection_with_the_wrong_token_is_closed_and_the_right_one_gets_hello() -> None:
+    # Spec "Modal data channel", step 4, through the real worker.
+    from letify.protocol import wire
+
+    channel, port, token = _listening_worker()
+    try:
+        intruder = _connect(port)
+        intruder.sendall(b"LETIFY-DATA " + b"cd" * 32 + b"\n")
+        assert intruder.recv(16) == b""
+        intruder.close()
+        good = _connect(port)
+        good.sendall(b"LETIFY-DATA " + token.encode() + b"\n")
+        receiver = wire.Receiver(good.recv_into)
+        kind, _stream, _value = receiver.next_event()
+        assert kind == wire.HELLO
+        good.close()
+    finally:
+        channel.close()
+
+
+class _WatchedTls:
+    """An identity cipher over two memory buffers that records two threads inside it at once."""
+
+    def __init__(self, incoming, outgoing):
+        import threading
+
+        self.incoming = incoming
+        self.outgoing = outgoing
+        self.overlapped = False
+        self._inside = 0
+        self._count = threading.Lock()
+
+    def _enter(self) -> None:
+        import time
+
+        with self._count:
+            self._inside += 1
+            if self._inside > 1:
+                self.overlapped = True
+        time.sleep(0.0005)
+
+    def _leave(self) -> None:
+        with self._count:
+            self._inside -= 1
+
+    def do_handshake(self) -> None:
+        return None
+
+    def write(self, data) -> int:
+        self._enter()
+        try:
+            self.outgoing.write(bytes(data))
+            return memoryview(data).nbytes
+        finally:
+            self._leave()
+
+    def read(self, size, buffer) -> int:
+        import ssl
+
+        self._enter()
+        try:
+            data = self.incoming.read(size)
+            if not data:
+                raise ssl.SSLWantReadError("no data")
+            buffer[: len(data)] = data
+            return len(data)
+        finally:
+            self._leave()
+
+
+def test_the_tls_state_is_never_used_by_two_threads_at_once() -> None:
+    # Spec "Modal data channel": a writing thread and the reading thread share one TLS
+    # object, which OpenSSL does not allow, so the channel serializes every use of it.
+    import os
+    import socket
+    import ssl
+    import threading
+
+    from letify.providers.modal import TlsStream
+
+    near, far = socket.socketpair()
+
+    def echo() -> None:
+        while True:
+            data = far.recv(1 << 16)
+            if not data:
+                break
+            far.sendall(data)
+        far.close()
+
+    threading.Thread(target=echo, daemon=True).start()
+    incoming, outgoing = ssl.MemoryBIO(), ssl.MemoryBIO()
+    tls = _WatchedTls(incoming, outgoing)
+    stream = TlsStream(near, tls, incoming, outgoing)
+    payload = os.urandom(4 << 20)
+    received = bytearray()
+
+    def read() -> None:
+        buffer = bytearray(1 << 20)
+        while len(received) < len(payload):
+            count = stream.recv_into(memoryview(buffer))
+            if not count:
+                break
+            received.extend(buffer[:count])
+
+    reader = threading.Thread(target=read)
+    reader.start()
+    view = memoryview(payload)
+    while view:
+        view = view[stream.send(view[: 256 << 10]) :]
+    reader.join(60)
+    near.close()
+    assert bytes(received) == payload
+    assert tls.overlapped is False
+
+
+def test_a_tls_data_connection_carries_overlapping_requests_during_large_transfers(
+    isolated_home, fake_modal, tls_proxy
+) -> None:
+    # Spec "Modal data channel": frames through a TLS-terminating proxy, as Modal's encrypted
+    # port is, while a second thread keeps sending requests during every transfer.
+    import os
+    import threading
+
+    fake_modal.tunnel_to("localhost", tls_proxy.start(modal_module.DATA_PORT), tls=True)
+    provider = provider_of(Modal, "m")
+    runtime = modal_runtime(provider)
+    channel = provider.open_channel(runtime)
+    channel.tls_context = tls_proxy.context
+    stop = threading.Event()
+    replies: list[object] = []
+    errors: list[BaseException] = []
+
+    def overlap() -> None:
+        while not stop.is_set():
+            try:
+                replies.append(channel.request({"op": "stat"}, timeout=60)[0])
+            except BaseException as exc:
+                errors.append(exc)
+                return
+
+    try:
+        channel.start()
+        reads = len(fake_modal.requests("read_until"))
+        thread = threading.Thread(target=overlap, daemon=True)
+        thread.start()
+        for _ in range(3):
+            assert channel.call(len, (os.urandom(16 << 20),), {}, timeout=60)[0] == 16 << 20
+            assert len(channel.call(os.urandom, (16 << 20,), {}, timeout=60)[0]) == 16 << 20
+        stop.set()
+        thread.join(60)
+        assert errors == []
+        assert replies
+        assert len(fake_modal.requests("read_until")) == reads
+    finally:
+        stop.set()
+        channel.close()
+        provider.stop(runtime)
+
+
+# -- parallel data streams: spec "Parallel data streams" ----------------------------------
+
+
+def _count_connections(monkeypatch) -> list[object]:
+    import socket
+
+    opened: list[object] = []
+    real = socket.create_connection
+
+    def counting(address, *args, **kwargs):
+        opened.append(address)
+        return real(address, *args, **kwargs)
+
+    monkeypatch.setattr(modal_module.socket, "create_connection", counting)
+    return opened
+
+
+def test_a_modal_channel_opens_one_connection_per_data_stream(
+    isolated_home, fake_modal, monkeypatch
+) -> None:
+    import os
+
+    opened = _count_connections(monkeypatch)
+    provider = provider_of(Modal, "m", data_streams=3)
+    runtime = modal_runtime(provider)
+    channel = provider.open_channel(runtime)
+    try:
+        channel.start()
+        assert len(opened) == 3
+        payload = os.urandom(24 << 20)
+        assert channel.call(len, (payload,), {})[0] == len(payload)
+        assert channel.call(bytes, (payload,), {})[0] == payload
+    finally:
+        channel.close()
+        provider.stop(runtime)
+
+
+def test_the_data_streams_default_is_four(isolated_home, fake_modal, monkeypatch) -> None:
+    opened = _count_connections(monkeypatch)
+    provider = provider_of(Modal, "m")
+    runtime = modal_runtime(provider)
+    channel = provider.open_channel(runtime)
+    try:
+        channel.start()
+        assert len(opened) == 4
+    finally:
+        channel.close()
+        provider.stop(runtime)
+
+
+@pytest.mark.parametrize("value", [0, 17, "4", True])
+def test_a_data_streams_value_out_of_range_is_refused(isolated_home, fake_modal, value) -> None:
+    provider = provider_of(Modal, "m", data_streams=value)
+    runtime = modal_runtime(provider)
+    with pytest.raises(letify.ConfigError, match="data_streams"):
+        provider.open_channel(runtime)
+
+
+def test_a_lane_whose_index_is_taken_is_closed_and_hello_waits_for_every_lane() -> None:
+    # Spec "Parallel data streams", step 1, through the real worker.
+    import socket
+    import sys
+
+    from letify.protocol import wire
+    from letify.protocol.worker import BOOTSTRAP
+    from letify.runtime.channel import PersistentChannel
+
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", 0))
+        port = probe.getsockname()[1]
+    channel = PersistentChannel([sys.executable, "-u", "-c", BOOTSTRAP], name="w")
+    channel.start()
+    token = "ab" * 32
+    channel.request({"op": "listen", "port": port, "token": token, "wait": 20, "streams": 2})
+    try:
+        lane0 = _connect(port)
+        lane0.sendall(b"LETIFY-DATA " + token.encode() + b"\n")
+        again = _connect(port)
+        again.sendall(b"LETIFY-DATA " + token.encode() + b"\n")
+        assert again.recv(16) == b""
+        again.close()
+        lane1 = _connect(port)
+        lane1.sendall(b"LETIFY-DATA " + token.encode() + b" 1\n")
+        stream = wire.Striped([lane0.send, lane1.send], [lane0.recv_into, lane1.recv_into])
+        kind, _stream, _value = wire.Receiver(stream.recv_into).next_event()
+        assert kind == wire.HELLO
+        lane0.close()
+        lane1.close()
+    finally:
+        channel.close()
+
+
+def test_every_provider_start_accepts_the_keywords_the_pool_passes() -> None:
+    # Spec "Provider model": the pool starts a runtime with name, volumes and held, so an
+    # override that drops one fails only when a live session starts.
+    import inspect
+
+    from letify.providers import base, colab, elice, local, modal, shell, tunnel
+
+    wanted = {"name", "volumes", "held"}
+    classes = {base.Provider}
+    for module in (colab, elice, local, modal, shell, tunnel):
+        for value in vars(module).values():
+            if isinstance(value, type) and issubclass(value, base.Provider):
+                classes.add(value)
+    for cls in classes:
+        parameters = inspect.signature(cls.start).parameters
+        missing = wanted - parameters.keys()
+        assert not missing, f"{cls.__name__}.start lacks {sorted(missing)}"

@@ -111,7 +111,21 @@ Two product lines exist and only one is automatable. Elice Cloud Infrastructure 
 
 There is nothing to tunnel to and no device to forward calls at, so `Modal.has_fast_path` is false and `host="local"` raises. Its volume is mounted from outside the container and sits in the same data centre as the GPU, which is why a persistent provider needs no separate cache tier.
 
-The local path is a pipe to the Modal adapter, a process letify starts with `uv run --no-project --with "modal>=1.0,<2"`. Modal's client inside it reaches Modal's API over HTTPS. Every worker request crosses that adapter twice, once as a `write` and once as a `read_until`, as spec "Modal adapter" describes. The round trip of that path has not been measured.
+The control path is a pipe to the Modal adapter, a process letify starts with `uv run --no-project --with "modal>=1.0,<2"`. Modal's client inside it reaches Modal's API over HTTPS. It carries the worker source and one `listen` request, as spec "Modal adapter" describes.
+
+The data path is a TCP connection from letify to a port inside the sandbox, exposed with Modal `encrypted_ports`, as spec [Modal data channel](SPEC.md#modal-data-channel) describes. TLS ends at Modal's tunnel host, which forwards plain TCP into the sandbox.
+
+Measured on 2026-09-14 from Seoul to a Modal CPU sandbox with the smallest default resources. The network floor, a TCP connect to the tunnel address, was 193 ms median:
+
+| Measurement | Standard input and output | Data channel |
+|---|---|---|
+| Empty call round trip, median of 20 | 230 ms | 191 ms |
+| 64 MiB argument | 3.4 MiB/s | 11 to 15 MiB/s |
+| 64 MiB result | fails, Modal's stdout stalls after about 0.95 MiB | 11 to 14 MiB/s |
+| 256 MiB CPU tensor round trip | not run | 13.7 MiB/s each way |
+| 1000 lines of output | 0.99 s | 0.20 s |
+
+Throughput is limited by the single TCP stream at this round trip, not by the worker: the worker's reading thread used about 30 ms of CPU for a 64 MiB argument.
 
 ## Call protocol throughput <!-- id: call-protocol-throughput -->
 

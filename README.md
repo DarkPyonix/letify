@@ -361,6 +361,18 @@ def train(lr): ...
 
 The runtime pulls the volume straight from the bucket, not through your machine. It uses a short-lived token borrowed from your own login, so no credential is left on the remote side.
 
+Training data needs no declaration at all. Pass a `pathlib.Path`, or read one from a global, and letify sends the files it names as content addressed blobs. The body receives a path on the runtime with the same layout. A persistent machine keeps the blobs on its own disk, so the second session uploads 0 bytes. An ephemeral account with `bucket = "<name>"` uploads each file to the bucket once, and every later runtime downloads it from there. The runtime's copy is kept within a budget, 50 GiB by default or `data_cache_gib` on the account, and `letify cache` shows or clears it.
+
+Results come back the same way. A `Path` that does not exist yet, or a directory, is also an output location: what the body creates or changes there is copied to the local path when the call returns, and a file the local copy already matches is not sent. So checkpoints and logs saved under `Path("runs/exp1")` are in your project after the call.
+
+```python
+DATA = Path("data/imagenet-subset")
+
+@let.function(device=lab.A100, host=letify.remote)
+def train(lr):
+    for file in DATA.iterdir(): ...   # already on the runtime's disk
+```
+
 Why this shape:
 
 | | 🐌 Two-way file sync | ⚡ Content addressed |
@@ -446,6 +458,7 @@ def test_train_returns_a_loss():
 letify login shell lab        # declare an account, and reference it here
 letify logout lab             # take the account off this machine
 letify client shell connect   # run on a remote machine behind NAT, so letify can reach it
+letify setup tailcat          # install tailcat or eci from its publisher ahead of time
 letify providers              # who is declared, storage, channel kind
 letify devices                # what each one offers
 letify status                 # what is running right now
@@ -455,6 +468,8 @@ letify check lab              # does this machine answer?
 letify probe lab              # is host=letify.local worth using here?
 letify efficiency 0.5 3 150   # the formula, from measured terms
 ```
+
+Add `--json` to `usage`, `utilization` or `status` for output a program can read. The VS Code extension in [letify-ext/](letify-ext/) uses it to show quota and GPU activity in the status bar.
 
 ---
 

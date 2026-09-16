@@ -26,7 +26,7 @@ from collections.abc import Callable, Sequence
 from functools import update_wrapper
 from typing import TYPE_CHECKING, Any, Generic, TypeVar
 
-from ..errors import ProtocolError, RuntimeFailure, RuntimeLost, UnsupportedMode
+from ..errors import ProtocolError, RuntimeFailure, RuntimeLost, SpotPreempted, UnsupportedMode
 from .instance import AnyInstance, Host, Instance
 
 if TYPE_CHECKING:
@@ -148,12 +148,16 @@ class Function(Generic[R]):
                     kwargs,
                     timeout=self.timeout,
                 )
-            except (RuntimeFailure, ProtocolError) as exc:
+            except (RuntimeFailure, ProtocolError) as failure:
                 # The session misbehaved rather than the user's code, so this runtime
-                # is no longer trusted and the call may be retried on a fresh one.
+                # is no longer trusted and the call may be retried on a fresh one. The
+                # provider may name the failure first, such as a spot preemption.
+                exc = runtime.provider.diagnose(runtime, failure)
                 last = exc
                 launcher.pool.discard(runtime)
                 if attempt == self.retries:
+                    if isinstance(exc, SpotPreempted):
+                        raise exc from failure
                     lost = RuntimeLost(
                         f"{self.__name__} failed after {attempt + 1} attempt(s) on "
                         f"{instance!r}: {exc}"
@@ -186,10 +190,15 @@ class Function(Generic[R]):
             client = runtime.device()
             with client.activate():
                 value = self.fn(*args, **kwargs)
+                if inspect.iscoroutine(value):
+                    value = asyncio.run(value)
                 client.synchronize()
-        except (RuntimeFailure, ProtocolError):
+        except (RuntimeFailure, ProtocolError) as failure:
+            named = runtime.provider.diagnose(runtime, failure)
             launcher.pool.discard(runtime)
-            raise
+            if named is failure:
+                raise
+            raise named from failure
         except BaseException:
             launcher.pool.release(runtime)
             raise

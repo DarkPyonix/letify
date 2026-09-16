@@ -108,10 +108,12 @@ class Adapter:
             image=image,
             gpu=request.get("gpu") or None,
             timeout=int(request["timeout"]),
+            idle_timeout=int(request["idle_timeout"]) if request.get("idle_timeout") else None,
             volumes={
                 str(path): modal.Volume.from_name(str(name), create_if_missing=True)
                 for path, name in (request.get("volumes") or {}).items()
             },
+            encrypted_ports=[int(port) for port in request.get("ports") or []],
         )
         sandbox_id = str(getattr(sandbox, "object_id", "") or f"sandbox-{len(self.sandboxes) + 1}")
         self.sandboxes[sandbox_id] = SandboxStream(sandbox)
@@ -151,6 +153,12 @@ class Adapter:
             raise KeyError(f"no sandbox {sandbox_id!r} in this adapter")
         return stream
 
+    def op_tunnel(self, request: dict[str, Any]) -> Any:
+        """The TLS address of an encrypted port the sandbox was created with."""
+        stream = self._stream(request)
+        tunnel = stream.sandbox.tunnels(timeout=50)[int(request["port"])]
+        return {"host": str(tunnel.host), "port": int(tunnel.port), "tls": True}
+
     def op_write(self, request: dict[str, Any]) -> Any:
         stream = self._stream(request)
         stream.sandbox.stdin.write(base64.b64decode(str(request["data"])))
@@ -170,10 +178,36 @@ class Adapter:
                 return {"lines": lines, "eof": False}
 
     def op_terminate(self, request: dict[str, Any]) -> Any:
-        stream = self.sandboxes.pop(str(request["sandbox"]), None)
+        sandbox_id = str(request["sandbox"])
+        stream = self.sandboxes.pop(sandbox_id, None)
         if stream is not None:
             stream.sandbox.terminate()
+            return None
+        # Another adapter process created it, one that is blocked or about to be killed.
+        modal = load_modal()
+        try:
+            modal.Sandbox.from_id(sandbox_id).terminate()
+        except not_found_errors(modal):
+            pass
         return None
+
+    # -- billing -----------------------------------------------------------------
+
+    def op_billing_summary(self, request: dict[str, Any]) -> Any:
+        """This month's workspace cost. Read-only: it starts no app and no sandbox."""
+        modal = load_modal()
+        summary = modal.Workspace.from_context().billing.summary()
+        credits = sum(
+            (value for key, value in summary.adjustments.items() if key.lower() == "credits"),
+            start=0,
+        )
+        return {
+            "metered_cost": str(summary.metered_cost),
+            "billed_cost": str(summary.billed_cost),
+            "credits": str(credits),
+            "start": summary.start.timestamp(),
+            "end": summary.end.timestamp(),
+        }
 
     # -- volumes -----------------------------------------------------------------
 
