@@ -763,7 +763,8 @@ def test_queued_operators_travel_without_a_round_trip_until_a_value_is_read(
     for _ in range(100):
         x = x * 1.0 + 0.0
     assert client.stats.round_trips == before.round_trips
-    value = x.sum().item()
+    # float() of a tensor still synchronizes, where item() defers: spec "Deferred value reads".
+    value = float(x.sum())
     assert value == 16.0
     delta = client.stats.snapshot() - before
     assert delta.round_trips == 1
@@ -806,10 +807,10 @@ def test_a_queue_with_nothing_after_it_is_sent_once_idle(client, monkeypatch) ->
     assert client.stats.round_trips == before.round_trips
 
 
-def test_item_and_cpu_are_synchronization_points(client) -> None:
+def test_float_and_cpu_are_synchronization_points(client) -> None:
     x = torch.full((3,), 2.5, device="cuda")
     before = client.stats.round_trips
-    assert x[0].item() == 2.5
+    assert float(x[0]) == 2.5
     assert client.stats.round_trips == before + 1
     assert x.cpu().tolist() == [2.5, 2.5, 2.5]
     assert client.stats.round_trips == before + 2
@@ -876,7 +877,7 @@ def test_a_read_with_nothing_else_being_sent_is_written_by_the_waiting_thread(
         original(head, buffers)
 
     monkeypatch.setattr(client.transport, "send", recorded)
-    assert (x * 2).sum().item() == 8.0
+    assert float((x * 2).sum()) == 8.0
     assert writers and writers[-1] is True
 
 
@@ -912,7 +913,7 @@ def test_a_read_sends_only_the_entries_its_value_depends_on(client, monkeypatch)
     client.synchronize()
     total = (x * 2).sum()
     later = x + 1
-    assert total.item() == 8.0
+    assert float(total) == 8.0
     assert client.queued > 0
     assert later.cpu().tolist() == [2.0, 2.0, 2.0, 2.0]
     assert client.queued == 0
@@ -1477,7 +1478,7 @@ def test_a_tensor_used_by_an_entry_a_read_leaves_queued_is_not_released_early(
     later = x + 1
     del x
     gc.collect()
-    assert total.item() == 8.0
+    assert float(total) == 8.0
     assert client.queued > 0
     assert later.cpu().tolist() == [2.0, 2.0, 2.0, 2.0]
 
@@ -1665,3 +1666,231 @@ def test_host_local_is_refused_without_torch(let, cpu, monkeypatch) -> None:
     monkeypatch.setitem(sys.modules, "torch", None)
     with pytest.raises(letify.UnsupportedMode, match="PyTorch"):
         cpu.provider.check_mode(cpu._placed("local"))
+
+
+# -- Spec: Deferred value reads ------------------------------------------------
+
+
+@pytest.fixture
+def eager_client():
+    """A client with ``auto_fetch`` off, so a value read synchronizes as it used to."""
+    connected = forwarding.connect(
+        forwarding.worker_command(sys.executable), device="cpu", auto_fetch=False
+    )
+    try:
+        with connected.activate():
+            yield connected
+    finally:
+        connected.close()
+
+
+def test_item_on_a_forwarded_tensor_defers_instead_of_synchronizing(client, monkeypatch) -> None:
+    _hold_queue(monkeypatch)
+    x = torch.ones(4, device="cuda")
+    client.synchronize()
+    before = client.stats.snapshot()
+    value = (x * 2).sum().item()
+    delta = client.stats.snapshot() - before
+    assert delta.round_trips == 0
+    assert delta.auto_deferred == 1
+    assert float(value) == 8.0
+
+
+def test_a_loop_logging_item_every_step_pays_no_round_trip_per_step(client, monkeypatch) -> None:
+    _hold_queue(monkeypatch)
+    x = torch.ones(8, device="cuda")
+    client.synchronize()
+    before = client.stats.snapshot()
+    logged = [(x * float(step)).sum().item() for step in range(20)]
+    delta = client.stats.snapshot() - before
+    assert delta.round_trips == 0
+    assert delta.auto_deferred == 20
+    assert [float(value) for value in logged] == [8.0 * step for step in range(20)]
+
+
+def test_a_deferred_value_equals_the_eager_value_bit_for_bit(client) -> None:
+    def train(to_device):
+        torch.manual_seed(0)
+        data = to_device(torch.randn(128, 8))
+        model = to_device(torch.nn.Sequential(torch.nn.Linear(8, 16), torch.nn.Linear(16, 8)))
+        opt = torch.optim.Adam(model.parameters(), lr=1e-2)
+        logged = []
+        for step in range(20):
+            chunk = data[step : step + 16]
+            loss = torch.nn.functional.mse_loss(model(chunk), chunk)
+            opt.zero_grad()
+            loss.backward()
+            opt.step()
+            logged.append(loss.item())
+        return [float(value) for value in logged]
+
+    with client.suspended():
+        local = train(lambda value: value)
+    remote = train(lambda value: value.cuda())
+    assert remote == pytest.approx(local, rel=1e-5, abs=1e-6)
+
+
+def test_a_comparison_resolves_a_deferred_value(client) -> None:
+    loss = (torch.ones(2, device="cuda") * 1.5).sum().item()
+    assert loss > 2.0
+    assert loss == 3.0
+    assert not loss < 1.0
+
+
+def test_formatting_resolves_a_deferred_value(client) -> None:
+    loss = (torch.ones(2, device="cuda") * 1.5).sum().item()
+    assert f"{loss:.2f}" == "3.00"
+    assert str(loss) == "3.0"
+    assert repr(loss) == "3.0"
+
+
+def test_arithmetic_and_round_resolve_a_deferred_value(client) -> None:
+    import math
+
+    loss = (torch.ones(2, device="cuda") * 1.25).sum().item()
+    assert loss + 1.0 == 3.5
+    assert 1.0 + loss == 3.5
+    assert round(loss, 1) == 2.5
+    assert math.sqrt(loss) == math.sqrt(2.5)
+    assert abs(-loss) == 2.5
+
+
+def test_tolist_defers_and_resolves_where_it_is_read(client, monkeypatch) -> None:
+    _hold_queue(monkeypatch)
+    x = torch.arange(3.0).cuda()
+    client.synchronize()
+    before = client.stats.snapshot()
+    values = (x * 2).tolist()
+    assert (client.stats.snapshot() - before).round_trips == 0
+    assert list(values) == [0.0, 2.0, 4.0]
+    assert len(values) == 3
+
+
+def test_int_and_float_of_a_tensor_still_synchronize(client) -> None:
+    """CPython refuses a ``__float__`` that is not a float, so these cannot be deferred."""
+    x = torch.ones((), device="cuda") * 7
+    client.synchronize()
+    before = client.stats.snapshot()
+    as_float = float(x)
+    as_int = int(x)
+    delta = client.stats.snapshot() - before
+    assert type(as_float) is float and as_float == 7.0
+    assert type(as_int) is int and as_int == 7
+    assert delta.auto_deferred == 0
+    assert delta.round_trips == 2
+
+
+def test_bool_of_a_tensor_still_synchronizes(client) -> None:
+    x = torch.ones(2, device="cuda")
+    client.synchronize()
+    before = client.stats.snapshot()
+    taken = bool(x.sum() > 1.0)
+    delta = client.stats.snapshot() - before
+    assert taken is True
+    assert delta.auto_deferred == 0
+    assert delta.round_trips >= 1
+
+
+def test_a_deferred_value_used_as_an_index_resolves_before_it_selects(client) -> None:
+    position = (torch.ones((), dtype=torch.int64, device="cuda") * 2).item()
+    row = [10.0, 11.0, 12.0, 13.0]
+    assert row[position] == 12.0
+
+
+def test_synchronize_resolves_every_deferred_value(client, monkeypatch) -> None:
+    _hold_queue(monkeypatch)
+    x = torch.ones(2, device="cuda")
+    client.synchronize()
+    values = [(x * float(step)).sum().item() for step in range(3)]
+    torch.cuda.synchronize()
+    before = client.stats.snapshot()
+    assert [float(value) for value in values] == [0.0, 2.0, 4.0]
+    assert (client.stats.snapshot() - before).round_trips == 0
+
+
+def test_the_client_counts_the_deferred_reads_resolved_early(client, monkeypatch) -> None:
+    _hold_queue(monkeypatch)
+    x = torch.ones(2, device="cuda")
+    client.synchronize()
+    before = client.stats.snapshot()
+    early = (x * 2).sum().item()
+    assert float(early) == 4.0
+    late = (x * 3).sum().item()
+    torch.cuda.synchronize()
+    assert float(late) == 6.0
+    delta = client.stats.snapshot() - before
+    assert delta.auto_deferred == 2
+    assert delta.resolved_early == 1
+
+
+def test_a_value_returned_from_a_local_call_is_a_real_float(let, cpu) -> None:
+    @let.function(device=cpu, host="local")
+    def step() -> float:
+        return (torch.ones(3, device="cuda") * 2).sum().item()
+
+    got = step()
+    assert type(got) is float
+    assert got == 6.0
+
+
+def test_a_deferred_value_inside_a_returned_container_is_resolved(let, cpu) -> None:
+    @let.function(device=cpu, host="local")
+    def step() -> dict:
+        loss = (torch.ones(2, device="cuda") * 1.5).sum()
+        return {"loss": loss.item(), "history": [loss.item()]}
+
+    got = step()
+    assert type(got["loss"]) is float
+    assert type(got["history"][0]) is float
+    assert got == {"loss": 3.0, "history": [3.0]}
+
+
+def test_a_deferred_value_is_resolved_before_it_is_saved(client, tmp_path) -> None:
+    loss = (torch.ones(3, device="cuda") * 3).sum().item()
+    path = tmp_path / "checkpoint.pt"
+    torch.save({"loss": loss}, path)
+    assert b"Deferred" not in path.read_bytes()
+    assert torch.load(path, weights_only=False) == {"loss": 9.0}
+
+
+def test_a_deferred_value_pickles_as_its_value(client) -> None:
+    import pickle
+
+    loss = (torch.ones(3, device="cuda") * 3).sum().item()
+    restored = pickle.loads(pickle.dumps(loss))
+    assert type(restored) is float
+    assert restored == 9.0
+
+
+def test_auto_fetch_false_makes_a_value_read_synchronize_again(eager_client) -> None:
+    x = torch.ones(4, device="cuda")
+    eager_client.synchronize()
+    before = eager_client.stats.snapshot()
+    value = (x * 2).sum().item()
+    delta = eager_client.stats.snapshot() - before
+    assert type(value) is float
+    assert value == 8.0
+    assert delta.auto_deferred == 0
+    assert delta.round_trips == 1
+
+
+def test_fetch_still_defers_when_auto_fetch_is_off(eager_client) -> None:
+    import asyncio
+
+    x = torch.arange(3.0).cuda()
+    before = eager_client.stats.snapshot()
+    got = asyncio.run(_await(letify.fetch(x * 2)))
+    assert got.tolist() == [0.0, 2.0, 4.0]
+    assert (eager_client.stats.snapshot() - before).deferred == 1
+
+
+def test_the_environment_variable_turns_the_automatic_behaviour_off(monkeypatch) -> None:
+    from letify.remoting.device.value import auto_fetch_enabled
+
+    monkeypatch.setenv("LETIFY_AUTO_FETCH", "0")
+    assert auto_fetch_enabled(None) is False
+    monkeypatch.setenv("LETIFY_AUTO_FETCH", "1")
+    assert auto_fetch_enabled(False) is True
+    monkeypatch.delenv("LETIFY_AUTO_FETCH")
+    assert auto_fetch_enabled(False) is False
+    assert auto_fetch_enabled(None) is True

@@ -248,6 +248,8 @@ Before a launch, letify reads `eci pricing list --resource-kind vm_allocation --
 
 An ondemand launch checks quota first, and a spot launch does not, because spot does not count against Elice's compute quota. letify reads `eci org info --format json`. A value of 0 for the instance type's id or name under `resource_quota.compute.instance_types`, or a `resource_quota.compute.devices` of 0 for an accelerator type, raises `ProviderUnavailable` saying the ondemand quota for that type is 0 and that the portal takes a quota request or `price_type = "spot"` avoids the quota. A quota that cannot be read prints `letify: <name>: the ondemand quota could not be read, launching anyway` and does not refuse.
 
+A launch Elice refuses because the zone has no spot capacity raises `ProviderUnavailable` naming the instance type, rather than `RuntimeFailure`. Nothing was created, so there is no session to discard and retrying the call on a fresh runtime would ask the same zone for the same capacity again. letify recognises the refusal by `no spot capacity` in the command's standard error. The message says that Elice has no spot capacity for that type right now, and that a later retry or `price_type = "ondemand"` gets a machine. Every other launch failure stays a `RuntimeFailure`.
+
 `Launcher.status()` reports `price_type` on each runtime, `ondemand` or `spot` on Elice and `None` elsewhere, and `letify status` prints it. An Elice `Usage` record carries the account's `price_type`, which `letify usage` prints and `--json` includes.
 
 #### Spot preemption <!-- id: elice-spot-preemption -->
@@ -464,6 +466,8 @@ Nothing in this path runs per training step. A `print` inside a loop costs one p
 > Requests on one persistent channel may overlap. There is no lock across a whole call.
 
 Any number of threads may send requests on one channel. Whichever waiting thread holds the read lock reads the next frame and hands it to the request it belongs to, so a `stat` or a lease renewal sent while a call runs gets its reply while the call is still running. On the worker, `stat` and `lease` are answered by the thread that reads frames. Every other request is queued and run in order on the worker's main thread, so user code runs on the main thread.
+
+A request may be answered by more than one reply. Each reply of such a request carries whether it is the last, and the local process reads them in order on that request's stream until the last one arrives, which is when the stream id is released. The worker sends them from the thread that runs the request and never waits for the local process between two of them. `data_stream`, which [Writing back](#project-data-write-back) describes, is the only request answered this way.
 
 A request that passes its timeout kills the worker process, which ends every read, and raises `RuntimeFailure`.
 
@@ -925,7 +929,11 @@ When the runtime path of an output that did not exist is a regular file, the loc
 
 Deletions are not written back. A file the body removed from an output location stays on the local disk, because a missing file on the runtime cannot be told apart from a file the body never needed, and write-back never destroys local data.
 
-On the local side, a listed file whose local copy exists with the same digest, by the digest cache, is skipped and counted as already on the client. Every other file travels in `data_get` requests of at most 64 MiB each, answered with the bytes as out-of-band `DATA` frames. The local process writes them to `.<name>.letify-partial.<pid>.<thread id>` beside the target, checks the digest of the whole file, then renames it over the target with `os.replace` and records the new file in the digest cache. A digest that does not match raises `RuntimeFailure` and the partial file is removed. A download of 64 MiB or more shows the download progress line of Installing external tools.
+On the local side, a listed file whose local copy exists with the same digest, by the digest cache, is skipped and counted as already on the client. Every other file travels as one `data_stream` request naming its digest, not one request per piece, because a request per piece leaves the link idle for a round trip and for the runtime's own disk read between pieces.
+
+The worker answers a `data_stream` request with a sequence of replies on that request's stream, each carrying at most 8 MiB of the file in order as an out-of-band `DATA` frame, the last one marked as the end. It reads and sends the next piece without waiting for the local process, so the pipe's own capacity is the only thing that paces it. A piece the worker cannot read ends the sequence with a failed reply, which raises `RuntimeFailure`.
+
+The local process hands each piece to one writing thread through a queue holding at most 4 pieces, so receiving the next piece overlaps writing and hashing the one before it. The writing thread appends each piece to `.<name>.letify-partial.<pid>.<thread id>` beside the target and updates the file digest as it writes, rather than reading the file again afterwards. When the last piece has been written the local process compares the digest, then renames the file over the target with `os.replace` and records the new file in the digest cache. A digest that does not match raises `RuntimeFailure` and the partial file is removed. A download of 64 MiB or more shows the download progress line of Installing external tools.
 
 Concurrent calls that write back to the same local path take one local lock per resolved local path, held for the whole write-back of that output. So one call's files land after the other's, never interleaved inside one file, and the last call to return wins per file. Files only one of the calls wrote are all kept.
 
@@ -1626,6 +1634,8 @@ The dispatching thread appends an entry without taking a lock. When the queue is
 
 A synchronization is one round trip. These synchronize: `Tensor.item()`, `tolist()`, `cpu()` and `to("cpu")` without `non_blocking=True`, `bool()`, `int()` and `float()` of a tensor, which includes control flow on a tensor value, `repr()` and `str()` of a tensor, copying a device tensor into a CPU tensor, an operator whose meta inference raised, the `torch.cuda` queries in [Mapping cuda](#mapping-cuda), `torch.cuda.synchronize()`, and the end of the declared function.
 
+With `auto_fetch` on, `Tensor.item()` and `tolist()` do not synchronize. They return a deferred value, as [Deferred value reads](#forwarding-auto-deferred) describes. `bool()`, `int()` and `float()` of a tensor still synchronize.
+
 A read of one tensor's value sends only what that value depends on when that can be decided from the queue alone. When no repetition of a captured step is unfinished, if the tensor was created by a queued eager entry and no entry after it writes to an argument, the entries up to and including that one are sent with the read, and the rest stay queued in order. If the tensor was created before the queue and no queued entry writes to an argument, the read is sent alone. An operator writes to an argument when its schema marks one as written, which covers in-place operators, `out=` and the running statistics of batch norm. Otherwise the whole queue, the unfinished part of a captured step included, is sent with the read. `torch.cuda.synchronize()` and the end of the declared function always send everything.
 
 The client counts operators, queued entries, batches, round trips, released handles, metadata cache hits, templates, captured steps, replayed operators and fallbacks, and `Client.queued` is the number of entries not yet sent, so ops per round trip and synchronizations per step are read from the session rather than estimated. An operator is counted when it is dispatched, not when its batch is sent, and a replayed operator counts as an operator too. `letify.remoting.device.current_client()` returns the client of the innermost active forwarding, or None outside one, so code inside a `host="local"` function reads `current_client().stats`.
@@ -1643,6 +1653,39 @@ A batch that holds fetch entries asks for one reply, which carries every fetch i
 `letify.fetch(tensor)` is the form for `async def` code. It queues the same fetch when called and returns an awaitable resolving to the CPU tensor, equal to `tensor.cpu()`. Awaiting it waits in a thread from `asyncio.to_thread`, so the event loop keeps running, and `asyncio.gather` over several fetches waits for all of them. Given a tensor that is not on the runtime, it resolves to `tensor.detach().cpu()` with no round trip. An `async def` declared with `host="local"` runs its coroutine to completion with `asyncio.run` in the thread its call runs in.
 
 A fetch skipped because an earlier operator failed raises `RemoteError` where its tensor is used or its awaitable is awaited. A failure carried by a reply that no synchronization waits for is kept, and the next synchronization raises it.
+
+### Deferred value reads <!-- id: forwarding-auto-deferred -->
+
+> A single value read on a forwarded tensor returns a deferred value instead of waiting. The read is queued as `letify.fetch` queues one, and the value is waited for where it is used.
+
+A training loop that logs `loss.item()` every step pays one round trip per step for a number it only prints. Under `host="local"` that read is deferred by default, so the user gets the behaviour of `letify.fetch` without writing it.
+
+**The methods replaced.** While forwarding is active and `auto_fetch` is on, two torch functions on a `RemoteTensor` queue a fetch and return a deferred value: `Tensor.item()` and `Tensor.tolist()`. Nothing else is replaced.
+
+`float(tensor)`, `int(tensor)` and `bool(tensor)` synchronize, and so do `Tensor.__index__`, `numpy()`, `repr()`, `str()`, `cpu()` and `to("cpu")` without `non_blocking=True`, as [Batching and synchronization](#forwarding-batching) says. Each of them has to hand back a value letify cannot follow. CPython raises `TypeError` when `__float__` returns anything but a `float` and when `__int__` returns anything but an `int`, so those two conversions cannot be deferred at all. `bool()` decides control flow, `__index__` selects memory, and the other four hand out a buffer or a formatted string. `loss.item()` is the read a training loop repeats, so deferring it is what removes the round trip per step.
+
+The fetch is queued exactly as `letify.fetch` queues one, through the same `read_later` path, so it reads the tensor at its place in the operator order and a later in-place operator does not change it. The deferred value holds the pending read and the conversion to apply to the filled CPU tensor: `item()` and `float()` give a Python float or int, `int()` gives an int, `tolist()` gives a list.
+
+**Where it resolves.** Resolving waits for that one read only, through the same `Client.wait` a non-blocking copy uses, and never for the whole queue. A deferred value resolves when anything asks for the value it stands for:
+
+| Kind of use | Examples |
+|---|---|
+| Arithmetic and comparison | `+`, `-`, `*`, `/`, `//`, `%`, `**`, `-x`, `abs`, `<`, `<=`, `==`, `!=`, `>`, `>=` |
+| Conversion | `float()`, `int()`, `bool()`, `__index__`, `complex()`, `round()`, `math` functions, which call `__float__` |
+| Text | `str()`, `repr()`, `format()`, an f-string, `%` formatting |
+| Container and iteration | `len()`, `iter()`, indexing, `in` |
+| Leaving the process | pickling, `torch.save`, `copy`, `numpy` array construction |
+| Any other attribute | anything not in the small set below |
+
+Only `__class__`, `__slots__` and the deferred value's own `resolved` property are answered without waiting. Anything else resolves first, so a value that reaches a place letify cannot follow is a real `float`, `int` or `list` by the time it gets there. A C extension argument resolves through `__float__` or `__index__`, `numpy` through `__array__`, and pickling through `__reduce__`, which pickles the resolved value and never the deferred object.
+
+A deferred value is not an instance of `float` or `int`. A library that checks the type instead of converting, such as `json.dump`, raises `TypeError` rather than writing something that is not the number.
+
+**Where everything resolves.** `torch.cuda.synchronize()`, the end of the declared function and `letify.fetch` resolve every pending read, as [Reads without waiting](#forwarding-async-reads) already says of unfilled tensors. The value a `host="local"` call returns is walked before the call returns, through lists, tuples, sets, dictionaries and dataclasses, and every deferred value in it is resolved, so a deferred value never leaves the call and never reaches a checkpoint.
+
+**The setting.** `auto_fetch = false` on the account entry turns the replacement off, and `LETIFY_AUTO_FETCH` in the environment overrides the account entry, with `0`, `false` and `no` meaning off. With it off, `item()`, `tolist()`, `int()` and `float()` synchronize as before, and `letify.fetch` still defers, because it is the explicit form and is not a default.
+
+**What is reported.** The client counts `auto_deferred`, the reads deferred by this replacement, and `resolved_early`, those whose value was asked for before its reply had arrived, so each one cost a wait. A `host="local"` call that deferred at least one read prints one line on standard error at its end, `letify: deferred N value reads, M resolved early`. A workload that gains nothing shows `M` equal to `N`.
 
 ### Step capture <!-- id: forwarding-step-capture -->
 

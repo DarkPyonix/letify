@@ -138,6 +138,10 @@ class Stats:
     fallbacks: int = 0
     #: Non-blocking reads queued.
     deferred: int = 0
+    #: Value reads deferred by the automatic replacement of ``item`` and its neighbours.
+    auto_deferred: int = 0
+    #: Deferred values asked for before their reply had arrived, so each one cost a wait.
+    resolved_early: int = 0
 
     def snapshot(self) -> Stats:
         return Stats(**{field.name: getattr(self, field.name) for field in fields(self)})
@@ -182,11 +186,16 @@ class Client:
         *,
         process: subprocess.Popen | None = None,
         name: str = "device",
+        auto_fetch: bool | None = None,
     ):
+        from .value import auto_fetch_enabled
+
         self.transport = transport
         self.process = process
         self.name = name
         self.stats = Stats()
+        #: Whether a single value read returns a deferred value instead of synchronizing.
+        self.auto_fetch = auto_fetch_enabled(auto_fetch)
         #: The process that connected, the only one that may write to the transport.
         self._pid = os.getpid()
         #: Handles whose last RemoteTensor was collected, appended from ``Ref.__del__``.
@@ -763,6 +772,28 @@ class Client:
         self._enqueue(entry)
         return target
 
+    def read_pending(self, tensor: Any, dtype: torch.dtype | None = None) -> Pending:
+        """Queue a fetch of ``tensor`` and return its pending read.
+
+        The CPU tensor it fills is not registered in ``unfilled``, because only the deferred
+        value of spec "Deferred value reads" holds it and no torch function ever sees it.
+        """
+        self._check_open()
+        if len(self._replies) >= UNREAD_LIMIT:
+            with self._request_lock:
+                if self._replies:
+                    self._receive()
+        with torch._C.DisableTorchFunction():
+            target = torch.empty(tuple(tensor.shape), dtype=dtype or tensor.dtype)
+        entry = (E_REQUEST, "letify.fetch", (tensor._ref.handle, None), "fetch")
+        read = Pending(target, entry)
+        self._cut()
+        self.stats.ops += 1
+        self.stats.auto_deferred += 1
+        self._later[id(entry)] = read
+        self._enqueue(entry)
+        return read
+
     def wait(self, read: Pending) -> torch.Tensor:
         """Send what ``read`` needs and read replies until it is applied."""
         with self._request_lock:
@@ -967,6 +998,7 @@ def connect(
     device: str,
     env: dict[str, str] | None = None,
     name: str = "device",
+    auto_fetch: bool | None = None,
 ) -> Client:
     """Start a device executor as its own process with this command and return a client."""
     check_torch_version(torch.__version__)
@@ -989,7 +1021,7 @@ def connect(
         readinto=process.stdout.readinto,
         owns_fds=False,
     )
-    client = Client(transport, process=process, name=name)
+    client = Client(transport, process=process, name=name, auto_fetch=auto_fetch)
     threading.Thread(
         target=client._drain_stderr, args=(process.stderr,), name=f"{name}-stderr", daemon=True
     ).start()
@@ -1005,11 +1037,13 @@ def connect(
     return client
 
 
-def attach(channel: Any, *, device: str, name: str = "device") -> Client:
+def attach(
+    channel: Any, *, device: str, name: str = "device", auto_fetch: bool | None = None
+) -> Client:
     """Start a device executor inside a persistent channel's call worker and return a client."""
     check_torch_version(torch.__version__)
     transport = ChannelTransport(channel.connection)
-    client = Client(transport, name=name)
+    client = Client(transport, name=name, auto_fetch=auto_fetch)
     channel.request(
         {"op": "device", "device": device, "source": worker_source(None).decode()}, timeout=600
     )

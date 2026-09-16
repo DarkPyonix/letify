@@ -371,14 +371,29 @@ def _op_data_written(request):
     return {"ok": True, "value": _DATA_WRITTEN.pop(request["dir"], {})}
 
 
-def _op_data_get(request):
-    """One piece of a file blob, sent as an out-of-band buffer."""
-    with open(_data_file(request["dir"], request["digest"]), "rb") as handle:
-        handle.seek(request["offset"])
-        buffer = bytearray(request["length"])
-        count = handle.readinto(buffer)
-    del buffer[count:]
-    return {"ok": True, "value": pickle.PickleBuffer(buffer)}
+#: Bytes of one piece of a streamed file blob, one ``DATA`` frame each.
+_DATA_PIECE = 8 << 20
+
+
+def _op_data_stream(stream, request):
+    """Send a whole file blob as replies on one stream, without waiting between pieces.
+
+    Spec "Writing back". The pipe's own capacity paces this, so the link stays busy while
+    the caller writes and hashes the piece before.
+    """
+    path = _data_file(request["dir"], request["digest"])
+    with open(path, "rb") as handle:
+        while True:
+            buffer = bytearray(_DATA_PIECE)
+            count = handle.readinto(buffer)
+            del buffer[count:]
+            last = count < _DATA_PIECE
+            _SENDER.message(REPLY, stream, {
+                "ok": True, "value": pickle.PickleBuffer(buffer), "last": last,
+            })
+            buffer = None
+            if last:
+                return
 
 
 def _data_file(root, digest):
@@ -1567,7 +1582,7 @@ _OPS = {
     "data_evict": _op_data_evict,
     "data_cache": _op_data_cache,
     "data_written": _op_data_written,
-    "data_get": _op_data_get,
+    "data_stream": _op_data_stream,
     "data_stats": _op_data_stats,
     "blob_dir": _op_blob_dir,
     "put_blob": _op_put_blob,
@@ -1585,6 +1600,9 @@ _OPS = {
 
 #: Answered by the frame reader at once, so they work while a call runs.
 _LIGHT = ("stat", "lease")
+
+#: Answered by several replies, the last one marked. These send their own replies.
+_STREAMING = ("data_stream",)
 
 _JOBS = queue.Queue()
 
@@ -1613,9 +1631,24 @@ def _data_serve():
 
 
 def _run(stream, request, settle):
-    op = _OPS.get(request.get("op"))
+    name = request.get("op")
+    op = _OPS.get(name)
     if op is None:
-        outcome = {"ok": False, "error": "unknown op %r" % request.get("op"), "traceback": ""}
+        outcome = {"ok": False, "error": "unknown op %r" % name, "traceback": ""}
+    elif name in _STREAMING:
+        if settle:
+            _settle()
+        try:
+            op(stream, request)
+            return
+        except BaseException as exc:
+            # The sequence ends with a failed reply, which the caller raises.
+            _reply(stream, {
+                "ok": False,
+                "error": "%s: %s" % (type(exc).__name__, exc),
+                "traceback": traceback.format_exc(),
+            })
+            return
     else:
         try:
             outcome = op(request)

@@ -652,6 +652,43 @@ def test_a_large_write_back_shows_the_download_progress_line(let, cpu, project, 
     assert "wrote back 1 files 65.0 MiB" in wrote_back(err)[0]
 
 
+def test_a_written_back_file_travels_as_one_streaming_request(
+    let, cpu, project, monkeypatch
+) -> None:
+    from letify.runtime.session import Runtime
+
+    ops: list[str] = []
+    plain = Runtime.request
+
+    def spy_request(self, payload, **rest):
+        ops.append(str(payload.get("op")))
+        return plain(self, payload, **rest)
+
+    monkeypatch.setattr(Runtime, "request", spy_request)
+    streaming = getattr(Runtime, "stream", None)
+    if streaming is not None:
+
+        def spy_stream(self, payload, **rest):
+            ops.append(str(payload.get("op")))
+            return streaming(self, payload, **rest)
+
+        monkeypatch.setattr(Runtime, "stream", spy_stream)
+
+    run = project / "runs"
+    size = (25 << 20) + 1234
+
+    @let.function(device=cpu, host=letify.remote)
+    def save(out: Path, count: int) -> None:
+        out.mkdir()
+        (out / "big.bin").write_bytes(b"x" * count)
+
+    save(run, size)
+    assert (run / "big.bin").read_bytes() == b"x" * size
+    # One request carries the whole file, however many pieces it arrives in.
+    assert ops.count("data_stream") == 1
+    assert "data_get" not in ops
+
+
 def test_concurrent_calls_writing_one_path_keep_every_file_and_whole_files(
     let, cpu, project
 ) -> None:

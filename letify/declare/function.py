@@ -181,11 +181,14 @@ class Function(Generic[R]):
         runtime = launcher.pool.acquire(instance, self.env, self.volumes)
         try:
             client = runtime.device()
+            before = client.stats.snapshot()
             with client.activate():
                 value = self.fn(*args, **kwargs)
                 if inspect.iscoroutine(value):
                     value = asyncio.run(value)
                 client.synchronize()
+                value = _resolve_deferred(value)
+            _report_deferred(client.stats.snapshot() - before)
         except (RuntimeFailure, ProtocolError) as failure:
             named = runtime.provider.diagnose(runtime, failure)
             launcher.pool.discard(runtime)
@@ -209,6 +212,23 @@ class Function(Generic[R]):
     def __repr__(self) -> str:
         mode = "async" if self.is_async else "sync"
         return f"<Function {self.__name__} {mode} on {self.device!r}>"
+
+
+def _resolve_deferred(value: Any) -> Any:
+    """Resolve every deferred value the call returns, as spec "Deferred value reads" says."""
+    from ..remoting.device.value import resolve
+
+    return resolve(value)
+
+
+def _report_deferred(delta: Any) -> None:
+    """One line naming how many value reads were deferred and how many cost a wait."""
+    if delta.auto_deferred:
+        print(
+            f"letify: deferred {delta.auto_deferred} value reads, "
+            f"{delta.resolved_early} resolved early",
+            file=sys.stderr,
+        )
 
 
 def _where(host: Host | str | None) -> Host:
