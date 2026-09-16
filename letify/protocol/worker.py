@@ -610,6 +610,9 @@ _DATA_PLACING = threading.local()
 #: How far behind the send order an observed read may be before it counts as a miss.
 _DATA_MISS_AHEAD = 32
 
+#: Marks a file being copied into place. It is never listed and never read.
+_DATA_PARTIAL = ".letify-placing."
+
 
 def _data_register(data):
     """Build the call's layout from its manifest, place what has arrived, and patch reads.
@@ -711,9 +714,17 @@ def _data_place_now(state, path, entry):
         except OSError:
             pass
     if not linked:
+        # Copied to a name of its own and renamed into place, so a reader never stats a
+        # file that is half written. Spec "What the body sees before a file arrives".
+        partial = "%s%s%d" % (path, _DATA_PARTIAL, os.getpid())
         try:
-            shutil.copyfile(source, path)
+            shutil.copyfile(source, partial)
+            os.replace(partial, path)
         except OSError:
+            try:
+                os.remove(partial)
+            except OSError:
+                pass
             return False
     info = os.stat(path)
     cached = (info.st_size, info.st_mtime_ns) if linked else None
@@ -936,7 +947,7 @@ def _data_install_patch():
         return found
 
     def listed(path="."):
-        entries = list(real["listdir"](path))
+        entries = [name for name in real["listdir"](path) if _DATA_PARTIAL not in name]
         for name, _size in names_of(path):
             if name not in entries:
                 entries.append(name)
@@ -947,7 +958,7 @@ def _data_install_patch():
         found = real["scandir"](path)
         if not pending:
             return found
-        entries = list(found)
+        entries = [entry for entry in found if _DATA_PARTIAL not in entry.name]
         held = {entry.name for entry in entries}
         prefix = full(path).rstrip("/") + "/"
         for name, size in pending:

@@ -8,6 +8,7 @@ bucket client, which is the ``gcs`` backend.
 
 from __future__ import annotations
 
+import collections
 import json
 import os
 import pathlib
@@ -414,7 +415,10 @@ def prepare(runtime: Runtime, collector: Collector, blobs: str, order: list[str]
             detected_files += 1
             detected_bytes += size
     ordered = [digest for digest in order if digest in sizes]
-    ordered.extend(digest for digest in sizes if digest not in set(ordered))
+    # The membership set is built once: rebuilding it per digest is quadratic in the file
+    # count, which a dataset of thousands of files pays before every call.
+    placed = set(ordered)
+    ordered.extend(digest for digest in sizes if digest not in placed)
     held = set(
         _worker(
             runtime,
@@ -453,7 +457,7 @@ class Stream:
         self.before_files = self.before_bytes = 0
         self.during_files = self.during_bytes = 0
         self.before_seconds = self.during_seconds = 0.0
-        self._queue: list[str] = list(plan.missing)
+        self._queue: collections.deque[str] = collections.deque(plan.missing)
         self._sent: set[str] = set()
         self._lock = threading.Lock()
         self._cancelled = threading.Event()
@@ -510,7 +514,7 @@ class Stream:
     def _take(self) -> str | None:
         with self._lock:
             while self._queue:
-                digest = self._queue.pop(0)
+                digest = self._queue.popleft()
                 if digest not in self._sent:
                     return digest
         return None
@@ -526,12 +530,12 @@ class Stream:
         if not wanted:
             return
         with self._lock:
-            waiting = set(self._queue)
-            front = [digest for digest in dict.fromkeys(wanted) if digest in waiting]
-            if not front:
-                return
-            taken = set(front)
-            self._queue = front + [digest for digest in self._queue if digest not in taken]
+            # Put them in front rather than filtering the queue, which would cost the whole
+            # queue on every want. A digest left behind later is skipped by ``_take``,
+            # because ``_sent`` already holds it.
+            for digest in reversed(list(dict.fromkeys(wanted))):
+                if digest not in self._sent:
+                    self._queue.appendleft(digest)
 
     def cancel(self) -> None:
         """Stop sending, as spec "When a blob does not arrive" requires when a call ends."""

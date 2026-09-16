@@ -310,6 +310,31 @@ def test_the_size_of_a_file_that_has_not_arrived_is_its_final_size(
     assert are_files == [True] * 4
 
 
+def test_a_file_is_never_seen_half_written(launcher_from, project) -> None:
+    """A file inside a directory is copied rather than linked, because the body may rewrite
+    it, and a copy straight to its runtime path can be stat'd with only some of its bytes."""
+    let = streaming(launcher_from, data_first_wave_mib=0)
+    root = dataset(project, 24, size=1 << 18)
+
+    @let.function(device=let.providers.lab.CPU, host=letify.remote)
+    def watch(directory: Path) -> tuple[set[int], list[str]]:
+        seen = set()
+        odd = []
+        for _sweep in range(40):
+            for entry in sorted(directory.iterdir()):
+                if ".letify-placing." in entry.name:
+                    odd.append(entry.name)
+                seen.add(entry.stat().st_size)
+        # Read them all, so the sweeps above overlap files still being placed.
+        for entry in sorted(directory.iterdir()):
+            entry.read_bytes()
+        return seen, odd
+
+    sizes, partials = watch(root)
+    assert sizes == {1 << 18}
+    assert partials == []
+
+
 def test_opening_a_file_that_has_not_arrived_waits_for_it(launcher_from, project) -> None:
     let = streaming(launcher_from, data_first_wave_mib=0)
     root = dataset(project, 4, size=1 << 16)
