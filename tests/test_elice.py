@@ -783,3 +783,27 @@ def test_a_hashed_host_key_entry_for_the_alias_is_forgotten(account) -> None:
     text = known.read_text(encoding="utf-8")
     assert hashed not in text
     assert "other-host" in text
+
+
+def test_a_spot_launch_refused_for_no_capacity_is_unavailable_not_a_runtime_failure(
+    account, fake_eci
+) -> None:
+    # Spec: "Price type". Nothing was created, so this is an availability answer.
+    fake_eci.set(
+        fail={
+            "compute vm launch": {
+                "code": 1,
+                "stderr": (
+                    "Error: No spot capacity available for 'G-A100-1'.\n"
+                    "  nvidia_a100_80gb_pcie: need 1, free 0"
+                ),
+            }
+        }
+    )
+    provider = account()
+    instance = Instance(provider, gpu="A100").priced("spot")
+    with pytest.raises(letify.ProviderUnavailable) as caught:
+        provider.create_session(instance, "letify-a100-spot")
+    message = str(caught.value)
+    assert "G-A100-1" in message
+    assert "ondemand" in message

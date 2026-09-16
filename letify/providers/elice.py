@@ -80,6 +80,9 @@ SSH_POLL_SECONDS = 5.0
 #: What ``spot_fallback`` accepts. Spec "Spot preemption".
 SPOT_FALLBACKS = ("none", "ondemand")
 
+#: Standard error that means the zone has no spot capacity for the type. Spec "Price type".
+NO_SPOT_CAPACITY = "no spot capacity"
+
 #: The key installed on a machine letify launches, as for the other SSH accounts.
 DEFAULT_KEY = "~/.ssh/id_letify"
 
@@ -793,7 +796,18 @@ class Elice(Shell):
         disk = self.config.option("disk_gib")
         if isinstance(disk, (int, str)) and str(disk).isdigit():
             args += ["--size-gib", str(disk)]
-        self._eci(args, parse=False)
+        try:
+            self._eci(args, parse=False)
+        except RuntimeFailure as exc:
+            # Nothing was created, so this is an availability answer rather than a session
+            # that misbehaved, and retrying on a fresh runtime would ask for the same card.
+            if NO_SPOT_CAPACITY in (exc.stderr or "").lower():
+                raise ProviderUnavailable(
+                    self.kind,
+                    f"Elice has no spot capacity for {type_name} in this zone right now. "
+                    'Retry in a few minutes, or set price_type = "ondemand" on the account',
+                ) from exc
+            raise
         return password
 
     def _ensure_started(self, machine: str, record: Mapping[str, Any]) -> dict[str, Any]:
