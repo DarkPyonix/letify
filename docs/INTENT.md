@@ -54,6 +54,17 @@ Forwarding is viable only if a step that dispatches dozens to thousands of opera
 
 The wait before a remote call's first step is proportional to the bytes that step reads, not to the size of the dataset, because letify derives the read order from the pickled call itself, sends only the first wave of that order before the call, and keeps sending the rest in the background while the call runs.
 
+## How an experiment reports efficiency
+
+This standard sits here rather than in `docs/SPEC.md` because it governs how a claim is tested, not what the system does. The spec records the design; this records what a report has to show before a claim above may be called supported. Every experiment pull request follows it.
+
+1. **Report efficiency twice.** Once as whole wall time, from the user's command to the result, including connection, session setup, the wait before the first step, all step time, transfer during the call and write-back. Once as step time only. Every table says which of the two it holds, in its caption or its column name, and no table mixes them.
+2. **Measure the direct-run baseline both ways too.** Running on the machine directly also moves data: report it once with the `scp` of the dataset and the copy back of the results included, and once without them. A letify whole wall time compared against a bare step time is not a comparison.
+3. **Separate the first run from repeated runs.** A first run on a machine pays a transfer in both directions, while a repeat may pay none, so the two go in different rows and are never averaged together. State the run index. The question the repeated case answers is whether letify adds overhead once the data is already there, and that is the number a reader is looking for.
+4. **Name the mode in every table.** `host="remote"` and `host="local"` have different cost models, so a table names the one it measured and never holds both.
+
+A report that omits one of the four is incomplete, and its claim stays open.
+
 ## Constraints
 
 - **The Python package is pure Python.** No compiled extension in `letify/`. A wheel that has to be built for each platform is a maintenance cost this project will not carry, and hashing and transfer are not CPU bound at the link speeds involved.
