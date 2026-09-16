@@ -149,6 +149,14 @@ class Shell(Provider):
 
         return find("tailcat") or "tailcat"
 
+    def remote_command(self, command: str) -> str:
+        """The command a link runs on the machine, which a provider may wrap.
+
+        A plain machine needs no wrapping. Colab overrides this because its driver
+        libraries are named only in the notebook kernel's own environment.
+        """
+        return command
+
     def ssh_command(self, remote_command: str | None = None) -> list[str]:
         """Build the OpenSSH command line that reaches this machine's address directly."""
         from ..config.secrets import account_directory
@@ -301,7 +309,7 @@ class Shell(Provider):
         )
         link = self.link()
         result = subprocess.run(
-            link.ssh_command(remote),
+            link.ssh_command(self.remote_command(remote)),
             capture_output=True,
             text=True,
             timeout=120,
@@ -386,7 +394,10 @@ class Shell(Provider):
         def run(command: tuple[str, ...]) -> str:
             remote = shlex.join(command)
             result = subprocess.run(
-                link.ssh_command(remote), capture_output=True, text=True, timeout=120
+                link.ssh_command(self.remote_command(remote)),
+                capture_output=True,
+                text=True,
+                timeout=120,
             )
             if result.returncode != 0:
                 raise RuntimeFailure(
@@ -426,7 +437,9 @@ class Shell(Provider):
                 files=getattr(link, "files", None),
             )
         return PersistentChannel(
-            link.ssh_command(f"{self.remote_python} -u -c {shlex.quote(BOOTSTRAP)}"),
+            link.ssh_command(
+                self.remote_command(f"{self.remote_python} -u -c {shlex.quote(BOOTSTRAP)}")
+            ),
             name=runtime.name,
         )
 
