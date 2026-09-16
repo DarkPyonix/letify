@@ -51,6 +51,8 @@ class Function(Generic[R]):
         volumes: Sequence[Volume] = (),
         timeout: float | None = None,
         retries: int = 1,
+        data_order: Any = None,
+        data_first_wave: int | None = None,
     ):
         self.fn = fn
         self.launcher = launcher
@@ -59,6 +61,9 @@ class Function(Generic[R]):
         self.volumes = tuple(volumes)
         self.timeout = timeout
         self.retries = retries
+        #: Spec "The send order and the first wave": a declared order outranks the analysis.
+        self.data_order = data_order
+        self.data_first_wave = data_first_wave
         self.is_async = inspect.iscoroutinefunction(fn)
         self.device = self._place(device)
         update_wrapper(self, fn)
@@ -147,6 +152,8 @@ class Function(Generic[R]):
                     args,
                     kwargs,
                     timeout=self.timeout,
+                    data_order=self.data_order,
+                    data_first_wave=self.data_first_wave,
                 )
             except (RuntimeFailure, ProtocolError) as failure:
                 # The session misbehaved rather than the user's code, so this runtime

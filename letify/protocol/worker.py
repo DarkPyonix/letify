@@ -258,15 +258,19 @@ def _op_call(request):
     data = request.pop("data", None)
     if data is None:
         return _call(request)
-    placed = _data_link(data)
+    state = _data_register(data)
     try:
         outcome = _call(request)
+        # Unregistered first, so the write-back walks the real file system rather than the
+        # manifest, and a file that never arrived is simply not there.
+        _data_unregister(state)
         if data.get("outputs"):
-            _DATA_WRITTEN[data["dir"]] = _data_collect(data, placed)
+            _DATA_WRITTEN[data["dir"]] = _data_collect(data, state["placed"])
         return outcome
     finally:
         import shutil
-        _data_check_cache(data, placed)
+        _data_unregister(state)
+        _data_check_cache(data, state["placed"])
         shutil.rmtree(data["dir"], ignore_errors=True)
 
 
@@ -551,6 +555,7 @@ def _op_data_put(request):
         del _DATA_OPEN[digest]
         handle.close()
         _data_commit(partial, final, digest, hasher)
+        _data_arrived(request["dir"], digest)
     return {"ok": True, "value": None}
 
 
@@ -586,6 +591,7 @@ def _op_data_pull(request):
                         if hasher is not None:
                             hasher.update(piece)
                 _data_commit(partial, final, digest, hasher)
+                _data_arrived(root, digest)
             except BaseException as exc:
                 with lock:
                     failures.append("%s: %s" % (digest, exc))
@@ -602,32 +608,622 @@ def _op_data_pull(request):
     return {"ok": True, "value": None}
 
 
-def _data_link(data):
-    """Place each file of a call at its runtime path, a hard link to the cache or a copy."""
-    import shutil
-    placed = {}
+class _DataFailure(Exception):
+    """A blob that never arrived. Infrastructure, so the caller may retry the call."""
+
+
+# Calls whose data is still arriving, by call directory, and what each is waiting for.
+_DATA_CALLS = {}
+_DATA_STATS = {}
+_DATA_READY = threading.Condition()
+_DATA_PATCHED = []
+
+#: Set while this thread is placing a file. The patch below stands aside for it, because
+#: placing one opens and stats the very paths the patch answers from the manifest.
+_DATA_PLACING = threading.local()
+
+#: How far behind the send order an observed read may be before it counts as a miss.
+_DATA_MISS_AHEAD = 32
+
+#: Marks a file being copied into place. It is never listed and never read.
+_DATA_PARTIAL = ".letify-placing."
+
+
+def _data_register(data):
+    """Build the call's layout from its manifest, place what has arrived, and patch reads.
+
+    Spec "What the body sees before a file arrives": every directory exists before the call
+    starts, a file appears only once its blob is complete, and everything else is answered
+    from the manifest.
+    """
+    state = {
+        "dir": data["dir"],
+        "blobs": data["blobs"],
+        "placed": {},
+        "pending": {},
+        "by_digest": {},
+        "copy": {},
+        "order": {},
+        "arrived": 0,
+        "wait": float(data.get("wait") or 600.0),
+        "observe": bool(data.get("observe", True)),
+        "prefetch": int(data.get("prefetch") or 64),
+        "files": 0,
+        "bytes": 0,
+        "seconds": 0.0,
+        "waiting": 0,
+        "since": None,
+        "first": None,
+        "misses": 0,
+    }
+    for index, digest in enumerate(data.get("order") or ()):
+        state["order"][digest] = index
     for directory in data.get("dirs", ()):
         os.makedirs(directory, exist_ok=True)
     for path, digest, copy in data.get("links", ()):
+        state["copy"][path] = bool(copy)
+    manifest = data.get("manifest") or {}
+    for path, entry in manifest.items():
+        digest, size = entry[0], int(entry[1])
+        state["pending"][path] = (digest, size)
+        state["by_digest"].setdefault(digest, []).append(path)
         os.makedirs(os.path.dirname(path), exist_ok=True)
-        source = _data_file(data["blobs"], digest)
+    if not manifest:
+        # No manifest travelled, so every link the call carries is already in the cache.
+        for path, digest, _copy in data.get("links", ()):
+            state["pending"][path] = (digest, 0)
+            state["by_digest"].setdefault(digest, []).append(path)
+    with _DATA_READY:
+        _DATA_CALLS[state["dir"]] = state
+        for path in list(state["pending"]):
+            _data_place(state, path)
+    if state["pending"]:
+        # Only a call still waiting for bytes needs the patch, the manifest on disk and the
+        # wrappers. A call whose files are all placed reads the real file system.
+        _data_install_patch()
+        _data_write_manifest(state)
+        _data_observe(state)
+    return state
+
+
+def _data_unregister(state):
+    """Stop answering this call's reads from the manifest, and keep its wait counters."""
+    with _DATA_READY:
+        if _DATA_CALLS.pop(state["dir"], None) is None:
+            return
+        _DATA_STATS[state["dir"]] = {
+            "files": state["files"],
+            "bytes": state["bytes"],
+            "seconds": state["seconds"],
+            "first": state["first"],
+            "misses": state["misses"],
+        }
+        _DATA_READY.notify_all()
+
+
+def _data_place(state, path):
+    """Put one file at its runtime path when its blob is complete. Answers whether it is."""
+    entry = state["pending"].get(path)
+    if entry is None:
+        return path in state["placed"]
+    _DATA_PLACING.on = True
+    try:
+        return _data_place_now(state, path, entry)
+    finally:
+        _DATA_PLACING.on = False
+
+
+def _data_place_now(state, path, entry):
+    """Place one file, with this thread's reads going to the real file system."""
+    digest, _size = entry
+    source = _data_file(state["blobs"], digest)
+    if not os.path.isfile(source):
+        return False
+    import shutil
+    try:
+        os.utime(source)
+    except OSError:
+        pass
+    linked = False
+    if not state["copy"].get(path, False):
         try:
-            os.utime(source)
+            os.link(source, path)
+            linked = True
         except OSError:
             pass
-        linked = False
-        if not copy:
+    if not linked:
+        # Copied to a name of its own and renamed into place, so a reader never stats a
+        # file that is half written. Spec "What the body sees before a file arrives".
+        partial = "%s%s%d" % (path, _DATA_PARTIAL, os.getpid())
+        try:
+            shutil.copyfile(source, partial)
+            os.replace(partial, path)
+        except OSError:
             try:
-                os.link(source, path)
-                linked = True
+                os.remove(partial)
             except OSError:
                 pass
-        if not linked:
-            shutil.copyfile(source, path)
-        info = os.stat(path)
-        cached = (info.st_size, info.st_mtime_ns) if linked else None
-        placed[path] = (digest, info.st_ino, info.st_size, info.st_mtime_ns, cached)
-    return placed
+            return False
+    info = os.stat(path)
+    cached = (info.st_size, info.st_mtime_ns) if linked else None
+    state["placed"][path] = (digest, info.st_ino, info.st_size, info.st_mtime_ns, cached)
+    del state["pending"][path]
+    return True
+
+
+def _data_arrived(blobs, digest):
+    """A blob finished arriving: place every file of every running call that wants it."""
+    with _DATA_READY:
+        for state in _DATA_CALLS.values():
+            if state["blobs"] != blobs:
+                continue
+            state["arrived"] += 1
+            for path in list(state["by_digest"].get(digest, ())):
+                if path in state["pending"]:
+                    _data_place(state, path)
+        _DATA_READY.notify_all()
+
+
+def _data_want(digests, blocking=False):
+    """Ask the local process for these blobs, in this order. Nothing replies to it."""
+    if not digests:
+        return
+    message = {"op": "data_want", "digests": list(digests), "blocking": blocking}
+    try:
+        _SENDER.message(REQUEST, DATA_STREAM, message)
+    except OSError:
+        pass
+
+
+def _data_state_for(path):
+    """The running call a path belongs to, or None."""
+    for state in _DATA_CALLS.values():
+        if path.startswith(state["dir"]):
+            return state
+    return None
+
+
+def _data_wait(path):
+    """Block this caller until the file at ``path`` holds all of its bytes.
+
+    Spec "Streaming the rest while the call runs": only the thread that opened the file
+    waits, and the call, its other readers and the background sender keep running.
+    """
+    with _DATA_READY:
+        state = _data_state_for(path)
+        if state is None or path in state["placed"]:
+            return
+        entry = state["pending"].get(path)
+        if entry is None:
+            return
+        digest, size = entry
+        index = state["order"].get(digest)
+        if index is not None and index > state["arrived"] + _DATA_MISS_AHEAD:
+            state["misses"] += 1
+        started = time.monotonic()
+        if state["waiting"] == 0:
+            state["since"] = started
+        state["waiting"] += 1
+        state["files"] += 1
+        state["bytes"] += size
+        if state["first"] is None:
+            state["first"] = os.path.basename(path)
+        deadline = started + state["wait"]
+    _data_want([digest], True)
+    try:
+        with _DATA_READY:
+            while path in state["pending"] and state["dir"] in _DATA_CALLS:
+                left = deadline - time.monotonic()
+                if left <= 0:
+                    raise _DataFailure(
+                        "the file blob %s of %s did not arrive within %.0f s"
+                        % (digest, os.path.basename(path), state["wait"])
+                    )
+                _DATA_READY.wait(min(left, 0.5))
+    finally:
+        with _DATA_READY:
+            state["waiting"] -= 1
+            if state["waiting"] == 0 and state["since"] is not None:
+                state["seconds"] += time.monotonic() - state["since"]
+                state["since"] = None
+
+
+def _op_data_stats(request):
+    """What a finished call waited for, as spec "Data log line" reports it."""
+    return {"ok": True, "value": _DATA_STATS.pop(request["dir"], {})}
+
+
+def _data_pending_entry(state, path):
+    """The manifest entry of a file that has not arrived, or None."""
+    return state["pending"].get(path)
+
+
+class _PendingEntry:
+    """A directory entry of a file the manifest names but the runtime does not hold yet."""
+
+    __slots__ = ("name", "path", "_size")
+
+    def __init__(self, name, path, size):
+        self.name = name
+        self.path = path
+        self._size = size
+
+    def inode(self):
+        return 0
+
+    def is_dir(self, follow_symlinks=True):
+        return False
+
+    def is_file(self, follow_symlinks=True):
+        return True
+
+    def is_symlink(self):
+        return False
+
+    def stat(self, follow_symlinks=True):
+        return _data_fake_stat(self._size)
+
+
+class _Scandir:
+    """What the patched ``os.scandir`` answers: real entries, then the pending ones."""
+
+    def __init__(self, entries, close):
+        self._entries = entries
+        self._close = close
+
+    def __iter__(self):
+        return iter(self._entries)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exception):
+        self.close()
+        return False
+
+    def close(self):
+        if self._close is not None:
+            self._close.close()
+            self._close = None
+
+
+def _data_fake_stat(size):
+    """A stat result for a file that has not arrived: a regular file of its final size."""
+    return os.stat_result((0o100444, 0, 0, 1, 0, 0, int(size), 0, 0, 0))
+
+
+def _data_install_patch():
+    """Answer listings and sizes from the manifest, and block a read until its file is here.
+
+    Installed once in the process that runs the body, so anything the body forks inherits it.
+    """
+    if _DATA_PATCHED:
+        return
+    _DATA_PATCHED.append(True)
+    import builtins
+    import io
+    real = {
+        "open": builtins.open,
+        "io_open": io.open,
+        "os_open": os.open,
+        "listdir": os.listdir,
+        "scandir": os.scandir,
+        "stat": os.stat,
+        "lstat": os.lstat,
+    }
+
+    def full(path):
+        try:
+            return os.path.abspath(os.fspath(path))
+        except TypeError:
+            return None
+
+    def pending_of(path):
+        if not _DATA_CALLS or getattr(_DATA_PLACING, "on", False):
+            return None
+        text = full(path)
+        if text is None:
+            return None
+        state = _data_state_for(text)
+        if state is None:
+            return None
+        entry = _data_pending_entry(state, text)
+        return (state, text, entry) if entry is not None else None
+
+    def wait_for(path):
+        found = pending_of(path)
+        if found is not None:
+            _data_wait(found[1])
+
+    def opened(file, *args, **kwargs):
+        wait_for(file)
+        return real["open"](file, *args, **kwargs)
+
+    def io_opened(file, *args, **kwargs):
+        wait_for(file)
+        return real["io_open"](file, *args, **kwargs)
+
+    def os_opened(path, *args, **kwargs):
+        wait_for(path)
+        return real["os_open"](path, *args, **kwargs)
+
+    def names_of(path):
+        """The manifest names of the directory at ``path``, pending ones included."""
+        if not _DATA_CALLS or getattr(_DATA_PLACING, "on", False):
+            return ()
+        text = full(path)
+        if text is None:
+            return ()
+        state = _data_state_for(text)
+        if state is None:
+            return ()
+        prefix = text.rstrip("/") + "/"
+        found = []
+        for pending in state["pending"]:
+            if pending.startswith(prefix) and "/" not in pending[len(prefix):]:
+                found.append((pending[len(prefix):], state["pending"][pending][1]))
+        return found
+
+    def listed(path="."):
+        entries = [name for name in real["listdir"](path) if _DATA_PARTIAL not in name]
+        for name, _size in names_of(path):
+            if name not in entries:
+                entries.append(name)
+        return entries
+
+    def scanned(path="."):
+        pending = names_of(path)
+        found = real["scandir"](path)
+        if not pending:
+            return found
+        entries = [entry for entry in found if _DATA_PARTIAL not in entry.name]
+        held = {entry.name for entry in entries}
+        prefix = full(path).rstrip("/") + "/"
+        for name, size in pending:
+            if name not in held:
+                entries.append(_PendingEntry(name, prefix + name, size))
+        return _Scandir(entries, found)
+
+    def stated(path, **kwargs):
+        try:
+            return real["stat"](path, **kwargs)
+        except FileNotFoundError:
+            found = pending_of(path)
+            if found is None:
+                raise
+            return _data_fake_stat(found[2][1])
+
+    def lstated(path, **kwargs):
+        try:
+            return real["lstat"](path, **kwargs)
+        except FileNotFoundError:
+            found = pending_of(path)
+            if found is None:
+                raise
+            return _data_fake_stat(found[2][1])
+
+    def disguise(patched, module, name):
+        """Give a wrapper the name it replaced, so pickling it finds the name, not the
+        closure. A process the body spawns would otherwise be sent this function by value,
+        and it holds things no pickle can carry."""
+        patched.__module__ = module
+        patched.__name__ = name
+        patched.__qualname__ = name
+        return patched
+
+    builtins.open = disguise(opened, "builtins", "open")
+    io.open = disguise(io_opened, "io", "open")
+    os.open = disguise(os_opened, "os", "open")
+    os.listdir = disguise(listed, "os", "listdir")
+    os.scandir = disguise(scanned, "os", "scandir")
+    os.stat = disguise(stated, "os", "stat")
+    os.lstat = disguise(lstated, "os", "lstat")
+
+
+def _data_write_manifest(state):
+    """Write the call's manifest beside its files, for a process started fresh.
+
+    Spec "What the body sees before a file arrives": a spawned interpreter installs the
+    same patch from ``letify_pending.pth`` and reads the layout from here, because it has
+    no channel of its own to ask on.
+    """
+    import json
+    entries = {}
+    for path, (_digest, size) in state["pending"].items():
+        entries[path] = size
+    for path in state["placed"]:
+        entries.setdefault(path, os.path.getsize(path) if os.path.isfile(path) else 0)
+    try:
+        with open(os.path.join(state["dir"], ".letify-pending.json"), "w") as handle:
+            json.dump({"dir": state["dir"], "files": entries, "wait": state["wait"]}, handle)
+    except OSError:
+        return
+    directory = os.path.join(os.path.dirname(state["blobs"]), "pending")
+    try:
+        os.makedirs(directory, exist_ok=True)
+        with open(os.path.join(directory, "letify_pending.py"), "w") as handle:
+            handle.write(_PENDING_MODULE)
+        with open(os.path.join(directory, "letify_pending.pth"), "w") as handle:
+            handle.write("import letify_pending\n")
+    except OSError:
+        return
+    existing = os.environ.get("PYTHONPATH", "")
+    parts = [part for part in existing.split(os.pathsep) if part]
+    if directory not in parts:
+        os.environ["PYTHONPATH"] = os.pathsep.join([directory, *parts])
+    os.environ["LETIFY_PENDING"] = state["dir"]
+
+
+#: Installed in a process the body starts fresh. It answers the same listings from the
+#: manifest file and waits for a file to appear, which the worker places as blobs arrive.
+_PENDING_MODULE = """
+# letify: answer a streaming call's listings in a process started fresh.
+
+import builtins
+import io
+import json
+import os
+import time
+
+
+def _install():
+    call_dir = os.environ.get("LETIFY_PENDING")
+    if not call_dir:
+        return
+    try:
+        with open(os.path.join(call_dir, ".letify-pending.json")) as handle:
+            record = json.load(handle)
+    except (OSError, ValueError):
+        return
+    files = record.get("files") or {}
+    wait = float(record.get("wait") or 600.0)
+    real_open, real_io_open = builtins.open, io.open
+    real_listdir, real_scandir = os.listdir, os.scandir
+    real_stat = os.stat
+
+    def missing(path):
+        try:
+            text = os.path.abspath(os.fspath(path))
+        except TypeError:
+            return None
+        if not text.startswith(call_dir) or os.path.exists(text):
+            return None
+        return text if text in files else None
+
+    def wait_for(path):
+        text = missing(path)
+        if text is None:
+            return
+        deadline = time.monotonic() + wait
+        while not os.path.exists(text):
+            if time.monotonic() >= deadline:
+                raise RuntimeError("letify: %s did not arrive within %.0f s" % (text, wait))
+            time.sleep(0.02)
+
+    def opened(file, *args, **kwargs):
+        wait_for(file)
+        return real_open(file, *args, **kwargs)
+
+    def io_opened(file, *args, **kwargs):
+        wait_for(file)
+        return real_io_open(file, *args, **kwargs)
+
+    def names(path):
+        try:
+            text = os.path.abspath(os.fspath(path))
+        except TypeError:
+            return []
+        if not text.startswith(call_dir):
+            return []
+        prefix = text.rstrip("/") + "/"
+        return [
+            name[len(prefix):]
+            for name in files
+            if name.startswith(prefix) and "/" not in name[len(prefix):]
+        ]
+
+    def listed(path="."):
+        found = list(real_listdir(path))
+        for name in names(path):
+            if name not in found:
+                found.append(name)
+        return found
+
+    def stated(path, **kwargs):
+        try:
+            return real_stat(path, **kwargs)
+        except FileNotFoundError:
+            text = missing(path)
+            if text is None:
+                raise
+            return os.stat_result((0o100444, 0, 0, 1, 0, 0, int(files[text]), 0, 0, 0))
+
+    builtins.open = opened
+    io.open = io_opened
+    os.listdir = listed
+    os.stat = stated
+    os.scandir = real_scandir
+
+
+_install()
+"""
+
+
+def _data_observe(state):
+    """Report the read order the body actually takes, as spec "Observing the read order on
+    the runtime" describes. Every wrapper calls the original and only reports what it saw."""
+    if not state["observe"]:
+        return
+    try:
+        import torch.utils.data as data_module
+    except BaseException:
+        return
+    if getattr(data_module, "_letify_observed", False):
+        return
+    data_module._letify_observed = True
+    prefetch = state["prefetch"]
+
+    def digests_of(paths):
+        found = []
+        for path in paths:
+            try:
+                text = os.path.abspath(os.fspath(path))
+            except TypeError:
+                continue
+            for call in list(_DATA_CALLS.values()):
+                entry = call["pending"].get(text)
+                if entry is not None:
+                    found.append(entry[0])
+        return found
+
+    def sequence_of(dataset):
+        for name in ("samples", "imgs", "files", "paths", "image_paths"):
+            found = getattr(dataset, name, None)
+            if isinstance(found, (list, tuple)) and found:
+                return found
+        return None
+
+    loader = getattr(data_module, "DataLoader", None)
+    if loader is not None and not getattr(loader, "_letify_wrapped", False):
+        original = loader.__iter__
+
+        def __iter__(self):
+            try:
+                sequence = sequence_of(getattr(self, "dataset", None))
+                sampler = getattr(self, "batch_sampler", None) or getattr(self, "sampler", None)
+                if sequence is not None and sampler is not None:
+                    ahead = max(1, prefetch) * max(1, int(getattr(self, "batch_size", 1) or 1))
+                    wanted = []
+                    for item in sampler:
+                        for index in item if isinstance(item, (list, tuple)) else (item,):
+                            if isinstance(index, int) and 0 <= index < len(sequence):
+                                wanted.append(sequence[index])
+                        if len(wanted) >= ahead:
+                            break
+                    _data_want(digests_of(wanted))
+            except BaseException:
+                pass
+            return original(self)
+
+        loader.__iter__ = __iter__
+        loader._letify_wrapped = True
+
+    dataset = getattr(data_module, "Dataset", None)
+    if dataset is not None and not getattr(dataset, "_letify_wrapped", False):
+        base = dataset.__getitem__
+
+        def __getitem__(self, index):
+            try:
+                sequence = sequence_of(self)
+                if sequence is not None and isinstance(index, int):
+                    ahead = sequence[index : index + max(1, prefetch)]
+                    _data_want(digests_of(ahead))
+            except BaseException:
+                pass
+            return base(self, index)
+
+        dataset.__getitem__ = __getitem__
+        dataset._letify_wrapped = True
 
 
 def _call(request):
@@ -987,6 +1583,7 @@ _OPS = {
     "data_cache": _op_data_cache,
     "data_written": _op_data_written,
     "data_stream": _op_data_stream,
+    "data_stats": _op_data_stats,
     "blob_dir": _op_blob_dir,
     "put_blob": _op_put_blob,
     "put_file": _op_put_file,
@@ -1008,6 +1605,29 @@ _LIGHT = ("stat", "lease")
 _STREAMING = ("data_stream",)
 
 _JOBS = queue.Queue()
+
+#: Data requests, served by a thread of their own so they run while a call runs.
+_DATA_JOBS = queue.Queue()
+_DATA_THREAD = []
+
+
+def _data_start():
+    """Start the thread that answers data requests, once."""
+    if _DATA_THREAD:
+        return
+    thread = threading.Thread(target=_data_serve, daemon=True)
+    _DATA_THREAD.append(thread)
+    thread.start()
+
+
+def _data_serve():
+    while True:
+        job = _DATA_JOBS.get()
+        if job is None:
+            return
+        stream, request = job
+        job = None
+        _run(stream, request, False)
 
 
 def _run(stream, request, settle):
@@ -1038,6 +1658,9 @@ def _run(stream, request, settle):
                 "error": "%s: %s" % (type(exc).__name__, exc),
                 "traceback": traceback.format_exc(),
             }
+            if isinstance(exc, _DataFailure):
+                # Infrastructure rather than the body's own error, so the call may be retried.
+                outcome["kind"] = "runtime"
     # Dropped before replying, so a pull token the request carried lives no longer.
     request = None
     if settle:
@@ -1199,6 +1822,12 @@ def _read():
         op = request.get("op") if isinstance(request, dict) else None
         if op in _LIGHT:
             _run(stream, request, False)
+            continue
+        if op is not None and op.startswith("data_"):
+            # Served beside the call, because the blobs a running call is waiting for
+            # cannot queue behind it. Spec "Streaming the rest while the call runs".
+            _data_start()
+            _DATA_JOBS.put((stream, request))
             continue
         if op == "listen":
             connection = _listen(stream, request)

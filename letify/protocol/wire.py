@@ -38,6 +38,10 @@ SHUTDOWN = 7
 #: The stream that carries the PyTorch device executor's messages. Calls take odd ids.
 DEVICE_STREAM = 2
 
+#: The stream the worker asks for file blobs on, as spec "Streaming the rest while the call
+#: runs" describes. Nothing replies on it, so it never opens a request slot.
+DATA_STREAM = 4
+
 #: The largest payload of one ``DATA`` frame, so other streams interleave between chunks.
 CHUNK = 8 << 20
 

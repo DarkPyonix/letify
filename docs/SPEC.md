@@ -281,7 +281,7 @@ The token is never an argument and never printed. Reads pass `--format json`. A 
 
 The runtime's `external_id` is the machine name, and the session runs over forward SSH to the address.
 
-**Stop.** Ending a session acts once no other runtime of this provider is on the machine, and follows the account's `persistent` setting, default `false` for Elice. On a persistent account letify runs `eci compute vm stop <name>`: an idle machine bills no compute, while its disk and public IP keep billing, and the next session starts the same machine with its disk. On an account that is not persistent a machine letify launched is deleted with `eci compute vm delete <name> --cascade -y`, which removes its disk, network interface and public IP, so nothing keeps billing, and the next session launches a new machine. A machine the account names with `machine_id` is never deleted; it is stopped. A stop or delete that fails prints `letify: could not stop <name>: <reason>. Run 'eci compute vm stop <name>'` or `letify: could not delete <name>: <reason>. Run 'eci compute vm delete <name> --cascade -y'` and does not raise, because the session is already ending. `letify logout` deletes nothing on Elice.
+**Stop.** An Elice machine letify launched is deleted at the end of the session unless the account is persistent. Ending a session acts once no other runtime of this provider is on the machine, and follows the account's `persistent` setting, default `false` for Elice. On a persistent account letify runs `eci compute vm stop <name>`: an idle machine bills no compute, while its disk and public IP keep billing, and the next session starts the same machine with its disk. On an account that is not persistent a machine letify launched is deleted with `eci compute vm delete <name> --cascade -y`, which removes its disk, network interface and public IP, so nothing keeps billing, and the next session launches a new machine. A machine the account names with `machine_id` is never deleted; it is stopped. A stop or delete that fails prints `letify: could not stop <name>: <reason>. Run 'eci compute vm stop <name>'` or `letify: could not delete <name>: <reason>. Run 'eci compute vm delete <name> --cascade -y'` and does not raise, because the session is already ending. `letify logout` deletes nothing on Elice.
 
 **A start that fails.** When a session start raises after letify launched or started a machine for it and before the session runs, and no other runtime of this provider is on that machine, letify ends the machine as Stop describes, deleting it on an account that is not persistent and stopping it otherwise, and then raises the original error. So a failed start leaves nothing billing compute, and on a non-persistent account nothing billing at all.
 
@@ -840,7 +840,7 @@ Nothing hands a session to the caller. There is no call that returns one, no arg
 
 ### Project data <!-- id: project-data -->
 
-> A call's data is found in the call itself. Every local `pathlib.Path` the function reaches is sent as content addressed file blobs, only the blobs the runtime or the account's bucket lacks travel, and the body sees a path on the runtime with the same layout. What the body writes into a detected directory or a path that did not exist comes back to the local path when the call returns. The runtime's file blob cache is kept within a byte budget.
+> A call's data is found in the call itself. Every local `pathlib.Path` the function reaches is sent as content addressed file blobs, only the blobs the runtime or the account's bucket lacks travel, and the body sees a path on the runtime with the same layout. The call is sent once the first wave of a send order derived from the call is placed, and the rest of the dataset arrives in the background while the call runs. What the body writes into a detected directory or a path that did not exist comes back to the local path when the call returns. The runtime's file blob cache is kept within a byte budget.
 
 The declared function is sent with cloudpickle, which serializes its closure variables, the globals it references, its default arguments and the call's arguments. letify's pickler intercepts every `os.PathLike` among them through `reducer_override`. Nothing is declared: the function's own references are the declaration.
 
@@ -878,11 +878,88 @@ The runtime keeps a file blob cache at `<workspace root>/data/blobs/<first two h
 
 `bucket = "<name>"` on an account names a Cloud Storage bucket for its data, reached as the `gcs` backend describes. `bucket_prefix` sets the object prefix, `letify` by default, and `bucket_endpoint` and `sts_endpoint` point the client and the token exchange elsewhere. A persistent account ignores `bucket`.
 
+The file blob cache lives inside the runtime's container, so it disappears when the container does. A later container on the same ephemeral provider can therefore fetch from an object store outside the container or from the local process, and from nothing else, which is why `bucket` exists. The two problems are answered separately: the bucket removes the repeated upload of a dataset the account has already sent once, and the send order with the background sender removes the wait before the first step. Neither replaces the other.
+
 Over the channel, a file travels in `data_put` requests of at most 64 MiB each, carried as out-of-band `DATA` frames. The worker writes them to `<digest>.partial.<pid>`, checks the digest of the whole file, and renames it into the cache. A digest that does not match raises `RuntimeFailure` and nothing is renamed.
 
 From the bucket, the worker receives one `data_pull` request naming each missing digest's object URL and the request headers, which carry a read token downscoped to the bucket and prefix exactly as Materializing into a runtime describes. It downloads up to 8 objects at a time into the cache with the same partial file and digest check, and discards the headers when the request finishes.
 
 An upload of 64 MiB or more shows the download progress line of Installing external tools on standard error, with `uploading` in place of `downloading`.
+
+#### The send order and the first wave <!-- id: project-data-send-order -->
+
+The local process does not send the whole dataset before the call. It computes a send order over the missing blobs, sends the first wave of that order, sends the call as soon as that wave is placed on the runtime, and keeps a background sender pushing the rest in the same order while the call runs. So the wait before the call is the first wave, not the dataset.
+
+The first wave is decided before the call is sent, by analysing what the local process already holds, because nothing is running remotely yet and there is nothing to observe. The order after the call starts comes from the runtime instead, from the reads the body actually makes, which Observing the read order on the runtime describes. The code-object scan below serves the first wave only and is not the source of the later order.
+
+The analysis reads three things, in this order of authority:
+
+1. **The pickled arguments.** An object among the arguments, defaults, closure cells or referenced globals that carries a file order gives that order directly. A list, tuple or dict of detected paths is read in its own order. An object that exposes `letify_read_order()` returning an iterable of `os.PathLike` is asked, and its answer is used as given. A `torch.utils.data.Dataset` is inspected for a sequence attribute of detected paths, `samples`, `imgs`, `files`, `paths` or `image_paths`, the names PyTorch's own dataset classes use. When a `torch.utils.data.DataLoader` is among them, its `sampler` or `batch_sampler` is iterated once with the generator it carries, and the indices it yields reorder that sequence. So a shuffled loader with a fixed seed gives the exact epoch order, and an unseeded one falls to the sequence's own order.
+2. **The function's code.** The declared function's code object, and the code objects of the functions it names in its globals to a depth of 2, are walked for the constants and names they carry. A detected path that appears as a constant, or a global whose value is a detected path, is ordered by the position of its first read. A read is a call in the code to `open`, `io.open`, `os.open`, `Path.open`, `read_text`, `read_bytes`, `np.load`, `np.memmap`, `torch.load`, `pandas.read_csv`, `pandas.read_parquet`, `PIL.Image.open`, `json.load`, `pickle.load` or `safetensors.torch.load_file`, taken by attribute or function name, with the path as an argument. A detected directory named by a call to `glob`, `rglob`, `iterdir`, `listdir`, `scandir` or `walk` contributes all of its files at that position, in manifest order.
+3. **The manifest.** Everything the first two steps did not place, and every detected path when they placed nothing, follows in manifest order, that is by detected path index and then by relative POSIX path.
+
+The analysis reads objects and code. It imports nothing, calls no user function except a sampler's iteration, and catches every exception it raises: an analysis that fails falls back to manifest order for the paths it could not place, and the call is not affected.
+
+The first wave is the leading part of the send order, cut at the first of 512 MiB and 256 files. An account sets both with `data_first_wave_mib` and `data_first_wave_files`, and `data_first_wave_mib = 0` sends the call with nothing placed. A blob the runtime or the bucket already holds costs nothing and does not count against either limit.
+
+A declaration overrides the analysis. `@let.function(data_order=...)` takes an iterable of `os.PathLike`, or a callable taking the call's bound arguments and returning one, and its answer is the send order, with anything it leaves out following in manifest order. `data_first_wave=<n>` on the same decorator counts the leading entries of that order to place before the call, in place of the byte and file limits. An explicit `data_order` also outranks the runtime's observation, so a user who knows the order is never second-guessed.
+
+#### Observing the read order on the runtime <!-- id: project-data-observed-order -->
+
+Once the call is running, the order comes from the reads the body makes, not from a prediction. The worker instruments three points, each of which calls the original unchanged and only reports what it saw to the worker's send order queue, which reorders the local process's background sender through `data_want` requests naming a list of digests in the order they are wanted.
+
+1. **`torch.utils.data.DataLoader`.** The worker wraps the class in the process that runs the body. On iteration it reads the loader's `sampler` or `batch_sampler` ahead of the loop, `data_prefetch_batches` batches in advance, 64 by default on the account, maps each index to the dataset's file through the sequence attributes The send order and the first wave lists, and reports those digests. This is the main source: a shuffled sampler with a fixed seed yields its indices long before the loop reaches them, so the request goes out many batches ahead of the read.
+2. **`Dataset.__getitem__`.** Wrapped as the fallback for a body that indexes a dataset without a `DataLoader`. It reports the files that item names, and the next `data_prefetch_batches` indices in the dataset's own order.
+3. **`builtins.open` and `pathlib.Path.open`.** The same wrapper the body sees for a file that has not arrived reports every opened path under a call directory, arrived or not. This is one step behind the read it reports, so it is a hint for a sequential pass over a directory, not a prefetch.
+
+A `DataLoader` with `num_workers > 0` reports through the parent. The wrapper reads the sampler in the parent process, where the indices are produced, so a worker process sends nothing and needs no channel of its own. A worker that reaches a file the parent did not report falls back to the blocking read of Streaming the rest while the call runs.
+
+`data_observe = false` on the account turns all three wrappers off, and the send order stays as the first wave analysis left it. Nothing else changes: the blocking read still serves a file that has not arrived.
+
+A missed prediction is logged. When the observed order asks for a digest the send order had placed later than the next 32 entries, the worker counts it as a miss, and the call's data log line reports the misses through `first access waited`, with the blocking reads reported separately by the line Streaming the rest while the call runs names.
+
+#### Streaming the rest while the call runs <!-- id: project-data-streaming -->
+
+Everything streams. There is no dataset size below which the old behaviour of sending every blob before the call is kept, because two paths would be two behaviours to specify, to test and to explain, and the streaming path already sends a small dataset in its first wave: 512 MiB at the measured 85 to 90 MiB/s is the same 6 seconds either way.
+
+The call request carries the manifest: every file of the call keyed by the runtime path it is placed at, with its digest and size, and the send order the local process derived. The worker keeps both for the life of the call. It travels inside the call request rather than as a request of its own, because a separate message could arrive after the call it describes and the worker would then answer a read with no manifest to answer it from. It is what makes a directory listing complete before any byte of it has arrived, which What the body sees before a file arrives describes.
+
+The background sender then sends the blobs that are not yet placed, in send order, in `data_put` requests as Where the bytes come from describes. It runs on the session's channel beside the call, and a blob is never sent twice.
+
+For an ephemeral provider with a `bucket`, the same order governs both halves: the local process uploads the missing blobs to the bucket in send order, and the worker pulls in send order with up to 8 objects at a time, so the runtime pulls directly and the local uplink is out of the path for every blob the bucket already holds. The worker is told a digest is available to pull by a `data_pull` request the local process sends as each upload completes.
+
+A blocking read is the backstop, not the mechanism. When the body opens a file whose blob has not arrived, the worker sends one `data_want` request naming the digest, the sender moves that digest to the front of its queue, and only the thread that opened the file waits. The call, its other readers and the background sender keep running. Every `data_want` means the analysis predicted the order wrong, so the worker counts them and the data log line reports the count and the total wait, and a call with at least one blocking read prints on standard error:
+
+`letify: data waited for <files> files <size> not sent in time, <seconds> s total, first <relative path>`
+
+#### What the body sees before a file arrives <!-- id: project-data-pending -->
+
+The layout is complete before the call starts and only file contents arrive later. The worker creates every directory of the manifest in the call directory, and places a file at its runtime path only when its blob is complete in the cache, by the hard link or copy of Materializing and the rewritten path. Nothing is placed half written, so a file that exists on the runtime's real file system holds all of its bytes.
+
+A file that has not arrived is answered from the manifest instead. The worker installs a patch in the process that runs the body, covering paths under the call directory only:
+
+| Call | Before the file arrives | After |
+|---|---|---|
+| `os.listdir`, `os.scandir` | every manifest entry of that directory, arrived or not, so `Path.iterdir` and `glob` are complete from the start | the same entries |
+| `os.stat`, `os.lstat` | the manifest's size and mode, so `Path.exists()` is `True`, `Path.is_file()` is `True` and `Path.stat().st_size` is the final size | the real file's `stat` |
+| `builtins.open`, `io.open`, `os.open` | sends `data_want` and blocks that caller until the blob is placed, then opens the real file | opens the real file |
+
+A data loader therefore lists the directory, gets every file, and reads them in an order the send order was built to match.
+
+The patch lives in the worker process, so a body that forks, including a PyTorch data loader worker, inherits it. For a process started fresh, such as one spawned by `multiprocessing` with the `spawn` method, the worker puts a directory holding a `letify_pending.pth` on `PYTHONPATH`, which installs the same patch at interpreter start. A process the body starts that is not a Python interpreter, for example an `ffmpeg` invocation, sees only the files that have arrived, and the declaration should name `data_first_wave` large enough to cover what it reads.
+
+#### When a blob does not arrive <!-- id: project-data-streaming-failures -->
+
+- **A blob that never arrives.** A `data_want` unanswered for `data_wait_timeout` seconds on the account, 600 by default, fails that open with `RuntimeFailure` naming the relative path and the digest. The call is not killed, because the body may handle it; the failure is infrastructure, so a retry of the call is allowed.
+- **A client that disconnects mid stream.** The session ends as any lost channel ends it. Every blocked reader is woken with `RuntimeFailure`, the call ends with it, and no partial file is ever placed or read. A `.partial` file is removed when the worker next starts.
+- **A call that finishes before the background transfer.** The transfer is cancelled, both the channel sender and any bucket upload not yet started. A blob already committed to the cache stays and counts as held for the next call, and a partial one is removed. The write-back and the `data_evict` request follow the cancellation, in that order.
+- **A bucket-backed ephemeral provider.** A pull that fails is retried twice with the same downscoped headers, then a third time with headers the local process derives again, and a pull that still fails fails the open with `RuntimeFailure`. A `data_want` for a digest not yet uploaded moves that object to the front of the upload queue, and the worker pulls it when the local process sends its `data_pull`.
+
+#### Ordering with write-back and the cache budget <!-- id: project-data-streaming-order -->
+
+A blob still being written is never evicted. Runtime data cache budget skips a blob whose link count is above 1 and one used within the past 600 seconds; a blob that is pending or in flight for any running call is skipped as well, by the manifests the worker holds, and partial files are skipped as they already are.
+
+A write-back waits for nothing that is still arriving. It runs after the transfer is cancelled, and it uses the worker's manifest to decide what to walk: a file that was never placed is unchanged by definition, so it is not fetched, not hashed and not written back. A file placed during the call is compared exactly as Writing back describes.
 
 #### Materializing and the rewritten path <!-- id: project-data-materialize -->
 
@@ -894,9 +971,9 @@ In the pickled call a detected `pathlib.Path` is replaced by `pathlib.Path(<runt
 
 A call that detected data prints one line on standard error:
 
-`letify: data <files> files <size> detected, <files> files <size> already on <the runtime|the bucket>, uploaded <files> files <size> in <seconds> s (<rate> MiB/s)`
+`letify: data <files> files <size> detected, <files> files <size> already on <the runtime|the bucket>, sent <files> files <size> before the call in <seconds> s, <files> files <size> during it in <seconds> s (<rate> MiB/s), first access waited <seconds> s`
 
-The line is printed when the call has at least one input file. Sizes are in MiB with one decimal. `<the bucket>` is named when the bytes come from the bucket.
+The line is printed when the call has at least one input file, after the call's outcome is known, because what was sent during the call is not known before then. Sizes are in MiB with one decimal. `<the bucket>` is named when the bytes come from the bucket. `before the call` counts the first wave of The send order and the first wave, `during it` counts what the background sender delivered while the call ran, and the rate covers both. `first access waited` is the wall clock time in which at least one reader was blocked on a blob that had not arrived, and it is `0.0` when the send order was right.
 
 A call with an output location that returned prints a second line after the write-back:
 
@@ -904,7 +981,7 @@ A call with an output location that returned prints a second line after the writ
 
 #### Writing back <!-- id: project-data-write-back -->
 
-When a call with an output location returns, every file the body created or changed at the output's runtime path is copied to the same relative path under the local path. A call that raised writes nothing back.
+When a call with an output location returns, every file the body created or changed at the output's runtime path is copied to the same relative path under the local path. A call that raised writes nothing back. The background transfer is cancelled before the write-back starts, and a file the streaming path never placed is unchanged by definition, so a write-back waits for nothing that is still arriving.
 
 On the runtime, after the body returned and before the call directory is removed, the worker walks each output's runtime path as Which paths are data walks a directory, without following symbolic links. A file is unchanged when it is the hard link or copy the worker placed and its inode, size and modification time in nanoseconds equal those recorded when it was placed; it is not read. Any other regular file is hashed with the file digest, and a file whose digest equals the digest placed at that relative path is unchanged too. Each changed file is renamed into the file blob cache and made read-only, or dropped when the cache already holds its digest with its size. The worker keeps the list of relative path, digest and size per output under the call id until the local process asks for it with one `data_written` request, which removes it.
 
@@ -934,7 +1011,8 @@ After each call whose data sending uploaded or pulled at least one blob, or whos
 
 1. a blob whose link count is above 1, because a running call's directory links it;
 2. a blob last used within the past 600 seconds, because a call may have been told the runtime holds it and not yet linked it;
-3. partial files.
+3. a blob a running call's manifest lists as pending or in flight, because it is still arriving for that call;
+4. partial files.
 
 So the cache can stay over the budget while every remaining blob is linked or recent. When at least one blob was removed, the local process prints one line on standard error:
 
@@ -1150,6 +1228,8 @@ Colab and Elice never need `letify client shell connect`. Their create and open 
 2. An SSH server answers on `--ssh-port`, default 22: a TCP connection to `127.0.0.1` on that port must send a line starting with `SSH-` within 3 s. Otherwise it prints how to install and start one, for a Debian or Ubuntu container `apt-get install -y openssh-server`, `mkdir -p /run/sshd` and `/usr/sbin/sshd`.
 
 It then starts the remote agent on a port the operating system chooses, starts `tailcat serve <agent port>` in front of it, and prints exactly one command for the user's own machine, `letify login tunnel <alias> --connect <token>`. The alias is `--name`, or this machine's host name with every character that is not a letter, digit or underscore replaced by `_`. The token is the URL-safe base64 encoding, without `=` padding, of the compact JSON object `{"tailcat": <address>, "tailcat_port": <agent port>, "user": <this machine's user name>, "port": <SSH port>}`. `--public-address` and `--public-port` add `"address"` and `"public_port"` to that object, for a machine whose SSH server is also reachable directly from outside under a published port. After the command it prints that the agent must keep running, how to keep it running with `tmux` or `nohup`, and that a restart prints a new address, so the login is run again with the new token.
+
+Re-registering a `tunnel` account after a container restart is manual by design. A restarted container has a new Tailcat address and no way for letify to learn it, because there is no API to ask: the machine is reached only through the address it just lost. letify automates account registration only where the provider has an API it can call, as `Colab`, `Modal` and `Elice` have. So the user runs `letify client shell connect` again and pastes the printed `letify login tunnel <alias> --connect <token>`.
 
 A connection to the agent is told apart by its first bytes: `SSH-` is spliced to the machine's SSH server, and `LETIFY-RDV ` is followed by one JSON request line and answered with one JSON line. For such an account the pipeline connects over Tailcat first, runs `tailcat <address> <agent port>` to exchange the TCP punch mapping and start time over that link, and then races as specified: the Tailcat link is the rank 3 candidate, and when TCP punching passes the probe it takes over.
 

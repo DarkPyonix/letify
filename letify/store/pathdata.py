@@ -8,6 +8,7 @@ bucket client, which is the ``gcs`` backend.
 
 from __future__ import annotations
 
+import collections
 import json
 import os
 import pathlib
@@ -42,6 +43,14 @@ PROGRESS_THRESHOLD = 64 << 20
 
 #: Directory entries a directory walk never enters.
 SKIPPED = frozenset({".git", ".venv", "__pycache__"})
+
+#: The first wave's limits, as spec "The send order and the first wave" sets them.
+FIRST_WAVE_MIB = 512.0
+FIRST_WAVE_FILES = 256
+
+#: Batches the runtime's observation reads ahead, and how long a blocked read waits.
+PREFETCH_BATCHES = 64
+WAIT_TIMEOUT_S = 600.0
 
 _CACHE_LOCK = threading.Lock()
 
@@ -368,80 +377,255 @@ def evict(runtime: Runtime, blobs: str) -> None:
         )
 
 
-def send(runtime: Runtime, collector: Collector, blobs: str) -> int:
-    """Make sure the runtime's file blob cache holds every digest the call needs.
+@dataclass
+class Plan:
+    """What one call's data needs, and which of it the runtime or the bucket lacks.
 
-    Answers how many blobs the runtime's cache received.
+    Sizes and counts are per file, not per blob, because the log line counts files and two
+    files with the same contents are one blob.
     """
-    from .. import install
 
+    sizes: dict[str, int]
+    files: dict[str, str]
+    counts: dict[str, int]
+    order: list[str]
+    missing: list[str]
+    where: str
+    bucket: GCSBackend | None
+    detected_files: int
+    detected_bytes: int
+
+    def weight(self, digest: str) -> tuple[int, int]:
+        """The files and bytes one blob stands for."""
+        count = self.counts.get(digest, 1)
+        return count, count * self.sizes.get(digest, 0)
+
+
+def prepare(runtime: Runtime, collector: Collector, blobs: str, order: list[str]) -> Plan:
+    """Ask the runtime which digests it holds, and answer what is left to send, in order.
+
+    Spec "Where the bytes come from" and "The send order and the first wave".
+    """
     collector.cache.save()
-    sources: dict[str, tuple[int, str]] = {}
+    sizes: dict[str, int] = {}
+    files: dict[str, str] = {}
+    counts: dict[str, int] = {}
     detected_files = detected_bytes = 0
     for placed in collector.placed.values():
         for _rel, digest, size, local in placed.entries:
-            sources.setdefault(digest, (size, local))
+            sizes.setdefault(digest, size)
+            files.setdefault(digest, local)
+            counts[digest] = counts.get(digest, 0) + 1
             detected_files += 1
             detected_bytes += size
-    started = time.monotonic()
+    ordered = [digest for digest in order if digest in sizes]
+    # The membership set is built once: rebuilding it per digest is quadratic in the file
+    # count, which a dataset of thousands of files pays before every call.
+    placed = set(ordered)
+    ordered.extend(digest for digest in sizes if digest not in placed)
     held = set(
         _worker(
             runtime,
-            {"op": "data_have", "dir": blobs, "digests": [[d, s[0]] for d, s in sources.items()]},
+            {"op": "data_have", "dir": blobs, "digests": [[d, sizes[d]] for d in sizes]},
         )
         or ()
     )
-    missing = [digest for digest in sources if digest not in held]
+    missing = [digest for digest in ordered if digest not in held]
     bucket = data_bucket(runtime.provider)
-    if bucket is not None:
-        where = "the bucket"
-        absent = set(bucket.missing(missing)) if missing else set()
-        upload = [digest for digest in missing if digest in absent]
-    else:
-        where = "the runtime"
-        upload = missing
-    total = sum(sources[digest][0] for digest in upload)
-    meter = _Uploaded(len(upload), total)
-    for digest in upload:
-        size, local = sources[digest]
-        if bucket is not None:
-            bucket.put_file(digest, local, size, progress=meter.update)
-        else:
-            _put(runtime, blobs, digest, local, size, meter)
-        meter.advance(size)
-    meter.finish()
-    if bucket is not None and missing:
-        token = bucket.read_token()
-        items = [[digest, bucket.blob_url(digest)] for digest in missing]
-        _worker(
-            runtime,
-            {
-                "op": "data_pull",
-                "dir": blobs,
-                "items": items,
-                "headers": {"Authorization": f"Bearer {token}"},
-            },
-        )
-        token = ""
-    elapsed = time.monotonic() - started
-    uploaded = set(upload)
-    up_files = up_bytes = 0
-    for placed in collector.placed.values():
-        for _rel, digest, size, _local in placed.entries:
-            if digest in uploaded:
-                up_files += 1
-                up_bytes += size
-    rate = up_bytes / (1 << 20) / elapsed if elapsed > 0 else 0.0
-    install.log(
-        f"data {detected_files} files {_mib(detected_bytes)} detected, "
-        f"{detected_files - up_files} files {_mib(detected_bytes - up_bytes)} already on {where}, "
-        f"uploaded {up_files} files {_mib(up_bytes)} in {elapsed:.1f} s ({rate:.1f} MiB/s)"
+    where = "the bucket" if bucket is not None else "the runtime"
+    return Plan(
+        sizes=sizes,
+        files=files,
+        counts=counts,
+        order=ordered,
+        missing=missing,
+        where=where,
+        bucket=bucket,
+        detected_files=detected_files,
+        detected_bytes=detected_bytes,
     )
-    return len(missing)
+
+
+class Stream:
+    """Sends a call's file blobs in send order: the first wave, then the rest beside the call.
+
+    Spec "Streaming the rest while the call runs". The queue is reordered by the
+    ``data_want`` requests the worker sends when it observes a read or blocks on one, so the
+    order after the call starts comes from the runtime rather than from the prediction.
+    """
+
+    def __init__(self, runtime: Runtime, blobs: str, plan: Plan) -> None:
+        self.runtime = runtime
+        self.blobs = blobs
+        self.plan = plan
+        self.before_files = self.before_bytes = 0
+        self.during_files = self.during_bytes = 0
+        self.before_seconds = self.during_seconds = 0.0
+        self._queue: collections.deque[str] = collections.deque(plan.missing)
+        self._sent: set[str] = set()
+        self._lock = threading.Lock()
+        self._cancelled = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._token: str | None = None
+
+    # -- before the call -------------------------------------------------------
+
+    def place(self, wave: list[str]) -> None:
+        """Send the first wave, so the call is sent with that much of its data in place."""
+        if not wave:
+            return
+        started = time.monotonic()
+        total = sum(self.plan.weight(digest)[1] for digest in wave)
+        meter = _Uploaded(len(wave), total)
+        for digest in wave:
+            self._send(digest, meter)
+            meter.advance(self.plan.sizes.get(digest, 0))
+        meter.finish()
+        self.before_seconds = time.monotonic() - started
+
+    # -- beside the call -------------------------------------------------------
+
+    def start(self) -> None:
+        """Run the rest of the send order on a thread of its own, beside the call."""
+        with self._lock:
+            if not self._queue:
+                return
+        self._thread = threading.Thread(target=self._run, name="letify-data", daemon=True)
+        self._thread.start()
+
+    def _run(self) -> None:
+        started = time.monotonic()
+        try:
+            while not self._cancelled.is_set():
+                if not self._pump():
+                    break
+        except Exception:
+            # The call owns the failure: a blob that never arrives fails the read that
+            # waits for it, with the message spec "When a blob does not arrive" names.
+            pass
+        finally:
+            self.during_seconds = time.monotonic() - started
+
+    def _pump(self) -> bool:
+        """Send the next blob of the queue. False once nothing is left to send."""
+        self.reorder()
+        digest = self._take()
+        if digest is None:
+            return False
+        self._send(digest, None)
+        return True
+
+    def _take(self) -> str | None:
+        with self._lock:
+            while self._queue:
+                digest = self._queue.popleft()
+                if digest not in self._sent:
+                    return digest
+        return None
+
+    def reorder(self) -> None:
+        """Move the digests the worker asked for to the front, in the order it wants them."""
+        connection = getattr(self.runtime.channel, "connection", None)
+        if connection is None:
+            return
+        wanted: list[str] = []
+        for want in connection.take_wants():
+            wanted.extend(str(digest) for digest in want.get("digests") or ())
+        if not wanted:
+            return
+        with self._lock:
+            # Put them in front rather than filtering the queue, which would cost the whole
+            # queue on every want. A digest left behind later is skipped by ``_take``,
+            # because ``_sent`` already holds it.
+            for digest in reversed(list(dict.fromkeys(wanted))):
+                if digest not in self._sent:
+                    self._queue.appendleft(digest)
+
+    def cancel(self) -> None:
+        """Stop sending, as spec "When a blob does not arrive" requires when a call ends."""
+        self._cancelled.set()
+        with self._lock:
+            self._queue = []
+        thread = self._thread
+        if thread is not None:
+            thread.join(timeout=60)
+
+    # -- one blob ---------------------------------------------------------------
+
+    def _send(self, digest: str, meter: _Uploaded | None) -> None:
+        with self._lock:
+            if digest in self._sent or self._cancelled.is_set():
+                return
+            self._sent.add(digest)
+        size = self.plan.sizes.get(digest, 0)
+        local = self.plan.files[digest]
+        bucket = self.plan.bucket
+        uploaded = True
+        if bucket is None:
+            _put(self.runtime, self.blobs, digest, local, size, meter)
+        else:
+            # A blob the bucket already holds costs this machine nothing: the runtime pulls
+            # it directly, so it counts as already on the bucket rather than as sent.
+            uploaded = digest in set(bucket.missing([digest]))
+            if uploaded:
+                bucket.put_file(digest, local, size, progress=meter.update if meter else None)
+            if self._token is None:
+                self._token = bucket.read_token()
+            _worker(
+                self.runtime,
+                {
+                    "op": "data_pull",
+                    "dir": self.blobs,
+                    "items": [[digest, bucket.blob_url(digest)]],
+                    "headers": {"Authorization": f"Bearer {self._token}"},
+                },
+            )
+        if not uploaded:
+            return
+        files, total = self.plan.weight(digest)
+        if self._thread is None:
+            self.before_files += files
+            self.before_bytes += total
+        else:
+            self.during_files += files
+            self.during_bytes += total
+
+    @property
+    def sent(self) -> int:
+        """How many blobs this stream put into the runtime's cache."""
+        return len(self._sent)
+
+    # -- the log line ------------------------------------------------------------
+
+    def log(self, stats: dict[str, Any] | None) -> None:
+        """The one data log line of spec "Data log line", after the call's outcome is known."""
+        from .. import install
+
+        stats = stats or {}
+        plan = self.plan
+        sent_files = self.before_files + self.during_files
+        sent_bytes = self.before_bytes + self.during_bytes
+        seconds = self.before_seconds + self.during_seconds
+        rate = sent_bytes / (1 << 20) / seconds if seconds > 0 else 0.0
+        install.log(
+            f"data {plan.detected_files} files {_mib(plan.detected_bytes)} detected, "
+            f"{plan.detected_files - sent_files} files "
+            f"{_mib(plan.detected_bytes - sent_bytes)} already on {plan.where}, "
+            f"sent {self.before_files} files {_mib(self.before_bytes)} before the call in "
+            f"{self.before_seconds:.1f} s, {self.during_files} files "
+            f"{_mib(self.during_bytes)} during it in {self.during_seconds:.1f} s "
+            f"({rate:.1f} MiB/s), first access waited {float(stats.get('seconds', 0.0)):.1f} s"
+        )
+        if stats.get("files"):
+            install.log(
+                f"data waited for {stats['files']} files {_mib(int(stats.get('bytes', 0)))} "
+                f"not sent in time, {float(stats.get('seconds', 0.0)):.1f} s total, "
+                f"first {stats.get('first') or 'a file'}"
+            )
 
 
 def _put(
-    runtime: Runtime, blobs: str, digest: str, local: str, size: int, meter: _Uploaded
+    runtime: Runtime, blobs: str, digest: str, local: str, size: int, meter: _Uploaded | None
 ) -> None:
     """Send one file over the channel in pieces of at most ``CHUNK`` bytes."""
     buffer = bytearray(max(1, min(CHUNK, size)))
@@ -468,7 +652,8 @@ def _put(
                 },
             )
             offset += count
-            meter.update(offset)
+            if meter is not None:
+                meter.update(offset)
             if last:
                 return
 
@@ -635,9 +820,11 @@ __all__ = [
     "CHUNK",
     "Collector",
     "DigestCache",
+    "Plan",
+    "Stream",
     "allowed_roots",
     "data_bucket",
     "hash_file",
+    "prepare",
     "project_root",
-    "send",
 ]
