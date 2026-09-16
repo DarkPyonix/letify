@@ -1546,6 +1546,8 @@ The dispatching thread appends an entry without taking a lock. When the queue is
 
 A synchronization is one round trip. These synchronize: `Tensor.item()`, `tolist()`, `cpu()` and `to("cpu")` without `non_blocking=True`, `bool()`, `int()` and `float()` of a tensor, which includes control flow on a tensor value, `repr()` and `str()` of a tensor, copying a device tensor into a CPU tensor, an operator whose meta inference raised, the `torch.cuda` queries in [Mapping cuda](#mapping-cuda), `torch.cuda.synchronize()`, and the end of the declared function.
 
+With `auto_fetch` on, `Tensor.item()` and `tolist()` do not synchronize. They return a deferred value, as [Deferred value reads](#forwarding-auto-deferred) describes. `bool()`, `int()` and `float()` of a tensor still synchronize.
+
 A read of one tensor's value sends only what that value depends on when that can be decided from the queue alone. When no repetition of a captured step is unfinished, if the tensor was created by a queued eager entry and no entry after it writes to an argument, the entries up to and including that one are sent with the read, and the rest stay queued in order. If the tensor was created before the queue and no queued entry writes to an argument, the read is sent alone. An operator writes to an argument when its schema marks one as written, which covers in-place operators, `out=` and the running statistics of batch norm. Otherwise the whole queue, the unfinished part of a captured step included, is sent with the read. `torch.cuda.synchronize()` and the end of the declared function always send everything.
 
 The client counts operators, queued entries, batches, round trips, released handles, metadata cache hits, templates, captured steps, replayed operators and fallbacks, and `Client.queued` is the number of entries not yet sent, so ops per round trip and synchronizations per step are read from the session rather than estimated. An operator is counted when it is dispatched, not when its batch is sent, and a replayed operator counts as an operator too. `letify.remoting.device.current_client()` returns the client of the innermost active forwarding, or None outside one, so code inside a `host="local"` function reads `current_client().stats`.
@@ -1563,6 +1565,39 @@ A batch that holds fetch entries asks for one reply, which carries every fetch i
 `letify.fetch(tensor)` is the form for `async def` code. It queues the same fetch when called and returns an awaitable resolving to the CPU tensor, equal to `tensor.cpu()`. Awaiting it waits in a thread from `asyncio.to_thread`, so the event loop keeps running, and `asyncio.gather` over several fetches waits for all of them. Given a tensor that is not on the runtime, it resolves to `tensor.detach().cpu()` with no round trip. An `async def` declared with `host="local"` runs its coroutine to completion with `asyncio.run` in the thread its call runs in.
 
 A fetch skipped because an earlier operator failed raises `RemoteError` where its tensor is used or its awaitable is awaited. A failure carried by a reply that no synchronization waits for is kept, and the next synchronization raises it.
+
+### Deferred value reads <!-- id: forwarding-auto-deferred -->
+
+> A single value read on a forwarded tensor returns a deferred value instead of waiting. The read is queued as `letify.fetch` queues one, and the value is waited for where it is used.
+
+A training loop that logs `loss.item()` every step pays one round trip per step for a number it only prints. Under `host="local"` that read is deferred by default, so the user gets the behaviour of `letify.fetch` without writing it.
+
+**The methods replaced.** While forwarding is active and `auto_fetch` is on, two torch functions on a `RemoteTensor` queue a fetch and return a deferred value: `Tensor.item()` and `Tensor.tolist()`. Nothing else is replaced.
+
+`float(tensor)`, `int(tensor)` and `bool(tensor)` synchronize, and so do `Tensor.__index__`, `numpy()`, `repr()`, `str()`, `cpu()` and `to("cpu")` without `non_blocking=True`, as [Batching and synchronization](#forwarding-batching) says. Each of them has to hand back a value letify cannot follow. CPython raises `TypeError` when `__float__` returns anything but a `float` and when `__int__` returns anything but an `int`, so those two conversions cannot be deferred at all. `bool()` decides control flow, `__index__` selects memory, and the other four hand out a buffer or a formatted string. `loss.item()` is the read a training loop repeats, so deferring it is what removes the round trip per step.
+
+The fetch is queued exactly as `letify.fetch` queues one, through the same `read_later` path, so it reads the tensor at its place in the operator order and a later in-place operator does not change it. The deferred value holds the pending read and the conversion to apply to the filled CPU tensor: `item()` and `float()` give a Python float or int, `int()` gives an int, `tolist()` gives a list.
+
+**Where it resolves.** Resolving waits for that one read only, through the same `Client.wait` a non-blocking copy uses, and never for the whole queue. A deferred value resolves when anything asks for the value it stands for:
+
+| Kind of use | Examples |
+|---|---|
+| Arithmetic and comparison | `+`, `-`, `*`, `/`, `//`, `%`, `**`, `-x`, `abs`, `<`, `<=`, `==`, `!=`, `>`, `>=` |
+| Conversion | `float()`, `int()`, `bool()`, `__index__`, `complex()`, `round()`, `math` functions, which call `__float__` |
+| Text | `str()`, `repr()`, `format()`, an f-string, `%` formatting |
+| Container and iteration | `len()`, `iter()`, indexing, `in` |
+| Leaving the process | pickling, `torch.save`, `copy`, `numpy` array construction |
+| Any other attribute | anything not in the small set below |
+
+Only `__class__`, `__slots__` and the deferred value's own `resolved` property are answered without waiting. Anything else resolves first, so a value that reaches a place letify cannot follow is a real `float`, `int` or `list` by the time it gets there. A C extension argument resolves through `__float__` or `__index__`, `numpy` through `__array__`, and pickling through `__reduce__`, which pickles the resolved value and never the deferred object.
+
+A deferred value is not an instance of `float` or `int`. A library that checks the type instead of converting, such as `json.dump`, raises `TypeError` rather than writing something that is not the number.
+
+**Where everything resolves.** `torch.cuda.synchronize()`, the end of the declared function and `letify.fetch` resolve every pending read, as [Reads without waiting](#forwarding-async-reads) already says of unfilled tensors. The value a `host="local"` call returns is walked before the call returns, through lists, tuples, sets, dictionaries and dataclasses, and every deferred value in it is resolved, so a deferred value never leaves the call and never reaches a checkpoint.
+
+**The setting.** `auto_fetch = false` on the account entry turns the replacement off, and `LETIFY_AUTO_FETCH` in the environment overrides the account entry, with `0`, `false` and `no` meaning off. With it off, `item()`, `tolist()`, `int()` and `float()` synchronize as before, and `letify.fetch` still defers, because it is the explicit form and is not a default.
+
+**What is reported.** The client counts `auto_deferred`, the reads deferred by this replacement, and `resolved_early`, those whose value was asked for before its reply had arrived, so each one cost a wait. A `host="local"` call that deferred at least one read prints one line on standard error at its end, `letify: deferred N value reads, M resolved early`. A workload that gains nothing shows `M` equal to `N`.
 
 ### Step capture <!-- id: forwarding-step-capture -->
 

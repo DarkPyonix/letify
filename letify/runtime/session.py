@@ -186,7 +186,12 @@ class Runtime:
 
             channel = self.provider.device_channel(self)
             kind = "cuda" if self.instance.gpu else "cpu"
-            self.device_client = attach(channel, device=kind, name=f"{self.name}-device")
+            self.device_client = attach(
+                channel,
+                device=kind,
+                name=f"{self.name}-device",
+                auto_fetch=self.provider.config.option("auto_fetch"),
+            )
         return self.device_client
 
     # -- requests ------------------------------------------------------------
