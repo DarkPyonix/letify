@@ -62,11 +62,17 @@ class ContentsTransfer:
         self.url = url.rstrip("/")
         self.token = token
 
+    def _auth_query(self) -> dict[str, str]:
+        """Query parameters that authenticate a request. The Colab proxy's by default."""
+        return {"authuser": "0", "colab-runtime-proxy-token": self.token}
+
+    def _auth_headers(self) -> dict[str, str]:
+        """Headers that authenticate a request. The Colab proxy's by default."""
+        return {"X-Colab-Runtime-Proxy-Token": self.token}
+
     def _address(self, api: str, remote: str, **query: str) -> str:
         quoted = urllib.parse.quote(remote.lstrip("/"), safe="/")
-        parameters = urllib.parse.urlencode(
-            {"authuser": "0", "colab-runtime-proxy-token": self.token, **query}
-        )
+        parameters = urllib.parse.urlencode({**self._auth_query(), **query})
         return f"{self.url}/{api}/{quoted}?{parameters}"
 
     def _send(
@@ -79,8 +85,7 @@ class ContentsTransfer:
         headers: dict[str, str] | None = None,
     ) -> bytes:
         request = urllib.request.Request(address, data=body, method=method)
-        request.add_header("X-Colab-Runtime-Proxy-Token", self.token)
-        for key, value in (headers or {}).items():
+        for key, value in {**self._auth_headers(), **(headers or {})}.items():
             request.add_header(key, value)
         try:
             with urllib.request.urlopen(request, timeout=3600) as response:
@@ -189,14 +194,19 @@ class ColabFiles:
         runner: Callable[[str, float | None], str],
         *,
         workspace: str,
+        transfer: Callable[[], ContentsTransfer] | None = None,
     ):
         self.alias = alias
         self.session = session
         self.runner = runner
         #: The workspace root, before ``~`` is expanded on the VM. Temporary files go under it.
         self.workspace = workspace
+        #: Builds the transfer for another Jupyter server, such as a Kaggle session.
+        self._transfer = transfer
 
     def transfer(self) -> ContentsTransfer:
+        if self._transfer is not None:
+            return self._transfer()
         # Read per request, because the CLI writes the state when the session is created.
         return ContentsTransfer(*session_endpoint(self.alias, self.session))
 

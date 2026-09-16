@@ -94,12 +94,12 @@ def target(root: Path | None = None) -> Path | None:
 
 def _accelerators(provider: Provider) -> list[str] | None:
     """Accelerator names that can be known without a network call, or ``None``."""
-    from .providers import Colab, Local, Modal
+    from .providers import Colab, Kaggle, Local, Modal
 
     declared = read_table(provider.config.options)
     if declared:
         names = list(declared)
-    elif isinstance(provider, (Colab, Local, Modal)):
+    elif isinstance(provider, (Colab, Kaggle, Local, Modal)):
         names = list(provider.instances)
     else:
         return None
@@ -139,7 +139,14 @@ def render(launcher: Launcher) -> str:
         if accelerators is None:
             lines.append("    def __getattr__(self, name: str) -> Instance: ...")
         else:
-            lines.extend(f"    {accelerator}: Instance" for accelerator in accelerators)
+            # A provider that cannot serve host='local' types its accelerators so the
+            # declaration overloads reject that placement.
+            annotation = (
+                "Instance"
+                if provider.serves_host_local
+                else "letify.declare.instance.RemoteOnlyInstance"
+            )
+            lines.extend(f"    {accelerator}: {annotation}" for accelerator in accelerators)
             # Declaring no lookup makes a misspelled accelerator a type error.
             lines.append("    __getattr__: None  # type: ignore[assignment]")
         view.append((alias, name))

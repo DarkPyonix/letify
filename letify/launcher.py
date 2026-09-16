@@ -34,13 +34,13 @@ import threading
 from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, TypeVar
+from typing import TYPE_CHECKING, Any, Literal, TypeVar, overload
 
 from . import providers as provider_registry
 from .config import Config, load
 from .declare.env import Env
 from .declare.function import Function
-from .declare.instance import AnyInstance, Host, Instance
+from .declare.instance import AnyInstance, Host, Instance, RemoteOnlyInstance
 from .errors import LetifyError, UnknownInstance, UnknownProvider
 from .runtime.pool import RuntimePool
 
@@ -198,10 +198,38 @@ class Launcher:
 
     # -- declaration ---------------------------------------------------------
 
+    @overload
+    def function(
+        self,
+        *,
+        device: RemoteOnlyInstance,
+        host: Literal[Host.remote, "remote"],
+        env: Env | None = None,
+        volumes: Sequence[Volume] = (),
+        timeout: float | None = None,
+        retries: int = 1,
+        data_order: Any = None,
+        data_first_wave: int | None = None,
+    ) -> Callable[[Callable[..., R]], Function[R]]: ...
+
+    @overload
     def function(
         self,
         *,
         device: Instance | AnyInstance,
+        env: Env | None = None,
+        host: Host | str | None = None,
+        volumes: Sequence[Volume] = (),
+        timeout: float | None = None,
+        retries: int = 1,
+        data_order: Any = None,
+        data_first_wave: int | None = None,
+    ) -> Callable[[Callable[..., R]], Function[R]]: ...
+
+    def function(
+        self,
+        *,
+        device: Any,
         env: Env | None = None,
         host: Host | str | None = None,
         volumes: Sequence[Volume] = (),

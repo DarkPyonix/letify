@@ -46,7 +46,7 @@ def build_parser() -> argparse.ArgumentParser:
     utilization.add_argument("--json", action="store_true", help="print the records unformatted")
 
     log_in = sub.add_parser("login", help="declare an account and reference it here")
-    log_in.add_argument("kind", help="provider kind: shell, tunnel, colab, modal, elice")
+    log_in.add_argument("kind", help="provider kind: shell, tunnel, colab, modal, elice, kaggle")
     log_in.add_argument("alias", nargs="?", help="name to reach it by; defaults to the kind")
     log_in.add_argument("--address", help="machine address, for shell and tunnel")
     log_in.add_argument("--user", help="SSH user")
@@ -101,7 +101,10 @@ def build_parser() -> argparse.ArgumentParser:
     log_in.add_argument(
         "--connect",
         metavar="TOKEN",
-        help="the token 'letify client shell connect' printed, for tunnel",
+        help=(
+            "the token 'letify client shell connect' printed, for tunnel; the Colab Compatible "
+            "URL of a running Kaggle Jupyter Server session, for kaggle"
+        ),
     )
     log_in.add_argument(
         "--no-input",

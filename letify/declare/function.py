@@ -69,8 +69,22 @@ class Function(Generic[R]):
         update_wrapper(self, fn)
 
     def _place(self, device: Instance | AnyInstance) -> Instance | AnyInstance:
-        """Fold the declared host placement into the instance it names."""
-        return device._placed(self.host)
+        """Fold the declared host placement into the instance it names.
+
+        A placement the instance's provider cannot serve is refused here, at decoration, as
+        spec "Placements a provider cannot serve" describes.
+        """
+        placed = device._placed(self.host)
+        if (
+            isinstance(placed, Instance)
+            and placed.placement is Host.local
+            and not placed.provider.serves_host_local
+        ):
+            raise UnsupportedMode(
+                f"{placed.provider.alias} cannot serve host='local', so {self.fn.__name__} "
+                f"cannot be declared on {placed!r}. Declare it with host='remote'."
+            )
+        return placed
 
     # -- invocation ----------------------------------------------------------
 

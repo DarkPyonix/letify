@@ -69,6 +69,7 @@ A declaration taking two cards halves the width on a four card machine, which is
 Provider (abstract)
 ├── Local                 persistent
 ├── Modal                 persistent, reached through the Modal adapter
+├── Kaggle                ephemeral, host="remote" only, account reached through the Kaggle CLI
 └── Shell                 ephemeral by default, reached through the connection pipeline
     ├── Colab             session created by the Colab CLI, rendezvous over colab exec
     ├── Tunnel            a machine behind NAT, rendezvous through letify client shell connect
@@ -99,6 +100,54 @@ A provider is built from one entry in the configuration file and reached by attr
 | `Shell` | ephemeral, overridable | yes | persistent | `filesystem` |
 | `Tunnel` | ephemeral, overridable | yes | persistent | `filesystem` |
 | `Elice` | ephemeral | yes | persistent | `filesystem` |
+| `Kaggle` | ephemeral | no | one-shot: batch by default, a registered session when there is one | `filesystem` |
+
+### Kaggle <!-- id: kaggle-provider -->
+
+> A Kaggle account is declared with its API token and reports its weekly quota. It never opens a tunnel, a port forward or a Tailcat link, and it cannot serve `host="local"`.
+
+These follow from the Kaggle Acceptable Use Policy, which forbids tools for circumvention, and from Kaggle staff saying port forwarding is unsupported. The evidence is in the pull request for branch `feat/kaggle-provider`.
+
+- No keep-alive request is ever sent, and accounts are never rotated.
+- The accelerators are `CPU`, `P100`, `T4` and `TPU_V3_8`, a fixed list read without a network call.
+- **Batch mode is the default and needs no person.** An account with no registered `jupyter_url`, which is what `letify login kaggle <alias>` alone leaves, runs every call as a pushed script kernel. Nothing is opened in a browser and no URL is pasted.
+- An account with a registered `jupyter_url` runs on that session instead. Registering one is the only part of the Kaggle provider that needs a person, because Kaggle publishes no API that starts an interactive session: the Colab Compatible URL exists only in the editor, under Run, Kaggle Jupyter Server. It buys file transfer and a built environment, which a pushed script cannot have.
+
+#### Kaggle Jupyter Server session <!-- id: kaggle-session -->
+
+> A declared function runs on the Kaggle Jupyter Server session the user started, through the URL registered with `--connect`, one program per request over a one-shot channel.
+
+The user starts the session in the Kaggle editor with Run, Kaggle Jupyter Server, choosing the accelerator there, and registers its Colab Compatible URL. letify never starts, extends or stops that session, so `create_session` does nothing and `needs_lease` is false.
+
+The URL is split into the server base, the URL without its query string, and the token, the `token` query parameter when present. Every REST request goes to `<base>/api/...` with `token=<token>` in the query and `Authorization: token <token>`, through the standard library HTTP client. The full URL and the token never appear in a message, a log or a command line; a message names only the host.
+
+1. **Start.** `open_channel` reads `<base>/api/status`. It then creates one kernel with `POST <base>/api/kernels` and body `{"name": "python3"}` and keeps its id for the runtime. `stop` deletes it with `DELETE <base>/api/kernels/<id>`, best effort.
+2. **A program.** Each program is run by the Kaggle adapter, `letify/providers/kaggle_adapter.py`, started by `uv run --no-project --python 3.13 --with "jupyter-kernel-client<1" python -P`. It receives the URL, the kernel id and the timeout in the environment variables `LETIFY_JUPYTER_URL`, `LETIFY_KERNEL_ID` and `LETIFY_TIMEOUT`, and the program source on standard input. It runs the source in that kernel and writes the kernel's `stdout` stream to its standard output and the `stderr` stream and any error traceback to its standard error. It exits 0 when the execution reply status is `ok`, 3 when the program raised, and 4 when the server could not be reached. The letify process never imports `jupyter_kernel_client`.
+3. **Failure.** Exit 3 raises `RuntimeFailure` carrying the adapter's standard error. Exit 4, any other exit, or a timeout makes the provider read `<base>/api/status` again. When that read fails or returns anything other than 200, `KaggleSessionEnded` is raised. It is a `RuntimeLost`, and its message says the session has ended, names the two usual causes (20 minutes idle, the 12 hour limit) and tells the user to start a new session with Run, Kaggle Jupyter Server and run `letify login kaggle <alias> --connect <new URL>`. When the status read still succeeds, `RuntimeFailure` is raised with the adapter's standard error.
+4. **Files.** `put_file`, `get_file` and `pack_dir` use the Jupyter contents API and `/files/<path>` exactly as the Colab fallback describes, with the Kaggle token authentication above instead of the Colab proxy token.
+5. **Environment.** The session builds the environment like any other runtime: uv is installed, and `uv sync` runs with this process's Python minor version, so the interpreter check compares like with like. The default workspace root is `/kaggle/working/letify`.
+
+No request is sent to keep the session alive. A session that Kaggle ends for being idle stays ended.
+
+#### Kaggle batch mode <!-- id: kaggle-batch -->
+
+> An account with no registered session runs each declared call as one Kaggle script kernel: one `kaggle kernels push` with a hard `--timeout`, status reads until it finishes, and one `kaggle kernels output`.
+
+Every command runs through `uv tool run --from kaggle kaggle` with the environment Logging in describes, in a temporary directory.
+
+1. **One push per call.** The batch channel holds back each program that returns no value and sends it with the next program that returns one, so a call is one push. A batch runtime prepares nothing on the runtime: `prepares_env` and `prepares_workspace` are both false, so the Kaggle image's own Python and packages are used, no workspace root is entered, and the interpreter check is skipped. Preparing a root would be a second pushed kernel for a directory a pushed script never writes to. File transfer, `put_file`, `get_file` and `pack_dir`, raises `UnsupportedMode` in batch mode, because a pushed script has no file API. Its message says the call itself runs without a browser step and that file transfer is the one part a registered session buys.
+   cloudpickle ships a function defined in `__main__` as bytecode, which does not load across Python minor versions, so batch mode needs this process's Python minor version to equal the Kaggle image's, 3.12 as of 2026-09-16. Every pushed script starts with a check that prints which two versions disagree and which one to run letify on. It prints and does not raise, because the call that follows carries its own traceback.
+2. **The kernel.** The directory holds `script.py` and `kernel-metadata.json` with `id` `<username>/<slug>`, `title` equal to the slug, `code_file` `script.py`, `language` `python`, `kernel_type` `script`, `is_private` true, `enable_internet` true, and `enable_gpu` and `enable_tpu` false. The slug is `letify-` followed by the runtime name lowercased, with every character other than a letter, digit or dash replaced by a dash. The username is `username` from `kaggle.json`, or else the `- username: <name>` line of `kaggle config view`, read once per provider.
+3. **Accelerator and timeout.** `kaggle kernels push -p <dir> --timeout <seconds>` carries `--accelerator NvidiaTeslaT4` for `T4`, `NvidiaTeslaP100` for `P100` and `Tpu1VmV38` for `TPU_V3_8`, and no flag for `CPU`. The timeout is the account's `batch_timeout` in seconds, 1800 when unset, or the call's own timeout when that is smaller.
+4. **Waiting.** `kaggle kernels status <id>` is read every 30 seconds. The quoted value after `has status` is compared without case: a value containing `complete` finishes the wait, one containing `error` or `cancel` raises `RuntimeFailure` with the `Failure message` line and the kernel log, and any other value keeps waiting. When the timeout plus 300 seconds has passed, `RuntimeFailure` is raised. letify never pushes the same call again and never pushes to keep an accelerator.
+5. **Output.** `kaggle kernels output <id> -p <dir> -o -q` downloads `<slug>.log`. The log is a JSON list of entries with `stream_name` and `data`. The program's standard output is the concatenated `data` of the `stdout` entries, and a log that is not JSON is used as it is.
+6. **Failure.** A push, status or output command that exits non zero raises `RuntimeFailure` naming the command, with the account's secrets replaced by `***`.
+
+#### Recording devices at login for Kaggle <!-- id: kaggle-login-devices -->
+
+> A `--connect` login runs `nvidia-smi --query-gpu=index,name,memory.total --format=csv,noheader` on the session once and writes a `count` per accelerator to `[<alias>.devices]`.
+
+It runs on a new kernel through the adapter, as a session program does, and the kernel is deleted afterwards. Names are normalized as for other providers after a leading `Tesla ` is removed, so `Tesla T4` is `T4` and `Tesla P100-PCIE-16GB` is `P100`. The table holds `NAME = { count = N }`, because Kaggle assigns the cards. When `nvidia-smi` is missing, fails or lists nothing, as on a CPU session, the login still succeeds, no table is written and a note says so. A session that cannot be reached fails the login with `KaggleSessionEnded` and writes nothing.
 
 `Shell` and its subclasses default to ephemeral because a machine's disk policy is not knowable in advance. Assuming ephemeral costs time, since letify rebuilds the environment each runtime and the work still succeeds; assuming persistent fails outright when the disk turns out to be wiped. A configuration entry overrides it with `persistent = true`.
 
@@ -366,6 +415,17 @@ The reading is taken at the moment it is asked for and carries no history. A loa
 **PyTorch forwarding** (`host="local"`) keeps Python, the data and the libraries in the local process and forwards PyTorch operators to a worker that holds the GPU. It supports PyTorch only. The local process needs any PyTorch build, a CPU build included, and the operators run on real CUDA tensors on the runtime. Local data and the local environment stay in place, at the cost of one network round trip at every point where the host reads a value back from the device. [PyTorch forwarding](#pytorch-forwarding) describes the mechanism.
 
 The declared function runs in the calling process, inside a session whose device worker is started on first use. It is not retried: a failure part way through has already run the function's side effects here once.
+
+### Placements a provider cannot serve <!-- id: remote-only-providers -->
+
+> A provider whose class sets `serves_host_local = False` cannot be declared with `host="local"`, and both the type checker and the decorator say so before anything runs.
+
+`Kaggle` sets it, because the Kaggle Acceptable Use Policy forbids circumvention tools and Kaggle does not support port forwarding, so no device stream can reach a Kaggle session. The refusal happens in two places:
+
+1. **The type checker.** The generated provider types annotate each accelerator of such an account as `RemoteOnlyInstance`, and `Launcher.function` has two overloads: one takes `RemoteOnlyInstance` with `host` typed `Literal[letify.remote, "remote"]` and no default, the other takes `Instance` or `AnyInstance`. `RemoteOnlyInstance` is not a subtype of `Instance` to a type checker, so `host=letify.local`, `host="local"` or no `host` at all matches neither overload and pyright and mypy report an error. At run time `RemoteOnlyInstance` is `Instance`. `letify.local` and `letify.remote` are `Final`, so a type checker sees their literal values.
+2. **The decorator.** `@let.function` raises `UnsupportedMode` naming the account and `host='remote'` when the resolved placement is local and the instance's provider does not serve it, at decoration, before any call. `let.providers.any` requests are checked when they resolve, in `check_mode`.
+
+The same mechanism fits a limit that makes a declaration impossible, such as `Modal`'s. It is not used for `has_fast_path`, because a slow path is a warning and the declaration still runs.
 
 A provider refuses a mode only when it cannot serve it. `Modal` refuses `host="local"` because it exposes function calls into a container and there is no device to forward at. `host="local"` is refused with `UnsupportedMode` when PyTorch does not import in this process or is older than 2.1. A provider without a fast path warns with its expected round trip and then runs, because the choice belongs to whoever wrote the declaration.
 
@@ -1392,6 +1452,17 @@ The account is written with `kind = "elice"`, `zone_id`, `key`, `machine_id` and
 
 The account is written with `kind = "tunnel"`, `tailcat`, `tailcat_port`, `user`, `port` and `key` from the token and the options. It has no `address` unless the token or `--address` gives one, and `public_port` is written when the token or `--public-port` gives it. A value in the token wins over the option. Every login step still runs over Tailcat.
 
+`letify login kaggle <alias>` declares a Kaggle account from the API token made at kaggle.com under Settings, API. The token is `--token`, or with a terminal it is asked for with hidden input as `Kaggle API token, or the path to kaggle.json: `, and `--no-input` without `--token` refuses. Two forms are accepted:
+
+1. An access token, a single string. It is written to `~/.letify/accounts/<alias>/access_token`.
+2. The legacy `kaggle.json`, given as its JSON text or as the path to the file. It needs `username` and `key`, and is written to `~/.letify/accounts/<alias>/kaggle.json`.
+
+Both files are created with mode 0600. The token is then checked with `kaggle quota --format json`, a read-only call, run through `uv tool run --from kaggle kaggle`. The Kaggle CLI runs with `HOME` and `KAGGLE_CONFIG_DIR` set to the account directory, `KAGGLE_API_TOKEN` set to the path of `access_token` when that file exists, and `KAGGLE_USERNAME` and `KAGGLE_KEY` removed, so the CLI reads this account's token and no other. A check that exits non zero writes nothing to either `config.toml`, removes the token file the attempt wrote, and raises `LoginError` with the exit code and the CLI's error output with the token replaced by `***`. The token never appears in a command line letify builds, in `config.toml` or in output.
+
+`--connect <URL>` also records the Colab Compatible URL of a running Kaggle Jupyter Server session, copied from Run, Kaggle Jupyter Server in the Kaggle editor. It must start with `http://` or `https://`, and is written to `~/.letify/accounts/<alias>/jupyter_url` with mode 0600, because its query string carries the session token. On an account already in the home file, `letify login kaggle <alias> --connect <URL>` replaces only that file and asks for nothing else, which is how a new session is registered after the previous one ended.
+
+The home entry is `kind = "kaggle"`, plus `workspace` when `--workspace` is given.
+
 Credentials never enter either `config.toml`. A token goes to a file in the account directory. An SSH password is never stored at all, which the next section explains.
 
 ### Recording devices at login <!-- id: login-records-devices -->
@@ -1447,6 +1518,7 @@ One other approach is not the default. `sshpass` feeds a stored password to each
 | `elice` | endpoint when not the default, zone, key path, and `machine_id`, `price_type` and `workspace` when given | access token in `~/.letify/accounts/<alias>/access_token`; the generated machine password in `machine_password` once letify launches a machine |
 | `colab` | account email, `workspace` when given | the Colab CLI's token, written by its own sign in under `~/.letify/accounts/<alias>/` |
 | `modal` | `profile` and `workspace`, each when given | Modal's token, written by `modal token new` to `~/.letify/accounts/<alias>/modal.toml` |
+| `kaggle` | `workspace` when given | the Kaggle API token in `~/.letify/accounts/<alias>/access_token` or `kaggle.json`, and the session URL in `jupyter_url` when `--connect` is given |
 | `local` | nothing | none; this machine needs no declaration |
 
 For `colab` and `modal`, letify runs the vendor's sign in through uv and does not parse or refresh the token. The vendor's client reads and refreshes it from the account directory.
