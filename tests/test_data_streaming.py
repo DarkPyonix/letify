@@ -567,3 +567,47 @@ def test_a_write_back_does_not_wait_for_a_file_that_never_arrived(
     assert (root / "result.txt").read_text(encoding="utf-8") == "done"
     err = capsys.readouterr().err
     assert "wrote back 1 files" in err
+
+
+def test_a_call_whose_files_are_all_held_carries_no_streaming_machinery(
+    launcher_from, project
+) -> None:
+    """Spec "Streaming the rest while the call runs": a warm repeat streams nothing.
+
+    The manifest, the send order, the observation settings and the wait statistics request
+    all exist to serve bytes that have not arrived. A call whose files the runtime already
+    holds has none, so none of them may be sent. This is the repeat run of a dataset being
+    iterated on, and it is what the streaming path must not make slower.
+    """
+    from letify.runtime import channel as channel_module
+
+    let = streaming(launcher_from, data_first_wave_files=1)
+    root = dataset(project, 4, size=1 << 16)
+
+    @let.function(device=let.providers.lab.CPU, host=letify.remote)
+    def read_all(directory: Path) -> int:
+        return len([p.read_bytes() for p in sorted(directory.iterdir())])
+
+    assert read_all(root) == 4
+
+    seen: list[dict] = []
+    original = channel_module.PersistentChannel.request
+
+    def recording(self, request, **kwargs):
+        if isinstance(request, dict):
+            seen.append({"op": request.get("op", "call"), "data": request.get("data")})
+        return original(self, request, **kwargs)
+
+    channel_module.PersistentChannel.request = recording
+    try:
+        assert read_all(root) == 4
+    finally:
+        channel_module.PersistentChannel.request = original
+
+    calls = [entry for entry in seen if entry["op"] == "call"]
+    assert len(calls) == 1, seen
+    data = calls[0]["data"] or {}
+    assert "manifest" not in data, data.keys()
+    assert "order" not in data, data.keys()
+    assert "observe" not in data, data.keys()
+    assert [entry for entry in seen if entry["op"] == "data_stats"] == []
