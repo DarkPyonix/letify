@@ -137,12 +137,36 @@ def _set_data(self: RemoteTensor, value: Any) -> None:
         self._ref = value._ref
 
 
+#: How the filled CPU tensor becomes the value each replaced method returns.
+_CONVERT = {
+    "item": lambda target: target.item(),
+    "tolist": lambda target: target.tolist(),
+}
+
+
+def _value_read(self: RemoteTensor, kind: str) -> Any:
+    """A single value read: a deferred value with ``auto_fetch`` on, the value without it.
+
+    Spec "Deferred value reads". An ``item()`` of more than one element is left to the eager
+    path, so it raises what PyTorch raises.
+    """
+    from .value import Deferred
+
+    client = self._ref.client
+    if not client.auto_fetch or (kind == "item" and self.numel() != 1):
+        if kind == "tolist":
+            return self.detach().cpu().tolist()
+        return client.read_value(self)
+    return Deferred(client, client.read_pending(self), _CONVERT[kind])
+
+
 SPECIAL = {
     torch.Tensor.device.__get__: lambda self: REPORTED,  # type: ignore[attr-defined]
     torch.Tensor.is_cuda.__get__: lambda self: True,  # type: ignore[attr-defined]
     torch.Tensor.is_meta.__get__: lambda self: False,  # type: ignore[attr-defined]
     torch.Tensor.get_device: lambda self: 0,
-    torch.Tensor.tolist: lambda self: self.detach().cpu().tolist(),
+    torch.Tensor.item: lambda self: _value_read(self, "item"),
+    torch.Tensor.tolist: lambda self: _value_read(self, "tolist"),
     torch.Tensor.numpy: lambda self, *a, **k: self.detach().cpu().numpy(*a, **k),
     torch.Tensor.__repr__: _repr,
     torch.Tensor.data.__set__: _set_data,  # type: ignore[attr-defined]

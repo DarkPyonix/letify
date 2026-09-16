@@ -70,6 +70,8 @@ Function shipping is about 99% at every one of those round trips, and hundreds o
 
 A read does not have to be a synchronization. `loss.detach().to("cpu", non_blocking=True)` returns a CPU tensor at once and the loop keeps going, and the value is waited for only where it is used, for example when it is printed a step later. In `async def` code, `await letify.fetch(loss)` does the same without blocking the event loop.
 
+You do not have to write either of those for a logged number. Under `host="local"`, `loss.item()` already returns a deferred value: the read is queued and the loop keeps going, and the value is waited for where it is used, such as in the `print` a step later. `tolist()`, `float(tensor)` and `int(tensor)` work the same way. `bool(tensor)` still waits, because control flow needs the value at once. The value a call returns is always a real `float`, `int` or `list`. Put `auto_fetch = false` in the account entry, or `LETIFY_AUTO_FETCH=0` in the environment, to turn this off. At the end of a call letify prints how many reads it deferred and how many had to wait, so a loop that gains nothing from it is visible.
+
 Other things that force a synchronization: `nonzero()`, boolean mask indexing, `unique()`, and mixture of experts routing, which reads per-expert token counts back to the host. Any operation whose output shape the host has to know is a synchronization.
 
 ### Measure it instead of guessing
