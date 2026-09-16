@@ -772,7 +772,14 @@ class SandboxChannel(FramedChannel):
         piece = view[: self.WRITE_LIMIT]
         data = base64.b64encode(piece).decode("ascii")
         wait = STOP_WAIT if self._closing else None
-        self.adapter.request("write", sandbox=self.sandbox, data=data, wait=wait)
+        try:
+            self.adapter.request("write", sandbox=self.sandbox, data=data, wait=wait)
+        except RuntimeFailure as exc:
+            # A write the sandbox cannot take is the sandbox dying, not Modal refusing the
+            # call, and which of the two ends of the worker source hits it first is a race.
+            # Reported as a broken pipe, which the connection turns into the worker's death
+            # with its last output. Spec "Modal adapter".
+            raise OSError(str(exc)) from exc
         return piece.nbytes
 
     def _read_chunks(self) -> list[bytes]:

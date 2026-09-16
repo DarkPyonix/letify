@@ -144,7 +144,13 @@ Each file is hashed once and remembered by size, modification time and inode in 
 | ephemeral with `bucket = "<name>"` | missing files to the bucket, then the runtime downloads them | nothing uploaded; the runtime downloads from the bucket |
 | ephemeral without `bucket` | every file over the link | every file over the link again |
 
-A changed file is sent again on its own; the rest is not. Each call that carries data prints one line, for example `letify: data 8 files 1024.0 MiB detected, 7 files 896.0 MiB already on the runtime, uploaded 1 files 128.0 MiB in 1.4 s (91.4 MiB/s)`.
+A changed file is sent again on its own; the rest is not. Each call that carries data prints one line, for example `letify: data 1024 files 1024.0 MiB detected, 0 files 0.0 MiB already on the runtime, sent 512 files 512.0 MiB before the call in 5.9 s, 512 files 512.0 MiB during it in 5.8 s (88.1 MiB/s), first access waited 0.0 s`.
+
+The call starts as soon as the first wave of its data is on the runtime, and the rest arrives while the call runs. The first wave is the leading 512 MiB or 256 files of a send order letify derives from the pickled call: a `Dataset` or a path list in the arguments gives the order directly, a `DataLoader`'s sampler gives the shuffled epoch order, and the reads in the function's code order what those do not name. Everything else follows in manifest order. Set the limits with `data_first_wave_mib` and `data_first_wave_files` on the account, or name the order yourself with `@let.function(data_order=..., data_first_wave=...)`, which outranks the analysis.
+
+After the call starts the order comes from the runtime watching the real reads: a wrapped `DataLoader` reads its sampler 64 batches ahead, `Dataset.__getitem__` reports the item it is asked for, and `open` reports what a sequential pass touches. `data_observe = false` on the account turns all three off.
+
+The body never sees a half written file. Directory listings and `Path.stat()` are answered from the manifest before the bytes arrive, so `iterdir` and `glob` are complete from the first step, and only opening a file that has not arrived waits. A wait means the predicted order was wrong, and letify says so: `letify: data waited for 3 files 12.0 MiB not sent in time, 1.4 s total, first 0042.bin`. A blob that never arrives fails that read after `data_wait_timeout` seconds, 600 by default.
 
 The runtime keeps these files under `<workspace root>/data/blobs` within a budget: 50 GiB or half of the disk space the cache could use, whichever is smaller, or `data_cache_gib = <GiB>` on the account. After a call that sent or wrote back new files, the least recently used files no running call uses are removed, and one line reports it, for example `letify: data cache evicted 120 files 4096.0 MiB in 0.1 s, 51200.0 MiB of 50.0 GiB in use`. A file used in the last 10 minutes is never removed, so the cache can stay over the budget for a while.
 

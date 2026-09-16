@@ -29,6 +29,7 @@ from ..errors import (
     ConfigError,
     EnvironmentFailure,
     InterpreterMismatch,
+    ProtocolError,
     RemoteError,
     RuntimeFailure,
 )
@@ -237,6 +238,8 @@ class Runtime:
         kwargs: dict,
         *,
         timeout: float | None = None,
+        data_order: Any = None,
+        data_first_wave: int | None = None,
     ) -> tuple[Any, str]:
         """Run one declared function inside this runtime.
 
@@ -253,14 +256,22 @@ class Runtime:
             self.last_used = time.monotonic()
             return self.channel.call(fn, args, kwargs, timeout=timeout)
         args, kwargs = self._externalize(args, kwargs)
-        return self._call_with_data(fn, args, kwargs, timeout)
+        return self._call_with_data(fn, args, kwargs, timeout, data_order, data_first_wave)
 
     def _call_with_data(
-        self, fn: Any, args: tuple, kwargs: dict, timeout: float | None
+        self,
+        fn: Any,
+        args: tuple,
+        kwargs: dict,
+        timeout: float | None,
+        data_order: Any = None,
+        data_first_wave: int | None = None,
     ) -> tuple[Any, str]:
-        """Pickle a call, replacing local data paths, and send their blobs before it.
+        """Pickle a call, place the first wave of its data, and send the rest beside it.
 
-        Spec "Project data": the call carries the links the worker places before loading it.
+        Spec "Project data": the call carries the links and the manifest the worker needs,
+        the first wave of the send order is placed before it goes, and a background sender
+        pushes the rest while it runs.
         """
         import secrets
 
@@ -268,24 +279,110 @@ class Runtime:
 
         assert self.channel is not None
         root = (self.workspace or self.provider.workspace_root).rstrip("/")
-        collector = pathdata.Collector(f"{root}/data/calls/{secrets.token_hex(8)}")
+        call_dir = f"{root}/data/calls/{secrets.token_hex(8)}"
+        collector = pathdata.Collector(call_dir)
         head, buffers = protocol.dumps_call_parts(fn, args, kwargs, data=collector)
         request: dict[str, Any] = {"op": "call", "payload": head, "buffers": buffers}
         blobs = f"{root}/data/blobs"
-        added = 0
+        stream: pathdata.Stream | None = None
         if collector.placed:
-            if collector.inputs:
-                added = pathdata.send(self, collector, blobs)
             request["data"] = collector.request(blobs)
+            if collector.inputs:
+                stream = self._stream_data(
+                    collector, request["data"], blobs, fn, args, kwargs,
+                    data_order, data_first_wave,
+                )
         self.last_used = time.monotonic()
+        outcome = None
         try:
             outcome = self.channel.request(request, timeout=timeout)
-            if collector.outputs:
-                added += pathdata.write_back(self, collector, blobs)
-            return outcome
         finally:
-            if added:
-                pathdata.evict(self, blobs)
+            added = self._finish_data(stream, call_dir)
+            try:
+                if outcome is not None and collector.outputs:
+                    added += pathdata.write_back(self, collector, blobs)
+            finally:
+                if added:
+                    pathdata.evict(self, blobs)
+        return outcome
+
+    def _stream_data(
+        self,
+        collector: Any,
+        data: dict[str, Any],
+        blobs: str,
+        fn: Any,
+        args: tuple,
+        kwargs: dict,
+        data_order: Any,
+        data_first_wave: int | None,
+    ) -> Any:
+        """Derive the send order, place the first wave, and start the background sender."""
+        from ..store import pathdata, sendorder
+
+        option = self.provider.config.option
+        declared = self._declared_order(fn, args, kwargs, data_order)
+        order = sendorder.compute(collector, fn, args, kwargs, declared)
+        plan = pathdata.prepare(self, collector, blobs, order)
+        wave = sendorder.first_wave(
+            plan.order,
+            plan.sizes,
+            set(plan.missing),
+            mib=float(option("data_first_wave_mib", pathdata.FIRST_WAVE_MIB)),
+            files=int(option("data_first_wave_files", pathdata.FIRST_WAVE_FILES)),
+            count=data_first_wave,
+        )
+        stream = pathdata.Stream(self, blobs, plan)
+        if not plan.missing:
+            # Nothing to stream: the runtime holds every file, so the call places them all
+            # before the body starts. It needs no manifest, no patch and no observation.
+            return stream
+        data.update(
+            {
+                "manifest": sendorder.manifest(collector),
+                "order": plan.order,
+                "observe": bool(option("data_observe", True)),
+                "prefetch": int(option("data_prefetch_batches", pathdata.PREFETCH_BATCHES)),
+                "wait": float(option("data_wait_timeout", pathdata.WAIT_TIMEOUT_S)),
+            }
+        )
+        stream.place(wave)
+        stream.start()
+        return stream
+
+    @staticmethod
+    def _declared_order(fn: Any, args: tuple, kwargs: dict, data_order: Any) -> Any:
+        """``data_order`` from the declaration, with a callable given the bound arguments.
+
+        Spec "The send order and the first wave". A callable that raises is the
+        declaration's own error, so it is not caught here.
+        """
+        if data_order is None or not callable(data_order):
+            return data_order
+        import inspect
+
+        try:
+            bound = inspect.signature(fn).bind(*args, **kwargs)
+            bound.apply_defaults()
+        except TypeError:
+            return data_order(dict(kwargs))
+        return data_order(dict(bound.arguments))
+
+    def _finish_data(self, stream: Any, call_dir: str) -> int:
+        """Cancel the background transfer and print the call's data log line."""
+        if stream is None:
+            return 0
+        stream.cancel()
+        if not stream.plan.missing:
+            # Nothing was sent and nothing could have waited, so there is nothing to ask for.
+            stream.log(None)
+            return 0
+        try:
+            stats = self.request({"op": "data_stats", "dir": call_dir}, timeout=120)
+        except (RuntimeFailure, RemoteError, ProtocolError):
+            stats = None
+        stream.log(stats)
+        return stream.sent
 
     # -- content addressed arguments -----------------------------------------
 
