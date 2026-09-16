@@ -52,9 +52,11 @@ def data_lines(err: str) -> list[str]:
 
 
 def uploaded_files(line: str) -> int:
-    match = re.search(r"uploaded (\d+) files", line)
-    assert match, line
-    return int(match.group(1))
+    """Files the call sent, before it started and while it ran, as the log line reports."""
+    before = re.search(r"sent (\d+) files [\d.]+ MiB before the call", line)
+    during = re.search(r"MiB before the call in [\d.]+ s, (\d+) files", line)
+    assert before and during, line
+    return int(before.group(1)) + int(during.group(1))
 
 
 # -- Spec: Which paths are data ------------------------------------------------
@@ -538,7 +540,7 @@ def test_only_changed_files_come_back_from_an_existing_directory(let, cpu, proje
     assert (run / "train.log").read_text(encoding="utf-8") == "step 2"
     assert (run / "model.bin").read_bytes() == b"w" * 100_000
     err = capsys.readouterr().err
-    assert "uploaded 0 files" in data_lines(err)[0]
+    assert uploaded_files(data_lines(err)[0]) == 0
     assert "wrote back 1 files" in wrote_back(err)[0]
 
 

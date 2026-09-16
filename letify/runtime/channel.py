@@ -249,6 +249,8 @@ class Connection:
         self._tail = _Tail()
         #: Device executor messages that arrived on ``wire.DEVICE_STREAM``, or None when closed.
         self._device: collections.deque | None = None
+        #: ``data_want`` payloads that arrived on ``wire.DATA_STREAM``, for the data sender.
+        self._wants: collections.deque = collections.deque()
 
     # -- reading ---------------------------------------------------------------
 
@@ -275,6 +277,15 @@ class Connection:
         elif kind == wire.HELLO:
             with self._turn:
                 self.hello = value
+                self._turn.notify_all()
+        elif kind == wire.REQUEST and stream == wire.DATA_STREAM:
+            # The worker asking for blobs it is about to read. Nothing answers it: the
+            # background sender picks the request up and reorders its queue.
+            try:
+                self._wants.append(wire.loads(value[0], value[1]))
+            except Exception:
+                pass
+            with self._turn:
                 self._turn.notify_all()
         elif kind == wire.REPLY and stream == wire.DEVICE_STREAM:
             with self._turn:
@@ -365,6 +376,17 @@ class Connection:
 
     def _device_open(self) -> bool:
         return self._device is not None
+
+    # -- data stream -----------------------------------------------------------
+
+    def take_wants(self) -> list[dict[str, Any]]:
+        """Every ``data_want`` that has arrived so far, oldest first, and forget them."""
+        found = []
+        while True:
+            try:
+                found.append(self._wants.popleft())
+            except IndexError:
+                return found
 
     def _poll_ready(self) -> None:
         """Poll the read descriptor without blocking until it is readable or ``poll_s`` ends."""

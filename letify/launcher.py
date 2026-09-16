@@ -207,6 +207,8 @@ class Launcher:
         volumes: Sequence[Volume] = (),
         timeout: float | None = None,
         retries: int = 1,
+        data_order: Any = None,
+        data_first_wave: int | None = None,
     ) -> Callable[[Callable[..., R]], Function[R]]:
         """Declare where a function runs.
 
@@ -232,6 +234,8 @@ class Launcher:
                 volumes=volumes,
                 timeout=timeout,
                 retries=retries,
+                data_order=data_order,
+                data_first_wave=data_first_wave,
             )
             self.functions.append(declared)
             return declared

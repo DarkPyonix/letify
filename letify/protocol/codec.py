@@ -24,7 +24,7 @@ from typing import Any
 
 import cloudpickle
 
-from ..errors import ConfigError, ProtocolError, RemoteError
+from ..errors import ConfigError, ProtocolError, RemoteError, RuntimeFailure
 from . import wire
 
 #: Markers the one-shot driver writes around its outcome, so a result can be found
@@ -197,6 +197,10 @@ def unwrap(outcome: dict[str, Any], *, runtime_key: str) -> Any:
     if not isinstance(outcome, dict) or "ok" not in outcome:
         raise ProtocolError(f"unexpected remote payload: {outcome!r}")
     if not outcome["ok"]:
+        if outcome.get("kind") == "runtime":
+            # Infrastructure rather than the body's own error, so a retry is allowed.
+            # Spec "When a blob does not arrive".
+            raise RuntimeFailure(f"{runtime_key}: {outcome.get('error', 'the runtime failed')}")
         raise RemoteError(
             outcome.get("error", "the remote call failed"),
             outcome.get("traceback", ""),
