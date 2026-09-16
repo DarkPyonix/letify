@@ -270,7 +270,7 @@ def test_the_accelerators_a_provider_offers_appear_in_dir(let: letify.Launcher) 
 
 def test_the_local_machine_always_offers_a_plain_cpu(let: letify.Launcher) -> None:
     assert let.providers.local.CPU.accelerator == "cpu"
-    assert let.providers.local.prepares_env is False
+    assert let.providers.local.remote_env is False
     assert let.providers.local.needs_lease is False
 
 
@@ -329,12 +329,16 @@ def test_an_nvidia_smi_that_cannot_be_run_is_treated_as_no_gpu(
     assert list(provider_of(Local, "local").instances) == ["CPU"]
 
 
-def test_the_local_worker_runs_under_the_declared_interpreter(let: letify.Launcher) -> None:
-    provider = provider_of(Local, "local", python="/usr/bin/python3.12")
+def test_the_local_worker_runs_under_this_interpreter(let: letify.Launcher) -> None:
+    # No account names it. The worker is a subprocess of this process, so the interpreter
+    # that can load a call pickled here is the one running letify and nothing else.
+    import sys
+
+    provider = provider_of(Local, "local")
     runtime = type("R", (), {"name": "letify-cpu-1"})()
     channel = provider.open_channel(runtime)
     assert isinstance(channel, PersistentChannel)
-    assert channel.command[0] == "/usr/bin/python3.12"
+    assert channel.command[0] == sys.executable
 
 
 # -- Spec: Transport, Colab ----------------------------------------------------
@@ -905,11 +909,13 @@ def test_a_check_that_fails_names_the_command_it_tried(patch_run) -> None:
 
 def test_a_remote_worker_is_one_python_reading_framed_requests(patch_run) -> None:
     patch_run(shell_module)
-    provider = provider_of(Shell, "lab", address="gpu.example.edu", python="python3.12")
+    provider = provider_of(Shell, "lab", address="gpu.example.edu")
     runtime = type("R", (), {"name": "letify-a100-1"})()
     channel = provider.open_channel(runtime)
     assert isinstance(channel, PersistentChannel)
-    assert channel.command[-1].startswith("python3.12 -u -c ")
+    # Always python3: no account names the bootstrap interpreter, so no account can pick
+    # one whose minor version the call cannot load.
+    assert channel.command[-1].startswith("python3 -u -c ")
     # Spec "Channels": the stub reads a byte count line and raw source, with no base64.
     assert "sys.stdin.buffer" in channel.command[-1]
     assert "base64" not in channel.command[-1]

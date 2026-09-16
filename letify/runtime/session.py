@@ -26,7 +26,6 @@ from typing import TYPE_CHECKING, Any
 
 from .. import protocol
 from ..errors import (
-    ConfigError,
     EnvironmentFailure,
     InterpreterMismatch,
     ProtocolError,
@@ -555,11 +554,7 @@ class Runtime:
         provider whose account names ``python`` manages its own interpreter, so nothing
         is built there.
         """
-        if not self.provider.prepares_env:
-            return
-        if self.provider.managed_python:
-            self.python = self.provider.managed_python
-            self.require_cloudpickle()
+        if not self.provider.remote_env:
             return
         from . import bootstrap
 
@@ -608,34 +603,8 @@ class Runtime:
         self.python = where["python"]
         self.channel.switch_interpreter(where["python"])
 
-    def require_cloudpickle(self) -> None:
-        """Refuse a user-managed interpreter that cannot import cloudpickle.
-
-        letify installs nothing into that interpreter, so the fix is the user's. Not
-        retried, because a fresh runtime has the same interpreter.
-        """
-        importable, executable = self.eval(
-            "import sys\n"
-            "try:\n"
-            "    import cloudpickle\n"
-            "    __letify_value__ = (True, sys.executable)\n"
-            "except ImportError:\n"
-            "    __letify_value__ = (False, sys.executable)\n",
-            timeout=120,
-        )
-        if not importable:
-            self.shutdown()
-            raise ConfigError(
-                f"{self.name}: the account's python {executable} cannot import cloudpickle, "
-                f"which the worker needs to load a call. letify installs nothing into a "
-                f"user-managed interpreter: install cloudpickle there, or remove the python "
-                f"option so the runtime builds the project .venv with uv sync"
-            )
-
     def check_interpreter(self) -> None:
         """Refuse a worker whose Python major.minor differs from this process."""
-        if not self.provider.prepares_env:
-            return
         from . import bootstrap
 
         assert self.channel is not None

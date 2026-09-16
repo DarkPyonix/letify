@@ -67,9 +67,10 @@ class Provider(abc.ABC):
     #: Whether a worker process can be kept alive between calls.
     persistent_channel: bool = True
 
-    #: Whether a runtime has to install the declared environment. False when the
-    #: machine already runs in it, which is the case for the local provider.
-    prepares_env: bool = True
+    #: Whether the declared environment has to be built on another machine. False only
+    #: for the local provider, whose worker is a subprocess of this process and so already
+    #: runs in it. No account setting turns this off.
+    remote_env: bool = True
 
     #: Whether a session can outlive this process and keep billing.
     needs_lease: bool = True
@@ -363,12 +364,6 @@ class Provider(abc.ABC):
             )
         return value
 
-    @property
-    def managed_python(self) -> str | None:
-        """The interpreter the account names with ``python``, which the user manages."""
-        value = self.config.option("python")
-        return str(value) if value else None
-
     @abc.abstractmethod
     def open_channel(self, runtime: Runtime) -> Channel:
         """Return the channel that talks to this runtime."""
@@ -416,7 +411,7 @@ class Provider(abc.ABC):
             raise UnsupportedMode(
                 f"{self.alias} has no spot pricing. Only an elice account runs spot instances"
             )
-        if self.prepares_env and not self.managed_python:
+        if self.remote_env:
             from ..runtime.bootstrap import project_files
 
             # A missing lock file or a Python that cannot match is refused before the
@@ -463,10 +458,6 @@ class Provider(abc.ABC):
             f"{self.kind} cannot start a PyTorch device worker, so host='local' cannot run "
             f"on {self.alias}. Use host='remote'."
         )
-
-    #: Whether forwarding needs the agent installed on another machine. False only
-    #: where the device is in this machine, so nothing has to be reached.
-    needs_remote_agent: bool = True
 
     def forwarding_host(self) -> str | None:
         """The name to measure the round trip against, if this provider has one.
