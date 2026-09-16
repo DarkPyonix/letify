@@ -19,7 +19,7 @@ depends on what the provider charges for.
 from __future__ import annotations
 
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -202,6 +202,13 @@ class Runtime:
         self.last_used = time.monotonic()
         value, _logs = self.channel.request(payload, timeout=timeout)
         return value
+
+    def stream(self, payload: dict[str, Any], *, timeout: float | None = None) -> Iterator[Any]:
+        """Send one worker request answered by several replies, yielding each value."""
+        if self.channel is None:
+            raise RuntimeFailure(f"{self.name}: the channel is not open")
+        self.last_used = time.monotonic()
+        return self.channel.stream(payload, timeout=timeout)
 
     def exec(self, source: str, *, timeout: float | None = None) -> None:
         """Run plain source inside the runtime, sharing the worker's globals."""
