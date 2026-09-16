@@ -812,3 +812,52 @@ def test_batch_mode_refuses_file_transfer(kaggle_batch) -> None:
     _provider, channel = batch_channel()
     with pytest.raises(letify.UnsupportedMode, match="batch"):
         channel.request({"op": "get_file", "path": "/kaggle/working/x"})
+
+
+def test_a_batch_account_prepares_no_workspace_so_a_call_costs_one_push(
+    isolated_home, patch_which
+) -> None:
+    from conftest import provider_of
+
+    from letify import tools
+    from letify.providers import Kaggle
+
+    patch_which(tools, present=True)
+    provider = provider_of(Kaggle, "kaggle_a")
+    assert provider.prepares_workspace is False
+    assert provider.prepares_env is False
+
+
+def test_a_registered_session_prepares_the_workspace_on_the_session(fake_kaggle) -> None:
+    from conftest import provider_of
+
+    from letify.providers import Kaggle
+
+    provider = provider_of(Kaggle, "kaggle_a")
+    assert provider.prepares_workspace is True
+    assert provider.prepares_env is True
+
+
+def test_a_pushed_script_says_so_when_the_image_python_cannot_load_the_call(
+    kaggle_batch,
+) -> None:
+    import sys
+
+    fake = kaggle_batch(["complete"])
+    _provider, channel = batch_channel()
+    channel.request({"op": "eval", "source": "__letify_value__ = 1"})
+    script = fake.pushes[0]["script"]
+    assert f"({sys.version_info[0]}, {sys.version_info[1]})" in script
+    assert "was pickled by Python" in script
+
+
+def test_the_file_transfer_refusal_says_batch_mode_needs_no_browser_step(kaggle_batch) -> None:
+    import letify
+
+    kaggle_batch(["complete"])
+    _provider, channel = batch_channel()
+    with pytest.raises(letify.UnsupportedMode) as caught:
+        channel.request({"op": "get_file", "path": "/kaggle/working/x"})
+    message = str(caught.value)
+    assert "runs without a browser step" in message
+    assert "--connect" in message

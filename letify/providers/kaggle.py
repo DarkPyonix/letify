@@ -252,12 +252,14 @@ class BatchChannel(OneShotChannel):
         if op in ("put_file", "get_file", "pack_dir"):
             raise UnsupportedMode(
                 f"{self.provider.alias}: {op} is not available in Kaggle batch mode, because a "
-                f"pushed script has no file API. Register a session with --connect for it."
+                f"pushed script has no file API. The call itself runs without a browser step. "
+                f"File transfer is the one part that needs a session started by hand: register "
+                f"it with `letify login kaggle {self.provider.alias} --connect <URL>`."
             )
         return super().request(payload, timeout=timeout)
 
     def _run_batch(self, source: str, timeout: float | None) -> str:
-        program = "\n".join([*self.held, source])
+        program = "\n".join([version_banner(), *self.held, source])
         self.held = []
         seconds = self.provider.batch_timeout
         if timeout:
@@ -309,6 +311,27 @@ class BatchChannel(OneShotChannel):
                     f"{seconds + STATUS_GRACE} s. It was not pushed again."
                 )
             sleep(STATUS_INTERVAL)
+
+
+def version_banner() -> str:
+    """Source that says plainly when the Kaggle image cannot load a call pickled here.
+
+    cloudpickle ships a ``__main__`` function as bytecode, which does not load across Python
+    minor versions, and batch mode builds no environment, so the image's own Python decides.
+    The check prints and does not raise, because the next line is the call itself and its
+    own failure carries the traceback.
+    """
+    import sys
+
+    local = (sys.version_info[0], sys.version_info[1])
+    return (
+        "import sys\n"
+        f"if sys.version_info[:2] != {local}:\n"
+        "    print('letify: this Kaggle image runs Python %d.%d, and the call was pickled by "
+        f"Python {local[0]}.{local[1]}. cloudpickle ships a __main__ function as bytecode, "
+        "which does not load across minor versions, so run letify on Python %d.%d for this "
+        "account.' % (sys.version_info[:2] + sys.version_info[:2]))\n"
+    )
 
 
 def stdout_of(log: str) -> str:
@@ -376,6 +399,15 @@ class Kaggle(Provider):
     @property
     def prepares_env(self) -> bool:  # type: ignore[override]
         """A registered session builds the environment. Batch mode uses the Kaggle image."""
+        return session_url(self.alias) is not None
+
+    @property
+    def prepares_workspace(self) -> bool:  # type: ignore[override]
+        """A registered session enters a workspace root. Batch mode does not.
+
+        Preparing the root in batch mode would be a second pushed kernel for a directory
+        a pushed script never writes to, as spec "Kaggle batch mode" says.
+        """
         return session_url(self.alias) is not None
 
     @property
@@ -537,4 +569,6 @@ __all__ = [
     "parse_quota",
     "session_url",
     "split_url",
+    "stdout_of",
+    "version_banner",
 ]
