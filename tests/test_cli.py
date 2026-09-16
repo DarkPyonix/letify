@@ -529,7 +529,9 @@ def test_logging_in_to_colab_runs_the_colab_login_inside_the_account_directory(
     patch_which(tools, present=True)
     recorder = patch_run(login)
     assert main(["login", "colab", "colab_a", "--account", "me@example.com", "--no-input"]) == 0
-    call = recorder.calls[-1]
+    # The sign in is one of several commands the login runs, so it is picked by name
+    # rather than by position.
+    call = next(c for c in recorder.calls if c["command"][-1] == "sessions")
     assert call["command"][:3] == ["/usr/bin/uv", "tool", "run"]
     assert call["command"][-2:] == ["colab", "sessions"]
     assert call["env"]["HOME"] == str(Path.home() / ".letify" / "accounts" / "colab_a")

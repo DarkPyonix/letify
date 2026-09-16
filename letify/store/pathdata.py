@@ -12,6 +12,7 @@ import json
 import os
 import pathlib
 import pickle
+import queue
 import sys
 import threading
 import time
@@ -29,6 +30,9 @@ if TYPE_CHECKING:
 
 #: The largest piece of a file one ``data_put`` request carries.
 CHUNK = 64 << 20
+
+#: Pieces of a streamed file blob held before the receiving thread waits for the writer.
+WRITE_QUEUE = 4
 
 #: Files at least this large are hashed through a memory map with blake3's threads.
 LARGE_FILE = 64 << 20
@@ -551,7 +555,11 @@ def _same(cache: DigestCache, target: Path, digest: str) -> bool:
 def _get(
     runtime: Runtime, blobs: str, digest: str, target: Path, size: int, meter: _Uploaded
 ) -> None:
-    """Receive one file blob in pieces, check its digest, and rename it over the target."""
+    """Receive one file blob as one stream, writing and hashing it as the pieces arrive.
+
+    Spec "Writing back". One writing thread takes the pieces, so receiving the next one
+    overlaps writing and hashing the one before it and the link does not idle.
+    """
     from ..protocol.codec import _hasher
 
     target.parent.mkdir(parents=True, exist_ok=True)
@@ -559,40 +567,66 @@ def _get(
         f".{target.name}.letify-partial.{os.getpid()}.{threading.get_ident()}"
     )
     hasher = _hasher()
-    offset = 0
+    pieces: queue.Queue = queue.Queue(maxsize=WRITE_QUEUE)
+    failure: list[BaseException] = []
+
+    def write_pieces() -> None:
+        """Append each piece to the partial file and hash it, until the queue ends."""
+        try:
+            with open(partial, "wb") as handle:
+                while True:
+                    piece = pieces.get()
+                    if piece is None:
+                        return
+                    handle.write(piece)
+                    hasher.update(piece)
+        except BaseException as exc:  # pragma: no cover - a local disk failure
+            failure.append(exc)
+            # Drained, so the receiving thread is never left waiting on a full queue.
+            while pieces.get() is not None:
+                pass
+
+    writer = threading.Thread(target=write_pieces, daemon=True)
+    writer.start()
+    received = 0
     try:
-        with open(partial, "wb") as handle:
-            while offset < size or (size == 0 and offset == 0):
-                piece = _worker(
-                    runtime,
-                    {
-                        "op": "data_get",
-                        "dir": blobs,
-                        "digest": digest,
-                        "offset": offset,
-                        "length": min(CHUNK, size - offset),
-                    },
-                )
-                view = memoryview(piece).cast("B")
-                if not view.nbytes and size:
-                    raise RuntimeFailure(f"{runtime.name}: file blob {digest} ended early")
-                handle.write(view)
-                hasher.update(view)
-                offset += view.nbytes
-                meter.update(offset)
-                if size == 0:
-                    break
+        for piece in _stream(runtime, {"op": "data_stream", "dir": blobs, "digest": digest}):
+            view = memoryview(piece).cast("B")
+            if failure:
+                break
+            received += view.nbytes
+            pieces.put(view)
+            meter.update(received)
+        pieces.put(None)
+        writer.join()
+        if failure:
+            raise failure[0]
+        if received != size:
+            raise RuntimeFailure(
+                f"{runtime.name}: file blob {digest} arrived with {received} bytes, not {size}"
+            )
         found = hasher.hexdigest() if hasher.name == "blake2b" else hasher.hexdigest(length=16)
         if found != digest:
             raise RuntimeFailure(f"{runtime.name}: file blob {digest} arrived with digest {found}")
         os.replace(partial, target)
     finally:
+        if writer.is_alive():
+            pieces.put(None)
+            writer.join(5)
         partial.unlink(missing_ok=True)
 
 
 def _worker(runtime: Runtime, payload: dict[str, Any]) -> Any:
     try:
         return runtime.request(payload, timeout=3600)
+    except RemoteError as exc:
+        raise RuntimeFailure(f"{runtime.name}: {payload['op']} failed: {exc}") from exc
+
+
+def _stream(runtime: Runtime, payload: dict[str, Any]) -> Any:
+    """Each piece of a request the worker answers with several replies."""
+    try:
+        yield from runtime.stream(payload, timeout=3600)
     except RemoteError as exc:
         raise RuntimeFailure(f"{runtime.name}: {payload['op']} failed: {exc}") from exc
 
