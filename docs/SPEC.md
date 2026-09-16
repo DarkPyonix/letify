@@ -248,6 +248,8 @@ Before a launch, letify reads `eci pricing list --resource-kind vm_allocation --
 
 An ondemand launch checks quota first, and a spot launch does not, because spot does not count against Elice's compute quota. letify reads `eci org info --format json`. A value of 0 for the instance type's id or name under `resource_quota.compute.instance_types`, or a `resource_quota.compute.devices` of 0 for an accelerator type, raises `ProviderUnavailable` saying the ondemand quota for that type is 0 and that the portal takes a quota request or `price_type = "spot"` avoids the quota. A quota that cannot be read prints `letify: <name>: the ondemand quota could not be read, launching anyway` and does not refuse.
 
+A launch Elice refuses because the zone has no spot capacity raises `ProviderUnavailable` naming the instance type, rather than `RuntimeFailure`. Nothing was created, so there is no session to discard and retrying the call on a fresh runtime would ask the same zone for the same capacity again. letify recognises the refusal by `no spot capacity` in the command's standard error. The message says that Elice has no spot capacity for that type right now, and that a later retry or `price_type = "ondemand"` gets a machine. Every other launch failure stays a `RuntimeFailure`.
+
 `Launcher.status()` reports `price_type` on each runtime, `ondemand` or `spot` on Elice and `None` elsewhere, and `letify status` prints it. An Elice `Usage` record carries the account's `price_type`, which `letify usage` prints and `--json` includes.
 
 #### Spot preemption <!-- id: elice-spot-preemption -->
