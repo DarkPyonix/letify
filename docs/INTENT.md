@@ -50,6 +50,10 @@ A declaration that says where the accelerator is and where the host code runs, p
 
 Forwarding is viable only if a step that dispatches dozens to thousands of operators pays a handful of round trips. Queueing every operator whose result the host does not read, and computing output shapes locally on meta tensors, achieves that, so the network term of the efficiency model is `k * RTT` with `k` counting host synchronizations rather than operators.
 
+### N8. A remote call waits for the data its first step reads, not for the dataset
+
+The wait before a remote call's first step is proportional to the bytes that step reads, not to the size of the dataset, because letify derives the read order from the pickled call itself, sends only the first wave of that order before the call, and keeps sending the rest in the background while the call runs.
+
 ## Constraints
 
 - **The Python package is pure Python.** No compiled extension in `letify/`. A wheel that has to be built for each platform is a maintenance cost this project will not carry, and hashing and transfer are not CPU bound at the link speeds involved.
@@ -76,4 +80,5 @@ Each of these would change a claim or a default. Answering one is a good first e
 4. **Is NVFP4 reachable in a stock Colab runtime?** Needs the CUDA version, the compute capability and whether the quantization stack installs.
 5. **Is the Elice SSH port stable across a restart?** If it is not, the configuration needs a command that resolves the current port.
 6. **What does Elice spot pricing cost?** The API exposes a pricing id, which suggests preemptible instances are available. This is a direct cost lever.
-7. **How many operators does a real NVFP4 fine-tune dispatch per step, and what is `d` on a researcher's laptop?** The benchmark model dispatches 31 operators per step. A transformer step dispatches thousands, where `n * d` may dominate `T`, and that decides whether operator forwarding needs a faster local dispatch path for large models.
+7. **How often can the read order be derived from the pickled call?** N8 rests on it. A `Dataset` or a list of paths in the arguments carries the exact order, and a sampler with a fixed seed carries the shuffled one, but a body that builds its file list at runtime carries nothing. The share of real calls in each group decides whether the manifest order fallback is the common case or the rare one, and how often the blocking backstop fires.
+8. **How many operators does a real NVFP4 fine-tune dispatch per step, and what is `d` on a researcher's laptop?** The benchmark model dispatches 31 operators per step. A transformer step dispatches thousands, where `n * d` may dominate `T`, and that decides whether operator forwarding needs a faster local dispatch path for large models.
