@@ -320,6 +320,11 @@ class Runtime:
             files=int(option("data_first_wave_files", pathdata.FIRST_WAVE_FILES)),
             count=data_first_wave,
         )
+        stream = pathdata.Stream(self, blobs, plan)
+        if not plan.missing:
+            # Nothing to stream: the runtime holds every file, so the call places them all
+            # before the body starts. It needs no manifest, no patch and no observation.
+            return stream
         data.update(
             {
                 "manifest": sendorder.manifest(collector),
@@ -329,7 +334,6 @@ class Runtime:
                 "wait": float(option("data_wait_timeout", pathdata.WAIT_TIMEOUT_S)),
             }
         )
-        stream = pathdata.Stream(self, blobs, plan)
         stream.place(wave)
         stream.start()
         return stream
@@ -357,6 +361,10 @@ class Runtime:
         if stream is None:
             return 0
         stream.cancel()
+        if not stream.plan.missing:
+            # Nothing was sent and nothing could have waited, so there is nothing to ask for.
+            stream.log(None)
+            return 0
         try:
             stats = self.request({"op": "data_stats", "dir": call_dir}, timeout=120)
         except (RuntimeFailure, RemoteError, ProtocolError):

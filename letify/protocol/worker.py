@@ -662,9 +662,12 @@ def _data_register(data):
         _DATA_CALLS[state["dir"]] = state
         for path in list(state["pending"]):
             _data_place(state, path)
-    _data_install_patch()
-    _data_write_manifest(state)
-    _data_observe(state)
+    if state["pending"]:
+        # Only a call still waiting for bytes needs the patch, the manifest on disk and the
+        # wrappers. A call whose files are all placed reads the real file system.
+        _data_install_patch()
+        _data_write_manifest(state)
+        _data_observe(state)
     return state
 
 
