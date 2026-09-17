@@ -131,8 +131,8 @@ class Shell(Provider):
 
     @property
     def remote_python(self) -> str:
-        value = self.config.option("python", "python3")
-        return str(value)
+        """The interpreter the bootstrap worker starts on, before it moves to the .venv."""
+        return "python3"
 
     @property
     def reverse_ssh(self) -> dict[str, Any] | None:

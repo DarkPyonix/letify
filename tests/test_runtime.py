@@ -331,7 +331,7 @@ def test_a_request_on_a_runtime_whose_channel_is_shut_says_so(let, remote_cpu, l
 def test_installation_is_skipped_where_the_machine_already_runs_in_the_environment(let) -> None:
     # The local provider is the case the spec names, so booting one must not try to
     # install anything.
-    assert let.providers.local.prepares_env is False
+    assert let.providers.local.remote_env is False
 
 
 def test_a_directory_inside_a_runtime_can_be_packed_in_one_payload(let, remote_cpu, tmp_path, live):
@@ -890,8 +890,7 @@ def test_modal_builds_the_project_environment_like_every_remote_runtime() -> Non
     from letify.providers.modal import Modal
 
     modal = provider_of(Modal, "lab")
-    assert modal.prepares_env is True
-    assert modal.managed_python is None
+    assert modal.remote_env is True
 
 
 def test_every_remote_path_derives_from_the_provider_workspace_root(uv_project: Path) -> None:
@@ -1022,22 +1021,6 @@ def test_the_worker_reaches_the_project_interpreter_without_cloudpickle_or_pip(
     assert "pip" not in stderr
 
 
-def test_an_account_python_without_cloudpickle_is_refused_by_name(
-    tmp_path: Path, monkeypatch
-) -> None:
-    # The user manages that interpreter, so letify installs nothing into it and says why.
-    modules, binaries, marker = without_cloudpickle_or_pip(tmp_path)
-    monkeypatch.chdir(tmp_path)
-    monkeypatch.setenv("PYTHONPATH", str(modules))
-    monkeypatch.setenv("PATH", f"{binaries}:{__import__('os').environ['PATH']}")
-    provider = provider_of(PreparingLocal, "lab", python=sys.executable)
-    with pytest.raises(letify.ConfigError) as caught:
-        provider.start(remote_instance(provider), Env(), name="lab-1")
-    assert sys.executable in str(caught.value)
-    assert "cloudpickle" in str(caught.value)
-    assert not marker.exists()
-
-
 # -- Spec: uv on the runtime ---------------------------------------------------
 
 
@@ -1125,7 +1108,7 @@ def test_the_environment_archive_is_keyed_by_env_key_python_version_and_platform
     assert Env(python="3.11").key != Env(python="3.12").key
 
 
-# -- Spec: Interpreter check and Interpreter override --------------------------
+# -- Spec: Interpreter check ---------------------------------------------------
 
 
 def test_the_ready_line_carries_the_worker_python_version(channel) -> None:
@@ -1134,40 +1117,29 @@ def test_the_ready_line_carries_the_worker_python_version(channel) -> None:
 
 
 def test_a_worker_on_another_python_version_fails_the_start_naming_both(
-    tmp_path: Path, monkeypatch
+    uv_project: Path, monkeypatch
 ) -> None:
-    monkeypatch.chdir(tmp_path)
+    # A real locked project, because every runtime builds its environment now. The account
+    # setting that skipped the build, and with it this check, is gone.
     monkeypatch.setattr(bootstrap, "local_python", lambda: "3.99")
-    provider = provider_of(PreparingLocal, "lab", python=sys.executable)
+    provider = provider_of(PreparingLocal, "lab")
     with pytest.raises(letify.InterpreterMismatch) as caught:
         provider.start(remote_instance(provider), Env(), name="lab-1")
     assert "3.99" in str(caught.value)
     assert LOCAL_PYTHON in str(caught.value)
 
 
-def test_an_account_python_runs_the_worker_on_that_interpreter_without_syncing(
-    tmp_path: Path, monkeypatch
-) -> None:
-    # No pyproject.toml or uv.lock here, so a sync could not have run.
-    monkeypatch.chdir(tmp_path)
-    provider = provider_of(PreparingLocal, "lab", python=sys.executable)
-    runtime = provider.start(remote_instance(provider), Env(), name="lab-1")
-    try:
-        assert runtime.stat()["executable"] == sys.executable
-        assert runtime.env_source is None
-    finally:
-        runtime.shutdown()
-
-
-def test_a_shell_account_python_is_the_worker_interpreter_and_marks_it_user_managed() -> None:
+def test_no_account_can_name_the_bootstrap_interpreter() -> None:
+    # An account that named its own interpreter also turned the environment build off, which
+    # is the hole Kaggle's batch mode used to skip the interpreter check. There is no such
+    # setting now: every runtime bootstraps on python3 and then moves onto the project .venv.
+    from letify.providers.base import Provider
     from letify.providers.shell import Shell
 
     plain = provider_of(Shell, "lab", address="gpu.example")
     assert plain.remote_python == "python3"
-    assert plain.managed_python is None
-    managed = provider_of(Shell, "lab", address="gpu.example", python="/opt/py/bin/python")
-    assert managed.remote_python == "/opt/py/bin/python"
-    assert managed.managed_python == "/opt/py/bin/python"
+    assert not hasattr(plain, "managed_python")
+    assert not hasattr(Provider, "managed_python")
 
 
 def test_a_one_shot_channel_moved_to_the_venv_runs_each_program_with_that_python(
@@ -1190,7 +1162,7 @@ def test_a_one_shot_channel_moved_to_the_venv_runs_each_program_with_that_python
 
 
 def test_the_local_provider_still_runs_in_the_local_environment(let) -> None:
-    assert let.providers.local.prepares_env is False
+    assert let.providers.local.remote_env is False
 
 
 def test_a_cached_environment_archive_lands_in_the_content_addressed_layout() -> None:
@@ -1300,10 +1272,21 @@ def test_a_call_that_finds_every_card_taken_waits_for_one_to_come_free(
         pool.shutdown()
 
 
-def test_a_session_that_fails_to_start_gives_its_slot_back(launcher_from, tmp_path, live) -> None:
-    # Otherwise one failed start would permanently shrink the ceiling.
-    let = launcher_from('[broken]\nkind = "local"\npython = "letify-no-such-python"\n')
-    broken = let.providers.broken.CPU._placed("remote")
+def test_a_session_that_fails_to_start_gives_its_slot_back(
+    launcher_from, tmp_path, live, monkeypatch
+) -> None:
+    # Otherwise one failed start would permanently shrink the ceiling. The failure has to
+    # land after the slot is reserved, which is why the channel is what refuses: a provider
+    # that is refused earlier never takes a slot to give back.
+    let = launcher_from('[broken]\nkind = "local"\n')
+    provider = let.providers.broken
+
+    def refuse(runtime):
+        raise RuntimeFailure("the worker did not start")
+
+    # On the instance, so the working session below still opens its own channel.
+    monkeypatch.setattr(provider, "open_channel", refuse)
+    broken = provider.CPU._placed("remote")
     with pytest.raises(RuntimeFailure):
         live(let, broken)
     assert let.pool.live == []

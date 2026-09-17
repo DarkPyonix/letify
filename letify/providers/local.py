@@ -42,14 +42,11 @@ class Local(Provider):
     #: Nothing crosses a network, so there is no round trip to pay.
     has_fast_path = True
 
-    #: The device is in this machine, so there is no second machine to install on.
-    needs_remote_agent = False
-
     #: A subprocess with pipes, so the object and blob tables persist.
     persistent_channel = True
 
     #: This machine already runs in its environment.
-    prepares_env = False
+    remote_env = False
 
     #: A local subprocess ends with this process and costs nothing.
     needs_lease = False
@@ -137,7 +134,7 @@ class Local(Provider):
         """
         from ..runtime.channel import PersistentChannel
 
-        interpreter = self.config.option("python") or sys.executable
+        interpreter = sys.executable
         from ..protocol.worker import BOOTSTRAP
 
         return PersistentChannel([str(interpreter), "-u", "-c", BOOTSTRAP], name=runtime.name)

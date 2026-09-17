@@ -121,7 +121,7 @@ class PreparingLocal(Local):
     exercised over a real worker instead of needing a remote machine.
     """
 
-    prepares_env = True
+    remote_env = True
 
 
 @pytest.fixture

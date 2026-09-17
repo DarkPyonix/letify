@@ -100,18 +100,18 @@ A provider is built from one entry in the configuration file and reached by attr
 | `Shell` | ephemeral, overridable | yes | persistent | `filesystem` |
 | `Tunnel` | ephemeral, overridable | yes | persistent | `filesystem` |
 | `Elice` | ephemeral | yes | persistent | `filesystem` |
-| `Kaggle` | ephemeral | no | one-shot: batch by default, a registered session when there is one | `filesystem` |
+| `Kaggle` | ephemeral | no | one-shot, on the session the user registered | `filesystem` |
 
 ### Kaggle <!-- id: kaggle-provider -->
 
 > A Kaggle account is declared with its API token and reports its weekly quota. It never opens a tunnel, a port forward or a Tailcat link, and it cannot serve `host="local"`.
 
-These follow from the Kaggle Acceptable Use Policy, which forbids tools for circumvention, and from Kaggle staff saying port forwarding is unsupported. The evidence is in the pull request for branch `feat/kaggle-provider`.
+Two sources decide this, and they say different things. Kaggle staff answered a request for SSH access with "You can't run docker inside Kaggle. We also don't support port forwarding.", which is a statement that the feature does not exist, not that reaching it is forbidden. The Acceptable Use Policy of June 22, 2025 forbids using the Services "to disable, interfere with or circumvent any aspect of the Services" and lists "tools for circumvention/obfuscation" among abusive uses. Whether hole punching to a machine that offers no inbound port is circumvention is not written anywhere, so treating it as circumvention is this project's reading rather than Kaggle's rule. letify takes the cautious side because the cost of being wrong falls on the user's account.
 
 - No keep-alive request is ever sent, and accounts are never rotated.
 - The accelerators are `CPU`, `P100`, `T4` and `TPU_V3_8`, a fixed list read without a network call.
-- **Batch mode is the default and needs no person.** An account with no registered `jupyter_url`, which is what `letify login kaggle <alias>` alone leaves, runs every call as a pushed script kernel. Nothing is opened in a browser and no URL is pasted.
-- An account with a registered `jupyter_url` runs on that session instead. Registering one is the only part of the Kaggle provider that needs a person, because Kaggle publishes no API that starts an interactive session: the Colab Compatible URL exists only in the editor, under Run, Kaggle Jupyter Server. It buys file transfer and a built environment, which a pushed script cannot have.
+- **A registered session is required.** Kaggle publishes no API that starts an interactive session, and the Colab Compatible URL exists only in the editor, under Run, Kaggle Jupyter Server. So a person registers one with `letify login kaggle <alias> --connect '<URL>'`, and that is the only part of the Kaggle provider a person has to do. A call on an account without one raises `ConfigError` naming the alias and the command to run.
+- Everything after that registration is what every other provider does: the session builds the declared environment with `uv sync`, enters a workspace root, transfers files and checks the worker's interpreter. Kaggle gets no exemption from any of it.
 
 #### Kaggle Jupyter Server session <!-- id: kaggle-session -->
 
@@ -128,20 +128,6 @@ The URL is split into the server base, the URL without its query string, and the
 5. **Environment.** The session builds the environment like any other runtime: uv is installed, and `uv sync` runs with this process's Python minor version, so the interpreter check compares like with like. The default workspace root is `/kaggle/working/letify`.
 
 No request is sent to keep the session alive. A session that Kaggle ends for being idle stays ended.
-
-#### Kaggle batch mode <!-- id: kaggle-batch -->
-
-> An account with no registered session runs each declared call as one Kaggle script kernel: one `kaggle kernels push` with a hard `--timeout`, status reads until it finishes, and one `kaggle kernels output`.
-
-Every command runs through `uv tool run --from kaggle kaggle` with the environment Logging in describes, in a temporary directory.
-
-1. **One push per call.** The batch channel holds back each program that returns no value and sends it with the next program that returns one, so a call is one push. A batch runtime prepares nothing on the runtime: `prepares_env` and `prepares_workspace` are both false, so the Kaggle image's own Python and packages are used, no workspace root is entered, and the interpreter check is skipped. Preparing a root would be a second pushed kernel for a directory a pushed script never writes to. File transfer, `put_file`, `get_file` and `pack_dir`, raises `UnsupportedMode` in batch mode, because a pushed script has no file API. Its message says the call itself runs without a browser step and that file transfer is the one part a registered session buys.
-   cloudpickle ships a function defined in `__main__` as bytecode, which does not load across Python minor versions, so batch mode needs this process's Python minor version to equal the Kaggle image's, 3.12 as of 2026-09-16. Every pushed script starts with a check that prints which two versions disagree and which one to run letify on. It prints and does not raise, because the call that follows carries its own traceback.
-2. **The kernel.** The directory holds `script.py` and `kernel-metadata.json` with `id` `<username>/<slug>`, `title` equal to the slug, `code_file` `script.py`, `language` `python`, `kernel_type` `script`, `is_private` true, `enable_internet` true, and `enable_gpu` and `enable_tpu` false. The slug is `letify-` followed by the runtime name lowercased, with every character other than a letter, digit or dash replaced by a dash. The username is `username` from `kaggle.json`, or else the `- username: <name>` line of `kaggle config view`, read once per provider.
-3. **Accelerator and timeout.** `kaggle kernels push -p <dir> --timeout <seconds>` carries `--accelerator NvidiaTeslaT4` for `T4`, `NvidiaTeslaP100` for `P100` and `Tpu1VmV38` for `TPU_V3_8`, and no flag for `CPU`. The timeout is the account's `batch_timeout` in seconds, 1800 when unset, or the call's own timeout when that is smaller.
-4. **Waiting.** `kaggle kernels status <id>` is read every 30 seconds. The quoted value after `has status` is compared without case: a value containing `complete` finishes the wait, one containing `error` or `cancel` raises `RuntimeFailure` with the `Failure message` line and the kernel log, and any other value keeps waiting. When the timeout plus 300 seconds has passed, `RuntimeFailure` is raised. letify never pushes the same call again and never pushes to keep an accelerator.
-5. **Output.** `kaggle kernels output <id> -p <dir> -o -q` downloads `<slug>.log`. The log is a JSON list of entries with `stream_name` and `data`. The program's standard output is the concatenated `data` of the `stdout` entries, and a log that is not JSON is used as it is.
-6. **Failure.** A push, status or output command that exits non zero raises `RuntimeFailure` naming the command, with the account's secrets replaced by `***`.
 
 #### Recording devices at login for Kaggle <!-- id: kaggle-login-devices -->
 
@@ -715,7 +701,7 @@ Everything above a runtime is declaration. Creating one is when a provider actua
 
 A runtime boots in seven steps:
 
-1. Open the channel. The worker starts on the bootstrap interpreter: the account's `python` option, `python3` by default.
+1. Open the channel. The worker starts on the bootstrap interpreter, `python3`.
 2. Arm the lease.
 3. Prepare the workspace root, as Workspace root describes: expand `~` on the runtime, create the directory, make it the worker's working directory, and point `TMPDIR` at `<workspace root>/tmp`.
 4. Build the environment: restore the environment archive, or run `uv sync` in the project directory, as Environment describes.
@@ -723,7 +709,9 @@ A runtime boots in seven steps:
 6. Check the worker's interpreter version against the local one.
 7. Attach volumes.
 
-Step 3 is skipped on the local provider, whose worker keeps the working directory of the process that started it. Steps 4 to 6 are skipped on the local provider, which already runs in the project's environment. Steps 1 to 5 run on the bootstrap interpreter and use only the standard library, as Channels describes. Steps 4 and 5 are skipped when the account sets `python`, which means the user manages the interpreter on that machine. In their place the worker checks that the interpreter can import cloudpickle, and one that cannot raises `ConfigError` naming the interpreter and the missing module. Step 6 still runs then.
+Step 3 is skipped where `prepares_workspace` is false, and steps 4 and 5 where `remote_env` is false. Both are the local provider alone: its worker is a subprocess of this process, so it keeps the working directory it was started in and already runs in the project's environment. No other provider turns either off, and no account setting can.
+
+Step 6 runs everywhere, with nothing to turn it off. cloudpickle ships a function defined in `__main__` as bytecode, which does not load across Python minor versions, so a worker whose version differs cannot run the call at all. Skipping the check only moves the failure to a place that reads as the user's bug. On the local provider the worker is this interpreter, so the check passes without a round trip. Steps 1 to 5 run on the bootstrap interpreter and use only the standard library, as Channels describes.
 
 ### Pooling
 
@@ -1524,12 +1512,6 @@ One other approach is not the default. `sshpass` feeds a stored password to each
 | `local` | nothing | none; this machine needs no declaration |
 
 For `colab` and `modal`, letify runs the vendor's sign in through uv and does not parse or refresh the token. The vendor's client reads and refreshes it from the account directory.
-
-### Interpreter override <!-- id: python-option -->
-
-> `python` on an account names the interpreter the worker runs with. Setting it means the user manages that interpreter, so letify does not build the environment there.
-
-Without `python`, a `shell`, `tunnel`, `colab` or `elice` account starts its bootstrap worker with `python3` and then runs the worker from the project `.venv`, as Building the environment on a runtime describes. With `python = "/path/to/python"`, the worker is started with that interpreter and stays on it: no project files are sent, no uv runs and no environment archive is read or written. That interpreter has to provide cloudpickle: letify installs nothing into it, and a session start on one that lacks it raises `ConfigError` naming the interpreter and `cloudpickle`. `ConfigError` is not retried, because a fresh runtime has the same interpreter. The interpreter check still applies. On `local`, `python` names the interpreter of the worker subprocess, which defaults to the interpreter running letify.
 
 ## PyTorch forwarding
 
