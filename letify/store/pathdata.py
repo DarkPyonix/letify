@@ -30,7 +30,10 @@ if TYPE_CHECKING:
     from .backends.objects import GCSBackend
 
 #: The largest piece of a file one ``data_put`` request carries.
-CHUNK = 64 << 20
+CHUNK = 8 << 20
+
+#: Pieces the sender keeps unanswered on its stream, spec "Where the bytes come from".
+WINDOW = 8
 
 #: Pieces of a streamed file blob held before the receiving thread waits for the writer.
 WRITE_QUEUE = 4
@@ -467,6 +470,8 @@ class Stream:
         self._cancelled = threading.Event()
         self._thread: threading.Thread | None = None
         self._token: str | None = None
+        #: The one stream every piece of this call travels on, opened at the first piece.
+        self._pipeline: Any = None
 
     # -- before the call -------------------------------------------------------
 
@@ -480,6 +485,8 @@ class Stream:
         for digest in wave:
             self._send(digest, meter)
             meter.advance(self.plan.sizes.get(digest, 0))
+        # Every piece answered, so the wave is placed when the call goes out.
+        self._flush()
         meter.finish()
         self.before_seconds = time.monotonic() - started
 
@@ -499,6 +506,8 @@ class Stream:
             while not self._cancelled.is_set():
                 if not self._pump():
                     break
+            # The pieces still in flight are answered before the stream is released.
+            self._flush()
         except Exception:
             # The call owns the failure: a blob that never arrives fails the read that
             # waits for it, with the message spec "When a blob does not arrive" names.
@@ -549,6 +558,28 @@ class Stream:
         thread = self._thread
         if thread is not None:
             thread.join(timeout=60)
+        # Released only once no thread sends on it: a reply arriving on a released stream
+        # is dropped, and a sender still waiting for it would then wait for nothing.
+        if (thread is None or not thread.is_alive()) and self._pipeline is not None:
+            self._pipeline.close()
+            self._pipeline = None
+
+    # -- the stream ---------------------------------------------------------------
+
+    def _link(self) -> Any:
+        """The call's pipelined stream, opened at the first piece."""
+        if self._pipeline is None:
+            self._pipeline = self.runtime.pipeline(window=WINDOW, timeout=3600)
+        return self._pipeline
+
+    def _flush(self) -> None:
+        """Read every outstanding reply, so a piece the worker refused fails here."""
+        if self._pipeline is None:
+            return
+        try:
+            self._pipeline.drain()
+        except RemoteError as exc:
+            raise RuntimeFailure(f"{self.runtime.name}: data_put failed: {exc}") from exc
 
     # -- one blob ---------------------------------------------------------------
 
@@ -562,7 +593,7 @@ class Stream:
         bucket = self.plan.bucket
         uploaded = True
         if bucket is None:
-            _put(self.runtime, self.blobs, digest, local, size, meter)
+            _put(self.runtime, self._link(), self.blobs, digest, local, size, meter)
         else:
             # A blob the bucket already holds costs this machine nothing: the runtime pulls
             # it directly, so it counts as already on the bucket rather than as sent.
@@ -625,9 +656,19 @@ class Stream:
 
 
 def _put(
-    runtime: Runtime, blobs: str, digest: str, local: str, size: int, meter: _Uploaded | None
+    runtime: Runtime,
+    pipeline: Any,
+    blobs: str,
+    digest: str,
+    local: str,
+    size: int,
+    meter: _Uploaded | None,
 ) -> None:
-    """Send one file over the channel in pieces of at most ``CHUNK`` bytes."""
+    """Send one file on the call's stream in pieces of at most ``CHUNK`` bytes.
+
+    Spec "Where the bytes come from". A piece is sent without waiting for the reply of the
+    one before, and the pipeline's window is what paces the sender.
+    """
     buffer = bytearray(max(1, min(CHUNK, size)))
     view = memoryview(buffer)
     offset = 0
@@ -640,17 +681,19 @@ def _put(
                     break
                 count += read
             last = count < len(buffer) or offset + count >= size
-            _worker(
-                runtime,
-                {
-                    "op": "data_put",
-                    "dir": blobs,
-                    "digest": digest,
-                    "offset": offset,
-                    "chunk": pickle.PickleBuffer(view[:count]),
-                    "last": last,
-                },
-            )
+            try:
+                pipeline.send(
+                    {
+                        "op": "data_put",
+                        "dir": blobs,
+                        "digest": digest,
+                        "offset": offset,
+                        "chunk": pickle.PickleBuffer(view[:count]),
+                        "last": last,
+                    }
+                )
+            except RemoteError as exc:
+                raise RuntimeFailure(f"{runtime.name}: data_put failed: {exc}") from exc
             offset += count
             if meter is not None:
                 meter.update(offset)

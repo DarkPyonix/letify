@@ -94,6 +94,17 @@ class Channel(abc.ABC):
             f"reply, so {payload.get('op')!r} is not available here."
         )
 
+    def pipeline(self, *, window: int, timeout: float | None = None) -> Pipeline:
+        """Open one stream carrying several requests in order, each answered in order.
+
+        Spec "Waiting for a reply". A channel that cannot carry it refuses, so nothing
+        silently falls back to one request per piece.
+        """
+        raise RuntimeFailure(
+            f"{getattr(self, 'name', 'runtime')}: this channel cannot carry pipelined "
+            f"requests, so streaming project data is not available here."
+        )
+
     def call(
         self,
         fn: Any,
@@ -501,6 +512,10 @@ class Connection:
             if watchdog is not None:
                 watchdog.cancel()
 
+    def pipeline(self, *, window: int, timeout: float | None, kill: Callable[[], None]) -> Pipeline:
+        """Open one stream that carries several requests, each answered in order."""
+        return Pipeline(self, window=window, timeout=timeout, kill=kill)
+
     def _open(self, *, streaming: bool = False) -> _Slot:
         with self._slots_lock:
             if self.failure is not None:
@@ -513,6 +528,87 @@ class Connection:
     def _forget(self, slot: _Slot) -> None:
         with self._slots_lock:
             self._slots.pop(slot.stream, None)
+
+
+class Pipeline:
+    """Several requests sent in order on one stream, each answered by one reply in order.
+
+    Spec "Waiting for a reply". ``send`` does not wait for the reply of the request before
+    it: at most ``window`` requests are unanswered at once, so the link carries the next
+    piece while the worker serves the one before, and the worker holds at most ``window``
+    it has not served. The replies are read whenever a send has to wait for room and by
+    ``drain``, and the first failed reply raises. One thread uses a pipeline at a time.
+    """
+
+    def __init__(
+        self,
+        connection: Connection,
+        *,
+        window: int,
+        timeout: float | None,
+        kill: Callable[[], None],
+    ):
+        self._connection = connection
+        self._window = max(1, window)
+        self._timeout = timeout
+        self._kill = kill
+        self._slot = connection._open(streaming=True)
+        #: Requests sent, and replies read, since the stream was opened.
+        self.sent = 0
+        self.answered = 0
+
+    def send(self, payload: dict[str, Any]) -> None:
+        """Send one request, first reading replies until fewer than ``window`` are open."""
+        self._settle(self.sent - self._window + 1)
+        connection = self._connection
+        with connection.gate.shared():
+            try:
+                connection.sender.message(wire.REQUEST, self._slot.stream, payload)
+            except OSError as exc:
+                raise RuntimeLost(f"{connection.name}: the worker pipe is closed") from exc
+        self.sent += 1
+
+    def drain(self) -> None:
+        """Read every outstanding reply, raising the first failure among them."""
+        self._settle(self.sent)
+
+    def close(self) -> None:
+        """Release the stream id. A reply that arrives after this is dropped."""
+        self._connection._forget(self._slot)
+
+    def _settle(self, count: int) -> None:
+        """Read replies until at least ``count`` requests are answered."""
+        self._take()
+        if self.answered >= count:
+            return
+        connection = self._connection
+        slot = self._slot
+        watchdog = _Watchdog(self._kill, self._timeout) if self._timeout is not None else None
+        try:
+            while self.answered < count:
+                connection._wait(lambda: bool(slot.pieces) or slot.error is not None)
+                if not slot.pieces:
+                    if watchdog is not None and watchdog.expired:
+                        raise RuntimeFailure(
+                            f"{connection.name}: the call exceeded {self._timeout}s"
+                        )
+                    raise ProtocolError(str(slot.error or connection.failure))
+                self._take()
+        finally:
+            if watchdog is not None:
+                watchdog.cancel()
+
+    def _take(self) -> None:
+        """Count and check the replies that have arrived, in order."""
+        slot = self._slot
+        with self._connection._turn:
+            pieces = list(slot.pieces)
+            slot.pieces.clear()
+            slot.event.clear()
+        for head, buffers in pieces:
+            self.answered += 1
+            outcome = wire.loads(head, buffers)
+            protocol.unwrap(outcome, runtime_key=self._connection.name)
 
 
 class FramedChannel(Channel):
@@ -595,6 +691,10 @@ class FramedChannel(Channel):
     def stream(self, payload: dict[str, Any], *, timeout: float | None = None) -> Iterator[Any]:
         connection = self._require()
         return connection.stream(payload, timeout=timeout, kill=self._kill)
+
+    def pipeline(self, *, window: int, timeout: float | None = None) -> Pipeline:
+        connection = self._require()
+        return connection.pipeline(window=window, timeout=timeout, kill=self._kill)
 
 
 class PersistentChannel(FramedChannel):
