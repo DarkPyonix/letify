@@ -1397,29 +1397,74 @@ def patch_popen(monkeypatch):
     return patch
 
 
-# -- a Kaggle Jupyter Server session -------------------------------------------
 
 
-class FakeKaggleJupyter:
-    """The Jupyter REST API of a Kaggle Jupyter Server session, on loopback.
+# -- a Kaggle session, and the cloud that hands out its URL ---------------------
 
-    Answers ``/api/status``, kernel creation, lookup and deletion, the contents API and
-    ``/files`` with ``Range``, all requiring ``token`` in the query. Contents paths are
-    absolute paths of this machine, as ``/`` is the contents root on the session.
-    ``end_session()`` makes every later request answer 404, as an ended session does.
+
+def kaggle_test_cookie(exp_iso: str = "2099-01-01T00:00:00Z") -> str:
+    """A cookie of the shape the provider requires, with a far-future expiry."""
+
+    def part(obj: dict) -> str:
+        return base64.urlsafe_b64encode(json.dumps(obj).encode()).decode().rstrip("=")
+
+    header = part({"alg": "none", "typ": "JWT"})
+    client_token = f"{header}.{part({'sub': 'irack000', 'exp': exp_iso})}."
+    jar = {
+        "ka_sessionid": "sid",
+        "XSRF-TOKEN": "xtok",
+        "build-hash": "bh",
+        "CLIENT-TOKEN": client_token,
+    }
+    return "; ".join(f"{name}={value}" for name, value in jar.items())
+
+
+class _Reply:
+    """A minimal stand-in for the object ``urlopen`` returns, with the JSON body."""
+
+    def __init__(self, payload: dict[str, Any]):
+        self._data = json.dumps(payload).encode()
+
+    def read(self) -> bytes:
+        return self._data
+
+    def __enter__(self) -> _Reply:
+        return self
+
+    def __exit__(self, *exc: Any) -> None:
+        return None
+
+
+class FakeKaggleCloud:
+    """Stands in for every live Kaggle service the token chain reaches.
+
+    A loopback HTTP server answers the Jupyter proxy REST, with the session token in the URL
+    path as the real routed URL carries it. Everything else, the internal Kaggle API, the
+    Firebase exchange and Firestore, is answered by a fake ``urlopen`` the provider's one HTTP
+    seam is pointed at. A live account and a GPU are the only things replaced: the token
+    chain, the channel and the worker are the real code.
+
+    ``end_session()`` makes every later proxy request answer 404, as an ended session does.
     """
+
+    RUN_ID = 350000001
+    NOTEBOOK_ID = 134000001
 
     def __init__(self, token: str = "kaggle-session-token"):
         import http.server
+        import re
         import threading
         import uuid
 
         self.token = token
         self.requests: list[dict[str, Any]] = []
         self.kernels: set[str] = set()
+        self.cloud_calls: list[tuple[str, dict[str, Any]]] = []
+        self.cancelled: list[int] = []
         self.ended = False
         self._lock = threading.Lock()
         self._uuid = uuid
+        self._route = re.compile(r"^/k/(?P<run>[^/]+)/(?P<token>[^/]+)/proxy(?P<rest>.*)$")
         owner = self
 
         class Handler(http.server.BaseHTTPRequestHandler):
@@ -1440,9 +1485,10 @@ class FakeKaggleJupyter:
 
         self._server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
         self._server.daemon_threads = True
-        base = f"http://127.0.0.1:{self._server.server_address[1]}/k/123/proxy"
-        self.base = base
-        self.url = f"{base}?token={token}"
+        self.port = self._server.server_address[1]
+        self.proxy_host = f"http://127.0.0.1:{self.port}"
+        #: The routed URL the Firestore document hands back: token in the path, no query.
+        self.url = f"{self.proxy_host}/k/{self.RUN_ID}/{token}/proxy"
         threading.Thread(target=self._server.serve_forever, daemon=True).start()
 
     def close(self) -> None:
@@ -1452,20 +1498,74 @@ class FakeKaggleJupyter:
     def end_session(self) -> None:
         self.ended = True
 
+    # -- the fake urlopen the provider's HTTP seam is pointed at --
+
+    def urlopen(self, request: Any, timeout: float | None = None) -> Any:
+        import urllib.request as real_urllib
+
+        from letify.providers import kaggle as kaggle_module
+
+        url = request.full_url
+        if url.startswith(self.proxy_host):
+            return real_urllib.urlopen(request, timeout=timeout)
+        if url.startswith(kaggle_module.KAGGLE_INTERNAL):
+            return self._cloud(url[len(kaggle_module.KAGGLE_INTERNAL) :], request)
+        if url.startswith(kaggle_module.IDENTITY_TOOLKIT):
+            return _Reply({"idToken": "fake-id-token", "refreshToken": "fake-refresh"})
+        if url.startswith(kaggle_module.FIRESTORE_BASE):
+            return _Reply({"fields": {"jupyterUrl": {"stringValue": self.url}}})
+        raise AssertionError(f"unexpected URL in the token chain: {url}")
+
+    def _cloud(self, path: str, request: Any) -> _Reply:
+        body = json.loads(request.data) if request.data else {}
+        self.cloud_calls.append((path, body))
+        if path.endswith("CreateKernelWithSettings"):
+            return _Reply({"id": self.NOTEBOOK_ID, "currentUrlSlug": "letify-runtime"})
+        if path.endswith("GetOrCreateKernelSession"):
+            return _Reply({"draft": {"sequence": 1}})
+        if path.endswith("CommitAndRun"):
+            return _Reply({"kernelRunId": self.RUN_ID})
+        if path.endswith("GetFirebaseConfig"):
+            return _Reply({"apiKey": "fake-api-key"})
+        if path.endswith("GetFirebaseAuthToken"):
+            return _Reply({"authToken": "fake-custom-token"})
+        if path.endswith("UpdateUserKernelFirestoreAuth"):
+            return _Reply({"sessionId": f"webtier-{self.RUN_ID}"})
+        if path.endswith("CancelKernelSession"):
+            self.cancelled.append(int(body.get("kernelSessionId")))
+            return _Reply({})
+        if path.endswith("GetAcceleratorQuotaStatistics"):
+            return _Reply(
+                {
+                    "quotaRefreshTime": "2026-09-19T00:00:00Z",
+                    "gpuQuota": {"totalTimeAllowed": "108000s", "timeUsed": "11700s"},
+                    "tpuQuota": {"totalTimeAllowed": "72000s", "timeUsed": "0s"},
+                }
+            )
+        if path.endswith("GetCurrentUser"):
+            return _Reply({"displayName": "IRACK"})
+        raise AssertionError(f"unexpected internal call: {path}")
+
+    # -- the loopback Jupyter proxy --
+
+    def made(self, method: str, prefix: str) -> list[dict[str, Any]]:
+        return [r for r in self.requests if r["method"] == method and r["path"].startswith(prefix)]
+
     def _handle(self, handler: Any, method: str) -> None:
         import urllib.parse
 
         parsed = urllib.parse.urlsplit(handler.path)
-        query = dict(urllib.parse.parse_qsl(parsed.query))
+        route = self._route.match(urllib.parse.unquote(parsed.path))
         length = int(handler.headers.get("Content-Length") or 0)
-        body = handler.rfile.read(length) if length else b""
-        path = urllib.parse.unquote(parsed.path).removeprefix("/k/123/proxy")
+        raw = handler.rfile.read(length) if length else b""
+        path = route.group("rest") if route else parsed.path
+        path_token = route.group("token") if route else None
         with self._lock:
             self.requests.append(
                 {
                     "method": method,
                     "path": path,
-                    "query": query,
+                    "path_token": path_token,
                     "authorization": handler.headers.get("Authorization"),
                 }
             )
@@ -1480,8 +1580,8 @@ class FakeKaggleJupyter:
 
         if self.ended:
             return answer(404, b'{"message": "session not found"}')
-        if query.get("token") != self.token:
-            return answer(403, b'{"message": "forbidden"}')
+        if path_token != self.token:
+            return answer(404, b'{"message": "not found"}')
         if path == "/api/status" and method == "GET":
             return answer(200, b'{"started": "2026-09-14T00:00:00Z"}')
         if path == "/api/kernels" and method == "POST":
@@ -1499,7 +1599,7 @@ class FakeKaggleJupyter:
         if path.startswith("/api/contents/"):
             local = Path("/") / path[len("/api/contents/") :]
             if method == "PUT":
-                model = json.loads(body)
+                model = json.loads(raw)
                 content = base64.b64decode(model["content"])
                 mode = "ab" if model.get("chunk") not in (None, 1) else "wb"
                 with open(local, mode) as handle:
@@ -1509,39 +1609,27 @@ class FakeKaggleJupyter:
                 return answer(404, b'{"message": "no such file"}')
             model = {"path": str(local), "type": "file", "size": local.stat().st_size}
             return answer(200, json.dumps(model).encode())
-        if path.startswith("/files/") and method == "GET":
-            local = Path("/") / path[len("/files/") :]
-            if not local.is_file():
-                return answer(404, b"no such file")
-            data = local.read_bytes()
-            wanted = handler.headers.get("Range")
-            if wanted:
-                first, _, last = wanted.removeprefix("bytes=").partition("-")
-                start, end = int(first), min(int(last), len(data) - 1)
-                piece = data[start : end + 1]
-                return answer(206, piece, {"Content-Range": f"bytes {start}-{end}/{len(data)}"})
-            return answer(200, data)
         return answer(400, b'{"message": "unexpected request"}')
-
-    def made(self, method: str, prefix: str) -> list[dict[str, Any]]:
-        return [r for r in self.requests if r["method"] == method and r["path"].startswith(prefix)]
 
 
 @pytest.fixture
 def fake_kaggle(isolated_home, monkeypatch, tmp_path: Path):
-    """A registered Kaggle session for alias ``kaggle_a``, with the adapter replaced.
+    """A Kaggle account whose whole token chain and session are faked for alias ``kaggle_a``.
 
     The fake adapter in ``tests/fake_kaggle_adapter.py`` keeps the real adapter's contract and
-    runs each program in a local interpreter, so the driver programs are the real ones.
+    runs the worker in a local interpreter, so the driver programs are the real ones.
     """
     from letify.config.secrets import write_secret
     from letify.providers import kaggle as kaggle_module
 
-    server = FakeKaggleJupyter()
-    write_secret("kaggle_a", "jupyter_url", server.url)
+    write_secret("kaggle_a", "cookie", kaggle_test_cookie())
+    cloud = FakeKaggleCloud()
+    monkeypatch.setattr(kaggle_module, "urlopen", cloud.urlopen)
+    monkeypatch.setattr(kaggle_module, "JUPYTER_PROXY_HOST", cloud.proxy_host)
+    monkeypatch.setattr(kaggle_module, "SESSION_START_TIMEOUT", 1.0)
     script = Path(__file__).with_name("fake_kaggle_adapter.py")
     monkeypatch.setattr(kaggle_module, "adapter_command", lambda: [sys.executable, str(script)])
-    server.log = tmp_path / "kaggle-adapter.jsonl"
-    monkeypatch.setenv("FAKE_KAGGLE_LOG", str(server.log))
-    yield server
-    server.close()
+    cloud.log = tmp_path / "kaggle-adapter.jsonl"
+    monkeypatch.setenv("FAKE_KAGGLE_LOG", str(cloud.log))
+    yield cloud
+    cloud.close()

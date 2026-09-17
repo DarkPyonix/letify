@@ -1,8 +1,9 @@
-"""The Kaggle account: login, the token files and the environment the Kaggle CLI runs in.
+"""The Kaggle account: the cookie login, the token chain and the session channel.
 
-Spec sections pinned here: "Logging in" (the kaggle paragraphs) and "What each kind asks for".
-The Kaggle CLI needs a live account, so subprocess.run is answered by the recorder in
-conftest.py and the test asserts on the command, the environment and the files written.
+Spec sections pinned here: "Kaggle account", "Kaggle Jupyter Server session" and "Remaining
+usage, Kaggle". A live Kaggle account, its Firebase and Firestore, and a GPU are the only
+things a fake stands in for, in ``conftest.FakeKaggleCloud``; the token chain, the channel
+and the worker are the real code.
 """
 
 from __future__ import annotations
@@ -14,13 +15,9 @@ import tomllib
 from pathlib import Path
 
 import pytest
-from conftest import FakeCompleted
 
 from letify.cli import main
 from letify.config import login
-
-ACCESS_TOKEN = "KGAT_0123456789abcdef"
-LEGACY = {"username": "researcher", "key": "0123456789abcdef0123456789abcdef"}
 
 
 def home_config() -> dict:
@@ -29,19 +26,6 @@ def home_config() -> dict:
 
 def account(alias: str) -> Path:
     return Path.home() / ".letify" / "accounts" / alias
-
-
-@pytest.fixture
-def kaggle_cli(patch_which, patch_run):
-    """uv on PATH, and the Kaggle CLI answered with ``result``."""
-    from letify import tools
-
-    patch_which(tools, present=True)
-
-    def answer(result: FakeCompleted | None = None):
-        return patch_run(login, result=result or FakeCompleted(stdout="[]\n"))
-
-    return answer
 
 
 # -- Spec: Logging in, kaggle ------------------------------------------------------
@@ -173,15 +157,6 @@ def test_a_kaggle_login_records_the_workspace(isolated_home, accept_cookie) -> N
 
 # -- Spec: Remaining usage, Kaggle -------------------------------------------------
 
-QUOTA = """Warning: Looks like you're using an outdated API Version
-[
-  {"resource": "GPU", "used": "3.25h", "remaining": "26.75h", "total": "30.00h",
-   "refreshAt": "2026-09-19T00:00:00+00:00"},
-  {"resource": "TPU", "used": "0.00h", "remaining": "20.00h", "total": "20.00h",
-   "refreshAt": "2026-09-19T00:00:00+00:00"}
-]
-"""
-
 
 def kaggle_provider():
     from conftest import provider_of
@@ -216,70 +191,57 @@ def test_the_account_note_flags_an_expired_cookie(isolated_home) -> None:
     assert "EXPIRED" in (kaggle_provider().account_note() or "")
 
 
-def test_kaggle_usage_reads_the_weekly_gpu_quota(isolated_home, patch_which, patch_run) -> None:
-    from letify import tools
-    from letify.providers import kaggle as kaggle_module
+def test_kaggle_usage_reads_the_weekly_quota_from_the_cookie(fake_kaggle) -> None:
+    """Spec "Remaining usage, Kaggle": the quota comes from the cookie, not an API key.
 
-    patch_which(tools, present=True)
-    recorder = patch_run(kaggle_module, result=FakeCompleted(stdout=QUOTA))
+    ``GetAcceleratorQuotaStatistics`` answers the weekly GPU and TPU quota in seconds, which
+    the provider turns into hours. No Kaggle CLI and no API token are used anywhere.
+    """
     usage = kaggle_provider().usage()
 
     assert usage.unit == "GPU hours"
-    assert usage.used == 3.25
-    assert usage.remaining == 26.75
+    assert usage.used == 11700 / 3600
     assert usage.limit == 30.0
-    assert "2026-09-19T00:00:00+00:00" in (usage.note or "")
+    assert usage.remaining == 30.0 - 11700 / 3600
+    assert "2026-09-19T00:00:00Z" in (usage.note or "")
     assert "TPU 0 h used, 20 h left of 20" in (usage.note or "")
-    call = recorder.calls[-1]
-    assert call["command"][-3:] == ["quota", "--format", "json"]
-    assert call["env"]["KAGGLE_CONFIG_DIR"] == str(account("kaggle_a"))
+    called = [path for path, _ in fake_kaggle.cloud_calls]
+    assert any(path.endswith("GetAcceleratorQuotaStatistics") for path in called)
 
 
-def test_a_failed_quota_call_is_an_infrastructure_error_without_the_token(
-    isolated_home, patch_which, patch_run
-) -> None:
+def test_a_failed_quota_call_is_an_infrastructure_error(fake_kaggle, monkeypatch) -> None:
     import letify
-    from letify import tools
-    from letify.config.secrets import write_secret
     from letify.providers import kaggle as kaggle_module
 
-    write_secret("kaggle_a", "access_token", ACCESS_TOKEN)
-    patch_which(tools, present=True)
-    patch_run(kaggle_module, result=FakeCompleted(returncode=1, stderr=f"401 {ACCESS_TOKEN}"))
-    with pytest.raises(letify.RuntimeFailure) as caught:
+    def refuse(request, timeout=None):
+        raise OSError("connection reset")
+
+    monkeypatch.setattr(kaggle_module, "urlopen", refuse)
+    with pytest.raises(letify.RuntimeFailure):
         kaggle_provider().usage()
-    assert ACCESS_TOKEN not in str(caught.value)
-    assert "***" in str(caught.value)
 
 
-def test_quota_output_with_no_gpu_row_is_refused(isolated_home, patch_which, patch_run) -> None:
+def test_quota_with_no_gpu_figure_is_refused(fake_kaggle, monkeypatch) -> None:
+    from conftest import _Reply
+
     import letify
-    from letify import tools
     from letify.providers import kaggle as kaggle_module
 
-    patch_which(tools, present=True)
-    patch_run(kaggle_module, result=FakeCompleted(stdout="No quota information available\n"))
+    def answer(request, timeout=None):
+        if request.full_url.endswith("GetAcceleratorQuotaStatistics"):
+            return _Reply({"quotaRefreshTime": "2026-09-19T00:00:00Z"})
+        return fake_kaggle.urlopen(request, timeout)
+
+    monkeypatch.setattr(kaggle_module, "urlopen", answer)
     with pytest.raises(letify.RuntimeFailure, match="GPU"):
         kaggle_provider().usage()
 
 
-def test_every_kaggle_call_names_this_accounts_token_file_in_kaggle_api_token(
-    isolated_home, patch_which, patch_run, monkeypatch
-) -> None:
-    # The Kaggle CLI does not read access_token from KAGGLE_CONFIG_DIR, so the variable is what
-    # authenticates. It holds the file's path, which keeps the token out of the environment.
-    from letify import tools
-    from letify.config.secrets import write_secret
-    from letify.providers import kaggle as kaggle_module
+def test_usage_without_a_cookie_says_to_log_in(isolated_home) -> None:
+    import letify
 
-    monkeypatch.setenv("KAGGLE_API_TOKEN", "another-accounts-token")
-    path = write_secret("kaggle_a", "access_token", ACCESS_TOKEN)
-    patch_which(tools, present=True)
-    recorder = patch_run(kaggle_module, result=FakeCompleted(stdout=QUOTA))
-    kaggle_provider().usage()
-    env = recorder.calls[-1]["env"]
-    assert env["KAGGLE_API_TOKEN"] == str(path)
-    assert ACCESS_TOKEN not in env.values()
+    with pytest.raises(letify.ConfigError, match="login kaggle"):
+        kaggle_provider().usage()
 
 
 # -- Spec: Placements a provider cannot serve --------------------------------------
@@ -420,15 +382,22 @@ def test_a_program_runs_on_the_registered_session_in_the_kernel_letify_created(
     assert all(fake_kaggle.token not in " ".join(run["argv"]) for run in runs)
 
 
-def test_every_rest_request_carries_the_session_token_both_ways(fake_kaggle) -> None:
+def test_every_rest_request_carries_the_session_token_in_the_path_not_a_header(
+    fake_kaggle,
+) -> None:
+    """Spec "Kaggle Jupyter Server session": the routed URL carries the token in its path.
+
+    The proxy rejects a token sent only as an Authorization header, so the token rides in the
+    URL path. Every REST request the provider makes therefore carries the path token and no
+    ``token`` Authorization header.
+    """
     session_channel(fake_kaggle)
-    token = fake_kaggle.token
     assert fake_kaggle.requests
-    assert all(r["query"].get("token") == token for r in fake_kaggle.requests)
-    assert all(r["authorization"] == f"token {token}" for r in fake_kaggle.requests)
+    assert all(r["path_token"] == fake_kaggle.token for r in fake_kaggle.requests)
+    assert all(r["authorization"] is None for r in fake_kaggle.requests)
 
 
-def test_an_account_with_no_registered_session_refuses_the_call(isolated_home) -> None:
+def test_an_account_with_no_cookie_refuses_the_call(isolated_home) -> None:
     from letify.errors import ConfigError
 
     provider = kaggle_provider()
@@ -436,10 +405,10 @@ def test_an_account_with_no_registered_session_refuses_the_call(isolated_home) -
         provider.open_channel(type("R", (), {"name": "n", "instance": provider.CPU})())
     message = str(caught.value)
     assert "kaggle_a" in message
-    assert "--connect" in message
+    assert "login kaggle" in message
 
 
-def test_an_ended_session_at_start_says_how_to_register_a_new_one(fake_kaggle) -> None:
+def test_an_ended_session_at_start_says_to_run_again(fake_kaggle) -> None:
     import letify
     from letify.providers.kaggle import KaggleSessionEnded
 
@@ -448,36 +417,10 @@ def test_an_ended_session_at_start_says_how_to_register_a_new_one(fake_kaggle) -
         session_channel(fake_kaggle)
     message = str(caught.value)
     assert isinstance(caught.value, letify.RuntimeLost)
-    assert "Run, Kaggle Jupyter Server" in message
-    assert "letify login kaggle kaggle_a --connect" in message
-    assert "20 minutes" in message and "12 hour" in message
-    assert fake_kaggle.token not in message
-    assert "/k/123/proxy" not in message
-
-
-def test_a_session_that_does_not_route_is_not_reported_as_having_ended(fake_kaggle) -> None:
-    """Spec "Kaggle Jupyter Server session": the message does not state that the session ended.
-
-    Kaggle's proxy answers 404 for an ended session, for a URL that no longer routes to a
-    live one, and for a session id that never existed. A status read that is not 200
-    therefore cannot tell those apart, so a message asserting the session ended states as
-    fact something letify has not established. Here the server is running throughout: only
-    the registered URL points somewhere it does not serve.
-    """
-    from letify.config.secrets import write_secret
-    from letify.providers.kaggle import KaggleSessionEnded
-
-    write_secret("kaggle_a", "jupyter_url", fake_kaggle.url.replace("/k/123/", "/k/999/"))
-    with pytest.raises(KaggleSessionEnded) as caught:
-        session_channel(fake_kaggle)
-    message = str(caught.value)
-
-    assert "has ended" not in message
     assert "did not answer" in message
-    assert "no longer route" in message
-    # The remedy is the same either way, so it is still spelled out.
-    assert "letify login kaggle kaggle_a --connect" in message
     assert "20 minutes" in message and "12 hour" in message
+    assert "Run the function again" in message
+    assert fake_kaggle.token not in message
 
 
 def test_a_session_that_ends_under_a_running_worker_is_a_lost_runtime(fake_kaggle) -> None:
@@ -541,13 +484,18 @@ def test_files_move_as_worker_requests_rather_than_through_the_contents_api(
     assert not fake_kaggle.made("PUT", "/api/contents/")
 
 
-def test_stopping_deletes_the_kernel_and_leaves_the_session_running(fake_kaggle) -> None:
+def test_stopping_deletes_the_kernel_and_cancels_the_run(fake_kaggle) -> None:
+    """Spec "Kaggle Jupyter Server session": the run is letify's own, so stop cancels it.
+
+    letify starts the session for the runtime, so ending the runtime cancels the run to
+    release the accelerator quota it holds, after deleting the kernel it created.
+    """
     provider, runtime, _channel = session_channel(fake_kaggle)
     assert len(fake_kaggle.kernels) == 1
     provider.stop(runtime)
     assert fake_kaggle.kernels == set()
     assert len(fake_kaggle.made("DELETE", "/api/kernels/")) == 1
-    assert fake_kaggle.made("GET", "/api/status")
+    assert fake_kaggle.cancelled == [fake_kaggle.RUN_ID]
 
 
 def test_kaggle_never_opts_out_of_preparing_the_runtime(fake_kaggle) -> None:

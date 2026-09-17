@@ -49,19 +49,6 @@ except (urllib.error.URLError, OSError) as exc:
 # binary read. Here the same shape is a subprocess whose standard input and output are pipes:
 # the bridge copies lines in and out, exactly as it would copy them to input_request replies
 # and from stream messages.
-if os.environ.get("LETIFY_ADAPTER_MODE") == "program":
-    # One program, then exit: what a login needs, before any runtime or channel exists.
-    timeout = float(os.environ.get("LETIFY_TIMEOUT") or 120)
-    ran = subprocess.run(
-        [sys.executable, "-c", sys.stdin.read()],
-        capture_output=True,
-        text=True,
-        timeout=timeout,
-    )
-    sys.stdout.write(ran.stdout)
-    sys.stderr.write(ran.stderr)
-    raise SystemExit(0 if ran.returncode == 0 else 3)
-
 STUB = (
     "import sys;"
     "b=sys.stdin.buffer;"
