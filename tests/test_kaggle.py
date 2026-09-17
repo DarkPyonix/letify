@@ -471,6 +471,27 @@ def test_a_session_that_ends_under_a_running_worker_is_a_lost_runtime(fake_kaggl
         channel.request({"op": "eval", "source": "__letify_value__ = LETIFY_ALIVE\n"})
 
 
+def test_a_bridge_that_dies_before_hello_reports_its_standard_error(
+    fake_kaggle, monkeypatch
+) -> None:
+    """Spec "Kaggle Jupyter Server session": a worker death is reported with the bridge's
+    standard error.
+
+    The bridge is a subprocess whose standard error is a pipe the channel owns. What it
+    prints before exiting, such as uv failing to resolve the kernel client or the kernel
+    refusing the cell, is the only account of why the worker never said hello, so the
+    failure has to carry it. A report that says only that the worker stopped leaves the
+    user, and the next reader of a flaky suite, with nothing to act on.
+    """
+    from letify.errors import RuntimeFailure
+
+    monkeypatch.setenv("FAKE_KAGGLE_DIE", "the bridge refused to start: no kernel client")
+    _provider, _runtime, channel = session_channel(fake_kaggle)
+    with pytest.raises(RuntimeFailure) as raised:
+        channel.request({"op": "eval", "source": "__letify_value__ = 1"})
+    assert "the bridge refused to start: no kernel client" in str(raised.value)
+
+
 def test_a_program_that_raises_on_a_live_session_carries_its_own_traceback(fake_kaggle) -> None:
     """The worker reports the user's error, and the session is untouched by it.
 
