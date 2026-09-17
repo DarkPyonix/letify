@@ -215,6 +215,13 @@ class Runtime:
         self.last_used = time.monotonic()
         return self.channel.stream(payload, timeout=timeout)
 
+    def pipeline(self, *, window: int, timeout: float | None = None) -> Any:
+        """Open one stream carrying several worker requests in order, each answered in order."""
+        if self.channel is None:
+            raise RuntimeFailure(f"{self.name}: the channel is not open")
+        self.last_used = time.monotonic()
+        return self.channel.pipeline(window=window, timeout=timeout)
+
     def exec(self, source: str, *, timeout: float | None = None) -> None:
         """Run plain source inside the runtime, sharing the worker's globals."""
         self.request({"op": "exec", "source": source}, timeout=timeout)
