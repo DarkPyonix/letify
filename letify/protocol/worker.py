@@ -673,6 +673,8 @@ def _data_register(data):
         for path, digest, _copy in data.get("links", ()):
             state["pending"][path] = (digest, 0)
             state["by_digest"].setdefault(digest, []).append(path)
+            # A single file input names no directory of its own in the request.
+            os.makedirs(os.path.dirname(path), exist_ok=True)
     with _DATA_READY:
         _DATA_CALLS[state["dir"]] = state
         for path in list(state["pending"]):
