@@ -13,11 +13,13 @@ import base64
 import binascii
 import json
 import os
+import re
 import subprocess
 import urllib.error
 import urllib.parse
 import urllib.request
 from collections.abc import Mapping
+from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 
 from .. import tools
@@ -101,6 +103,83 @@ def split_url(url: str) -> tuple[str, str | None]:
     base = urllib.parse.urlunsplit((parts.scheme, parts.netloc, parts.path.rstrip("/"), "", ""))
     token = dict(urllib.parse.parse_qsl(parts.query)).get("token")
     return base, token
+
+
+#: The cookie that carries the session's expiry, an alg:none JWT with an ``exp`` claim.
+CLIENT_TOKEN_COOKIE = "CLIENT-TOKEN"
+
+#: Cookie names a usable Kaggle session must carry. The principal cookie, the CSRF token
+#: and the JWT that dates the session; missing any one means the copy was partial.
+REQUIRED_COOKIES = ("ka_sessionid", CLIENT_TOKEN_COOKIE, "XSRF-TOKEN")
+
+
+def parse_cookie(cookie: str) -> dict[str, str]:
+    """Split a ``name=value; name=value`` cookie header into a mapping.
+
+    Only the first ``=`` separates a pair, so a base64 value ending in ``==`` survives.
+    """
+    jar: dict[str, str] = {}
+    for part in cookie.strip().split(";"):
+        part = part.strip()
+        if "=" in part:
+            name, value = part.split("=", 1)
+            jar[name.strip()] = value.strip()
+    return jar
+
+
+def require_cookie_shape(cookie: str) -> dict[str, str]:
+    """Return the parsed jar, or raise ``ValueError`` naming the cookies that are missing."""
+    jar = parse_cookie(cookie)
+    missing = [name for name in REQUIRED_COOKIES if not jar.get(name)]
+    if missing:
+        raise ValueError(
+            "the Kaggle cookie is missing " + ", ".join(missing) + "; copy the whole cookie "
+            "of a logged-in kaggle.com tab"
+        )
+    return jar
+
+
+def _client_token_claims(cookie: str) -> dict[str, Any]:
+    token = parse_cookie(cookie).get(CLIENT_TOKEN_COOKIE)
+    if not token:
+        raise ValueError("the Kaggle cookie has no CLIENT-TOKEN, so its expiry cannot be read")
+    parts = token.split(".")
+    if len(parts) < 2:
+        raise ValueError("the Kaggle CLIENT-TOKEN is not a JWT")
+    payload = parts[1] + "=" * (-len(parts[1]) % 4)
+    try:
+        claims = json.loads(base64.urlsafe_b64decode(payload))
+    except (binascii.Error, ValueError):
+        raise ValueError("the Kaggle CLIENT-TOKEN payload could not be decoded") from None
+    if not isinstance(claims, dict):
+        raise ValueError("the Kaggle CLIENT-TOKEN payload is not an object")
+    return claims
+
+
+def _parse_iso8601(text: str) -> datetime:
+    """Parse an ISO 8601 instant, tolerating a trailing Z and over-long fractional seconds."""
+    value = text.strip().replace("Z", "+00:00")
+    match = re.match(r"^(.*\.\d{6})\d*([+-]\d{2}:\d{2})?$", value)
+    if match:
+        value = match.group(1) + (match.group(2) or "")
+    parsed = datetime.fromisoformat(value)
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=UTC)
+    return parsed.astimezone(UTC).replace(microsecond=0)
+
+
+def cookie_expiry(cookie: str) -> datetime:
+    """When the session cookie expires, from the CLIENT-TOKEN ``exp`` claim (UTC)."""
+    exp = _client_token_claims(cookie).get("exp")
+    if not exp:
+        raise ValueError("the Kaggle CLIENT-TOKEN has no exp claim")
+    return _parse_iso8601(str(exp))
+
+
+def cookie_days_left(cookie: str, now: datetime | None = None) -> float:
+    """Days until the cookie expires; negative once it has."""
+    moment = now or datetime.now(UTC)
+    return (cookie_expiry(cookie) - moment).total_seconds() / 86400.0
 
 
 def adapter_command() -> list[str]:
