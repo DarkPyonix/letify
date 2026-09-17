@@ -13,6 +13,7 @@ suite does not install PyTorch and the wrapper's contract is the class it wraps.
 
 from __future__ import annotations
 
+import collections
 import re
 import time
 from pathlib import Path
@@ -21,6 +22,7 @@ import pytest
 
 import letify
 from letify.errors import RuntimeFailure
+from letify.protocol import wire
 from letify.store import pathdata, sendorder
 
 #: A module global a declared body reads, set per test.
@@ -275,6 +277,194 @@ def test_the_second_call_sends_nothing_and_waits_for_nothing(
     assert before_files(line) == 0
     assert during_files(line) == 0
     assert waited_seconds(line) == 0.0
+
+
+# -- Spec: Where the bytes come from, the pipelined data_put pieces -----------------
+
+
+class Pieces:
+    """Every ``data_put`` head this process sent, and every reply it read on those streams.
+
+    Hooked at the frame layer, ``wire.Sender.message`` and ``wire.Receiver.next_event``, so
+    it sees what crosses the channel rather than how the sender is written. Each entry of
+    ``sent`` records how many earlier pieces had no reply yet when that piece went out.
+    """
+
+    def __init__(self, monkeypatch) -> None:
+        self.sent: list[tuple[int, str, int, bool, int]] = []
+        self.answered: collections.Counter = collections.Counter()
+        #: Unanswered pieces at the moment each call request went out.
+        self.calls: list[int] = []
+        hook = self
+        original_message = wire.Sender.message
+        original_next = wire.Receiver.next_event
+
+        def message(self_, kind, stream, obj):
+            if kind == wire.REQUEST and isinstance(obj, dict):
+                if obj.get("op") == "data_put":
+                    hook.sent.append(
+                        (
+                            stream,
+                            str(obj["digest"]),
+                            int(obj["offset"]),
+                            bool(obj.get("last")),
+                            hook.unanswered,
+                        )
+                    )
+                elif obj.get("op") == "call":
+                    hook.calls.append(hook.unanswered)
+            return original_message(self_, kind, stream, obj)
+
+        def next_event(self_):
+            event = original_next(self_)
+            if event is not None and event[0] == wire.REPLY and event[1] in hook.streams:
+                hook.answered[event[1]] += 1
+            return event
+
+        monkeypatch.setattr(wire.Sender, "message", message)
+        monkeypatch.setattr(wire.Receiver, "next_event", next_event)
+
+    @property
+    def streams(self) -> set[int]:
+        return {stream for stream, *_rest in self.sent}
+
+    @property
+    def unanswered(self) -> int:
+        return len(self.sent) - sum(self.answered.values())
+
+    def per_digest(self) -> dict[str, int]:
+        return collections.Counter(digest for _s, digest, *_rest in self.sent)
+
+
+def test_the_first_wave_is_sent_without_waiting_for_a_reply_per_piece(
+    launcher_from, project, monkeypatch
+) -> None:
+    """Spec "Where the bytes come from": at most 8 pieces are unanswered, never fewer in
+    flight than the window allows, and the call goes out once every piece is answered.
+
+    Only this thread reads frames before the call is sent, so the count of unanswered
+    pieces at each send is exact: a sender that waits for each reply shows 0 every time,
+    and a pipelined one climbs to 7 and stays there.
+    """
+    pieces = Pieces(monkeypatch)
+    let = streaming(launcher_from, data_first_wave_files=64)
+    root = dataset(project, 32, size=1 << 16)
+
+    @let.function(device=let.providers.lab.CPU, host=letify.remote)
+    def read_all(directory: Path) -> list[int]:
+        return [p.read_bytes()[0] for p in sorted(directory.iterdir())]
+
+    assert read_all(root) == [index % 251 for index in range(32)]
+    assert len(pieces.sent) == 32
+    assert len(pieces.streams) == 1, "every piece of the call travels on one stream"
+    # Eight in flight: the ninth piece waits for the first reply, and no later piece
+    # goes out with more than seven earlier ones unanswered.
+    assert max(entry[4] for entry in pieces.sent) == 7
+    assert [entry[4] for entry in pieces.sent[:8]] == list(range(8))
+    assert pieces.calls == [0], "the call is sent only once the wave is placed"
+    assert sum(pieces.answered.values()) == 32
+
+
+def test_the_background_sender_uses_the_stream_of_the_first_wave(
+    launcher_from, project, monkeypatch
+) -> None:
+    """Spec "Streaming the rest while the call runs": the rest goes on the same stream, and
+    no piece is a request of its own."""
+    from letify.runtime import channel as channel_module
+
+    pieces = Pieces(monkeypatch)
+    let = streaming(launcher_from, data_first_wave_files=1)
+    root = dataset(project, 16, size=1 << 16)
+    requested: list[str] = []
+    original = channel_module.PersistentChannel.request
+
+    def recording(self, request, **kwargs):
+        if isinstance(request, dict):
+            requested.append(str(request.get("op", "call")))
+        return original(self, request, **kwargs)
+
+    monkeypatch.setattr(channel_module.PersistentChannel, "request", recording)
+
+    @let.function(device=let.providers.lab.CPU, host=letify.remote)
+    def read_all(directory: Path) -> list[int]:
+        return [p.read_bytes()[0] for p in sorted(directory.iterdir())]
+
+    assert read_all(root) == [index % 251 for index in range(16)]
+    assert len(pieces.sent) == 16
+    assert len(pieces.streams) == 1, "the first wave and the rest share one stream"
+    assert "data_put" not in requested, requested
+    assert sum(pieces.answered.values()) == 16, "every reply is read before the stream closes"
+
+
+def test_a_piece_boundary_inside_a_file_never_shows_a_half_written_file(
+    launcher_from, project, monkeypatch
+) -> None:
+    """Spec "What the body sees before a file arrives", with files that span pieces: the
+    worker assembles the pieces beside the cache and a file appears only whole."""
+    monkeypatch.setattr(pathdata, "CHUNK", 1 << 16)
+    pieces = Pieces(monkeypatch)
+    let = streaming(launcher_from, data_first_wave_mib=0)
+    root = dataset(project, 24, size=1 << 18)
+
+    @let.function(device=let.providers.lab.CPU, host=letify.remote)
+    def watch(directory: Path) -> tuple[set[int], list[str]]:
+        seen = set()
+        odd = []
+        for _sweep in range(40):
+            for entry in sorted(directory.iterdir()):
+                if ".letify-placing." in entry.name or ".partial." in entry.name:
+                    odd.append(entry.name)
+                seen.add(entry.stat().st_size)
+        for entry in sorted(directory.iterdir()):
+            seen.add(len(entry.read_bytes()))
+        return seen, odd
+
+    sizes, partials = watch(root)
+    assert sizes == {1 << 18}
+    assert partials == []
+    # Four pieces per file, the last one marked, so the boundary was really crossed.
+    assert set(pieces.per_digest().values()) == {4}
+    assert [offset for _s, _d, offset, last, _u in pieces.sent if last] == [3 << 16] * 24
+
+
+def test_a_want_for_a_file_whose_pieces_are_in_flight_is_not_sent_again(
+    launcher_from, project, monkeypatch
+) -> None:
+    """Spec "Streaming the rest while the call runs": a blob is never sent twice, even when
+    the body blocks on a file the sender is in the middle of."""
+    monkeypatch.setattr(pathdata, "CHUNK", 1 << 16)
+    pieces = Pieces(monkeypatch)
+    let = streaming(launcher_from, data_first_wave_mib=0)
+    root = dataset(project, 4, size=1 << 19)
+
+    @let.function(device=let.providers.lab.CPU, host=letify.remote)
+    def read_first_then_all(directory: Path) -> list[int]:
+        files = sorted(directory.iterdir())
+        # The first file is the one the sender starts with, so this open lands while its
+        # pieces are in flight and the want it sends names a blob already on the way.
+        first = files[0].read_bytes()[0]
+        return [first, *[p.read_bytes()[0] for p in files[1:]]]
+
+    assert read_first_then_all(root) == [index % 251 for index in range(4)]
+    assert set(pieces.per_digest().values()) == {8}, pieces.per_digest()
+
+
+def test_a_piece_whose_digest_does_not_match_fails_the_call(
+    launcher_from, project, monkeypatch
+) -> None:
+    """Spec "Where the bytes come from": the failed reply of the last piece raises
+    RuntimeFailure on the local side, through the pipelined stream, and nothing is renamed."""
+    monkeypatch.setattr(pathdata, "hash_file", lambda path, size: "0" * 32)
+    let = streaming(launcher_from, data_first_wave_files=64)
+    root = dataset(project, 2, size=1 << 16)
+
+    @let.function(device=let.providers.lab.CPU, host=letify.remote)
+    def read_all(directory: Path) -> int:
+        return len([p.read_bytes() for p in sorted(directory.iterdir())])
+
+    with pytest.raises(RuntimeFailure) as failure:
+        read_all(root)
+    assert "arrived with digest" in str(failure.value)
 
 
 # -- Spec: What the body sees before a file arrives -------------------------------
