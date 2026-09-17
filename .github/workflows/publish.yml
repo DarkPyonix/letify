@@ -48,10 +48,16 @@ jobs:
             arch: aarch64
     runs-on: ${{ matrix.runner }}
     container: quay.io/pypa/manylinux_2_28_${{ matrix.arch }}
-    env:
-      PATH: /opt/python/cp312-cp312/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
     steps:
       - uses: actions/checkout@v4
+      - name: Put the image's CPython 3.12 on PATH
+        # A job level PATH would also hide what later steps append through GITHUB_PATH,
+        # so the interpreter is found here and appended the same way cargo is below.
+        run: |
+          ls /opt/python
+          bin=$(ls -d /opt/python/cp312-cp312/bin 2>/dev/null || ls -d /opt/python/cp312*/bin | head -1)
+          test -x "$bin/python" || { echo "no CPython 3.12 under /opt/python"; exit 1; }
+          echo "$bin" >> "$GITHUB_PATH"
       - name: Install Rust
         # rustup reads letify-core/rust-toolchain.toml when cargo runs there. Inside the
         # container HOME is /github/home rather than /root, so cargo lands under that HOME
