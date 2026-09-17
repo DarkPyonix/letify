@@ -502,41 +502,65 @@ def test_an_ended_session_at_start_says_how_to_register_a_new_one(fake_kaggle) -
     assert "/k/123/proxy" not in message
 
 
-def test_a_session_that_ends_between_programs_raises_session_ended(fake_kaggle) -> None:
-    from letify.providers.kaggle import KaggleSessionEnded
+def test_a_session_that_ends_under_a_running_worker_is_a_lost_runtime(fake_kaggle) -> None:
+    """Spec "Kaggle Jupyter Server session": the bridge exiting is the worker dying.
+
+    There is no "between programs" on a persistent channel. A session Kaggle ends takes the
+    cell and the worker with it, so every blocked read ends as a lost channel does, and the
+    failure names the runtime rather than the call that happened to be in flight.
+    """
+    import letify
 
     _provider, _runtime, channel = session_channel(fake_kaggle)
+    channel.request({"op": "exec", "source": "LETIFY_ALIVE = True\n"})
+
     fake_kaggle.end_session()
-    with pytest.raises(KaggleSessionEnded):
-        channel.request({"op": "exec", "source": "print('hello')"})
+    channel._kill()
+    with pytest.raises((letify.RuntimeLost, letify.RuntimeFailure)):
+        channel.request({"op": "eval", "source": "__letify_value__ = LETIFY_ALIVE\n"})
 
 
-def test_a_program_that_raises_on_a_live_session_is_a_runtime_failure(fake_kaggle) -> None:
+def test_a_program_that_raises_on_a_live_session_carries_its_own_traceback(fake_kaggle) -> None:
+    """The worker reports the user's error, and the session is untouched by it.
+
+    A one-shot adapter could only say that the program exited non zero. A worker answers
+    with the exception itself, so user code failing is a RemoteError with its traceback
+    rather than an infrastructure failure, and the next request still works.
+    """
     import letify
     from letify.providers.kaggle import KaggleSessionEnded
 
     _provider, _runtime, channel = session_channel(fake_kaggle)
-    with pytest.raises(letify.RuntimeFailure) as caught:
+    with pytest.raises(letify.RemoteError) as caught:
         channel.request({"op": "exec", "source": "1 / 0"})
     assert not isinstance(caught.value, KaggleSessionEnded)
     assert "ZeroDivisionError" in str(caught.value)
 
+    # The worker survived the user's error, which is the point of reporting it this way.
+    value, _logs = channel.request({"op": "eval", "source": "__letify_value__ = 6 * 7\n"})
+    assert value == 42
 
-def test_files_move_through_the_session_contents_api(fake_kaggle, tmp_path) -> None:
-    import base64 as b64
 
+def test_files_move_as_worker_requests_rather_than_through_the_contents_api(
+    fake_kaggle, tmp_path
+) -> None:
+    """Spec "Kaggle Jupyter Server session": the three file ops are worker requests.
+
+    The Jupyter contents API was the substitute a one-shot channel needed, because a
+    channel with no worker has nobody to ask. A worker serves them itself, so the bytes
+    travel as frames and no contents request is made at all.
+    """
     _provider, _runtime, channel = session_channel(fake_kaggle)
     target = tmp_path / "session" / "weights.bin"
     payload = bytes(range(256)) * 4
-    value, _ = channel.request(
-        {"op": "put_file", "path": str(target), "payload": b64.b64encode(payload).decode()}
-    )
+
+    value, _ = channel.request({"op": "put_file", "path": str(target), "payload": payload})
     assert value == {"path": str(target), "size": len(payload)}
     assert target.read_bytes() == payload
-    assert fake_kaggle.made("PUT", "/api/contents/")
 
     back, _ = channel.request({"op": "get_file", "path": str(target)})
-    assert b64.b64decode(back["payload"]) == payload
+    assert bytes(back["payload"]) == payload
+    assert not fake_kaggle.made("PUT", "/api/contents/")
 
 
 def test_stopping_deletes_the_kernel_and_leaves_the_session_running(fake_kaggle) -> None:

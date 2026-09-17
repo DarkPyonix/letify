@@ -9,6 +9,8 @@ any kind, and it sends no keep-alive request.
 
 from __future__ import annotations
 
+import base64
+import binascii
 import json
 import os
 import subprocess
@@ -24,14 +26,15 @@ from ..config.secrets import account_directory
 from ..declare.instance import Host, Instance
 from ..errors import (
     ConfigError,
+    ProtocolError,
     ProviderUnavailable,
     RuntimeFailure,
     RuntimeLost,
     UnsupportedMode,
 )
-from ..runtime.channel import OneShotChannel
+from ..protocol import wire
+from ..runtime.channel import Connection, FramedChannel
 from .base import Provider
-from .colab_files import ContentsTransfer
 from .usage import Usage
 
 #: Seconds one REST request to the session may take.
@@ -108,16 +111,6 @@ def adapter_command() -> list[str]:
     return tools.script_command(tools.KAGGLE_KERNEL, uv, tools.KAGGLE_ADAPTER)
 
 
-class JupyterTransfer(ContentsTransfer):
-    """The contents API of a plain Jupyter server, authenticated with its token."""
-
-    def _auth_query(self) -> dict[str, str]:
-        return {"token": self.token} if self.token else {}
-
-    def _auth_headers(self) -> dict[str, str]:
-        return {"Authorization": f"token {self.token}"} if self.token else {}
-
-
 class Session:
     """The REST side of one Kaggle Jupyter Server session, through the standard library."""
 
@@ -175,14 +168,12 @@ class Session:
         except (urllib.error.URLError, OSError, ValueError):
             pass
 
-    def transfer(self) -> ContentsTransfer:
-        return JupyterTransfer(self.base, self.token or "")
-
     def run(self, kernel: str, source: str, timeout: float | None) -> str:
         """Run one program through the adapter and return its standard output."""
         env = dict(os.environ)
         env["LETIFY_JUPYTER_URL"] = self._url
         env["LETIFY_KERNEL_ID"] = kernel
+        env["LETIFY_ADAPTER_MODE"] = "program"
         env["LETIFY_TIMEOUT"] = str(timeout or DEFAULT_PROGRAM_TIMEOUT)
         process = subprocess.Popen(
             adapter_command(),
@@ -213,14 +204,157 @@ class Session:
         raise RuntimeFailure(f"{self.alias}: the Kaggle adapter {reason}", stderr=stderr)
 
 
+class KaggleChannel(FramedChannel):
+    """Carries the worker's frames over one kernel cell, through the adapter bridge.
+
+    The frames are the ones that run over SSH. Only the plumbing differs: a kernel carries
+    text, so the worker writes each frame as a base64 line, as the Modal sandbox already
+    does. The bridge is an ordinary subprocess, so its pipes are what a write and a read
+    reach, and the cell on the other side of it lives for the runtime.
+    """
+
+    text_frames = True
+
+    #: Bytes handed to the bridge per write, matching the Modal channel.
+    WRITE_LIMIT = 1 << 20
+
+    def __init__(
+        self, command: list[str], env: dict[str, str], *, name: str, session: Session
+    ):
+        self.command = command
+        self.env = env
+        self.name = name
+        #: Asked whether the session is still there when the worker stops answering.
+        self.session = session
+        self._process: subprocess.Popen[bytes] | None = None
+        self._connection = None
+        self._raw = bytearray()
+
+    def start(self) -> None:
+        if self._connection is not None:
+            return
+        try:
+            self._process = subprocess.Popen(
+                self.command,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                bufsize=0,
+                env={**os.environ, **self.env},
+            )
+        except OSError as exc:
+            raise RuntimeFailure(
+                f"{self.name}: could not start the Kaggle bridge: {exc}",
+                command=" ".join(self.command[:3]),
+            ) from exc
+        self._connection = Connection(
+            self.name,
+            self._write,
+            wire.chunks_readinto(self._read_chunks),
+            self._emit,
+            death_detail=self._raw_text,
+        )
+        self._send_worker()
+        self._await_ready()
+
+    def _write(self, view: memoryview) -> int:
+        piece = view[: self.WRITE_LIMIT]
+        process = self._process
+        assert process is not None and process.stdin is not None
+        process.stdin.write(base64.b64encode(piece) + b"\n")
+        process.stdin.flush()
+        return piece.nbytes
+
+    def _read_chunks(self) -> list[bytes]:
+        """The next frame line, decoded. A line that is not base64 is output from before the
+        worker started, such as the interpreter's own error, and is kept for the failure."""
+        process = self._process
+        assert process is not None and process.stdout is not None
+        while True:
+            line = process.stdout.readline()
+            if not line:
+                return []
+            try:
+                return [base64.b64decode(line.strip(), validate=True)]
+            except (binascii.Error, ValueError):
+                self._raw += line
+
+    def request(self, payload: dict[str, Any], *, timeout: float | None = None):
+        try:
+            return super().request(payload, timeout=timeout)
+        except ProtocolError as exc:
+            raise self._verdict(exc) from exc
+
+    def stream(self, payload: dict[str, Any], *, timeout: float | None = None):
+        try:
+            yield from super().stream(payload, timeout=timeout)
+        except ProtocolError as exc:
+            raise self._verdict(exc) from exc
+
+    def _startup_failure(self, expired: bool, cause: Exception) -> Exception:
+        """A worker that never said hello, answered by the same question as a later death."""
+        return self._verdict(cause)
+
+    def _verdict(self, cause: Exception) -> Exception:
+        """Which of the two happened: the session ended, or the worker died inside it.
+
+        Spec "Kaggle Jupyter Server session": the bridge exiting is the worker dying, and
+        one read of the session's status is what tells the two apart. A session that Kaggle
+        ended is a lost runtime, so a retry may start a new one; a worker that died inside a
+        living session is this runtime's failure and a retry would meet it again.
+        """
+        if not self.session.alive():
+            return self.session.ended()
+        return RuntimeFailure(
+            f"{self.name}: the Kaggle worker stopped while the session was still answering: "
+            f"{cause}",
+            stderr=self._raw_text(),
+        )
+
+    def _raw_text(self) -> str:
+        process = self._process
+        detail = bytes(self._raw[-2000:]).decode("utf-8", "replace")
+        if process is not None and process.stderr is not None:
+            try:
+                process.stderr.flush()
+            except (OSError, ValueError):
+                pass
+        return detail
+
+    def _kill(self) -> None:
+        if self._process is not None:
+            self._process.kill()
+
+    def close(self) -> None:
+        process = self._process
+        self._connection = None
+        if process is None:
+            return
+        self._process = None
+        for stream in (process.stdin, process.stdout, process.stderr):
+            try:
+                if stream is not None:
+                    stream.close()
+            except OSError:
+                pass
+        try:
+            process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            process.kill()
+
+
 class Kaggle(Provider):
     """One Kaggle account."""
 
     kind = "kaggle"
     default_persistence = "ephemeral"
     has_fast_path = False
-    persistent_channel = False
     needs_lease = False
+
+    @property
+    def persistent_channel(self) -> bool:  # type: ignore[override]
+        """A registered session keeps one worker, so the object and blob tables survive."""
+        return session_url(self.alias) is not None
 
     #: No device stream can reach a Kaggle session without a tunnel, which Kaggle forbids.
     serves_host_local = False
@@ -256,7 +390,7 @@ class Kaggle(Provider):
     def __init__(self, config: ProviderConfig):
         super().__init__(config)
         #: The session and kernel id each runtime runs its programs in.
-        self._kernels: dict[str, tuple[Session, str]] = {}
+        self._kernels: dict[str, tuple[Session, str, KaggleChannel]] = {}
 
     def cli(self, *args: str, cwd: str | None = None) -> str:
         """Run one Kaggle CLI command as this account and return its output."""
@@ -285,9 +419,7 @@ class Kaggle(Provider):
         return text
 
     def open_channel(self, runtime: Runtime) -> Channel:
-        """A one-shot channel whose programs run in a new kernel of the registered session."""
-        from .colab_files import ColabFiles
-
+        """One worker in one cell of the registered session, behind the adapter bridge."""
         url = session_url(self.alias)
         if url is None:
             raise ConfigError(
@@ -298,26 +430,30 @@ class Kaggle(Provider):
             )
         session = Session(self.alias, url)
         kernel = session.create_kernel()
-        self._kernels[runtime.name] = (session, kernel)
-
-        def run(source: str, timeout: float | None) -> str:
-            return session.run(kernel, source, timeout)
-
-        files = ColabFiles(
-            self.alias,
-            runtime.name,
-            run,
-            workspace=self.workspace_root,
-            transfer=session.transfer,
+        channel = KaggleChannel(
+            adapter_command(),
+            {"LETIFY_JUPYTER_URL": url, "LETIFY_KERNEL_ID": kernel},
+            name=runtime.name,
+            session=session,
         )
-        return OneShotChannel(run, name=runtime.name, files=files)
+        self._kernels[runtime.name] = (session, kernel, channel)
+        return channel
 
     def stop(self, runtime: Runtime) -> None:
-        """Delete the kernel letify created. The session itself is the user's and keeps running."""
+        """Close the bridge, then delete the kernel letify created.
+
+        In that order: closing the bridge's standard input ends the cell's read loop, so the
+        worker exits on its own rather than being cut off mid frame. The session itself is
+        the user's and keeps running.
+        """
         held = self._kernels.pop(runtime.name, None)
         if held is None:
             return
-        session, kernel = held
+        session, kernel, channel = held
+        try:
+            channel.close()
+        except OSError:
+            pass
         session.delete_kernel(kernel)
 
     def _secrets(self) -> list[str]:
@@ -385,7 +521,6 @@ __all__ = [
     "GPUS",
     "QUOTA",
     "TPUS",
-    "JupyterTransfer",
     "Kaggle",
     "KaggleSessionEnded",
     "Session",
