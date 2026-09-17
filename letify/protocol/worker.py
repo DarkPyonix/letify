@@ -1165,19 +1165,82 @@ _install()
 """
 
 
+#: The prefetch depth the lazy import hook wraps torch.utils.data with, set per call.
+_OBSERVE_PREFETCH = None
+
+
+class _ObserveFinder:
+    """A one-shot import hook that wraps torch.utils.data when the body imports it.
+
+    The worker never imports PyTorch to install the wrappers. A call whose body never
+    touches PyTorch would otherwise pay that import for nothing, and the import would sit
+    on the call's path, ahead of the body and the background sender. So the wrappers are
+    installed by hooking the body's own import instead. The finder delegates to the real
+    finders for the module, then wraps it once its own loader has run.
+    """
+
+    def find_spec(self, name, path=None, target=None):
+        if name != "torch.utils.data":
+            return None
+        spec = None
+        for finder in sys.meta_path:
+            if finder is self:
+                continue
+            find = getattr(finder, "find_spec", None)
+            if find is None:
+                continue
+            try:
+                spec = find(name, path, target)
+            except ImportError:
+                spec = None
+            if spec is not None:
+                break
+        if spec is None or spec.loader is None:
+            return None
+        real_exec = getattr(spec.loader, "exec_module", None)
+        if real_exec is None:
+            return None
+        prefetch = _OBSERVE_PREFETCH
+
+        def exec_module(module):
+            real_exec(module)
+            try:
+                _data_wrap(module, prefetch)
+            except BaseException:
+                pass
+
+        spec.loader.exec_module = exec_module
+        try:
+            sys.meta_path.remove(self)
+        except ValueError:
+            pass
+        return spec
+
+
 def _data_observe(state):
-    """Report the read order the body actually takes, as spec "Observing the read order on
-    the runtime" describes. Every wrapper calls the original and only reports what it saw."""
+    """Install the read-order wrappers of spec "Observing the read order on the runtime".
+
+    The worker does not import PyTorch. It wraps torch.utils.data at once when the body has
+    already imported it, and otherwise hooks the body's own import, so the wrappers arrive
+    when PyTorch does and never before."""
+    global _OBSERVE_PREFETCH
     if not state["observe"]:
         return
-    try:
-        import torch.utils.data as data_module
-    except BaseException:
+    _OBSERVE_PREFETCH = state["prefetch"]
+    module = sys.modules.get("torch.utils.data")
+    if module is not None:
+        _data_wrap(module, state["prefetch"])
         return
+    if not any(isinstance(finder, _ObserveFinder) for finder in sys.meta_path):
+        sys.meta_path.insert(0, _ObserveFinder())
+
+
+def _data_wrap(data_module, prefetch):
+    """Wrap DataLoader and Dataset once per process. Every wrapper calls the original and
+    only reports what it saw to the send order queue."""
     if getattr(data_module, "_letify_observed", False):
         return
     data_module._letify_observed = True
-    prefetch = state["prefetch"]
 
     def digests_of(paths):
         found = []
