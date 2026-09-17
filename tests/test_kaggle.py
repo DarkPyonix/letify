@@ -492,6 +492,27 @@ def test_a_bridge_that_dies_before_hello_reports_its_standard_error(
     assert "the bridge refused to start: no kernel client" in str(raised.value)
 
 
+def test_a_worker_killed_by_the_startup_watchdog_says_so(fake_kaggle, monkeypatch) -> None:
+    """Spec "Kaggle Jupyter Server session", Failure: a startup timeout is reported as one.
+
+    When the bridge never says hello, the watchdog kills it, the bridge's shim then dies on
+    an empty read, and a report that shows only that traceback reads as a crash inside an
+    answering session. The report has to name the timeout, because the next step is a
+    slower machine or a longer wait, not a look at the session.
+    """
+    from letify.errors import RuntimeFailure
+    from letify.runtime import channel as channel_module
+
+    monkeypatch.setenv("FAKE_KAGGLE_HANG", "1")
+    monkeypatch.setattr(channel_module, "STARTUP_TIMEOUT", 1.0)
+    _provider, _runtime, channel = session_channel(fake_kaggle)
+    with pytest.raises(RuntimeFailure) as raised:
+        channel.request({"op": "eval", "source": "__letify_value__ = 1"})
+    message = str(raised.value)
+    assert "did not say hello within 1 s" in message
+    assert "the bridge is waiting on the proxy" in message
+
+
 def test_a_program_that_raises_on_a_live_session_carries_its_own_traceback(fake_kaggle) -> None:
     """The worker reports the user's error, and the session is untouched by it.
 

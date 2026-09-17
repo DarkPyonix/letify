@@ -45,6 +45,14 @@ if os.environ.get("FAKE_KAGGLE_DIE"):
     print(os.environ["FAKE_KAGGLE_DIE"], file=sys.stderr)
     raise SystemExit(3)
 
+# A test can make the bridge hang before it reaches the kernel, as a bridge does when the
+# proxy accepts the connection and never answers, so the startup watchdog's report can be
+# checked. It blocks on standard input, which the channel closes when it kills the bridge.
+if os.environ.get("FAKE_KAGGLE_HANG"):
+    print("the bridge is waiting on the proxy", file=sys.stderr, flush=True)
+    sys.stdin.buffer.read()
+    raise SystemExit(4)
+
 try:
     request = urllib.request.Request(f"{base}/api/kernels/{kernel}?token={token}")
     urllib.request.urlopen(request, timeout=10).read()
