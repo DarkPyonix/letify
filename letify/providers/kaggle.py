@@ -337,7 +337,9 @@ def start_run(cookie: str, kernel_id: int, accelerator: str | None) -> int:
     """
     session = _call(cookie, KERNELS_SERVICE + "GetOrCreateKernelSession", {"kernelId": kernel_id})
     sequence = (session.get("draft") or {}).get("sequence")
-    compute: dict[str, Any] = {"internet": {"isEnabled": False}}
+    # Internet on: the environment step downloads from PyPI and astral.sh. A session
+    # started without it has no network at all. Spec "Kaggle Jupyter Server session".
+    compute: dict[str, Any] = {"internet": {"isEnabled": True}}
     if accelerator:
         compute["accelerator"] = accelerator
     reply = _call(
