@@ -613,23 +613,17 @@ def test_the_pending_manifest_names_every_file_of_the_call_exactly_once(
 def test_a_listing_during_streaming_never_sees_a_changing_map(
     launcher_from, project
 ) -> None:
-    """Spec "What the body sees before a file arrives": the body snapshots under the lock.
+    """Spec "What the body sees before a file arrives": every listing is complete.
 
-    The data thread deletes a path from the pending map as each blob completes, while the
-    body lists the same directory. Iterating the live map would raise
-    ``RuntimeError: dictionary changed size during iteration`` mid listing, so the body
-    takes a snapshot of the pending map under the lock the data thread writes it with.
-
-    What the fix guarantees, and what this test pins, is that no listing raises while the
-    map drains: before the fix these thousands of listings raised under aggressive thread
-    switching, and after it every one returns, with the directory complete once streaming
-    settles. It does not assert every single listing is complete. A listing straddling the
-    atomic place-and-delete of a file may momentarily miss it: the data thread makes the file
-    visible then removes it from the pending map, both under the lock, but the body reads the
-    real listing and the pending snapshot in two steps, so under this pathological switch
-    interval a listing can be short by a file or two. That handoff window is a separate
-    property from the crash this fix removes, and normal-timing completeness is pinned by
-    test_a_directory_listing_is_complete_before_the_files_arrive.
+    The data thread places a file and deletes its path from the pending map as each blob
+    completes, while the body lists the same directory. Two things can go wrong. Iterating
+    the live map raises ``RuntimeError: dictionary changed size during iteration``, so the
+    body snapshots the map under the lock the data thread writes it with. And reading the
+    real directory before the snapshot misses a file placed between the two steps: it is
+    on disk after the listing was read, and out of the map before the snapshot was taken.
+    So the body takes the snapshot first. Both are pinned here: the call returning all
+    4000 counts proves no listing raised, and every count being the full directory proves
+    no listing straddled a placement.
     """
     let = streaming(launcher_from, data_first_wave_files=1)
     count = 400
@@ -661,10 +655,7 @@ def test_a_listing_during_streaming_never_sees_a_changing_map(
     # The call returning all 4000 counts proves no listing raised: an unsnapshotted iteration
     # would have propagated RuntimeError out of iterdir and failed the call.
     assert len(seen) == 4000, "every listing returned without raising"
-    assert max(seen) == count, "the directory is complete once streaming settles"
-    # Listings stay near complete; a dip only reflects files in the place-to-pending handoff
-    # under this pathological switch interval, never garbage or an empty directory.
-    assert min(seen) > count // 2, "a listing is never wildly short"
+    assert set(seen) == {count}, "every listing is the whole directory"
 
 
 def test_a_call_whose_files_are_all_held_carries_no_streaming_machinery(
