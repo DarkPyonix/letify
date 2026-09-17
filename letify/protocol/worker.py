@@ -973,8 +973,14 @@ def _data_install_patch():
         return found
 
     def listed(path="."):
+        # Snapshot the pending names before reading the real directory, as scanned does.
+        # The data thread places a file and then drops it from the pending map, both under
+        # the lock, so a file placed between the two steps is in the snapshot or on disk.
+        # Read the other way round it is in neither. Spec "What the body sees before a
+        # file arrives".
+        pending = names_of(path)
         entries = [name for name in real["listdir"](path) if _DATA_PARTIAL not in name]
-        for name, _size in names_of(path):
+        for name, _size in pending:
             if name not in entries:
                 entries.append(name)
         return entries
