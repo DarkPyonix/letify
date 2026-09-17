@@ -38,6 +38,13 @@ if log:
     with open(log, "a", encoding="utf-8") as handle:
         handle.write(json.dumps({"kernel": kernel, "argv": sys.argv[1:]}) + "\n")
 
+# A test can make the bridge die before it reaches the kernel, printing why to its standard
+# error as the real bridge does when uv or the kernel client fails, so the channel's report
+# of that death can be checked.
+if os.environ.get("FAKE_KAGGLE_DIE"):
+    print(os.environ["FAKE_KAGGLE_DIE"], file=sys.stderr)
+    raise SystemExit(3)
+
 try:
     request = urllib.request.Request(f"{base}/api/kernels/{kernel}?token={token}")
     urllib.request.urlopen(request, timeout=10).read()

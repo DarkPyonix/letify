@@ -41,7 +41,7 @@ from ..errors import (
     UnsupportedMode,
 )
 from ..protocol import wire
-from ..runtime.channel import Connection, FramedChannel
+from ..runtime.channel import Connection, FramedChannel, _drain, _Tail
 from .base import Provider
 from .usage import Usage
 
@@ -590,6 +590,10 @@ class KaggleChannel(FramedChannel):
         self._process: Any = None
         self._connection = None
         self._raw = bytearray()
+        #: The bridge's standard error, drained as it arrives so the pipe never fills and
+        #: the tail is there for the report when the bridge exits.
+        self._stderr = _Tail()
+        self._stderr_reader: Any = None
 
     def start(self) -> None:
         import os
@@ -611,6 +615,13 @@ class KaggleChannel(FramedChannel):
                 f"{self.name}: could not start the Kaggle bridge: {exc}",
                 command=" ".join(self.command[:3]),
             ) from exc
+        import threading
+
+        self._stderr = _Tail()
+        self._stderr_reader = threading.Thread(
+            target=_drain, args=(self._process.stderr, self._stderr.add), daemon=True
+        )
+        self._stderr_reader.start()
         self._connection = Connection(
             self.name,
             self._write,
@@ -677,14 +688,20 @@ class KaggleChannel(FramedChannel):
         )
 
     def _raw_text(self) -> str:
+        """What the bridge wrote: standard output from before the worker started, and its
+        standard error, complete once the bridge has exited."""
+        import subprocess
+
         process = self._process
-        detail = bytes(self._raw[-2000:]).decode("utf-8", "replace")
-        if process is not None and process.stderr is not None:
+        if process is not None:
             try:
-                process.stderr.flush()
-            except (OSError, ValueError):
+                process.wait(timeout=2)
+            except subprocess.TimeoutExpired:
                 pass
-        return detail
+        if self._stderr_reader is not None:
+            self._stderr_reader.join(1)
+        raw = bytes(self._raw[-2000:]).decode("utf-8", "replace")
+        return "\n".join(part for part in (raw.strip(), self._stderr.text().strip()) if part)
 
     def _kill(self) -> None:
         if self._process is not None:
