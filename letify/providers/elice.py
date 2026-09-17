@@ -733,7 +733,13 @@ class Elice(Shell):
             record = self.find_machine(machine)
             if record is None:
                 self._starting = machine
-                password = self._launch(instance, machine, price_type)
+                try:
+                    password = self._launch(instance, machine, price_type)
+                except ProviderUnavailable:
+                    # A refused launch created no machine, so the failed start has nothing
+                    # to end. Spec "A start that fails".
+                    self._starting = None
+                    raise
                 record = self.get_machine(machine) or {}
                 # A new machine has a new host key, even on an address a deleted one had.
                 self.forget_host_key()

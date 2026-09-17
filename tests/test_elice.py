@@ -807,3 +807,27 @@ def test_a_spot_launch_refused_for_no_capacity_is_unavailable_not_a_runtime_fail
     message = str(caught.value)
     assert "G-A100-1" in message
     assert "ondemand" in message
+
+
+def test_a_refused_spot_launch_ends_nothing(account, fake_eci, capsys) -> None:
+    # Spec: "A start that fails". A refused launch created no machine, so the failed start
+    # has nothing to end: no delete command, and no line telling the user to delete one.
+    fake_eci.set(
+        fail={
+            "compute vm launch": {
+                "code": 1,
+                "stderr": (
+                    "Error: No spot capacity available for 'G-A100-1'.\n"
+                    "  nvidia_a100_80gb_pcie: need 1, free 0"
+                ),
+            }
+        }
+    )
+    Path("pyproject.toml").write_text("[project]\nname = 'study'\n", encoding="utf-8")
+    Path("uv.lock").write_text("", encoding="utf-8")
+    provider = account()
+    instance = Instance(provider, gpu="A100").priced("spot")._placed("remote")
+    with pytest.raises(letify.ProviderUnavailable):
+        provider.start(instance, letify.Env(), name="letify-a100-spot")
+    assert not any(c.startswith("compute vm delete") for c in fake_eci.commands())
+    assert "could not delete" not in capsys.readouterr().err
