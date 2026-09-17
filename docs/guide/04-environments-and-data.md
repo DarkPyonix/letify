@@ -172,7 +172,7 @@ def train(epochs):
 - A call that raised writes nothing back.
 - A file the body deleted on the runtime is not deleted locally.
 - Calls writing the same local path at the same time are applied one after the other, and for the same file the call that returned last wins. A file is never half from one call and half from another.
-- Files inside a directory are placed on the runtime as writable copies, so the body may overwrite an existing file.
+- Files inside a directory are placed on the runtime as hard links to the runtime's cache, and a file becomes a private copy the moment the body opens it for writing, so the body may overwrite an existing file and a call that only reads copies nothing. A program the body starts, such as `sh` or `ffmpeg`, sees the read-only link and cannot write it in place unless it runs as root.
 
 Each such call prints one more line, for example `letify: data wrote back 3 files 512.1 MiB in 2.4 s (213.4 MiB/s), 0 files 0.0 MiB already on the client`.
 
