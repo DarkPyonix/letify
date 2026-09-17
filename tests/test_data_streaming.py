@@ -277,6 +277,27 @@ def test_the_second_call_sends_nothing_and_waits_for_nothing(
     assert waited_seconds(line) == 0.0
 
 
+def test_a_warm_repeat_of_a_single_file_input_places_the_file(
+    launcher_from, project, capsys
+) -> None:
+    """Spec "Streaming the rest while the call runs": a call whose files the runtime holds
+    places every file before the body starts. A single file input has no directory of its
+    own in the request, so the worker makes its parent when no manifest travelled."""
+    let = streaming(launcher_from)
+    state = project / "state.txt"
+    state.write_text("before", encoding="utf-8")
+
+    # The timeout is the net: a file never placed leaves the body's open waiting.
+    @let.function(device=let.providers.lab.CPU, host=letify.remote, timeout=10)
+    def read(target: Path) -> tuple[int, str]:
+        return target.stat().st_size, target.read_text(encoding="utf-8")
+
+    assert read(state) == (6, "before")
+    capsys.readouterr()
+    assert read(state) == (6, "before")
+    assert "1 files 0.0 MiB already on the runtime" in data_line(capsys.readouterr().err)
+
+
 # -- Spec: What the body sees before a file arrives -------------------------------
 
 
