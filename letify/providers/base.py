@@ -264,6 +264,14 @@ class Provider(abc.ABC):
     def persistent(self) -> bool:
         return self.persistence == "persistent"
 
+    def account_note(self) -> str | None:
+        """A short line about the account's credential health, for listings.
+
+        None by default. A provider whose credential expires (Kaggle's cookie) overrides
+        this to say how many days are left, so `letify providers` shows it at a glance.
+        """
+        return None
+
     # -- instances -----------------------------------------------------------
 
     @abc.abstractmethod

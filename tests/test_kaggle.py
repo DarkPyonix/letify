@@ -197,6 +197,25 @@ def test_a_kaggle_account_is_a_known_provider_kind() -> None:
     assert KINDS["kaggle"] is Kaggle
 
 
+def test_the_account_note_reports_days_left_on_the_cookie(isolated_home) -> None:
+    """Spec "Kaggle account": the listing shows how many days the cookie has left."""
+    from letify.config.secrets import write_secret
+
+    write_secret("kaggle_a", "cookie", make_cookie())  # far-future expiry
+    assert "cookie expires in" in (kaggle_provider().account_note() or "")
+
+
+def test_the_account_note_flags_a_missing_cookie(isolated_home) -> None:
+    assert "no cookie" in (kaggle_provider().account_note() or "")
+
+
+def test_the_account_note_flags_an_expired_cookie(isolated_home) -> None:
+    from letify.config.secrets import write_secret
+
+    write_secret("kaggle_a", "cookie", make_cookie("2000-01-01T00:00:00Z"))
+    assert "EXPIRED" in (kaggle_provider().account_note() or "")
+
+
 def test_kaggle_usage_reads_the_weekly_gpu_quota(isolated_home, patch_which, patch_run) -> None:
     from letify import tools
     from letify.providers import kaggle as kaggle_module

@@ -93,7 +93,7 @@ def test_providers_prints_a_table_and_json_on_request(isolated_home, capsys) -> 
     _declare(isolated_home, '[lab]\nkind = "shell"\naddress = "a"\npersistent = true\n')
     assert main(["providers"]) == 0
     lines = capsys.readouterr().out.splitlines()
-    assert lines[0].split() == ["ALIAS", "KIND", "PERSISTENCE"]
+    assert lines[0].split() == ["ALIAS", "KIND", "PERSISTENCE", "NOTES"]
     assert lines[1].split() == ["lab", "shell", "persistent"]
     assert main(["providers", "--json"]) == 0
     rows = json.loads(capsys.readouterr().out)

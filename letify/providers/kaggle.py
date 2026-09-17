@@ -97,6 +97,14 @@ def session_url(alias: str) -> str | None:
     return path.read_text(encoding="utf-8").strip() or None
 
 
+def read_cookie(alias: str) -> str | None:
+    """The browser session cookie registered for an account, or None."""
+    path = account_directory(alias) / "cookie"
+    if not path.is_file():
+        return None
+    return path.read_text(encoding="utf-8").strip() or None
+
+
 def split_url(url: str) -> tuple[str, str | None]:
     """The server base, which is the URL without its query, and the ``token`` parameter."""
     parts = urllib.parse.urlsplit(url)
@@ -485,6 +493,19 @@ class Kaggle(Provider):
 
     #: No device stream can reach a Kaggle session without a tunnel, which Kaggle forbids.
     serves_host_local = False
+
+    def account_note(self) -> str | None:
+        """How the account's cookie is doing, for `letify providers`."""
+        cookie = read_cookie(self.alias)
+        if cookie is None:
+            return "no cookie; run letify login kaggle"
+        try:
+            left = cookie_days_left(cookie)
+        except ValueError:
+            return "cookie unreadable; log in again"
+        if left <= 0:
+            return "cookie EXPIRED; log in again"
+        return f"cookie expires in {int(left)} days"
 
     usage_unit = "GPU hours"
     usage_source = "kaggle quota, the weekly accelerator quota endpoint"
