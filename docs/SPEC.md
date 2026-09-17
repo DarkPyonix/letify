@@ -938,6 +938,8 @@ A data loader therefore lists the directory, gets every file, and reads them in 
 
 The patch lives in the worker process, so a body that forks, including a PyTorch data loader worker, inherits it. For a process started fresh, such as one spawned by `multiprocessing` with the `spawn` method, the worker puts a directory holding a `letify_pending.pth` on `PYTHONPATH`, which installs the same patch at interpreter start. A process the body starts that is not a Python interpreter, for example an `ffmpeg` invocation, sees only the files that have arrived, and the declaration should name `data_first_wave` large enough to cover what it reads.
 
+The worker writes that manifest, installs the patch and wraps the loader while holding the same lock the data thread takes to place a file. The data thread moves a path out of the pending map and into the placed map as each blob completes, so a writer reading the live maps could see a path in neither of them, or fail outright because a map changed size while it was being read.
+
 #### When a blob does not arrive <!-- id: project-data-streaming-failures -->
 
 - **A blob that never arrives.** A `data_want` unanswered for `data_wait_timeout` seconds on the account, 600 by default, fails that open with `RuntimeFailure` naming the relative path and the digest. The call is not killed, because the body may handle it; the failure is infrastructure, so a retry of the call is allowed.
