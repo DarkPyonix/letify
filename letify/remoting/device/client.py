@@ -26,9 +26,10 @@ from pathlib import Path
 from typing import Any
 
 import torch
+from blake3 import blake3
 
 from ...errors import RemoteError, RuntimeLost
-from .executor import E_DEFINE, E_OP, E_REQUEST, E_STEP, E_STEP_DEFINE
+from .executor import E_DEFINE, E_OP, E_REQUEST, E_STEP, E_STEP_DEFINE, UPLOAD_CACHE_BYTES
 from .frames import ChannelTransport, StreamTransport, Transport, TransportClosed
 from .guard import check_torch_version, check_worker_version
 from .tensor import _CACHE, _NAMES, MISS, REPLAY, Big, layout, outputs, reader
@@ -48,6 +49,13 @@ BATCH_RELEASES = 4096
 
 #: Handles reserved for the outputs of an operator the runtime ran at once.
 DESCRIBED_OUTPUTS = 64
+
+#: CPU tensors at least this large are hashed and travel as their digest when the executor
+#: already holds their bytes.
+CACHE_MIN_BYTES = 64 << 10
+
+#: CPU tensors at least this large are hashed with BLAKE3's automatic multithreading.
+HASH_THREADS_BYTES = 1 << 20
 
 #: Unread replies at which the next non-blocking read first reads the oldest.
 UNREAD_LIMIT = 1024
@@ -136,6 +144,10 @@ class Stats:
     replayed: int = 0
     #: Repetitions ended by an operator that did not match.
     fallbacks: int = 0
+    #: Uploads sent as a digest because the executor held their bytes.
+    cache_hits: int = 0
+    #: Bytes those uploads did not send.
+    cache_saved_bytes: int = 0
     #: Non-blocking reads queued.
     deferred: int = 0
     #: Value reads deferred by the automatic replacement of ``item`` and its neighbours.
@@ -221,6 +233,12 @@ class Client:
         self._mutating: dict[int, bool] = {}
         self._steps: dict[int, Any] = {}
         self.tracer = Tracer()
+        #: The executor's upload table as keys and lengths, updated in the executor's order.
+        self._uploads: collections.OrderedDict[tuple, int] = collections.OrderedDict()
+        self._upload_bytes = 0
+        self._upload_budget = UPLOAD_CACHE_BYTES
+        #: A budget set here and not yet sent, guarded by ``_flush_lock``.
+        self._budget_unsent: int | None = None
         #: The consumers of each reply-carrying batch sent and not yet answered, in send order.
         self._replies: collections.deque[list] = collections.deque()
         #: Non-blocking reads whose fetch entry is still queued, by ``id`` of the entry.
@@ -296,6 +314,21 @@ class Client:
     def queued(self) -> int:
         """Entries queued and not yet sent."""
         return len(self._queue)
+
+    # -- upload cache -----------------------------------------------------------------
+
+    def set_upload_cache_bytes(self, budget: int) -> None:
+        """Bound the executor's upload table to ``budget`` bytes, 0 for no cache."""
+        with self._flush_lock:
+            self._upload_budget = budget
+            self._evict_uploads()
+            self._budget_unsent = budget
+
+    def _evict_uploads(self) -> None:
+        uploads = self._uploads
+        while self._upload_bytes > self._upload_budget:
+            _key, size = uploads.popitem(last=False)
+            self._upload_bytes -= size
 
     # -- templates ------------------------------------------------------------------
 
@@ -537,15 +570,22 @@ class Client:
             entries.extend(extra)
             buffers: list = []
             keep: list = []
+            # Placed in entry order, which is the order the executor updates its upload table.
+            for index, entry in enumerate(entries):
+                kind = entry[0]
+                if kind == E_OP:
+                    if entry[4] and any(type(blob) is Big for blob in entry[4]):
+                        placed = self._place(entry[4], buffers, keep)
+                        entries[index] = (*entry[:4], placed, *entry[5:])
+                elif kind == E_STEP and entry[7] and any(type(blob) is Big for blob in entry[7]):
+                    placed = self._place(entry[7], buffers, keep)
+                    entries[index] = (*entry[:7], placed, entry[8])
             upto = self._sent_upto
             located = False
             for index in range(len(entries) - 1, -1, -1):
                 entry = entries[index]
                 kind = entry[0]
                 if kind == E_OP:
-                    if entry[4] and any(type(blob) is Big for blob in entry[4]):
-                        placed = self._place(entry[4], buffers, keep)
-                        entry = entries[index] = (*entry[:4], placed, *entry[5:])
                     if not located:
                         outs = entry[5]
                         if type(outs) is int:
@@ -554,14 +594,10 @@ class Client:
                             made = [handle for handle in outs if handle is not None]
                             if made:
                                 upto, located = max(upto, made[-1] + 1), True
-                elif kind == E_STEP:
-                    if entry[7] and any(type(blob) is Big for blob in entry[7]):
-                        placed = self._place(entry[7], buffers, keep)
-                        entry = entries[index] = (*entry[:7], placed, entry[8])
-                    if not located:
-                        step = self._steps[entry[1]]
-                        made = entry[2] + step.news_before[entry[4]]
-                        upto, located = max(upto, made), True
+                elif kind == E_STEP and not located:
+                    step = self._steps[entry[1]]
+                    made = entry[2] + step.news_before[entry[4]]
+                    upto, located = max(upto, made), True
             self._keep(entries, pending)
             self._sent_upto = upto
             released: list[int] = []
@@ -586,11 +622,14 @@ class Client:
             if waiter is not None:
                 consumers.append(waiter)
             reply = bool(consumers)
-            if not entries and not released and not reply:
+            budget = self._budget_unsent
+            if not entries and not released and not reply and budget is None:
                 return
-            head = pickle.dumps(
-                {"entries": entries, "release": released, "reply": reply}, protocol=5
-            )
+            message: dict[str, Any] = {"entries": entries, "release": released, "reply": reply}
+            if budget is not None:
+                message["cache_bytes"] = budget
+                self._budget_unsent = None
+            head = pickle.dumps(message, protocol=5)
             direct = waiter is not None and self._unsent == 0 and not self._replies
             if reply:
                 self._replies.append(consumers)
@@ -648,14 +687,38 @@ class Client:
             self._dead = {handle for handle in dead if handle >= lowest}
 
     def _place(self, blobs: tuple, buffers: list, keep: list) -> tuple:
-        placed = []
+        """Each large blob as a buffer index, ``("p", index, key)`` or ``("h", key)``.
+
+        ``("p", index, key)`` sends the bytes and inserts them into the upload table;
+        ``("h", key)`` names bytes the table holds, as spec "Upload cache" describes.
+        """
+        placed: list = []
+        uploads = self._uploads
         for blob in blobs:
-            if type(blob) is Big:
-                buffers.append(blob.view)
-                keep.append(blob.keep)
-                placed.append(len(buffers) - 1)
-            else:
+            if type(blob) is not Big:
                 placed.append(blob)
+                continue
+            view = blob.view
+            size = view.nbytes
+            if CACHE_MIN_BYTES <= size <= self._upload_budget:
+                threads = blake3.AUTO if size >= HASH_THREADS_BYTES else 1
+                key = (blake3(view, max_threads=threads).digest(), size)
+                if key in uploads:
+                    uploads.move_to_end(key)
+                    self.stats.cache_hits += 1
+                    self.stats.cache_saved_bytes += size
+                    placed.append(("h", key))
+                    continue
+                uploads[key] = size
+                self._upload_bytes += size
+                self._evict_uploads()
+                buffers.append(view)
+                keep.append(blob.keep)
+                placed.append(("p", len(buffers) - 1, key))
+                continue
+            buffers.append(view)
+            keep.append(blob.keep)
+            placed.append(len(buffers) - 1)
         return tuple(placed)
 
     def _send_loop(self) -> None:
