@@ -1462,6 +1462,8 @@ class FakeKaggleCloud:
         self.cloud_calls: list[tuple[str, dict[str, Any]]] = []
         self.cancelled: list[int] = []
         self.ended = False
+        #: Endpoint name to (HTTP status, message) for internal calls the fake refuses.
+        self.refuse: dict[str, tuple[int, str]] = {}
         self._lock = threading.Lock()
         self._uuid = uuid
         self._route = re.compile(r"^/k/(?P<run>[^/]+)/(?P<token>[^/]+)/proxy(?P<rest>.*)$")
@@ -1519,6 +1521,14 @@ class FakeKaggleCloud:
     def _cloud(self, path: str, request: Any) -> _Reply:
         body = json.loads(request.data) if request.data else {}
         self.cloud_calls.append((path, body))
+        refused = self.refuse.get(path.rsplit("/", 1)[-1])
+        if refused is not None:
+            import io
+            import urllib.error
+
+            status, message = refused
+            payload = io.BytesIO(json.dumps({"message": message}).encode())
+            raise urllib.error.HTTPError(request.full_url, status, "refused", {}, payload)
         if path.endswith("CreateKernelWithSettings"):
             return _Reply({"id": self.NOTEBOOK_ID, "currentUrlSlug": "letify-runtime"})
         if path.endswith("GetOrCreateKernelSession"):
