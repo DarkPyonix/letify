@@ -9,13 +9,17 @@ any kind, and it sends no keep-alive request.
 
 from __future__ import annotations
 
+import base64
+import binascii
 import json
 import os
+import re
 import subprocess
 import urllib.error
 import urllib.parse
 import urllib.request
 from collections.abc import Mapping
+from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 
 from .. import tools
@@ -24,14 +28,15 @@ from ..config.secrets import account_directory
 from ..declare.instance import Host, Instance
 from ..errors import (
     ConfigError,
+    ProtocolError,
     ProviderUnavailable,
     RuntimeFailure,
     RuntimeLost,
     UnsupportedMode,
 )
-from ..runtime.channel import OneShotChannel
+from ..protocol import wire
+from ..runtime.channel import Connection, FramedChannel
 from .base import Provider
-from .colab_files import ContentsTransfer
 from .usage import Usage
 
 #: Seconds one REST request to the session may take.
@@ -92,6 +97,14 @@ def session_url(alias: str) -> str | None:
     return path.read_text(encoding="utf-8").strip() or None
 
 
+def read_cookie(alias: str) -> str | None:
+    """The browser session cookie registered for an account, or None."""
+    path = account_directory(alias) / "cookie"
+    if not path.is_file():
+        return None
+    return path.read_text(encoding="utf-8").strip() or None
+
+
 def split_url(url: str) -> tuple[str, str | None]:
     """The server base, which is the URL without its query, and the ``token`` parameter."""
     parts = urllib.parse.urlsplit(url)
@@ -100,22 +113,128 @@ def split_url(url: str) -> tuple[str, str | None]:
     return base, token
 
 
+#: The cookie that carries the session's expiry, an alg:none JWT with an ``exp`` claim.
+CLIENT_TOKEN_COOKIE = "CLIENT-TOKEN"
+
+#: Cookie names a usable Kaggle session must carry. The principal cookie, the CSRF token
+#: and the JWT that dates the session; missing any one means the copy was partial.
+REQUIRED_COOKIES = ("ka_sessionid", CLIENT_TOKEN_COOKIE, "XSRF-TOKEN")
+
+
+def parse_cookie(cookie: str) -> dict[str, str]:
+    """Split a ``name=value; name=value`` cookie header into a mapping.
+
+    Only the first ``=`` separates a pair, so a base64 value ending in ``==`` survives.
+    """
+    jar: dict[str, str] = {}
+    for part in cookie.strip().split(";"):
+        part = part.strip()
+        if "=" in part:
+            name, value = part.split("=", 1)
+            jar[name.strip()] = value.strip()
+    return jar
+
+
+def require_cookie_shape(cookie: str) -> dict[str, str]:
+    """Return the parsed jar, or raise ``ValueError`` naming the cookies that are missing."""
+    jar = parse_cookie(cookie)
+    missing = [name for name in REQUIRED_COOKIES if not jar.get(name)]
+    if missing:
+        raise ValueError(
+            "the Kaggle cookie is missing " + ", ".join(missing) + "; copy the whole cookie "
+            "of a logged-in kaggle.com tab"
+        )
+    return jar
+
+
+def _client_token_claims(cookie: str) -> dict[str, Any]:
+    token = parse_cookie(cookie).get(CLIENT_TOKEN_COOKIE)
+    if not token:
+        raise ValueError("the Kaggle cookie has no CLIENT-TOKEN, so its expiry cannot be read")
+    parts = token.split(".")
+    if len(parts) < 2:
+        raise ValueError("the Kaggle CLIENT-TOKEN is not a JWT")
+    payload = parts[1] + "=" * (-len(parts[1]) % 4)
+    try:
+        claims = json.loads(base64.urlsafe_b64decode(payload))
+    except (binascii.Error, ValueError):
+        raise ValueError("the Kaggle CLIENT-TOKEN payload could not be decoded") from None
+    if not isinstance(claims, dict):
+        raise ValueError("the Kaggle CLIENT-TOKEN payload is not an object")
+    return claims
+
+
+def _parse_iso8601(text: str) -> datetime:
+    """Parse an ISO 8601 instant, tolerating a trailing Z and over-long fractional seconds."""
+    value = text.strip().replace("Z", "+00:00")
+    match = re.match(r"^(.*\.\d{6})\d*([+-]\d{2}:\d{2})?$", value)
+    if match:
+        value = match.group(1) + (match.group(2) or "")
+    parsed = datetime.fromisoformat(value)
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=UTC)
+    return parsed.astimezone(UTC).replace(microsecond=0)
+
+
+def cookie_expiry(cookie: str) -> datetime:
+    """When the session cookie expires, from the CLIENT-TOKEN ``exp`` claim (UTC)."""
+    exp = _client_token_claims(cookie).get("exp")
+    if not exp:
+        raise ValueError("the Kaggle CLIENT-TOKEN has no exp claim")
+    return _parse_iso8601(str(exp))
+
+
+def cookie_days_left(cookie: str, now: datetime | None = None) -> float:
+    """Days until the cookie expires; negative once it has."""
+    moment = now or datetime.now(UTC)
+    return (cookie_expiry(cookie) - moment).total_seconds() / 86400.0
+
+
+#: The internal Kaggle service surface the web app uses, authenticated by the session cookie.
+KAGGLE_INTERNAL = "https://www.kaggle.com/api/i/"
+
+
+def cookie_headers(cookie: str) -> dict[str, str]:
+    """Headers that authenticate an internal Kaggle call as the cookie's session."""
+    jar = require_cookie_shape(cookie)
+    return {
+        "Content-Type": "application/json",
+        "cookie": cookie,
+        "x-xsrf-token": jar["XSRF-TOKEN"],
+        "x-kaggle-build-version": jar.get("build-hash", "1"),
+    }
+
+
+def verify_cookie(cookie: str) -> str:
+    """Prove the cookie is a live login by reading the account, and return its display name.
+
+    ``users.UsersService/GetCurrentUser`` answers with the account only for a real web
+    session; an anonymous or stale cookie comes back empty. Raises ``ValueError`` when the
+    call fails or the cookie is not accepted, so the caller can refuse the login.
+    """
+    request = urllib.request.Request(
+        KAGGLE_INTERNAL + "users.UsersService/GetCurrentUser",
+        data=b"{}", method="POST", headers=cookie_headers(cookie),
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=REST_TIMEOUT) as response:
+            body = json.loads(response.read())
+    except (urllib.error.URLError, OSError, ValueError) as exc:
+        raise ValueError(f"the Kaggle cookie could not be checked: {type(exc).__name__}") from None
+    name = body.get("displayName") or (body.get("user") or {}).get("displayName")
+    if not name:
+        raise ValueError(
+            "the Kaggle cookie was refused; log in to kaggle.com and copy a fresh cookie"
+        )
+    return str(name)
+
+
 def adapter_command() -> list[str]:
     """The argument list that starts the Kaggle adapter through uv."""
     uv = tools.find_uv()
     if uv is None:
         raise ProviderUnavailable("kaggle", tools.missing_uv_message())
     return tools.script_command(tools.KAGGLE_KERNEL, uv, tools.KAGGLE_ADAPTER)
-
-
-class JupyterTransfer(ContentsTransfer):
-    """The contents API of a plain Jupyter server, authenticated with its token."""
-
-    def _auth_query(self) -> dict[str, str]:
-        return {"token": self.token} if self.token else {}
-
-    def _auth_headers(self) -> dict[str, str]:
-        return {"Authorization": f"token {self.token}"} if self.token else {}
 
 
 class Session:
@@ -147,10 +266,18 @@ class Session:
         return True
 
     def ended(self) -> KaggleSessionEnded:
+        """The runtime is lost, named without claiming which of the two causes it was.
+
+        The proxy answers 404 for an ended session, for a registered URL that no longer
+        routes, and for a session id that never existed, so a status read that is not 200
+        cannot tell them apart. Saying the session ended would state as fact something
+        this read does not establish.
+        """
         return KaggleSessionEnded(
-            f"{self.alias}: the Kaggle Jupyter Server session at {self.host} has ended. Kaggle "
-            f"ends a session after 20 minutes idle or at its 12 hour limit. Start a new session "
-            f"in the Kaggle editor with Run, Kaggle Jupyter Server, then run: "
+            f"{self.alias}: the Kaggle Jupyter Server session at {self.host} did not answer. "
+            f"It may have ended, since Kaggle ends a session after 20 minutes idle or at its "
+            f"12 hour limit, or the registered URL may no longer route to it. Start a new "
+            f"session in the Kaggle editor with Run, Kaggle Jupyter Server, then run: "
             f"letify login kaggle {self.alias} --connect <new Colab Compatible URL>"
         )
 
@@ -175,14 +302,12 @@ class Session:
         except (urllib.error.URLError, OSError, ValueError):
             pass
 
-    def transfer(self) -> ContentsTransfer:
-        return JupyterTransfer(self.base, self.token or "")
-
     def run(self, kernel: str, source: str, timeout: float | None) -> str:
         """Run one program through the adapter and return its standard output."""
         env = dict(os.environ)
         env["LETIFY_JUPYTER_URL"] = self._url
         env["LETIFY_KERNEL_ID"] = kernel
+        env["LETIFY_ADAPTER_MODE"] = "program"
         env["LETIFY_TIMEOUT"] = str(timeout or DEFAULT_PROGRAM_TIMEOUT)
         process = subprocess.Popen(
             adapter_command(),
@@ -213,17 +338,174 @@ class Session:
         raise RuntimeFailure(f"{self.alias}: the Kaggle adapter {reason}", stderr=stderr)
 
 
+class KaggleChannel(FramedChannel):
+    """Carries the worker's frames over one kernel cell, through the adapter bridge.
+
+    The frames are the ones that run over SSH. Only the plumbing differs: a kernel carries
+    text, so the worker writes each frame as a base64 line, as the Modal sandbox already
+    does. The bridge is an ordinary subprocess, so its pipes are what a write and a read
+    reach, and the cell on the other side of it lives for the runtime.
+    """
+
+    text_frames = True
+
+    #: Bytes handed to the bridge per write, matching the Modal channel.
+    WRITE_LIMIT = 1 << 20
+
+    def __init__(
+        self, command: list[str], env: dict[str, str], *, name: str, session: Session
+    ):
+        self.command = command
+        self.env = env
+        self.name = name
+        #: Asked whether the session is still there when the worker stops answering.
+        self.session = session
+        self._process: subprocess.Popen[bytes] | None = None
+        self._connection = None
+        self._raw = bytearray()
+
+    def start(self) -> None:
+        if self._connection is not None:
+            return
+        try:
+            self._process = subprocess.Popen(
+                self.command,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                bufsize=0,
+                env={**os.environ, **self.env},
+            )
+        except OSError as exc:
+            raise RuntimeFailure(
+                f"{self.name}: could not start the Kaggle bridge: {exc}",
+                command=" ".join(self.command[:3]),
+            ) from exc
+        self._connection = Connection(
+            self.name,
+            self._write,
+            wire.chunks_readinto(self._read_chunks),
+            self._emit,
+            death_detail=self._raw_text,
+        )
+        self._send_worker()
+        self._await_ready()
+
+    def _write(self, view: memoryview) -> int:
+        piece = view[: self.WRITE_LIMIT]
+        process = self._process
+        assert process is not None and process.stdin is not None
+        process.stdin.write(base64.b64encode(piece) + b"\n")
+        process.stdin.flush()
+        return piece.nbytes
+
+    def _read_chunks(self) -> list[bytes]:
+        """The next frame line, decoded. A line that is not base64 is output from before the
+        worker started, such as the interpreter's own error, and is kept for the failure."""
+        process = self._process
+        assert process is not None and process.stdout is not None
+        while True:
+            line = process.stdout.readline()
+            if not line:
+                return []
+            try:
+                return [base64.b64decode(line.strip(), validate=True)]
+            except (binascii.Error, ValueError):
+                self._raw += line
+
+    def request(self, payload: dict[str, Any], *, timeout: float | None = None):
+        try:
+            return super().request(payload, timeout=timeout)
+        except ProtocolError as exc:
+            raise self._verdict(exc) from exc
+
+    def stream(self, payload: dict[str, Any], *, timeout: float | None = None):
+        try:
+            yield from super().stream(payload, timeout=timeout)
+        except ProtocolError as exc:
+            raise self._verdict(exc) from exc
+
+    def _startup_failure(self, expired: bool, cause: Exception) -> Exception:
+        """A worker that never said hello, answered by the same question as a later death."""
+        return self._verdict(cause)
+
+    def _verdict(self, cause: Exception) -> Exception:
+        """Whether the session still answers, which is as much as one status read settles.
+
+        Spec "Kaggle Jupyter Server session": the bridge exiting is the worker dying, and
+        one read of the session's status is what decides how that is reported. A worker that
+        died inside an answering session is this runtime's failure, and a retry would meet it
+        again. A session that does not answer is a lost runtime, so a retry may start a new
+        one. The read does not say why it stopped answering, so ``ended`` does not claim to.
+        """
+        if not self.session.alive():
+            return self.session.ended()
+        return RuntimeFailure(
+            f"{self.name}: the Kaggle worker stopped while the session was still answering: "
+            f"{cause}",
+            stderr=self._raw_text(),
+        )
+
+    def _raw_text(self) -> str:
+        process = self._process
+        detail = bytes(self._raw[-2000:]).decode("utf-8", "replace")
+        if process is not None and process.stderr is not None:
+            try:
+                process.stderr.flush()
+            except (OSError, ValueError):
+                pass
+        return detail
+
+    def _kill(self) -> None:
+        if self._process is not None:
+            self._process.kill()
+
+    def close(self) -> None:
+        process = self._process
+        self._connection = None
+        if process is None:
+            return
+        self._process = None
+        for stream in (process.stdin, process.stdout, process.stderr):
+            try:
+                if stream is not None:
+                    stream.close()
+            except OSError:
+                pass
+        try:
+            process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            process.kill()
+
+
 class Kaggle(Provider):
     """One Kaggle account."""
 
     kind = "kaggle"
     default_persistence = "ephemeral"
     has_fast_path = False
-    persistent_channel = False
     needs_lease = False
+
+    @property
+    def persistent_channel(self) -> bool:  # type: ignore[override]
+        """A registered session keeps one worker, so the object and blob tables survive."""
+        return session_url(self.alias) is not None
 
     #: No device stream can reach a Kaggle session without a tunnel, which Kaggle forbids.
     serves_host_local = False
+
+    def account_note(self) -> str | None:
+        """How the account's cookie is doing, for `letify providers`."""
+        cookie = read_cookie(self.alias)
+        if cookie is None:
+            return "no cookie; run letify login kaggle"
+        try:
+            left = cookie_days_left(cookie)
+        except ValueError:
+            return "cookie unreadable; log in again"
+        if left <= 0:
+            return "cookie EXPIRED; log in again"
+        return f"cookie expires in {int(left)} days"
 
     usage_unit = "GPU hours"
     usage_source = "kaggle quota, the weekly accelerator quota endpoint"
@@ -256,7 +538,7 @@ class Kaggle(Provider):
     def __init__(self, config: ProviderConfig):
         super().__init__(config)
         #: The session and kernel id each runtime runs its programs in.
-        self._kernels: dict[str, tuple[Session, str]] = {}
+        self._kernels: dict[str, tuple[Session, str, KaggleChannel]] = {}
 
     def cli(self, *args: str, cwd: str | None = None) -> str:
         """Run one Kaggle CLI command as this account and return its output."""
@@ -285,39 +567,41 @@ class Kaggle(Provider):
         return text
 
     def open_channel(self, runtime: Runtime) -> Channel:
-        """A one-shot channel whose programs run in a new kernel of the registered session."""
-        from .colab_files import ColabFiles
-
+        """One worker in one cell of the registered session, behind the adapter bridge."""
         url = session_url(self.alias)
         if url is None:
             raise ConfigError(
-                f"{self.alias} has no registered Kaggle Jupyter Server session. Kaggle "
-                f"publishes no API that starts one, so start it in the Kaggle editor with "
-                f"Run, Kaggle Jupyter Server, then register its Colab Compatible URL with "
-                f"`letify login kaggle {self.alias} --connect '<URL>'`."
+                f"{self.alias} has no registered Kaggle Jupyter Server session. Kaggle's API "
+                f"returns no address for a session it starts, so start it in the Kaggle "
+                f"editor with Run, Kaggle Jupyter Server, then register its Colab Compatible "
+                f"URL with `letify login kaggle {self.alias} --connect '<URL>'`."
             )
         session = Session(self.alias, url)
         kernel = session.create_kernel()
-        self._kernels[runtime.name] = (session, kernel)
-
-        def run(source: str, timeout: float | None) -> str:
-            return session.run(kernel, source, timeout)
-
-        files = ColabFiles(
-            self.alias,
-            runtime.name,
-            run,
-            workspace=self.workspace_root,
-            transfer=session.transfer,
+        channel = KaggleChannel(
+            adapter_command(),
+            {"LETIFY_JUPYTER_URL": url, "LETIFY_KERNEL_ID": kernel},
+            name=runtime.name,
+            session=session,
         )
-        return OneShotChannel(run, name=runtime.name, files=files)
+        self._kernels[runtime.name] = (session, kernel, channel)
+        return channel
 
     def stop(self, runtime: Runtime) -> None:
-        """Delete the kernel letify created. The session itself is the user's and keeps running."""
+        """Close the bridge, then delete the kernel letify created.
+
+        In that order: closing the bridge's standard input ends the cell's read loop, so the
+        worker exits on its own rather than being cut off mid frame. The session itself is
+        the user's and keeps running.
+        """
         held = self._kernels.pop(runtime.name, None)
         if held is None:
             return
-        session, kernel = held
+        session, kernel, channel = held
+        try:
+            channel.close()
+        except OSError:
+            pass
         session.delete_kernel(kernel)
 
     def _secrets(self) -> list[str]:
@@ -385,7 +669,6 @@ __all__ = [
     "GPUS",
     "QUOTA",
     "TPUS",
-    "JupyterTransfer",
     "Kaggle",
     "KaggleSessionEnded",
     "Session",

@@ -101,9 +101,14 @@ def build_parser() -> argparse.ArgumentParser:
     log_in.add_argument(
         "--connect",
         metavar="TOKEN",
+        help="the token 'letify client shell connect' printed, for tunnel",
+    )
+    log_in.add_argument(
+        "--cookie",
+        metavar="COOKIE",
         help=(
-            "the token 'letify client shell connect' printed, for tunnel; the Colab Compatible "
-            "URL of a running Kaggle Jupyter Server session, for kaggle"
+            "the browser cookie of a logged-in kaggle.com tab, or a file holding it, for "
+            "kaggle; this is the whole Kaggle credential"
         ),
     )
     log_in.add_argument(
@@ -445,6 +450,7 @@ def _dispatch(args: argparse.Namespace) -> int:
                 "workspace": args.workspace,
                 "profile": args.profile,
                 "connect": args.connect,
+                "cookie": args.cookie,
                 "indices": args.indices,
                 "detect_devices": args.detect_devices,
             },
@@ -498,19 +504,26 @@ def _dispatch(args: argparse.Namespace) -> int:
             except Exception as exc:
                 records.append({"alias": alias, "unavailable": str(exc)})
                 continue
-            records.append(
-                {"alias": alias, "kind": provider.kind, "persistence": str(provider.persistence)}
-            )
+            record = {
+                "alias": alias,
+                "kind": provider.kind,
+                "persistence": str(provider.persistence),
+            }
+            note = provider.account_note()
+            if note:
+                record["note"] = note
+            records.append(record)
         if args.json:
             return _json(records)
         style = _out()
-        rows = [
-            [r["alias"], r["kind"], r["persistence"]]
-            if "unavailable" not in r
-            else [r["alias"], f"{render.mark('fail', style)} unavailable: {r['unavailable']}", ""]
-            for r in records
-        ]
-        sys.stdout.write(render.table(["ALIAS", "KIND", "PERSISTENCE"], rows, style))
+        def row(r: dict[str, str]) -> list[str]:
+            if "unavailable" in r:
+                why = f"{render.mark('fail', style)} unavailable: {r['unavailable']}"
+                return [r["alias"], why, "", ""]
+            return [r["alias"], r["kind"], r["persistence"], r.get("note", "")]
+
+        rows = [row(r) for r in records]
+        sys.stdout.write(render.table(["ALIAS", "KIND", "PERSISTENCE", "NOTES"], rows, style))
         return 0
 
     if args.command == "devices":
