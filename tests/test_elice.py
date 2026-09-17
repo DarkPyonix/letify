@@ -179,6 +179,23 @@ def test_a_machine_in_transition_is_waited_for_before_it_is_started(account, fak
     assert provider.address == "203.0.113.9"
 
 
+def test_a_machine_still_queued_at_the_limit_is_unavailable_not_a_runtime_failure(
+    account, fake_eci, monkeypatch
+) -> None:
+    # Spec: "Elice machines", Start step 4. A machine Elice has not placed by the end of the
+    # wait is a capacity answer like a refused spot launch: nothing to retry on this zone.
+    # Seen live: an ondemand A100 stayed queued for 300 s and the failure read as letify's.
+    monkeypatch.setattr(elice_module, "IDLE_WAIT_SECONDS", 0)
+    fake_eci.set(transitions={"letify-elice-a100": ["queued"] * 4})
+    provider = account()
+    with pytest.raises(letify.ProviderUnavailable) as caught:
+        provider.create_session(Instance(provider, gpu="A100"), "letify-a100-1")
+    message = str(caught.value)
+    assert "queued" in message
+    assert "letify-elice-a100" in message
+    assert "G-A100-1" in message
+
+
 def test_a_declared_machine_that_is_not_listed_is_refused(account) -> None:
     provider = account(machine_id="my-vm")
     with pytest.raises(letify.ProviderUnavailable, match="my-vm"):
