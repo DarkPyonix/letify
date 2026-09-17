@@ -25,6 +25,7 @@ from ..errors import ProviderUnavailable, RuntimeFailure
 from ..transport import sshopts
 from .base import Provider
 from .naming import gib_from_mib, normalize_gpu
+from .usage import Usage
 
 if TYPE_CHECKING:
     from ..runtime.channel import Channel
@@ -51,7 +52,17 @@ class Shell(Provider):
     has_fast_path = True
 
     #: A machine letify only runs commands on has no account behind it to meter.
-    usage_source = "a machine reached by SSH has no account behind it"
+    usage_source = "no quota: a machine reached by SSH has no account behind it"
+
+    def report_usage(self) -> Usage:
+        """No quota. Subclasses with an account behind them read it instead."""
+        return Usage(
+            alias=self.alias,
+            kind=self.kind,
+            unit=self.usage_unit,
+            source=self.usage_source,
+            unmetered=True,
+        )
 
     #: Whether connection decisions are printed. The Launcher sets its own announce flag here.
     announce = True
@@ -120,8 +131,8 @@ class Shell(Provider):
 
     @property
     def remote_python(self) -> str:
-        value = self.config.option("python", "python3")
-        return str(value)
+        """The interpreter the bootstrap worker starts on, before it moves to the .venv."""
+        return "python3"
 
     @property
     def reverse_ssh(self) -> dict[str, Any] | None:
@@ -130,7 +141,21 @@ class Shell(Provider):
 
     @property
     def tailcat_binary(self) -> str:
-        return str(self.config.option("tailcat_binary", "tailcat"))
+        """The account's ``tailcat_binary``, or the tool lookup's answer without asking."""
+        given = self.config.option("tailcat_binary")
+        if given:
+            return str(given)
+        from ..install import find
+
+        return find("tailcat") or "tailcat"
+
+    def remote_command(self, command: str) -> str:
+        """The command a link runs on the machine, which a provider may wrap.
+
+        A plain machine needs no wrapping. Colab overrides this because its driver
+        libraries are named only in the notebook kernel's own environment.
+        """
+        return command
 
     def ssh_command(self, remote_command: str | None = None) -> list[str]:
         """Build the OpenSSH command line that reaches this machine's address directly."""
@@ -208,7 +233,7 @@ class Shell(Provider):
         from ..transport import nat
         from ..transport.strategies import Target
 
-        address = self.config.option("address")
+        address = self.target_address()
         stun: tuple[str, int] = nat.DEFAULT_STUN
         configured = self.config.option("stun")
         if isinstance(configured, str) and ":" in configured:
@@ -230,6 +255,11 @@ class Shell(Provider):
             tailcat=self.tailcat_binary,
             workspace=self.workspace_root,
         )
+
+    def target_address(self) -> str | None:
+        """The address forward SSH dials: the account's ``address``, where it has one."""
+        value = self.config.option("address")
+        return value if isinstance(value, str) else None
 
     def _link_key(self, runtime: Runtime | None) -> str:
         """Links are per machine here; a provider whose runtimes are machines keys by runtime."""
@@ -279,7 +309,7 @@ class Shell(Provider):
         )
         link = self.link()
         result = subprocess.run(
-            link.ssh_command(remote),
+            link.ssh_command(self.remote_command(remote)),
             capture_output=True,
             text=True,
             timeout=120,
@@ -347,26 +377,46 @@ class Shell(Provider):
         """
         from ..runtime import telemetry
 
-        link = self.link()
-
-        def run(command: tuple[str, ...]) -> str:
-            remote = shlex.join(command)
-            result = subprocess.run(
-                link.ssh_command(remote), capture_output=True, text=True, timeout=120
-            )
-            if result.returncode != 0:
-                raise RuntimeFailure(
-                    f"{self.alias}: the busy check could not run, so which cards are free "
-                    f"is unknown and nothing was reserved",
-                    command=remote,
-                    stderr=result.stderr.strip(),
-                )
-            return result.stdout
+        run = self._remote_runner(
+            "the busy check could not run, so which cards are free is unknown and nothing was "
+            "reserved"
+        )
 
         owners: dict[int, tuple[str, ...]] = {}
         busy = telemetry.busy_indices(exclude_pids=self.worker_pids(), run=run, owners_out=owners)
         self.last_busy_owners = owners
         return busy
+
+    def _remote_runner(self, failure: str) -> Callable[[tuple[str, ...]], str]:
+        """Run one command on the machine over its link, raising ``failure`` when it cannot."""
+        link = self.link()
+
+        def run(command: tuple[str, ...]) -> str:
+            remote = shlex.join(command)
+            result = subprocess.run(
+                link.ssh_command(self.remote_command(remote)),
+                capture_output=True,
+                text=True,
+                timeout=120,
+            )
+            if result.returncode != 0:
+                raise RuntimeFailure(
+                    f"{self.alias}: {failure}",
+                    command=remote,
+                    stderr=result.stderr.strip(),
+                )
+            return result.stdout
+
+        return run
+
+    reads_machine = True
+
+    def read_machine(self) -> tuple[list[Any], dict[int, tuple[str, tuple[str, ...]]]]:
+        """The machine's cards and who holds them, asked over the link with no session."""
+        from ..runtime import telemetry
+
+        run = self._remote_runner("nvidia-smi could not be read over the link")
+        return telemetry.read_machine(run, self.worker_pids())
 
     def store_backend(self) -> str:
         backend = self.config.option("store")
@@ -387,7 +437,9 @@ class Shell(Provider):
                 files=getattr(link, "files", None),
             )
         return PersistentChannel(
-            link.ssh_command(f"{self.remote_python} -u -c {shlex.quote(BOOTSTRAP)}"),
+            link.ssh_command(
+                self.remote_command(f"{self.remote_python} -u -c {shlex.quote(BOOTSTRAP)}")
+            ),
             name=runtime.name,
         )
 

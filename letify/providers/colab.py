@@ -27,15 +27,22 @@ exhausted balance reverts the account to the free tier policy, which disallows t
 
 from __future__ import annotations
 
+import datetime
+import json
 import subprocess
+import time
+import urllib.parse
+import urllib.request
 from collections.abc import Callable, Mapping
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from .. import tools
+from ..config.secrets import account_directory
 from ..declare.instance import Instance
 from ..errors import ProviderUnavailable, RuntimeFailure
 from .shell import Shell
+from .usage import Usage
 
 if TYPE_CHECKING:
     from ..runtime.channel import Channel
@@ -63,6 +70,52 @@ ALIASES = {
     "H100_80GB": "H100",
 }
 
+#: Where a Colab VM keeps its GPU driver libraries. Only the notebook kernel's own
+#: environment names it, so a worker started over SSH has to be given it or it finds no
+#: libnvidia-ml.so and no libcuda.so on a session that holds a GPU. Spec "Colab".
+DRIVER_LIBRARY_PATH = "/usr/lib64-nvidia"
+
+#: The compute unit balance, as the Colab web page asks for it.
+CCU_INFO_URL = "https://colab.research.google.com/tun/m/ccu-info?authuser=0"
+
+#: Colab prefixes JSON answers with this line to defeat cross-site script inclusion.
+XSSI_PREFIX = ")]}'"
+
+#: A balance answers in well under a second, and a person is waiting for the table.
+USAGE_HTTP_TIMEOUT = 15.0
+
+
+def _access_token(stored: dict[str, Any]) -> str:
+    """A usable access token from the Colab CLI's token file, refreshed in memory if stale.
+
+    A token with more than a minute left is used as it is. Otherwise the refresh token is
+    exchanged at ``token_uri``, and the answer is not written back.
+    """
+    token = stored.get("token")
+    expiry = stored.get("expiry")
+    if isinstance(token, str) and isinstance(expiry, str):
+        try:
+            ends = datetime.datetime.fromisoformat(expiry.removesuffix("Z"))
+        except ValueError:
+            ends = None
+        if ends is not None:
+            if ends.tzinfo is None:
+                ends = ends.replace(tzinfo=datetime.UTC)
+            left = ends - datetime.datetime.now(datetime.UTC)
+            if left.total_seconds() > 60:
+                return token
+    form = urllib.parse.urlencode(
+        {
+            "client_id": stored["client_id"],
+            "client_secret": stored["client_secret"],
+            "refresh_token": stored["refresh_token"],
+            "grant_type": "refresh_token",
+        }
+    ).encode()
+    request = urllib.request.Request(str(stored["token_uri"]), data=form, method="POST")
+    with urllib.request.urlopen(request, timeout=USAGE_HTTP_TIMEOUT) as response:
+        return str(json.loads(response.read())["access_token"])
+
 
 class Colab(Shell):
     """A Colab runtime for one Google account."""
@@ -70,6 +123,8 @@ class Colab(Shell):
     kind = "colab"
     extra = "colab"
     default_persistence = "ephemeral"
+    #: Its machine lives only as long as a session, so utilization is read inside one.
+    reads_machine = False
 
     #: The control path crosses a Google frontend rather than reaching the machine
     #: directly, so forwarding pays a long round trip per synchronization.
@@ -78,10 +133,60 @@ class Colab(Shell):
     #: Measured from Seoul to a Colab runtime in the United States.
     expected_round_trip_ms = 175.0
 
-    #: Colab meters in compute units and keeps the balance in the web console; the CLI has
-    #: no command that prints it. A configuration entry can name one.
+    #: Colab meters in compute units. The CLI has no balance command, so the balance is
+    #: read from the endpoint the Colab web page reads, with the CLI's own OAuth token.
     usage_unit = "compute units"
-    usage_source = "the Colab CLI has no balance command; the figure is in the web console"
+    usage_source = "Colab ccu-info, the balance the Colab web page shows"
+
+    def report_usage(self) -> Usage:
+        """Read the compute unit balance and the hourly rate from ``ccu-info``.
+
+        Read-only: the token file is never rewritten, and a refreshed token lives only in
+        memory for this one request.
+        """
+        note: str | None = None
+        remaining: float | None = None
+        rate: float | None = None
+        token_file = account_directory(self.alias) / ".config" / "colab-cli" / "token.json"
+        try:
+            stored = json.loads(token_file.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            stored = None
+        if not isinstance(stored, dict):
+            note = f"not signed in to Colab. Run 'letify login colab {self.alias}'"
+        else:
+            try:
+                token = _access_token(stored)
+                request = urllib.request.Request(
+                    CCU_INFO_URL,
+                    headers={
+                        "Authorization": f"Bearer {token}",
+                        "Accept": "application/json",
+                        "X-Colab-Client-Agent": "colab-cli",
+                        "X-Colab-Tunnel": "Google",
+                    },
+                )
+                with urllib.request.urlopen(request, timeout=USAGE_HTTP_TIMEOUT) as response:
+                    text = response.read().decode(errors="replace")
+                body = json.loads(text.removeprefix(XSSI_PREFIX))
+                balance = body.get("currentBalance")
+                hourly = body.get("consumptionRateHourly")
+                remaining = float(balance) if isinstance(balance, (int, float)) else None
+                rate = float(hourly) if isinstance(hourly, (int, float)) else None
+                if remaining is None:
+                    note = "ccu-info answered without currentBalance"
+            except (OSError, ValueError, KeyError, AttributeError) as exc:
+                note = f"ccu-info could not be read: {exc}"
+        return Usage(
+            alias=self.alias,
+            kind=self.kind,
+            unit=self.usage_unit,
+            source=self.usage_source,
+            remaining=remaining,
+            rate_per_hour=rate,
+            as_of=time.time(),
+            note=note,
+        )
 
     #: The VM is discarded with the session, so the root sits beside Colab's own files.
     default_workspace = "/content/letify"
@@ -174,8 +279,13 @@ class Colab(Shell):
         names = []
         for line in self._cli("sessions", timeout=120).splitlines():
             token = line.strip().split()[:1]
-            if token and not token[0].lower().startswith(("name", "session", "-")):
-                names.append(token[0])
+            # A line starting with "[colab]" is the CLI's own message, not a session.
+            if token and not token[0].lower().startswith(("name", "session", "-", "[colab]")):
+                # The CLI prints a session as "[<name>] <id> | Hardware: ...".
+                word = token[0]
+                if word.startswith("[") and word.endswith("]"):
+                    word = word[1:-1]
+                names.append(word)
         return names
 
     # -- the pipeline ----------------------------------------------------------
@@ -215,6 +325,17 @@ class Colab(Shell):
             # Each runtime is a new VM with a new host key.
             target.host_key_alias = f"letify-{self.alias}-{runtime.name}"
         return target
+
+    def remote_command(self, command: str) -> str:
+        """Name the driver library directory the notebook kernel's environment names.
+
+        A login shell on the VM does not, so without this the worker sees no CUDA device.
+        A path the machine already set is kept after it.
+        """
+        return (
+            f"LD_LIBRARY_PATH={DRIVER_LIBRARY_PATH}"
+            "${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH} " + command
+        )
 
     def _link_key(self, runtime: Runtime | None) -> str:
         return runtime.name if runtime is not None else ""
@@ -258,4 +379,4 @@ class Colab(Shell):
         return super().open_channel(runtime)
 
 
-__all__ = ["ALIASES", "GPUS", "TPUS", "Colab"]
+__all__ = ["ALIASES", "DRIVER_LIBRARY_PATH", "GPUS", "TPUS", "Colab"]

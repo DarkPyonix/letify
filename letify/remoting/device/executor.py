@@ -154,11 +154,25 @@ class Executor:
     def define_step(self, sid: int, ops) -> None:
         compiled = []
         before = [0]
-        for tid, wiring, news in ops:
+        last: dict = {}
+        made = 0
+        for index, (tid, wiring, news) in enumerate(ops):
             fn, builder, name, scalars, blobs = self._templates[tid]
             compiled.append((fn, builder, name, scalars, blobs, tuple(wiring), tuple(news)))
-            before.append(before[-1] + sum(news))
-        self._steps[sid] = (compiled, before)
+            for offset in wiring:
+                if offset >= 0:
+                    last[offset] = index
+            for flag in news:
+                if flag:
+                    last[made] = index
+                    made += 1
+            before.append(made)
+        # The offsets last read at each position, released after it as spec "Step capture",
+        # **Early release**, describes; the client computes the same schedule in ``trace``.
+        frees: list = [[] for _ in ops]
+        for offset, index in last.items():
+            frees[index].append(offset)
+        self._steps[sid] = (compiled, before, tuple(tuple(sorted(group)) for group in frees))
 
     # -- execution ---------------------------------------------------------------
 
@@ -232,7 +246,50 @@ class Executor:
         results: list = []
         out_buffers: list = []
         keep: list = []
-        for entry in entries:
+        tensors = self.tensors
+        # Each release is applied after the last entry of this batch that reads the handle,
+        # and at once when none does, as spec "Handles" describes.
+        after: dict = {}
+        release = message.get("release", ())
+        if release:
+            wanted = set(release)
+            last: dict = {}
+            # Entries from which every handle at or above a bound may be read or created: a
+            # step entry and an entry whose outputs the runtime describes.
+            open_from: list = []
+            for index, entry in enumerate(entries):
+                kind = entry[0]
+                if kind == E_OP:
+                    touched = list(entry[2])
+                    outs = entry[5]
+                    if type(outs) is int:
+                        open_from.append((index, outs))
+                    elif outs:
+                        touched.extend(handle for handle in outs if handle is not None)
+                elif kind == E_STEP:
+                    touched = entry[5]
+                    open_from.append((index, entry[2]))
+                elif kind == E_REQUEST and entry[1] == "letify.fetch":
+                    touched = (entry[2][0],)
+                else:
+                    continue
+                for handle in touched:
+                    if handle in wanted:
+                        last[handle] = index
+            for index, bound in open_from:
+                for handle in release:
+                    if handle >= bound and last.get(handle, -1) < index:
+                        last[handle] = index
+            for handle in release:
+                index = last.get(handle)
+                if index is None:
+                    tensors.pop(handle, None)
+                else:
+                    after.setdefault(index, []).append(handle)
+        for index, entry in enumerate(entries):
+            if after and index - 1 in after:
+                for handle in after.pop(index - 1):
+                    tensors.pop(handle, None)
             kind = entry[0]
             if kind == E_DEFINE:
                 try:
@@ -280,11 +337,9 @@ class Executor:
             if want:
                 results.append(value)
         self._buffers = []
-        # Released after the entries, because an operator queued before its input's last
-        # RemoteTensor was collected travels in the same batch as that release.
-        tensors = self.tensors
-        for handle in message.get("release", ()):
-            tensors.pop(handle, None)
+        for handles in after.values():
+            for handle in handles:
+                tensors.pop(handle, None)
         if not message.get("reply"):
             return None
         failure, self.failure = self.failure, None
@@ -329,8 +384,10 @@ class Executor:
         return value if want == "value" else None
 
     def replay(self, entry) -> None:
-        _, sid, first, start, stop, externals, scalars, blobs = entry
-        ops, before = self._steps[sid]
+        _, sid, first, start, stop, externals, scalars, blobs, keep = entry
+        ops, before, frees = self._steps[sid]
+        if len(keep) > 8:
+            keep = frozenset(keep)
         table = self.tensors
         torch_tensor = self.torch.Tensor
         handle = first + before[start]
@@ -368,6 +425,13 @@ class Executor:
                         if flag:
                             table[handle] = leaf
                             handle += 1
+            value = None
+            inputs = None
+            drop = frees[index]
+            if drop:
+                for offset in drop:
+                    if offset not in keep:
+                        table.pop(first + offset, None)
 
     def _describe(self, value):
         torch = self.torch
@@ -413,14 +477,76 @@ class Executor:
                 torch.manual_seed(args[0])
             return None
         if name == "letify.memory":
-            if self.device.type != "cuda":
-                return 0
-            return getattr(torch.cuda, args[0])(self.device)
+            if self.device.type == "cuda":
+                return getattr(torch.cuda, args[0])(self.device)
+            if args[0] == "memory_stats":
+                return {}
+            if args[0] == "mem_get_info":
+                return (0, 0)
+            return None if args[0].startswith("reset_") else 0
         if name == "letify.empty_cache":
             if self.device.type == "cuda":
                 torch.cuda.empty_cache()
             return None
+        if name == "letify.kernel":
+            return self.kernel(*args)
         raise ValueError(f"unknown request {name}")
+
+    def kernel(self, function, described, flags):
+        """The backend this device's dispatch picks for ``function`` on tensors of ``described``."""
+        torch = self.torch
+
+        def empty(entry):
+            if entry is None:
+                return None
+            shape, stride, dtype = entry
+            return torch.empty_strided(
+                shape, stride, dtype=getattr(torch, dtype), device=self.device
+            )
+
+        tensors = [empty(entry) for entry in described]
+        if function == "batch_norm":
+            select = getattr(torch._C, "_select_batch_norm_backend", None)
+            if select is None:
+                return "Native"
+            x, weight, bias, mean, var = tensors
+            backend = select(
+                x, weight, bias, mean, var, bool(flags["training"]), float(flags.get("eps", 1e-5))
+            )
+            return backend.name
+        if function == "scaled_dot_product_attention":
+            choose = getattr(torch, "_fused_sdp_choice", None)
+            if choose is None:
+                return "MATH"
+            from torch.nn.attention import SDPBackend
+
+            query, key, value, mask = tensors
+            choice = int(
+                choose(
+                    query,
+                    key,
+                    value,
+                    mask,
+                    float(flags["dropout_p"]),
+                    bool(flags["is_causal"]),
+                    scale=flags.get("scale"),
+                    enable_gqa=bool(flags.get("enable_gqa", False)),
+                )
+            )
+            names = (
+                "ERROR",
+                "MATH",
+                "FLASH_ATTENTION",
+                "EFFICIENT_ATTENTION",
+                "CUDNN_ATTENTION",
+                "OVERRIDEABLE",
+            )
+            for backend_name in names:
+                member = getattr(SDPBackend, backend_name, None)
+                if member is not None and int(member) == choice:
+                    return backend_name
+            return "MATH"
+        raise ValueError(f"no kernel selection for {function}")
 
 
 def serve_transport(device: str, transport) -> None:

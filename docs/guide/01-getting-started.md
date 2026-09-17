@@ -46,7 +46,10 @@ Accounts live in `~/.letify/config.toml`, not in your repository, because they b
 [colab_a]
 kind = "colab"
 account = "you@example.com"
+key = "~/.ssh/id_letify"
 ```
+
+`key` is the SSH key letify installs on each Colab runtime so it can open a direct link instead of sending every call through `colab exec`. The login generates `~/.ssh/id_letify` when it is missing and never overwrites an existing key. `--key PATH` picks another key.
 
 For a lab server:
 

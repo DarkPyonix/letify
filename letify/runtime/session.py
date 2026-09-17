@@ -19,16 +19,16 @@ depends on what the provider charges for.
 from __future__ import annotations
 
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from .. import protocol
 from ..errors import (
-    ConfigError,
     EnvironmentFailure,
     InterpreterMismatch,
+    ProtocolError,
     RemoteError,
     RuntimeFailure,
 )
@@ -40,6 +40,9 @@ if TYPE_CHECKING:
     from ..providers.base import Provider
     from ..store.volume import Volume
     from .channel import Channel
+
+#: The total size of argument blob files kept under a persistent workspace root, 32 GiB.
+BLOB_DISK_LIMIT = 32 * 1024**3
 
 
 @dataclass
@@ -136,9 +139,25 @@ class Runtime:
             # Not retried, so nothing else would end this session.
             self.shutdown()
             raise
+        self.keep_blobs_on_disk()
         for volume in self.volumes:
             self.attach(volume)
         self.ready = True
+
+    def keep_blobs_on_disk(self) -> None:
+        """Have the worker write argument blobs under the workspace root on a persistent disk.
+
+        Spec "Argument blobs on a persistent disk". A later session on the same machine then
+        answers ``have`` from those files, so a repeated argument travels as its digest.
+        """
+        provider = self.provider
+        if not (provider.persistent and provider.prepares_workspace and self.persistent_channel):
+            return
+        root = self.workspace or provider.workspace_root
+        self.request(
+            {"op": "blob_dir", "path": f"{root.rstrip('/')}/blobs", "limit": BLOB_DISK_LIMIT},
+            timeout=120,
+        )
 
     def shutdown(self) -> None:
         """Stop everything that bills for this runtime."""
@@ -167,7 +186,12 @@ class Runtime:
 
             channel = self.provider.device_channel(self)
             kind = "cuda" if self.instance.gpu else "cpu"
-            self.device_client = attach(channel, device=kind, name=f"{self.name}-device")
+            self.device_client = attach(
+                channel,
+                device=kind,
+                name=f"{self.name}-device",
+                auto_fetch=self.provider.config.option("auto_fetch"),
+            )
         return self.device_client
 
     # -- requests ------------------------------------------------------------
@@ -183,6 +207,13 @@ class Runtime:
         self.last_used = time.monotonic()
         value, _logs = self.channel.request(payload, timeout=timeout)
         return value
+
+    def stream(self, payload: dict[str, Any], *, timeout: float | None = None) -> Iterator[Any]:
+        """Send one worker request answered by several replies, yielding each value."""
+        if self.channel is None:
+            raise RuntimeFailure(f"{self.name}: the channel is not open")
+        self.last_used = time.monotonic()
+        return self.channel.stream(payload, timeout=timeout)
 
     def exec(self, source: str, *, timeout: float | None = None) -> None:
         """Run plain source inside the runtime, sharing the worker's globals."""
@@ -206,6 +237,8 @@ class Runtime:
         kwargs: dict,
         *,
         timeout: float | None = None,
+        data_order: Any = None,
+        data_first_wave: int | None = None,
     ) -> tuple[Any, str]:
         """Run one declared function inside this runtime.
 
@@ -218,10 +251,137 @@ class Runtime:
         # cloudpickle and a process can hold declarations with different environments.
         if self.env.ship_modules:
             protocol.codec.ship_by_value(self.env.ship_modules)
-        if self.persistent_channel:
-            args, kwargs = self._externalize(args, kwargs)
+        if not self.persistent_channel:
+            self.last_used = time.monotonic()
+            return self.channel.call(fn, args, kwargs, timeout=timeout)
+        args, kwargs = self._externalize(args, kwargs)
+        return self._call_with_data(fn, args, kwargs, timeout, data_order, data_first_wave)
+
+    def _call_with_data(
+        self,
+        fn: Any,
+        args: tuple,
+        kwargs: dict,
+        timeout: float | None,
+        data_order: Any = None,
+        data_first_wave: int | None = None,
+    ) -> tuple[Any, str]:
+        """Pickle a call, place the first wave of its data, and send the rest beside it.
+
+        Spec "Project data": the call carries the links and the manifest the worker needs,
+        the first wave of the send order is placed before it goes, and a background sender
+        pushes the rest while it runs.
+        """
+        import secrets
+
+        from ..store import pathdata
+
+        assert self.channel is not None
+        root = (self.workspace or self.provider.workspace_root).rstrip("/")
+        call_dir = f"{root}/data/calls/{secrets.token_hex(8)}"
+        collector = pathdata.Collector(call_dir)
+        head, buffers = protocol.dumps_call_parts(fn, args, kwargs, data=collector)
+        request: dict[str, Any] = {"op": "call", "payload": head, "buffers": buffers}
+        blobs = f"{root}/data/blobs"
+        stream: pathdata.Stream | None = None
+        if collector.placed:
+            request["data"] = collector.request(blobs)
+            if collector.inputs:
+                stream = self._stream_data(
+                    collector, request["data"], blobs, fn, args, kwargs,
+                    data_order, data_first_wave,
+                )
         self.last_used = time.monotonic()
-        return self.channel.call(fn, args, kwargs, timeout=timeout)
+        outcome = None
+        try:
+            outcome = self.channel.request(request, timeout=timeout)
+        finally:
+            added = self._finish_data(stream, call_dir)
+            try:
+                if outcome is not None and collector.outputs:
+                    added += pathdata.write_back(self, collector, blobs)
+            finally:
+                if added:
+                    pathdata.evict(self, blobs)
+        return outcome
+
+    def _stream_data(
+        self,
+        collector: Any,
+        data: dict[str, Any],
+        blobs: str,
+        fn: Any,
+        args: tuple,
+        kwargs: dict,
+        data_order: Any,
+        data_first_wave: int | None,
+    ) -> Any:
+        """Derive the send order, place the first wave, and start the background sender."""
+        from ..store import pathdata, sendorder
+
+        option = self.provider.config.option
+        declared = self._declared_order(fn, args, kwargs, data_order)
+        order = sendorder.compute(collector, fn, args, kwargs, declared)
+        plan = pathdata.prepare(self, collector, blobs, order)
+        wave = sendorder.first_wave(
+            plan.order,
+            plan.sizes,
+            set(plan.missing),
+            mib=float(option("data_first_wave_mib", pathdata.FIRST_WAVE_MIB)),
+            files=int(option("data_first_wave_files", pathdata.FIRST_WAVE_FILES)),
+            count=data_first_wave,
+        )
+        stream = pathdata.Stream(self, blobs, plan)
+        if not plan.missing:
+            # Nothing to stream: the runtime holds every file, so the call places them all
+            # before the body starts. It needs no manifest, no patch and no observation.
+            return stream
+        data.update(
+            {
+                "manifest": sendorder.manifest(collector),
+                "order": plan.order,
+                "observe": bool(option("data_observe", True)),
+                "prefetch": int(option("data_prefetch_batches", pathdata.PREFETCH_BATCHES)),
+                "wait": float(option("data_wait_timeout", pathdata.WAIT_TIMEOUT_S)),
+            }
+        )
+        stream.place(wave)
+        stream.start()
+        return stream
+
+    @staticmethod
+    def _declared_order(fn: Any, args: tuple, kwargs: dict, data_order: Any) -> Any:
+        """``data_order`` from the declaration, with a callable given the bound arguments.
+
+        Spec "The send order and the first wave". A callable that raises is the
+        declaration's own error, so it is not caught here.
+        """
+        if data_order is None or not callable(data_order):
+            return data_order
+        import inspect
+
+        try:
+            bound = inspect.signature(fn).bind(*args, **kwargs)
+            bound.apply_defaults()
+        except TypeError:
+            return data_order(dict(kwargs))
+        return data_order(dict(bound.arguments))
+
+    def _finish_data(self, stream: Any, call_dir: str) -> int:
+        """Cancel the background transfer and print the call's data log line."""
+        if stream is None:
+            return 0
+        stream.cancel()
+        if not stream.plan.missing:
+            # Nothing was sent and nothing could have waited, so there is nothing to ask for.
+            stream.log(None)
+            return 0
+        try:
+            stats = self.request({"op": "data_stats", "dir": call_dir}, timeout=120)
+        except (RuntimeFailure, RemoteError, ProtocolError):
+            stats = None
+        stream.log(stats)
+        return stream.sent
 
     # -- content addressed arguments -----------------------------------------
 
@@ -394,21 +554,23 @@ class Runtime:
         provider whose account names ``python`` manages its own interpreter, so nothing
         is built there.
         """
-        if not self.provider.prepares_env:
-            return
-        if self.provider.managed_python:
-            self.python = self.provider.managed_python
-            self.require_cloudpickle()
+        if not self.provider.remote_env:
             return
         from . import bootstrap
 
         assert self.channel is not None
         files = bootstrap.project_files(self.env)
-        root = bootstrap.project_dir(self.workspace or self.provider.workspace_root, self.env)
+        env_root = self.provider.env_root
+        root = bootstrap.project_dir(
+            env_root or self.workspace or self.provider.workspace_root, self.env
+        )
         where = self.eval(bootstrap.probe_source(self.env, root), timeout=120)
         self.platform = where["platform"]
 
-        for volume in self.volumes:
+        # Spec "Volumes on a persistent runtime": the .venv is already on the runtime's
+        # disk, so an archive is neither restored nor packed there.
+        archives = () if self.provider.persistent else self.volumes
+        for volume in archives:
             digest = volume.cached_env(self.env, self.platform)
             if not digest:
                 continue
@@ -421,7 +583,13 @@ class Runtime:
                 break
 
         if self.env_source != "archive":
-            source = bootstrap.sync_source(self.env, files, root=root, name=self.name)
+            workspace = self.workspace or self.provider.workspace_root
+            # Spec "Environment on the sandbox disk": an env root keeps uv's default cache.
+            persistent_cache = self.provider.persistent and env_root is None
+            cache = bootstrap.uv_cache_dir(workspace) if persistent_cache else None
+            source = bootstrap.sync_source(
+                self.env, files, root=root, name=self.name, cache_dir=cache
+            )
             try:
                 self.eval(source, timeout=3600)
             except RemoteError as exc:
@@ -430,41 +598,13 @@ class Runtime:
                     message.removeprefix("RuntimeError: "), stderr=exc.remote_traceback
                 ) from exc
             self.env_source = "sync"
-            if self.volumes:
-                self.volumes[0].cache_env_from(
-                    self, self.env, where["root"], platform=self.platform
-                )
+            if archives:
+                archives[0].cache_env_from(self, self.env, where["root"], platform=self.platform)
         self.python = where["python"]
         self.channel.switch_interpreter(where["python"])
 
-    def require_cloudpickle(self) -> None:
-        """Refuse a user-managed interpreter that cannot import cloudpickle.
-
-        letify installs nothing into that interpreter, so the fix is the user's. Not
-        retried, because a fresh runtime has the same interpreter.
-        """
-        importable, executable = self.eval(
-            "import sys\n"
-            "try:\n"
-            "    import cloudpickle\n"
-            "    __letify_value__ = (True, sys.executable)\n"
-            "except ImportError:\n"
-            "    __letify_value__ = (False, sys.executable)\n",
-            timeout=120,
-        )
-        if not importable:
-            self.shutdown()
-            raise ConfigError(
-                f"{self.name}: the account's python {executable} cannot import cloudpickle, "
-                f"which the worker needs to load a call. letify installs nothing into a "
-                f"user-managed interpreter: install cloudpickle there, or remove the python "
-                f"option so the runtime builds the project .venv with uv sync"
-            )
-
     def check_interpreter(self) -> None:
         """Refuse a worker whose Python major.minor differs from this process."""
-        if not self.provider.prepares_env:
-            return
         from . import bootstrap
 
         assert self.channel is not None
@@ -493,10 +633,7 @@ class Runtime:
 
 def _pickled(value: Any, immutable: bool) -> dict[str, Any]:
     """A ``put_blob`` message for a value: its protocol 5 pickle and out-of-band buffers."""
-    import pickle
-
-    buffers: list[pickle.PickleBuffer] = []
-    head = pickle.dumps(value, protocol=5, buffer_callback=buffers.append)
+    head, buffers = protocol.wire.pickle_parts(value)
     return {"kind": "pickle", "immutable": immutable, "head": head, "buffers": buffers}
 
 

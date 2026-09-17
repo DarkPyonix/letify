@@ -11,7 +11,7 @@ import argparse
 import json
 import sys
 
-from . import __version__
+from . import __version__, render
 from .config import login
 from .errors import LetifyError
 from .launcher import Launcher
@@ -25,9 +25,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--config", help="a project .letify directory, or its config.toml")
     sub = parser.add_subparsers(dest="command", required=True)
 
-    sub.add_parser("providers", help="list declared providers and their storage")
-    sub.add_parser("devices", help="list the accelerators each provider offers")
-    sub.add_parser("status", help="show live runtimes and what they are costing")
+    providers_parser = sub.add_parser("providers", help="list declared providers and their storage")
+    providers_parser.add_argument(
+        "--json", action="store_true", help="print the records unformatted"
+    )
+    devices_parser = sub.add_parser("devices", help="list the accelerators each provider offers")
+    devices_parser.add_argument("--json", action="store_true", help="print the records unformatted")
+    status_parser = sub.add_parser("status", help="show live runtimes and what they are costing")
+    status_parser.add_argument("--json", action="store_true", help="print the records unformatted")
     sub.add_parser("stubs", help="write the provider types an editor completes")
 
     usage = sub.add_parser("usage", help="show what each account has left")
@@ -41,7 +46,7 @@ def build_parser() -> argparse.ArgumentParser:
     utilization.add_argument("--json", action="store_true", help="print the records unformatted")
 
     log_in = sub.add_parser("login", help="declare an account and reference it here")
-    log_in.add_argument("kind", help="provider kind: shell, tunnel, colab, modal, elice")
+    log_in.add_argument("kind", help="provider kind: shell, tunnel, colab, modal, elice, kaggle")
     log_in.add_argument("alias", nargs="?", help="name to reach it by; defaults to the kind")
     log_in.add_argument("--address", help="machine address, for shell and tunnel")
     log_in.add_argument("--user", help="SSH user")
@@ -65,8 +70,24 @@ def build_parser() -> argparse.ArgumentParser:
         help="the machine keeps its disk between sessions",
     )
     log_in.add_argument("--zone-id", dest="zone_id", help="Elice zone id")
-    log_in.add_argument("--machine-id", dest="machine_id", help="Elice machine id")
+    log_in.add_argument(
+        "--machine-id",
+        dest="machine_id",
+        help="Elice machine name or id; without it letify creates one on first use",
+    )
+    log_in.add_argument(
+        "--price-type",
+        dest="price_type",
+        choices=("ondemand", "spot"),
+        help="Elice price type for machines letify creates; ondemand by default",
+    )
     log_in.add_argument("--endpoint", help="API endpoint, where it is not the default")
+    log_in.add_argument(
+        "--organization", help="Elice organization short name, sent as x-elice-org-name-short"
+    )
+    log_in.add_argument(
+        "--billing-endpoint", dest="billing_endpoint", help="Elice billing API base URL"
+    )
     log_in.add_argument("--account", help="account email, for Colab")
     log_in.add_argument(
         "--workspace",
@@ -81,6 +102,14 @@ def build_parser() -> argparse.ArgumentParser:
         "--connect",
         metavar="TOKEN",
         help="the token 'letify client shell connect' printed, for tunnel",
+    )
+    log_in.add_argument(
+        "--cookie",
+        metavar="COOKIE",
+        help=(
+            "the browser cookie of a logged-in kaggle.com tab, or a file holding it, for "
+            "kaggle; this is the whole Kaggle credential"
+        ),
     )
     log_in.add_argument(
         "--no-input",
@@ -113,8 +142,14 @@ def build_parser() -> argparse.ArgumentParser:
     check = sub.add_parser("check", help="check that a provider answers")
     check.add_argument("alias", help="provider alias from the configuration")
 
+    cache = sub.add_parser("cache", help="show the data caches, or clear a provider's")
+    cache.add_argument("action", nargs="?", choices=("clear",), help="clear a runtime cache")
+    cache.add_argument("alias", nargs="?", help="provider alias whose runtime cache to clear")
+    cache.add_argument("--json", action="store_true", help="print the records unformatted")
+
     probe = sub.add_parser("probe", help="measure whether host='local' is worth using")
     probe.add_argument("host", nargs="?", help="host name to measure the round trip to")
+    probe.add_argument("--json", action="store_true", help="print the record unformatted")
 
     efficiency = sub.add_parser(
         "efficiency", help="expected fraction of a direct run, from measured terms"
@@ -122,6 +157,15 @@ def build_parser() -> argparse.ArgumentParser:
     efficiency.add_argument("step_seconds", type=float, help="GPU time per step")
     efficiency.add_argument("syncs", type=int, help="host synchronizations per step")
     efficiency.add_argument("round_trip_ms", type=float, help="network round trip")
+    efficiency.add_argument("--json", action="store_true", help="print the record unformatted")
+
+    setup_parser = sub.add_parser(
+        "setup", help="install tailcat or eci from its publisher ahead of time"
+    )
+    setup_parser.add_argument("tool", choices=("tailcat", "eci"), help="the tool to install")
+    setup_parser.add_argument(
+        "--where", action="store_true", help="print where the tool is and which copy letify uses"
+    )
 
     client = sub.add_parser("client", help="run letify's side on a remote machine")
     client_sub = client.add_subparsers(dest="client_command", required=True)
@@ -154,14 +198,21 @@ def build_parser() -> argparse.ArgumentParser:
 
 def _client_shell_connect(args: argparse.Namespace) -> int:
     """Check tailcat and the SSH server, run the remote agent, and print the login command."""
+    from .install import InstallError, ensure
     from .transport import setup
     from .transport.agent import Agent
 
-    if not setup.tailcat_on_path(args.tailcat):
-        print(setup.tailcat_install_instructions(), file=sys.stderr)
+    if args.tailcat == "tailcat":
+        try:
+            args.tailcat = ensure("tailcat", instructions=setup.tailcat_install_instructions())
+        except InstallError as exc:
+            _fail(str(exc))
+            return 1
+    elif not setup.tailcat_on_path(args.tailcat):
+        _fail(setup.tailcat_install_instructions())
         return 1
     if not setup.ssh_answers(args.ssh_port):
-        print(setup.sshd_missing_message(args.ssh_port), file=sys.stderr)
+        _fail(setup.sshd_missing_message(args.ssh_port))
         return 1
 
     agent = Agent(ssh=("127.0.0.1", args.ssh_port), tailcat=args.tailcat)
@@ -170,7 +221,7 @@ def _client_shell_connect(args: argparse.Namespace) -> int:
         address = agent.start_tailcat()
     except (OSError, RuntimeError) as exc:
         agent.close()
-        print(exc, file=sys.stderr)
+        _fail(str(exc))
         return 1
     fields = {
         "tailcat": address,
@@ -184,15 +235,20 @@ def _client_shell_connect(args: argparse.Namespace) -> int:
         fields["public_port"] = args.public_port
     token = setup.encode_token(fields)
     alias = args.name or setup.default_alias()
-    print("On your own machine, run:")
+    style = _out()
+    print(style.bold("On your own machine, run:"))
     print()
     print(f"  letify login tunnel {alias} --connect {token}")
     print()
-    print("Keep this agent running: every connection to this machine goes through it.")
-    print("To keep it running after you log out, start it inside tmux or with nohup:")
+    print(style.dim("Keep this agent running: every connection to this machine goes through it."))
+    print(style.dim("To keep it running after you log out, start it inside tmux or with nohup:"))
     print("  tmux new -s letify 'letify client shell connect'")
     print("  nohup letify client shell connect > letify-agent.log 2>&1 &")
-    print("A restart gets a new address, so run the login again with the new token it prints.")
+    print(
+        style.dim(
+            "A restart gets a new address, so run the login again with the new token it prints."
+        )
+    )
     sys.stdout.flush()
     try:
         agent.serve_forever()
@@ -203,49 +259,169 @@ def _client_shell_connect(args: argparse.Namespace) -> int:
     return 0
 
 
+def _setup_tool(args: argparse.Namespace) -> int:
+    """``letify setup <tool>``. Spec "Installing external tools"."""
+    from . import install
+
+    tool = args.tool
+    if args.where:
+        rows = install.where(tool)
+        width = max(len(label) for label, _ in rows)
+        for label, value in rows:
+            print(f"{label.ljust(width)}  {value}")
+        return 0
+    version = install.version_of(tool)
+    found = install.find(tool)
+    if found is None:
+        try:
+            install.install_and_link(tool)
+        except install.InstallError as exc:
+            _fail(str(exc))
+            return 1
+        found = install.find(tool)
+    if found is None:  # pragma: no cover - brew put tailcat off PATH
+        _fail(f"{tool} was installed but letify cannot find it")
+        return 1
+    _say("ok", f"{tool} {version} at {found}")
+    return 0
+
+
+def _data_cache_request(let: Launcher, alias: str, clear: bool) -> dict:
+    """Ask a session on the provider's first instance about its file blob cache."""
+    from .declare import Env
+    from .store import pathdata
+
+    provider = let.provider(alias)
+    from . import remote
+
+    # The worker answers the request, so no PyTorch is needed on this side.
+    instance = next(iter(provider.instances.values()))._placed(remote)
+    with let.invocation():
+        runtime = let.pool.acquire(instance, Env())
+        try:
+            root = (runtime.workspace or provider.workspace_root).rstrip("/")
+            payload = {
+                "op": "data_cache",
+                "dir": f"{root}/data/blobs",
+                "budget": pathdata.budget_bytes(provider),
+                "clear": clear,
+            }
+            return runtime.request(payload, timeout=600)
+        finally:
+            let.pool.release(runtime)
+
+
+def _cache(let: Launcher, args: argparse.Namespace) -> int:
+    """Spec "The cache command"."""
+    from .store import pathdata
+
+    mib = 1 << 20
+    if args.action == "clear":
+        if not args.alias:
+            _fail("name the provider whose runtime cache to clear: letify cache clear <alias>")
+            return 1
+        result = _data_cache_request(let, args.alias, True)
+        if args.json:
+            return _json({"alias": args.alias, **result})
+        print(
+            f"{args.alias}: removed {result['removed']} files "
+            f"{result['removed_bytes'] / mib:.1f} MiB"
+        )
+        return 0
+    digests = pathdata.DigestCache()
+    pruned = digests.prune()
+    digests.save()
+    records: list[dict] = []
+    for alias in let.config.order:
+        try:
+            provider = let.provider(alias)
+            if not provider.persistent:
+                records.append({"alias": alias, "kept": False})
+                continue
+            result = _data_cache_request(let, alias, False)
+        except LetifyError as exc:
+            records.append({"alias": alias, "unavailable": str(exc)})
+            continue
+        records.append(
+            {
+                "alias": alias,
+                "kept": True,
+                "files": result["files"],
+                "bytes": result["bytes"],
+                "budget": result["budget"],
+            }
+        )
+    record = {"digests": {"entries": len(digests), "pruned": pruned}, "providers": records}
+    if args.json:
+        return _json(record)
+    print(f"digest cache: {len(digests)} entries, {pruned} pruned")
+    rows = []
+    for row in records:
+        if "unavailable" in row:
+            rows.append([row["alias"], f"unavailable: {row['unavailable']}", "", ""])
+        elif not row["kept"]:
+            rows.append([row["alias"], "not kept between sessions", "", ""])
+        else:
+            rows.append(
+                [
+                    row["alias"],
+                    str(row["files"]),
+                    f"{row['bytes'] / mib:.1f} MiB",
+                    f"{row['budget'] / (1 << 30):.1f} GiB",
+                ]
+            )
+    sys.stdout.write(render.table(["PROVIDER", "BLOBS", "SIZE", "BUDGET"], rows, _out()))
+    return 0
+
+
 def _describe_usage(row: dict) -> str:
-    """One line for a usage row, saying plainly when there is no number."""
-    if row.get("unmetered"):
-        return "unmetered"
-    unit = row.get("unit") or ""
-    parts = []
-    if row.get("remaining") is not None:
-        left = f"{row['remaining']:g} {unit} left"
-        if row.get("limit"):
-            left += f" of {row['limit']:g}"
-        parts.append(left)
-    if row.get("rate_per_hour") is not None:
-        parts.append(f"{row['rate_per_hour']:g} {unit}/hour running now")
-    return ", ".join(parts) or f"not reported ({row.get('source')})"
+    """One line for a usage row, formatted by its unit as spec "Remaining usage" says."""
+    from .providers.usage import describe_row
+
+    return describe_row(row)
 
 
-def _describe_device(device: dict) -> str:
-    """One line for a device reading, leaving out what the card did not report."""
-    load = (
-        f"{device['utilization_percent']:.0f}% busy"
-        if device.get("utilization_percent") is not None
-        else "load unknown"
-    )
-    parts = [f"gpu{device['index']}", str(device["name"]), load]
-    if device.get("memory_total_gb"):
-        used = device.get("memory_used_gb") or 0.0
-        parts.append(f"{used:.1f}/{device['memory_total_gb']:.1f} GiB")
-    if device.get("temperature_c") is not None:
-        parts.append(f"{device['temperature_c']:.0f}C")
-    if device.get("power_w") is not None:
-        parts.append(f"{device['power_w']:.0f}W")
-    return " ".join(parts)
+def _out() -> render.Style:
+    return render.Style.for_stream(sys.stdout)
+
+
+def _fail(message: str) -> None:
+    """One failure on standard error, marked as spec "Command line" says."""
+    style = render.Style.for_stream(sys.stderr)
+    print(f"{render.mark('fail', style)} {message}", file=sys.stderr)
+
+
+def _say(kind: str, message: str) -> None:
+    """One marked line on standard output."""
+    print(f"{render.mark(kind, _out())} {message}")
+
+
+def _json(value: object) -> int:
+    print(json.dumps(value, indent=2))
+    return 0
 
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    try:
+        return _dispatch(args)
+    except LetifyError as exc:
+        _fail(str(exc))
+        return 1
 
+
+def _dispatch(args: argparse.Namespace) -> int:
     if args.command == "efficiency":
         from .remoting import efficiency as compute
 
         share = compute(args.step_seconds, args.syncs, args.round_trip_ms)
+        if args.json:
+            return _json({"efficiency": share})
         print(f"{share * 100:.1f}% of a direct run")
         return 0
+
+    if args.command == "setup":
+        return _setup_tool(args)
 
     if args.command == "client":
         # Runs on the remote machine, which has no accounts, so no Launcher is built.
@@ -266,11 +442,15 @@ def main(argv: list[str] | None = None) -> int:
                 "persistent": args.persistent,
                 "zone_id": args.zone_id,
                 "machine_id": args.machine_id,
+                "price_type": args.price_type,
                 "endpoint": args.endpoint,
+                "organization": args.organization,
+                "billing_endpoint": args.billing_endpoint,
                 "account": args.account,
                 "workspace": args.workspace,
                 "profile": args.profile,
                 "connect": args.connect,
+                "cookie": args.cookie,
                 "indices": args.indices,
                 "detect_devices": args.detect_devices,
             },
@@ -281,26 +461,27 @@ def main(argv: list[str] | None = None) -> int:
         try:
             fresh, home, project = login.log_in(answers, project=args.config)
         except LetifyError as exc:
-            print(exc, file=sys.stderr)
+            _fail(str(exc))
             return 1
         if fresh:
-            print(f"{alias} declared in {home}")
+            _say("ok", f"{alias} declared in {home}")
         else:
-            print(f"{alias} was already declared in {home}, so nothing was asked for")
-        print(f"{alias} referenced in {project}, which is safe to commit")
+            _say("warn", f"{alias} was already declared in {home}, so nothing was asked for")
+        _say("ok", f"{alias} referenced in {project}, which is safe to commit")
         return 0
 
     if args.command == "logout":
         removed, forgotten = login.log_out(args.alias)
         if not removed:
-            print(
-                f"{args.alias} is not declared in {login.home_path()}",
-                file=sys.stderr,
-            )
+            _fail(f"{args.alias} is not declared in {login.home_path()}")
             return 1
         detail = " and its account directory" if forgotten else ""
-        print(f"{args.alias} removed from {login.home_path()}{detail}")
-        print("The project reference is left alone, because this repository still needs it")
+        _say("ok", f"{args.alias} removed from {login.home_path()}{detail}")
+        print(
+            _out().dim(
+                "The project reference is left alone, because this repository still needs it"
+            )
+        )
         return 0
 
     let = Launcher(args.config, announce=False)
@@ -310,91 +491,125 @@ def main(argv: list[str] | None = None) -> int:
 
         written = stubs.write(let)
         if written is None:
-            print("generation is turned off by [tool.letify] typings = false", file=sys.stderr)
+            _fail("generation is turned off by [tool.letify] typings = false")
             return 1
-        print(written)
+        _say("ok", str(written))
         return 0
 
     if args.command == "providers":
+        records: list[dict[str, str]] = []
         for alias in let.config.order:
             try:
                 provider = let.provider(alias)
             except Exception as exc:
-                print(f"{alias:20} unavailable: {exc}")
+                records.append({"alias": alias, "unavailable": str(exc)})
                 continue
-            print(f"{alias:20} {provider.kind:10} {provider.persistence}")
+            record = {
+                "alias": alias,
+                "kind": provider.kind,
+                "persistence": str(provider.persistence),
+            }
+            note = provider.account_note()
+            if note:
+                record["note"] = note
+            records.append(record)
+        if args.json:
+            return _json(records)
+        style = _out()
+        def row(r: dict[str, str]) -> list[str]:
+            if "unavailable" in r:
+                why = f"{render.mark('fail', style)} unavailable: {r['unavailable']}"
+                return [r["alias"], why, "", ""]
+            return [r["alias"], r["kind"], r["persistence"], r.get("note", "")]
+
+        rows = [row(r) for r in records]
+        sys.stdout.write(render.table(["ALIAS", "KIND", "PERSISTENCE", "NOTES"], rows, style))
         return 0
 
     if args.command == "devices":
-        print(json.dumps(let.providers.devices, indent=2, sort_keys=True))
+        table = let.providers.devices
+        if args.json:
+            print(json.dumps(table, indent=2, sort_keys=True))
+            return 0
+        rows = [[alias, ", ".join(str(name) for name in names)] for alias, names in table.items()]
+        sys.stdout.write(render.table(["PROVIDER", "ACCELERATORS"], rows, _out()))
         return 0
 
     if args.command == "status":
-        print(json.dumps(let.status(), indent=2))
+        status = let.status()
+        if args.json:
+            return _json(status)
+        # A live runtime is what costs money, so only its account is asked what is left.
+        asked: dict[str, dict] = {}
+        for runtime in status.get("runtimes") or []:
+            alias = str(runtime["provider"])
+            if alias not in asked:
+                rows = let.usage(alias)
+                asked[alias] = rows[0] if rows else {}
+            runtime["usage"] = asked[alias] or None
+        sys.stdout.write(render.status_text(status, _out()))
         return 0
 
     if args.command == "usage":
         rows = let.usage(args.alias)
         if args.json:
-            print(json.dumps(rows, indent=2))
-            return 0
-        for row in rows:
-            alias = str(row["alias"])
-            if "unavailable" in row:
-                print(f"{alias:20} unavailable: {row['unavailable']}")
-                continue
-            line = f"{alias:20} {row['kind']!s:10} {_describe_usage(row)}"
-            print(line)
-            if row.get("note"):
-                print(f"{'':20} {row['note']}")
+            return _json(rows)
+        sys.stdout.write(render.usage_blocks(rows, render.Style.for_stream(sys.stdout)))
         return 0
 
     if args.command == "utilization":
         rows = let.utilization(args.alias)
         if args.json:
-            print(json.dumps(rows, indent=2))
-            return 0
-        for row in rows:
-            alias = str(row["alias"])
-            if "unavailable" in row:
-                print(f"{alias:20} unavailable: {row['unavailable']}")
-                continue
-            head = f"{alias}.{row['accelerator']}"
-            devices = row.get("devices") or []
-            if not devices:
-                print(f"{head:28} {row.get('reason') or 'nothing reported'}")
-                continue
-            for device in devices:
-                print(f"{head:28} {_describe_device(device)}")
+            return _json(rows)
+        sys.stdout.write(render.utilization_blocks(rows, render.Style.for_stream(sys.stdout)))
         return 0
+
+    if args.command == "cache":
+        return _cache(let, args)
 
     if args.command == "check":
         provider = let.provider(args.alias)
         checker = getattr(provider, "check", None)
         if checker is None:
-            print(f"{args.alias} has no check step", file=sys.stderr)
+            _fail(f"{args.alias} has no check step")
             return 1
-        print(checker())
+        answer = checker()
+        _say("ok", f"{args.alias} answers")
+        for line in str(answer).splitlines():
+            print(f"  {line}")
         return 0
 
     if args.command == "probe":
         from .remoting import probe as run_probe
 
         capability = run_probe(args.host)
-        print(
-            json.dumps(
-                {
-                    "platform": capability.platform,
-                    "core": capability.core,
-                    "agent": capability.agent,
-                    "round_trip_ms": capability.round_trip_ms,
-                    "usable": capability.usable,
-                    "costly": capability.costly,
-                    "reason": capability.explain(),
-                },
-                indent=2,
-            )
-        )
+        record = {
+            "platform": capability.platform,
+            "core": capability.core,
+            "agent": capability.agent,
+            "round_trip_ms": capability.round_trip_ms,
+            "usable": capability.usable,
+            "costly": capability.costly,
+            "reason": capability.explain(),
+        }
+        if args.json:
+            return _json(record)
+        if capability.usable and capability.costly:
+            _say("warn", "forwarding usable but costly")
+        elif capability.usable:
+            _say("ok", "forwarding usable")
+        else:
+            _say("fail", "forwarding not usable")
+        rtt = capability.round_trip_ms
+        pairs = [
+            ("platform", str(capability.platform)),
+            ("core", str(capability.core)),
+            ("agent", str(capability.agent)),
+            ("round trip", f"{rtt:.1f} ms" if rtt is not None else "not measured"),
+        ]
+        style = _out()
+        sys.stdout.write(render.fields(pairs, style))
+        print(style.dim(str(record["reason"])))
         return 0
 
     return 1

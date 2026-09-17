@@ -56,6 +56,18 @@ MODAL = Tool(
     pins=("modal>=1.0,<2",),
 )
 
+#: The environment the Kaggle adapter runs in. ``jupyter-kernel-client`` below 1.0 is the
+#: release whose ``KernelClient`` the Colab CLI also uses.
+KAGGLE_KERNEL = Tool(
+    package="jupyter-kernel-client",
+    executable="python",
+    python="3.13",
+    pins=("jupyter-kernel-client<1",),
+)
+
+#: The Kaggle adapter file, run by path so it needs nothing of letify's own environment.
+KAGGLE_ADAPTER = Path(__file__).parent / "providers" / "kaggle_adapter.py"
+
 #: The adapter file, run by path so it needs nothing of letify's own environment.
 MODAL_ADAPTER = Path(__file__).parent / "providers" / "modal_adapter.py"
 

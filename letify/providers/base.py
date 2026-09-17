@@ -25,9 +25,10 @@ and no blob table, so a large argument travels again on every call.
 from __future__ import annotations
 
 import abc
+import dataclasses
 import threading
 from collections.abc import Iterator, Mapping, Sequence
-from typing import TYPE_CHECKING, Literal
+from typing import TYPE_CHECKING, Any, Literal
 
 from ..config import ProviderConfig
 from ..config.inventory import Devices, read_table
@@ -59,12 +60,17 @@ class Provider(abc.ABC):
     #: Whether CUDA call forwarding can reach this provider at useful latency.
     has_fast_path: bool = False
 
+    #: Whether a declaration may place its host code here with ``host="local"``. False makes
+    #: the declaration a type error and a decoration-time ``UnsupportedMode``.
+    serves_host_local: bool = True
+
     #: Whether a worker process can be kept alive between calls.
     persistent_channel: bool = True
 
-    #: Whether a runtime has to install the declared environment. False when the
-    #: machine already runs in it, which is the case for the local provider.
-    prepares_env: bool = True
+    #: Whether the declared environment has to be built on another machine. False only
+    #: for the local provider, whose worker is a subprocess of this process and so already
+    #: runs in it. No account setting turns this off.
+    remote_env: bool = True
 
     #: Whether a session can outlive this process and keep billing.
     needs_lease: bool = True
@@ -145,6 +151,19 @@ class Provider(abc.ABC):
         busy = tuple(self.busy())
         self.last_busy = busy
         return tuple(index for index in entry.indices if index not in held | set(busy))
+
+    #: Whether ``letify utilization`` reads the machine itself rather than a live session.
+    #: True only where the machine outlives a session and can be asked without starting one.
+    reads_machine: bool = False
+
+    def read_machine(self) -> tuple[list[Any], dict[int, tuple[str, tuple[str, ...]]]]:
+        """Every card's load and holder on the machine, with no session. See ``reads_machine``."""
+        raise NotImplementedError(f"{self.kind} is read inside a live session")
+
+    def reserved_indices(self) -> set[int]:
+        """The device indices this process has reserved on this provider."""
+        with self._devices_guard:
+            return {index for held in self._reserved.values() for index in held}
 
     def busy(self) -> tuple[int, ...]:
         """Device indices another user is computing on. Nothing for a provider letify cannot ask.
@@ -245,6 +264,14 @@ class Provider(abc.ABC):
     def persistent(self) -> bool:
         return self.persistence == "persistent"
 
+    def account_note(self) -> str | None:
+        """A short line about the account's credential health, for listings.
+
+        None by default. A provider whose credential expires (Kaggle's cookie) overrides
+        this to say how many days are left, so `letify providers` shows it at a glance.
+        """
+        return None
+
     # -- instances -----------------------------------------------------------
 
     @abc.abstractmethod
@@ -322,6 +349,11 @@ class Provider(abc.ABC):
     #: Whether a session boot expands, creates and enters the workspace root on the runtime.
     prepares_workspace: bool = True
 
+    #: Where the project directory and its ``.venv`` live instead of the workspace root, with
+    #: uv's default cache. None keeps them under the workspace root. Spec "Environment on the
+    #: sandbox disk".
+    env_root: str | None = None
+
     @property
     def workspace_root(self) -> str:
         """Where letify may write on the runtime, before ``~`` is expanded there.
@@ -340,12 +372,6 @@ class Provider(abc.ABC):
             )
         return value
 
-    @property
-    def managed_python(self) -> str | None:
-        """The interpreter the account names with ``python``, which the user manages."""
-        value = self.config.option("python")
-        return str(value) if value else None
-
     @abc.abstractmethod
     def open_channel(self, runtime: Runtime) -> Channel:
         """Return the channel that talks to this runtime."""
@@ -353,6 +379,20 @@ class Provider(abc.ABC):
     def create_session(self, instance: Instance, name: str) -> None:
         """Ask the provider for a machine. Nothing to do where one already exists."""
         return None
+
+    #: Whether this provider can run an instance at spot pricing. Spec "Price type".
+    offers_spot: bool = False
+
+    def price_type_of(self, instance: Instance) -> str | None:
+        """The price type a session of this instance runs at, or None where there is none."""
+        return None
+
+    def diagnose(self, runtime: Runtime, failure: Exception) -> Exception:
+        """Name an infrastructure failure more precisely before it is retried.
+
+        Spec "Failure and retry". The default returns the failure unchanged.
+        """
+        return failure
 
     def stop(self, runtime: Runtime) -> None:
         """Release whatever the provider allocated for this runtime."""
@@ -375,7 +415,11 @@ class Provider(abc.ABC):
         from ..runtime.session import Runtime
 
         self.check_mode(instance)
-        if self.prepares_env and not self.managed_python:
+        if instance.price_type == "spot" and not self.offers_spot:
+            raise UnsupportedMode(
+                f"{self.alias} has no spot pricing. Only an elice account runs spot instances"
+            )
+        if self.remote_env:
             from ..runtime.bootstrap import project_files
 
             # A missing lock file or a Python that cannot match is refused before the
@@ -422,10 +466,6 @@ class Provider(abc.ABC):
             f"{self.kind} cannot start a PyTorch device worker, so host='local' cannot run "
             f"on {self.alias}. Use host='remote'."
         )
-
-    #: Whether forwarding needs the agent installed on another machine. False only
-    #: where the device is in this machine, so nothing has to be reached.
-    needs_remote_agent: bool = True
 
     def forwarding_host(self) -> str | None:
         """The name to measure the round trip against, if this provider has one.
@@ -481,7 +521,13 @@ class Provider(abc.ABC):
                 str(unit) if isinstance(unit, str) else self.usage_unit,
                 float(limit) if isinstance(limit, (int, float)) else None,
             )
-        return self.report_usage()
+        reading = self.report_usage()
+        plan = self.config.option("usage_limit")
+        if reading.limit is None and isinstance(plan, (int, float)) and plan > 0:
+            # A plan allowance the user configured, for a service that states only a balance.
+            used = None if reading.remaining is None else max(float(plan) - reading.remaining, 0.0)
+            reading = dataclasses.replace(reading, limit=float(plan), used=used)
+        return reading
 
     def report_usage(self) -> Usage:
         """What the provider itself can answer, with no configured command in the way."""

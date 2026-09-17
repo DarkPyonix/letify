@@ -22,6 +22,8 @@ _LAZY = {
     "worker_source": "client",
     "RemoteTensor": "tensor",
     "current_client": "cuda",
+    "Deferred": "value",
+    "auto_fetch_enabled": "value",
 }
 
 
@@ -36,8 +38,10 @@ def __getattr__(name: str) -> Any:
 
 __all__ = [
     "Client",
+    "Deferred",
     "RemoteTensor",
     "Stats",
+    "auto_fetch_enabled",
     "check_torch_version",
     "check_worker_version",
     "connect",

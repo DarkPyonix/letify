@@ -83,6 +83,17 @@ class Channel(abc.ABC):
     def request(self, payload: dict[str, Any], *, timeout: float | None = None) -> tuple[Any, str]:
         """Send one request and return ``(value, logs)``."""
 
+    def stream(self, payload: dict[str, Any], *, timeout: float | None = None) -> Iterator[Any]:
+        """Send one request answered by several replies, yielding each value in order.
+
+        Spec "Waiting for a reply". A channel that cannot carry such an answer refuses it,
+        so nothing silently falls back to one request per piece.
+        """
+        raise RuntimeFailure(
+            f"{getattr(self, 'name', 'runtime')}: this channel cannot carry a streamed "
+            f"reply, so {payload.get('op')!r} is not available here."
+        )
+
     def call(
         self,
         fn: Any,
@@ -172,14 +183,18 @@ class _Gate:
 class _Slot:
     """One open request: where its reply, its failure and its output end up."""
 
-    __slots__ = ("error", "event", "reply", "stream", "tail")
+    __slots__ = ("error", "event", "pieces", "reply", "stream", "streaming", "tail")
 
-    def __init__(self, stream: int):
+    def __init__(self, stream: int, *, streaming: bool = False):
         self.stream = stream
         self.event = threading.Event()
         self.reply: tuple[Any, list] | None = None
         self.error: ProtocolError | None = None
         self.tail = _Tail()
+        #: Whether more than one reply is expected, so the slot stays open until the last.
+        self.streaming = streaming
+        #: Replies of a streamed answer, in arrival order.
+        self.pieces: collections.deque = collections.deque()
 
 
 class _Watchdog:
@@ -249,6 +264,8 @@ class Connection:
         self._tail = _Tail()
         #: Device executor messages that arrived on ``wire.DEVICE_STREAM``, or None when closed.
         self._device: collections.deque | None = None
+        #: ``data_want`` payloads that arrived on ``wire.DATA_STREAM``, for the data sender.
+        self._wants: collections.deque = collections.deque()
 
     # -- reading ---------------------------------------------------------------
 
@@ -276,6 +293,15 @@ class Connection:
             with self._turn:
                 self.hello = value
                 self._turn.notify_all()
+        elif kind == wire.REQUEST and stream == wire.DATA_STREAM:
+            # The worker asking for blobs it is about to read. Nothing answers it: the
+            # background sender picks the request up and reorders its queue.
+            try:
+                self._wants.append(wire.loads(value[0], value[1]))
+            except Exception:
+                pass
+            with self._turn:
+                self._turn.notify_all()
         elif kind == wire.REPLY and stream == wire.DEVICE_STREAM:
             with self._turn:
                 if self._device is not None:
@@ -283,10 +309,16 @@ class Connection:
                 self._turn.notify_all()
         elif kind == wire.REPLY:
             with self._slots_lock:
-                slot = self._slots.pop(stream, None)
+                slot = self._slots.get(stream)
+                # A streamed answer keeps its slot until its last reply has been read.
+                if slot is not None and not slot.streaming:
+                    del self._slots[stream]
             if slot is not None:
                 with self._turn:
-                    slot.reply = value
+                    if slot.streaming:
+                        slot.pieces.append(value)
+                    else:
+                        slot.reply = value
                     slot.event.set()
                     self._turn.notify_all()
 
@@ -366,6 +398,17 @@ class Connection:
     def _device_open(self) -> bool:
         return self._device is not None
 
+    # -- data stream -----------------------------------------------------------
+
+    def take_wants(self) -> list[dict[str, Any]]:
+        """Every ``data_want`` that has arrived so far, oldest first, and forget them."""
+        found = []
+        while True:
+            try:
+                found.append(self._wants.popleft())
+            except IndexError:
+                return found
+
     def _poll_ready(self) -> None:
         """Poll the read descriptor without blocking until it is readable or ``poll_s`` ends."""
         poller = self._poller
@@ -413,11 +456,56 @@ class Connection:
         outcome = wire.loads(head, buffers)
         return protocol.unwrap(outcome, runtime_key=self.name), slot.tail.text()
 
-    def _open(self) -> _Slot:
+    def stream(
+        self,
+        payload: dict[str, Any],
+        *,
+        timeout: float | None,
+        kill: Callable[[], None],
+    ) -> Iterator[Any]:
+        """Send one request and yield each reply's value until the one marked last.
+
+        Spec "Waiting for a reply". The slot stays open across the whole sequence, so the
+        worker sends the next piece without waiting for this process to read the one before.
+        """
+        watchdog = _Watchdog(kill, timeout) if timeout is not None else None
+        slot: _Slot | None = None
+        try:
+            with self.gate.shared():
+                slot = self._open(streaming=True)
+                try:
+                    self.sender.message(wire.REQUEST, slot.stream, payload)
+                except OSError as exc:
+                    if watchdog is not None and watchdog.expired:
+                        raise RuntimeFailure(f"{self.name}: the call exceeded {timeout}s") from exc
+                    raise RuntimeLost(f"{self.name}: the worker pipe is closed") from exc
+            while True:
+                self._wait(lambda: bool(slot.pieces))  # type: ignore[union-attr]
+                with self._turn:
+                    piece = slot.pieces.popleft() if slot.pieces else None
+                    if not slot.pieces:
+                        slot.event.clear()
+                if piece is None:
+                    if watchdog is not None and watchdog.expired:
+                        raise RuntimeFailure(f"{self.name}: the call exceeded {timeout}s")
+                    raise ProtocolError(str(slot.error or self.failure))
+                head, buffers = piece
+                outcome = wire.loads(head, buffers)
+                last = not isinstance(outcome, dict) or bool(outcome.get("last"))
+                yield protocol.unwrap(outcome, runtime_key=self.name)
+                if last:
+                    return
+        finally:
+            if slot is not None:
+                self._forget(slot)
+            if watchdog is not None:
+                watchdog.cancel()
+
+    def _open(self, *, streaming: bool = False) -> _Slot:
         with self._slots_lock:
             if self.failure is not None:
                 raise ProtocolError(str(self.failure))
-            slot = _Slot(self._next_stream)
+            slot = _Slot(self._next_stream, streaming=streaming)
             self._next_stream += 2
             self._slots[slot.stream] = slot
         return slot
@@ -503,6 +591,10 @@ class FramedChannel(Channel):
     def request(self, payload: dict[str, Any], *, timeout: float | None = None) -> tuple[Any, str]:
         connection = self._require()
         return connection.request(payload, timeout=timeout, kill=self._kill)
+
+    def stream(self, payload: dict[str, Any], *, timeout: float | None = None) -> Iterator[Any]:
+        connection = self._require()
+        return connection.stream(payload, timeout=timeout, kill=self._kill)
 
 
 class PersistentChannel(FramedChannel):

@@ -24,6 +24,7 @@ import getpass
 import subprocess
 import sys
 import tomllib
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -543,26 +544,132 @@ def shell_account(answers: Answers) -> dict[str, Any]:
     return options
 
 
+#: The last line of the Elice machine menu, which records no machine.
+CREATE_MACHINE = "Create a new machine with letify"
+
+
 def elice_account(answers: Answers) -> dict[str, Any]:
-    """Record the zone and machine, and keep the access token in the account directory."""
-    zone = ask(answers, "zone_id", "Elice zone id: ")
-    machine = ask(answers, "machine_id", "Elice machine id: ")
+    """Check the access token with eci, choose the zone and any machine, and keep the token.
+
+    Spec "Logging in". Nothing is written until eci has accepted the token and the zone,
+    so a mistyped token leaves no account and no secret file behind. No machine has to
+    exist: without one, letify creates its own on first use.
+    """
+    from ..providers import elice
+
+    confirm = None
+    if answers.interactive:
+
+        def confirm() -> bool:
+            return read_line(elice.install_question()).lower() in ("y", "yes")
+
+    try:
+        binary = elice.find_eci(confirm=confirm)
+    except LetifyError as exc:
+        raise LoginError(str(exc)) from None
+    given = answers.get("endpoint")
+    endpoint = given if isinstance(given, str) and given else elice.DEFAULT_ENDPOINT
     token = answers.token or (
         read_password("Elice access token: ") if answers.interactive else None
     )
     if not token:
         raise LoginError(f"{answers.alias} needs an access token. Pass --token or drop --no-input.")
-    store_secret(answers.alias, "access_token", token)
-    options: dict[str, Any] = {
-        "kind": answers.kind,
-        "zone_id": zone,
-        "machine_id": machine,
-    }
-    endpoint = answers.get("endpoint")
-    if isinstance(endpoint, str) and endpoint:
+    unzoned = elice.eci_environment(answers.alias, token, endpoint, None)
+    try:
+        zones = elice.items(elice.eci(binary, ["zone", "list"], unzoned))
+    except LetifyError as exc:
+        raise LoginError(f"Elice refused the access token, so nothing was written: {exc}") from None
+
+    zone = choose(answers, "zone_id", "zone", lambda: zones)
+    env = elice.eci_environment(answers.alias, token, endpoint, zone)
+    try:
+        elice.eci(binary, ["config", "verify"], env, parse=False)
+    except LetifyError as exc:
+        raise LoginError(f"eci config verify failed, so nothing was written: {exc}") from None
+
+    machine = answers.get("machine_id")
+    if not (isinstance(machine, str) and machine):
+        machine = None
+        try:
+            listed = [m for m in elice.items(elice.eci(binary, ["compute", "vm", "list"], env))]
+        except LetifyError as exc:
+            raise LoginError(f"could not list Elice machines: {exc}") from None
+        listed = [m for m in listed if m.get("id")]
+        if not listed:
+            print("Elice lists no machine; letify creates one on first use.")
+        elif answers.interactive:
+            machine = choose_machine(listed)
+
+    options: dict[str, Any] = {"kind": answers.kind, "zone_id": zone}
+    if machine:
+        options["machine_id"] = machine
+    price_type = answers.get("price_type")
+    if price_type:
+        options["price_type"] = price_type
+    if endpoint != elice.DEFAULT_ENDPOINT:
         options["endpoint"] = endpoint
+    short_name = answers.get("organization")
+    if not (isinstance(short_name, str) and short_name):
+        try:
+            organization = elice.eci(binary, ["org", "info"], env)
+        except LetifyError:
+            organization = None
+        if isinstance(organization, dict):
+            short_name = organization.get("name_short") or organization.get("nameShort")
+    if isinstance(short_name, str) and short_name:
+        options["organization"] = short_name
+    billing = ask(
+        answers, "billing_endpoint", "Elice billing API base URL (blank to skip): ", required=False
+    )
+    if billing:
+        options["billing_endpoint"] = billing
+    key_path = str(answers.get("key") or DEFAULT_KEY)
+    ensure_key(key_path)
+    options["key"] = key_path
     record_workspace(answers, options)
+    store_secret(answers.alias, "access_token", token)
     return options
+
+
+def choose_machine(listed: list[dict[str, Any]]) -> str | None:
+    """A listed machine's id picked by number, or None for the last choice, create one."""
+    for number, item in enumerate(listed, start=1):
+        print(f"{number}. {item.get('name') or item['id']} ({item['id']})")
+    last = len(listed) + 1
+    print(f"{last}. {CREATE_MACHINE}")
+    prompt = f"Elice machine [1-{last}]: "
+    while True:
+        answer = read_line(prompt)
+        if answer.isdigit() and 1 <= int(answer) <= last:
+            return None if int(answer) == last else str(listed[int(answer) - 1]["id"])
+        print(f"Enter a number from 1 to {last}.")
+
+
+def choose(
+    answers: Answers, name: str, noun: str, fetch: Callable[[], list[dict[str, Any]]]
+) -> str:
+    """A given id, or one picked by number from what the API lists."""
+    value = answers.get(name)
+    if isinstance(value, str) and value:
+        return value
+    if not answers.interactive:
+        raise LoginError(
+            f"{answers.alias} needs {name!r}. Pass --{name.replace('_', '-')} or drop "
+            f"--no-input so it can be chosen."
+        )
+    found = [item for item in fetch() if item.get("id")]
+    if not found:
+        raise LoginError(f"Elice lists no {noun} for this token, so there is nothing to choose.")
+    for number, item in enumerate(found, start=1):
+        print(f"{number}. {item.get('name') or item['id']} ({item['id']})")
+    prompt = f"Elice {noun} [1-{len(found)}]: "
+    while True:
+        answer = read_line(prompt)
+        if not answer and len(found) == 1:
+            return str(found[0]["id"])
+        if answer.isdigit() and 1 <= int(answer) <= len(found):
+            return str(found[int(answer) - 1]["id"])
+        print(f"Enter a number from 1 to {len(found)}.")
 
 
 def modal_account(answers: Answers) -> dict[str, Any]:
@@ -633,6 +740,68 @@ def colab_account(answers: Answers) -> dict[str, Any]:
     )
     if result.returncode != 0:
         raise LoginError(f"the Colab sign in exited {result.returncode}, so nothing was written")
+    # The rendezvous installs this key's public half on each runtime, which is what lets
+    # tcp_punch log in. An existing key is reused, never regenerated.
+    key_path = str(answers.get("key") or DEFAULT_KEY)
+    ensure_key(key_path)
+    options["key"] = key_path
+    return options
+
+
+#: The cookie file and the prompt for it. The cookie is the whole Kaggle credential.
+KAGGLE_COOKIE = "cookie"
+KAGGLE_COOKIE_PROMPT = "Kaggle cookie (from a logged-in kaggle.com tab): "
+
+
+def read_kaggle_cookie(answers: Answers, given: str | None) -> str:
+    """Return the cookie string, from the value given, a file it names, or a prompt."""
+    text = (given or "").strip()
+    if not text and answers.interactive:
+        text = read_password(KAGGLE_COOKIE_PROMPT).strip()
+    if not text:
+        raise LoginError(
+            f"{answers.alias} needs the Kaggle cookie of a logged-in kaggle.com tab. "
+            f"Copy it from the browser, then pass --cookie or drop --no-input."
+        )
+    candidate = Path(text).expanduser()
+    if len(text) < 4096 and "=" not in text and candidate.is_file():
+        try:
+            text = candidate.read_text(encoding="utf-8").strip()
+        except OSError as exc:
+            raise LoginError(f"{answers.alias}: {candidate} could not be read: {exc}") from None
+    return text
+
+
+def kaggle_account(answers: Answers) -> dict[str, Any]:
+    """Store the browser session cookie and prove it names a live login.
+
+    The cookie is the whole account: only the web session principal can mint the Jupyter
+    proxy token, so an API key is useless here. The cookie is checked for shape and expiry
+    before any network call, then proven with a read of the account. Nothing is written
+    until the check passes.
+    """
+    from ..providers import kaggle as kg
+
+    given = answers.get(KAGGLE_COOKIE) or answers.token
+    cookie = read_kaggle_cookie(answers, given if isinstance(given, str) else None)
+    try:
+        kg.require_cookie_shape(cookie)
+        expiry = kg.cookie_expiry(cookie)
+    except ValueError as exc:
+        raise LoginError(f"{answers.alias}: {exc}") from None
+    if kg.cookie_days_left(cookie) <= 0:
+        raise LoginError(
+            f"{answers.alias}: that Kaggle cookie expired on {expiry:%Y-%m-%d}; log in to "
+            f"kaggle.com again and copy a fresh cookie"
+        )
+    try:
+        kg.verify_cookie(cookie)
+    except ValueError as exc:
+        raise LoginError(f"{answers.alias}: {exc}") from None
+
+    options: dict[str, Any] = {"kind": answers.kind}
+    record_workspace(answers, options)
+    store_secret(answers.alias, KAGGLE_COOKIE, cookie)
     return options
 
 
@@ -646,13 +815,19 @@ def tunnel_account(answers: Answers) -> dict[str, Any]:
     Every SSH command runs with ``ProxyCommand=tailcat <address> <agent port>``, and the
     account is written with no address. A failure at any step names the step.
     """
+    from ..install import InstallError, ensure
     from ..transport import setup
 
     def failed(step: str, reason: object) -> LoginError:
         return LoginError(f"tunnel login failed at {step}: {reason}")
 
-    if not setup.tailcat_on_path():
-        raise failed("tailcat", setup.tailcat_install_instructions())
+    try:
+        tailcat = ensure(
+            "tailcat",
+            instructions=setup.tailcat_install_instructions(),
+        )
+    except InstallError as exc:
+        raise failed("tailcat", exc) from None
 
     token = answers.get("connect")
     if not (isinstance(token, str) and token):
@@ -669,7 +844,7 @@ def tunnel_account(answers: Answers) -> dict[str, Any]:
 
     address = str(fields["tailcat"])
     agent_port = int(fields["tailcat_port"])
-    proxy = f"tailcat {address} {agent_port}"
+    proxy = f"{tailcat} {address} {agent_port}"
     user = fields.get("user") or answers.get("user")
     port = int(fields.get("port") or answers.get("port") or 22)
     key_path = str(answers.get("key") or DEFAULT_KEY)
@@ -721,6 +896,7 @@ FLOWS = {
     "elice": elice_account,
     "colab": colab_account,
     "modal": modal_account,
+    "kaggle": kaggle_account,
 }
 
 
@@ -786,6 +962,8 @@ def log_in(answers: Answers, *, project: str | Path | None = None) -> tuple[bool
         devices = options.pop("devices", None)
         writer.update(home, answers.alias, options, private=True)
     else:
+        add_colab_key(answers, existing, home)
+        existing = home.read_text(encoding="utf-8")
         if answers.get("workspace"):
             change_workspace(answers, existing, home)
         if answers.get("detect_devices"):
@@ -807,6 +985,18 @@ def log_in(answers: Answers, *, project: str | Path | None = None) -> tuple[bool
 
 def devices_table(alias: str) -> str:
     return f"{alias}.devices"
+
+
+def add_colab_key(answers: Answers, text: str, home: Path) -> None:
+    """Give an already declared Colab account with no key the key the rendezvous needs."""
+    entry = tomllib.loads(text).get(answers.alias, {})
+    if entry.get("kind", answers.kind) != "colab" or entry.get("key"):
+        return
+    key_path = str(answers.get("key") or DEFAULT_KEY)
+    ensure_key(key_path)
+    body = {key: value for key, value in entry.items() if key != "devices"}
+    body["key"] = key_path
+    writer.update(home, answers.alias, body, private=True)
 
 
 def change_workspace(answers: Answers, text: str, home: Path) -> None:

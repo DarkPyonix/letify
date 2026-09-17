@@ -122,6 +122,60 @@ The arithmetic: 50,000 images at 100 ms each is over an hour of pure input and o
 
 Drive is a fine warehouse. It is not a working disk. If you already keep data there, pull one archive at session start rather than reading from it during training.
 
+## Data your call reads
+
+Use `pathlib.Path` for local data, and letify sends it with the call. A `Path` argument, a `Path` default, or a `Path` in a global or closure the function reads is detected while the call is pickled. The body receives a `Path` on the runtime with the same file names and directory layout.
+
+```python
+DATA = Path("data/corpus")
+
+@let.function(device=lab.A100, host=letify.remote)
+def train(lr):
+    files = sorted(DATA.rglob("*.bin"))   # a directory on the runtime
+```
+
+What is detected: a file, a directory or a path that does not exist yet, under the project root, the nearest directory with a `pyproject.toml`, or under a directory listed in `[tool.letify] data_roots`. A path outside those roots and the project root itself stay plain paths. `.git`, `.venv` and `__pycache__` inside a directory are skipped.
+
+Each file is hashed once and remembered by size, modification time and inode in `~/.cache/letify/digests.json`, so an unchanged dataset is not read again. Where the bytes come from depends on the account:
+
+| Account | First session | Later sessions |
+|---|---|---|
+| persistent (`persistent = true`, Modal, local) | missing files over the link | nothing uploaded; the runtime's disk holds them |
+| ephemeral with `bucket = "<name>"` | missing files to the bucket, then the runtime downloads them | nothing uploaded; the runtime downloads from the bucket |
+| ephemeral without `bucket` | every file over the link | every file over the link again |
+
+A changed file is sent again on its own; the rest is not. Each call that carries data prints one line, for example `letify: data 1024 files 1024.0 MiB detected, 0 files 0.0 MiB already on the runtime, sent 512 files 512.0 MiB before the call in 5.9 s, 512 files 512.0 MiB during it in 5.8 s (88.1 MiB/s), first access waited 0.0 s`.
+
+The call starts as soon as the first wave of its data is on the runtime, and the rest arrives while the call runs. The first wave is the leading 512 MiB or 256 files of a send order letify derives from the pickled call: a `Dataset` or a path list in the arguments gives the order directly, a `DataLoader`'s sampler gives the shuffled epoch order, and the reads in the function's code order what those do not name. Everything else follows in manifest order. Set the limits with `data_first_wave_mib` and `data_first_wave_files` on the account, or name the order yourself with `@let.function(data_order=..., data_first_wave=...)`, which outranks the analysis.
+
+After the call starts the order comes from the runtime watching the real reads: a wrapped `DataLoader` reads its sampler 64 batches ahead, `Dataset.__getitem__` reports the item it is asked for, and `open` reports what a sequential pass touches. `data_observe = false` on the account turns all three off.
+
+The body never sees a half written file. Directory listings and `Path.stat()` are answered from the manifest before the bytes arrive, so `iterdir` and `glob` are complete from the first step, and only opening a file that has not arrived waits. A wait means the predicted order was wrong, and letify says so: `letify: data waited for 3 files 12.0 MiB not sent in time, 1.4 s total, first 0042.bin`. A blob that never arrives fails that read after `data_wait_timeout` seconds, 600 by default.
+
+The runtime keeps these files under `<workspace root>/data/blobs` within a budget: 50 GiB or half of the disk space the cache could use, whichever is smaller, or `data_cache_gib = <GiB>` on the account. After a call that sent or wrote back new files, the least recently used files no running call uses are removed, and one line reports it, for example `letify: data cache evicted 120 files 4096.0 MiB in 0.1 s, 51200.0 MiB of 50.0 GiB in use`. A file used in the last 10 minutes is never removed, so the cache can stay over the budget for a while.
+
+`letify cache` shows the size of each persistent provider's runtime cache and prunes `~/.cache/letify/digests.json` of files that no longer exist. `letify cache clear <alias>` empties one provider's runtime cache. Ephemeral providers are listed as not kept between sessions.
+### Files the call writes
+
+A directory and a path that does not exist yet are output locations. When the call returns, every file the body created or changed there is copied to the same relative path on the local disk.
+
+```python
+RUN = Path("runs/exp1")
+
+@let.function(device=lab.A100, host=letify.remote)
+def train(epochs):
+    RUN.mkdir(parents=True, exist_ok=True)
+    torch.save(model.state_dict(), RUN / "model.pt")   # local runs/exp1/model.pt after the call
+```
+
+- A file whose contents did not change is not sent. A second call that only changes the logs receives only the logs.
+- A call that raised writes nothing back.
+- A file the body deleted on the runtime is not deleted locally.
+- Calls writing the same local path at the same time are applied one after the other, and for the same file the call that returned last wins. A file is never half from one call and half from another.
+- Files inside a directory are placed on the runtime as writable copies, so the body may overwrite an existing file.
+
+Each such call prints one more line, for example `letify: data wrote back 3 files 512.1 MiB in 2.4 s (213.4 MiB/s), 0 files 0.0 MiB already on the client`.
+
 ## Data that is too big to move
 
 Three options, in the order worth trying.

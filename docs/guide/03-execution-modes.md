@@ -68,6 +68,10 @@ Function shipping is about 99% at every one of those round trips, and hundreds o
 | Loss or gradient norm logging | every logging step | `.item()` |
 | Gradient scaler | every step under fp16 | checks for infinities |
 
+A read does not have to be a synchronization. `loss.detach().to("cpu", non_blocking=True)` returns a CPU tensor at once and the loop keeps going, and the value is waited for only where it is used, for example when it is printed a step later. In `async def` code, `await letify.fetch(loss)` does the same without blocking the event loop.
+
+You do not have to write either of those for a logged number. Under `host="local"`, `loss.item()` already returns a deferred value: the read is queued and the loop keeps going, and the value is waited for where it is used, such as in the `print` a step later. `tolist()`, `float(tensor)` and `int(tensor)` work the same way. `bool(tensor)` still waits, because control flow needs the value at once. The value a call returns is always a real `float`, `int` or `list`. Put `auto_fetch = false` in the account entry, or `LETIFY_AUTO_FETCH=0` in the environment, to turn this off. At the end of a call letify prints how many reads it deferred and how many had to wait, so a loop that gains nothing from it is visible.
+
 Other things that force a synchronization: `nonzero()`, boolean mask indexing, `unique()`, and mixture of experts routing, which reads per-expert token counts back to the host. Any operation whose output shape the host has to know is a synchronization.
 
 ### Measure it instead of guessing
@@ -96,6 +100,29 @@ Forwarding is not inherently 53%. That is 53% **with default settings**. Three c
 Turning off the NaN filter alone stops at 92%, because the mask check remains.
 
 This is tuning on your training code, which is why letify does not do it for you and why shipping stays the default.
+
+## Per-step data under `host="local"`
+
+Under `host="local"` the data stays on your machine, so every batch crosses the network to the GPU. A link carries only so many bytes per second, and letify cannot change that. Two parallel streams over ssh from a university client to lab_docker carried 101 MiB/s in total, and one carried 91 MiB/s. When the batches are large, that transfer, not the GPU, sets the step time.
+
+Send the smallest form of the batch, and do the rest of the preprocessing on the GPU. For images, that means the decoded `uint8` pixels rather than normalized `float32`, which is 4 times fewer bytes:
+
+```python
+class Images(torch.utils.data.Dataset):
+    def __getitem__(self, i):
+        return decode(i), label(i)            # uint8, 3 x H x W, no ToTensor() or Normalize()
+
+mean = torch.tensor([0.485, 0.456, 0.406], device="cuda").view(1, 3, 1, 1)
+std = torch.tensor([0.229, 0.224, 0.225], device="cuda").view(1, 3, 1, 1)
+
+for images, labels in loader:
+    images = images.cuda(non_blocking=True).float().div_(255).sub_(mean).div_(std)
+    labels = labels.cuda(non_blocking=True)
+```
+
+Measured on ResNet-50, bf16, against training directly on the same RTX PRO 5000: at batch 64, `float32` batches run at 13% of direct speed and `uint8` batches at 52%. At batch 256 it is 14% and 52%. The losses are identical to direct training in both cases, because the same normalization runs on the same GPU. `pin_memory=True` does not apply under `host="local"`: this process has no CUDA to pin with, and letify copies the batch before sending it anyway.
+
+When even `uint8` batches are too large for the link, the data belongs next to the GPU. Use `host="remote"` with the dataset in a volume on the runtime.
 
 ## How the default is chosen
 

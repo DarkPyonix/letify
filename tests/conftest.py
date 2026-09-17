@@ -13,8 +13,10 @@ what a caller observes instead of on which method was called.
 from __future__ import annotations
 
 import base64
+import contextlib
 import json
 import os
+import socket
 import subprocess
 import sys
 from dataclasses import dataclass, field
@@ -76,16 +78,21 @@ def launcher_from(config_file):
 
 @pytest.fixture
 def isolated_home(monkeypatch, tmp_path: Path) -> Path:
-    """Point Path.home and the working directory at empty directories.
+    """Point Path.home, "~" expansion and the working directory at empty directories.
 
     The command line entry point reads ~/.letify and ./.letify, so a test that goes
-    through it has to be moved off the developer's own files.
+    through it has to be moved off the developer's own files. HOME is set as well as
+    Path.home, because Path.expanduser reads the environment rather than Path.home, and
+    login expands the default key path "~/.ssh/id_letify". Without it a test would see
+    the developer's own key and behave differently on a machine that has none.
     """
     home = tmp_path / "home"
     (home / ".letify").mkdir(parents=True)
     project = tmp_path / "project"
     (project / ".letify").mkdir(parents=True)
     monkeypatch.setattr(Path, "home", classmethod(lambda cls: home))
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("USERPROFILE", str(home))
     monkeypatch.chdir(project)
     return project
 
@@ -114,7 +121,7 @@ class PreparingLocal(Local):
     exercised over a real worker instead of needing a remote machine.
     """
 
-    prepares_env = True
+    remote_env = True
 
 
 @pytest.fixture
@@ -211,6 +218,20 @@ def patch_run(monkeypatch):
 def no_uv_variable(monkeypatch):
     """`uv run pytest` sets UV, which would let the real uv answer where tests patch PATH."""
     monkeypatch.delenv("UV", raising=False)
+
+
+@pytest.fixture(autouse=True)
+def no_project_environment(monkeypatch):
+    """Hide the virtual environment the suite runs in from the tool lookup.
+
+    Spec "Installing external tools" links tools into the project environment, which for
+    the suite would be the repository's own .venv. A test that needs one creates it.
+    """
+    from letify import install
+
+    monkeypatch.setattr(install, "project_environment", lambda: None)
+    # Automatic install would reach GitHub; a test that installs serves a release locally.
+    monkeypatch.setenv("LETIFY_AUTO_INSTALL", "0")
 
 
 @pytest.fixture
@@ -417,8 +438,10 @@ class FakeEliceServer:
                 "method": method,
                 "path": path,
                 "params": dict(urllib.parse.parse_qsl(parsed.query)) or None,
-                "json": json.loads(body) if body else None,
+                "json": _json_or_none(body),
+                "form": dict(urllib.parse.parse_qsl(body.decode(errors="replace"))) or None,
                 "authorization": handler.headers.get("Authorization"),
+                "org": handler.headers.get("x-elice-org-name-short"),
             }
         )
         response = self.responses.get((method, path), self.default)
@@ -433,8 +456,226 @@ class FakeEliceServer:
         handler.wfile.write(payload)
 
 
+def _json_or_none(body: bytes) -> Any:
+    """A request body decoded as JSON, or None when it is empty or form encoded."""
+    import json
+
+    if not body:
+        return None
+    try:
+        return json.loads(body)
+    except ValueError:
+        return None
+
+
 @pytest.fixture
 def fake_elice():
+    server = FakeEliceServer()
+    yield server
+    server.close()
+
+
+#: The stand-in for Elice's ``eci`` binary. It answers from a JSON state file and appends
+#: every call, with its arguments and the ECI_* variables it saw, to that file.
+FAKE_ECI_SOURCE = r"""
+import json, os, sys
+
+path = os.environ["FAKE_ECI_STATE"]
+with open(path, encoding="utf-8") as handle:
+    state = json.load(handle)
+argv = sys.argv[1:]
+state["calls"].append(
+    {"argv": argv, "env": {k: v for k, v in os.environ.items() if k.startswith("ECI_")}}
+)
+
+def save():
+    with open(path, "w", encoding="utf-8") as handle:
+        json.dump(state, handle)
+
+def done(body=None, code=0, err=""):
+    save()
+    if body is not None:
+        print(json.dumps(body))
+    if err:
+        print(err, file=sys.stderr)
+    sys.exit(code)
+
+def flag(name):
+    return argv[argv.index(name) + 1] if name in argv else None
+
+words = [a for a in argv if not a.startswith("--")]
+joined = " ".join(words)
+for prefix, failure in state.get("fail", {}).items():
+    if joined.startswith(prefix):
+        done(code=failure.get("code", 1), err=failure.get("stderr", "failed"))
+if os.environ.get("ECI_API_TOKEN") != state["token"]:
+    done(code=1, err="Error: 401 Unauthorized: invalid token")
+
+def vm(name):
+    return next((v for v in state["vms"] if name in (v["name"], v["id"])), None)
+
+if joined.startswith("config verify"):
+    done(code=0)
+if joined.startswith("zone list"):
+    done(state["zones"])
+if joined.startswith("instance-type list"):
+    if "--activated" in argv:
+        done(code=2, err="Error: No such option: --activated")
+    done(state["instance_types"])
+if joined.startswith("pricing list"):
+    done(state["pricing"])
+if joined.startswith("org info"):
+    done(state["org"])
+if joined.startswith("compute vm list"):
+    done(state["vms"])
+if joined.startswith("compute vm get"):
+    found = vm(words[3])
+    queued = state.get("transitions", {}).get(words[3])
+    if found and queued:
+        found["status"] = queued.pop(0)
+    done(found) if found else done(code=1, err=f"Error: virtual machine {words[3]} not found")
+if joined.startswith("compute vm launch"):
+    number = len(state["vms"]) + 1
+    record = {
+        "id": f"vm-{number}",
+        "name": flag("--name"),
+        "status": "started",
+        "instance_type": flag("--instance-type"),
+        "pricing_type": flag("--price-type") or "ondemand",
+        "public_ip": f"203.0.113.{number}",
+    }
+    state["vms"].append(record)
+    done(record)
+if joined.startswith("compute vm start"):
+    vm(words[3])["status"] = "started"
+    done({})
+if joined.startswith("compute vm stop"):
+    vm(words[3])["status"] = "idle"
+    done({})
+if joined.startswith("compute vm delete"):
+    if "--cascade" not in argv or "-y" not in argv:
+        done(code=1, err="aborted: stdin is not a TTY")
+    state["vms"] = [v for v in state["vms"] if v["name"] != words[3]]
+    done({"status": "deleted"})
+done(code=2, err=f"fake eci does not know: {joined}")
+"""
+
+
+class FakeEci:
+    """Elice's ``eci`` command on PATH, answering from a state a test sets.
+
+    A real executable, so the subprocess call, the environment letify builds and the JSON
+    it parses are all exercised. Only the service behind the command is faked.
+    """
+
+    def __init__(self, directory: Path) -> None:
+        self.directory = directory
+        self.state_path = directory / "state.json"
+        binary = directory / "eci"
+        binary.write_text(f"#!{sys.executable}\n{FAKE_ECI_SOURCE}", encoding="utf-8")
+        binary.chmod(0o755)
+        self.write(
+            {
+                "token": "token-1",
+                "zones": [{"id": "zone-1", "name": "central-01-a"}],
+                "vms": [],
+                "instance_types": [
+                    {"id": "it-cpu", "name": "C-4", "cpu_vcore": 4, "devices": []},
+                    {"id": "it-cpu-small", "name": "C-2", "cpu_vcore": 2, "devices": []},
+                    {
+                        "id": "it-a100",
+                        "name": "G-A100-1",
+                        "cpu_vcore": 16,
+                        "devices": ["nvidia_a100_80gb_pcie"],
+                        "activated": True,
+                    },
+                    {
+                        "id": "it-a100x2",
+                        "name": "G-A100-2",
+                        "cpu_vcore": 32,
+                        "devices": ["nvidia_a100_80gb_pcie", "nvidia_a100_80gb_pcie"],
+                        "activated": True,
+                    },
+                    {
+                        "id": "it-h100-retired",
+                        "name": "G-NHHS-80-OLD",
+                        "cpu_vcore": 24,
+                        "devices": ["nvidia_h100_80gb_sxm"],
+                        "activated": False,
+                    },
+                ],
+                "pricing": [
+                    {"name": "G-A100-1", "pricing_type": "ondemand", "price_per_hour": "2500"},
+                    {"name": "G-A100-1", "pricing_type": "spot", "price_per_hour": "900"},
+                ],
+                "org": {"name_short": "lab", "resource_quota": {"compute": {"devices": 8}}},
+                "fail": {},
+                "calls": [],
+            }
+        )
+
+    def read(self) -> dict[str, Any]:
+        return json.loads(self.state_path.read_text(encoding="utf-8"))
+
+    def write(self, state: dict[str, Any]) -> None:
+        self.state_path.write_text(json.dumps(state), encoding="utf-8")
+
+    def set(self, **values: Any) -> None:
+        state = self.read()
+        state.update(values)
+        self.write(state)
+
+    def machine(self, name: str, **fields: Any) -> None:
+        """Change one listed machine, as Elice would behind letify's back."""
+        state = self.read()
+        for record in state["vms"]:
+            if record["name"] == name:
+                record.update(fields)
+        self.write(state)
+
+    def remove(self, name: str) -> None:
+        state = self.read()
+        state["vms"] = [record for record in state["vms"] if record["name"] != name]
+        self.write(state)
+
+    @property
+    def calls(self) -> list[dict[str, Any]]:
+        return self.read()["calls"]
+
+    def commands(self) -> list[str]:
+        """Each call's words, without flags or their values, joined by spaces."""
+        switches = {"--wait", "--no-spec"}
+        found = []
+        for call in self.calls:
+            words, skip = [], False
+            for arg in call["argv"]:
+                if skip:
+                    skip = False
+                elif arg.startswith("--"):
+                    skip = arg not in switches
+                else:
+                    words.append(arg)
+            found.append(" ".join(words))
+        return found
+
+
+@pytest.fixture
+def fake_eci(tmp_path: Path, monkeypatch) -> FakeEci:
+    directory = tmp_path / "fake-eci-bin"
+    directory.mkdir()
+    fake = FakeEci(directory)
+    monkeypatch.setenv("FAKE_ECI_STATE", str(fake.state_path))
+    monkeypatch.setenv("PATH", f"{directory}{os.pathsep}{os.environ.get('PATH', '')}")
+    return fake
+
+
+@pytest.fixture
+def fake_google():
+    """Google's OAuth token endpoint and Colab's ``ccu-info`` on loopback.
+
+    The same recording server as the Elice stand-in, because both are plain HTTP answered
+    from a table. Paths are below ``/api``.
+    """
     server = FakeEliceServer()
     yield server
     server.close()
@@ -470,11 +711,146 @@ class FakeModalAdapter:
             return []
         return [json.loads(line) for line in log.read_text(encoding="utf-8").splitlines()]
 
+    def sandbox_pids(self) -> list[int]:
+        """The local process id behind each sandbox the stand-in started, in order."""
+        log = self.state / "sandboxes.jsonl"
+        if not log.is_file():
+            return []
+        return [json.loads(line)[1] for line in log.read_text(encoding="utf-8").splitlines()]
+
+    @staticmethod
+    def alive(pid: int) -> bool:
+        """Whether a sandbox process still runs. A zombie waiting to be reaped has ended."""
+        try:
+            stat = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
+        except OSError:
+            return False
+        return stat.rsplit(")", 1)[1].split()[0] != "Z"
+
     def fail(self, *ops: str) -> None:
         self._monkeypatch.setenv("FAKE_MODAL_FAIL", ",".join(ops))
 
     def exit_on(self, *ops: str) -> None:
         self._monkeypatch.setenv("FAKE_MODAL_EXIT", ",".join(ops))
+
+    def tunnel_to(self, host: str, port: int, *, tls: bool) -> None:
+        """Answer ``tunnel`` with this address instead of the sandbox's own port."""
+        self._monkeypatch.setenv(
+            "FAKE_MODAL_TUNNEL", json.dumps({"host": host, "port": port, "tls": tls})
+        )
+
+
+class TlsProxy:
+    """A local TLS-terminating proxy, as a Modal encrypted port is, in front of a plain port.
+
+    One thread relays each connection with non-blocking sockets, so the proxy never uses its
+    own TLS object from two threads.
+    """
+
+    def __init__(self, cert: Path, key: Path):
+        import ssl
+
+        self.cert = cert
+        self._server_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        self._server_context.load_cert_chain(str(cert), str(key))
+        #: A client context that trusts the proxy's certificate for the name ``localhost``.
+        self.context = ssl.create_default_context(cafile=str(cert))
+
+    def start(self, target_port: int) -> int:
+        """Listen on a free port, relaying each connection to ``target_port``, and return it."""
+        import threading
+
+        server = socket.socket()
+        server.bind(("127.0.0.1", 0))
+        server.listen(8)
+        threading.Thread(target=self._accept, args=(server, target_port), daemon=True).start()
+        return server.getsockname()[1]
+
+    def _accept(self, server: socket.socket, target_port: int) -> None:
+        import threading
+
+        while True:
+            try:
+                raw, _ = server.accept()
+                tls = self._server_context.wrap_socket(raw, server_side=True)
+                upstream = socket.create_connection(("127.0.0.1", target_port))
+            except OSError:
+                continue
+            threading.Thread(target=_relay, args=(tls, upstream), daemon=True).start()
+
+
+def _relay(tls: Any, upstream: socket.socket) -> None:
+    import selectors
+    import ssl
+
+    selector = selectors.DefaultSelector()
+    tls.setblocking(False)
+    upstream.setblocking(False)
+    selector.register(tls, selectors.EVENT_READ)
+    selector.register(upstream, selectors.EVENT_READ)
+    to_upstream = bytearray()
+    to_tls = bytearray()
+    try:
+        while True:
+            for key, _ in selector.select(0.01):
+                sock = key.fileobj
+                try:
+                    data = sock.recv(1 << 16)
+                except (ssl.SSLWantReadError, ssl.SSLWantWriteError, BlockingIOError):
+                    continue
+                if not data:
+                    return
+                (to_upstream if sock is tls else to_tls).extend(data)
+            while tls.pending():
+                to_upstream.extend(tls.recv(tls.pending()))
+            for buffer, sock in ((to_upstream, upstream), (to_tls, tls)):
+                while buffer:
+                    try:
+                        sent = sock.send(buffer[: 1 << 16])
+                    except (ssl.SSLWantReadError, ssl.SSLWantWriteError, BlockingIOError):
+                        break
+                    del buffer[:sent]
+    except OSError:
+        return
+    finally:
+        for sock in (tls, upstream):
+            with contextlib.suppress(OSError):
+                sock.close()
+
+
+@pytest.fixture
+def tls_proxy(tmp_path: Path) -> TlsProxy:
+    """A TLS proxy with a certificate made for this test only, never stored in the repository."""
+    import shutil
+    import subprocess
+
+    openssl = shutil.which("openssl")
+    if openssl is None:
+        pytest.skip("openssl is needed to make a test certificate")
+    cert, key = tmp_path / "cert.pem", tmp_path / "key.pem"
+    subprocess.run(
+        [
+            openssl,
+            "req",
+            "-x509",
+            "-newkey",
+            "rsa:2048",
+            "-nodes",
+            "-days",
+            "1",
+            "-subj",
+            "/CN=localhost",
+            "-addext",
+            "subjectAltName=DNS:localhost",
+            "-keyout",
+            str(key),
+            "-out",
+            str(cert),
+        ],
+        check=True,
+        capture_output=True,
+    )
+    return TlsProxy(cert, key)
 
 
 @pytest.fixture
@@ -492,6 +868,12 @@ def fake_modal(monkeypatch, tmp_path: Path) -> FakeModalAdapter:
     monkeypatch.setattr(
         tools, "modal_adapter_command", lambda uv: [sys.executable, str(FAKE_MODAL_ADAPTER)]
     )
+    from letify.providers import modal as modal_module
+
+    # The stand-in sandbox is a local process, so its data port is one free on this machine.
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", 0))
+        monkeypatch.setattr(modal_module, "DATA_PORT", probe.getsockname()[1])
     return FakeModalAdapter(monkeypatch, state)
 
 
@@ -876,7 +1258,10 @@ class FakeStrategy:
         unmet: str | None = None,
         probe_error: bool = False,
         probed: bool = True,
+        cancellable: bool = False,
     ):
+        import threading
+
         self.name = name
         self.probed = probed
         self.rank = rank
@@ -885,6 +1270,11 @@ class FakeStrategy:
         self.error = error
         self.unmet = unmet
         self.probe_error = probe_error
+        #: Whether the delay ends early when the pipeline sets the attempt's cancel event.
+        self.cancellable = cancellable
+        self.cancelled = False
+        #: Set when an attempt returns or raises.
+        self.ended = threading.Event()
         self.attempts = 0
         self.assumed = 0
         self.links: list[FakeLink] = []
@@ -897,14 +1287,24 @@ class FakeStrategy:
         self.links.append(link)
         return link
 
-    def attempt(self, target: Any) -> FakeLink:
+    def attempt(self, target: Any, cancel: Any = None) -> FakeLink:
         import time
 
+        from letify.transport import nat
+
         self.attempts += 1
-        time.sleep(self.delay)
-        if self.error:
-            raise OSError(self.error)
-        return self._link()
+        try:
+            if self.cancellable and cancel is not None:
+                if cancel.wait(self.delay):
+                    self.cancelled = True
+                    raise nat.Cancelled(f"{self.name} was cancelled")
+            else:
+                time.sleep(self.delay)
+            if self.error:
+                raise OSError(self.error)
+            return self._link()
+        finally:
+            self.ended.set()
 
     def assume(self, target: Any) -> FakeLink:
         self.assumed += 1
@@ -995,3 +1395,241 @@ def patch_popen(monkeypatch):
         return started
 
     return patch
+
+
+
+
+# -- a Kaggle session, and the cloud that hands out its URL ---------------------
+
+
+def kaggle_test_cookie(exp_iso: str = "2099-01-01T00:00:00Z") -> str:
+    """A cookie of the shape the provider requires, with a far-future expiry."""
+
+    def part(obj: dict) -> str:
+        return base64.urlsafe_b64encode(json.dumps(obj).encode()).decode().rstrip("=")
+
+    header = part({"alg": "none", "typ": "JWT"})
+    client_token = f"{header}.{part({'sub': 'irack000', 'exp': exp_iso})}."
+    jar = {
+        "ka_sessionid": "sid",
+        "XSRF-TOKEN": "xtok",
+        "build-hash": "bh",
+        "CLIENT-TOKEN": client_token,
+    }
+    return "; ".join(f"{name}={value}" for name, value in jar.items())
+
+
+class _Reply:
+    """A minimal stand-in for the object ``urlopen`` returns, with the JSON body."""
+
+    def __init__(self, payload: dict[str, Any]):
+        self._data = json.dumps(payload).encode()
+
+    def read(self) -> bytes:
+        return self._data
+
+    def __enter__(self) -> _Reply:
+        return self
+
+    def __exit__(self, *exc: Any) -> None:
+        return None
+
+
+class FakeKaggleCloud:
+    """Stands in for every live Kaggle service the token chain reaches.
+
+    A loopback HTTP server answers the Jupyter proxy REST, with the session token in the URL
+    path as the real routed URL carries it. Everything else, the internal Kaggle API, the
+    Firebase exchange and Firestore, is answered by a fake ``urlopen`` the provider's one HTTP
+    seam is pointed at. A live account and a GPU are the only things replaced: the token
+    chain, the channel and the worker are the real code.
+
+    ``end_session()`` makes every later proxy request answer 404, as an ended session does.
+    """
+
+    RUN_ID = 350000001
+    NOTEBOOK_ID = 134000001
+
+    def __init__(self, token: str = "kaggle-session-token"):
+        import http.server
+        import re
+        import threading
+        import uuid
+
+        self.token = token
+        self.requests: list[dict[str, Any]] = []
+        self.kernels: set[str] = set()
+        self.cloud_calls: list[tuple[str, dict[str, Any]]] = []
+        self.cancelled: list[int] = []
+        self.ended = False
+        self._lock = threading.Lock()
+        self._uuid = uuid
+        self._route = re.compile(r"^/k/(?P<run>[^/]+)/(?P<token>[^/]+)/proxy(?P<rest>.*)$")
+        owner = self
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def log_message(self, *args: Any) -> None:
+                return None
+
+            def do_GET(self) -> None:
+                owner._handle(self, "GET")
+
+            def do_PUT(self) -> None:
+                owner._handle(self, "PUT")
+
+            def do_POST(self) -> None:
+                owner._handle(self, "POST")
+
+            def do_DELETE(self) -> None:
+                owner._handle(self, "DELETE")
+
+        self._server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self._server.daemon_threads = True
+        self.port = self._server.server_address[1]
+        self.proxy_host = f"http://127.0.0.1:{self.port}"
+        #: The routed URL the Firestore document hands back: token in the path, no query.
+        self.url = f"{self.proxy_host}/k/{self.RUN_ID}/{token}/proxy"
+        threading.Thread(target=self._server.serve_forever, daemon=True).start()
+
+    def close(self) -> None:
+        self._server.shutdown()
+        self._server.server_close()
+
+    def end_session(self) -> None:
+        self.ended = True
+
+    # -- the fake urlopen the provider's HTTP seam is pointed at --
+
+    def urlopen(self, request: Any, timeout: float | None = None) -> Any:
+        import urllib.request as real_urllib
+
+        from letify.providers import kaggle as kaggle_module
+
+        url = request.full_url
+        if url.startswith(self.proxy_host):
+            return real_urllib.urlopen(request, timeout=timeout)
+        if url.startswith(kaggle_module.KAGGLE_INTERNAL):
+            return self._cloud(url[len(kaggle_module.KAGGLE_INTERNAL) :], request)
+        if url.startswith(kaggle_module.IDENTITY_TOOLKIT):
+            return _Reply({"idToken": "fake-id-token", "refreshToken": "fake-refresh"})
+        if url.startswith(kaggle_module.FIRESTORE_BASE):
+            return _Reply({"fields": {"jupyterUrl": {"stringValue": self.url}}})
+        raise AssertionError(f"unexpected URL in the token chain: {url}")
+
+    def _cloud(self, path: str, request: Any) -> _Reply:
+        body = json.loads(request.data) if request.data else {}
+        self.cloud_calls.append((path, body))
+        if path.endswith("CreateKernelWithSettings"):
+            return _Reply({"id": self.NOTEBOOK_ID, "currentUrlSlug": "letify-runtime"})
+        if path.endswith("GetOrCreateKernelSession"):
+            return _Reply({"draft": {"sequence": 1}})
+        if path.endswith("CommitAndRun"):
+            return _Reply({"kernelRunId": self.RUN_ID})
+        if path.endswith("GetFirebaseConfig"):
+            return _Reply({"apiKey": "fake-api-key"})
+        if path.endswith("GetFirebaseAuthToken"):
+            return _Reply({"authToken": "fake-custom-token"})
+        if path.endswith("UpdateUserKernelFirestoreAuth"):
+            return _Reply({"sessionId": f"webtier-{self.RUN_ID}"})
+        if path.endswith("CancelKernelSession"):
+            self.cancelled.append(int(body.get("kernelSessionId")))
+            return _Reply({})
+        if path.endswith("GetAcceleratorQuotaStatistics"):
+            return _Reply(
+                {
+                    "quotaRefreshTime": "2026-09-19T00:00:00Z",
+                    "gpuQuota": {"totalTimeAllowed": "108000s", "timeUsed": "11700s"},
+                    "tpuQuota": {"totalTimeAllowed": "72000s", "timeUsed": "0s"},
+                }
+            )
+        if path.endswith("GetCurrentUser"):
+            return _Reply({"displayName": "IRACK"})
+        raise AssertionError(f"unexpected internal call: {path}")
+
+    # -- the loopback Jupyter proxy --
+
+    def made(self, method: str, prefix: str) -> list[dict[str, Any]]:
+        return [r for r in self.requests if r["method"] == method and r["path"].startswith(prefix)]
+
+    def _handle(self, handler: Any, method: str) -> None:
+        import urllib.parse
+
+        parsed = urllib.parse.urlsplit(handler.path)
+        route = self._route.match(urllib.parse.unquote(parsed.path))
+        length = int(handler.headers.get("Content-Length") or 0)
+        raw = handler.rfile.read(length) if length else b""
+        path = route.group("rest") if route else parsed.path
+        path_token = route.group("token") if route else None
+        with self._lock:
+            self.requests.append(
+                {
+                    "method": method,
+                    "path": path,
+                    "path_token": path_token,
+                    "authorization": handler.headers.get("Authorization"),
+                }
+            )
+
+        def answer(status: int, payload: bytes = b"", extra: dict[str, str] | None = None) -> None:
+            handler.send_response(status)
+            for key, value in (extra or {}).items():
+                handler.send_header(key, value)
+            handler.send_header("Content-Length", str(len(payload)))
+            handler.end_headers()
+            handler.wfile.write(payload)
+
+        if self.ended:
+            return answer(404, b'{"message": "session not found"}')
+        if path_token != self.token:
+            return answer(404, b'{"message": "not found"}')
+        if path == "/api/status" and method == "GET":
+            return answer(200, b'{"started": "2026-09-14T00:00:00Z"}')
+        if path == "/api/kernels" and method == "POST":
+            kernel = self._uuid.uuid4().hex
+            self.kernels.add(kernel)
+            return answer(201, json.dumps({"id": kernel, "name": "python3"}).encode())
+        if path.startswith("/api/kernels/"):
+            kernel = path.rsplit("/", 1)[-1]
+            if kernel not in self.kernels:
+                return answer(404, b'{"message": "no such kernel"}')
+            if method == "DELETE":
+                self.kernels.discard(kernel)
+                return answer(204)
+            return answer(200, json.dumps({"id": kernel}).encode())
+        if path.startswith("/api/contents/"):
+            local = Path("/") / path[len("/api/contents/") :]
+            if method == "PUT":
+                model = json.loads(raw)
+                content = base64.b64decode(model["content"])
+                mode = "ab" if model.get("chunk") not in (None, 1) else "wb"
+                with open(local, mode) as handle:
+                    handle.write(content)
+                return answer(200, json.dumps({"path": str(local), "type": "file"}).encode())
+            if not local.is_file():
+                return answer(404, b'{"message": "no such file"}')
+            model = {"path": str(local), "type": "file", "size": local.stat().st_size}
+            return answer(200, json.dumps(model).encode())
+        return answer(400, b'{"message": "unexpected request"}')
+
+
+@pytest.fixture
+def fake_kaggle(isolated_home, monkeypatch, tmp_path: Path):
+    """A Kaggle account whose whole token chain and session are faked for alias ``kaggle_a``.
+
+    The fake adapter in ``tests/fake_kaggle_adapter.py`` keeps the real adapter's contract and
+    runs the worker in a local interpreter, so the driver programs are the real ones.
+    """
+    from letify.config.secrets import write_secret
+    from letify.providers import kaggle as kaggle_module
+
+    write_secret("kaggle_a", "cookie", kaggle_test_cookie())
+    cloud = FakeKaggleCloud()
+    monkeypatch.setattr(kaggle_module, "urlopen", cloud.urlopen)
+    monkeypatch.setattr(kaggle_module, "JUPYTER_PROXY_HOST", cloud.proxy_host)
+    monkeypatch.setattr(kaggle_module, "SESSION_START_TIMEOUT", 1.0)
+    script = Path(__file__).with_name("fake_kaggle_adapter.py")
+    monkeypatch.setattr(kaggle_module, "adapter_command", lambda: [sys.executable, str(script)])
+    cloud.log = tmp_path / "kaggle-adapter.jsonl"
+    monkeypatch.setenv("FAKE_KAGGLE_LOG", str(cloud.log))
+    yield cloud
+    cloud.close()

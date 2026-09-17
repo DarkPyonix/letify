@@ -269,6 +269,7 @@ Measure your own `k` with `torch.cuda.set_sync_debug_mode("warn")` and your roun
 Provider
 ├── 💻 Local      your machine            persistent
 ├── ☁️  Modal      serverless GPU          persistent
+├── 🏅 Kaggle     Kaggle account          ephemeral, host=remote only
 └── 🐚 Shell      any remote machine      ephemeral by default
     ├── 📓 Colab   via the official CLI
     ├── 🕳️  Tunnel  a machine behind NAT
@@ -283,6 +284,13 @@ Provider
 | 🐚 `Shell` | overridable | lab and university servers |
 | 🕳️ `Tunnel` | overridable | a machine behind NAT you cannot port-forward |
 | 🇰🇷 `Elice` | persistent | Korean GPU cloud, per-second billing |
+| 🏅 `Kaggle` | ephemeral | free weekly GPU hours, `host=letify.remote` only |
+
+**Kaggle.** Make an API token at kaggle.com under Settings, API, then run `letify login kaggle kaggle_a`. The token is asked for without echo, and a `kaggle.json` path works too. letify keeps it in `~/.letify/accounts/kaggle_a/` and checks it with a read-only `kaggle quota` call. `letify usage kaggle_a` prints the GPU hours left this week. A Kaggle declaration must say `host=letify.remote`: Kaggle forbids tunnels, so `host=letify.local` is a type error and raises when the decorator runs.
+
+One more step, and it is the only part of Kaggle that needs a person: start a session in the Kaggle editor with Run, Kaggle Jupyter Server, copy its Colab Compatible URL, and run `letify login kaggle kaggle_a --connect '<URL>'`. That URL exists only in the editor. Kaggle's API can start and stop a session, but it returns no address for one, and the proxy that fronts a session accepts only the token the editor issues. A call on an account without one is refused and tells you this.
+
+After that, Kaggle is like any other provider: letify builds your declared environment on the session with `uv sync`, enters a workspace root, ships files, and checks the worker's interpreter. It records the session's GPUs and runs calls there until Kaggle ends the session, after 20 minutes idle or 12 hours. Then it raises an error telling you to register a new URL, and it never keeps a session alive.
 
 **letify finds the fastest way in.** For any `Shell`, letify tries several ways to reach the machine at once and keeps the fastest one that works:
 
@@ -354,6 +362,18 @@ def train(lr): ...
 ```
 
 The runtime pulls the volume straight from the bucket, not through your machine. It uses a short-lived token borrowed from your own login, so no credential is left on the remote side.
+
+Training data needs no declaration at all. Pass a `pathlib.Path`, or read one from a global, and letify sends the files it names as content addressed blobs. The body receives a path on the runtime with the same layout. A persistent machine keeps the blobs on its own disk, so the second session uploads 0 bytes. An ephemeral account with `bucket = "<name>"` uploads each file to the bucket once, and every later runtime downloads it from there. The runtime's copy is kept within a budget, 50 GiB by default or `data_cache_gib` on the account, and `letify cache` shows or clears it. The call does not wait for the dataset: letify derives the read order from the call itself, sends only the first wave of that order before the call, and keeps sending the rest while the call runs, reordered by what the runtime observes the body reading. Listings and file sizes are answered from the manifest from the first step, so only reading a file that has not arrived waits.
+
+Results come back the same way. A `Path` that does not exist yet, or a directory, is also an output location: what the body creates or changes there is copied to the local path when the call returns, and a file the local copy already matches is not sent. So checkpoints and logs saved under `Path("runs/exp1")` are in your project after the call.
+
+```python
+DATA = Path("data/imagenet-subset")
+
+@let.function(device=lab.A100, host=letify.remote)
+def train(lr):
+    for file in DATA.iterdir(): ...   # already on the runtime's disk
+```
 
 Why this shape:
 
@@ -440,6 +460,7 @@ def test_train_returns_a_loss():
 letify login shell lab        # declare an account, and reference it here
 letify logout lab             # take the account off this machine
 letify client shell connect   # run on a remote machine behind NAT, so letify can reach it
+letify setup tailcat          # install tailcat or eci from its publisher ahead of time
 letify providers              # who is declared, storage, channel kind
 letify devices                # what each one offers
 letify status                 # what is running right now
@@ -449,6 +470,8 @@ letify check lab              # does this machine answer?
 letify probe lab              # is host=letify.local worth using here?
 letify efficiency 0.5 3 150   # the formula, from measured terms
 ```
+
+Add `--json` to `usage`, `utilization` or `status` for output a program can read. The VS Code extension in [letify-ext/](letify-ext/) uses it to show quota and GPU activity in the status bar.
 
 ---
 

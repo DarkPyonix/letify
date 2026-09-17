@@ -26,7 +26,7 @@ from collections.abc import Callable, Sequence
 from functools import update_wrapper
 from typing import TYPE_CHECKING, Any, Generic, TypeVar
 
-from ..errors import ProtocolError, RuntimeFailure, RuntimeLost, UnsupportedMode
+from ..errors import ProtocolError, RuntimeFailure, RuntimeLost, SpotPreempted, UnsupportedMode
 from .instance import AnyInstance, Host, Instance
 
 if TYPE_CHECKING:
@@ -51,6 +51,8 @@ class Function(Generic[R]):
         volumes: Sequence[Volume] = (),
         timeout: float | None = None,
         retries: int = 1,
+        data_order: Any = None,
+        data_first_wave: int | None = None,
     ):
         self.fn = fn
         self.launcher = launcher
@@ -59,13 +61,30 @@ class Function(Generic[R]):
         self.volumes = tuple(volumes)
         self.timeout = timeout
         self.retries = retries
+        #: Spec "The send order and the first wave": a declared order outranks the analysis.
+        self.data_order = data_order
+        self.data_first_wave = data_first_wave
         self.is_async = inspect.iscoroutinefunction(fn)
         self.device = self._place(device)
         update_wrapper(self, fn)
 
     def _place(self, device: Instance | AnyInstance) -> Instance | AnyInstance:
-        """Fold the declared host placement into the instance it names."""
-        return device._placed(self.host)
+        """Fold the declared host placement into the instance it names.
+
+        A placement the instance's provider cannot serve is refused here, at decoration, as
+        spec "Placements a provider cannot serve" describes.
+        """
+        placed = device._placed(self.host)
+        if (
+            isinstance(placed, Instance)
+            and placed.placement is Host.local
+            and not placed.provider.serves_host_local
+        ):
+            raise UnsupportedMode(
+                f"{placed.provider.alias} cannot serve host='local', so {self.fn.__name__} "
+                f"cannot be declared on {placed!r}. Declare it with host='remote'."
+            )
+        return placed
 
     # -- invocation ----------------------------------------------------------
 
@@ -133,13 +152,19 @@ class Function(Generic[R]):
                     args,
                     kwargs,
                     timeout=self.timeout,
+                    data_order=self.data_order,
+                    data_first_wave=self.data_first_wave,
                 )
-            except (RuntimeFailure, ProtocolError) as exc:
+            except (RuntimeFailure, ProtocolError) as failure:
                 # The session misbehaved rather than the user's code, so this runtime
-                # is no longer trusted and the call may be retried on a fresh one.
+                # is no longer trusted and the call may be retried on a fresh one. The
+                # provider may name the failure first, such as a spot preemption.
+                exc = runtime.provider.diagnose(runtime, failure)
                 last = exc
                 launcher.pool.discard(runtime)
                 if attempt == self.retries:
+                    if isinstance(exc, SpotPreempted):
+                        raise exc from failure
                     lost = RuntimeLost(
                         f"{self.__name__} failed after {attempt + 1} attempt(s) on "
                         f"{instance!r}: {exc}"
@@ -170,12 +195,20 @@ class Function(Generic[R]):
         runtime = launcher.pool.acquire(instance, self.env, self.volumes)
         try:
             client = runtime.device()
+            before = client.stats.snapshot()
             with client.activate():
                 value = self.fn(*args, **kwargs)
+                if inspect.iscoroutine(value):
+                    value = asyncio.run(value)
                 client.synchronize()
-        except (RuntimeFailure, ProtocolError):
+                value = _resolve_deferred(value)
+            _report_deferred(client.stats.snapshot() - before)
+        except (RuntimeFailure, ProtocolError) as failure:
+            named = runtime.provider.diagnose(runtime, failure)
             launcher.pool.discard(runtime)
-            raise
+            if named is failure:
+                raise
+            raise named from failure
         except BaseException:
             launcher.pool.release(runtime)
             raise
@@ -193,6 +226,23 @@ class Function(Generic[R]):
     def __repr__(self) -> str:
         mode = "async" if self.is_async else "sync"
         return f"<Function {self.__name__} {mode} on {self.device!r}>"
+
+
+def _resolve_deferred(value: Any) -> Any:
+    """Resolve every deferred value the call returns, as spec "Deferred value reads" says."""
+    from ..remoting.device.value import resolve
+
+    return resolve(value)
+
+
+def _report_deferred(delta: Any) -> None:
+    """One line naming how many value reads were deferred and how many cost a wait."""
+    if delta.auto_deferred:
+        print(
+            f"letify: deferred {delta.auto_deferred} value reads, "
+            f"{delta.resolved_early} resolved early",
+            file=sys.stderr,
+        )
 
 
 def _where(host: Host | str | None) -> Host:

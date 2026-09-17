@@ -34,13 +34,13 @@ import threading
 from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, TypeVar
+from typing import TYPE_CHECKING, Any, Literal, TypeVar, overload
 
 from . import providers as provider_registry
 from .config import Config, load
 from .declare.env import Env
 from .declare.function import Function
-from .declare.instance import AnyInstance, Host, Instance
+from .declare.instance import AnyInstance, Host, Instance, RemoteOnlyInstance
 from .errors import LetifyError, UnknownInstance, UnknownProvider
 from .runtime.pool import RuntimePool
 
@@ -53,6 +53,9 @@ if TYPE_CHECKING:
     from .store.volume import Volume
 
 R = TypeVar("R")
+
+#: Seconds ``Launcher.usage`` waits for one provider, unless its entry sets usage_timeout.
+USAGE_TIMEOUT = 20.0
 
 
 class Providers:
@@ -195,6 +198,21 @@ class Launcher:
 
     # -- declaration ---------------------------------------------------------
 
+    @overload
+    def function(
+        self,
+        *,
+        device: RemoteOnlyInstance,
+        host: Literal[Host.remote, "remote"],
+        env: Env | None = None,
+        volumes: Sequence[Volume] = (),
+        timeout: float | None = None,
+        retries: int = 1,
+        data_order: Any = None,
+        data_first_wave: int | None = None,
+    ) -> Callable[[Callable[..., R]], Function[R]]: ...
+
+    @overload
     def function(
         self,
         *,
@@ -204,6 +222,21 @@ class Launcher:
         volumes: Sequence[Volume] = (),
         timeout: float | None = None,
         retries: int = 1,
+        data_order: Any = None,
+        data_first_wave: int | None = None,
+    ) -> Callable[[Callable[..., R]], Function[R]]: ...
+
+    def function(
+        self,
+        *,
+        device: Any,
+        env: Env | None = None,
+        host: Host | str | None = None,
+        volumes: Sequence[Volume] = (),
+        timeout: float | None = None,
+        retries: int = 1,
+        data_order: Any = None,
+        data_first_wave: int | None = None,
     ) -> Callable[[Callable[..., R]], Function[R]]:
         """Declare where a function runs.
 
@@ -229,6 +262,8 @@ class Launcher:
                 volumes=volumes,
                 timeout=timeout,
                 retries=retries,
+                data_order=data_order,
+                data_first_wave=data_first_wave,
             )
             self.functions.append(declared)
             return declared
@@ -276,25 +311,72 @@ class Launcher:
         Every declared alias is listed, including one whose provider could not even be
         built, because an account missing from a table reads as an account with nothing
         left on it.
+
+        Providers are asked at once, one daemon thread each, and each is waited on for its
+        ``usage_timeout`` seconds at most. A provider that is late or raises gets a row
+        with the reason in its note, and the others are unaffected.
         """
+        import time
+
+        from .providers.usage import Usage
+
         wanted = [alias] if alias else list(self.config.order)
-        rows: list[dict[str, Any]] = []
-        for name in wanted:
+        rows: list[dict[str, Any] | None] = [None] * len(wanted)
+        answers: dict[int, dict[str, Any]] = {}
+        asked: list[tuple[int, Provider, threading.Thread, float]] = []
+
+        def failed(provider: Provider, note: str) -> dict[str, Any]:
+            return Usage(
+                alias=provider.alias,
+                kind=provider.kind,
+                unit=provider.usage_unit,
+                source=provider.usage_source,
+                as_of=time.time(),
+                note=note,
+            ).to_dict()
+
+        def ask(index: int, provider: Provider) -> None:
+            try:
+                answers[index] = provider.usage().to_dict()
+            except Exception as exc:
+                answers[index] = failed(provider, f"could not be read: {type(exc).__name__}: {exc}")
+
+        for index, name in enumerate(wanted):
             try:
                 provider = self.provider(name)
             except LetifyError as exc:
-                rows.append({"alias": name, "unavailable": str(exc)})
+                rows[index] = {"alias": name, "unavailable": str(exc)}
                 continue
-            rows.append(provider.usage().to_dict())
-        return rows
+            limit = provider.config.option("usage_timeout", USAGE_TIMEOUT)
+            timeout = float(limit) if isinstance(limit, (int, float)) else USAGE_TIMEOUT
+            thread = threading.Thread(
+                target=ask, args=(index, provider), name=f"letify-usage-{name}", daemon=True
+            )
+            thread.start()
+            asked.append((index, provider, thread, timeout))
+
+        started = time.monotonic()
+        for index, provider, thread, timeout in asked:
+            thread.join(max(0.0, started + timeout - time.monotonic()))
+            answer = answers.get(index)
+            rows[index] = (
+                answer
+                if answer is not None
+                else failed(provider, f"no answer within {timeout:g} s")
+            )
+        return [row for row in rows if row is not None]
 
     def utilization(self, alias: str | None = None) -> list[dict[str, Any]]:
-        """How hard each declared instance's accelerator is working right now.
+        """How hard each declared provider's accelerators are working right now.
 
-        A local instance is read here. A remote one is read inside its live session, and
-        an instance with no session reports no devices and says so, because starting one
-        to measure its load would cost money and change the answer.
+        A provider whose machine outlives a session is read directly and read-only, one row
+        for the machine, with who holds each card. Any other is read inside its live
+        session, one row per instance, and an instance with no session reports no devices
+        and says so, because starting one to measure its load would cost money and change
+        the answer. Providers are asked at once, since each remote read is a round trip.
         """
+        from concurrent.futures import ThreadPoolExecutor
+
         from .runtime.telemetry import parse_smi, read_smi
 
         wanted = [alias] if alias else list(self.config.order)
@@ -302,45 +384,98 @@ class Launcher:
             (runtime.provider.alias, runtime.instance.accelerator): runtime
             for runtime in self.pool.live
         }
-        rows: list[dict[str, Any]] = []
-        for name in wanted:
-            try:
-                provider = self.provider(name)
-                instances = provider.instances
-            except LetifyError as exc:
-                rows.append({"alias": name, "unavailable": str(exc)})
-                continue
 
-            for accelerator, instance in instances.items():
+        def machine(provider: Provider) -> dict[str, Any]:
+            row: dict[str, Any] = {
+                "alias": provider.alias,
+                "kind": provider.kind,
+                "accelerator": None,
+                "scope": "machine",
+                "devices": [],
+                "reason": None,
+            }
+            try:
+                devices, holders = provider.read_machine()
+            except LetifyError as exc:
+                row["reason"] = str(exc)
+                return row
+            reserved = provider.reserved_indices()
+            for device in devices:
+                holder, users = (
+                    ("letify", ())
+                    if device.index in reserved
+                    else holders.get(device.index, ("unknown", ()))
+                )
+                row["devices"].append(
+                    {
+                        **device.to_dict(),
+                        "holder": holder,
+                        "users": list(users),
+                        "reserved": device.index in reserved,
+                    }
+                )
+            if not devices:
+                row["reason"] = "nvidia-smi reported nothing on that machine"
+            return row
+
+        def sessions(provider: Provider) -> list[dict[str, Any]]:
+            rows: list[dict[str, Any]] = []
+            for accelerator, instance in provider.instances.items():
                 if instance.gpu is None:
                     continue
                 row: dict[str, Any] = {
-                    "alias": name,
+                    "alias": provider.alias,
+                    "kind": provider.kind,
                     "accelerator": accelerator,
+                    "scope": "session",
                     "devices": [],
                     "reason": None,
                 }
-                runtime = live.get((name, accelerator))
+                rows.append(row)
+                runtime = live.get((provider.alias, accelerator))
+                if runtime is None:
+                    row["reason"] = "no live session, so nothing to measure"
+                    continue
                 try:
-                    if provider.kind == "local":
-                        output = read_smi()
-                    elif runtime is not None:
-                        output, _logs = runtime.call(read_smi, (), {})
-                    else:
-                        row["reason"] = "no live session, so nothing to measure"
-                        rows.append(row)
-                        continue
+                    output, _logs = runtime.call(read_smi, (), {})
                 except LetifyError as exc:
                     row["reason"] = str(exc)
-                    rows.append(row)
                     continue
-
                 devices = parse_smi(output or "")
-                row["devices"] = [device.to_dict() for device in devices]
+                row["devices"] = [
+                    {**device.to_dict(), "holder": None, "users": [], "reserved": False}
+                    for device in devices
+                ]
                 if not devices:
                     row["reason"] = "nvidia-smi reported nothing on that machine"
-                rows.append(row)
-        return rows
+            return rows
+
+        def read(name: str) -> list[dict[str, Any]]:
+            try:
+                provider = self.provider(name)
+                if provider.reads_machine:
+                    return [machine(provider)]
+                rows = sessions(provider)
+            except LetifyError as exc:
+                return [{"alias": name, "unavailable": str(exc)}]
+            if not rows:
+                rows = [
+                    {
+                        "alias": name,
+                        "kind": provider.kind,
+                        "accelerator": None,
+                        "scope": "session",
+                        "devices": [],
+                        "reason": "no GPU instance is declared",
+                    }
+                ]
+            return rows
+
+        if not wanted:
+            return []
+        with ThreadPoolExecutor(max_workers=len(wanted)) as pool:
+            answers = list(pool.map(read, wanted))
+        return [row for rows in answers for row in rows]
 
     def status(self) -> dict[str, Any]:
         """What is running right now, and what it is costing.
@@ -353,6 +488,8 @@ class Launcher:
         This process only, because the pool lives in the process that owns it. What a
         machine itself is doing is what ``letify utilization`` answers.
         """
+        import time
+
         live = list(self.pool.live)
         return {
             "name": self.name,
@@ -366,15 +503,28 @@ class Launcher:
                     "accelerator": runtime.instance.accelerator,
                     "devices": list(runtime.held_devices) or runtime.instance.devices,
                     "placement": str(runtime.instance.placement),
+                    "price_type": runtime.provider.price_type_of(runtime.instance),
                     "busy": runtime.busy,
                     "persistent_channel": runtime.persistent_channel,
                     "idle_seconds": round(runtime.idle_for, 1),
+                    "uptime_seconds": round(time.monotonic() - runtime.started, 1),
+                    **self._link_report(runtime),
                 }
                 for runtime in live
             ],
             "declared": [f.__name__ for f in self.functions],
             "config_sources": [str(p) for p in self.config.sources],
         }
+
+    @staticmethod
+    def _link_report(runtime: Any) -> dict[str, Any]:
+        """The strategy a runtime's provider connected over and its measured round trip."""
+        provider = runtime.provider
+        key_of = getattr(provider, "_link_key", None)
+        link = provider.__dict__.get("_links", {}).get(key_of(runtime)) if key_of else None
+        if link is None:
+            return {"link": None, "rtt_ms": None}
+        return {"link": link.strategy, "rtt_ms": getattr(link, "rtt_ms", None)}
 
     def _device_report(self) -> dict[str, Any]:
         """Each provider's inventory against what is reserved.

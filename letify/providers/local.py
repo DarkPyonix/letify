@@ -20,7 +20,7 @@ import subprocess
 import sys
 from collections.abc import Mapping
 from functools import cache
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from ..declare.instance import Instance
 from .base import Provider
@@ -42,14 +42,11 @@ class Local(Provider):
     #: Nothing crosses a network, so there is no round trip to pay.
     has_fast_path = True
 
-    #: The device is in this machine, so there is no second machine to install on.
-    needs_remote_agent = False
-
     #: A subprocess with pipes, so the object and blob tables persist.
     persistent_channel = True
 
     #: This machine already runs in its environment.
-    prepares_env = False
+    remote_env = False
 
     #: A local subprocess ends with this process and costs nothing.
     needs_lease = False
@@ -103,6 +100,21 @@ class Local(Provider):
         self.last_busy_owners = owners
         return busy
 
+    reads_machine = True
+
+    def read_machine(self) -> tuple[list[Any], dict[int, tuple[str, tuple[str, ...]]]]:
+        """This machine's cards and who holds them, read with nvidia-smi here."""
+        import os
+
+        from ..runtime import telemetry
+
+        def run(command: tuple[str, ...]) -> str:
+            if command == telemetry.SMI_COMMAND:
+                return telemetry.read_smi()
+            return telemetry._run(command)
+
+        return telemetry.read_machine(run, {os.getpid(), *self.worker_pids()})
+
     def store_backend(self) -> str:
         return "filesystem"
 
@@ -122,7 +134,7 @@ class Local(Provider):
         """
         from ..runtime.channel import PersistentChannel
 
-        interpreter = self.config.option("python") or sys.executable
+        interpreter = sys.executable
         from ..protocol.worker import BOOTSTRAP
 
         return PersistentChannel([str(interpreter), "-u", "-c", BOOTSTRAP], name=runtime.name)

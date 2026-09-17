@@ -14,10 +14,13 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 from enum import StrEnum
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal
 
 if TYPE_CHECKING:
     from ..providers.base import Provider
+
+#: The price types an instance may name. Elice's reserved pricing is not offered.
+PRICE_TYPES = ("ondemand", "spot")
 
 
 class Host(StrEnum):
@@ -52,7 +55,10 @@ class Instance:
     cpus: int | None = None
     memory_gb: int | None = None
     vram_gb: int | None = None
-    spot: bool = False
+
+    #: ``"ondemand"`` or ``"spot"``, or None for the account's own ``price_type``. Set with
+    #: ``priced``. Only providers with spot pricing accept ``"spot"``.
+    price_type: str | None = None
 
     #: How many of this accelerator one session takes. A run that trains across two cards
     #: asks for two, which is a property of the shape rather than a separate argument, so it
@@ -84,6 +90,20 @@ class Instance:
     def __rmul__(self, count: int) -> Instance:
         return self.__mul__(count)
 
+    def priced(self, price_type: Literal["ondemand", "spot"]) -> Instance:
+        """Return a copy that runs at this price type, as in ``elice.A100.priced("spot")``.
+
+        A value rather than a mutation, like ``n * instance``. A spot machine may be taken
+        back by the provider at any time.
+        """
+        if price_type not in PRICE_TYPES:
+            raise ValueError(f"a price type is 'ondemand' or 'spot', not {price_type!r}")
+        return replace(self, price_type=price_type)
+
+    @property
+    def spot(self) -> bool:
+        return self.price_type == "spot"
+
     @property
     def accelerator(self) -> str:
         return self.gpu or self.tpu or "cpu"
@@ -103,13 +123,48 @@ class Instance:
                 str(self.placement),
                 # A session holding two cards is not interchangeable with one holding one.
                 f"x{self.devices}",
-                "spot" if self.spot else "ondemand",
+                # None follows the account, so it is not the same session as a named type.
+                self.price_type or "default",
             ]
         )
 
     def __repr__(self) -> str:
         count = f"x{self.devices}" if self.devices > 1 else ""
         return f"<Instance {self.provider.alias}:{self.accelerator}{count} host={self.placement}>"
+
+
+if TYPE_CHECKING:
+
+    class RemoteOnlyInstance:
+        """An accelerator of a provider that cannot serve ``host="local"``, for a type checker.
+
+        Deliberately not a subtype of ``Instance`` for a type checker, so ``Launcher.function``
+        accepts it only in the overload whose ``host`` is ``remote``. At run time it is
+        ``Instance``, as spec "Placements a provider cannot serve" describes.
+        """
+
+        provider: Provider
+        gpu: str | None
+        tpu: str | None
+        host: Host | None
+        cpus: int | None
+        memory_gb: int | None
+        vram_gb: int | None
+        spot: bool
+        devices: int
+
+        def __init__(self, provider: Provider, gpu: str | None = None) -> None: ...
+        def __mul__(self, count: int) -> RemoteOnlyInstance: ...
+        def __rmul__(self, count: int) -> RemoteOnlyInstance: ...
+        @property
+        def accelerator(self) -> str: ...
+        @property
+        def placement(self) -> Host: ...
+        @property
+        def key(self) -> str: ...
+
+else:
+    RemoteOnlyInstance = Instance
 
 
 @dataclass(frozen=True, slots=True)
@@ -134,4 +189,4 @@ class AnyInstance:
         return f"<AnyInstance {self.accelerator}>"
 
 
-__all__ = ["AnyInstance", "Host", "Instance"]
+__all__ = ["AnyInstance", "Host", "Instance", "RemoteOnlyInstance"]

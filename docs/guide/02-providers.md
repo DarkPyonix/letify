@@ -166,7 +166,7 @@ Setup is two commands, one on each machine. Both machines need `tailcat`, and th
 letify client shell connect --name home_box
 ```
 
-If `tailcat` or an SSH server is missing, the command prints the exact install steps for that machine and exits. Otherwise it prints one command to run on your own machine:
+If `tailcat` is missing, the command installs it as [Installing tailcat and eci](#installing-tailcat-and-eci) describes. If automatic install is turned off, or the SSH server is missing, it prints the exact install steps for that machine and exits. Otherwise it prints one command to run on your own machine:
 
 ```
 letify login tunnel home_box --connect eyJ0YWlsY2F0Ijoi...
@@ -221,18 +221,31 @@ Modal's client runs in its own uv environment, with Modal pinned to `>=1.0,<2`, 
 [elice_a100]
 kind = "elice"
 zone_id = "00000000-0000-0000-0000-000000000000"
-machine_id = "00000000-0000-0000-0000-000000000000"
-address = "..."
-user = "elicer"
-key = "~/.ssh/elice.pem"
+price_type = "spot"                 # optional: ondemand (default) or spot
+spot_fallback = "ondemand"          # optional: none (default) or ondemand
 access_token_env = "ELICE_ACCESS_TOKEN"
 ```
 
-Targets Elice Cloud Infrastructure, which has a published REST API. letify powers the machine on and off by creating and deleting an allocation, which maps exactly onto a session, so a call's own lifetime follows Elice's.
+Targets Elice Cloud Infrastructure through `eci`, Elice's own command line. letify installs it the first time it is needed, or install it ahead of time:
 
-**letify does not create the machine.** Declare the virtual machine once in the console or with Terraform and put its id in `machine_id`. letify allocates and releases it.
+```bash
+letify setup eci                 # letify downloads Elice's release
+curl -fsSL https://raw.githubusercontent.com/elice-dev/eci-cli/main/scripts/install.sh | sh
+```
 
-Two costs to remember. Compute bills by the second while allocated, and block storage keeps billing while the machine is stopped. A forgotten machine costs money with no allocation running.
+See [Installing tailcat and eci](#installing-tailcat-and-eci) for where letify puts it.
+
+**No machine has to exist.** `letify login elice elice_a100` checks the token with `eci`, and without a machine it records none. On the first call letify launches `letify-elice-a100`, or `letify-elice-a100-spot` for spot, with an instance type matching the declaration. It keeps a generated password in `~/.letify/accounts/elice_a100/machine_password` and installs your SSH key. Later calls start the same machine again. To use a machine you made yourself, pick it at login or set `machine_id`.
+
+```python
+elice = let.providers.elice_a100
+elice.A100                    # the account's price type
+elice.A100.priced("spot")     # spot for this declaration only
+```
+
+A session ends with `eci compute vm stop`, and letify never deletes anything. An idle machine bills no compute, but its disk and public IP keep billing. Remove a machine with `eci compute vm delete <name> --cascade`; without `--cascade` the disk, network interface and IP stay and keep billing.
+
+Spot costs less, and Elice may take the machine back at any time. letify then raises `SpotPreempted`, an infrastructure failure retried under `retries`. Files on the machine's disk and in volumes survive, while memory and session cache handles are lost. An ondemand launch checks the organization's quota first, and spot is offered for GPU types only.
 
 Elice's other product, Run Box, is console driven and has no API. You can still use it by declaring it as a plain `shell` with its tunnel address and port.
 
@@ -306,3 +319,30 @@ letify check lab_a100
 ---
 
 [← Getting started](01-getting-started.md) · [Guides](README.md) · [Next: Execution modes →](03-execution-modes.md)
+
+## Installing tailcat and eci
+
+letify runs two programs it does not ship: `tailcat`, from Tailscale, for Tunnel accounts, and `eci`, from Elice, for Elice accounts. Neither is part of letify or covered by its license. When a command needs one and finds none, letify installs it and prints two lines on standard error:
+
+```
+letify: installing tailcat 0.6.0 from https://github.com/tailscale/tailcat/releases/download/v0.6.0/tailcat_0.6.0_linux_amd64.tar.gz into ~/.letify/tools/tailcat/0.6.0
+letify: tailcat 0.6.0 verified sha256 f3597a9a..., linked at .venv/bin/tailcat
+```
+
+To install ahead of time, or to see what letify uses:
+
+```bash
+letify setup tailcat          # install now
+letify setup eci --where      # where it is and which copy letify uses
+```
+
+To turn automatic install off, put `auto_install = false` at the top of `~/.letify/config.toml`, or set `LETIFY_AUTO_INSTALL=0`. A missing tool then fails with the install steps and the `letify setup <tool>` command.
+
+What an install does:
+
+1. Downloads the pinned release archive from the publisher's GitHub releases, `tailscale/tailcat` or `elice-dev/eci-cli`.
+2. Checks its SHA-256 against the digest pinned in letify and against the release's `checksums.txt`, and refuses a mismatch.
+3. Unpacks it into `~/.letify/tools/<tool>/<version>/`, refusing any archive entry that points outside that directory.
+4. Links it into your project's `.venv/bin`: a hard link for `tailcat` (a copy when a hard link is impossible), a small launcher script for `eci`.
+
+letify never writes to `~/.local/bin`, `/usr/local/bin` or your shell profile. A copy you installed yourself on `PATH` is used as it is and never replaced, and a file in `.venv/bin` that letify did not create is left alone. On macOS with Homebrew, `tailcat` comes from `brew install tailcat`.

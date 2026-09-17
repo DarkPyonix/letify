@@ -69,6 +69,7 @@ A declaration taking two cards halves the width on a four card machine, which is
 Provider (abstract)
 ├── Local                 persistent
 ├── Modal                 persistent, reached through the Modal adapter
+├── Kaggle                ephemeral, host="remote" only, account reached through a browser cookie
 └── Shell                 ephemeral by default, reached through the connection pipeline
     ├── Colab             session created by the Colab CLI, rendezvous over colab exec
     ├── Tunnel            a machine behind NAT, rendezvous through letify client shell connect
@@ -98,27 +99,93 @@ A provider is built from one entry in the configuration file and reached by attr
 | `Colab` | ephemeral | no | persistent, or one-shot by configuration | `gcs` |
 | `Shell` | ephemeral, overridable | yes | persistent | `filesystem` |
 | `Tunnel` | ephemeral, overridable | yes | persistent | `filesystem` |
-| `Elice` | persistent | yes | persistent | `filesystem` |
+| `Elice` | ephemeral | yes | persistent | `filesystem` |
+| `Kaggle` | ephemeral | no | persistent, in one cell of the session the user registered | `filesystem` |
+
+### Kaggle <!-- id: kaggle-provider -->
+
+> A Kaggle account is declared with the browser session cookie of a logged-in kaggle.com tab. It never opens a tunnel, a port forward or a Tailcat link, and it cannot serve `host="local"`.
+
+Two sources decide this, and they say different things. Kaggle staff answered a request for SSH access with "You can't run docker inside Kaggle. We also don't support port forwarding.", which is a statement that the feature does not exist, not that reaching it is forbidden. The Acceptable Use Policy of June 22, 2025 forbids using the Services "to disable, interfere with or circumvent any aspect of the Services" and lists "tools for circumvention/obfuscation" among abusive uses. Whether hole punching to a machine that offers no inbound port is circumvention is not written anywhere, so treating it as circumvention is this project's reading rather than Kaggle's rule. letify takes the cautious side because the cost of being wrong falls on the user's account.
+
+- No keep-alive request is ever sent, and accounts are never rotated.
+- The accelerators are `CPU`, `P100`, `T4` and `TPU_V3_8`, a fixed list read without a network call.
+- **The credential is a browser session cookie, and nothing else.** The API token cannot be used: the internal endpoints that mint the Jupyter proxy token authenticate only the web session principal, so an API key is treated as anonymous and returns empty. The cookie is the whole account. `letify login kaggle <alias>` reads the cookie string of a logged-in kaggle.com tab (from `--cookie`, a file it names, or an interactive prompt), stores it at `~/.letify/accounts/<alias>/cookie` with mode 600, and proves it by calling `users.UsersService/GetCurrentUser`, which returns the account only for a real session. There is no other login step, and no session URL is registered by hand.
+- **The cookie carries its own expiry, and letify reads it rather than guessing.** The `CLIENT-TOKEN` cookie is an `alg:none` JWT whose `exp` claim is the session's hard expiry, thirty days after the login that minted it. Ordinary activity does not extend it; only a fresh browser login does. So letify computes the days remaining from that claim, `letify usage` and the account listing show `cookie expires in N days` (or `EXPIRED`), and any run whose cookie is missing or past `exp` raises `ConfigError` naming the alias and telling the user to log in to kaggle.com again and re-run `letify login kaggle <alias>` with the new cookie. The message never states that the session ended for another reason, because the `exp` claim is the one fact letify has.
+- Everything after that registration is what every other provider does: the session builds the declared environment with `uv sync`, enters a workspace root, transfers files and checks the worker's interpreter. Kaggle gets no exemption from any of it.
+
+#### Kaggle Jupyter Server session <!-- id: kaggle-session -->
+
+> A declared function runs on a Kaggle Jupyter Server session letify starts from the account's cookie, on one worker kept alive inside a single kernel cell whose frames travel as base64 lines.
+
+letify starts the session itself, on a notebook it owns, through the token chain in the "Kaggle session token chain" section below. It gets back a routed proxy URL, whose token rides in the URL path because the proxy rejects a token sent only as a header. Since letify starts the run, it also ends it: `stop` cancels the run to release the accelerator quota it holds. `create_session` still does nothing and `needs_lease` is false, because the session is started lazily in `open_channel`.
+
+The URL is split into the server base, the URL without its query string, and the token, the `token` query parameter when present. A routed proxy URL carries no query, so the token is in the path and every REST request goes to `<base>/api/...` with no `token` query and no `Authorization` header, through the standard library HTTP client. The full URL and the token never appear in a message, a log or a command line; a message names only the host.
+
+1. **Start.** `open_channel` reads the account's cookie, refusing the run with a `ConfigError` when it is missing or past its `exp`. It runs the token chain to get the routed URL, waits for `<base>/api/status` to answer, then creates one kernel with `POST <base>/api/kernels` and body `{"name": "python3"}` and keeps its id for the runtime. `stop` deletes the kernel with `DELETE <base>/api/kernels/<id>`, then cancels the run, both best effort.
+2. **The worker.** The session carries one worker for the life of the runtime, not one program per request. The Kaggle adapter, `letify/providers/kaggle_adapter.py`, is a bridge process started by `uv run --no-project --python 3.13 --with "jupyter-kernel-client<1" python -P`, and it receives the URL and the kernel id in the environment variables `LETIFY_JUPYTER_URL` and `LETIFY_KERNEL_ID`. It executes one cell in that kernel which runs until the runtime ends, and that cell carries a shim rather than the bootstrap stub of Channels. A kernel answers `input()` and nothing else: the cell's `sys.stdin` is a `TextIOWrapper` whose `buffer` reads empty instead of raising `input_request`, so a worker reading binary from standard input would read nothing at all. The shim therefore reads base64 lines with `input()`, decodes each one, and writes the bytes into a pipe the worker reads as its standard input, with the worker's own standard output going back out as `stream` messages. The bridge moves the lines on two threads, one per kernel channel, and never on one: what it reads on its standard input one thread hands to the cell by answering `input_request`, and every `stream` message the cell writes the other thread copies to its standard output. One thread is required rather than a convenience. Answering an `input_request` from the same loop that reads the cell's output blocks that loop in a standard-input read, and while it blocks no `stream` message is delivered. The worker announces itself with a `stream` message, so a single-loop bridge holds that hello behind an `input_request` the channel does not answer until it has seen the hello, which is a deadlock, and the same deadlock returns on every large response, where the cell reads the next request while the worker is still writing output. The letify process never imports `jupyter_kernel_client`.
+
+   The channel is a `FramedChannel` with `text_frames` set, so the worker writes each frame as a base64 line, as the Modal sandbox already does for the same reason: a kernel's `stream` messages carry text, not bytes. `persistent_channel` is therefore true, which is what gives Kaggle an object table, a blob table that keeps a large argument across calls, and the option of `host="local"` if a link ever makes it worth using.
+
+   Two behaviours of the kernel protocol are what make one cell enough, and both are verified rather than assumed: a `stream` message reaches the client while the cell is still running, and a cell blocked on input raises `input_request` as many times as it reads. Base64 over the kernel is asymmetric, measured on the live proxy from Seoul: upstream, into the cell over `input_request`, reaches about 9 MiB/s for a 16 MiB frame; downstream, out of the cell over `stream`, is about 1.5 MiB/s and linear, because every byte becomes a base64 `stream` message and iopub is the slower, rate-limited path. The measurements are in the pull request for branch `feat/kaggle-runtime-cookie`.
+3. **Failure.** The bridge exiting is the worker dying, so every blocked read ends as a lost channel does, with the bridge's standard error as the detail. The provider then reads `<base>/api/status` once. When that read answers 200 the session is alive and the worker is not, so `RuntimeFailure` is raised with the bridge's standard error. Otherwise `KaggleSessionEnded` is raised. It is a `RuntimeLost`, and its message does not state that the session ended, because letify cannot tell an ended session from one that failed to start: the proxy answers 404 for both, and for a session id that never existed. The message says the session did not answer, names the causes it could be (20 minutes idle, the 12 hour limit, or a failure to start) and tells the user to run the function again. A session Kaggle ends mid call is therefore reported as the lost runtime it is, rather than as the call's own failure.
+4. **Files.** `put_file`, `get_file` and `pack_dir` are worker requests, so they travel as frames like every other provider's do. The Jupyter contents API is not used for them: it was only ever the substitute a one-shot channel needed, because a channel with no worker has nobody to ask.
+5. **Environment.** The session builds the environment like any other runtime: uv is installed, and `uv sync` runs with this process's Python minor version, so the interpreter check compares like with like. The default workspace root is `/kaggle/working/letify`.
+
+No request is sent to keep the session alive. A session that Kaggle ends for being idle stays ended.
+
+#### Kaggle session token chain <!-- id: kaggle-session-token-chain -->
+
+> letify turns the account's cookie into a live routed Jupyter proxy URL, because only the web session principal can mint that token.
+
+letify owns one notebook per account, created once with `CreateKernelWithSettings` and its id kept in the account directory, so it can commit the body a session needs. The chain, all on `https://www.kaggle.com/api/i/`, authenticated by the cookie:
+
+1. `GetOrCreateKernelSession {kernelId}` reads the notebook's draft sequence.
+2. `CommitAndRun` commits a trivial notebook body and starts the interactive session, returning the run id. This is what the editor's Run does. `CreateKernelSession` on an empty notebook wedges it, so `CommitAndRun` is the call that reliably starts a session letify controls. Empty compute is a CPU session; an accelerator name (`NVIDIA_TESLA_P100` or `NVIDIA_TESLA_T4`) asks for that card.
+3. `GetFirebaseConfig` and `GetFirebaseAuthToken` mint a Firebase custom token, exchanged at `identitytoolkit.googleapis.com` for an id token. An empty custom token means the cookie is not a live principal, which is a `ConfigError`.
+4. `UpdateUserKernelFirestoreAuth {firebaseIdToken, kernelRunId}` registers the run's Firestore auth and returns a web tier session id.
+5. The Firestore document `sessions/<web tier id>/data/JupyterURL`, read with the id token, holds the proxy URL. letify extracts the token and builds `https://kkb-production.jupyter-proxy.kaggle.net/k/<run id>/<token>/proxy`, polling until the document appears because a session takes a little while to publish it.
+
+There is no API token, no `kaggle.json` and no session URL registered by hand: the internal endpoints treat an API key as anonymous and answer empty, so the cookie is the whole credential.
+
+The accelerators letify offers are the fixed set `discover` returns, `CPU`, `P100` and `T4` and the `TPU_V3_8`, all of which the web app lets a session start with. No call is made to list them, because Kaggle assigns the card the session gets.
 
 `Shell` and its subclasses default to ephemeral because a machine's disk policy is not knowable in advance. Assuming ephemeral costs time, since letify rebuilds the environment each runtime and the work still succeeds; assuming persistent fails outright when the disk turns out to be wiped. A configuration entry overrides it with `persistent = true`.
 
 ### Remaining usage
 
-> Every provider is asked the same question, and a provider that cannot answer says so instead of guessing.
+> Every provider is asked what is left on its account, reads the answer from the service itself, and says why when it cannot.
 
-`Provider.usage()` returns a `Usage` record: the alias, the unit the account is metered in, how much is left, how much is spent, the ceiling, the hourly rate of what is running now, when the figure was taken, and where it came from. Every field except the alias, the unit and the source may be `None`, because a missing number is information and a fabricated one is not.
+`Provider.usage()` returns a `Usage` record with these fields:
 
-A provider reports what its service actually publishes:
+| Field | Means |
+|---|---|
+| `alias`, `kind` | The account and its provider kind |
+| `unit` | What the account is metered in: `compute units`, `KRW`, `USD` or `GPU hours` |
+| `source` | Where the figure came from, or why there is none |
+| `remaining` | How much is left, in `unit` |
+| `used`, `limit` | How much of the current allowance is spent, and the allowance, when the service states them |
+| `rate_per_hour` | What is running now costs per hour, in `unit` |
+| `resets_at` | When the allowance renews, as Unix seconds, when it renews on a schedule |
+| `unmetered` | True when there is no quota at all |
+| `as_of` | When the figure was read, as Unix seconds |
+| `note` | Why a figure is missing, in one line |
+| `resources` | Further allowances on the same account, such as Kaggle's TPU hours beside its GPU hours. A list of records with `name`, `unit`, `remaining`, `used`, `limit` and `resets_at`, empty when there are none |
 
-| Provider | Unit | Remaining | Comes from |
-|---|---|---|---|
-| `Local` | hours | unmetered | nothing to ask; this machine bills nobody |
-| `Elice` | KRW | not published | live allocations priced from the zone price list, which gives the rate and the spend, not the balance |
-| `Colab` | compute units | not published | the CLI has no balance command; the figure is in the web console |
-| `Modal` | USD | not published | the SDK exposes no workspace balance |
-| `Shell`, `Tunnel` | hours | not published | a machine letify only runs commands on has no account behind it |
+Every field except `alias`, `kind`, `unit` and `source` may be `None`. A provider that cannot be read returns a record with `remaining` set to `None` and the reason in `note`. It does not raise.
 
-Where the service publishes nothing, a configuration entry supplies the number itself:
+Each provider reads its own service. Every call is read-only: none creates a runtime, a sandbox or a session.
+
+| Provider | Unit | Remaining comes from |
+|---|---|---|
+| `Colab` | compute units | `GET https://colab.research.google.com/tun/m/ccu-info?authuser=0`, the call the Colab web page makes. `remaining` is `currentBalance` and `rate_per_hour` is `consumptionRateHourly`. The OAuth token is the Colab CLI's `.config/colab-cli/token.json` in the account directory. An expired token is refreshed in memory at its `token_uri` and the file is not rewritten |
+| `Elice` | KRW | `GET <billing_endpoint>/stats` with the account's bearer token and, when `organization` is set, the `x-elice-org-name-short` header. `remaining` is `total_credit_remaining_amount`, sent as a number or as `"<amount> <currency>"`. `rate_per_hour` prices the live allocations against the zone price list. `billing_endpoint` is the Elice billing API base URL. The public portal assets do not carry it, so it has no default: `letify login elice` records it from `--billing-endpoint` or the prompt, and without it `note` says so |
+| `Modal` | USD | The Modal adapter op `billing_summary`, which calls `modal.Workspace.billing.summary()` for the current month. `used` is the month's metered cost and `limit` is the monthly credit, `monthly_credit` in the entry or 30 USD, the Starter plan credit. `remaining` is `limit - used`, not below 0. `resets_at` is 00:00 UTC on the first of next month |
+| `Kaggle` | GPU hours | The weekly GPU quota the Kaggle provider reads. `remaining`, `used` and `limit` are hours, and `resets_at` is the weekly renewal |
+| `Local` | hours | unmetered: this machine bills nobody |
+| `Shell`, `Tunnel` | hours | unmetered: a machine reached by SSH has no quota and no account behind it |
+
+A configured command replaces the provider's own reading:
 
 ```toml
 [colab_a]
@@ -128,9 +195,124 @@ usage_unit = "compute units"
 usage_limit = 100.0
 ```
 
-The last number in the command's output is read as the remaining amount. This exists because the alternative is letify inventing an endpoint, and a wrong balance is worse than an absent one. The command runs only when usage is asked for, never during a call.
+The last number in the command's output is read as the remaining amount. The command runs only when usage is asked for, never during a call.
 
-`letify usage` prints one row per declared provider, and `letify usage <alias>` one provider. A provider whose optional dependency or setting is missing is reported as unavailable rather than skipped, so the table always lists every alias.
+`usage_limit` without `usage_command` is the plan allowance for the provider's own reading. It fills `limit` only when the service did not state one, and `used` becomes `limit - remaining`, not below 0. Colab reports a balance and no allowance, so this is how a Colab row gets a percentage.
+
+`Launcher.usage()` asks every provider at once, one thread each, and waits at most `usage_timeout` seconds per provider, 20 by default. A provider that has not answered by then, or that raised, gets a row with `remaining` set to `None` and the reason in `note`. The other rows are unaffected.
+
+`letify usage` prints one block per declared provider, and `letify usage <alias>` one provider. A provider whose optional dependency or setting is missing is reported as unavailable rather than skipped, so the output always lists every alias. `letify usage --json` prints the records unformatted.
+
+Amounts are formatted by unit:
+
+| Unit | Printed as |
+|---|---|
+| `KRW` | `12,345 KRW`, whole won with thousands separators |
+| `USD` | `$29.50` |
+| `compute units` | `99.93 compute units`, two decimals |
+| a unit ending in `hours`, such as `GPU hours` | `12.5 GPU hours`, one decimal |
+| any other | the number as given, then the unit |
+
+A block is a header line, `<alias>  <kind>`, followed by lines indented by 2 spaces:
+
+```
+colab_a  colab
+  [████████████████░░░░░░░░░░░░░░░░░░░░░░░░] 40% used
+  60.00 compute units left of 100.00
+  1.96 compute units/hour running now, about 1 d 6 h at this rate
+
+kaggle  kaggle
+  [████████████████████████░░░░░░░░░░░░░░░░] 60% used
+  12.0 GPU hours left of 30.0
+  resets in 4 d 6 h (2026-09-18 12:00 UTC)
+  TPU [████░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░] 10% used
+      18.0 TPU hours left of 20.0
+
+lab  shell
+  no quota, unmetered
+```
+
+| Line | Printed when | Content |
+|---|---|---|
+| Gauge | `limit` is known and above 0 | `[<filled><empty>] <p>% used`, where `p` is `used / limit` rounded to a whole percent, with `used` taken as `limit - remaining` when the service did not state it |
+| Amount | `remaining` is known | `<remaining> left`, then ` of <limit>` when the limit is known. With no limit the line ends `, limit unknown` and no gauge or percentage is printed |
+| Reset | `resets_at` is known | `resets in <relative> (<YYYY-MM-DD HH:MM UTC>)`, or `reset due (<date>)` once the time has passed |
+| Rate | `rate_per_hour` is known | `<rate>/hour running now`, then `, about <relative> at this rate` when the rate is above 0 and `remaining` is known |
+| No quota | `unmetered` is true | `no quota, unmetered`, and no other line |
+| Not reported | neither `remaining` nor `rate_per_hour` is known | `not reported` |
+| Note | `note` is set | the note |
+| Unavailable | the provider could not be built | `unavailable: <reason>` |
+
+A relative time uses the two largest units of days, hours and minutes, as `4 d 6 h`, `3 h 12 min` or `45 min`. Each record in `resources` prints its own gauge, amount and reset lines under the account's lines. Its gauge line starts with its `name` and its other lines are indented to the gauge's bracket.
+
+The gauge is 16 to 40 cells wide. Its width is the terminal width from `shutil.get_terminal_size`, minus the 2 space indent, the 2 brackets and 10 columns for the percentage text, then clamped to that range. A further allowance's gauge is also shorter by its name and a space, with the same 16 cell minimum, so a narrow terminal still gets a 16 cell gauge. A filled cell is `█` and an empty cell is `░` when the standard output encoding is UTF-8. Otherwise they are `#` and `-`.
+
+Colour is added only when standard output is a terminal and the `NO_COLOR` environment variable is unset or empty. The gauge and its percentage are green while more than 50% of the allowance remains, yellow from 20% to 50%, and red below 20%. The header's alias is bold. Without colour no escape sequence is written.
+
+### Elice machines <!-- id: elice-machines -->
+
+> letify finds, creates, starts and stops an Elice Cloud Infrastructure virtual machine through Elice's own `eci` command, so an account needs no machine made in the portal beforehand.
+
+`eci` is the standalone binary Elice publishes at github.com/elice-dev/eci-cli for macOS arm64, Linux x86_64 and Windows x86_64. letify runs it as a separate process and never bundles or mirrors it. `eci` is found by the lookup [Installing external tools](#confirmed-tool-install) describes. When it is found nowhere, `letify login elice` asks `eci, Elice's command line, is not installed. letify can download eci <version> from Elice's GitHub release into ~/.letify/tools; it is Elice's software, not part of letify. Install it now? [y/N]: `. `y` or `yes` installs it as [Installing external tools](#confirmed-tool-install) describes and the login continues. Any other answer, and a login with `--no-input`, stops the login with the install command and `Install it with: letify setup eci`, and writes nothing. An Elice session start never asks and never installs; it raises `ProviderUnavailable` with the same text. `eci` is never installed without that answer or `letify setup eci`, because its release carries no license. When `eci_binary` names a program that is not on `PATH`, the error carries the install command for this system:
+
+- macOS and Linux: `curl -fsSL https://raw.githubusercontent.com/elice-dev/eci-cli/main/scripts/install.sh | sh`
+- Windows: `powershell -c "irm https://eci.sh/install.ps1 | iex"`
+
+Every `eci` command runs with four environment variables and no `eci` configuration of the user's own:
+
+| Variable | Value |
+|---|---|
+| `ECI_API_ENDPOINT` | the account's `endpoint`, default `https://portal.elice.cloud/api`. The public sector portal is `https://portal.gov.elice.cloud/api` |
+| `ECI_API_TOKEN` | the account's access token |
+| `ECI_ZONE_ID` | the account's `zone_id`, once one is chosen |
+| `ECI_CONFIG` | `~/.letify/accounts/<alias>/eci.yaml` |
+
+The token is never an argument and never printed. Reads pass `--format json`. A command that exits non zero raises `RuntimeFailure` naming the command, with any password replaced by `***`, and its standard error. When that standard error contains `401`, `403`, `unauthorized` or `permission`, the message starts with `Elice refused the access token or it lacks permission` and says a token is issued in the portal under User management, User access token.
+
+**Which machine.** `machine_id` names an existing machine by name or UUID. Without it the machine is named `letify-<alias>` for an ondemand machine and `letify-<alias>-spot` for a spot one, with the alias lowercased and `_` replaced by `-`. A machine is found with `eci compute vm list --format json`, taking the row whose `name` or `id` equals it exactly. The name is how a later start finds the same machine, so nothing is written back to a configuration file.
+
+**Start.** Starting a session runs these steps in order:
+
+1. Find the machine.
+2. A declared `machine_id` that is not listed raises `ProviderUnavailable` naming it.
+3. A missing letify machine is launched. The instance type is the account's `instance_type` when set. Otherwise it comes from `eci instance-type list --format json`, keeping the rows whose `activated` is not `false`, because `eci` has no option to filter them: a GPU instance takes a row whose `devices` normalize to the instance's accelerator and number exactly the instance's device count, and `CPU` takes the row with no devices and the fewest `cpu_vcore`. No match raises `ProviderUnavailable` listing the names that were offered. The price type, price line and quota check follow Price type below. The password is generated: 20 characters with an upper case letter, a lower case letter, a digit and a symbol, and no three characters that run consecutively up or down such as `123` or `cba`. It is written to `~/.letify/accounts/<alias>/machine_password` with mode 0600 before the launch runs, so a launch that succeeds after letify is interrupted still has its password. The command is `eci compute vm launch --name <name> --instance-type <type> --password <password> --wait --no-spec`, where `--no-spec` keeps a launch spec the user saved as `default` from changing the machine letify asked for, with `--price-type spot` for a spot machine and `--image <image>` and `--size-gib <disk_gib>` only when the account sets `image` and `disk_gib`. Without them `eci` chooses Ubuntu 24.04 AI/GPU with 50 GiB for an accelerator type and Ubuntu 24.04 Standard with 20 GiB for a CPU type.
+4. A machine with status `started` is used as it is. A machine with status `idle` is started with `eci compute vm start <name>`. Any other status is a transition, and `eci compute vm get <name> --format json` is read every 10 seconds until it is `idle`, for up to 300 seconds, before the start. After a start the status is read every 10 seconds until it is `started`, for up to 600 seconds. Either limit raises `RuntimeFailure` naming the last status.
+5. The address is the machine's first public IP in `eci compute vm get <name> --format json`: a string under a key containing `public_ip`, or the `ip` of the first entry of a list under such a key. No public IP raises `ProviderUnavailable` saying the machine has none. A machine reports `started` before its SSH server accepts connections, so after a launch or a start letify prints `letify: <name>: waiting for SSH on <address>` and tries a TCP connection to the address on the account's SSH port every 5 seconds, for up to 300 seconds, before any SSH step. A machine that was already `started` is not waited for. The limit raises `RuntimeFailure` saying SSH on the address did not answer.
+6. Right after a launch, the host key recorded under `letify-<alias>` in `~/.letify/accounts/<alias>/known_hosts` is removed, because a new machine has a new host key even when Elice gives it the same public IP as a machine deleted earlier. A machine that was only started keeps its recorded key, so a changed key on it still fails the connection. Then letify's key is installed. The key is `key`, default `~/.ssh/id_letify`, generated as at login when missing. Its public half is appended to `~/.ssh/authorized_keys` of `user`, default `ubuntu`, the login user `eci` gives a launched machine, over one SSH connection that reads the password through `SSH_ASKPASS` from the password file. The password is therefore never an argument of letify's own SSH command. A machine letify did not launch must already accept the account's key.
+
+The runtime's `external_id` is the machine name, and the session runs over forward SSH to the address.
+
+**Stop.** An Elice machine letify launched is deleted at the end of the session unless the account is persistent. Ending a session acts once no other runtime of this provider is on the machine, and follows the account's `persistent` setting, default `false` for Elice. On a persistent account letify runs `eci compute vm stop <name>`: an idle machine bills no compute, while its disk and public IP keep billing, and the next session starts the same machine with its disk. On an account that is not persistent a machine letify launched is deleted with `eci compute vm delete <name> --cascade -y`, which removes its disk, network interface and public IP, so nothing keeps billing, and the next session launches a new machine. A machine the account names with `machine_id` is never deleted; it is stopped. A stop or delete that fails prints `letify: could not stop <name>: <reason>. Run 'eci compute vm stop <name>'` or `letify: could not delete <name>: <reason>. Run 'eci compute vm delete <name> --cascade -y'` and does not raise, because the session is already ending. `letify logout` deletes nothing on Elice.
+
+**A start that fails.** When a session start raises after letify launched or started a machine for it and before the session runs, and no other runtime of this provider is on that machine, letify ends the machine as Stop describes, deleting it on an account that is not persistent and stopping it otherwise, and then raises the original error. So a failed start leaves nothing billing compute, and on a non-persistent account nothing billing at all.
+
+#### Price type <!-- id: elice-price-type -->
+
+> An Elice machine runs ondemand or spot, chosen on the account and overridable on one instance.
+
+`price_type = "ondemand"` or `"spot"` on the account, default `ondemand`. Any other value raises `ConfigError`. Elice's reserved pricing is not offered. `instance.priced("spot")` and `instance.priced("ondemand")` return a copy with that price type, the way `n * instance` returns a copy with `n` devices, and any other argument raises `ValueError`. The price type is part of the pool key. A spot machine may be stopped or deleted by Elice at any time.
+
+A spot instance on a provider that has no spot pricing, which is every provider except `elice`, raises `UnsupportedMode` when its session starts. On Elice, spot on a CPU instance type raises `UnsupportedMode` before anything is created, because Elice offers spot for accelerator types only. A declared `machine_id` keeps the pricing it was created with, so a requested price type that differs from the machine's `pricing_type` raises `ConfigError` naming both.
+
+Before a launch, letify reads `eci pricing list --resource-kind vm_allocation --format json` and prints `letify: <name>: <type> <price type> at <price> KRW/hour` from the row whose `name` is the instance type and whose `pricing_type` is the price type, or `letify: <name>: no <price type> price listed for <type>` when there is no such row.
+
+An ondemand launch checks quota first, and a spot launch does not, because spot does not count against Elice's compute quota. letify reads `eci org info --format json`. A value of 0 for the instance type's id or name under `resource_quota.compute.instance_types`, or a `resource_quota.compute.devices` of 0 for an accelerator type, raises `ProviderUnavailable` saying the ondemand quota for that type is 0 and that the portal takes a quota request or `price_type = "spot"` avoids the quota. A quota that cannot be read prints `letify: <name>: the ondemand quota could not be read, launching anyway` and does not refuse.
+
+A launch Elice refuses because the zone has no spot capacity raises `ProviderUnavailable` naming the instance type, rather than `RuntimeFailure`. Nothing was created, so there is no session to discard and retrying the call on a fresh runtime would ask the same zone for the same capacity again. letify recognises the refusal by `no spot capacity` in the command's standard error. The message says that Elice has no spot capacity for that type right now, and that a later retry or `price_type = "ondemand"` gets a machine. Every other launch failure stays a `RuntimeFailure`.
+
+`Launcher.status()` reports `price_type` on each runtime, `ondemand` or `spot` on Elice and `None` elsewhere, and `letify status` prints it. An Elice `Usage` record carries the account's `price_type`, which `letify usage` prints and `--json` includes.
+
+#### Spot preemption <!-- id: elice-spot-preemption -->
+
+> A spot machine that Elice stopped or deleted is an infrastructure failure, raised as `SpotPreempted` and retried under the ordinary retry rule.
+
+When a call on a runtime fails with `RuntimeFailure` or `ProtocolError`, the call path asks the provider to diagnose it before retrying. On Elice, for a spot runtime, the provider reads `eci compute vm get <name> --format json`. A machine that is gone, or whose status is not `started` while letify did not stop it, turns the failure into `SpotPreempted`, a `RuntimeLost`, carrying `machine`, `state` (the last status, or `deleted`) and `at` in Unix seconds. A read that itself fails leaves the original failure standing.
+
+A preemption prints `letify: <name> was preempted by Elice (state <state>)`. When the machine still exists it also prints `letify: <name> keeps its disk and public IP, which keep billing. 'eci compute vm delete <name> --cascade' removes them`. letify removes nothing.
+
+Recovery follows [Failure and retry](#failure-and-retry). The call already running fails, the runtime is discarded, and the call is retried up to `retries` times; when no retry is left, `SpotPreempted` itself is raised. A retry starts a machine again by the start steps above, so an idle machine is started and a deleted one is launched. There is no fall back to local execution. `spot_fallback = "none"` or `"ondemand"` on the account, default `none`, decides the price type of that retry. With `none` the retry uses spot again and prints `letify: <name> preempted, retrying on spot`. With `ondemand`, every later start of that instance in this process uses the ondemand machine and prints `letify: <name> preempted, retrying on ondemand machine <ondemand name>`.
+
+A preemption loses the worker's memory and every session cache handle. Files survive only on the machine's disk, which includes the workspace root, when Elice stopped the machine rather than deleted it, and in volumes, which live in the store.
 
 ### Inventory
 
@@ -167,7 +349,7 @@ A reserved session sets `CUDA_VISIBLE_DEVICES` to its reserved physical indices 
 
 > An `Instance` is one accelerator shape on one provider account.
 
-`colab.G4` is an `Instance`. It holds the provider, the accelerator name, the host placement, how many devices one session takes, and the core count, memory and VRAM the provider reported. `n * instance` returns a copy taking `n` devices. An instance has no method that changes where the host code runs, because that is the declaration's `host`.
+`colab.G4` is an `Instance`. It holds the provider, the accelerator name, the host placement, how many devices one session takes, and the core count, memory and VRAM the provider reported. `n * instance` returns a copy taking `n` devices, and `instance.priced("spot")` a copy with that price type, as [Price type](#elice-price-type) describes. An instance has no method that changes where the host code runs, because that is the declaration's `host`.
 
 The device count is part of the pool key, because a session holding two cards is not interchangeable with one holding one.
 
@@ -185,11 +367,43 @@ Every provider that can start a session without an accelerator registers it as `
 
 > How hard each declared instance's accelerator is working right now, read from the machine that owns it.
 
-`letify utilization` reports one row per instance: the provider alias, the accelerator, and for each physical device its utilization percentage, memory used against memory total, temperature and power draw. `nvidia-smi --query-gpu` is the single source, because it is the only reading present on every machine letify reaches and it needs no framework loaded.
+`letify utilization` reports, for each physical device, its utilization percentage, memory used against memory total, temperature and power draw. `nvidia-smi --query-gpu` is the single source for those readings, because it is the only reading present on every machine letify reaches and it needs no framework loaded.
 
-Where the reading comes from depends on where the device is. An instance on the local provider is read by running `nvidia-smi` here. An instance on a remote provider is read inside its live session, by shipping the same reader function through the ordinary call protocol, so no new channel and no new remote dependency is involved.
+Where the reading comes from depends on whether the machine outlives a session.
 
-An instance with no live session reports no devices and says why, because starting a session to measure its load would cost money and change the answer. A machine without `nvidia-smi` reports no devices with that as the reason. Neither is an error: the table lists every declared instance either way.
+| Provider | Scope | Read from |
+|---|---|---|
+| `Local`, `Shell`, `Tunnel` | `machine` | The machine itself, with no session: `nvidia-smi` here for `Local`, and over the provider's link for `Shell` and `Tunnel`. One row per provider |
+| `Colab`, `Elice`, `Modal`, `Kaggle` | `session` | Inside the instance's live session, by shipping the same reader function through the ordinary call protocol. One row per instance |
+
+A `machine` reading is read-only. It runs the three `nvidia-smi` queries the busy check runs, starts no process on a card and reserves nothing. Each device in it also carries who holds the card:
+
+| `holder` | Means |
+|---|---|
+| `letify` | This process has reserved the index |
+| `others` | Another user is computing on it, by the busy check rule under Inventory. `users` names them |
+| `mine` | Only the login user's own processes, or this client's workers, are computing on it |
+| `free` | No compute process is on it |
+| `unknown` | The utilization was read but the owner query failed |
+
+The first row of that table that applies wins. A `session` device has `holder` set to `None`.
+
+A `session` instance with no live session reports no devices and says why, because starting a session to measure its load would cost money and change the answer. A machine without `nvidia-smi`, or one the link cannot reach, reports no devices with that as the reason. Neither is an error: every declared provider is listed either way. `--json` prints the rows with `alias`, `accelerator` (`None` for a `machine` row), `scope`, `devices` and `reason`.
+
+The command prints one block per provider, with the same header, indent, gauge characters, colour and width rules as `letify usage`:
+
+```
+dept_gpu  shell
+  gpu0  Tesla P100-PCIE-16GB  free
+    load   [████████░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░]  20%
+    memory [████░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░░]  10%  1.6/16.0 GiB
+    41C  38W
+
+colab_pro_plus  colab
+  no live session, so nothing to measure
+```
+
+A card's header line is `gpu<index>  <name>  <holder text>`, where the holder text is `reserved by letify`, `busy: <users>`, `in use by your processes`, `free` or `holder unknown`, coloured cyan, red, yellow, green and not at all. The load line is left out when the card reports no utilization, the memory line when it reports no total, and the last line holds whichever of temperature and power the card reported. Each gauge is 16 to 40 cells: the terminal width minus 4 columns of indent, 7 of label, 2 brackets, 5 of percentage and 16 of memory text. Both gauges are coloured by the unused share with the thresholds `letify usage` uses. A `session` row's reason is printed as `<accelerator>: <reason>`, or once without the accelerator when every instance of the provider gives the same reason.
 
 The reading is taken at the moment it is asked for and carries no history. A load that has to be watched over time belongs in the caller's own loop, not in a CLI that shells out to `nvidia-smi` per poll.
 
@@ -202,6 +416,17 @@ The reading is taken at the moment it is asked for and carries no history. A loa
 **PyTorch forwarding** (`host="local"`) keeps Python, the data and the libraries in the local process and forwards PyTorch operators to a worker that holds the GPU. It supports PyTorch only. The local process needs any PyTorch build, a CPU build included, and the operators run on real CUDA tensors on the runtime. Local data and the local environment stay in place, at the cost of one network round trip at every point where the host reads a value back from the device. [PyTorch forwarding](#pytorch-forwarding) describes the mechanism.
 
 The declared function runs in the calling process, inside a session whose device worker is started on first use. It is not retried: a failure part way through has already run the function's side effects here once.
+
+### Placements a provider cannot serve <!-- id: remote-only-providers -->
+
+> A provider whose class sets `serves_host_local = False` cannot be declared with `host="local"`, and both the type checker and the decorator say so before anything runs.
+
+`Kaggle` sets it, because the Kaggle Acceptable Use Policy forbids circumvention tools and Kaggle does not support port forwarding, so no device stream can reach a Kaggle session. The refusal happens in two places:
+
+1. **The type checker.** The generated provider types annotate each accelerator of such an account as `RemoteOnlyInstance`, and `Launcher.function` has two overloads: one takes `RemoteOnlyInstance` with `host` typed `Literal[letify.remote, "remote"]` and no default, the other takes `Instance` or `AnyInstance`. `RemoteOnlyInstance` is not a subtype of `Instance` to a type checker, so `host=letify.local`, `host="local"` or no `host` at all matches neither overload and pyright and mypy report an error. At run time `RemoteOnlyInstance` is `Instance`. `letify.local` and `letify.remote` are `Final`, so a type checker sees their literal values.
+2. **The decorator.** `@let.function` raises `UnsupportedMode` naming the account and `host='remote'` when the resolved placement is local and the instance's provider does not serve it, at decoration, before any call. `let.providers.any` requests are checked when they resolve, in `check_mode`.
+
+The same mechanism fits a limit that makes a declaration impossible, such as `Modal`'s. It is not used for `has_fast_path`, because a slow path is a warning and the declaration still runs.
 
 A provider refuses a mode only when it cannot serve it. `Modal` refuses `host="local"` because it exposes function calls into a container and there is no device to forward at. `host="local"` is refused with `UnsupportedMode` when PyTorch does not import in this process or is older than 2.1. A provider without a fast path warns with its expected round trip and then runs, because the choice belongs to whoever wrote the declaration.
 
@@ -277,6 +502,8 @@ Streams multiplex the one pipe pair. Stream 0 carries `HELLO`, `STDOUT`, `STDERR
 
 A message is one Python object. It is pickled with protocol 5 and a `buffer_callback`, so every `PickleBuffer` inside it, such as a `bytearray`, a `bytes` value of 1 MiB or more at the top level or inside a list, tuple or dict, or a NumPy array, becomes an out-of-band buffer instead of being copied into the pickle. The head frame's payload is `<I>` buffer count, `<Q>` length of each buffer, then the pickle. The buffers follow in order as `DATA` frames of at most 8 MiB each. The sender writes each frame with `os.write` on a `memoryview` of the buffer, so no joined copy is made. The receiver preallocates one buffer per out-of-band buffer and fills it with `readinto`, then unpickles with `buffers=`. The high bit of a buffer's 8 byte length marks a buffer that unpickles as a `bytes` value. For such a buffer the receiver allocates an uninitialized `bytes` object of that length with `PyBytes_FromStringAndSize(NULL, n)` through `ctypes` and reads into it, so the unpickled value is that object and no copy is made. Where `ctypes` is unavailable it reads into a `bytearray` and `bytes()` copies it once. Any other buffer is read into a `bytearray`. Peak memory for a `bytes` value is therefore one copy on each side.
 
+A PyTorch tensor is pickled by letify's own reducer rather than by `Tensor.__reduce_ex__`, which copies the whole storage into the pickle. The reducer applies to an object of exact type `torch.Tensor` or `torch.nn.Parameter` on the CPU, with a strided layout, no autograd history of its own (a leaf) and at least one element. Such a tensor, made contiguous first when it is not, pickles as `torch.frombuffer` over its bytes, then `reshape` to its shape, then `requires_grad_` when it requires grad, and `Parameter` wraps it when it was one. Its bytes are a `PickleBuffer` when they are 64 KiB or more, so they travel as an out-of-band buffer written from the tensor's own memory, and a `bytearray` copied into the pickle otherwise. Every other tensor keeps PyTorch's own pickling. The reducer references PyTorch functions only, so a worker without letify unpickles it, and a message without tensors pays nothing for it. The same reducer is used by `wire.dumps`, by `codec.dumps_call_parts` on top of cloudpickle, and by the `put_blob` pickle of [argument addressing](#argument-addressing). A view is sent as the bytes it covers, not the whole storage it views, and two tensors that share one storage arrive as two separate tensors.
+
 On Linux both ends set every pipe they frame over to 1 MiB with `fcntl(F_SETPIPE_SZ)`, capped at `/proc/sys/fs/pipe-max-size`, so an 8 MiB chunk crosses in 8 writes instead of 128. A descriptor that is not a pipe, or a system that refuses, keeps its size.
 
 Frames of different streams interleave. A writer holds the write lock for one frame at a time, so a `stat` or `lease` request is sent between two 8 MiB chunks of a large upload, and a reply is not delayed behind another stream's data.
@@ -301,7 +528,11 @@ Nothing in this path runs per training step. A `print` inside a loop costs one p
 
 Any number of threads may send requests on one channel. Whichever waiting thread holds the read lock reads the next frame and hands it to the request it belongs to, so a `stat` or a lease renewal sent while a call runs gets its reply while the call is still running. On the worker, `stat` and `lease` are answered by the thread that reads frames. Every other request is queued and run in order on the worker's main thread, so user code runs on the main thread.
 
-A request that passes its timeout kills the worker process, which ends every read, and raises `RuntimeFailure`. A worker that closes its pipe fails every open request with `ProtocolError` quoting the last output.
+A request may be answered by more than one reply. Each reply of such a request carries whether it is the last, and the local process reads them in order on that request's stream until the last one arrives, which is when the stream id is released. The worker sends them from the thread that runs the request and never waits for the local process between two of them. `data_stream`, which [Writing back](#project-data-write-back) describes, is the only request answered this way.
+
+A request that passes its timeout kills the worker process, which ends every read, and raises `RuntimeFailure`.
+
+A body may fork, as `multiprocessing` and a `DataLoader` with `num_workers > 0` do. The thread that reads frames may hold the lock of `sys.stdin` at the fork, so every process forked from the worker replaces `sys.stdin` with `/dev/null` before anything else runs in it, and a child that closes `sys.stdin`, as `multiprocessing` does, never waits for that lock. On Linux each process forked from the worker asks for `SIGKILL` when the worker's main thread exits (`prctl(PR_SET_PDEATHSIG)`), so a worker killed by a timeout or closed with its session takes its forked children with it. A worker that closes its pipe fails every open request with `ProtocolError` quoting the last output.
 
 The worker never installs anything into the interpreter it starts on. Everything it runs before it moves to the project interpreter uses only the standard library: the ready line, workspace preparation, the environment build and the move itself. The worker imports cloudpickle only when it loads a call, so a system Python that lacks cloudpickle and refuses `pip install`, as an externally managed Python under PEP 668 does, still starts the worker. blake3 and letify are likewise imported only after the move, and blake3 falls back to blake2b where it is absent.
 
@@ -324,10 +555,12 @@ The protocol is one JSON object per line. letify sends `{"id": <int>, "op": <nam
 | Op | Fields | Value |
 |---|---|---|
 | `hello` | none | `{"modal": <installed Modal version>}` |
-| `create` | `app`, `args`, `packages`, `gpu`, `timeout` | `{"sandbox": <id>}`. Runs `app` as an ephemeral app on first use, builds `debian_slim` with `packages` installed, and starts `args` in a sandbox |
-| `write` | `sandbox`, `data` | `null`. `data` is base64. Writes the decoded bytes to the sandbox's standard input and drains it |
+| `create` | `app`, `args`, `packages`, `gpu`, `timeout`, `idle_timeout`, `volumes`, `ports` | `{"sandbox": <id>}`. Runs `app` as an ephemeral app on first use, builds `debian_slim` with `packages` installed, and starts `args` in a sandbox. Each port in `ports` is exposed with Modal `encrypted_ports` |
+| `tunnel` | `sandbox`, `port` | `{"host": <text>, "port": <int>, "tls": <bool>}`. The address that reaches `port` inside the sandbox, from `Sandbox.tunnels()`. `tls` is true when the connection has to be made with TLS, which an encrypted port needs |
+| `write` | `sandbox`, `data` | `null`. `data` is base64 of at most 1 MiB. Writes the decoded bytes to the sandbox's standard input and drains it. Modal refuses a write that would buffer more than 2 MiB, so the channel splits a larger frame into `write` requests of 1 MiB, in order |
 | `read_until` | `sandbox`, `prefixes` | `{"lines": [...], "eof": <bool>}`. The sandbox's stdout lines up to and including the first that starts with one of `prefixes`, or every line left when the stream ends |
-| `terminate` | `sandbox` | `null` |
+| `terminate` | `sandbox` | `null`. Also ends a sandbox this adapter did not create, found by id |
+| `billing_summary` | none | `{"metered_cost": <text>, "billed_cost": <text>, "credits": <text>, "start": <Unix seconds>, "end": <Unix seconds>}` for the current month, from `modal.Workspace.billing.summary()`. Amounts are decimal text in USD. `credits` is the `Credits` adjustment, negative when credit was applied |
 | `volume_put` | `volume`, `version`, `path`, `data` | `null`. `data` is base64 |
 | `volume_get` | `volume`, `version`, `path` | base64 of the file |
 | `volume_list` | `volume`, `version`, `path` | the paths under `path`, recursively |
@@ -335,9 +568,64 @@ The protocol is one JSON object per line. letify sends `{"id": <int>, "op": <nam
 
 Every volume op creates the volume when it is missing, as version `version`.
 
-The persistent channel to a sandbox is that sandbox's standard input and output, carried by `write` and `read_until`. The sandbox runs the bootstrap stub `python3 -u -c BOOTSTRAP`, and the worker source goes out first as the byte count line and source described above. Modal returns a sandbox's standard output as text, so the source the channel sends sets `_LETIFY_TEXT_FRAMES = True` after the frame code, and that worker writes each frame as one line holding the base64 of the frame's bytes. The channel reads those lines with `read_until` and `prefixes` `[""]`, one line per request, and decodes them back into frames. Frames sent to the sandbox are raw bytes, base64 encoded only inside the `write` request. A `read_until` that ends at end of stream without a reply raises `ProtocolError`.
+The persistent channel to a sandbox starts on that sandbox's standard input and output, carried by `write` and `read_until`. The sandbox runs the bootstrap stub `python3 -u -c BOOTSTRAP`, and the worker source goes out first as the byte count line and source described above. Modal returns a sandbox's standard output as text, so the source the channel sends sets `_LETIFY_TEXT_FRAMES = True` after the frame code, and that worker writes each frame as lines of base64 of the frame's bytes, each line encoding at most 36 KiB, so no line is longer than 48 KiB. Modal delivers a stdout line longer than 64 KiB as several lines, which are not base64 on their own, and ends the stream on a line of 768 KiB. Each line decodes on its own, because 36 KiB is a multiple of 3 bytes. The channel reads those lines with `read_until` and `prefixes` `[""]`, one line per request, and joins the decoded bytes back into frames. Frames sent to the sandbox are raw bytes, base64 encoded only inside the `write` request. A `read_until` that ends at end of stream without a reply raises `ProtocolError`.
 
 A missing uv raises `ProviderUnavailable` naming uv. A reply of kind `unavailable` raises `ProviderUnavailable` for `modal`. An adapter process that exits, or prints a line that is not the reply it was waiting for, raises `RuntimeFailure` carrying the adapter's standard error, because that is an infrastructure failure. A reply of kind `failure` raises `RuntimeFailure` with the adapter's message. One adapter process serves one provider or one backend and exits when its standard input closes.
+
+#### Ending a sandbox while a request is blocked <!-- id: modal-abort -->
+
+> A sandbox is terminated through a second adapter process, so a request blocked in the first adapter cannot keep the sandbox running.
+
+A `read_until` blocks until the sandbox prints a line, and the adapter answers one request at a time. So while a call runs, the adapter that carries it cannot take a `terminate`.
+
+- `Adapter` records the id of every sandbox `create` returned, until a `terminate` for it succeeds.
+- A request interrupted after its line was written and before its reply was read, by `KeyboardInterrupt` or any other exception, leaves the adapter out of step. Every later request on that adapter raises `RuntimeFailure` without writing anything.
+- `Modal.stop` and the `SHUTDOWN` frame written by `SandboxChannel.close` wait at most 5 s for the adapter's lock. Other requests wait as long as they need.
+- `Adapter.abort()` starts a second adapter process for the same account, sends it `terminate` for every recorded sandbox, and closes it. It then kills the first adapter's process group with `SIGKILL`. The first adapter is started in its own session, so that group holds only the adapter and its children. An aborted adapter is closed, and the provider starts a new one for its next request.
+- `Modal.stop` calls `abort()` when the adapter is out of step or its lock is still held after 5 s. The call timeout watchdog calls it through `SandboxChannel._kill`, so a call past its `timeout` ends its sandbox too.
+- The adapter's `terminate` for an id it did not create finds the sandbox with `modal.Sandbox.from_id` and terminates it. A sandbox that is already gone is not an error.
+
+Modal also bounds a sandbox that nothing terminates. `create` passes `timeout`, the entry option `timeout`, 3600 s by default, as the sandbox's maximum lifetime. It passes `idle_timeout`, the entry option `idle_timeout`, 600 s by default, after which Modal terminates a sandbox that is idle.
+
+### Modal data channel <!-- id: modal-data-channel -->
+
+> Once the worker has said hello over the sandbox's standard input and output, the channel moves its frames to a TCP connection through a Modal encrypted port. Standard input and output stay the control path and the fallback.
+
+`Modal.open_channel` creates the sandbox with `ports` `[DATA_PORT]`, where `modal.DATA_PORT` is 8765. The provider option `data_channel = false` creates it with no port and keeps every frame on standard input and output.
+
+After each `HELLO` that arrives over standard input and output, the first and the one after every `reexec`, the channel opens the data channel:
+
+1. It makes a token of 32 random bytes with `secrets.token_hex(32)` and sends the request `{"op": "listen", "port": DATA_PORT, "token": <token>, "wait": 60}` over standard input and output.
+2. The worker's frame reader answers that request itself, before reading another frame. It binds `0.0.0.0:<port>` with `SO_REUSEADDR`, sends the reply, and accepts connections until one authenticates, `wait` seconds pass, or a byte arrives on standard input.
+3. The channel asks the adapter for `tunnel` on `DATA_PORT` and connects to that host and port with a 30 s timeout, wrapping the socket in TLS with the tunnel host as server name when `tls` is true. It sets `TCP_NODELAY` and writes the line `LETIFY-DATA <token>\n`.
+4. The worker reads that line within 10 s and compares the token with `hmac.compare_digest`. A connection that sends anything else is closed and the worker accepts again. On a match it closes the listener, sends `HELLO` on the connection, sends every later frame there as binary frames under the old sender's lock so no frame is split, and its frame reader reads frames from the connection instead of standard input.
+5. The channel waits for that `HELLO` and then carries every request over the connection.
+
+TLS comes from the Modal tunnel. The channel's side of TLS is an `ssl.SSLObject` over two `ssl.MemoryBIO` buffers, not an `ssl.SSLSocket`, because the thread reading frames and a thread writing a request run at the same time and OpenSSL does not allow two threads inside one TLS object. One lock guards the TLS object and its buffers. A second lock orders the encrypted bytes on the socket. Socket reads and writes happen outside the first lock, so a write blocked on a full socket never stops the reading thread from decrypting. Each write encrypts at most 1 MiB. The token is what stops another client of the public tunnel address from speaking the protocol, and it travels only over the adapter's authenticated control path.
+
+#### Parallel data streams <!-- id: modal-data-streams -->
+
+> The data channel is `N` TCP connections through the same tunnel, called lanes, and a write of 1 MiB or more is split across all of them, because one TCP stream over a path with a round trip near 190 ms carries about 12 MiB/s.
+
+`N` is the provider option `data_streams`, an integer from 1 to 16, 4 when it is not set. Any other value raises `ConfigError` naming the account. `data_streams = 1` is the single connection described above, with no segment framing.
+
+With `N` above 1:
+
+1. The `listen` request carries `"streams": N`. Lane 0 authenticates with the line `LETIFY-DATA <token>\n` and lane `i` from 1 to `N - 1` with `LETIFY-DATA <token> <i>\n`. The channel opens the `N` connections at the same time. The worker accepts until every lane from 0 to `N - 1` has authenticated once, and closes a connection with a wrong token, an index out of range or an index already taken. Only then does it close the listener and send `HELLO`.
+2. The frames of both directions become one byte stream carried as segments. A segment is a frame header, `wire.HEADER`, with type 8 `SEGMENT`, flags 0, stream set to the lane index and length set to the segment's bytes, followed by the 8 byte little endian offset of its first byte in the byte stream, then the bytes. `SEGMENT` appears only on a lane, never inside the byte stream.
+3. A write shorter than 1 MiB (`wire.STRIPE_MIN`) is one segment on lane 0, sent by the writing thread. A longer write is cut into `N` pieces of `ceil(length / N)` bytes, the last one shorter or absent, and piece `i` goes on lane `i`. Lane 0's piece is sent by the writing thread and every other piece by that lane's own sending thread, and the write returns once every piece is sent. One lock holds a write from its offset to its last piece, so offsets follow write order. The 8 MiB `DATA` chunks of [Frames](#frames) are writes, so a large buffer crosses all lanes chunk by chunk.
+4. Each end has one reading thread per lane. It reads segments and hands them to one reassembly buffer keyed by offset, and the frame reader takes bytes from it in offset order only. A lane whose next segment does not start at the next undelivered offset waits before reading its bytes while the buffer holds more than 64 MiB (`wire.STRIPE_HOLD`), so memory held out of order stays bounded. A segment whose magic or type is wrong, or whose offset repeats bytes already received, ends the stream.
+5. The byte stream ends for its reader once every lane has reached end of stream or failed, and the bytes received in order before that have been delivered. The channel handles that as a closed connection. One lane ending leaves the others running, because a worker that replies to `reexec` and then replaces its process closes all lanes at once, and the reply may still be arriving on another lane when the first end of stream does. A malformed segment ends the stream at once. Shutting the socket of every lane is how closing and a request timeout end a blocked read.
+
+While the channel waits for `HELLO` each read waits at most 30 s, and a lane reading thread treats a socket timeout as no data yet. After `HELLO` reads wait without a limit.
+
+Socket buffers are left to the kernel. `SO_SNDBUF` and `SO_RCVBUF` are never set, because setting them turns off the kernel's buffer tuning and the value is capped at `net.core.wmem_max`, 212 KiB by default.
+
+When any step fails, a `tunnel` failure, a connection that does not open, or no `HELLO` within 30 s, the channel prints one line on stderr, `letify: <runtime>: the data channel did not open (<reason>); frames stay on standard input and output`, and keeps using standard input and output. The worker returns to reading standard input when a byte arrives there or its `wait` ends without an authenticated connection, so a request the channel sends over standard input after a failure is answered without waiting for `wait`.
+
+A `reexec` request goes over the data connection. The worker replies there and replaces its process, which closes the connection. The channel then sends the worker source over standard input, waits for `HELLO` there, and opens the data channel again.
+
+Closing the channel sends `SHUTDOWN` over the connection that carries frames and closes the socket. A connection that ends while requests are open fails them with `ProtocolError`, as a closed pipe does. A request timeout closes the socket, which ends the blocked read.
 
 The adapter never deploys an app. `create` starts `modal.App(app).run()` the first time it sees an app name and holds that context for the adapter's lifetime. When standard input closes, the adapter terminates its remaining sandboxes and then leaves every app context, which stops the ephemeral app. An adapter that dies stops sending Modal's client heartbeat, and Modal stops the ephemeral app for it. So no app named `app` stays on the account after letify stops.
 
@@ -352,6 +640,16 @@ Base64 appears only where a transport carries text: the one-shot driver, the Col
 On a one-shot channel the call travels inside a driver script that prints its base64 encoded outcome between `__LETIFY_RESULT_BEGIN__` and `__LETIFY_RESULT_END__`, so it can be found in a stream that also carries the user's prints. Absence of the marker is not a protocol quirk: it means the remote process died, and letify reports that as `ProtocolError` naming the likely causes.
 
 An `async def` body is awaited on the remote side, so it runs to completion there and can use `await` internally.
+
+### Child processes of a call <!-- id: call-child-processes -->
+
+> A process the body starts with `multiprocessing` or `torch.multiprocessing`, with the `spawn` or `forkserver` start method, can run a function or class the user's script defined.
+
+cloudpickle ships what the script's `__main__` defines by value, so in the worker such a function has `__module__` `"__main__"` but the worker's own `__main__` holds no attribute of that name. Standard pickling saves a function or a class by module and name, so without help a child's target fails with `PicklingError: attribute lookup ... on __main__ failed`.
+
+When the worker loads its first call it sets `reducer_override` on `multiprocessing.reduction.ForkingPickler`, the pickler `multiprocessing` uses for a process object, a queue and a pipe. For a function or a class whose `__module__` is `"__main__"` and which `sys.modules["__main__"]` does not hold under its qualified name, it returns `cloudpickle.loads` applied to `cloudpickle.dumps` of the object, so the child rebuilds it by value. Every other object keeps the reduction it had. The child imports cloudpickle from the runtime's environment, which includes it because letify depends on it.
+
+The `fork` start method copies the worker's memory and pickles no target, so it needs nothing.
 
 ### Session cache <!-- id: handles -->
 
@@ -390,11 +688,21 @@ The digest of an immutable argument is cached on the `Runtime` for the life of t
 
 The worker keeps the unpickled value of an immutable blob, so a repeated argument is not unpickled again either. For any other blob it keeps the pickle and the buffers, and unpickles a fresh copy for each call, so a call that mutates its argument does not change what the next call receives.
 
+### Argument blobs on a persistent disk <!-- id: persistent-argument-blobs -->
+
+> On a persistent provider an argument blob is also written under the workspace root, so a later session on the same machine receives the digest instead of the bytes.
+
+A session whose provider is persistent, prepares a workspace root and has a persistent channel sends `{"op": "blob_dir", "path": "<workspace root>/blobs", "limit": <bytes>}` once, after the interpreter check. From then on the worker writes every blob it receives with `put_blob` to `<workspace root>/blobs/<first two hex characters>/<digest>`, before it replies. A `bytes` blob is the file as it is. Any other blob goes to `<digest>.pickle`: the eight bytes `LTFYPKL1`, one byte that is 1 for an immutable value, a big-endian 32-bit part count, a big-endian 64-bit size per part, then the pickle and each buffer in order. A file is written to a name ending in `.partial.<pid>` and renamed, so a reader never sees half a blob.
+
+`have` reports a digest as held when it is in the worker's memory or its file exists, and sets that file's modification time to now. A call that names a blob the worker holds only on disk loads it into memory first. An ephemeral provider sends no `blob_dir`, so its worker writes nothing.
+
+After each write the worker lists the blob directory and removes files, oldest modification time first, until their total size is at most `limit`. `limit` is 32 GiB. The file just written is never removed by its own write.
+
 ### Failure and retry
 
 > Infrastructure failure may be retried. User code failure never is. Neither falls back to a slower path.
 
-`RuntimeFailure` and `ProtocolError` mean the session misbehaved, so the runtime is discarded and the call is retried on a fresh one up to `retries` times. `RemoteError` means the shipped function raised, and it propagates with the remote traceback attached.
+`RuntimeFailure` and `ProtocolError` mean the session misbehaved, so the runtime is discarded and the call is retried on a fresh one up to `retries` times. Before that, `Provider.diagnose(runtime, failure)` may replace the failure with a more specific infrastructure failure, as Elice does with `SpotPreempted`; the default returns it unchanged. A `SpotPreempted` left after the last retry is raised as it is. `RemoteError` means the shipped function raised, and it propagates with the remote traceback attached.
 
 A `RuntimeFailure` raised for a failed command carries `command` and `stderr`, and its message names the command and the last 40 lines of stderr. The `RuntimeLost` raised after the last retry keeps the last failure's message, `command` and `stderr`.
 
@@ -408,7 +716,7 @@ Everything above a runtime is declaration. Creating one is when a provider actua
 
 A runtime boots in seven steps:
 
-1. Open the channel. The worker starts on the bootstrap interpreter: the account's `python` option, `python3` by default.
+1. Open the channel. The worker starts on the bootstrap interpreter, `python3`.
 2. Arm the lease.
 3. Prepare the workspace root, as Workspace root describes: expand `~` on the runtime, create the directory, make it the worker's working directory, and point `TMPDIR` at `<workspace root>/tmp`.
 4. Build the environment: restore the environment archive, or run `uv sync` in the project directory, as Environment describes.
@@ -416,7 +724,9 @@ A runtime boots in seven steps:
 6. Check the worker's interpreter version against the local one.
 7. Attach volumes.
 
-Step 3 is skipped on the local provider, whose worker keeps the working directory of the process that started it. Steps 4 to 6 are skipped on the local provider, which already runs in the project's environment. Steps 1 to 5 run on the bootstrap interpreter and use only the standard library, as Channels describes. Steps 4 and 5 are skipped when the account sets `python`, which means the user manages the interpreter on that machine. In their place the worker checks that the interpreter can import cloudpickle, and one that cannot raises `ConfigError` naming the interpreter and the missing module. Step 6 still runs then.
+Step 3 is skipped where `prepares_workspace` is false, and steps 4 and 5 where `remote_env` is false. Both are the local provider alone: its worker is a subprocess of this process, so it keeps the working directory it was started in and already runs in the project's environment. No other provider turns either off, and no account setting can.
+
+Step 6 runs everywhere, with nothing to turn it off. cloudpickle ships a function defined in `__main__` as bytecode, which does not load across Python minor versions, so a worker whose version differs cannot run the call at all. Skipping the check only moves the failure to a place that reads as the user's bug. On the local provider the worker is this interpreter, so the check passes without a round trip. Steps 1 to 5 run on the bootstrap interpreter and use only the standard library, as Channels describes.
 
 ### Pooling
 
@@ -450,11 +760,11 @@ What the lease actually does is exit the worker process, which releases the occu
 | `Shell`, `Tunnel` | nothing; the card is occupied | the worker exits, so the card frees |
 | `Modal` | the sandbox | **guaranteed.** A deadline is set when the sandbox is created and Modal enforces it |
 | `Colab` | the runtime | not guaranteed. Colab's own idle policy is what ends it |
-| `Elice` | the allocation | **not guaranteed.** An allocation bills until something issues the delete |
+| `Elice` | the started machine | **not guaranteed.** A started machine bills compute until something runs `eci compute vm stop` |
 
-Where it is not guaranteed, the preferred answer is a deadline at creation time, because the platform outlives the caller. Modal takes one and letify sets it. Whether the Elice allocation API takes one is unverified.
+Where it is not guaranteed, the preferred answer is a deadline at creation time, because the platform outlives the caller. Modal takes one and letify sets it. `eci compute vm launch` documents no deadline.
 
-Where the platform takes none, the intended bound is reconciliation: the next letify process asks the provider what is running under this project's name and ends what nothing is watching. That is not immediate, and it is **not implemented yet**, so today an Elice allocation left by a killed machine bills until somebody deletes it. It is listed under Known gaps.
+Where the platform takes none, the intended bound is reconciliation: the next letify process asks the provider what is running under this project's name and ends what nothing is watching. That is not immediate, and it is **not implemented yet**, so today an Elice machine left started by a killed process bills until somebody stops it. It is listed under Known gaps.
 
 There is no detached execution. A detached run whose remote side is preempted would lose its results, so the local process stays the owner and durability comes from checkpoints in the store.
 
@@ -465,6 +775,8 @@ There is no detached execution. A detached run whose remote side is preempted wo
 `Launcher.status()` answers three questions: how many sessions exist, how many are serving a call, and what each one is. `live` and `busy` are counts, and `devices` reports each provider's inventory against what is reserved, so a reader can see at a glance whether a call is waiting for a card. `runtimes` describes each session: its name, provider, accelerator, the device indices it holds, placement, whether it is busy and how long it has been idle.
 
 Nothing internal is reported. The pool holds a guard so that a session released by one call is not ended while an overlapping call is still running, and whether that guard is currently open is a fact about the pool's implementation rather than about what is running. A field among counts that looks like a count and is actually a boolean is worse than no field, because it is read as a count.
+
+Each runtime also reports `price_type`, as [Price type](#elice-price-type) describes, `uptime_seconds`, the `link` strategy its provider connected over and the `rtt_ms` that link measured, each `None` where there is none. `letify status` asks `usage()` only of providers with a live runtime, because a runtime is what costs money, and adds that record as `usage`.
 
 `status()` describes this process only. A session started by a different process is not in it, since the pool lives in the process that owns it. What a machine itself is doing is a different question, answered by `letify utilization`.
 
@@ -485,7 +797,7 @@ refs/<name>
 
 Immutability buys two things. Concurrent writers cannot conflict, because different contents get different names, where a two way synchronization loses one writer's changes to the other. And nothing is verified twice, because holding a digest is proof of holding the contents.
 
-Refs carry the mutable part, in the way Git keeps branch names apart from objects. A ref is a few dozen bytes, so a last writer wins race on one is harmless and both blobs survive it. letify reserves `env/<env key>-<platform>` for environment archives and `path/<path key>` for project data; nothing else is written there.
+Refs carry the mutable part, in the way Git keeps branch names apart from objects. A ref is a few dozen bytes, so a last writer wins race on one is harmless and both blobs survive it. letify reserves `env/<env key>-<platform>` for environment archives; nothing else is written there. Project data needs no ref, because a call carries its own manifest.
 
 ### Blob granularity
 
@@ -515,28 +827,217 @@ The environment archive is automatic. The first session that runs `uv sync` for 
 
 A volume's files on a runtime live in its volume directory, `<workspace root>/volumes/<volume name>`. A blob materialized without a named destination is written to `<volume directory>/blobs/<first two hex characters>/<digest>`. The volume option `mount` names another directory for one volume; nothing else sets it. A restored `.venv/bin/python` that does not start is treated as no archive, and the session syncs. Nothing in the public surface names this step.
 
+### Volumes on a persistent runtime <!-- id: persistent-volumes -->
+
+> On a persistent provider the volume directory under the workspace root is the runtime's copy of the volume. A file is sent only when that copy does not already hold its digest, and no environment archive is packed or restored.
+
+A persistent runtime keeps `<workspace root>/volumes/<volume name>` between sessions, so a later session already holds what an earlier one received. The volume directory holds a manifest, `.letify-manifest.json`, mapping each materialized destination path to the digest, size in bytes and modification time in nanoseconds it had when it was written.
+
+Before a blob is written to a destination that is not unpacked, the local process asks the runtime for that manifest entry. When the entry names the same digest and the file on disk still has the recorded size and modification time, nothing is sent. Otherwise the blob is written as Materializing into a runtime describes, and the entry is recorded. A file changed on the runtime by anything other than letify fails the size or time comparison and is sent again. The manifest is replaced atomically, so a session that reads it while another writes sees one version or the other, and at worst sends a file twice.
+
+A persistent provider builds its environment with `uv sync` in `<workspace root>/project/<env key>` every session, and never packs the project directory into a volume or unpacks an archive from one. A sync over an existing `.venv` checks it and installs nothing, so it is faster than any archive transfer, and the `.venv` is already on the disk the archive would be unpacked to.
+
+An ephemeral provider keeps the behaviour of Materializing into a runtime: every file is sent each session, and the environment archive is packed and restored.
+
 Nothing hands a session to the caller. There is no call that returns one, no argument that takes one, and no way to hold the wrong one, because which session serves a call is the pool's answer to work out from the declaration.
 
 ### Project data <!-- id: project-data -->
 
-> A call's data is found in the call itself. Every `pathlib.Path` the function reaches travels with it: the local contents go up to the provider's volume, the runtime sees the same path already filled, and what the call changes under it comes back when the call ends.
+> A call's data is found in the call itself. Every local `pathlib.Path` the function reaches is sent as content addressed file blobs, only the blobs the runtime or the account's bucket lacks travel, and the body sees a path on the runtime with the same layout. The call is sent once the first wave of a send order derived from the call is placed, and the rest of the dataset arrives in the background while the call runs. What the body writes into a detected directory or a path that did not exist comes back to the local path when the call returns. The runtime's file blob cache is kept within a byte budget.
 
-The declared function is sent with cloudpickle, which serializes its closure variables, the globals it references, its default arguments and the call's arguments. letify's pickler intercepts every `pathlib.Path` among them through `reducer_override`. Nothing is declared: the function's own references are the declaration, which is what makes the decorator behave as a closure over the data it uses.
+The declared function is sent with cloudpickle, which serializes its closure variables, the globals it references, its default arguments and the call's arguments. letify's pickler intercepts every `os.PathLike` among them through `reducer_override`. Nothing is declared: the function's own references are the declaration.
 
-A path is project data when it exists on the local machine at call time, as a file or a directory. For each one:
+Detection runs on a persistent channel only. A one-shot channel has no worker to hold a cache, so its paths travel as plain paths. A Kaggle account with a registered session has a persistent channel, so a call to one carries its project data like any other provider's does.
 
-1. The local contents are packed into content addressed blobs, large files as their own blobs and trees of small files as one archive, and only the digests the volume is missing are uploaded, directly to the backend.
-2. The ref `path/<path key>` records the manifest, where the path key is the digest of the path resolved against the project root.
-3. In the pickled call, the path is replaced by the path the runtime materializes it at, under the volume directory, so the function body uses it unchanged.
-4. Before the call runs, the runtime pulls the manifest's blobs straight from the backend, as Materializing into a runtime describes.
+#### Which paths are data <!-- id: project-data-detection -->
 
-A path that does not exist locally is an output location. It is created empty in the runtime and replaced the same way.
+A path is project data when all of these hold at call time:
 
-When the call returns, the runtime compares each replaced path with the manifest it started from. Files that are new or changed are stored as blobs in the volume, and the local process writes them back to the local path. So a checkpoint written under a referenced `Path` is on the local disk when the call returns, and the next session receives it as input with no separate resume step.
+1. `os.fspath` gives a `str`, and it names an existing regular file or directory on the local machine, or nothing at all.
+2. Its resolved form is inside an allowed root. The allowed roots are the project root, which is the nearest directory upward from the working directory holding a `pyproject.toml` or the working directory when there is none, and each entry of `[tool.letify] data_roots` in that `pyproject.toml`, relative to the root.
+3. It is not the project root itself nor a directory above it, because a path such as `Path(__file__).parent` names the code and its `.venv`, not data.
 
-Only `pathlib.Path` objects are detected. A string that happens to name a local file is left alone, because no rule can tell a path from any other string, and uploading on a guess would send data the user did not mean to send.
+A detected path that exists is an input. A detected directory and a detected path that does not exist are also output locations, which Writing back describes. An existing file is an input only.
 
-Detection costs one `stat` per path per call, and packing is skipped when the manifest ref already matches the local tree's modification times and sizes.
+Any other path is pickled unchanged, so the body receives the local path as it was. Only `os.PathLike` objects are detected. A string that happens to name a local file is left alone, because no rule tells a path from any other string.
+
+A directory is walked without following symbolic links to directories. Regular files and symbolic links to regular files are included. Entries named `.git`, `.venv` and `__pycache__` are skipped.
+
+#### Digests and the digest cache <!-- id: project-data-digests -->
+
+Each file is one blob, named by the blake3 digest of its contents with 16 byte output, the digest of Argument addressing. A file of 64 MiB or more is hashed through a memory map with blake3's multithreaded update. A directory is a manifest: a list of relative POSIX path, digest and size per file, sorted by path.
+
+The local digest cache is `~/.cache/letify/digests.json`. An entry is keyed by the resolved path and holds size, modification time in nanoseconds, inode and digest. A file whose four stat fields match its entry is not read again. The file is replaced atomically after a call that added or changed an entry.
+
+#### Where the bytes come from <!-- id: project-data-transfer -->
+
+The runtime keeps a file blob cache at `<workspace root>/data/blobs/<first two hex characters>/<digest>`. A cache file is made read-only when it is committed. Before a call the local process asks the worker which digests that cache holds with the expected size, with one `data_have` request. Then:
+
+| Provider | Missing blobs come from |
+|---|---|
+| persistent (`shell` or `tunnel` with `persistent = true`, `modal`, `elice` with a persistent account, `local`) | the local process over the channel. The cache is on the machine's own disk, so a later session already holds what an earlier one received |
+| ephemeral, account sets `bucket` | the bucket. The local process lists the bucket once, uploads the digests the bucket lacks straight to it, and the worker downloads the rest into its cache |
+| ephemeral, no `bucket` | the local process over the channel, every session |
+
+`bucket = "<name>"` on an account names a Cloud Storage bucket for its data, reached as the `gcs` backend describes. `bucket_prefix` sets the object prefix, `letify` by default, and `bucket_endpoint` and `sts_endpoint` point the client and the token exchange elsewhere. A persistent account ignores `bucket`.
+
+The file blob cache lives inside the runtime's container, so it disappears when the container does. A later container on the same ephemeral provider can therefore fetch from an object store outside the container or from the local process, and from nothing else, which is why `bucket` exists. The two problems are answered separately: the bucket removes the repeated upload of a dataset the account has already sent once, and the send order with the background sender removes the wait before the first step. Neither replaces the other.
+
+Over the channel, a file travels in `data_put` requests of at most 64 MiB each, carried as out-of-band `DATA` frames. The worker writes them to `<digest>.partial.<pid>`, checks the digest of the whole file, and renames it into the cache. A digest that does not match raises `RuntimeFailure` and nothing is renamed.
+
+From the bucket, the worker receives one `data_pull` request naming each missing digest's object URL and the request headers, which carry a read token downscoped to the bucket and prefix exactly as Materializing into a runtime describes. It downloads up to 8 objects at a time into the cache with the same partial file and digest check, and discards the headers when the request finishes.
+
+An upload of 64 MiB or more shows the download progress line of Installing external tools on standard error, with `uploading` in place of `downloading`.
+
+#### The send order and the first wave <!-- id: project-data-send-order -->
+
+The local process does not send the whole dataset before the call. It computes a send order over the missing blobs, sends the first wave of that order, sends the call as soon as that wave is placed on the runtime, and keeps a background sender pushing the rest in the same order while the call runs. So the wait before the call is the first wave, not the dataset.
+
+The first wave is decided before the call is sent, by analysing what the local process already holds, because nothing is running remotely yet and there is nothing to observe. The order after the call starts comes from the runtime instead, from the reads the body actually makes, which Observing the read order on the runtime describes. The code-object scan below serves the first wave only and is not the source of the later order.
+
+The analysis reads three things, in this order of authority:
+
+1. **The pickled arguments.** An object among the arguments, defaults, closure cells or referenced globals that carries a file order gives that order directly. A list, tuple or dict of detected paths is read in its own order. An object that exposes `letify_read_order()` returning an iterable of `os.PathLike` is asked, and its answer is used as given. A `torch.utils.data.Dataset` is inspected for a sequence attribute of detected paths, `samples`, `imgs`, `files`, `paths` or `image_paths`, the names PyTorch's own dataset classes use. When a `torch.utils.data.DataLoader` is among them, its `sampler` or `batch_sampler` is iterated once with the generator it carries, and the indices it yields reorder that sequence. So a shuffled loader with a fixed seed gives the exact epoch order, and an unseeded one falls to the sequence's own order.
+2. **The function's code.** The declared function's code object, and the code objects of the functions it names in its globals to a depth of 2, are walked for the constants and names they carry. A detected path that appears as a constant, or a global whose value is a detected path, is ordered by the position of its first read. A read is a call in the code to `open`, `io.open`, `os.open`, `Path.open`, `read_text`, `read_bytes`, `np.load`, `np.memmap`, `torch.load`, `pandas.read_csv`, `pandas.read_parquet`, `PIL.Image.open`, `json.load`, `pickle.load` or `safetensors.torch.load_file`, taken by attribute or function name, with the path as an argument. A detected directory named by a call to `glob`, `rglob`, `iterdir`, `listdir`, `scandir` or `walk` contributes all of its files at that position, in manifest order.
+3. **The manifest.** Everything the first two steps did not place, and every detected path when they placed nothing, follows in manifest order, that is by detected path index and then by relative POSIX path.
+
+The analysis reads objects and code. It imports nothing, calls no user function except a sampler's iteration, and catches every exception it raises: an analysis that fails falls back to manifest order for the paths it could not place, and the call is not affected.
+
+The first wave is the leading part of the send order, cut at the first of 512 MiB and 256 files. An account sets both with `data_first_wave_mib` and `data_first_wave_files`, and `data_first_wave_mib = 0` sends the call with nothing placed. A blob the runtime or the bucket already holds costs nothing and does not count against either limit.
+
+A declaration overrides the analysis. `@let.function(data_order=...)` takes an iterable of `os.PathLike`, or a callable taking the call's bound arguments and returning one, and its answer is the send order, with anything it leaves out following in manifest order. `data_first_wave=<n>` on the same decorator counts the leading entries of that order to place before the call, in place of the byte and file limits. An explicit `data_order` also outranks the runtime's observation, so a user who knows the order is never second-guessed.
+
+#### Observing the read order on the runtime <!-- id: project-data-observed-order -->
+
+Once the call is running, the order comes from the reads the body makes, not from a prediction. The worker instruments three points, each of which calls the original unchanged and only reports what it saw to the worker's send order queue, which reorders the local process's background sender through `data_want` requests naming a list of digests in the order they are wanted.
+
+1. **`torch.utils.data.DataLoader`.** The worker wraps the class in the process that runs the body. On iteration it reads the loader's `sampler` or `batch_sampler` ahead of the loop, `data_prefetch_batches` batches in advance, 64 by default on the account, maps each index to the dataset's file through the sequence attributes The send order and the first wave lists, and reports those digests. This is the main source: a shuffled sampler with a fixed seed yields its indices long before the loop reaches them, so the request goes out many batches ahead of the read.
+2. **`Dataset.__getitem__`.** Wrapped as the fallback for a body that indexes a dataset without a `DataLoader`. It reports the files that item names, and the next `data_prefetch_batches` indices in the dataset's own order.
+3. **`builtins.open` and `pathlib.Path.open`.** The same wrapper the body sees for a file that has not arrived reports every opened path under a call directory, arrived or not. This is one step behind the read it reports, so it is a hint for a sequential pass over a directory, not a prefetch.
+
+A `DataLoader` with `num_workers > 0` reports through the parent. The wrapper reads the sampler in the parent process, where the indices are produced, so a worker process sends nothing and needs no channel of its own. A worker that reaches a file the parent did not report falls back to the blocking read of Streaming the rest while the call runs.
+
+`data_observe = false` on the account turns all three wrappers off, and the send order stays as the first wave analysis left it. Nothing else changes: the blocking read still serves a file that has not arrived.
+
+A missed prediction is logged. When the observed order asks for a digest the send order had placed later than the next 32 entries, the worker counts it as a miss, and the call's data log line reports the misses through `first access waited`, with the blocking reads reported separately by the line Streaming the rest while the call runs names.
+
+#### Streaming the rest while the call runs <!-- id: project-data-streaming -->
+
+Everything streams. There is no dataset size below which the old behaviour of sending every blob before the call is kept, because two paths would be two behaviours to specify, to test and to explain, and the streaming path already sends a small dataset in its first wave: 512 MiB at the measured 85 to 90 MiB/s is the same 6 seconds either way.
+
+The call request carries the manifest: every file of the call keyed by the runtime path it is placed at, with its digest and size, and the send order the local process derived. The worker keeps both for the life of the call. It travels inside the call request rather than as a request of its own, because a separate message could arrive after the call it describes and the worker would then answer a read with no manifest to answer it from. It is what makes a directory listing complete before any byte of it has arrived, which What the body sees before a file arrives describes.
+
+The background sender then sends the blobs that are not yet placed, in send order, in `data_put` requests as Where the bytes come from describes. It runs on the session's channel beside the call, and a blob is never sent twice.
+
+A call whose files the runtime already holds streams nothing, and pays for none of this. The local process sends such a call with no manifest, no send order and no observation settings, and asks for no wait statistics when it ends. The worker then places every file before the body starts, installs no pending patch, writes no manifest file for a spawned child and wraps no data loader, because each of them could only answer that every file is already there. This is the repeat run of a dataset a researcher is iterating on, so it is the common case rather than an edge one, and the streaming machinery must not tax it. The data log line still reports what was detected and what was already on the runtime.
+
+For an ephemeral provider with a `bucket`, the same order governs both halves: the local process uploads the missing blobs to the bucket in send order, and the worker pulls in send order with up to 8 objects at a time, so the runtime pulls directly and the local uplink is out of the path for every blob the bucket already holds. The worker is told a digest is available to pull by a `data_pull` request the local process sends as each upload completes.
+
+A blocking read is the backstop, not the mechanism. When the body opens a file whose blob has not arrived, the worker sends one `data_want` request naming the digest, the sender moves that digest to the front of its queue, and only the thread that opened the file waits. The call, its other readers and the background sender keep running. Every `data_want` means the analysis predicted the order wrong, so the worker counts them and the data log line reports the count and the total wait, and a call with at least one blocking read prints on standard error:
+
+`letify: data waited for <files> files <size> not sent in time, <seconds> s total, first <relative path>`
+
+#### What the body sees before a file arrives <!-- id: project-data-pending -->
+
+The layout is complete before the call starts and only file contents arrive later. The worker creates every directory of the manifest in the call directory, and places a file at its runtime path only when its blob is complete in the cache, by the hard link or copy of Materializing and the rewritten path. Nothing is placed half written, so a file that exists on the runtime's real file system holds all of its bytes.
+
+A file that has not arrived is answered from the manifest instead. The worker installs a patch in the process that runs the body, covering paths under the call directory only:
+
+| Call | Before the file arrives | After |
+|---|---|---|
+| `os.listdir`, `os.scandir` | every manifest entry of that directory, arrived or not, so `Path.iterdir` and `glob` are complete from the start | the same entries |
+| `os.stat`, `os.lstat` | the manifest's size and mode, so `Path.exists()` is `True`, `Path.is_file()` is `True` and `Path.stat().st_size` is the final size | the real file's `stat` |
+| `builtins.open`, `io.open`, `os.open` | sends `data_want` and blocks that caller until the blob is placed, then opens the real file | opens the real file |
+
+A data loader therefore lists the directory, gets every file, and reads them in an order the send order was built to match.
+
+The patch lives in the worker process, so a body that forks, including a PyTorch data loader worker, inherits it. For a process started fresh, such as one spawned by `multiprocessing` with the `spawn` method, the worker puts a directory holding a `letify_pending.pth` on `PYTHONPATH`, which installs the same patch at interpreter start. A process the body starts that is not a Python interpreter, for example an `ffmpeg` invocation, sees only the files that have arrived, and the declaration should name `data_first_wave` large enough to cover what it reads.
+
+The worker writes that manifest, installs the patch and wraps the loader while holding the same lock the data thread takes to place a file. The data thread moves a path out of the pending map and into the placed map as each blob completes, so a writer reading the live maps could see a path in neither of them, or fail outright because a map changed size while it was being read.
+
+The body thread reads the pending map only through a snapshot it takes under that same lock, and iterates the snapshot rather than the live map. A directory listing therefore never observes a map that the data thread is changing size, so `os.listdir` and `os.scandir` cannot fail mid listing.
+
+#### When a blob does not arrive <!-- id: project-data-streaming-failures -->
+
+- **A blob that never arrives.** A `data_want` unanswered for `data_wait_timeout` seconds on the account, 600 by default, fails that open with `RuntimeFailure` naming the relative path and the digest. The call is not killed, because the body may handle it; the failure is infrastructure, so a retry of the call is allowed.
+- **A client that disconnects mid stream.** The session ends as any lost channel ends it. Every blocked reader is woken with `RuntimeFailure`, the call ends with it, and no partial file is ever placed or read. A `.partial` file is removed when the worker next starts.
+- **A call that finishes before the background transfer.** The transfer is cancelled, both the channel sender and any bucket upload not yet started. A blob already committed to the cache stays and counts as held for the next call, and a partial one is removed. The write-back and the `data_evict` request follow the cancellation, in that order.
+- **A bucket-backed ephemeral provider.** A pull that fails is retried twice with the same downscoped headers, then a third time with headers the local process derives again, and a pull that still fails fails the open with `RuntimeFailure`. A `data_want` for a digest not yet uploaded moves that object to the front of the upload queue, and the worker pulls it when the local process sends its `data_pull`.
+
+#### Ordering with write-back and the cache budget <!-- id: project-data-streaming-order -->
+
+A blob still being written is never evicted. Runtime data cache budget skips a blob whose link count is above 1 and one used within the past 600 seconds; a blob that is pending or in flight for any running call is skipped as well, by the manifests the worker holds, and partial files are skipped as they already are.
+
+A write-back waits for nothing that is still arriving. It runs after the transfer is cancelled, and it uses the worker's manifest to decide what to walk: a file that was never placed is unchanged by definition, so it is not fetched, not hashed and not written back. A file placed during the call is compared exactly as Writing back describes.
+
+#### Materializing and the rewritten path <!-- id: project-data-materialize -->
+
+Each call that carries data gets a call directory, `<workspace root>/data/calls/<call id>`, where the call id is 16 random hex characters. The `n`th distinct detected path, counted from 0, is placed at `<call directory>/<n>/<name>`, where `<name>` is the local path's final component. A file is placed there; a directory is recreated there with every manifest entry at its relative path. For a path that does not exist, only `<call directory>/<n>` is created, so the body may create a file or a directory at the runtime path. Each entry of an input-only file is a hard link to the cache file, or a copy where a hard link fails. Each entry inside a directory is a writable copy of the cache file, because a directory is an output location and the body may rewrite a file in it, which a read-only link refuses. The same local path detected twice in one call maps to the same runtime path.
+
+In the pickled call a detected `pathlib.Path` is replaced by `pathlib.Path(<runtime path>)`, and any other `os.PathLike` by the same `pathlib.Path`. The worker creates the call directory before it loads the call, and removes it after the call's outcome is computed, whether the body returned or raised.
+
+#### Data log line <!-- id: project-data-log -->
+
+A call that detected data prints one line on standard error:
+
+`letify: data <files> files <size> detected, <files> files <size> already on <the runtime|the bucket>, sent <files> files <size> before the call in <seconds> s, <files> files <size> during it in <seconds> s (<rate> MiB/s), first access waited <seconds> s`
+
+The line is printed when the call has at least one input file, after the call's outcome is known, because what was sent during the call is not known before then. Sizes are in MiB with one decimal. `<the bucket>` is named when the bytes come from the bucket. `before the call` counts the first wave of The send order and the first wave, `during it` counts what the background sender delivered while the call ran, and the rate covers both. `first access waited` is the wall clock time in which at least one reader was blocked on a blob that had not arrived, and it is `0.0` when the send order was right.
+
+A call with an output location that returned prints a second line after the write-back:
+
+`letify: data wrote back <files> files <size> in <seconds> s (<rate> MiB/s), <files> files <size> already on the client`
+
+#### Writing back <!-- id: project-data-write-back -->
+
+When a call with an output location returns, every file the body created or changed at the output's runtime path is copied to the same relative path under the local path. A call that raised writes nothing back. The background transfer is cancelled before the write-back starts, and a file the streaming path never placed is unchanged by definition, so a write-back waits for nothing that is still arriving.
+
+On the runtime, after the body returned and before the call directory is removed, the worker walks each output's runtime path as Which paths are data walks a directory, without following symbolic links. A file is unchanged when it is the hard link or copy the worker placed and its inode, size and modification time in nanoseconds equal those recorded when it was placed; it is not read. Any other regular file is hashed with the file digest, and a file whose digest equals the digest placed at that relative path is unchanged too. Each changed file is renamed into the file blob cache and made read-only, or dropped when the cache already holds its digest with its size. The worker keeps the list of relative path, digest and size per output under the call id until the local process asks for it with one `data_written` request, which removes it.
+
+When the runtime path of an output that did not exist is a regular file, the local path receives that file. When it is a directory, the local path becomes a directory holding the changed files. When nothing was created there, nothing is written.
+
+Deletions are not written back. A file the body removed from an output location stays on the local disk, because a missing file on the runtime cannot be told apart from a file the body never needed, and write-back never destroys local data.
+
+On the local side, a listed file whose local copy exists with the same digest, by the digest cache, is skipped and counted as already on the client. Every other file travels as one `data_stream` request naming its digest, not one request per piece, because a request per piece leaves the link idle for a round trip and for the runtime's own disk read between pieces.
+
+The worker answers a `data_stream` request with a sequence of replies on that request's stream, each carrying at most 8 MiB of the file in order as an out-of-band `DATA` frame, the last one marked as the end. It reads and sends the next piece without waiting for the local process, so the pipe's own capacity is the only thing that paces it. A piece the worker cannot read ends the sequence with a failed reply, which raises `RuntimeFailure`.
+
+The local process hands each piece to one writing thread through a queue holding at most 4 pieces, so receiving the next piece overlaps writing and hashing the one before it. The writing thread appends each piece to `.<name>.letify-partial.<pid>.<thread id>` beside the target and updates the file digest as it writes, rather than reading the file again afterwards. When the last piece has been written the local process compares the digest, then renames the file over the target with `os.replace` and records the new file in the digest cache. A digest that does not match raises `RuntimeFailure` and the partial file is removed. A download of 64 MiB or more shows the download progress line of Installing external tools.
+
+Concurrent calls that write back to the same local path take one local lock per resolved local path, held for the whole write-back of that output. So one call's files land after the other's, never interleaved inside one file, and the last call to return wins per file. Files only one of the calls wrote are all kept.
+
+A file placed as a hard link shares its inode with the cache file. When a body writes into such a file in place, which a process running as root can do despite the read-only mode, the cache file no longer matches its digest. After every call, whether it returned or raised, the worker compares each placed cache file's size and modification time with those recorded at placement and removes the cache file when they differ, so the next call receives the digest again.
+
+#### Runtime data cache budget <!-- id: project-data-cache-budget -->
+
+The file blob cache under `<workspace root>/data/blobs` is kept under a byte budget by evicting the least recently used blobs no running call links to.
+
+The budget is `data_cache_gib` on the account, in GiB, when it is set. Otherwise it is the smaller of 50 GiB and half of the cache's current size plus the free space of the file system holding it, measured by the worker when it checks.
+
+A blob's last use is its modification time. Committing a blob sets it, and the worker sets it to the current time for every digest a `data_have` request finds and every blob a call links or copies.
+
+After each call whose data sending uploaded or pulled at least one blob, or whose write-back listed at least one file, whether the call returned or raised, the local process sends one `data_evict` request after the write-back has finished, with the cache directory and `data_cache_gib` in bytes or none. When the cache total is over the budget, the worker removes blobs oldest last use first until the total is within it, skipping:
+
+1. a blob whose link count is above 1, because a running call's directory links it;
+2. a blob last used within the past 600 seconds, because a call may have been told the runtime holds it and not yet linked it;
+3. a blob a running call's manifest lists as pending or in flight, because it is still arriving for that call;
+4. partial files.
+
+So the cache can stay over the budget while every remaining blob is linked or recent. When at least one blob was removed, the local process prints one line on standard error:
+
+`letify: data cache evicted <files> files <size> in <seconds> s, <size> of <budget> in use`
+
+Sizes are in MiB with one decimal and `<budget>` in GiB with one decimal.
+
+#### The cache command <!-- id: project-data-cache-command -->
+
+`letify cache` shows the client digest cache and each provider's runtime file blob cache. `letify cache clear <alias>` empties one provider's runtime cache.
+
+`letify cache` first removes every digest cache entry whose file no longer exists, then prints the digest cache's entry count and how many were removed. For each provider in the configuration whose runtime disk persists between sessions, it starts a session on the provider's first instance, asks the worker with one `data_cache` request, and prints the alias, the blob count, the total size and the budget. A provider whose runtime disk does not persist is listed with `not kept between sessions` and no session is started. `--json` prints the same records.
+
+`letify cache clear <alias>` starts a session on that provider and sends `data_cache` with `clear` set. The worker removes every committed blob whose link count is 1, ignoring the 600 second window, and the command prints `<alias>: removed <files> files <size>`.
+
+The digest cache also drops entries whose file no longer exists each time it is saved.
 
 
 ### Backends
@@ -591,6 +1092,18 @@ This applies to every provider except `local`: `shell`, `tunnel`, `colab`, `elic
 
 A failed sync raises `EnvironmentFailure` saying `uv sync failed on <runtime>`, with the command and the last lines of uv's standard error. `EnvironmentFailure` is a `RuntimeFailure`, so the call is retried on a fresh runtime.
 
+### Environment on the sandbox disk <!-- id: modal-env-disk -->
+
+> On `modal` the project directory, its `.venv` and uv's cache live on the sandbox's own disk, not on the workspace volume, because importing a large package from a Modal volume reads thousands of small files over the network.
+
+A provider's `env_root` names where the project directory lives instead of the workspace root. It is None for every kind except `modal`, whose `env_root` is `/root/.letify-env`. When `env_root` is set:
+
+1. The project directory is `<env_root>/project/<env key>`.
+2. The sync sets no `UV_CACHE_DIR`, so uv uses its default cache under `~/.cache/uv` on the same disk and hard links from it.
+3. No environment archive is packed or restored, as on any persistent provider.
+
+The sandbox disk is discarded with the sandbox, so every Modal session syncs from the package index. Everything else under the workspace root, volumes, argument blobs and temporary files, stays on the volume.
+
 ### Interpreter version <!-- id: interpreter-version -->
 
 > The runtime's `.venv` always runs the same Python major.minor as the local process, and `Env` guarantees it.
@@ -603,7 +1116,19 @@ Two declarations cannot diverge from the local process. Before any session start
 
 > The runtime uses the uv it has, and installs uv under the home directory when it has none.
 
-The worker looks for `uv` on `PATH`, then at `~/.local/bin/uv`. When neither exists it downloads `https://astral.sh/uv/install.sh` over HTTPS with the bootstrap interpreter's `urllib` and runs it with `sh`, with `UV_INSTALL_DIR=~/.local/bin` and `UV_NO_MODIFY_PATH=1`. That is the same as `curl -LsSf https://astral.sh/uv/install.sh | env UV_INSTALL_DIR="$HOME/.local/bin" UV_NO_MODIFY_PATH=1 sh`, without needing `curl`. It needs no root, because it writes only under the home directory. A failed download or a non-zero exit raises `EnvironmentFailure` saying `uv could not be installed on <runtime>` with the reason.
+The worker looks for `uv` on `PATH`, then at `~/.local/bin/uv`. When neither exists it downloads `https://astral.sh/uv/install.sh` over HTTPS with the bootstrap interpreter's `urllib`, sending `User-Agent: letify/<version>` because astral.sh answers Python's default `Python-urllib` agent with 403, and runs it with `sh`, with `UV_INSTALL_DIR=~/.local/bin` and `UV_NO_MODIFY_PATH=1`. That is the same as `curl -LsSf https://astral.sh/uv/install.sh | env UV_INSTALL_DIR="$HOME/.local/bin" UV_NO_MODIFY_PATH=1 sh`, and letify fetches the script itself so it does not need `curl` to reach astral.sh. The installer script does need one, though: it downloads the uv binary with `curl` or `wget`. So before running it, the worker checks that one of the two is on `PATH`, and when neither is it raises `uv cannot be installed on <runtime>: its installer needs curl or wget on PATH, and neither is present` rather than letting the installer fail with an unclear message. It needs no root, because it writes only under the home directory. A failed download or a non-zero exit raises `EnvironmentFailure` saying `uv could not be installed on <runtime>` with the reason.
+
+### uv cache <!-- id: uv-cache -->
+
+> On a persistent provider the runtime's uv cache is `<workspace root>/uv-cache`, on the same filesystem as every project `.venv`, so a new env key is built from hard links. An ephemeral provider keeps uv's default cache.
+
+uv installs a package into a `.venv` by hard linking it from its cache, and falls back to a full copy when the cache is on another filesystem. A container's home directory is often an overlay while the workspace root is a mounted disk, so the default cache under `~/.cache/uv` makes every new env key copy the whole environment.
+
+The sync step sets `UV_CACHE_DIR=<workspace root>/uv-cache` for `uv sync` and `uv pip install` when the provider's `persistence` is `persistent` and it sets no `env_root`. On a runtime with a persistent workspace root the cache then outlives a container rebuild along with the projects built from it. An `Env.vars` entry naming `UV_CACHE_DIR` wins over this rule.
+
+An ephemeral provider sets nothing. Its disk is discarded with the runtime, so a cache there is filled once per runtime wherever it lives, and moving it only matters when the home directory and the project are on different filesystems.
+
+letify never deletes from the cache. The first sync on a runtime fills `<workspace root>/uv-cache` once, and a cache uv already had elsewhere is left in place. `uv cache prune` run with the same `UV_CACHE_DIR` removes entries no lock file needs any more; a file still hard linked from a `.venv` keeps its disk blocks until that `.venv` is removed as well.
 
 ### Interpreter check <!-- id: interpreter-check -->
 
@@ -621,7 +1146,7 @@ A package the lock file names is installed in the runtime and referenced by name
 
 > A `Shell` reaches its machine through a connection pipeline: several strategies are tried at once, the fastest acceptable one wins, and the winner is cached per account.
 
-`Modal` and `Local` are not part of this. Modal is reached through the Modal adapter, described in [Modal adapter](#modal-adapter), and Local starts its worker as a child process.
+`Modal` and `Local` are not part of this. Modal is reached through the Modal adapter, described in [Modal adapter](#modal-adapter), with frames on a TCP connection through a Modal encrypted port as [Modal data channel](#modal-data-channel) describes, and Local starts its worker as a child process.
 
 The measurements behind the order and the rules below are in [NETWORK.md](NETWORK.md#connection-pipeline-measurements).
 
@@ -665,7 +1190,7 @@ A strategy that cannot carry the probe, such as the provider fallback, does not 
 
 Every connected strategy is probed: 30 round trips, then 2 s of transfer in each direction. A strategy whose throughput in either direction is below 25% of the fastest connected strategy in that direction is rejected. The lowest ranked strategy that remains is chosen. When only one strategy connects, it is chosen without comparison.
 
-Strategies that lose are closed, including one that connects after the choice is made.
+Strategies that lose are closed, including one that connects after the choice is made. Once the choice is made, every attempt still running is cancelled: the pipeline hands each attempt a cancel event and sets it, so a TCP punch stops waiting for its agreed start time and stops dialing within 0.1 s, and its attempt ends with a cancellation that is printed as cancelled rather than failed. An attempt that cannot observe the event, such as a provider call already in progress, runs to its end and is closed if it connects.
 
 When only one strategy is applicable there is nothing to choose between, so it is used directly: it is not raced, not probed and not cached, and a failure surfaces at its first use. When a race of two or more ends with one connected strategy, that strategy is still probed so the cache has throughput to compare against, but a failed probe does not reject it.
 
@@ -701,17 +1226,19 @@ The public IP address is learned from the same STUN servers the punch uses. The 
 | Provider | Rendezvous |
 |---|---|
 | `Colab` | the provider layer: `colab new` creates the runtime and `colab exec` runs the remote half |
-| `Elice` | the provider layer: the Elice Cloud API creates and allocates the machine, and the remote half runs over forward SSH to it |
+| `Elice` | the provider layer: `eci` launches or starts the machine, and the remote half runs over forward SSH to its public IP |
 | `Tunnel`, and a plain `Shell` behind NAT | the remote agent started by `letify client shell connect`, reached over Tailcat |
 
 Colab and Elice never need `letify client shell connect`. Their create and open step is what puts letify's remote half on the machine.
 
 `letify client shell connect` is run once on a plain machine by its user. The agent needs letify installed on that machine. Before starting anything it checks two things, and each failure prints what to do and exits 1:
 
-1. `tailcat` is on `PATH`. Otherwise it prints the install command for the detected operating system and CPU architecture, for the Tailcat release pinned in `letify.transport.setup.TAILCAT_VERSION`: on Linux amd64, arm64 and armv7, `mkdir -p ~/.local/bin && curl -L <release tar.gz> | tar xz -C ~/.local/bin tailcat` with a note that `~/.local/bin` must be on `PATH`; on macOS, `brew install tailcat`; on Windows amd64 and arm64, the release zip and where to put `tailcat.exe`. Any other platform gets the releases page.
+1. `tailcat` is found by the lookup of [Installing external tools](#confirmed-tool-install). Otherwise it is installed automatically as that section describes, and when automatic install is turned off it prints the install command for the detected operating system and CPU architecture, for the Tailcat release pinned in `letify.transport.setup.TAILCAT_VERSION`: on Linux amd64, arm64 and armv7, `mkdir -p ~/.local/bin && curl -L <release tar.gz> | tar xz -C ~/.local/bin tailcat` with a note that `~/.local/bin` must be on `PATH`; on macOS, `brew install tailcat`; on Windows amd64 and arm64, the release zip and where to put `tailcat.exe`. Any other platform gets the releases page. The instructions end with `letify setup tailcat`.
 2. An SSH server answers on `--ssh-port`, default 22: a TCP connection to `127.0.0.1` on that port must send a line starting with `SSH-` within 3 s. Otherwise it prints how to install and start one, for a Debian or Ubuntu container `apt-get install -y openssh-server`, `mkdir -p /run/sshd` and `/usr/sbin/sshd`.
 
 It then starts the remote agent on a port the operating system chooses, starts `tailcat serve <agent port>` in front of it, and prints exactly one command for the user's own machine, `letify login tunnel <alias> --connect <token>`. The alias is `--name`, or this machine's host name with every character that is not a letter, digit or underscore replaced by `_`. The token is the URL-safe base64 encoding, without `=` padding, of the compact JSON object `{"tailcat": <address>, "tailcat_port": <agent port>, "user": <this machine's user name>, "port": <SSH port>}`. `--public-address` and `--public-port` add `"address"` and `"public_port"` to that object, for a machine whose SSH server is also reachable directly from outside under a published port. After the command it prints that the agent must keep running, how to keep it running with `tmux` or `nohup`, and that a restart prints a new address, so the login is run again with the new token.
+
+Re-registering a `tunnel` account after a container restart is manual by design. A restarted container has a new Tailcat address and no way for letify to learn it, because there is no API to ask: the machine is reached only through the address it just lost. letify automates account registration only where the provider has an API it can call, as `Colab`, `Modal` and `Elice` have. So the user runs `letify client shell connect` again and pastes the printed `letify login tunnel <alias> --connect <token>`.
 
 A connection to the agent is told apart by its first bytes: `SSH-` is spliced to the machine's SSH server, and `LETIFY-RDV ` is followed by one JSON request line and answered with one JSON line. For such an account the pipeline connects over Tailcat first, runs `tailcat <address> <agent port>` to exchange the TCP punch mapping and start time over that link, and then races as specified: the Tailcat link is the rank 3 candidate, and when TCP punching passes the probe it takes over.
 
@@ -751,11 +1278,13 @@ The key is per session. letify generates a new ed25519 key pair for each session
 
 > Colab is a `Shell` whose rendezvous is `colab exec`. It has no forward SSH, and its fallback is `colab exec` with the Colab file API.
 
-The Colab CLI runs as `uv tool run --from google-colab-cli colab`, with `jupyter-kernel-client<1` pinned, because release 0.6.0 of the CLI calls an API that jupyter-kernel-client 1.0 removed. `colab new` and `colab stop` manage the session.
+The Colab CLI runs as `uv tool run --from google-colab-cli colab`, with `jupyter-kernel-client<1` pinned, because release 0.6.0 of the CLI calls an API that jupyter-kernel-client 1.0 removed. `colab new` and `colab stop` manage the session. `Colab.sessions()` reads `colab sessions` and returns the first word of each listing line. The CLI prints a session as `[<name>] <id> | Hardware: <hardware> | Variant: <variant>`, so a first word in square brackets gives the name inside them. A line starting with `[colab]` is a message from the CLI, such as `[colab] No active sessions found on server.`, and names no session, so an account with no session returns an empty list.
 
 Colab limits outbound UDP to roughly 200 packets per second, so rank 3 is expected to lose the probe there. It stays in the list because the ratio rule removes it without a special case.
 
-A `channel = "exec"` entry skips the pipeline and uses the fallback directly. A Colab VM has no SSH server by default, so the rendezvous request asks the remote half to install `openssh-server` and start `sshd` first. The request carries the account's public key, `key` with `.pub` appended, which the remote side adds to `authorized_keys`. SSH over a punched or Tailcat link logs in as `root` unless `user` says otherwise.
+A `channel = "exec"` entry skips the pipeline and uses the fallback directly. A Colab VM has no SSH server on the port letify splices to, so the rendezvous request asks the remote half to start one first. The remote half connects to `127.0.0.1:<ssh_port>`, and when no line starting with `SSH-` arrives within 3 s it installs `openssh-server` if `/usr/sbin/sshd` is missing, creates `/run/sshd`, and starts `/usr/sbin/sshd -p <ssh_port> -o ListenAddress=127.0.0.1`. The port is explicit because a Colab image ships `sshd` configured for `127.0.0.1:2222`, so starting it with its own configuration leaves port 22 closed. An SSH server that already answers on the port is used as it is. The request carries the account's public key, `key` with `.pub` appended, which the remote side adds to `authorized_keys`. An account with no `key`, or whose `.pub` file is missing, has nothing the VM could authorize, so its Colab rendezvous is unavailable with the reason `no key`: `tcp_punch` and `tailcat` are skipped with that reason and the fallback carries the session. SSH over a punched or Tailcat link logs in as `root` unless `user` says otherwise.
+
+A Colab VM keeps its GPU driver libraries in `/usr/lib64-nvidia`, and only the notebook kernel's own environment names that directory in `LD_LIBRARY_PATH`. A login shell does not, so a worker started over SSH finds no `libnvidia-ml.so` and no `libcuda.so`: `nvidia-smi` fails and `torch.cuda.is_available()` is false on a session that holds a GPU. Every command letify runs over a Colab link, the worker and the `check` command included, is therefore prefixed with `LD_LIBRARY_PATH=/usr/lib64-nvidia${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}`, which keeps a path the machine already set. The `colab exec` fallback needs no prefix, because it runs inside the kernel.
 
 The fallback sends calls with `colab exec` and bulk data through the Jupyter contents API that the Colab runtime proxy exposes: uploads are split into parts sent in parallel, each part in chunked `PUT` requests, and downloads read `/files/<path>` in parallel parts. The contents API root is `/` on the VM, not `/content`.
 
@@ -826,7 +1355,7 @@ A100 = { indices = "0-3" }
 [elice_a100]
 kind = "elice"
 zone_id = "00000000-0000-0000-0000-000000000000"
-machine_id = "00000000-0000-0000-0000-000000000000"
+price_type = "spot"            # ondemand by default; the machine letify-elice-a100-spot is created on first use
 access_token_env = "ELICE_ACCESS_TOKEN"
 ```
 
@@ -855,9 +1384,12 @@ Everything letify writes on the runtime is under the root:
 
 | Path | Holds |
 |---|---|
-| `<workspace root>/project/<env key>` | the project files `uv sync` reads, and the `.venv` it builds |
+| `<workspace root>/project/<env key>` | the project files `uv sync` reads, and the `.venv` it builds, except on `modal`, as Environment on the sandbox disk describes |
 | `<workspace root>/project/.<digest>.tar.gz` | an environment archive while it is unpacked, removed once the `.venv` starts |
+| `<workspace root>/uv-cache` | uv's cache on a persistent provider, as uv cache describes |
 | `<workspace root>/volumes/<volume name>` | a volume's materialized blobs and project data |
+| `<workspace root>/blobs` | argument blobs on a persistent provider, as Argument blobs on a persistent disk describes |
+| `<workspace root>/data` | the file blob cache and the per-call data directories of Project data |
 | `<workspace root>/tmp` | temporary files, including the archive `pack_dir` builds on a one-shot channel; `TMPDIR` points here |
 
 The worker's working directory is the root, so a relative path in user code resolves under it. The uv installer is the one exception to the root: uv goes to `~/.local/bin`, as uv on the runtime describes, because it is shared by every account on that home directory.
@@ -898,11 +1430,29 @@ An account that is already in the home file is not asked for again. `letify logi
 
 `letify login colab <alias>` signs in to Colab itself. It runs `colab sessions` through `uv tool run --python 3.13 --from google-colab-cli colab`, with `HOME` set to `~/.letify/accounts/<alias>/`. The Colab CLI keeps its token at a fixed path under its home directory, so the token lands in the account directory and the CLI refreshes it on later calls. Every later Colab command runs with the same `HOME`, which is what lets two Colab accounts live on one machine. uv's cache, Python installs and tools stay pinned to the real home, so a changed `HOME` downloads nothing again. A sign in that exits non zero writes nothing.
 
+After the sign in succeeds, the Colab login records `key`, the SSH private key whose public half the Colab rendezvous installs on each runtime at connect time, as described under [Colab](#colab-transport). The key is `--key` when given, and `~/.ssh/id_letify` otherwise, the same key a `shell` login generates. The key lives under `~/.ssh` rather than in the account directory because it is not a Colab credential: it authorizes only the throwaway VM, and `letify logout` must not delete a key other accounts use. A missing key is generated as an ed25519 pair with no passphrase. An existing key is used as it is and never regenerated. A Colab account already in the home file with no `key` is the one exception to not being asked for again: `letify login colab <alias>` ensures the key the same way and adds `key` to the entry, leaving its other fields alone, without signing in again.
+
 `letify login modal <alias>` signs in to Modal itself. It first asks for an optional Modal profile, which names the Modal workspace to sign in to. It then runs `modal token new` through `uv tool run --python 3.12 --with "modal>=1.0,<2" --from modal modal`, with `MODAL_CONFIG_PATH` set to `~/.letify/accounts/<alias>/modal.toml` and, when a profile was given, `--profile <profile>`. The profile is written as `profile`, because `workspace` is the workspace root. Modal's command prints a link and waits for the browser approval, so `modal` never has to be on `PATH` or in the project's environment. The token lands in the account directory, and the adapter reads it from there. A sign in that exits non zero, or exits zero without writing `modal.toml`, writes nothing to either `config.toml` and removes a `modal.toml` the attempt created.
+
+`letify login elice <alias>` checks the access token with `eci` before it writes anything, and needs no machine to exist. Every `eci` command runs as [Elice machines](#elice-machines) describes. The steps run in this order, and a failure at any step writes nothing: no `config.toml` entry and no file in the account directory.
+
+1. `eci` must be found as Elice machines describes. Otherwise it is installed automatically, and when automatic install is turned off `LoginError` carries the install command.
+2. The token comes from `--token`, or else from a hidden prompt, `Elice access token: `. `--no-input` without `--token` refuses.
+3. `eci zone list --format json`. `endpoint` is `--endpoint` or `https://portal.elice.cloud/api`. A non zero exit fails the login with `LoginError`, whose message starts with `Elice refused the access token`.
+4. The zone is `--zone-id`. Without it, a terminal is shown the listed zones, one numbered line each, `1. <name> (<id>)`, and asked `Elice zone [1-<n>]: `. A blank answer takes the only zone when there is exactly one. An answer that is not a listed number is refused and asked again. `--no-input` without `--zone-id` refuses, and so does an empty list.
+5. `eci config verify` with that zone. A non zero exit fails the login with `LoginError` naming its output.
+6. The machine is `--machine-id` when given. Otherwise `eci compute vm list --format json` is read. With no machines listed, nothing is asked and no machine is recorded, and the login prints `Elice lists no machine; letify creates one on first use.` With machines listed, a terminal is shown them as `1. <name> (<id>)` followed by `<n+1>. Create a new machine with letify`, and asked `Elice machine [1-<n+1>]: `. A listed machine is recorded as `machine_id`; the last choice records none. `--no-input` without `--machine-id` records none.
+7. `price_type` is `--price-type` and is written only when given.
+8. `organization` is `--organization`, or else the `name_short` of `eci org info --format json`. It is written only when one of them gives a value.
+9. `billing_endpoint` is `--billing-endpoint`, or else a terminal is asked `Elice billing API base URL (blank to skip): `. It is written only when given.
+10. `key` is `--key` or `~/.ssh/id_letify`, generated as for Colab when missing.
+11. The token is written to `~/.letify/accounts/<alias>/access_token` with mode 0600.
+
+The account is written with `kind = "elice"`, `zone_id`, `key`, `machine_id` and `price_type` when chosen, and `endpoint` only when it is not the default.
 
 `letify login tunnel <alias> --connect <token>` declares a machine behind NAT from the command `letify client shell connect` printed on it. Without `--connect`, a terminal is asked `Token printed by 'letify client shell connect': `, and `--no-input` refuses. The steps run in this order, and a failure at any step writes nothing to either file and raises `LoginError` whose message starts with `tunnel login failed at <step>: `:
 
-1. `tailcat`: `tailcat` must be on the local `PATH`. Otherwise the message is the same install instructions `letify client shell connect` prints, for this machine's operating system and architecture.
+1. `tailcat`: `tailcat` must be found by the lookup of Installing external tools, and every SSH command runs it by the path found. Otherwise it is installed automatically, and when automatic install is turned off the message is the same install instructions `letify client shell connect` prints, for this machine's operating system and architecture.
 2. `token`: the token is decoded. A token that is not the base64 JSON described under Rendezvous, or that lacks `tailcat` or `tailcat_port`, is refused.
 3. `key install`: the key is generated and installed as SSH authentication describes, over SSH with `-o ProxyCommand=tailcat <address> <agent port>`, logging in as the token's `user` on the token's `port`. `--skip-key-install` and `--key` work as for `shell`.
 4. `key confirmation`: the key is confirmed with `BatchMode=yes` over the same `ProxyCommand`.
@@ -910,6 +1460,12 @@ An account that is already in the home file is not asked for again. `letify logi
 6. `devices`: the GPUs are recorded as Recording devices at login describes, over the same `ProxyCommand`.
 
 The account is written with `kind = "tunnel"`, `tailcat`, `tailcat_port`, `user`, `port` and `key` from the token and the options. It has no `address` unless the token or `--address` gives one, and `public_port` is written when the token or `--public-port` gives it. A value in the token wins over the option. Every login step still runs over Tailcat.
+
+`letify login kaggle <alias>` declares a Kaggle account from the browser session cookie of a logged-in kaggle.com tab. The cookie is `--cookie`, a file it names, or with a terminal it is asked for with hidden input as `Kaggle cookie (from a logged-in kaggle.com tab): `, and `--no-input` without `--cookie` refuses. It is checked for shape (it must carry `ka_sessionid`, `CLIENT-TOKEN` and `XSRF-TOKEN`) and expiry (from the `CLIENT-TOKEN` `exp` claim) before any network call, then proven with `users.UsersService/GetCurrentUser`, which returns the account only for a real session. Nothing is written until the check passes. The cookie is stored at `~/.letify/accounts/<alias>/cookie` with mode 0600, and it never appears in `config.toml` or in output.
+
+The cookie is the whole credential: there is no API token, no `kaggle.json` and no session URL. The internal endpoints that mint the Jupyter proxy token treat an API key as anonymous, so only the cookie's web session can start a session and reach its proxy.
+
+The home entry is `kind = "kaggle"`, plus `workspace` when `--workspace` is given.
 
 Credentials never enter either `config.toml`. A token goes to a file in the account directory. An SSH password is never stored at all, which the next section explains.
 
@@ -963,18 +1519,13 @@ One other approach is not the default. `sshpass` feeds a stored password to each
 |---|---|---|
 | `shell` | address, user, port, key path, `workspace` when it is not the default, and the `devices` table the machine reported | an SSH key, installed by `login`; no password stored |
 | `tunnel` | `tailcat`, `tailcat_port`, user and port from the token `letify client shell connect` printed, key path, `workspace` when it is not the default, and the `devices` table; `address` and `public_port` only when the token or the options give them | an SSH key, installed by `login` over Tailcat; no password stored |
-| `elice` | endpoint, zone, machine, `workspace` when given | access token in `~/.letify/accounts/<alias>/access_token` |
+| `elice` | endpoint when not the default, zone, key path, and `machine_id`, `price_type` and `workspace` when given | access token in `~/.letify/accounts/<alias>/access_token`; the generated machine password in `machine_password` once letify launches a machine |
 | `colab` | account email, `workspace` when given | the Colab CLI's token, written by its own sign in under `~/.letify/accounts/<alias>/` |
 | `modal` | `profile` and `workspace`, each when given | Modal's token, written by `modal token new` to `~/.letify/accounts/<alias>/modal.toml` |
+| `kaggle` | `workspace` when given | the browser session cookie in `~/.letify/accounts/<alias>/cookie`, and the id of the notebook letify owns in `notebook_id` |
 | `local` | nothing | none; this machine needs no declaration |
 
 For `colab` and `modal`, letify runs the vendor's sign in through uv and does not parse or refresh the token. The vendor's client reads and refreshes it from the account directory.
-
-### Interpreter override <!-- id: python-option -->
-
-> `python` on an account names the interpreter the worker runs with. Setting it means the user manages that interpreter, so letify does not build the environment there.
-
-Without `python`, a `shell`, `tunnel`, `colab` or `elice` account starts its bootstrap worker with `python3` and then runs the worker from the project `.venv`, as Building the environment on a runtime describes. With `python = "/path/to/python"`, the worker is started with that interpreter and stays on it: no project files are sent, no uv runs and no environment archive is read or written. That interpreter has to provide cloudpickle: letify installs nothing into it, and a session start on one that lacks it raises `ConfigError` naming the interpreter and `cloudpickle`. `ConfigError` is not retried, because a fresh runtime has the same interpreter. The interpreter check still applies. On `local`, `python` names the interpreter of the worker subprocess, which defaults to the interpreter running letify.
 
 ## PyTorch forwarding
 
@@ -1003,6 +1554,14 @@ PrivateUse1 is not used. On torch 2.5.1 a wrapper tensor on a device renamed thr
 
 The `meta` device is an implementation detail. The `TorchFunctionMode` of [Mapping cuda](#mapping-cuda) answers `device` as `cuda:0`, `is_cuda` as `True` and `get_device()` as `0` for a `RemoteTensor`, which is what code written for CUDA reads. `RemoteTensor` disables its own `__torch_function__`, so a tensor method enters Python once, in the mode, instead of twice.
 
+#### Tensor subclasses <!-- id: forwarding-tensor-subclasses -->
+
+> A wrapper tensor subclass whose inner tensors are `RemoteTensor`s, such as a torchao quantized weight, is created on the `meta` device and reads as `cuda:0`, so its own `__torch_dispatch__` runs here and each operator on its inner tensors is forwarded.
+
+While forwarding is active, `torch.Tensor._make_wrapper_subclass` is replaced. A call naming a CUDA device, which is what a subclass reads from a `RemoteTensor`'s `device`, makes the wrapper on `meta` instead, and `cuda:N` with `N` other than 0 raises `UnsupportedMode`. So a wrapper built while the mapping answers `cuda:0` and one built inside a `__torch_dispatch__`, where it answers `meta`, are on the same device, and `return_and_correct_aliasing` can alias their storage. The function is restored when forwarding ends and undone in a forked child.
+
+For a tensor on `meta` whose type is neither `torch.Tensor` nor `RemoteTensor` and whose `__tensor_flatten__` names at least one `RemoteTensor`, the `TorchFunctionMode` of [Mapping cuda](#mapping-cuda) answers `device`, `is_cuda`, `is_meta` and `get_device()` as it does for a `RemoteTensor`. A tensor on `meta` holding no `RemoteTensor` keeps PyTorch's answers, so a model built on the `meta` device is still on `meta`.
+
 Autograd runs locally. Backward operators and optimizer steps reach `__torch_dispatch__` like forward ones, so they are queued and executed on the runtime the same way. A tensor that requires grad on the runtime never exists: the runtime holds values only.
 
 Inferred metadata is cached per operator. Every `RemoteTensor` carries its signature, the shape, strides, storage offset and dtype, and builds its meta tensor only when an inference needs one. One pass over an operator's arguments reads three things:
@@ -1014,15 +1573,31 @@ Inferred metadata is cached per operator. Every `RemoteTensor` carries its signa
 | scalars | the values of the `int` and `float` arguments, in order |
 | handles | the handles of the `RemoteTensor` arguments, in order |
 
-A batch slice taken at a new position each step changes only its offset, so it keeps its structure. The metadata key is the structure plus the offsets and the scalars, except that a float argument of a `_foreach_` operator is left out, because an optimizer passes per step values such as bias corrections there and they never change output metadata. A hit builds the outputs with `_make_wrapper_subclass` from the recorded signatures and returns an input where the first inference returned that input, so a training step that repeats its operators runs each meta kernel once. An operator whose arguments include a value that cannot be a key, such as a generator, is inferred every time.
+A batch slice taken at a new position each step changes only its offset, so it keeps its structure. The metadata key is the structure plus the offsets and the scalars, except that a float argument of a `_foreach_` operator is left out, because an optimizer passes per step values such as bias corrections there and they never change output metadata. The offsets are left out too for an operator none of whose schema returns carries alias information, because such an operator returns new tensors whose metadata does not depend on where its inputs start in their storage. A batch at a new position therefore reuses the metadata of `addmm`, `mm` or `mse_loss` inferred at an earlier position, and only its view operators, such as `slice` and `t`, are inferred again. A hit builds the outputs with `_make_wrapper_subclass` from the recorded signatures and returns an input where the first inference returned that input, so a training step that repeats its operators runs each meta kernel once. An operator whose arguments include a value that cannot be a key, such as a generator, is inferred every time.
 
 While forwarding is active, `RemoteTensor` is added to every `_foreach_supported_types` list PyTorch keeps, which in 2.5 is one in `torch.optim.optimizer` and one in `torch.utils._foreach_utils`, so an optimizer that picks its foreach path for CUDA tensors picks it here too and a step issues one operator per tensor list instead of one per parameter. A PyTorch without such a list keeps the per parameter path.
 
 `aten.detach` and `aten.alias` are recognized before the arguments are read, and produce a new `RemoteTensor` sharing the same handle, with no operator sent. An in-place operator, or one writing to `out=`, returns the input it wrote to. Every other operator output gets a new handle.
 
+An in-place operator that changes the view metadata of the input it returns, such as `as_strided_`, which the composite `adaptive_avg_pool2d` calls to give a `channels_last` result `channels_last` strides, is mirrored on that input's wrapper: its signature, and the wrapper's own shape, strides and storage offset, take the meta result's values before the operator returns. Only that wrapper changes, as in PyTorch, and other `RemoteTensor`s sharing its handle keep their metadata. The metadata cache records the new signature, so a cache hit and a replayed step apply the same change. Memory formats need nothing else: strides are part of every signature, so a `channels_last` tensor keeps its strides through inference and the runtime computes on tensors with the same strides.
+
 A plain CPU tensor passed to an operator travels with it as a buffer and is a CPU tensor on the runtime, so a zero-dimensional CPU scalar mixes with device tensors as it does in PyTorch. A CPU tensor larger than 4 KiB flushes the queue immediately after its operator, so a later write to it in this process cannot change what the runtime received.
 
 When the meta operator raises, the operator is sent at once and executed on the runtime, and the reply carries its output metadata. That covers data-dependent shapes such as `nonzero` and `masked_select`, and reports a genuine error with the runtime's own message.
+
+### Kernel selection <!-- id: forwarding-kernel-selection -->
+
+> `batch_norm` and `scaled_dot_product_attention` on a `RemoteTensor` run the kernel the runtime's own CUDA dispatch chooses, not the one a meta tensor chooses.
+
+PyTorch picks the kernel for these two functions from the device when it dispatches. A meta tensor gets `native_batch_norm` and math attention. A CUDA tensor gets cuDNN batch norm, and flash, memory-efficient or cuDNN attention depending on shape, dtype and card. Those kernels give different values and use different memory.
+
+When the executor's hello reports a CUDA device, the `TorchFunctionMode` of [Mapping cuda](#mapping-cuda) asks the executor which backend applies, with a `letify.kernel` request, once per distinct signature, and caches the answer in the client. A signature is the function and, for every tensor argument, its shape, strides, dtype and whether it is None, plus `training` and `eps` for batch norm and `dropout_p`, `is_causal`, `scale` and `enable_gqa` for attention. The executor answers by calling `torch._C._select_batch_norm_backend` or `torch._fused_sdp_choice` on empty tensors of that signature on its own device. A PyTorch without the selector answers `Native` or `MATH`.
+
+Attention with `enable_gqa`, and flash attention for a head dimension that is not a multiple of 8, keep the ordinary path, because PyTorch reshapes or pads those before its fused kernel.
+
+The mode then calls the chosen ATen operator directly: `aten.cudnn_batch_norm` for `Cudnn`, and `aten._scaled_dot_product_flash_attention`, `aten._scaled_dot_product_efficient_attention` or `aten._scaled_dot_product_cudnn_attention` for the attention backends. Each of them has a meta kernel that infers its outputs and an autograd formula that records its backward, so it is dispatched and forwarded like any other operator. The function returns the operator's first output, the normalized or attended tensor, and `cudnn_batch_norm` updates the running statistics in place as `batch_norm` does.
+
+The ordinary path applies when the executor's device is CPU, when the runtime answers `Native` or math attention, or when an argument is not a `RemoteTensor`.
 
 ### Mapping cuda <!-- id: mapping-cuda -->
 
@@ -1047,12 +1622,59 @@ These `torch.cuda` functions are replaced while the function runs, and restored 
 | `is_current_stream_capturing()` | `False`, because a CUDA graph cannot be captured under `host="local"` |
 | `synchronize(d=None)` | Flushes the queue and waits for the runtime, which surfaces a pending error |
 | `manual_seed(s)`, `manual_seed_all(s)` | Seeds the runtime's generator for its device |
-| `memory_allocated()`, `max_memory_allocated()`, `memory_reserved()` | The runtime's value, one round trip |
+| `memory_allocated(d=None)`, `max_memory_allocated(d=None)`, `memory_reserved(d=None)`, `max_memory_reserved(d=None)`, `memory_cached(d=None)`, `max_memory_cached(d=None)`, `memory_stats(d=None)`, `mem_get_info(d=None)` | The runtime's value for its device, one round trip. A CPU executor answers `0`, `{}` and `(0, 0)` |
+| `reset_peak_memory_stats(d=None)`, `reset_max_memory_allocated(d=None)`, `reset_max_memory_cached(d=None)`, `reset_accumulated_memory_stats(d=None)` | Resets the runtime's counters for its device, one round trip |
 | `empty_cache()` | Queued and executed on the runtime |
 
 `Stream`, `Event`, `current_stream`, `stream`, `CUDAGraph`, `graph`, `get_rng_state` and `set_rng_state` raise `UnsupportedMode` naming the function, because a stream, an event, a graph or a generator state lives in the runtime's process and has no local counterpart here. Every other `torch.cuda` attribute is PyTorch's own and behaves as it does on a machine without CUDA.
 
 No replaced function initializes CUDA in this process. A CUDA build of PyTorch on a machine with no NVIDIA driver raises `CUDA driver version is insufficient` from any call that does, and a training loop makes such calls without naming them: `Adam.step()` and `AdamW.step()` call `is_current_stream_capturing()`, and `torch.cuda.is_bf16_supported()`, which `autocast` reads for `bfloat16`, calls `get_device_properties()`.
+
+A process forked while forwarding is active, such as a `DataLoader` worker, starts with the mapping undone: `torch.cuda` holds PyTorch's own functions, the device rewrite is off and `current_client()` is None, so the worker's `torch.manual_seed` and its CPU tensors stay in that process. The client refuses to send from a process other than the one that connected it, raising `RuntimeLost` naming the fork, because the channel it would write to belongs to the parent.
+
+### Pinned memory <!-- id: forwarding-pinned-memory -->
+
+> Under `host="local"`, pinning host memory is a copy into ordinary memory that reports itself as pinned, so `DataLoader(pin_memory=True)` runs unchanged and never initializes CUDA in this process.
+
+Pinned memory exists so the CUDA driver can copy to the device asynchronously. No driver runs in this process, and an upload is already asynchronous, as [Transfers](#forwarding-transfers) describes, so pinning has nothing to speed up. While forwarding is active:
+
+| Function | Behaviour |
+|---|---|
+| `Tensor.pin_memory(device=None)` | A copy of the tensor in ordinary CPU memory, with the same shape, strides, dtype and values. A tensor that already reports itself pinned is returned as it is |
+| `Tensor.is_pinned(device=None)` | `True` for a tensor `pin_memory` returned, and PyTorch's own answer for any other tensor, which is `False` without a driver |
+| `torch.accelerator.is_available()` | `True` |
+| `torch.accelerator.current_device_index()` | `0` |
+| `torch.accelerator.set_device_index(i)`, `torch.accelerator.set_device_idx(i)` | Accepted for device 0, `UnsupportedMode` otherwise |
+
+The two `Tensor` methods are replaced on the class and the `torch.accelerator` functions on the module, not in the `TorchFunctionMode`, because the `DataLoader` pins in a thread of its own, where the mode is not active. They are restored when forwarding ends, and undone in a forked process as the rest of the mapping is. A pinned tensor uploaded with `non_blocking=True` takes the same queued, asynchronous path as any other upload.
+
+### Compilation <!-- id: forwarding-compile -->
+
+> Under `host="local"`, `torch.compile` returns the function or module it is given, unchanged, and warns once that it runs eagerly, so a compiled training loop runs and computes what eager code computes.
+
+Inductor, the default backend, cannot compile here: before tracing it creates a CUDA tensor in this process to set up a device context, which needs a driver this process does not have. Dynamo with any backend also traces into `RemoteTensor` dispatch, which is letify's own Python, and recompiles it for every operator. A replayed step already sends the whole step as one entry, as [Step capture](#forwarding-step-capture) describes, so compiling on the client has nothing left to batch.
+
+While forwarding is active, `torch.compile(model, ...)` with any arguments returns `model` itself, and `torch.compile(...)` used as a decorator factory returns a decorator that returns the function itself. `Module.compile(...)` does nothing. The first such call in a process emits a `UserWarning` naming `host="local"` and eager execution. `torch.compile` and `Module.compile` are restored when forwarding ends and undone in a forked process, as the rest of the mapping is.
+
+`torch.cuda.get_rng_state` and `torch.cuda.set_rng_state` stay refused, so code that saves and restores the generator state names the gap instead of silently restoring a state that is not the runtime's.
+
+### Autocast <!-- id: forwarding-autocast -->
+
+> Inside `torch.autocast("cuda")`, an operator on a `RemoteTensor` gets the argument casts CUDA autocast gives it, so a mixed precision loop computes in the same dtypes as on the runtime's own GPU.
+
+A `RemoteTensor` lives on the `meta` device, so PyTorch's own CUDA autocast, a dispatch key on CUDA tensors, never sees it. The `TorchFunctionMode` of [Mapping cuda](#mapping-cuda) applies the casts instead, above autograd as autocast does, so each cast is recorded as a differentiable `to(dtype)` and gradients reach the float32 parameters in float32.
+
+While `torch.is_autocast_enabled("cuda")` is true, a torch function named in one of three lists casts its floating point `RemoteTensor` arguments, top level or one list level down, other than `float64` ones, and then runs with autocast's casts applied. The lists follow PyTorch's CUDA autocast policy and are matched by the function's name:
+
+| Policy | Cast | Functions |
+|---|---|---|
+| lower precision | to `torch.get_autocast_dtype("cuda")` | `conv1d`, `conv2d`, `conv3d`, `conv_transpose1d`, `conv_transpose2d`, `conv_transpose3d`, `conv_tbc`, `prelu`, `addmm`, `addmv`, `addr`, `matmul`, `__matmul__`, `__rmatmul__`, `einsum`, `mm`, `mv`, `linear`, `bmm`, `baddbmm`, `addbmm`, `chain_matmul`, `multi_dot`, `scaled_dot_product_attention`, `lstm_cell`, `gru_cell`, `rnn_tanh_cell`, `rnn_relu_cell` |
+| float32 | to `float32` | `acos`, `asin`, `cosh`, `erfinv`, `exp`, `expm1`, `log`, `log10`, `log2`, `log1p`, `reciprocal`, `rsqrt`, `sinh`, `tan`, `pow`, `__pow__`, `softplus`, `layer_norm`, `group_norm`, `norm`, `cosine_similarity`, `poisson_nll_loss`, `cosine_embedding_loss`, `nll_loss`, `hinge_embedding_loss`, `kl_div`, `l1_loss`, `smooth_l1_loss`, `huber_loss`, `mse_loss`, `margin_ranking_loss`, `multilabel_margin_loss`, `soft_margin_loss`, `triplet_margin_loss`, `multi_margin_loss`, `binary_cross_entropy_with_logits`, `dist`, `pdist`, `cdist`, `renorm`, `logsumexp`, `softmax`, `log_softmax`, `sum`, `prod`, `cumsum`, `cumprod` |
+| widest | to the widest floating dtype among those arguments | `addcdiv`, `addcmul`, `atan2`, `bilinear`, `cross`, `dot`, `vdot`, `grid_sample`, `index_put`, `scatter_add`, `tensordot`, `cat`, `stack` |
+
+`cross_entropy` with class index targets and no label smoothing runs as CUDA's `cross_entropy_loss` does: `log_softmax` in its input's dtype, then `nll_loss` with that result cast to float32. With probability targets or label smoothing, its input is cast to float32.
+
+Every other function runs with its arguments as they are. A cast is not cached: a parameter used twice in one region is cast twice, which gives the same values as autocast's weight cache. `GradScaler` is PyTorch's own and is not covered.
 
 ### The device worker <!-- id: device-worker -->
 
@@ -1082,11 +1704,60 @@ The queue is sent when it holds 256 entries, when its oldest entry has waited 2 
 
 The dispatching thread appends an entry without taking a lock. When the queue is due, the dispatching thread pickles the batch and hands the bytes to a sender thread, which writes them. A full pipe or SSH buffer therefore blocks the sender thread, never the step, and the dispatching thread holds the GIL only for the pickling. A synchronization is the exception: its batch is written by the waiting thread itself when no earlier batch is still queued for or being written by the sender thread, because that thread waits for the reply anyway and handing the batch over costs a thread wake per read. A background thread sends only a queue that nothing has been added to for 50 ms, so operators do not wait behind idle time between steps, and it never sends the unfinished part of a captured step, which [Step capture](#forwarding-step-capture) leaves to the dispatching thread.
 
-A synchronization is one round trip. These synchronize: `Tensor.item()`, `tolist()`, `cpu()` and `to("cpu")`, `bool()`, `int()` and `float()` of a tensor, which includes control flow on a tensor value, `repr()` and `str()` of a tensor, copying a device tensor into a CPU tensor, an operator whose meta inference raised, the `torch.cuda` queries in [Mapping cuda](#mapping-cuda), `torch.cuda.synchronize()`, and the end of the declared function.
+A synchronization is one round trip. These synchronize: `Tensor.item()`, `tolist()`, `cpu()` and `to("cpu")` without `non_blocking=True`, `bool()`, `int()` and `float()` of a tensor, which includes control flow on a tensor value, `repr()` and `str()` of a tensor, copying a device tensor into a CPU tensor, an operator whose meta inference raised, the `torch.cuda` queries in [Mapping cuda](#mapping-cuda), `torch.cuda.synchronize()`, and the end of the declared function.
+
+With `auto_fetch` on, `Tensor.item()` and `tolist()` do not synchronize. They return a deferred value, as [Deferred value reads](#forwarding-auto-deferred) describes. `bool()`, `int()` and `float()` of a tensor still synchronize.
 
 A read of one tensor's value sends only what that value depends on when that can be decided from the queue alone. When no repetition of a captured step is unfinished, if the tensor was created by a queued eager entry and no entry after it writes to an argument, the entries up to and including that one are sent with the read, and the rest stay queued in order. If the tensor was created before the queue and no queued entry writes to an argument, the read is sent alone. An operator writes to an argument when its schema marks one as written, which covers in-place operators, `out=` and the running statistics of batch norm. Otherwise the whole queue, the unfinished part of a captured step included, is sent with the read. `torch.cuda.synchronize()` and the end of the declared function always send everything.
 
 The client counts operators, queued entries, batches, round trips, released handles, metadata cache hits, templates, captured steps, replayed operators and fallbacks, and `Client.queued` is the number of entries not yet sent, so ops per round trip and synchronizations per step are read from the session rather than estimated. An operator is counted when it is dispatched, not when its batch is sent, and a replayed operator counts as an operator too. `letify.remoting.device.current_client()` returns the client of the innermost active forwarding, or None outside one, so code inside a `host="local"` function reads `current_client().stats`.
+
+### Reads without waiting <!-- id: forwarding-async-reads -->
+
+> A copy to the host with `non_blocking=True`, and `await letify.fetch(tensor)`, queue the read and return at once. The value is waited for only where it is used.
+
+`Tensor.to("cpu", non_blocking=True)` and `host.copy_(device_tensor, non_blocking=True)` of the same shape return a CPU tensor at once, with the shape and dtype the eager copy has, and queue a fetch entry. The fetch reads the device tensor at its place in the operator order, so a later in-place operator does not change it. Nothing is sent and nothing waits.
+
+Until the fetch's reply is applied, the CPU tensor is unfilled. A torch function called while forwarding is active with an unfilled tensor among its arguments, or one list level down, first waits for that tensor: the queue up to and including its fetch is sent, and replies are read until that fetch's reply is applied. That covers `item()`, `tolist()`, `numpy()`, `repr()`, indexing and arithmetic. Reading metadata, which is `shape`, `dtype`, `device`, `ndim`, `is_cuda`, `requires_grad`, `size()`, `dim()`, `numel()`, `stride()`, `element_size()` and `len()`, does not wait. Access that is not a torch function, such as the buffer of an array `numpy()` returned before the reply, does not wait.
+
+A batch that holds fetch entries asks for one reply, which carries every fetch in the batch in queue order. Replies are read in the order their batches were sent, by the thread that needs one, so a synchronization applies every earlier fetch reply before its own. `torch.cuda.synchronize()` and the end of the declared function therefore fill every unfilled tensor. A synchronization's batch is written by the waiting thread only when no earlier reply is still unread, as well as no batch queued for the sender thread. When 1024 replies are unread, the next non-blocking read first reads the oldest.
+
+`letify.fetch(tensor)` is the form for `async def` code. It queues the same fetch when called and returns an awaitable resolving to the CPU tensor, equal to `tensor.cpu()`. Awaiting it waits in a thread from `asyncio.to_thread`, so the event loop keeps running, and `asyncio.gather` over several fetches waits for all of them. Given a tensor that is not on the runtime, it resolves to `tensor.detach().cpu()` with no round trip. An `async def` declared with `host="local"` runs its coroutine to completion with `asyncio.run` in the thread its call runs in.
+
+A fetch skipped because an earlier operator failed raises `RemoteError` where its tensor is used or its awaitable is awaited. A failure carried by a reply that no synchronization waits for is kept, and the next synchronization raises it.
+
+### Deferred value reads <!-- id: forwarding-auto-deferred -->
+
+> A single value read on a forwarded tensor returns a deferred value instead of waiting. The read is queued as `letify.fetch` queues one, and the value is waited for where it is used.
+
+A training loop that logs `loss.item()` every step pays one round trip per step for a number it only prints. Under `host="local"` that read is deferred by default, so the user gets the behaviour of `letify.fetch` without writing it.
+
+**The methods replaced.** While forwarding is active and `auto_fetch` is on, two torch functions on a `RemoteTensor` queue a fetch and return a deferred value: `Tensor.item()` and `Tensor.tolist()`. Nothing else is replaced.
+
+`float(tensor)`, `int(tensor)` and `bool(tensor)` synchronize, and so do `Tensor.__index__`, `numpy()`, `repr()`, `str()`, `cpu()` and `to("cpu")` without `non_blocking=True`, as [Batching and synchronization](#forwarding-batching) says. Each of them has to hand back a value letify cannot follow. CPython raises `TypeError` when `__float__` returns anything but a `float` and when `__int__` returns anything but an `int`, so those two conversions cannot be deferred at all. `bool()` decides control flow, `__index__` selects memory, and the other four hand out a buffer or a formatted string. `loss.item()` is the read a training loop repeats, so deferring it is what removes the round trip per step.
+
+The fetch is queued exactly as `letify.fetch` queues one, through the same `read_later` path, so it reads the tensor at its place in the operator order and a later in-place operator does not change it. The deferred value holds the pending read and the conversion to apply to the filled CPU tensor: `item()` and `float()` give a Python float or int, `int()` gives an int, `tolist()` gives a list.
+
+**Where it resolves.** Resolving waits for that one read only, through the same `Client.wait` a non-blocking copy uses, and never for the whole queue. A deferred value resolves when anything asks for the value it stands for:
+
+| Kind of use | Examples |
+|---|---|
+| Arithmetic and comparison | `+`, `-`, `*`, `/`, `//`, `%`, `**`, `-x`, `abs`, `<`, `<=`, `==`, `!=`, `>`, `>=` |
+| Conversion | `float()`, `int()`, `bool()`, `__index__`, `complex()`, `round()`, `math` functions, which call `__float__` |
+| Text | `str()`, `repr()`, `format()`, an f-string, `%` formatting |
+| Container and iteration | `len()`, `iter()`, indexing, `in` |
+| Leaving the process | pickling, `torch.save`, `copy`, `numpy` array construction |
+| Any other attribute | anything not in the small set below |
+
+Only `__class__`, `__slots__` and the deferred value's own `resolved` property are answered without waiting. Anything else resolves first, so a value that reaches a place letify cannot follow is a real `float`, `int` or `list` by the time it gets there. A C extension argument resolves through `__float__` or `__index__`, `numpy` through `__array__`, and pickling through `__reduce__`, which pickles the resolved value and never the deferred object.
+
+A deferred value is not an instance of `float` or `int`. A library that checks the type instead of converting, such as `json.dump`, raises `TypeError` rather than writing something that is not the number.
+
+**Where everything resolves.** `torch.cuda.synchronize()`, the end of the declared function and `letify.fetch` resolve every pending read, as [Reads without waiting](#forwarding-async-reads) already says of unfilled tensors. The value a `host="local"` call returns is walked before the call returns, through lists, tuples, sets, dictionaries and dataclasses, and every deferred value in it is resolved, so a deferred value never leaves the call and never reaches a checkpoint.
+
+**The setting.** `auto_fetch = false` on the account entry turns the replacement off, and `LETIFY_AUTO_FETCH` in the environment overrides the account entry, with `0`, `false` and `no` meaning off. With it off, `item()`, `tolist()`, `int()` and `float()` synchronize as before, and `letify.fetch` still defers, because it is the explicit form and is not a default.
+
+**What is reported.** The client counts `auto_deferred`, the reads deferred by this replacement, and `resolved_early`, those whose value was asked for before its reply had arrived, so each one cost a wait. A `host="local"` call that deferred at least one read prints one line on standard error at its end, `letify: deferred N value reads, M resolved early`. A workload that gains nothing shows `M` equal to `N`.
 
 ### Step capture <!-- id: forwarding-step-capture -->
 
@@ -1098,25 +1769,33 @@ A step is what a training loop repeats: forward, backward and the optimizer upda
 
 **Detection.** When an operator's trace key occurred earlier at a distance `P` of at least 8 and at most 4096 operators, and the last `P` trace keys equal the `P` before them, both windows are wired: each tensor argument becomes the offset of its handle among the handles its window creates, or `external` when the window did not create it. The handles a window creates must be one consecutive range. When the two wirings are equal, the last `P` operators are a step. A step is therefore registered after it has run eagerly twice in a row. A step records, for each operator, its template, the signatures of its outputs, and for each tensor argument either the offset of its handle among the handles the repetition creates or `external`. Its definition goes into the next batch. A step equal to one already registered keeps that number.
 
-**Replay.** After a step is registered, each dispatched operator is compared with the step's next one. It matches when its template is the same, its output signatures from the metadata cache are the same, and each tensor argument was created at the expected offset in this repetition, or before this repetition began where the step expects `external`. A matching operator builds its outputs as eager dispatch does, taking handles from the same counter, so a repetition's new handles are one consecutive range, and it adds its external handles, scalars and blobs to the repetition. Nothing is queued per operator. When the last operator matches, one entry `(step, first handle, start, stop, externals, scalars, blobs)` is queued and the next repetition begins with the next operator.
+**Replay.** After a step is registered, each dispatched operator is compared with the step's next one. It matches when its template is the same, its output signatures from the metadata cache are the same, and each tensor argument was created at the expected offset in this repetition, or before this repetition began where the step expects `external`. A matching operator builds its outputs as eager dispatch does, taking handles from the same counter, so a repetition's new handles are one consecutive range, and it adds its external handles, scalars and blobs to the repetition. Nothing is queued per operator. When the last operator matches, one entry `(step, first handle, start, stop, externals, scalars, blobs, keep)` is queued, with `keep` filled in when the entry is taken into a batch as **Early release** describes, and the next repetition begins with the next operator.
+
+**Position readers.** The first time an operator matches at a step position, the client generates a Python function for that position from its arguments, unless an argument is a plain CPU or meta tensor. The function checks, without building the structure, that the overload is the same object, and that the arguments have the same count, container types and lengths, keyword names, tensor shapes, strides and dtypes, `int` and `float` types, and other values. It returns the tensor arguments, the scalars and the metadata key's offsets and scalars. A later operator at that position that passes the checks, and whose first tensor belongs to the same client, takes the position's recorded metadata when its key is the recorded one and the metadata cache entry for its key otherwise. It is then matched as **Replay** describes. A failed check or a cache miss sends the operator down the full path, which matches or falls back as above, so the entries queued and the values are the same with and without the reader.
 
 **Fallback.** An operator that does not match ends the repetition. The operators matched so far are queued as an entry with `stop` at the mismatch, and the mismatching operator is dispatched eagerly and starts a new trace. A shape that changes mid-run, a different operator, an argument from a different producer, and an inference that raises are all mismatches. The runtime has executed nothing of the repetition before its entry arrives, so a fallback runs every operator exactly once, in dispatch order, and values are the same as eager.
 
 **Partial sends.** A synchronization during a repetition, and a matched operator carrying a CPU tensor larger than 4 KiB, queue the repetition so far as an entry and send the queue; the repetition then continues with `start` at the next operator and the same first handle. A handle created in a repetition and released before its entry is queued stays in the release list until the entry is queued.
 
-**Worker.** The worker executes operators `start` to `stop - 1` of the step in order, reading an argument's handle as `first handle + offset` or from `externals`, and stores each new output under the next handle counted from `first handle`. Each operator is the same call an eager entry makes, so a failure is recorded and reported as [Failure semantics](#forwarding-failure) describes, naming the operator. The worker does not use CUDA graphs, because the handles bound to a step, such as the batch, change between repetitions and a graph needs fixed input memory.
+**Early release.** A tensor a repetition creates is released on the runtime right after the last operator of the step that reads it, when nothing else can read it, rather than with the release list after the whole step. When a step is registered, the client and the worker both compute each created handle's release position from the wiring: the last position whose operator takes that offset as an argument, or the position that created it when no later operator of the step reads it. A step entry carries `keep`, the offsets whose release position lies in `start` to `stop - 1` and that must not be released early. The client computes `keep` when it takes the entry into a batch: an offset is kept when a `RemoteTensor` still names its handle, which is when its handle has not been released locally, or when an entry after it in that batch, an entry left in the queue, or the unfinished repetition reads the handle. A saved tensor autograd holds for backward is named by a `RemoteTensor`, so it is released only after the backward operator that reads it. A tensor the loop keeps across steps, such as the loss or a gradient, is kept, and released by the release list as before.
+
+**Worker.** The worker executes operators `start` to `stop - 1` of the step in order, reading an argument's handle as `first handle + offset` or from `externals`, and stores each new output under the next handle counted from `first handle`. After each operator it drops the handles whose release position is that operator, other than those in `keep`, from its table. Each operator is the same call an eager entry makes, so a failure is recorded and reported as [Failure semantics](#forwarding-failure) describes, naming the operator. The worker does not use CUDA graphs, because the handles bound to a step, such as the batch, change between repetitions and a graph needs fixed input memory.
 
 ### Handles <!-- id: forwarding-handles -->
 
 > The client assigns handles, so creating a tensor needs no reply, and a dropped tensor's handle is released with the next batch.
 
-A handle is an integer from a per-session counter. `RemoteTensor`s that share a handle, through `detach` or an in-place result, share one reference object, and when the last of them is collected its handle is appended to a release list. The list travels in the next batch, and a batch is sent early when it reaches 4096 handles. The worker applies a batch's releases after its operators, because an operator queued before its input was collected can travel in the same batch as that input's release.
+A handle is an integer from a per-session counter. `RemoteTensor`s that share a handle, through `detach` or an in-place result, share one reference object, and when the last of them is collected its handle is appended to a release list. The list travels in the next batch, and a batch is sent early when it reaches 4096 handles. The worker applies each release of a batch right after the last entry of that batch that reads the handle, as an argument of an eager entry, an external of a step entry or the tensor of a fetch, and before the batch's first entry when no entry of the batch reads it. An operator queued before its input was collected can travel in the same batch as that input's release, and still finds the input, while memory a collected tensor held is returned before the batch's later operators allocate.
+
+A release never reaches the worker ahead of an operator that uses the handle. A batch takes the release list before it takes entries from the queue, so every entry dispatched before a handle was collected is in that batch or an earlier one. A batch carries no releases when it leaves entries in the queue, as a read that sends only its dependencies does, or while a repetition has matched operators not yet queued, whose externals are not in the queue. Those releases stay in the list for a later batch. This holds whichever thread sends the batch: the dispatching thread, the idle sender, or a collection that runs mid-step.
 
 ### Transfers <!-- id: forwarding-transfers -->
 
 > A copy to the device and a copy to the host travel as out-of-band binary buffers, with no base64 and no copy beyond the one the kernel makes.
 
-A contiguous CPU tensor is sent as a view of its own memory, taken through `ctypes` from its data pointer, so no NumPy is needed. A non-contiguous one is made contiguous first. On the runtime the buffer is received into a `bytearray` and wrapped with `torch.frombuffer`. A copy to the host is made contiguous on the runtime, copied to CPU memory, sent as a view of that memory, received into a `bytearray` and wrapped with `torch.frombuffer`.
+A copy to the device returns before its bytes are written. `Tensor.cuda()`, `Tensor.to("cuda")` and a factory call with a CPU tensor argument queue their entry and hand it to the sender thread, and only a read of a value that depends on the entry waits for the bytes. The runtime receives the CPU tensor's values as they were at the call, not at the write, so a CPU tensor larger than 4 KiB is sent as a private copy of its bytes made at the call, blocking or not. The client does not ask whether the memory is pinned, because that query can initialize CUDA in this process, and the copy costs memory speed against a link about 100 times slower.
+
+A contiguous CPU tensor, or its private copy, is sent as a view of its memory, taken through `ctypes` from its data pointer, so no NumPy is needed. A non-contiguous one is made contiguous first. On the runtime the buffer is received into a `bytearray` and wrapped with `torch.frombuffer`. A copy to the host is made contiguous on the runtime, copied to CPU memory, sent as a view of that memory, received into a `bytearray` and wrapped with `torch.frombuffer`.
 
 ### Upload cache <!-- id: forwarding-upload-cache -->
 
@@ -1165,6 +1844,153 @@ A lost worker process or link raises `RuntimeLost`, and the session is discarded
 
 Measured on 2026-09-14 against a Tesla P100 server with torch 2.5.1 cu121: libcudart 12.1 resolves 425 driver symbols by name and the stand-in `libcuda.so.1` exports 20, so CUDA initialization fails with `cudaErrorInsufficientDriver`. The private `cuGetExportTable` blocks adding symbols one by one, and PyTorch kernels arrive through fatbinary registration that `cuModuleLoadData` does not see. Operator forwarding depends on PyTorch's public extension points instead of the driver's private ones. The Rust crates in `letify-core/` and `letify.remoting.probe` remain in the tree and the wheels, and nothing on the `host="local"` path calls them.
 
+## Command line
+
+> Every command prints for a person by default and for a program with `--json`, through one renderer, `letify/render.py`.
+
+### Output conventions
+
+A style is chosen per stream, so standard output and standard error decide separately:
+
+| Setting | Rule |
+|---|---|
+| Colour | Only when the stream is a terminal and `NO_COLOR` is unset or empty |
+| Characters | Block characters and symbols when the stream encoding is UTF-8, ASCII otherwise |
+| Width | `shutil.get_terminal_size`, 80 columns when it cannot be read |
+
+| Mark | UTF-8 | ASCII | Colour | Means |
+|---|---|---|---|---|
+| success | `✓` | `+` | green | The command did what was asked |
+| failure | `✗` | `x` | red | It did not, and the line says why |
+| warning | `!` | `!` | yellow | It ran, with something to notice |
+
+A heading, an alias at the top of a block and a table's column names are bold. Secondary text, such as a note, a path hint or a reset date, is dim. A table left-aligns each column to its longest cell with two spaces between columns and names its columns in capitals.
+
+A `LetifyError` that reaches the command line prints `✗ <message>` on standard error and exits with 1. An argument error is argparse's own and exits with 2.
+
+`--json` prints the records with no styling on `providers`, `devices`, `status`, `usage`, `utilization`, `probe` and `efficiency`.
+
+Connection decision lines stay on standard error as `letify: <message>`, with the content set by Transport. When standard error is a terminal with colour, the `letify:` prefix is dim and nothing else changes.
+
+### Commands
+
+| Command | Prints |
+|---|---|
+| `providers` | A table `ALIAS  KIND  PERSISTENCE`. A provider that cannot be built has `✗ unavailable: <reason>` in place of kind and persistence. `--json` is a list of `{alias, kind, persistence}` or `{alias, unavailable}` |
+| `devices` | A table `PROVIDER  ACCELERATORS`, the accelerators joined by `, `. `--json` is the mapping from alias to accelerator names |
+| `status` | The header `<name>  <live> live, <busy> busy`, one block per live runtime, then a table `PROVIDER  ACCELERATOR  RESERVED  INDICES` with reserved as `<reserved>/<count>`. With no runtime the blocks are replaced by `no live session in this process`. `--json` is `Launcher.status()` |
+| `usage`, `utilization` | As Remaining usage and GPU utilization describe |
+| `probe` | A mark and `forwarding usable`, `forwarding usable but costly` or `forwarding not usable`, then aligned `platform`, `core`, `agent` and `round trip` fields and the reason, dim. `--json` is the capability record |
+| `efficiency` | `<p>% of a direct run`. `--json` is `{"efficiency": <fraction>}` |
+| `check` | `✓ <alias> answers`, then the machine's output indented by 2 spaces |
+| `login` | `✓ <alias> declared in <home>`, or `! <alias> was already declared in <home>, so nothing was asked for`, then `✓ <alias> referenced in <project>, which is safe to commit` |
+| `logout` | `✓ <alias> removed from <home>`, then the note about the project reference, dim |
+| `stubs` | `✓ <path written>` |
+| `setup <tool>` | `✓ <tool> <version> at <path>`, or with `--where` the `cache`, `link`, `PATH` and `uses` lines, as Installing external tools describes |
+| `client shell connect` | `On your own machine, run:` bold, the login command plain so it can be copied, and the notes dim |
+
+A runtime block in `status` is:
+
+```
+run-1  lab.P100  busy
+  cards 0, 1  host remote  link forward-ssh, 42.0 ms
+  up 1 h 2 min  idle 3 min
+  about 2.07 compute units so far at 2.00 compute units/hour
+  [████████████████████░░░░░░░░░░░░░░░░░░░░] 50% used
+  50.00 compute units left of 100.00
+```
+
+The header ends `busy` while a call runs and `idle` otherwise. `cards` is left out where the provider assigns the device, `link` where there is none, and the round trip where it was not measured. The cost line needs a usage record with a rate, and is uptime times the rate, so it is an estimate and says `about`. The gauge and amount lines are the usage block's own lines for that record.
+
+### Installing external tools <!-- id: confirmed-tool-install -->
+
+> letify installs a missing `tailcat` or `eci` automatically the first time it needs one, and says so on standard error. Each is fetched from its publisher's GitHub release, Tailscale or Elice, verified against pinned SHA-256 digests, cached per version under `~/.letify/tools` and linked into the project's virtual environment. Neither binary is part of letify or covered by its license, and letify never writes to a shared `PATH` directory.
+
+| Tool | Pinned version | Release | Assets |
+|---|---|---|---|
+| `tailcat` | `letify.transport.setup.TAILCAT_VERSION` | `https://github.com/tailscale/tailcat/releases/download/v<version>/` | `tailcat_<version>_linux_{amd64,arm64,armv7}.tar.gz`, `tailcat_<version>_windows_{amd64,arm64}.zip` |
+| `eci` | `letify.install.ECI_VERSION` | `https://github.com/elice-dev/eci-cli/releases/download/<version>/` | `eci-darwin-arm64-<version>.tar.gz`, `eci-linux-x86_64-<version>.tar.gz`, `eci-windows-x86_64-<version>.zip` |
+
+**Lookup.** When letify needs a tool it takes the first of:
+
+1. The project environment: `<venv>/bin/<tool>`, or `<venv>\Scripts\<tool>.exe` on Windows. The environment is `sys.prefix` when letify runs inside a virtual environment, and otherwise `.venv` in the working directory when it holds `pyvenv.cfg`. A link letify made for another version is skipped here and replaced in step 2.
+2. The cache for the pinned version, `~/.letify/tools/<tool>/<version>/<tool>` (`.exe` on Windows). A hit is linked into the project environment as below.
+3. `PATH`. A user's own install is used as it is and never replaced.
+4. The confirmed install.
+
+An account's `tailcat_binary` or `eci_binary`, when set, skips the lookup and is run as written.
+
+**Automatic install.** `tailcat` is installed when a command that needs it finds none: `letify client shell connect` and `letify login tunnel`. It happens with or without a terminal and asks nothing. `eci` is not installed automatically: `letify login elice` asks first, as [Elice machines](#elice-machines) describes, and otherwise only `letify setup eci` installs it. Two lines go to standard error, as connection decision lines do:
+
+- before the download, `letify: installing <tool> <version> from <asset URL> into <version directory>`
+- after it, `letify: <tool> <version> verified sha256 <digest>, linked at <path>`, where the path is the project link, or the cache path when nothing is linked
+
+**Download progress.** The asset download reports progress on standard error, because a release archive can take minutes over a slow link. The download reads 64 KiB at a time. On a terminal one line is redrawn in place with a carriage return, at most every 0.1 s and once at the end: `letify: downloading <tool> <version> [<gauge>] <percent>% <done>/<total> MiB <rate> MiB/s`, where the gauge is the command line gauge 20 cells wide. When the server sends no `Content-Length` the gauge and percent are left out and the line shows `<done> MiB <rate> MiB/s`. The finished line ends with a newline. When standard error is not a terminal, nothing is redrawn: one line without a gauge is written at 25, 50, 75 and 100 percent, or a single line at the end when the size is unknown, so a log file gets at most four lines. `checksums.txt` is small and shows no progress.
+
+Automatic install is on by default. `auto_install = false` at the top level of `~/.letify/config.toml` turns it off, and so does the environment variable `LETIFY_AUTO_INSTALL` set to `0`, `false` or `no`. The environment variable, when set to any value, decides over the file. Turned off, a missing tool fails with the install instructions followed by `Install it with: letify setup <tool>`. The Tailcat connection strategy never installs, because it runs inside a race; it is skipped with `tailcat is not on PATH; run 'letify setup tailcat'`.
+
+**Installing.** On macOS with `brew` on `PATH`, `tailcat` is installed with `brew install tailcat` and not cached. Otherwise:
+
+1. The asset for this operating system and architecture and the release's `checksums.txt` are downloaded with `urllib`. A platform with no asset fails with the releases page.
+2. The asset's SHA-256 must equal the digest pinned in `letify.install` for that asset, and the line naming the asset in `checksums.txt` must carry the same digest. A mismatch fails naming both digests and writes nothing.
+3. The archive is read member by member. A member whose path is absolute or contains `..`, or that is a device, a hard link, or a symbolic link pointing outside the archive, refuses the whole archive. For `tailcat` only the member `tailcat` (`tailcat.exe`) at the root or one directory down is kept. For `eci` the whole bundle is kept with its top directory stripped, because the `eci` binary loads the libraries next to it.
+4. Extraction goes to a temporary directory next to the version directory, which is renamed onto `~/.letify/tools/<tool>/<version>/` after the binary is found in it. The binary is mode 0555 and every other file loses its write bits.
+
+Elice's `install.sh` is not run, because it writes to `/usr/local` or `~/.local`, may call `sudo`, and appends to the user's shell profile. letify downloads the asset that script downloads and checks it against the same `checksums.txt`.
+
+**Linking.** With a project environment, the cached tool is linked to `<venv>/bin/<tool>` and recorded in the marker file `<venv>/bin/.letify-<tool>`, which holds the version.
+
+- `tailcat` is a hard link to the cached binary. When the hard link fails, for another file system or no hard link support, the binary is copied and `! linked by copy: <reason>` is printed once.
+- `eci` is a launcher that runs the cached binary with the same arguments: a `#!/bin/sh` script with `exec`, or a `.cmd` file on Windows, because a hard link separated from the bundle cannot find its libraries.
+- An existing link whose marker names another version is replaced.
+- A file at that path that has no marker and is not the same file as the cache is not letify's. It is left untouched, `! <path> exists and was not created by letify; using <cache path>` is printed, and the cache path is used.
+
+With no project environment nothing is linked and the cache path is used.
+
+**`letify setup <tool>`**, for `tailcat` or `eci`, runs the lookup, installs into the cache when nothing is found, whatever the automatic install setting, links into the project environment, prints the two `letify:` lines when it installed, and prints `✓ <tool> <version> at <path>`. `--where` installs nothing and prints four aligned lines: `cache` with the cache path and `present` or `missing`, `link` with the link path and `letify <version>`, `not letify's`, `missing` or `no project environment`, `PATH` with the path found or `none`, and `uses` with the path the lookup chose or `nothing`.
+
+### Machine-readable output <!-- id: machine-readable-output -->
+
+> `letify usage --json`, `letify utilization --json` and `letify status --json` print JSON whose field names and types are a contract: a field may be added, but none is renamed, removed or retyped.
+
+Each command prints one JSON document on standard output and exits 0. An error that stops the command prints a message on standard error and exits non zero, with nothing on standard output. The formatting of the human output does not change the JSON.
+
+`letify usage --json` prints a list with one object per declared alias, in configuration order. A usage object carries every field of the `Usage` record under "Remaining usage", all keys always present:
+
+| Key | Type |
+|---|---|
+| `alias`, `kind`, `unit`, `source` | string |
+| `remaining`, `limit`, `used`, `rate_per_hour` | number or null |
+| `resets_at`, `as_of` | number of Unix seconds, or null |
+| `unmetered` | boolean |
+| `note` | string or null |
+| `resources` | list of `{"name", "unit"}` strings with `remaining`, `used`, `limit` and `resets_at` as number or null, empty when the account has no further allowance |
+
+An alias whose provider cannot be built prints `{"alias": <string>, "unavailable": <string>}` instead.
+
+`letify utilization --json` prints a list of rows as "GPU utilization" describes: one per `machine` provider and one per `session` instance with an accelerator. A row has `alias`, `kind` and `scope` (string), `accelerator` (string, or null on a `machine` row), `devices` (list) and `reason` (string or null, why `devices` is empty). A device object has `index` (integer), `name` (string), `utilization_percent`, `memory_used_gb`, `memory_total_gb`, `memory_percent`, `temperature_c`, `power_w` (number or null each), `holder` (one of `letify`, `others`, `mine`, `free`, `unknown`, or null on a `session` row), `users` (list of strings, the owners when `holder` is `others`) and `reserved` (boolean). An alias whose provider cannot be built prints `{"alias": <string>, "unavailable": <string>}`.
+
+`letify status --json` prints the `Launcher.status()` object described under "Status reporting": `name` (string), `live` and `busy` (integer), `devices` (object keyed by alias, then by accelerator, each `{"count": integer, "reserved": integer, "indices": [integer]}`), `runtimes` (list of `{"name", "provider", "accelerator", "placement"}` strings, `devices` list, `busy` and `persistent_channel` booleans, `idle_seconds` number), `declared` and `config_sources` (lists of strings). `letify status` without the flag prints the same document.
+
+### Editor extension <!-- id: editor-extension -->
+
+> `letify-ext/` is a VS Code extension that shows the remaining quota and GPU load in the status bar, read only through the JSON above.
+
+The extension runs `uv run letify <command> --json` in the first workspace folder. The command is the setting `letify.command`. It reads usage every `letify.usageIntervalSeconds`, 60 by default, and utilization and status every `letify.utilizationIntervalSeconds`, 10 by default while its view is visible and at the usage interval otherwise. It makes no network call of its own and writes no credential anywhere.
+
+The quota status bar item shows the account with the lowest remaining share, `remaining / limit`, as `<alias> <percent>% left`, with `(<time to reset>)` when `resets_at` is known. An account with no limit is ranked after every account with one. The item turns to the warning color when the share left is below `letify.warningPercent`, 20 by default, and to the error color below `letify.errorPercent`, 5 by default. The GPU item shows `GPU <free>/<total> free <mean>%` when any device reports a `holder`, where a device is free when its `holder` is `free`. When no device reports one it shows `GPU <busy>/<total> busy <mean>%`, where a device is busy at `letify.busyPercent`, 10 by default, or above. The mean is over devices that report utilization.
+
+Hovering either item shows its cards. Clicking one opens the letify view with the tabs Quota, GPU and Runtimes. A quota card shows a gauge of the share used, the reset time, the share of the period elapsed where the period length is known (7 days for `GPU hours`, the calendar month for `USD`), the projection `used / elapsed share` capped at 999 percent, and the hourly rate. Each record in `resources` adds a row under them: its `name`, the amount left of its limit, a gauge of the share used when the limit is known, and its reset time. A GPU card shows, per device, utilization and memory gauges, temperature, power and the holder label:
+
+| `holder` | Label |
+|---|---|
+| `letify` | `letify reserved` |
+| `others` | `other users: <users>` |
+| `mine` | `yours` |
+| `free` | `free` |
+| `unknown` | `unknown` |
+| null | `letify reserved` when `status` lists the index as reserved, nothing otherwise | Daily history is the mean GPU utilization and the quota spent per UTC day, kept by the extension in its own storage for 30 days from its own samples.
+
 ## Packaging
 
 > One install, `uv add letify`, with no extras. It installs cloudpickle and blake3 and nothing else.
@@ -1188,15 +2014,32 @@ The Python code is pure and links no Python extension. letify-core binaries are 
 
 Linux wheels are built inside the `manylinux_2_28` containers, so the binaries need glibc 2.28 or newer. That covers RHEL 8, Debian 10 and Ubuntu 18.10 onward. The sdist carries no binaries, and an install from it has no letify-core.
 
+### Versioning and releases <!-- id: versioning -->
+
+> One version for everything, read from `pyproject.toml`, and a release is the push of the tag `v<version>`.
+
+`[project].version` in `pyproject.toml` is the source of truth. These carry the same value:
+
+| File | Field |
+|---|---|
+| `letify/__init__.py` | `__version__` |
+| `letify-core/Cargo.toml` | `[workspace.package].version`, and the `letify-wire`, `letify-driver` and `letify-agent` entries in `Cargo.lock` |
+| `letify-ext/package.json` | `version`, and `version` and `packages[""].version` in `package-lock.json`, when `letify-ext/` exists |
+| Git tag | `v<version>` |
+
+`python scripts/version.py set <version>` writes all of them and `python scripts/version.py check [--tag v<version>]` exits 1 naming each file that disagrees. The `ci` workflow runs the check on every push and pull request, and the `publish` workflow runs it with the pushed tag before building anything.
+
+Pushing a tag `v*` runs `.github/workflows/publish.yml`. It builds the sdist, the six platform wheels above and, when `letify-ext/` exists, the extension's `letify-ext-<version>.vsix` after its unit tests pass. It then creates the GitHub Release for the tag with every one of those files attached, and uploads the sdist and wheels to PyPI. The extension is not published to the VS Code Marketplace.
+
 ## Known gaps
 
 > Implemented and unimplemented, stated plainly so nobody builds on a promise.
 
 - **PyTorch forwarding still pays one round trip per value read.** On dept_gpu the benchmark step takes a median 1.31 ms under `host="local"` against 1.72 ms directly when the loss is read once per 50 steps, and 4.94 ms against 1.78 ms when it is read every step. The measurement is in [NETWORK.md](NETWORK.md#pytorch-forwarding-on-dept_gpu).
 - **PyTorch forwarding covers one device per session and no CUDA streams, events, graphs or generator state.** Custom CUDA extensions and Triton kernels compiled in this process cannot run, because nothing here compiles for the runtime's GPU. `torch.compile` is untested.
-- **`Modal` and `Elice` are not exercised against the live services.** Their code follows each service's published interface, and the Elice paths come from Elice's own Terraform provider, but neither has been run end to end. The Modal adapter's calls were checked against the signatures of Modal 1.5.5, and `letify login modal` has not been run against Modal's sign in.
+- **`Modal` and `Elice` are not exercised against the live services.** Their code follows each service's published interface, but neither has been run end to end. The `eci` commands and flags come from Elice's CLI documentation. The JSON field names letify reads from `eci` (`devices`, `cpu_vcore`, `pricing_type`, `price_per_hour`, `status`, the public IP, `resource_quota`) come from the models in Elice's Terraform provider, elice-dev/terraform-provider-eci, and are not checked against `eci` output. The field names above and the `ubuntu` login user were checked against `eci` 0.2.1 output on a live organization on 2026-09-15.
+- **`eci compute vm launch` takes the machine password as an argument.** It is visible to other local users that can list processes while the launch runs. letify generates a password per account and never prints it. The Modal adapter's calls were checked against the signatures of Modal 1.5.5, and `letify login modal` has not been run against Modal's sign in.
 - **The connection pipeline is not exercised against live networks.** `Rendezvous`, `Strategy`, `Link`, `Probe`, `Pipeline`, `LinkCache` and the remote agent are implemented and tested over loopback sockets and faked commands. Installing and starting `sshd` on a Colab VM over `colab exec` is not yet checked against a live runtime.
-- **The Elice API runs no command on a machine.** The paths letify uses (virtual machine, allocation, instance type, pricing) create and power machines only, so Elice's remote half runs over forward SSH to the allocated machine, and the punch and Tailcat strategies need that SSH to succeed first.
-- **Orphan reconciliation is not implemented.** A session whose controlling machine was killed outright is released by the lease on the providers where the process is the cost. Where the platform bills for the machine and takes no deadline, nothing ends it: an Elice allocation bills until a delete is issued. The intended answer is that the next letify process asks the provider what is running under this project's name and ends what nothing is watching, with a command to do it on demand. Neither exists yet.
-- **Whether the Elice allocation API takes a deadline is unverified.** If it does, that is where the guarantee belongs, because the platform outlives the caller.
+- **letify runs no command on an Elice machine through `eci`.** Elice's remote half runs over forward SSH to the machine's public IP, and the punch and Tailcat strategies need that SSH to succeed first.
+- **Orphan reconciliation is not implemented.** A session whose controlling machine was killed outright is released by the lease on the providers where the process is the cost. Where the platform bills for the machine and takes no deadline, nothing ends it: an Elice machine bills compute until it is stopped. The intended answer is that the next letify process asks the provider what is running under this project's name and ends what nothing is watching, with a command to do it on demand. Neither exists yet.
 - **Persistence detection is not implemented.** Deciding a machine's disk policy by writing a marker file and looking for it in a later runtime is a decision recorded here, not yet code.

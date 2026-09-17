@@ -27,6 +27,8 @@ the base install and a provider whose package is missing reports itself unavaila
 
 from __future__ import annotations
 
+from typing import Final
+
 from .declare.cache import session_cache
 from .declare.env import Env
 from .declare.function import Function
@@ -42,6 +44,7 @@ from .errors import (
     RemoteError,
     RuntimeFailure,
     RuntimeLost,
+    SpotPreempted,
     UnknownInstance,
     UnknownProvider,
     UnsupportedMode,
@@ -52,13 +55,26 @@ from .store.volume import Volume
 
 #: Where a declaration's host code runs. Two named values rather than the enum class that holds
 #: them, because a declaration only ever needs one of the two.
-local = Host.local
-remote = Host.remote
+#: ``Final`` so a type checker sees the literal member, which the declaration overloads match on.
+local: Final = Host.local
+remote: Final = Host.remote
 
 # The enum class stays importable from letify.declare.instance for letify's own use.
 del Host
 
 __version__ = "1.0.0"
+
+
+def fetch(tensor):  # type: ignore[no-untyped-def]
+    """Queue a read of ``tensor`` and return an awaitable resolving to its CPU copy.
+
+    Under ``host="local"`` the read is queued at the call and awaiting it does not block the
+    event loop. A tensor not on the runtime resolves to ``tensor.detach().cpu()``.
+    """
+    from .remoting.device.client import fetch as queue_fetch
+
+    return queue_fetch(tensor)
+
 
 __all__ = [
     "AnyInstance",
@@ -79,6 +95,7 @@ __all__ = [
     "RemoteFile",
     "RuntimeFailure",
     "RuntimeLost",
+    "SpotPreempted",
     "UnknownInstance",
     "UnknownProvider",
     "UnsupportedMode",

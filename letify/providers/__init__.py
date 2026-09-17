@@ -12,6 +12,7 @@ from ..errors import ConfigError
 from .base import Persistence, Provider
 from .colab import Colab
 from .elice import Elice
+from .kaggle import Kaggle
 from .local import Local
 from .modal import Modal
 from .shell import Shell
@@ -26,6 +27,7 @@ KINDS: dict[str, type[Provider]] = {
     "ssh": Shell,
     "tunnel": Tunnel,
     "elice": Elice,
+    "kaggle": Kaggle,
 }
 
 
@@ -46,6 +48,7 @@ __all__ = [
     "KINDS",
     "Colab",
     "Elice",
+    "Kaggle",
     "Local",
     "Modal",
     "Persistence",
