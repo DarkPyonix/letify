@@ -569,6 +569,47 @@ def test_a_write_back_does_not_wait_for_a_file_that_never_arrived(
     assert "wrote back 1 files" in err
 
 
+def test_the_pending_manifest_names_every_file_of_the_call_exactly_once(
+    launcher_from, project
+) -> None:
+    """Spec "What the body sees before a file arrives": the manifest is written from a copy.
+
+    The data thread moves a path out of the pending map and into the placed map as each
+    blob completes. A writer that read the live maps could miss a path that was between
+    the two, or fail outright on a map that changed size while it was being read, so the
+    manifest is written from a copy taken under the lock the data thread takes.
+    """
+    let = streaming(launcher_from, data_first_wave_files=1)
+    root = dataset(project, 16, size=1 << 16)
+
+    @let.function(device=let.providers.lab.CPU, host=letify.remote)
+    def read_manifest(directory: Path) -> dict:
+        import json
+
+        # The manifest sits in the call directory, which is an ancestor of the dataset.
+        found = None
+        for parent in [directory, *directory.parents]:
+            candidate = parent / ".letify-pending.json"
+            if candidate.is_file():
+                found = candidate
+                break
+        if found is None:
+            return {"manifest": None, "files": sorted(p.name for p in directory.iterdir())}
+        written = json.loads(found.read_text())
+        return {
+            "manifest": sorted(Path(p).name for p in written["files"]),
+            "files": sorted(p.name for p in directory.iterdir()),
+        }
+
+    answer = read_manifest(root)
+    assert answer["manifest"] is not None, "the call had pending files, so a manifest was written"
+    # Both listings are taken inside the body, against the same runtime directory, because
+    # that is where the two maps live. Comparing against the client's directory would race
+    # the write-back instead of the placement this test is about.
+    assert answer["manifest"] == answer["files"]
+    assert len(answer["manifest"]) == len(set(answer["manifest"])), "a path was named twice"
+
+
 def test_a_call_whose_files_are_all_held_carries_no_streaming_machinery(
     launcher_from, project
 ) -> None:
