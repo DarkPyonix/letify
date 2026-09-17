@@ -140,10 +140,18 @@ class Session:
         return True
 
     def ended(self) -> KaggleSessionEnded:
+        """The runtime is lost, named without claiming which of the two causes it was.
+
+        The proxy answers 404 for an ended session, for a registered URL that no longer
+        routes, and for a session id that never existed, so a status read that is not 200
+        cannot tell them apart. Saying the session ended would state as fact something
+        this read does not establish.
+        """
         return KaggleSessionEnded(
-            f"{self.alias}: the Kaggle Jupyter Server session at {self.host} has ended. Kaggle "
-            f"ends a session after 20 minutes idle or at its 12 hour limit. Start a new session "
-            f"in the Kaggle editor with Run, Kaggle Jupyter Server, then run: "
+            f"{self.alias}: the Kaggle Jupyter Server session at {self.host} did not answer. "
+            f"It may have ended, since Kaggle ends a session after 20 minutes idle or at its "
+            f"12 hour limit, or the registered URL may no longer route to it. Start a new "
+            f"session in the Kaggle editor with Run, Kaggle Jupyter Server, then run: "
             f"letify login kaggle {self.alias} --connect <new Colab Compatible URL>"
         )
 
@@ -296,12 +304,13 @@ class KaggleChannel(FramedChannel):
         return self._verdict(cause)
 
     def _verdict(self, cause: Exception) -> Exception:
-        """Which of the two happened: the session ended, or the worker died inside it.
+        """Whether the session still answers, which is as much as one status read settles.
 
         Spec "Kaggle Jupyter Server session": the bridge exiting is the worker dying, and
-        one read of the session's status is what tells the two apart. A session that Kaggle
-        ended is a lost runtime, so a retry may start a new one; a worker that died inside a
-        living session is this runtime's failure and a retry would meet it again.
+        one read of the session's status is what decides how that is reported. A worker that
+        died inside an answering session is this runtime's failure, and a retry would meet it
+        again. A session that does not answer is a lost runtime, so a retry may start a new
+        one. The read does not say why it stopped answering, so ``ended`` does not claim to.
         """
         if not self.session.alive():
             return self.session.ended()

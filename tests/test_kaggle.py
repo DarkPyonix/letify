@@ -502,6 +502,31 @@ def test_an_ended_session_at_start_says_how_to_register_a_new_one(fake_kaggle) -
     assert "/k/123/proxy" not in message
 
 
+def test_a_session_that_does_not_route_is_not_reported_as_having_ended(fake_kaggle) -> None:
+    """Spec "Kaggle Jupyter Server session": the message does not state that the session ended.
+
+    Kaggle's proxy answers 404 for an ended session, for a URL that no longer routes to a
+    live one, and for a session id that never existed. A status read that is not 200
+    therefore cannot tell those apart, so a message asserting the session ended states as
+    fact something letify has not established. Here the server is running throughout: only
+    the registered URL points somewhere it does not serve.
+    """
+    from letify.config.secrets import write_secret
+    from letify.providers.kaggle import KaggleSessionEnded
+
+    write_secret("kaggle_a", "jupyter_url", fake_kaggle.url.replace("/k/123/", "/k/999/"))
+    with pytest.raises(KaggleSessionEnded) as caught:
+        session_channel(fake_kaggle)
+    message = str(caught.value)
+
+    assert "has ended" not in message
+    assert "did not answer" in message
+    assert "no longer route" in message
+    # The remedy is the same either way, so it is still spelled out.
+    assert "letify login kaggle kaggle_a --connect" in message
+    assert "20 minutes" in message and "12 hour" in message
+
+
 def test_a_session_that_ends_under_a_running_worker_is_a_lost_runtime(fake_kaggle) -> None:
     """Spec "Kaggle Jupyter Server session": the bridge exiting is the worker dying.
 
