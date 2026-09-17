@@ -432,10 +432,10 @@ class Kaggle(Provider):
         url = session_url(self.alias)
         if url is None:
             raise ConfigError(
-                f"{self.alias} has no registered Kaggle Jupyter Server session. Kaggle "
-                f"publishes no API that starts one, so start it in the Kaggle editor with "
-                f"Run, Kaggle Jupyter Server, then register its Colab Compatible URL with "
-                f"`letify login kaggle {self.alias} --connect '<URL>'`."
+                f"{self.alias} has no registered Kaggle Jupyter Server session. Kaggle's API "
+                f"returns no address for a session it starts, so start it in the Kaggle "
+                f"editor with Run, Kaggle Jupyter Server, then register its Colab Compatible "
+                f"URL with `letify login kaggle {self.alias} --connect '<URL>'`."
             )
         session = Session(self.alias, url)
         kernel = session.create_kernel()

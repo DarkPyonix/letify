@@ -110,7 +110,7 @@ Two sources decide this, and they say different things. Kaggle staff answered a 
 
 - No keep-alive request is ever sent, and accounts are never rotated.
 - The accelerators are `CPU`, `P100`, `T4` and `TPU_V3_8`, a fixed list read without a network call.
-- **A registered session is required.** Kaggle publishes no API that starts an interactive session, and the Colab Compatible URL exists only in the editor, under Run, Kaggle Jupyter Server. So a person registers one with `letify login kaggle <alias> --connect '<URL>'`, and that is the only part of the Kaggle provider a person has to do. A call on an account without one raises `ConfigError` naming the alias and the command to run.
+- **A registered session is required.** Kaggle's API starts and stops an interactive session, but it returns no Jupyter address for the session it started, and the proxy that fronts one accepts only the token the editor issues. The Colab Compatible URL therefore exists only in the editor, under Run, Kaggle Jupyter Server. So a person registers one with `letify login kaggle <alias> --connect '<URL>'`, and that is the only part of the Kaggle provider a person has to do. A call on an account without one raises `ConfigError` naming the alias and the command to run.
 - Everything after that registration is what every other provider does: the session builds the declared environment with `uv sync`, enters a workspace root, transfers files and checks the worker's interpreter. Kaggle gets no exemption from any of it.
 
 #### Kaggle Jupyter Server session <!-- id: kaggle-session -->

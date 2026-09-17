@@ -282,7 +282,7 @@ Provider
 
 **Kaggle.** kaggle.com의 Settings, API에서 API 토큰을 만든 뒤 `letify login kaggle kaggle_a`를 실행합니다. 토큰은 화면에 표시되지 않게 입력받고, `kaggle.json` 경로를 넣어도 됩니다. letify는 토큰을 `~/.letify/accounts/kaggle_a/`에 보관하고 읽기 전용인 `kaggle quota` 호출로 확인합니다. `letify usage kaggle_a`는 이번 주에 남은 GPU 시간을 보여 줍니다. Kaggle 선언에는 `host=letify.remote`를 써야 합니다. Kaggle은 터널을 금지하므로 `host=letify.local`은 타입 오류이고, 데코레이터가 실행될 때 예외가 납니다.
 
-한 단계가 더 있고, Kaggle에서 사람이 해야 하는 것은 이것뿐입니다. Kaggle 편집기에서 Run, Kaggle Jupyter Server로 세션을 시작하고, Colab Compatible URL을 복사한 뒤 `letify login kaggle kaggle_a --connect '<URL>'`을 실행합니다. 그 URL은 편집기에만 있습니다. Kaggle이 대화형 세션을 시작하는 API를 공개하지 않기 때문입니다. 세션이 등록되지 않은 계정으로 호출하면 거부하면서 이 안내를 보여 줍니다.
+한 단계가 더 있고, Kaggle에서 사람이 해야 하는 것은 이것뿐입니다. Kaggle 편집기에서 Run, Kaggle Jupyter Server로 세션을 시작하고, Colab Compatible URL을 복사한 뒤 `letify login kaggle kaggle_a --connect '<URL>'`을 실행합니다. 그 URL은 편집기에만 있습니다. Kaggle API로 세션을 시작하고 끌 수는 있지만 그 세션의 주소는 돌려주지 않고, 세션 앞의 프록시는 편집기가 발급한 토큰만 받습니다. 세션이 등록되지 않은 계정으로 호출하면 거부하면서 이 안내를 보여 줍니다.
 
 그다음부터 Kaggle은 다른 프로바이더와 같습니다. letify가 선언된 환경을 세션에서 `uv sync`로 만들고, 작업 디렉터리에 들어가고, 파일을 주고받고, 워커의 인터프리터를 검사합니다. 세션의 GPU를 기록하고, Kaggle이 세션을 끝낼 때까지 호출을 그 세션에서 실행합니다. 세션은 20분 동안 쓰지 않거나 12시간이 지나면 끝납니다. 그러면 새 URL을 등록하라는 오류를 내고, 세션을 억지로 유지하지 않습니다.
 
