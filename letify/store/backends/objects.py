@@ -1,22 +1,39 @@
-"""Object store backends: Google Cloud Storage, S3 compatible, and Modal volumes.
+"""Object store backends: Google Cloud Storage and Modal volumes.
 
-Each client library is imported lazily, so importing letify never pulls in a cloud SDK.
+Google Cloud Storage is reached with the standard library HTTP client against the JSON
+API, with a token borrowed from the user's own Google login. A Modal volume is reached
+through the Modal adapter, a separate process, so importing letify never pulls in a cloud
+SDK.
 
-One habit is shared by all three: ``missing`` answers with a single listing rather than
-one request per digest. Object level requests are billed and add latency, and avoiding
-that is the whole point of diffing against a manifest.
+One habit is shared by every backend: ``missing`` answers with a single listing rather
+than one request per digest. Object level requests are billed and add latency, and
+avoiding that is the whole point of diffing against a manifest.
 """
 
 from __future__ import annotations
 
-import io
-import os
+import base64
+import json
+import urllib.error
+import urllib.parse
+import urllib.request
 from collections.abc import Iterator
 from typing import Any
 
-from ...errors import ProviderUnavailable
+from ...errors import ConfigError, ProviderUnavailable, RuntimeFailure
 from ..cas import Backend
+from .google_auth import TokenSource
 from .layout import BLOB_PREFIX, blob_key, ref_key
+
+#: The Cloud Storage JSON API.
+GCS_ENDPOINT = "https://storage.googleapis.com"
+
+#: The Modal volume version a missing volume is created as. Version 1 cannot read back a
+#: file above 4 MiB.
+MODAL_VOLUME_VERSION = 2
+
+#: Google's Security Token Service, which downscopes a token with a Credential Access Boundary.
+STS_ENDPOINT = "https://sts.googleapis.com/v1/token"
 
 
 class GCSBackend(Backend):
@@ -31,162 +48,281 @@ class GCSBackend(Backend):
 
     name = "gcs"
 
-    def __init__(self, bucket: str, prefix: str = "letify"):
-        try:
-            from google.cloud import storage
-        except ImportError as exc:
-            raise ProviderUnavailable(
-                "gcs", "the google-cloud-storage package is not installed", "gcs"
-            ) from exc
-        self.prefix = prefix.strip("/")
-        self._client = storage.Client()
-        self._bucket = self._client.bucket(bucket)
-
-    def _key(self, key: str) -> str:
-        return f"{self.prefix}/{key}" if self.prefix else key
-
-    def has(self, digest: str) -> bool:
-        return self._bucket.blob(self._key(blob_key(digest))).exists()
-
-    def put(self, digest: str, payload: bytes) -> None:
-        self._bucket.blob(self._key(blob_key(digest))).upload_from_string(payload)
-
-    def get(self, digest: str) -> bytes:
-        return self._bucket.blob(self._key(blob_key(digest))).download_as_bytes()
-
-    def list_digests(self, prefix: str = "") -> Iterator[str]:
-        base = self._key(BLOB_PREFIX)
-        for blob in self._client.list_blobs(self._bucket, prefix=base):
-            name = blob.name.rsplit("/", 1)[-1]
-            if name.startswith(prefix):
-                yield name
-
-    def missing(self, digests: list[str]) -> list[str]:
-        held = set(self.list_digests())
-        return [digest for digest in digests if digest not in held]
-
-    def read_ref(self, name: str) -> str | None:
-        blob = self._bucket.blob(self._key(ref_key(name)))
-        return blob.download_as_text().strip() if blob.exists() else None
-
-    def write_ref(self, name: str, digest: str) -> None:
-        self._bucket.blob(self._key(ref_key(name))).upload_from_string(digest)
-
-
-class S3Backend(Backend):
-    """Any S3 compatible object store.
-
-    This covers Elice Data Hub as well as Amazon S3 and most other providers, because
-    the S3 API is what object stores agree on.
-    """
-
-    name = "s3"
-
     def __init__(
         self,
         bucket: str,
         prefix: str = "letify",
-        *,
-        endpoint_url: str | None = None,
-        region: str | None = None,
+        endpoint: str = GCS_ENDPOINT,
+        sts_endpoint: str = STS_ENDPOINT,
+        tokens: TokenSource | None = None,
     ):
-        try:
-            import boto3
-        except ImportError as exc:
-            raise ProviderUnavailable("s3", "the boto3 package is not installed", "s3") from exc
         self.bucket = bucket
         self.prefix = prefix.strip("/")
-        self._client: Any = boto3.client(
-            "s3",
-            endpoint_url=endpoint_url or os.environ.get("LETIFY_S3_ENDPOINT"),
-            region_name=region,
-        )
+        self.endpoint = endpoint.rstrip("/")
+        self.sts_endpoint = sts_endpoint
+        self.tokens = tokens or TokenSource()
+
+    # -- the runtime's pull ------------------------------------------------------
+
+    def access_boundary(self) -> dict[str, object]:
+        """Read access to this bucket, narrowed to object names under the prefix."""
+        resource = f"projects/_/buckets/{self.bucket}"
+        rule: dict[str, object] = {
+            "availablePermissions": ["inRole:roles/storage.objectViewer"],
+            "availableResource": f"//storage.googleapis.com/{resource}",
+        }
+        if self.prefix:
+            rule["availabilityCondition"] = {
+                "expression": f"resource.name.startsWith('{resource}/objects/{self.prefix}/')"
+            }
+        return {"accessBoundary": {"accessBoundaryRules": [rule]}}
+
+    def read_token(self) -> str:
+        """Exchange the local login for a token that can only read this volume.
+
+        A failure raises rather than handing out the unscoped token, because that token can
+        do everything the user's login can.
+        """
+        form = urllib.parse.urlencode(
+            {
+                "grant_type": "urn:ietf:params:oauth:grant-type:token-exchange",
+                "subject_token_type": "urn:ietf:params:oauth:token-type:access_token",
+                "requested_token_type": "urn:ietf:params:oauth:token-type:access_token",
+                "subject_token": self.tokens.token(),
+                "options": json.dumps(self.access_boundary()),
+            }
+        ).encode()
+        request = urllib.request.Request(self.sts_endpoint, data=form, method="POST")
+        request.add_header("Content-Type", "application/x-www-form-urlencoded")
+        try:
+            with urllib.request.urlopen(request, timeout=60) as response:
+                return str(json.loads(response.read())["access_token"])
+        except urllib.error.HTTPError as exc:
+            detail = exc.read()[:500].decode(errors="replace")
+            raise RuntimeFailure(
+                f"downscoping the read token for gs://{self.bucket} returned {exc.code}: {detail}"
+            ) from exc
+        except (urllib.error.URLError, OSError, KeyError, ValueError) as exc:
+            raise RuntimeFailure(
+                f"downscoping the read token for gs://{self.bucket} failed: {exc}"
+            ) from exc
+
+    def pull_source(self, digest: str) -> dict[str, object] | None:
+        """A Colab runtime is a Compute Engine VM, so it reads the bucket over Google's network."""
+        return {
+            "url": self.blob_url(digest),
+            "headers": {"Authorization": f"Bearer {self.read_token()}"},
+        }
 
     def _key(self, key: str) -> str:
         return f"{self.prefix}/{key}" if self.prefix else key
 
-    def has(self, digest: str) -> bool:
-        from botocore.exceptions import ClientError
+    def blob_url(self, digest: str) -> str:
+        """The media download URL of one blob, which carries no credential."""
+        return self.object_url(self._key(blob_key(digest)), media=True)
 
+    # -- HTTP ------------------------------------------------------------------
+
+    def object_url(self, name: str, *, media: bool = False) -> str:
+        quoted = urllib.parse.quote(name, safe="")
+        url = f"{self.endpoint}/storage/v1/b/{urllib.parse.quote(self.bucket)}/o/{quoted}"
+        return url + "?alt=media" if media else url
+
+    def _request(
+        self, method: str, url: str, *, data: bytes | None = None, what: str
+    ) -> bytes | None:
+        """Send one request. A 404 answers None, any other failure raises."""
+        request = urllib.request.Request(url, data=data, method=method)
+        request.add_header("Authorization", f"Bearer {self.tokens.token()}")
+        if data is not None:
+            request.add_header("Content-Type", "application/octet-stream")
         try:
-            self._client.head_object(Bucket=self.bucket, Key=self._key(blob_key(digest)))
-        except ClientError:
-            return False
-        return True
+            with urllib.request.urlopen(request, timeout=3600) as response:
+                return response.read()
+        except urllib.error.HTTPError as exc:
+            if exc.code == 404:
+                return None
+            detail = exc.read()[:500].decode(errors="replace")
+            raise RuntimeFailure(
+                f"gs://{self.bucket}/{what}: {method} returned {exc.code}: {detail}"
+            ) from exc
+        except (urllib.error.URLError, OSError) as exc:
+            raise RuntimeFailure(f"gs://{self.bucket}/{what}: {method} failed: {exc}") from exc
+
+    def _upload(self, name: str, payload: bytes) -> None:
+        query = urllib.parse.urlencode({"uploadType": "media", "name": name})
+        url = f"{self.endpoint}/upload/storage/v1/b/{urllib.parse.quote(self.bucket)}/o?{query}"
+        self._request("POST", url, data=payload, what=name)
+
+    def put_file(self, digest: str, path: str, size: int, progress: Any = None) -> None:
+        """Upload one file as a blob, streamed from disk rather than read into memory.
+
+        ``progress``, when given, is called with the number of bytes sent so far.
+        """
+        name = self._key(blob_key(digest))
+        query = urllib.parse.urlencode({"uploadType": "media", "name": name})
+        url = f"{self.endpoint}/upload/storage/v1/b/{urllib.parse.quote(self.bucket)}/o?{query}"
+        with open(path, "rb") as handle:
+            body = _CountingReader(handle, progress)
+            request = urllib.request.Request(url, data=body, method="POST")  # type: ignore[arg-type]
+            request.add_header("Authorization", f"Bearer {self.tokens.token()}")
+            request.add_header("Content-Type", "application/octet-stream")
+            request.add_header("Content-Length", str(size))
+            try:
+                with urllib.request.urlopen(request, timeout=3600) as response:
+                    response.read()
+            except urllib.error.HTTPError as exc:
+                detail = exc.read()[:500].decode(errors="replace")
+                raise RuntimeFailure(
+                    f"gs://{self.bucket}/{name}: POST returned {exc.code}: {detail}"
+                ) from exc
+            except (urllib.error.URLError, OSError) as exc:
+                raise RuntimeFailure(f"gs://{self.bucket}/{name}: POST failed: {exc}") from exc
+
+    def _download(self, name: str) -> bytes | None:
+        return self._request("GET", self.object_url(name, media=True), what=name)
+
+    # -- the backend -----------------------------------------------------------
+
+    def has(self, digest: str) -> bool:
+        name = self._key(blob_key(digest))
+        return self._request("GET", self.object_url(name), what=name) is not None
 
     def put(self, digest: str, payload: bytes) -> None:
-        self._client.put_object(Bucket=self.bucket, Key=self._key(blob_key(digest)), Body=payload)
+        self._upload(self._key(blob_key(digest)), payload)
 
     def get(self, digest: str) -> bytes:
-        response = self._client.get_object(Bucket=self.bucket, Key=self._key(blob_key(digest)))
-        return response["Body"].read()
+        name = self._key(blob_key(digest))
+        payload = self._download(name)
+        if payload is None:
+            raise RuntimeFailure(f"gs://{self.bucket}/{name} does not exist")
+        return payload
 
     def list_digests(self, prefix: str = "") -> Iterator[str]:
-        paginator = self._client.get_paginator("list_objects_v2")
-        for page in paginator.paginate(Bucket=self.bucket, Prefix=self._key(BLOB_PREFIX)):
-            for item in page.get("Contents", []):
-                name = item["Key"].rsplit("/", 1)[-1]
+        base = self._key(BLOB_PREFIX) + "/"
+        listing = f"{self.endpoint}/storage/v1/b/{urllib.parse.quote(self.bucket)}/o"
+        page: str | None = None
+        while True:
+            query = {"prefix": base, "fields": "items(name),nextPageToken"}
+            if page:
+                query["pageToken"] = page
+            url = f"{listing}?{urllib.parse.urlencode(query)}"
+            body = json.loads(self._request("GET", url, what=base) or b"{}")
+            for item in body.get("items", []):
+                name = str(item["name"]).rsplit("/", 1)[-1]
                 if name.startswith(prefix):
                     yield name
+            page = body.get("nextPageToken")
+            if not page:
+                return
 
     def missing(self, digests: list[str]) -> list[str]:
         held = set(self.list_digests())
         return [digest for digest in digests if digest not in held]
 
     def read_ref(self, name: str) -> str | None:
-        from botocore.exceptions import ClientError
-
-        try:
-            response = self._client.get_object(Bucket=self.bucket, Key=self._key(ref_key(name)))
-        except ClientError:
-            return None
-        return response["Body"].read().decode("utf-8").strip()
+        payload = self._download(self._key(ref_key(name)))
+        return payload.decode().strip() if payload is not None else None
 
     def write_ref(self, name: str, digest: str) -> None:
-        self._client.put_object(
-            Bucket=self.bucket, Key=self._key(ref_key(name)), Body=digest.encode()
-        )
+        self._upload(self._key(ref_key(name)), digest.encode())
+
+
+class _CountingReader:
+    """A file object for an upload body that reports how many bytes were read."""
+
+    def __init__(self, handle: Any, progress: Any) -> None:
+        self._handle = handle
+        self._progress = progress
+        self._done = 0
+
+    def read(self, size: int = -1) -> bytes:
+        # http.client reads the body in blocks of its own size; a wider block sends faster.
+        chunk = self._handle.read(max(size, 1 << 20) if size > 0 else size)
+        self._done += len(chunk)
+        if self._progress is not None:
+            self._progress(self._done)
+        return chunk
 
 
 class ModalBackend(Backend):
     """A Modal volume, mounted from outside the container.
 
     A Modal volume sits in the same data centre as the GPU and caches read blocks on
-    local disk, which is why a persistent provider needs no separate cache tier.
+    local disk, which is why a persistent provider needs no separate cache tier. Every
+    operation goes through the Modal adapter acting as ``account``, so the letify process
+    never imports ``modal``.
     """
 
     name = "modal"
 
-    def __init__(self, volume_name: str, prefix: str = "letify"):
-        try:
-            import modal
-        except ImportError as exc:
-            raise ProviderUnavailable(
-                "modal", "the modal package is not installed", "modal"
-            ) from exc
+    def __init__(self, volume_name: str, prefix: str = "letify", account: str | None = None):
+        from ... import tools
+        from ...providers.modal import Adapter
+
+        if not account:
+            raise ConfigError(
+                f"the modal backend for volume {volume_name!r} needs an account to act as. "
+                f"Set account = '<alias of a modal login>' on the volume."
+            )
+        if tools.find_uv() is None:
+            raise ProviderUnavailable("modal", tools.missing_uv_message())
+        self.volume_name = volume_name
+        self.account = account
         self.prefix = prefix.strip("/")
-        self._volume = modal.Volume.from_name(volume_name, create_if_missing=True)
+        self._adapter = Adapter.for_account(account)
 
     def _key(self, key: str) -> str:
         return f"/{self.prefix}/{key}" if self.prefix else f"/{key}"
 
-    def has(self, digest: str) -> bool:
+    def _request(self, op: str, **fields: Any) -> Any:
+        """Send one volume op, naming the volume and the version it is created as."""
+        return self._adapter.request(
+            op, volume=self.volume_name, version=MODAL_VOLUME_VERSION, **fields
+        )
+
+    def _put(self, path: str, payload: bytes) -> None:
+        data = base64.b64encode(payload).decode()
+        self._request("volume_put", path=path, data=data)
+
+    def _get(self, path: str) -> bytes | None:
+        from ...providers.modal import VolumePathMissing
+
         try:
-            next(iter(self._volume.listdir(self._key(blob_key(digest)))))
-        except Exception:
-            return False
-        return True
+            data = self._request("volume_get", path=path)
+        except VolumePathMissing:
+            return None
+        return base64.b64decode(str(data))
+
+    def _list(self, path: str) -> list[str]:
+        from ...providers.modal import VolumePathMissing
+
+        try:
+            found = self._request("volume_list", path=path)
+        except VolumePathMissing:
+            return []
+        return [str(entry) for entry in found]
+
+    def delete(self, digest: str) -> None:
+        """Remove a blob. A blob that is already absent is not an error."""
+        self._request("volume_delete", path=self._key(blob_key(digest)))
+
+    def has(self, digest: str) -> bool:
+        return bool(self._list(self._key(blob_key(digest))))
 
     def put(self, digest: str, payload: bytes) -> None:
-        with self._volume.batch_upload(force=True) as batch:
-            batch.put_file(io.BytesIO(payload), self._key(blob_key(digest)))
+        self._put(self._key(blob_key(digest)), payload)
 
     def get(self, digest: str) -> bytes:
-        return b"".join(self._volume.read_file(self._key(blob_key(digest))))
+        path = self._key(blob_key(digest))
+        payload = self._get(path)
+        if payload is None:
+            raise RuntimeFailure(f"modal volume {self.volume_name}:{path} does not exist")
+        return payload
 
     def list_digests(self, prefix: str = "") -> Iterator[str]:
-        for entry in self._volume.listdir(self._key(BLOB_PREFIX), recursive=True):
-            name = entry.path.rsplit("/", 1)[-1]
+        for path in self._list(self._key(BLOB_PREFIX)):
+            name = path.rsplit("/", 1)[-1]
             if name.startswith(prefix):
                 yield name
 
@@ -195,15 +331,15 @@ class ModalBackend(Backend):
         return [digest for digest in digests if digest not in held]
 
     def read_ref(self, name: str) -> str | None:
-        try:
-            payload = b"".join(self._volume.read_file(self._key(ref_key(name))))
-        except Exception:
-            return None
-        return payload.decode().strip()
+        payload = self._get(self._key(ref_key(name)))
+        return payload.decode().strip() if payload is not None else None
 
     def write_ref(self, name: str, digest: str) -> None:
-        with self._volume.batch_upload(force=True) as batch:
-            batch.put_file(io.BytesIO(digest.encode()), self._key(ref_key(name)))
+        self._put(self._key(ref_key(name)), digest.encode())
+
+    def close(self) -> None:
+        """Stop the adapter process this backend started."""
+        self._adapter.close()
 
 
-__all__ = ["GCSBackend", "ModalBackend", "S3Backend"]
+__all__ = ["GCSBackend", "ModalBackend"]

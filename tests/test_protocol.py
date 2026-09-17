@@ -1,14 +1,14 @@
 """The wire between this process and a runtime.
 
-Spec sections pinned here: "Channels", "Call protocol", "Handles" and "Argument
-addressing". The one-shot driver is exercised by really running the script it builds in
-a fresh interpreter, because that is what a provider such as ``colab exec`` does with
-it, and the markers and the decoder are then the real ones.
+Spec sections pinned here: "Channels", "Call protocol", "Session cache" and
+"Argument addressing". The one-shot driver is exercised by really running the script it
+builds in a fresh interpreter, because that is what a provider such as ``colab exec``
+does with it, and the markers and the decoder are then the real ones.
 """
 
 from __future__ import annotations
 
-import base64
+import os
 import pickle
 import subprocess
 import sys
@@ -22,9 +22,9 @@ import pytest
 import letify
 from letify import protocol
 from letify.declare.env import Env
-from letify.protocol import codec, driver, framing, guards
-from letify.protocol.handle import Blob, Handle, RemoteFile
-from letify.protocol.worker import BOOTSTRAP, READY, REPLY
+from letify.protocol import codec, driver, wire
+from letify.protocol.handle import Blob, RemoteFile
+from letify.protocol.worker import BOOTSTRAP
 
 
 def run_script(source: str) -> str:
@@ -95,61 +95,140 @@ def test_an_unrecognized_payload_is_a_protocol_error(payload: object) -> None:
         codec.unwrap(payload, runtime_key="r")  # type: ignore[arg-type]
 
 
-# -- Spec: Handles -------------------------------------------------------------
+# -- Spec: Session cache -------------------------------------------------------
 
 
-def test_a_kept_value_comes_back_as_a_handle_scoped_to_its_runtime() -> None:
-    value = codec.unwrap(
-        {
-            "ok": True,
-            "handle": {"object_id": "abc123", "type_name": "Module", "summary": "Module(...)"},
-        },
-        runtime_key="letify-cpu-1",
+def test_a_session_cache_works_within_one_one_shot_call() -> None:
+    # A one-shot process keeps nothing for the next call, but inside the call the cache holds.
+    def work() -> int:
+        builds = []
+
+        def load() -> int:
+            builds.append(1)
+            return 3
+
+        first = letify.session_cache("value", load)
+        second = letify.session_cache("value", load)
+        return first + second + len(builds)
+
+    stdout = run_script(driver.build(work, (), {}))
+    assert codec.parse(stdout, runtime_key="one-shot")[1] == 7
+
+
+def test_a_runtime_that_cannot_import_letify_names_the_reason(tmp_path: Path) -> None:
+    blocker = tmp_path / "letify"
+    blocker.mkdir()
+    (blocker / "__init__.py").write_text(
+        "raise ModuleNotFoundError(\"No module named 'letify'\", name='letify')\n",
+        encoding="utf-8",
     )
-    assert isinstance(value, Handle)
-    # The handle names the live runtime, not the pool key, because two runtimes can
-    # share a key and the object lives in only one of them.
-    assert value.runtime == "letify-cpu-1"
-    assert value.type_name == "Module"
-    assert value.summary == "Module(...)"
+
+    def work() -> int:
+        return letify.session_cache("value", lambda: 1)
+
+    import os
+
+    env = {**os.environ, "PYTHONPATH": str(tmp_path)}
+    stdout = subprocess.run(
+        [sys.executable, "-c", driver.build(work, (), {})],
+        capture_output=True,
+        text=True,
+        timeout=120,
+        env=env,
+        cwd=tmp_path,
+    ).stdout
+    with pytest.raises(letify.RemoteError, match=r"letify is not installed.*uv add letify"):
+        codec.parse(stdout, runtime_key="one-shot")
 
 
-def test_a_handle_belonging_to_another_runtime_is_refused_before_anything_is_sent() -> None:
-    stranger = Handle(runtime="elsewhere", object_id="00", type_name="dict")
-    with pytest.raises(letify.HandleScopeError, match="belongs to runtime 'elsewhere'"):
-        guards.check_handles("here", (), {"model": stranger})
+def test_a_body_that_imports_letify_while_running_names_the_reason(tmp_path: Path) -> None:
+    # The call loads without letify, and only the body's own import needs it.
+    blocker = tmp_path / "letify"
+    blocker.mkdir()
+    (blocker / "__init__.py").write_text(
+        "raise ModuleNotFoundError(\"No module named 'letify'\", name='letify')\n",
+        encoding="utf-8",
+    )
+
+    def work() -> int:
+        import letify as inside
+
+        return inside.session_cache("value", lambda: 1)
+
+    import os
+
+    env = {**os.environ, "PYTHONPATH": str(tmp_path)}
+    stdout = subprocess.run(
+        [sys.executable, "-c", driver.build(work, (), {})],
+        capture_output=True,
+        text=True,
+        timeout=120,
+        env=env,
+        cwd=tmp_path,
+    ).stdout
+    with pytest.raises(letify.RemoteError, match=r"letify is not installed.*uv add letify"):
+        codec.parse(stdout, runtime_key="one-shot")
 
 
-def test_a_handle_is_found_however_deeply_it_is_nested() -> None:
-    # Catching this locally is the point: otherwise the payload crosses the network
-    # before the far side discovers it cannot resolve the handle.
-    stranger = Handle(runtime="elsewhere", object_id="00", type_name="dict")
-    with pytest.raises(letify.HandleScopeError):
-        guards.check_handles("here", ([{"models": (stranger,)}],), {})
+def test_a_worker_call_whose_body_imports_letify_while_running_names_the_reason(
+    tmp_path: Path,
+) -> None:
+    # The persistent worker's call op, loaded by path in a process where letify cannot
+    # be imported, as in a runtime whose environment lacks it.
+    blocker = tmp_path / "letify"
+    blocker.mkdir()
+    (blocker / "__init__.py").write_text(
+        "raise ModuleNotFoundError(\"No module named 'letify'\", name='letify')\n",
+        encoding="utf-8",
+    )
 
+    def work() -> int:
+        import letify as inside
 
-def test_a_handle_from_the_target_runtime_passes_the_check() -> None:
-    own = Handle(runtime="here", object_id="00", type_name="dict")
-    assert guards.check_handles("here", (own,), {"also": own}) is None
+        return inside.session_cache("value", lambda: 1)
 
+    from letify.protocol.worker import SOURCE
 
-def test_every_leaf_of_a_nested_structure_is_inspected() -> None:
-    assert sorted(guards.walk([1, (2, 3), {"a": 4}, {5}])) == [1, 2, 3, 4, 5]
+    source = SOURCE.encode()
+    stdin = bytearray(b"%d\n" % len(source) + source)
+    sender = wire.Sender(lambda view: stdin.extend(view) or view.nbytes)
+    head, buffers = codec.dumps_call_parts(work, (), {})
+    sender.message(wire.REQUEST, 1, {"op": "call", "payload": head, "buffers": buffers})
+    sender.frame(wire.SHUTDOWN, 0)
+    import os
+
+    env = {**os.environ, "PYTHONPATH": str(tmp_path)}
+    stdout = subprocess.run(
+        [sys.executable, "-u", "-c", BOOTSTRAP],
+        input=bytes(stdin),
+        capture_output=True,
+        timeout=120,
+        env=env,
+        cwd=tmp_path,
+    ).stdout
+    receiver = wire.Receiver(_reader(stdout))
+    replies = []
+    while True:
+        try:
+            event = receiver.next_event()
+        except EOFError:
+            break
+        if event is not None and event[0] == wire.REPLY:
+            replies.append(wire.loads(*event[2]))
+    [reply] = replies
+    assert reply["ok"] is False
+    assert "letify is not installed" in reply["error"] and "uv add letify" in reply["error"]
 
 
 def test_a_reference_names_what_it_points_at() -> None:
-    # These strings are what a user sees when a kept value is printed.
-    assert repr(Handle("rt", "0123456789abcdef", "Module")) == "<Handle Module 01234567 on rt>"
     assert repr(Blob("0123456789abcdef", 2048)) == "<Blob 01234567 2048 bytes>"
     assert repr(RemoteFile("/opt/letify/x.bin", "abc", 10)) == (
         "<RemoteFile /opt/letify/x.bin 10 bytes>"
     )
 
 
-def test_the_worker_recognizes_a_reference_without_importing_letify() -> None:
-    # The worker runs where letify is not installed, so it reads a marker by attribute
-    # rather than doing an isinstance check.
-    assert Handle.__letify_kind__ == "handle"
+def test_the_worker_recognizes_a_blob_by_marker() -> None:
+    # The worker source reads a marker by attribute rather than doing an isinstance check.
     assert Blob.__letify_kind__ == "blob"
 
 
@@ -161,38 +240,84 @@ def test_the_inline_limit_is_sixty_four_kilobytes() -> None:
     assert codec.INLINE_LIMIT == 64 * 1024
 
 
-# -- Spec: Channels, framing ---------------------------------------------------
+# -- Spec: Channels, frames ---------------------------------------------------
 
 
-def test_a_request_travels_as_one_base64_line() -> None:
-    # One line per message is what survives an SSH channel, a WebSocket bridge and a
-    # plain pipe without any of them mangling the bytes.
-    line = framing.encode_request({"op": "stat"})
-    assert "\n" not in line
-    assert pickle.loads(base64.b64decode(line)) == {"op": "stat"}
+def test_a_request_travels_as_frames_with_no_base64() -> None:
+    written = bytearray()
+    sender = wire.Sender(lambda view: written.extend(view) or view.nbytes)
+    sender.message(wire.REQUEST, 1, {"op": "stat"})
+    magic, kind, _flags, stream, length = wire.HEADER.unpack_from(written)
+    assert (magic, kind, stream) == (b"LF", wire.REQUEST, 1)
+    assert len(written) == wire.HEADER.size + length
+    receiver = wire.Receiver(_reader(bytes(written)))
+    kind, stream, (head, buffers) = receiver.next_event()
+    assert wire.loads(head, buffers) == {"op": "stat"}
 
 
-def test_a_reply_is_told_apart_from_the_user_own_output_by_its_prefix() -> None:
-    # letify's replies and the user's prints share one stream, so the marker is what
+def test_output_frames_are_told_apart_from_replies_by_their_type() -> None:
+    # letify's replies and the user's prints travel on one pipe, so the frame type is what
     # separates them.
-    outcome = {"ok": True, "value": 7}
-    line = REPLY + base64.b64encode(pickle.dumps(outcome)).decode() + "\n"
-    assert framing.is_reply(line)
-    assert framing.decode_reply(line) == outcome
-    assert not framing.is_reply("a line the user printed\n")
+    written = bytearray()
+    sender = wire.Sender(lambda view: written.extend(view) or view.nbytes)
+    sender.frame(wire.STDOUT, 0, b"a line the user printed\n")
+    sender.message(wire.REPLY, 3, {"ok": True, "value": 7})
+    receiver = wire.Receiver(_reader(bytes(written)))
+    assert receiver.next_event() == (wire.STDOUT, 0, b"a line the user printed\n")
+    kind, stream, (head, buffers) = receiver.next_event()
+    assert (kind, stream) == (wire.REPLY, 3)
+    assert wire.loads(head, buffers) == {"ok": True, "value": 7}
 
 
-def test_the_worker_announces_itself_before_it_reads_requests() -> None:
-    assert framing.is_ready(READY + "\n")
-    assert not framing.is_ready("still installing\n")
+def test_the_hello_frame_names_the_python_version_the_worker_runs_on() -> None:
+    # Spec "Frames" and "Interpreter check".
+    written = bytearray()
+    wire.Sender(lambda view: written.extend(view) or view.nbytes).frame(wire.HELLO, 0, b"3.12")
+    assert wire.Receiver(_reader(bytes(written))).next_event() == (wire.HELLO, 0, "3.12")
 
 
-def test_the_bootstrap_stub_leaves_standard_input_open_for_requests() -> None:
-    # python - reads to end of file before compiling anything, so the worker source
-    # cannot be sent as a script. The stub reads a length-prefixed blob instead.
-    assert "sys.stdin.readline()" in BOOTSTRAP
-    assert "sys.stdin.read(n)" in BOOTSTRAP
-    assert "\n" not in BOOTSTRAP
+def test_a_frame_split_across_reads_is_reassembled_in_order() -> None:
+    payload = bytes(range(256)) * 40000
+    written = bytearray()
+    sender = wire.Sender(lambda view: written.extend(view) or view.nbytes)
+    sender.message(wire.REPLY, 5, {"ok": True, "value": bytearray(payload)})
+    receiver = wire.Receiver(_reader(bytes(written), step=7777))
+    event = None
+    while event is None:
+        event = receiver.next_event()
+    assert wire.loads(event[2][0], event[2][1])["value"] == payload
+
+
+def test_text_frames_carry_the_same_frames_as_base64_lines() -> None:
+    # Spec "Modal adapter": a transport whose output is text gets one line per frame.
+    import base64
+
+    written = bytearray()
+    wire.TextSender(lambda view: written.extend(view) or view.nbytes).message(
+        wire.REPLY, 1, {"ok": True, "value": b"x" * (2 << 20)}
+    )
+    lines = bytes(written).splitlines()
+    assert all(b"\n" not in line for line in lines)
+    batches = iter([[base64.b64decode(line)] for line in lines] + [[]])
+    receiver = wire.Receiver(wire.chunks_readinto(lambda: next(batches)))
+    event = None
+    while event is None:
+        event = receiver.next_event()
+    assert wire.loads(event[2][0], event[2][1])["value"] == b"x" * (2 << 20)
+
+
+def _reader(data: bytes, step: int = 1 << 30):
+    view = memoryview(data)
+    position = 0
+
+    def readinto(target: memoryview) -> int:
+        nonlocal position
+        count = min(target.nbytes, step, len(view) - position)
+        target[:count] = view[position : position + count]
+        position += count
+        return count
+
+    return readinto
 
 
 # -- Spec: Call protocol, the one-shot path ------------------------------------
@@ -269,17 +394,6 @@ def test_an_async_body_is_awaited_on_the_far_side() -> None:
 
     stdout = run_script(driver.build(work, (), {}))
     assert codec.parse(stdout, runtime_key="one-shot")[1] == 7
-
-
-def test_keeping_a_value_is_refused_where_no_process_survives_the_call() -> None:
-    # There is nothing for a handle to point at once a one-shot command returns, so this
-    # fails with its reason rather than returning a handle that cannot be resolved.
-    def build() -> dict[str, int]:
-        return {"weights": 1}
-
-    stdout = run_script(driver.build(build, (), {}, keep_remote=True))
-    with pytest.raises(letify.RemoteError, match="keep_remote needs a persistent session"):
-        codec.parse(stdout, runtime_key="one-shot")
 
 
 def test_a_return_value_that_cannot_be_serialized_reports_that_rather_than_hanging() -> None:
@@ -367,3 +481,152 @@ def test_a_declaration_ships_what_its_environment_asked_for(let, cpu, tmp_path) 
             return module.score(x) + 1
 
         assert scored(x=5) == 16
+
+
+def test_a_large_bytes_value_is_read_into_the_object_it_becomes() -> None:
+    # Spec "Frames": a buffer marked as bytes is filled in place, so no copy follows the read.
+    payload = os.urandom(2 << 20)
+    written = bytearray()
+    wire.Sender(lambda view: written.extend(view) or view.nbytes).message(
+        wire.REPLY, 1, {"ok": True, "value": payload}
+    )
+    receiver = wire.Receiver(_reader(bytes(written), step=1 << 20))
+    event = None
+    while event is None:
+        event = receiver.next_event()
+    head, buffers = event[2]
+    assert [type(buffer) for buffer in buffers] == [bytes]
+    value = wire.loads(head, buffers)["value"]
+    assert value is buffers[0]
+    assert value == payload
+    assert hash(value) == hash(payload)
+
+
+def test_a_bytearray_value_still_arrives_as_a_bytearray() -> None:
+    # Only buffers marked as bytes are filled in place; a bytearray keeps its own type.
+    written = bytearray()
+    wire.Sender(lambda view: written.extend(view) or view.nbytes).message(
+        wire.REPLY, 1, {"ok": True, "value": bytearray(b"y" * (2 << 20))}
+    )
+    receiver = wire.Receiver(_reader(bytes(written)))
+    event = None
+    while event is None:
+        event = receiver.next_event()
+    value = wire.loads(*event[2])["value"]
+    assert type(value) is bytearray and value == bytearray(b"y" * (2 << 20))
+
+
+# -- striped byte stream: spec "Parallel data streams" ------------------------------------
+
+
+class _CountingLane:
+    """One end of a socket pair whose writes are recorded by size."""
+
+    def __init__(self, sock):
+        self.sock = sock
+        self.segments: list[int] = []
+
+    def send(self, view) -> int:
+        count = self.sock.send(view)
+        self.segments.append(count)
+        return count
+
+
+def _striped_pair(lanes: int):
+    import socket
+
+    pairs = [socket.socketpair() for _ in range(lanes)]
+    near = [_CountingLane(a) for a, _ in pairs]
+    far = [b for _, b in pairs]
+    sender = wire.Striped([lane.send for lane in near], [lane.sock.recv_into for lane in near])
+    receiver = wire.Striped([sock.send for sock in far], [sock.recv_into for sock in far])
+    return sender, receiver, near, far
+
+
+def _close_all(near, far) -> None:
+    for sock in [lane.sock for lane in near] + list(far):
+        sock.close()
+
+
+def _read_exactly(stream, size: int) -> bytes:
+    out = bytearray()
+    buffer = bytearray(1 << 20)
+    while len(out) < size:
+        count = stream.recv_into(memoryview(buffer))
+        if not count:
+            break
+        out.extend(buffer[:count])
+    return bytes(out)
+
+
+def _send_all(stream, data: bytes) -> None:
+    view = memoryview(data)
+    while view:
+        view = view[stream.send(view) :]
+
+
+def test_a_striped_stream_delivers_interleaved_writes_in_order() -> None:
+    import threading
+
+    sender, receiver, near, far = _striped_pair(4)
+    writes = [os.urandom(size) for size in (10, 3 << 20, 1, (1 << 20) - 1, 9 << 20 | 7, 100)]
+    expected = b"".join(writes)
+    got: list[bytes] = []
+    reader = threading.Thread(target=lambda: got.append(_read_exactly(receiver, len(expected))))
+    reader.start()
+    for data in writes:
+        _send_all(sender, data)
+    reader.join(60)
+    assert got == [expected]
+    _close_all(near, far)
+
+
+def test_a_write_of_one_mib_or_more_uses_every_lane_and_a_smaller_one_only_lane_zero() -> None:
+    import threading
+
+    sender, receiver, near, far = _striped_pair(4)
+    size = 100 + wire.STRIPE_MIN * 4
+    got: list[bytes] = []
+    reader = threading.Thread(target=lambda: got.append(_read_exactly(receiver, size)))
+    reader.start()
+    _send_all(sender, b"x" * 100)
+    assert [bool(lane.segments) for lane in near] == [True, False, False, False]
+    _send_all(sender, os.urandom(wire.STRIPE_MIN * 4))
+    assert all(lane.segments for lane in near)
+    reader.join(60)
+    assert len(got[0]) == size
+    _close_all(near, far)
+
+
+def test_a_segment_that_repeats_received_bytes_ends_the_stream() -> None:
+    import socket
+
+    a, b = socket.socketpair()
+    c, d = socket.socketpair()
+    receiver = wire.Striped([b.send, d.send], [b.recv_into, d.recv_into])
+    first = wire.HEADER.pack(wire.MAGIC, wire.SEGMENT, 0, 0, 4) + (0).to_bytes(8, "little")
+    a.sendall(first + b"abcd")
+    assert _read_exactly(receiver, 4) == b"abcd"
+    again = wire.HEADER.pack(wire.MAGIC, wire.SEGMENT, 0, 1, 4) + (2).to_bytes(8, "little")
+    c.sendall(again + b"cdef")
+    assert receiver.recv_into(memoryview(bytearray(16))) == 0
+    for sock in (a, b, c, d):
+        sock.close()
+
+
+def test_bytes_still_arriving_on_one_lane_are_delivered_after_another_lane_ends() -> None:
+    # Spec "Parallel data streams", step 5: a worker replying to reexec closes every lane
+    # at once, and the reply may arrive after another lane's end of stream.
+    import socket
+    import time
+
+    sender, receiver, near, far = _striped_pair(2)
+    # Shut down first: close alone leaves the descriptor open under this end's blocked reader.
+    near[1].sock.shutdown(socket.SHUT_RDWR)
+    time.sleep(0.2)
+    _send_all(sender, b"reply")
+    near[0].sock.shutdown(socket.SHUT_RDWR)
+    assert _read_exactly(receiver, 5) == b"reply"
+    assert receiver.recv_into(memoryview(bytearray(8))) == 0
+    for sock in [lane.sock for lane in near] + far:
+        sock.close()

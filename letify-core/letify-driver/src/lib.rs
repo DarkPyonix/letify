@@ -24,6 +24,7 @@
 
 mod client;
 mod exports;
+mod image;
 mod status;
 mod table;
 

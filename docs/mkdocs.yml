@@ -48,18 +48,20 @@ nav:
       - Providers and accounts: 02-providers.md
       - Choosing the execution mode: 03-execution-modes.md
       - Environments and data: 04-environments-and-data.md
-      - Sweeps and capacity: 05-sweeps.md
+      - Concurrency and capacity: 05-concurrency.md
       - Cost control: 06-cost.md
       - Troubleshooting: 07-troubleshooting.md
+      - Releasing: 08-releasing.md
   - 한국어:
       - 가이드: ko/README.md
       - 시작하기: ko/01-시작하기.md
       - 프로바이더와 계정: ko/02-프로바이더.md
       - 실행 방식 고르기: ko/03-실행-방식.md
       - 환경과 데이터: ko/04-환경과-데이터.md
-      - 스윕과 용량: ko/05-스윕.md
+      - 동시 실행과 용량: ko/05-동시-실행.md
       - 비용 관리: ko/06-비용.md
       - 문제 해결: ko/07-문제-해결.md
+      - 릴리스: ko/08-릴리스.md
 
 # The guides link to design documents that live on develop only, so those links are reported
 # rather than failing the build.

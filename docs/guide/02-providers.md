@@ -29,35 +29,50 @@ def train(lr): ...
 
 ## Where configuration lives
 
-Two files, merged, with different jobs.
+letify keeps its state in two `.letify` directories with different jobs.
 
-| File | Holds | Tracked by Git? |
+| Path | Holds | Tracked by Git? |
 |---|---|---|
-| `~/.letify` | Accounts, addresses, keys, tokens | No, it is outside the repository |
-| `.letify` in the project | Defaults that are safe to share | Yes |
+| `~/.letify/config.toml` | Every account this machine has: kind and connection details, never a secret | No, it is outside the repository |
+| `~/.letify/accounts/<alias>/` | That account's credentials, owner only | No |
+| `<project>/.letify/config.toml` | Project defaults, and the aliases of the accounts the project uses | Yes |
 
-The project file refines what the home file declared, so someone else can clone your repository and run it under their own accounts.
+The home file is the set of accounts on this machine. The project file chooses from it. An account is available in a project only when one of these holds:
+
+1. The project file names it. An empty table is enough.
+2. The home entry sets `global = true`.
+3. It is `local`, which is always available.
 
 ```toml
-# .letify in the project, committed
-[defaults]
-name = "nvfp4"
+# .letify/config.toml in the project, committed
+[colab_a]         # use the home account colab_a with all of its settings
+[lab_a100]
 ```
+
+A field set in the project table overrides the home entry's field. Someone else can clone your repository and run `letify login` for the aliases it names.
 
 ## Secrets
 
-A credential is referenced, never written.
+A credential never appears in either `config.toml`. `letify login` asks for it and stores it.
+
+```bash
+letify login elice elice_a100      # writes ~/.letify/accounts/elice_a100/access_token
+letify logout elice_a100           # removes the account and deletes its directory
+```
+
+A field such as `access_token` is resolved in this order:
+
+1. The environment variable named by `access_token_env`.
+2. The file `~/.letify/accounts/<alias>/access_token`, created with mode 0600.
+3. A literal value in the home entry, meant only for non secret defaults.
 
 ```toml
 [elice_a100]
 kind = "elice"
-access_token_env = "ELICE_ACCESS_TOKEN"        # an environment variable
-# access_token_keyring = "elice/researcher"    # or an OS keyring entry
+access_token_env = "ELICE_ACCESS_TOKEN"        # optional, overrides the stored file
 ```
 
-Resolution order is the environment variable, then the keyring, then a literal value. A literal is only appropriate in `~/.letify`, which is not tracked.
-
-For the keyring, install the extra: `uv add "letify[keyring]"`.
+The OS keyring is not used.
 
 ## 📓 Colab
 
@@ -100,6 +115,7 @@ persistent = true
 | `gpus` | A list, to skip connecting during discovery |
 | `port_command` | A command that prints the current port, for hosts that reassign it |
 | `store` | Override the cache backend |
+| `workspace` | The one directory letify writes under on the machine: the project `.venv`, volume data and temporary files. Default `~/.letify-runtime`. Home file only |
 
 **Persistence defaults to ephemeral,** which is the pessimistic choice on purpose. Assuming ephemeral when the disk actually survives only costs time, because letify rebuilds the environment and the work still succeeds. Assuming persistent when the disk is wiped fails outright.
 
@@ -111,31 +127,70 @@ Declaring `gpus` avoids an SSH connection at import time:
 gpus = ["A100", "A100", "A100", "A100"]
 ```
 
+Some servers allow writes only under a given directory, such as `/workspace`. Right after the key works, `letify login shell` asks where letify may write, and checks over SSH that it can create and write that directory without root. A path that fails writes nothing and names the error.
+
+```
+$ letify login shell lab_a100 --address gpu.lab.example.edu
+Workspace root on gpu.lab.example.edu [~/.letify-runtime]: /workspace/researcher/letify
+```
+
+In a script, pass `--workspace /workspace/researcher/letify` with `--no-input`. To move an account that is already declared, run the login again with `--workspace`, and the new path is checked before it is written. `letify check lab_a100` prints `workspace <path>: writable` or the reason it is not.
+
+`letify login shell` writes the devices table for you. Right after the key works, it runs `nvidia-smi` on the machine once, shows what it found and asks which cards letify may use. A blank answer takes them all.
+
+```
+$ letify login shell lab_a100 --address gpu.lab.example.edu
+A100: 4 cards, indices 0-3 (80 GB each)
+RTX_PRO_6000: 2 cards, indices 4-5 (96 GB each)
+Indices letify may use for A100 [0-3]: 0,1
+Indices letify may use for RTX_PRO_6000 [4-5]:
+```
+
+```toml
+[lab_a100.devices]
+A100 = { indices = "0-1" }
+RTX_PRO_6000 = { indices = "4-5" }
+```
+
+In a script, `--no-input` records every card, and `--indices A100=0-1` (repeatable) narrows one name. When `nvidia-smi` is missing or finds no GPU, the login still succeeds, nothing is recorded, and letify asks the machine at first use. An account that is already declared is not asked again; `letify login shell lab_a100 --detect-devices` asks the machine again and replaces the table once you confirm. The table is ordinary TOML, so you can also edit it by hand.
+
 ## 🕳️ Tunnel, for a machine behind NAT
 
-For a machine that cannot accept an inbound connection. The tunnel builds the path; SSH still does the work.
+For a machine that cannot accept an inbound connection. letify reaches it over [Tailcat](https://github.com/tailscale/tailcat), which needs no account and no server of your own. SSH still does the work.
+
+Setup is two commands, one on each machine. Both machines need `tailcat`, and the remote one needs letify and an SSH server.
+
+**1. On the remote machine**, start the agent:
+
+```bash
+letify client shell connect --name home_box
+```
+
+If `tailcat` is missing, the command installs it as [Installing tailcat and eci](#installing-tailcat-and-eci) describes. If automatic install is turned off, or the SSH server is missing, it prints the exact install steps for that machine and exits. Otherwise it prints one command to run on your own machine:
+
+```
+letify login tunnel home_box --connect eyJ0YWlsY2F0Ijoi...
+```
+
+Keep the agent running, for example inside `tmux`. It carries every connection, and a restart gives it a new address, so you would log in again with the new token.
+
+**2. On your own machine**, run the printed command:
+
+```bash
+letify login tunnel home_box --connect eyJ0YWlsY2F0Ijoi...
+```
+
+It installs your SSH key over Tailcat (you type the remote password once), confirms the key, checks the workspace root and records the GPUs, as `letify login shell` does. Then `letify check home_box` confirms the machine answers. The account in `~/.letify/config.toml` looks like this, with no address:
 
 ```toml
 [home_box]
 kind = "tunnel"
-transport = "tailscale"
-address = "home-box"               # the Tailscale machine name
+tailcat = "tc..."
+tailcat_port = 40123
 user = "researcher"
-auth_key_env = "TS_AUTHKEY"
-mtu = 1280
-persistent = true
+port = 22
+key = "~/.ssh/id_letify"
 ```
-
-Tailscale is the default because it needs no server of your own, authenticates from an auth key without a prompt, and carries any TCP port. When UDP is blocked it relays over TCP 443, which keeps working but slowly.
-
-If your network blocks UDP and the relay is too slow, switch transports:
-
-```toml
-transport = "frp"
-frp_config = "~/.config/frp/frpc.toml"
-```
-
-> ⚠️ **Leave the MTU low.** Every mesh VPN in this class shows the same failure above roughly 1400: the tunnel comes up, small commands work, and bulk transfers stall silently. 1280 always works.
 
 Try the simpler paths first. A direct address, then a jump host, then this. Campus machines often allow one of the first two. Details and measurements are in [docs/NETWORK.md](../NETWORK.md).
 
@@ -146,11 +201,19 @@ Try the simpler paths first. A direct address, then a jump host, then this. Camp
 kind = "modal"
 ```
 
-Reads its credentials the way the Modal client does. Storage is persistent because a Modal volume is mounted from outside the container, so function shipping is the default and no separate cache tier is needed.
+Sign in once per account:
 
-`host="local"` raises. Modal exposes function calls into a container, not a device to forward calls at.
+```bash
+letify login modal modal_lab
+```
 
-The Modal package is imported lazily. Without it, this provider reports itself unavailable and every other provider keeps working.
+letify asks for an optional Modal profile, which names the Modal workspace to sign in to (`--profile` in a script), then runs Modal's own `modal token new` through uv. It prints a link; approve it in the browser. The token is written to `~/.letify/accounts/modal_lab/modal.toml`, so two Modal accounts can live on one machine. You never install `modal` yourself, on `PATH` or in your project's `.venv`. uv is the only requirement.
+
+Storage is persistent because a Modal volume is mounted from outside the container, so function shipping is the default and no separate cache tier is needed. letify's own files in the sandbox, the project `.venv` included, live under `/letify`, where a Modal volume named `<app>-workspace` is mounted, so the next sandbox finds them. `--workspace PATH` at login moves that mount.
+
+`host="local"` raises. Modal exposes function calls into a container, not a device to forward operators to.
+
+Modal's client runs in its own uv environment, with Modal pinned to `>=1.0,<2`, in a small adapter process that letify starts on the first call. The first start downloads Modal into uv's cache. A token in `MODAL_TOKEN_ID` or `MODAL_TOKEN_SECRET` in your shell is ignored, because the account's `modal.toml` decides which account acts.
 
 ## 🇰🇷 Elice
 
@@ -158,18 +221,31 @@ The Modal package is imported lazily. Without it, this provider reports itself u
 [elice_a100]
 kind = "elice"
 zone_id = "00000000-0000-0000-0000-000000000000"
-machine_id = "00000000-0000-0000-0000-000000000000"
-address = "..."
-user = "elicer"
-key = "~/.ssh/elice.pem"
+price_type = "spot"                 # optional: ondemand (default) or spot
+spot_fallback = "ondemand"          # optional: none (default) or ondemand
 access_token_env = "ELICE_ACCESS_TOKEN"
 ```
 
-Targets Elice Cloud Infrastructure, which has a published REST API. letify powers the machine on and off by creating and deleting an allocation, which maps exactly onto a session, so a call's own lifetime follows Elice's.
+Targets Elice Cloud Infrastructure through `eci`, Elice's own command line. letify installs it the first time it is needed, or install it ahead of time:
 
-**letify does not create the machine.** Declare the virtual machine once in the console or with Terraform and put its id in `machine_id`. letify allocates and releases it.
+```bash
+letify setup eci                 # letify downloads Elice's release
+curl -fsSL https://raw.githubusercontent.com/elice-dev/eci-cli/main/scripts/install.sh | sh
+```
 
-Two costs to remember. Compute bills by the second while allocated, and block storage keeps billing while the machine is stopped. A forgotten machine costs money with no allocation running.
+See [Installing tailcat and eci](#installing-tailcat-and-eci) for where letify puts it.
+
+**No machine has to exist.** `letify login elice elice_a100` checks the token with `eci`, and without a machine it records none. On the first call letify launches `letify-elice-a100`, or `letify-elice-a100-spot` for spot, with an instance type matching the declaration. It keeps a generated password in `~/.letify/accounts/elice_a100/machine_password` and installs your SSH key. Later calls start the same machine again. To use a machine you made yourself, pick it at login or set `machine_id`.
+
+```python
+elice = let.providers.elice_a100
+elice.A100                    # the account's price type
+elice.A100.priced("spot")     # spot for this declaration only
+```
+
+A session ends with `eci compute vm stop`, and letify never deletes anything. An idle machine bills no compute, but its disk and public IP keep billing. Remove a machine with `eci compute vm delete <name> --cascade`; without `--cascade` the disk, network interface and IP stay and keep billing.
+
+Spot costs less, and Elice may take the machine back at any time. letify then raises `SpotPreempted`, an infrastructure failure retried under `retries`. Files on the machine's disk and in volumes survive, while memory and session cache handles are lost. An ondemand launch checks the organization's quota first, and spot is offered for GPU types only.
 
 Elice's other product, Run Box, is console driven and has no API. You can still use it by declaring it as a plain `shell` with its tunnel address and port.
 
@@ -243,3 +319,30 @@ letify check lab_a100
 ---
 
 [← Getting started](01-getting-started.md) · [Guides](README.md) · [Next: Execution modes →](03-execution-modes.md)
+
+## Installing tailcat and eci
+
+letify runs two programs it does not ship: `tailcat`, from Tailscale, for Tunnel accounts, and `eci`, from Elice, for Elice accounts. Neither is part of letify or covered by its license. When a command needs one and finds none, letify installs it and prints two lines on standard error:
+
+```
+letify: installing tailcat 0.6.0 from https://github.com/tailscale/tailcat/releases/download/v0.6.0/tailcat_0.6.0_linux_amd64.tar.gz into ~/.letify/tools/tailcat/0.6.0
+letify: tailcat 0.6.0 verified sha256 f3597a9a..., linked at .venv/bin/tailcat
+```
+
+To install ahead of time, or to see what letify uses:
+
+```bash
+letify setup tailcat          # install now
+letify setup eci --where      # where it is and which copy letify uses
+```
+
+To turn automatic install off, put `auto_install = false` at the top of `~/.letify/config.toml`, or set `LETIFY_AUTO_INSTALL=0`. A missing tool then fails with the install steps and the `letify setup <tool>` command.
+
+What an install does:
+
+1. Downloads the pinned release archive from the publisher's GitHub releases, `tailscale/tailcat` or `elice-dev/eci-cli`.
+2. Checks its SHA-256 against the digest pinned in letify and against the release's `checksums.txt`, and refuses a mismatch.
+3. Unpacks it into `~/.letify/tools/<tool>/<version>/`, refusing any archive entry that points outside that directory.
+4. Links it into your project's `.venv/bin`: a hard link for `tailcat` (a copy when a hard link is impossible), a small launcher script for `eci`.
+
+letify never writes to `~/.local/bin`, `/usr/local/bin` or your shell profile. A copy you installed yourself on `PATH` is used as it is and never replaced, and a file in `.venv/bin` that letify did not create is left alone. On macOS with Homebrew, `tailcat` comes from `brew install tailcat`.

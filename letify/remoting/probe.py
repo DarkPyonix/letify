@@ -33,8 +33,14 @@ from .capability import LATENCY_BUDGET_MS, Capability
 CORE_NAMES = {
     "win32": "nvcuda.dll",
     "linux": "libcuda.so.1",
-    "darwin": "libletify_shim.dylib",
+    "darwin": "libletify_driver.dylib",
 }
+
+#: Where a platform wheel carries letify-core and the agent.
+LIB_DIR = Path(__file__).resolve().parent / "lib"
+
+#: The agent executable name on this platform.
+AGENT_NAME = "letify-agent.exe" if sys.platform.startswith("win") else "letify-agent"
 
 
 def core_path() -> Path | None:
@@ -44,9 +50,18 @@ def core_path() -> Path | None:
     override = os.environ.get("LETIFY_CORE_PATH")
     if override and Path(override).exists():
         return Path(override)
-    name = CORE_NAMES.get(sys.platform, "libletify_shim.so")
-    candidate = Path(__file__).resolve().parent / "lib" / name
+    name = CORE_NAMES.get(sys.platform, "libletify_driver.so")
+    candidate = LIB_DIR / name
     return candidate if candidate.exists() else None
+
+
+def agent_path() -> Path | None:
+    """Where the agent is: the copy bundled in the package first, then PATH."""
+    bundled = LIB_DIR / AGENT_NAME
+    if bundled.is_file():
+        return bundled
+    found = shutil.which("letify-agent")
+    return Path(found) if found else None
 
 
 def probe(host: str | None = None, *, remote: bool | None = None) -> Capability:
@@ -62,7 +77,7 @@ def probe(host: str | None = None, *, remote: bool | None = None) -> Capability:
         remote = host is not None
     return Capability(
         core=core_path() is not None,
-        agent=shutil.which("letify-agent") is not None or not remote,
+        agent=agent_path() is not None or not remote,
         round_trip_ms=ping(host) if host else None,
         platform=sys.platform,
     )
@@ -78,8 +93,8 @@ def require(host: str | None = None, *, remote: bool | None = None) -> Capabilit
     capability = probe(host, remote=remote)
     if not capability.usable:
         raise UnsupportedMode(
-            f"host='local' cannot run here: {capability.explain()}. Build letify-core from "
-            f"the letify-core/ directory, or use host='remote' to ship the function instead."
+            f"host='local' cannot run here: {capability.explain()}. Install a letify wheel "
+            f"built for this platform, or use host='remote' to ship the function instead."
         )
     return capability
 
@@ -116,9 +131,12 @@ def efficiency(step_seconds: float, syncs: int, round_trip_ms: float) -> float:
 
 
 __all__ = [
+    "AGENT_NAME",
     "CORE_NAMES",
     "LATENCY_BUDGET_MS",
+    "LIB_DIR",
     "Capability",
+    "agent_path",
     "core_path",
     "efficiency",
     "ping",

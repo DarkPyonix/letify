@@ -9,8 +9,8 @@ Narrower tests live beside this file: declaration values in test_declare.py, the
 test_protocol.py, channels and the pool in test_runtime.py, providers in
 test_providers.py, storage in test_store.py.
 
-Spec sections pinned here: "Invocation", "Fan-out", "Call protocol", "Handles",
-"Argument addressing", "Failure and retry", "Pooling" and "Lifetime".
+Spec sections pinned here: "Invocation", "Concurrency", "Call protocol", "Session cache",
+"Argument addressing", "Failure and retry", "Pooling" and "Lifetime", which covers keep_alive.
 """
 
 from __future__ import annotations
@@ -70,183 +70,251 @@ def test_an_async_body_can_await_inside_the_runtime(
     assert asyncio.run(work()) == "finished"
 
 
-# -- Spec: Fan-out -------------------------------------------------------------
+# -- Spec: Concurrency ---------------------------------------------------------
 
 
-def test_a_space_fans_out_to_one_call_per_point(let: letify.Launcher, cpu: letify.Instance) -> None:
-    @let.function(device=cpu, host="remote")
-    def identity(lr: float, bs: int) -> tuple[float, int]:
-        return lr, bs
-
-    results = identity(letify.grid(lr=[1e-4, 3e-4], bs=[16, 32]))
-    assert len(results) == 4
-    assert set(results) == {(1e-4, 16), (1e-4, 32), (3e-4, 16), (3e-4, 32)}
-
-
-def test_a_sync_declaration_returns_its_results_in_input_order(
-    let: letify.Launcher, cpu: letify.Instance
-) -> None:
-    @let.function(device=cpu, host="remote")
-    def identity(n: int) -> int:
-        return n
-
-    assert identity(letify.grid(n=[3, 1, 2])) == [3, 1, 2]
-
-
-def test_a_space_may_be_passed_by_keyword_or_by_position(
-    let: letify.Launcher, cpu: letify.Instance
-) -> None:
-    # train(space) and train(over=space) mean the same thing, because a space names the
-    # arguments it varies.
-    @let.function(device=cpu, host="remote")
-    def identity(n: int) -> int:
-        return n
-
-    assert identity(letify.grid(n=[1, 2])) == [1, 2]
-    assert identity(over=letify.grid(n=[1, 2])) == [1, 2]
-
-
-def test_awaiting_a_space_collects_in_input_order(
+def test_gathered_calls_return_their_values_in_the_order_they_were_made(
     let: letify.Launcher, cpu: letify.Instance
 ) -> None:
     @let.function(device=cpu, host="remote")
     async def slow(n: int) -> int:
         import asyncio as remote_asyncio
 
-        # The later points finish first, so completion order is not input order.
+        # The later calls finish first, so completion order is not call order.
         await remote_asyncio.sleep(0.05 / n)
         return n
 
-    assert asyncio.run(_collect(slow(letify.grid(n=[1, 2, 3])))) == [1, 2, 3]
-
-
-async def _collect(call) -> list[int]:
-    return await call
-
-
-def test_an_async_space_can_be_iterated_as_it_completes(
-    let: letify.Launcher, cpu: letify.Instance
-) -> None:
-    @let.function(device=cpu, host="remote")
-    async def square(n: int) -> int:
-        return n * n
-
     async def run() -> list[int]:
-        return [r async for r in square(letify.grid(n=[1, 2, 3]))]
+        with let.keep_alive():
+            return list(await asyncio.gather(*(slow(n) for n in (1, 2, 3))))
 
-    assert sorted(asyncio.run(run())) == [1, 4, 9]
-
-
-# -- Spec: Handles -------------------------------------------------------------
+    assert asyncio.run(run()) == [1, 2, 3]
 
 
-def test_a_kept_value_stays_in_the_runtime(let: letify.Launcher, cpu: letify.Instance) -> None:
-    @let.function(device=cpu, host="remote", keep_remote=True, lifetime="process")
-    def build() -> dict[str, list[int]]:
-        return {"weights": [1, 2, 3]}
-
-    @let.function(device=cpu, host="remote", lifetime="process")
-    def total(model: dict[str, list[int]]) -> int:
-        return sum(model["weights"])
-
-    handle = build()
-    assert isinstance(handle, letify.Handle)
-    assert handle.type_name == "dict"
-    # Resolving it in a later call is what the persistent worker exists for.
-    assert total(model=handle) == 6
-    let.pool.shutdown()
+# -- Spec: Session cache -------------------------------------------------------
 
 
-def test_a_handle_from_another_runtime_is_refused(
-    let: letify.Launcher, cpu: letify.Instance
-) -> None:
-    @let.function(device=cpu, host="remote")
-    def consume(value: object) -> object:
-        return value
+def _builds(ledger) -> list[str]:
+    """The lines a factory appended, one per build, each naming the building process."""
+    return ledger.read_text(encoding="utf-8").split() if ledger.exists() else []
 
-    stranger = letify.Handle(runtime="elsewhere", object_id="00", type_name="dict")
-    with pytest.raises(letify.HandleScopeError, match="belongs to runtime"):
-        consume(value=stranger)
+
+def test_two_calls_inside_keep_alive_share_one_build(let, cpu, tmp_path) -> None:
+    ledger = str(tmp_path / "builds")
+
+    @let.function(device=cpu, host=letify.remote)
+    def use() -> int:
+        import os
+
+        def load() -> int:
+            with open(ledger, "a", encoding="utf-8") as handle:
+                handle.write(f"{os.getpid()}\n")
+            return os.getpid()
+
+        return letify.session_cache("model", load)
+
+    with let.keep_alive():
+        first = use()
+        second = use()
+
+    assert first == second
+    assert len(_builds(tmp_path / "builds")) == 1
+
+
+def test_concurrent_sessions_each_build_their_own_value(launcher_from, tmp_path) -> None:
+    # Nothing may depend on which session the pool picks, so each builds its own.
+    limited = launcher_from('[box]\nkind = "local"\n[box.devices]\nCPU = { count = 2 }\n')
+    here = limited.provider("box").CPU
+    ledger = str(tmp_path / "builds")
+
+    @limited.function(device=here, host=letify.remote)
+    async def use() -> tuple[int, int]:
+        import asyncio as remote_asyncio
+        import os
+
+        def load() -> int:
+            with open(ledger, "a", encoding="utf-8") as handle:
+                handle.write(f"{os.getpid()}\n")
+            return os.getpid()
+
+        value = letify.session_cache("model", load)
+        await remote_asyncio.sleep(0.5)
+        return value, os.getpid()
+
+    async def run() -> list[tuple[int, int]]:
+        with limited.keep_alive():
+            return list(await asyncio.gather(use(), use()))
+
+    results = asyncio.run(run())
+    assert all(value == pid for value, pid in results)
+    assert len({pid for _, pid in results}) == 2
+    assert sorted(_builds(tmp_path / "builds")) == sorted(str(pid) for _, pid in results)
+
+
+def test_a_new_session_after_keep_alive_ends_builds_again(let, cpu, tmp_path) -> None:
+    ledger = str(tmp_path / "builds")
+
+    @let.function(device=cpu, host=letify.remote)
+    def use() -> int:
+        def load() -> int:
+            with open(ledger, "a", encoding="utf-8") as handle:
+                handle.write("built\n")
+            return 1
+
+        return letify.session_cache("model", load)
+
+    with let.keep_alive():
+        use()
+    with let.keep_alive():
+        use()
+
+    assert len(_builds(tmp_path / "builds")) == 2
+
+
+def test_concurrent_first_use_of_one_key_builds_once(let, cpu) -> None:
+    @let.function(device=cpu, host=letify.remote)
+    def race() -> tuple[int, list[object]]:
+        import threading
+        import time
+
+        builds = []
+
+        def load() -> object:
+            builds.append(1)
+            time.sleep(0.2)
+            return object()
+
+        seen: list[object] = []
+        threads = [
+            threading.Thread(target=lambda: seen.append(letify.session_cache("race", load)))
+            for _ in range(8)
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        return len(builds), [id(value) for value in seen]
+
+    builds, identities = race()
+    assert builds == 1
+    assert len(identities) == 8 and len(set(identities)) == 1
+
+
+def test_a_body_run_locally_memoizes_in_this_process(let, cpu) -> None:
+    import uuid
+
+    key = f"local-{uuid.uuid4().hex}"
+    builds: list[int] = []
+
+    @let.function(device=cpu, host=letify.remote)
+    def use() -> int:
+        return letify.session_cache(key, lambda: builds.append(1) or len(builds))
+
+    assert use.local() == 1
+    assert use.local() == 1
+    assert builds == [1]
+
+
+def test_a_factory_that_raises_stores_nothing(let, cpu) -> None:
+    import uuid
+
+    key = f"failing-{uuid.uuid4().hex}"
+    attempts: list[int] = []
+
+    def load() -> int:
+        attempts.append(1)
+        if len(attempts) == 1:
+            raise ValueError("first build fails")
+        return 5
+
+    with pytest.raises(ValueError, match="first build fails"):
+        letify.session_cache(key, load)
+    assert letify.session_cache(key, load) == 5
+    assert len(attempts) == 2
+
+
+def test_keep_remote_is_refused_as_an_unknown_argument(let, cpu) -> None:
+    with pytest.raises(TypeError, match="keep_remote"):
+        let.function(device=cpu, host=letify.remote, keep_remote=True)  # type: ignore[call-arg]
 
 
 # -- Spec: Argument addressing -------------------------------------------------
 
 
 def test_a_large_argument_is_sent_once(let: letify.Launcher, cpu: letify.Instance) -> None:
-    @let.function(device=cpu, host="remote", lifetime="process")
+    @let.function(device=cpu, host=letify.remote)
     def size(payload: bytes) -> int:
         return len(payload)
 
     big = b"x" * 200_000
-    assert size(payload=big) == 200_000
-    assert size(payload=big) == 200_000
-
-    stat = let.pool.live[0].stat()
+    with let.keep_alive():
+        assert size(payload=big) == 200_000
+        assert size(payload=big) == 200_000
+        stat = let.pool.live[0].stat()
     # One blob, not two, even though the argument was passed twice.
     assert stat["blobs"] == 1
     assert stat["blob_bytes"] > 200_000 - 1
-    let.pool.shutdown()
 
 
 def test_a_small_argument_travels_with_the_call(let: letify.Launcher, cpu: letify.Instance) -> None:
     # Below the inline limit there is nothing to gain from a second round trip.
-    @let.function(device=cpu, host="remote", lifetime="process")
+    @let.function(device=cpu, host=letify.remote)
     def size(payload: bytes) -> int:
         return len(payload)
 
-    assert size(payload=b"x" * 1024) == 1024
-    assert let.pool.live[0].stat()["blobs"] == 0
-    let.pool.shutdown()
+    with let.keep_alive():
+        assert size(payload=b"x" * 1024) == 1024
+        assert let.pool.live[0].stat()["blobs"] == 0
 
 
 # -- Spec: Channels, what one living process buys ------------------------------
 
 
 def test_the_worker_is_one_process_across_calls(let: letify.Launcher, cpu: letify.Instance) -> None:
-    @let.function(device=cpu, host="remote", lifetime="process")
+    @let.function(device=cpu, host=letify.remote)
     def noop() -> None:
         return None
 
-    noop()
-    first = let.pool.live[0].stat()["pid"]
-    noop()
-    assert let.pool.live[0].stat()["pid"] == first
-    let.pool.shutdown()
+    with let.keep_alive():
+        noop()
+        first = let.pool.live[0].stat()["pid"]
+        noop()
+        assert let.pool.live[0].stat()["pid"] == first
 
 
 def test_files_written_into_a_runtime_survive_between_calls(
     let: letify.Launcher, cpu: letify.Instance, tmp_path
 ) -> None:
-    @let.function(device=cpu, host="remote", lifetime="process")
+    @let.function(device=cpu, host=letify.remote)
     def read(path: str) -> str:
         with open(path, encoding="utf-8") as handle:
             return handle.read()
 
-    @let.function(device=cpu, host="remote", lifetime="process")
+    @let.function(device=cpu, host=letify.remote)
     def touch() -> None:
         return None
 
-    touch()
-    runtime = let.pool.live[0]
-    target = str(tmp_path / "materialized.txt")
-    runtime.put_bytes(b"from the store", target)
-    assert read(path=target) == "from the store"
-    payload, digest = runtime.get_bytes(target)
+    with let.keep_alive():
+        touch()
+        runtime = let.pool.live[0]
+        target = str(tmp_path / "materialized.txt")
+        runtime.put_bytes(b"from the store", target)
+        assert read(path=target) == "from the store"
+        payload, digest = runtime.get_bytes(target)
     assert payload == b"from the store"
     assert digest
-    let.pool.shutdown()
 
 
 def test_the_prints_a_body_made_reach_the_caller(let, cpu, capsys) -> None:
-    # The user's own stdout comes back separately from the outcome, and letify passes it
-    # through rather than swallowing it.
-    @let.function(device=cpu, host="remote")
+    # Spec "Worker output": the body's stdout is written to the caller's own stdout, live,
+    # rather than swallowed or held until the call returns.
+    @let.function(device=cpu, host=letify.remote)
     def train() -> int:
         print("epoch 1 loss 0.5")
         return 1
 
     assert train() == 1
-    assert "epoch 1 loss 0.5" in capsys.readouterr().err
+    assert "epoch 1 loss 0.5" in capsys.readouterr().out
 
 
 # -- Spec: Failure and retry ---------------------------------------------------
@@ -255,7 +323,7 @@ def test_the_prints_a_body_made_reach_the_caller(let, cpu, capsys) -> None:
 def test_a_remote_exception_arrives_with_its_traceback(
     let: letify.Launcher, cpu: letify.Instance
 ) -> None:
-    @let.function(device=cpu, host="remote", retries=0)
+    @let.function(device=cpu, host=letify.remote, retries=0)
     def boom() -> None:
         raise ValueError("intentional")
 
@@ -270,7 +338,7 @@ def test_a_remote_exception_arrives_with_its_traceback(
 
 
 def test_a_runtime_dies_when_its_call_finishes(let: letify.Launcher, cpu: letify.Instance) -> None:
-    @let.function(device=cpu, host="remote")
+    @let.function(device=cpu, host=letify.remote)
     def noop() -> None:
         return None
 
@@ -278,47 +346,110 @@ def test_a_runtime_dies_when_its_call_finishes(let: letify.Launcher, cpu: letify
     assert let.pool.live == []
 
 
-def test_a_process_lifetime_declaration_keeps_its_session(
+def test_keep_alive_keeps_sessions_until_the_block_ends(
     let: letify.Launcher, cpu: letify.Instance
 ) -> None:
-    @let.function(device=cpu, host="remote", lifetime="process")
+    @let.function(device=cpu, host=letify.remote)
     def noop() -> None:
         return None
 
-    noop()
-    assert len(let.pool.live) == 1
-    noop()
-    assert len(let.pool.live) == 1
-    assert let.pool.shutdown()
+    with let.keep_alive():
+        noop()
+        assert len(let.pool.live) == 1
+        noop()
+        # The second call reused the session instead of starting another.
+        assert len(let.pool.live) == 1
+    assert let.pool.live == []
+
+
+def test_only_the_outermost_keep_alive_ends_sessions(
+    let: letify.Launcher, cpu: letify.Instance
+) -> None:
+    @let.function(device=cpu, host=letify.remote)
+    def noop() -> None:
+        return None
+
+    with let.keep_alive():
+        with let.keep_alive():
+            noop()
+        assert len(let.pool.live) == 1
+    assert let.pool.live == []
+
+
+def test_keep_alive_ends_its_sessions_when_the_block_raises(
+    let: letify.Launcher, cpu: letify.Instance
+) -> None:
+    # A block has a visible end whichever way it is left, so nothing outlives the code that
+    # asked for it.
+    @let.function(device=cpu, host=letify.remote)
+    def noop() -> None:
+        return None
+
+    with pytest.raises(RuntimeError), let.keep_alive():
+        noop()
+        raise RuntimeError("user code failed")
     assert let.pool.live == []
 
 
 def test_two_declarations_on_one_device_share_a_session(
     let: letify.Launcher, cpu: letify.Instance
 ) -> None:
-    @let.function(device=cpu, host="remote", lifetime="process")
+    @let.function(device=cpu, host=letify.remote)
     def first() -> int:
         return 1
 
-    @let.function(device=cpu, host="remote", lifetime="process")
+    @let.function(device=cpu, host=letify.remote)
     def second() -> int:
         return 2
 
-    first()
-    second()
-    # Pooling is by instance and environment, so two declarations share a session with
-    # nothing said about it.
-    assert len(let.pool.live) == 1
-    let.pool.shutdown()
+    with let.keep_alive():
+        first()
+        second()
+        # Pooling is by instance and environment, so two declarations share a session with
+        # nothing said about it.
+        assert len(let.pool.live) == 1
 
 
-def test_a_sweep_is_one_invocation(launcher_from) -> None:
-    # Its runtimes start once and are released once, and the inventory still holds: two
-    # cards declared means two sessions however many points there are.
+def test_concurrent_calls_run_no_wider_than_the_inventory(launcher_from) -> None:
+    # Two cards declared means at most two sessions, however many calls are gathered, and the
+    # calls beyond the inventory wait for a card rather than failing.
     limited = launcher_from('[box]\nkind = "local"\n[box.devices]\nCPU = { count = 2 }\n')
     here = limited.provider("box").CPU
 
-    @limited.function(device=here, host="remote")
+    @limited.function(device=here, host=letify.remote)
+    async def slow(n: int) -> int:
+        import asyncio as remote_asyncio
+
+        await remote_asyncio.sleep(0.05)
+        return n
+
+    widest = 0
+
+    async def watch() -> None:
+        nonlocal widest
+        for _ in range(40):
+            widest = max(widest, len(limited.pool.live))
+            await asyncio.sleep(0.01)
+
+    async def run() -> list[int]:
+        with limited.keep_alive():
+            calls = asyncio.gather(*(slow(n) for n in (1, 2, 3, 4)))
+            _, results = await asyncio.gather(watch(), calls)
+            return list(results)
+
+    assert asyncio.run(run()) == [1, 2, 3, 4]
+    assert 1 <= widest <= 2
+    assert limited.pool.live == []
+
+
+def test_overlapping_calls_release_their_sessions_when_the_last_one_finishes(
+    launcher_from,
+) -> None:
+    # Outside keep_alive, calls that overlap in time share one span, so nothing outlives them.
+    limited = launcher_from('[box]\nkind = "local"\n[box.devices]\nCPU = { count = 2 }\n')
+    here = limited.provider("box").CPU
+
+    @limited.function(device=here, host=letify.remote)
     async def slow(n: int) -> int:
         import asyncio as remote_asyncio
 
@@ -326,11 +457,9 @@ def test_a_sweep_is_one_invocation(launcher_from) -> None:
         return n
 
     async def run() -> list[int]:
-        results = await slow(letify.grid(n=[1, 2, 3, 4]))
-        assert len(limited.pool.live) <= 2
-        return results
+        return list(await asyncio.gather(*(slow(n) for n in (1, 2, 3))))
 
-    assert sorted(asyncio.run(run())) == [1, 2, 3, 4]
+    assert asyncio.run(run()) == [1, 2, 3]
     assert limited.pool.live == []
 
 
@@ -338,13 +467,13 @@ def test_the_providers_holding_a_session_can_be_named(
     let: letify.Launcher, cpu: letify.Instance
 ) -> None:
     # The quickest answer to what is costing money.
-    @let.function(device=cpu, host="remote", lifetime="process")
+    @let.function(device=cpu, host=letify.remote)
     def noop() -> None:
         return None
 
-    noop()
-    assert let.providers.active["local"] == [let.pool.live[0].name]
-    let.pool.shutdown()
+    with let.keep_alive():
+        noop()
+        assert let.providers.active["local"] == [let.pool.live[0].name]
     assert let.providers.active == {}
 
 
@@ -359,37 +488,39 @@ def test_status_counts_the_sessions_against_the_ceiling(let, cpu) -> None:
     assert empty["busy"] == 0
     assert "max_runtimes" not in empty
 
-    @let.function(device=cpu, host="remote", lifetime="process")
+    @let.function(device=cpu, host=letify.remote)
     def answer() -> int:
         return 7
 
-    assert answer() == 7
-    running = let.status()
+    with let.keep_alive():
+        assert answer() == 7
+        running = let.status()
     assert running["live"] == 1
     assert running["busy"] == 0
     assert running["live"] == len(running["runtimes"])
 
 
 def test_status_does_not_report_the_pools_own_bookkeeping(let, cpu) -> None:
-    # The pool holds a guard so one invocation does not restart a session between the
-    # points of a sweep. Whether that guard is open is a fact about the pool rather than
-    # about what is running, and a boolean sitting among counts gets read as a count.
+    # The pool holds a guard so a session released by one call is not ended while an
+    # overlapping call is still running. Whether that guard is open is a fact about the pool
+    # rather than about what is running, and a boolean sitting among counts gets read as a count.
     report = let.status()
     assert "holding" not in report
     assert all(isinstance(report[field], int) for field in ("live", "busy"))
 
 
 def test_a_reported_session_says_what_it_is(let, cpu) -> None:
-    @let.function(device=cpu, host="remote", lifetime="process")
+    @let.function(device=cpu, host=letify.remote)
     def answer() -> int:
         return 7
 
-    answer()
-    row = let.status()["runtimes"][0]
+    with let.keep_alive():
+        answer()
+        row = let.status()["runtimes"][0]
     assert row["provider"] == "local"
     assert row["accelerator"] == cpu.accelerator
     assert row["placement"] == "remote"
-    assert row["lifetime"] == "process"
+    assert "lifetime" not in row
     assert row["busy"] is False
     assert row["idle_seconds"] >= 0
 

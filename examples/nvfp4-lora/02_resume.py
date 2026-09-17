@@ -45,31 +45,31 @@ def main() -> int:
         host=arguments.host,
         env=common.ENV,
         volumes=[cache],
-        lifetime="process",
         timeout=3600,
     )(recipe.train)
 
-    # The declaration is named, not a session, so the checkpoint lands in the session the
-    # call below is handed. It has to be there before the training function looks for it.
-    digest = cache.resume(train, name, RESUME_PATH)
-    print(f"put {name} ({digest[:12]}) inside the session at {RESUME_PATH}")
+    with let.keep_alive():
+        # The declaration is named, not a session, so the checkpoint lands in the session the
+        # call below is handed. It has to be there before the training function looks for it.
+        digest = cache.resume(train, name, RESUME_PATH)
+        print(f"put {name} ({digest[:12]}) inside the session at {RESUME_PATH}")
 
-    result = train(
-        lr=arguments.lr,
-        rank=arguments.rank,
-        steps=arguments.steps,
-        resume_from=RESUME_PATH,
-    )
-    print(
-        f"continued from step {result['resumed_at']} to "
-        f"{result['resumed_at'] + result['steps']}, loss {result['final_loss']:.4f}"
-    )
+        result = train(
+            lr=arguments.lr,
+            rank=arguments.rank,
+            steps=arguments.steps,
+            resume_from=RESUME_PATH,
+        )
+        print(
+            f"continued from step {result['resumed_at']} to "
+            f"{result['resumed_at'] + result['steps']}, loss {result['final_loss']:.4f}"
+        )
 
-    # The name moves to the new blob and the old one stays where it is. Blobs are immutable
-    # and a name is a few dozen bytes, so two sessions writing at once cannot lose each
-    # other's work: one name wins and both checkpoints remain.
-    moved = cache.absorb(train, result["adapter"], name)
-    print(f"{name} now points at {moved[:12]}, and {digest[:12]} is still there")
+        # The name moves to the new blob and the old one stays where it is. Blobs are immutable
+        # and a name is a few dozen bytes, so two sessions writing at once cannot lose each
+        # other's work: one name wins and both checkpoints remain.
+        moved = cache.absorb(train, result["adapter"], name)
+        print(f"{name} now points at {moved[:12]}, and {digest[:12]} is still there")
     return 0
 
 

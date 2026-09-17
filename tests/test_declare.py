@@ -1,12 +1,11 @@
 """The declaration surface: what a function needs and where it belongs.
 
 These tests pin the parts of a declaration that are decided before anything runs: the
-environment key, the placement of device and host and lifetime, and the shape of a
-declared search space. Anything that needs a live session is in test_runtime.py or
-test_core.py instead.
+environment key and the placement of device and host and lifetime. Anything that needs a
+live session is in test_runtime.py or test_core.py instead.
 
 Spec sections pinned here: "Declaration surface", "The three placements", "Invocation",
-"Fan-out", "Environment" and "Module shipping".
+"Concurrency", "Environment" and "Module shipping".
 """
 
 from __future__ import annotations
@@ -17,8 +16,7 @@ import pytest
 
 import letify
 from letify.declare.env import Env
-from letify.declare.instance import AnyInstance, Host, Instance, Lifetime
-from letify.declare.sweep import Sweep, grid, zip_
+from letify.declare.instance import AnyInstance, Host, Instance
 
 
 @pytest.fixture
@@ -118,26 +116,37 @@ def test_the_host_defaults_to_this_process(cpu: letify.Instance) -> None:
     assert cpu.host is None
 
 
-def test_on_host_returns_a_copy_rather_than_changing_the_registered_shape(
-    cpu: letify.Instance,
-) -> None:
-    # A provider registers one shape and every declaration that names it shares that
-    # object, so a placement has to be a new value.
-    remote = cpu.on_host("remote")
-    assert remote.placement is Host.remote
-    assert cpu.host is None
-    assert remote is not cpu
+def test_an_instance_has_no_placement_of_its_own() -> None:
+    # Where the host code runs is said by the declaration's host and nowhere else, so there is
+    # one place to read to know where a function runs.
+    assert not hasattr(Instance, "on_host")
+    assert not hasattr(AnyInstance, "on_host")
 
 
-def test_on_host_with_nothing_to_place_leaves_the_instance_alone(cpu: letify.Instance) -> None:
-    assert cpu.on_host(None) is cpu
-
-
-def test_host_and_lifetime_accept_the_plain_lowercase_string() -> None:
+def test_host_accepts_the_plain_lowercase_string() -> None:
     assert Host("remote") is Host.remote
     assert Host.local == "local"
-    assert Lifetime("process") is Lifetime.process
-    assert Lifetime.call == "call"
+
+
+def test_the_two_host_placements_are_named_values_on_the_package() -> None:
+    # Two named values say everything a declaration needs, so the enum class that holds them
+    # is not one more public name to learn.
+    assert letify.local is Host.local
+    assert letify.remote is Host.remote
+    assert letify.remote == "remote"
+    assert not hasattr(letify, "Host")
+    assert "Host" not in letify.__all__
+    assert {"local", "remote"} <= set(letify.__all__)
+
+
+def test_a_declaration_takes_the_named_placement(
+    let: letify.Launcher, cpu: letify.Instance
+) -> None:
+    @let.function(device=cpu, host=letify.remote)
+    def noop() -> None:
+        return None
+
+    assert noop.device.placement is letify.remote
 
 
 def test_the_accelerator_name_falls_back_from_gpu_to_tpu_to_the_cpu(let: letify.Launcher) -> None:
@@ -153,10 +162,14 @@ def test_the_pool_key_names_provider_accelerator_placement_and_purchase(
     # Spec "Pooling": the pool key is the instance key joined with the environment key,
     # so anything that makes two instances non-interchangeable belongs in it.
     provider = let.providers.local
-    on_demand = Instance(provider, gpu="H100").on_host("remote")
-    assert on_demand.key == "local:H100:remote:x1:ondemand"
-    assert Instance(provider, gpu="H100", spot=True).on_host("remote").key.endswith(":spot")
-    assert on_demand.key != Instance(provider, gpu="H100").on_host("local").key
+    on_demand = Instance(provider, gpu="H100")._placed("remote")
+    # Spec "Price type": an instance naming no price type follows the account, so it is
+    # keyed apart from one that names ondemand or spot.
+    assert on_demand.key == "local:H100:remote:x1:default"
+    named = Instance(provider, gpu="H100").priced("ondemand")._placed("remote")
+    assert named.key.endswith(":ondemand")
+    assert Instance(provider, gpu="H100").priced("spot")._placed("remote").key.endswith(":spot")
+    assert on_demand.key != Instance(provider, gpu="H100")._placed("local").key
 
 
 def test_the_core_count_comes_from_the_instance_not_the_declaration(cpu: letify.Instance) -> None:
@@ -175,74 +188,19 @@ def test_an_instance_names_itself_by_provider_accelerator_and_placement(
 
 def test_a_request_without_a_provider_carries_only_the_accelerator() -> None:
     request = AnyInstance(accelerator="G4")
-    assert request.on_host(None) is request
-    assert request.on_host("remote").host is Host.remote
+    assert request._placed(None) is request
+    assert request._placed("remote").host is Host.remote
     assert repr(request) == "<AnyInstance G4>"
 
 
-# -- Spec: Fan-out -------------------------------------------------------------
+# -- Spec: Concurrency ---------------------------------------------------------
 
 
-def test_grid_takes_the_product_of_its_axes() -> None:
-    space = grid(lr=[1e-4, 3e-4], bs=[16, 32])
-    assert len(space) == 4
-    assert {(p["lr"], p["bs"]) for p in space} == {
-        (1e-4, 16),
-        (1e-4, 32),
-        (3e-4, 16),
-        (3e-4, 32),
-    }
-
-
-def test_zip_pairs_the_axes_position_by_position() -> None:
-    space = zip_(lr=[1e-4, 3e-4], bs=[16, 32])
-    assert [(p["lr"], p["bs"]) for p in space] == [(1e-4, 16), (3e-4, 32)]
-
-
-def test_zip_refuses_axes_of_unequal_length_and_names_the_lengths() -> None:
-    with pytest.raises(ValueError, match=r"lr=3, bs=2"):
-        zip_(lr=[1e-4, 3e-4, 1e-3], bs=[16, 32])
-
-
-def test_a_scalar_axis_stays_fixed_across_the_space() -> None:
-    assert [p["bs"] for p in grid(lr=[1e-4, 3e-4], bs=32)] == [32, 32]
-    assert [p["bs"] for p in zip_(lr=[1e-4, 3e-4], bs=32)] == [32, 32]
-
-
-def test_a_string_axis_is_one_value_rather_than_its_characters() -> None:
-    # Otherwise model="gpt" would silently become a three point sweep.
-    assert [p["model"] for p in grid(model="gpt")] == ["gpt"]
-
-
-def test_a_space_over_nothing_has_no_points() -> None:
-    assert len(grid()) == 0
-    assert len(zip_()) == 0
-
-
-def test_two_spaces_combine_and_drop_duplicate_points() -> None:
-    combined = grid(lr=[1e-4, 3e-4]) | grid(lr=[3e-4, 1e-3])
-    assert [p["lr"] for p in combined] == [1e-4, 3e-4, 1e-3]
-
-
-def test_with_fixed_adds_arguments_constant_across_every_point() -> None:
-    space = grid(lr=[1e-4, 3e-4]).with_fixed(bs=32)
-    assert all(point["bs"] == 32 for point in space)
-    assert len(space) == 2
-
-
-def test_a_point_overrides_a_fixed_argument_of_the_same_name() -> None:
-    assert [p["lr"] for p in grid(lr=[1e-4]).with_fixed(lr=9.0)] == [1e-4]
-
-
-def test_a_space_names_its_size_and_its_axes() -> None:
-    # What a user sees when they print a space before spending money on it.
-    assert repr(grid(lr=[1e-4, 3e-4], bs=[16])) == "<Sweep 2 points over ['bs', 'lr']>"
-
-
-def test_a_space_is_a_finite_set_of_keyword_combinations() -> None:
-    space = Sweep(({"lr": 1e-4},))
-    assert list(space) == [{"lr": 1e-4}]
-    assert len(space) == 1
+def test_the_surface_has_no_search_space_type() -> None:
+    # Running many configurations is many calls, so no argument value stands for several.
+    for name in ("grid", "zip", "Sweep"):
+        assert not hasattr(letify, name)
+    assert not hasattr(letify.Launcher, "grid")
 
 
 # -- Spec: Invocation, values refused at declaration time ----------------------
@@ -258,27 +216,15 @@ def test_an_unrecognized_host_placement_names_both_options(
             return None
 
 
-def test_an_unrecognized_lifetime_names_both_options(
-    let: letify.Launcher, cpu: letify.Instance
-) -> None:
-    with pytest.raises(ValueError, match=r"lifetime='call'.*lifetime='process'"):
+def test_how_long_a_session_lives_is_not_a_declaration_argument(let, cpu) -> None:
+    # Keeping sessions is a with let.keep_alive() block around the calls, not a property of one
+    # function, so the declaration refuses the argument rather than ignoring it.
+    assert not hasattr(letify, "Lifetime")
+    with pytest.raises(TypeError):
 
-        @let.function(device=cpu, lifetime="forever")
+        @let.function(device=cpu, host=letify.remote, lifetime="process")
         def noop() -> None:
             return None
-
-
-def test_only_one_search_space_may_be_passed_per_call(
-    let: letify.Launcher, cpu: letify.Instance
-) -> None:
-    # Two would make the point count the product of two arguments rather than something
-    # visible in one place.
-    @let.function(device=cpu, host="remote")
-    def train(lr: float, bs: int) -> None:
-        return None
-
-    with pytest.raises(TypeError, match="only one search space"):
-        train(grid(lr=[1e-4]), grid(bs=[16]))
 
 
 def test_local_runs_the_body_in_the_calling_process(

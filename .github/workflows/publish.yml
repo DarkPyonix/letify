@@ -1,7 +1,14 @@
-# Publish to PyPI when a version tag is pushed.
+# Release when a version tag is pushed.
 #
-# A tag such as v1.2.0 builds the package, checks that the tag agrees with the version in
-# pyproject.toml and letify/__init__.py, and uploads to PyPI. Tests are run before tagging.
+# A tag such as v1.2.0 runs scripts/version.py check --tag, which fails unless the tag and every
+# file that carries the version agree with pyproject.toml. It then builds the sdist once, one
+# wheel per desktop platform and, when letify-ext/ exists, the VS Code extension .vsix. All of
+# them are attached to a GitHub Release for the tag, and the sdist and wheels are uploaded to
+# PyPI. Tests are run before tagging. The .vsix is not published to the Marketplace.
+#
+# The Python code is pure, and letify-core binaries do not link Python, so each wheel is
+# tagged py3-none-<platform>. Linux wheels are built in manylinux_2_28 containers so the
+# binaries need only glibc 2.28, and the tag says so.
 #
 # Upload uses PyPI trusted publishing, so there is no token in this repository. Configure it
 # once on PyPI: project letify, owner DarkPyonix, repository letify, workflow publish.yml,
@@ -16,30 +23,149 @@ permissions:
   contents: read
 
 jobs:
-  build:
+  sdist:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v6
-      - name: Check the tag matches the package version
-        run: |
-          tag="${GITHUB_REF_NAME#v}"
-          project="$(python3 -c 'import tomllib; print(tomllib.load(open("pyproject.toml", "rb"))["project"]["version"])')"
-          package="$(sed -n 's/^__version__ = "\(.*\)"$/\1/p' letify/__init__.py)"
-          echo "tag=$tag pyproject=$project __version__=$package"
-          if [ "$tag" != "$project" ] || [ "$tag" != "$package" ]; then
-            echo "::error::tag v$tag does not match pyproject.toml ($project) and letify/__init__.py ($package)"
-            exit 1
-          fi
-      - name: Build
-        run: uv build
+      - name: Check the tag and every file carry one version
+        run: uv run --no-project python scripts/version.py check --tag "$GITHUB_REF_NAME"
+      - name: Build the sdist
+        run: uv build --sdist
       - uses: actions/upload-artifact@v4
         with:
-          name: dist
+          name: dist-sdist
           path: dist/
 
+  linux:
+    needs: sdist
+    strategy:
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            arch: x86_64
+          - runner: ubuntu-24.04-arm
+            arch: aarch64
+    runs-on: ${{ matrix.runner }}
+    container: quay.io/pypa/manylinux_2_28_${{ matrix.arch }}
+    env:
+      PATH: /root/.cargo/bin:/opt/python/cp312-cp312/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        # rustup reads letify-core/rust-toolchain.toml when cargo runs there.
+        run: curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable
+      - name: Install uv
+        run: python -m pip install uv
+      - name: Build letify-core
+        run: python letify-core/build.py
+      - name: Build the wheel
+        run: uv build --wheel
+      - name: Tag the wheel for the platform
+        run: |
+          uvx wheel tags --remove --platform-tag manylinux_2_28_${{ matrix.arch }} dist/*-py3-none-any.whl
+          ls dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-linux-${{ matrix.arch }}
+          path: dist/*.whl
+
+  native:
+    needs: sdist
+    strategy:
+      matrix:
+        include:
+          - runner: windows-latest
+            tag: win_amd64
+          - runner: windows-11-arm
+            tag: win_arm64
+          - runner: macos-latest
+            tag: macosx_11_0_arm64
+          - runner: macos-15-intel
+            tag: macosx_10_12_x86_64
+    runs-on: ${{ matrix.runner }}
+    defaults:
+      run:
+        shell: bash
+    env:
+      # Matches the wheel tags above. Rust's own minimum is already 11.0 on arm64 and 10.12 on x86_64.
+      MACOSX_DEPLOYMENT_TARGET: ${{ matrix.runner == 'macos-15-intel' && '10.12' || '11.0' }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: astral-sh/setup-uv@v6
+      - name: Install Rust
+        # rustup reads letify-core/rust-toolchain.toml when cargo runs there.
+        uses: dtolnay/rust-toolchain@stable
+      - name: Build letify-core
+        run: python letify-core/build.py
+      - name: Build the wheel
+        run: uv build --wheel
+      - name: Tag the wheel for the platform
+        run: |
+          uvx wheel tags --remove --platform-tag ${{ matrix.tag }} dist/*-py3-none-any.whl
+          ls dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-${{ matrix.tag }}
+          path: dist/*.whl
+
+  vsix:
+    # Skipped in effect when letify-ext/ is absent: the job uploads nothing and the release
+    # attaches only the Python files.
+    needs: sdist
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Look for the extension
+        id: ext
+        run: |
+          if [ -f letify-ext/package.json ]; then echo "present=true" >> "$GITHUB_OUTPUT"; else echo "present=false" >> "$GITHUB_OUTPUT"; fi
+      - uses: actions/setup-node@v4
+        if: steps.ext.outputs.present == 'true'
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: letify-ext/package-lock.json
+      - name: Test and package the extension
+        if: steps.ext.outputs.present == 'true'
+        working-directory: letify-ext
+        run: |
+          npm ci
+          npm run build
+          npm test
+          mkdir -p ../vsix
+          npx vsce package --out "../vsix/letify-ext-${GITHUB_REF_NAME#v}.vsix"
+      - uses: actions/upload-artifact@v4
+        if: steps.ext.outputs.present == 'true'
+        with:
+          name: dist-vsix
+          path: vsix/*.vsix
+
+  release:
+    needs: [sdist, linux, native, vsix]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: dist-*
+          merge-multiple: true
+          path: dist/
+      - name: Create the GitHub Release with every build attached
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          ls dist
+          gh release create "$GITHUB_REF_NAME" --verify-tag --title "$GITHUB_REF_NAME" --generate-notes dist/*
+
   publish:
-    needs: build
+    # The .vsix is not a Python distribution, so only the sdist and wheels are uploaded.
+    needs: [sdist, linux, native]
     runs-on: ubuntu-latest
     environment:
       name: pypi
@@ -49,6 +175,9 @@ jobs:
     steps:
       - uses: actions/download-artifact@v4
         with:
-          name: dist
+          pattern: dist-*
+          merge-multiple: true
           path: dist/
+      - name: Keep only the Python distributions
+        run: rm -f dist/*.vsix
       - uses: pypa/gh-action-pypi-publish@release/v1

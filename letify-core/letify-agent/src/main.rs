@@ -20,7 +20,8 @@ use std::io::{BufReader, BufWriter, Write};
 use std::net::{TcpListener, TcpStream};
 
 use letify_wire::{
-    PROTOCOL_VERSION, Reply, Request, decode_request, encode_reply, read_frame, write_frame,
+    Incoming, PROTOCOL_VERSION, Reply, Request, encode_reply, read_incoming, write_frame,
+    write_payload_reply,
 };
 
 use crate::driver::Driver;
@@ -106,25 +107,45 @@ fn serve(stream: TcpStream, driver: &Driver) -> std::io::Result<()> {
     let mut reader = BufReader::new(stream.try_clone()?);
     let mut writer = BufWriter::new(stream);
     let mut session = Session::new();
+    // Copies to the device are read straight into this buffer and handed to the driver
+    // from it. It is kept for the whole connection, so it is allocated once.
+    let mut staging = Vec::new();
+    // Copies to the host are copied from the device into this buffer and written from
+    // it, and it is kept for the connection in the same way.
+    let mut host_staging = Vec::new();
 
     loop {
-        let frame = match read_frame(&mut reader) {
-            Ok(frame) => frame,
+        let incoming = match read_incoming(&mut reader, &mut staging) {
+            Ok(incoming) => incoming,
             Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(()),
-            Err(error) => return Err(error),
-        };
-        let request = match decode_request(&frame) {
-            Ok(request) => request,
-            Err(error) => {
+            Err(error) if error.kind() == std::io::ErrorKind::InvalidData => {
                 reply(&mut writer, &Reply::Failed { code: 1, message: error.to_string() })?;
                 continue;
             }
+            Err(error) => return Err(error),
         };
-        if matches!(request, Request::Shutdown) {
-            return Ok(());
-        }
-        let needs_reply = request.needs_reply();
-        let outcome = handle(&request, driver, &mut session);
+        let (needs_reply, outcome) = match incoming {
+            Incoming::CopyToDevice { handle, offset, bytes } => {
+                (false, copy_to_device(driver, &session, handle, offset, &staging[..bytes]))
+            }
+            Incoming::Request(Request::Shutdown) => return Ok(()),
+            Incoming::Request(Request::CopyToHost { handle, offset, bytes }) => {
+                match copy_to_host(driver, &session, handle, offset, bytes, &mut host_staging) {
+                    Ok(count) => {
+                        write_payload_reply(&mut writer, &host_staging[..count])?;
+                        writer.flush()?;
+                    }
+                    Err(message) => {
+                        eprintln!("letify-agent: {message}");
+                        reply(&mut writer, &Reply::Failed { code: 999, message })?;
+                    }
+                }
+                continue;
+            }
+            Incoming::Request(request) => {
+                (request.needs_reply(), handle(&request, driver, &mut session))
+            }
+        };
         // Only answer what asked for an answer. A queued launch that failed is reported
         // at the next synchronization, the same way a real driver reports it.
         match outcome {
@@ -143,6 +164,43 @@ fn serve(stream: TcpStream, driver: &Driver) -> std::io::Result<()> {
 fn reply<W: Write>(writer: &mut W, answer: &Reply) -> std::io::Result<()> {
     write_frame(writer, &encode_reply(answer))?;
     writer.flush()
+}
+
+/// Copy bytes the agent already holds, from the staging buffer or a decoded request,
+/// to the device memory a handle and offset name.
+fn copy_to_device(
+    driver: &Driver,
+    session: &Session,
+    handle: u64,
+    offset: u64,
+    payload: &[u8],
+) -> Result<Reply, String> {
+    let pointer = session
+        .address(handle, offset)
+        .ok_or_else(|| format!("handle {handle} was never allocated"))?;
+    driver.copy_to_device(pointer, payload)?;
+    Ok(Reply::Done)
+}
+
+/// Copy device memory into `staging`, growing it when needed, and return how many of its
+/// leading bytes hold the copy.
+fn copy_to_host(
+    driver: &Driver,
+    session: &Session,
+    handle: u64,
+    offset: u64,
+    bytes: u64,
+    staging: &mut Vec<u8>,
+) -> Result<usize, String> {
+    let pointer = session
+        .address(handle, offset)
+        .ok_or_else(|| format!("handle {handle} was never allocated"))?;
+    let count = usize::try_from(bytes).map_err(|_| format!("{bytes} bytes do not fit in memory"))?;
+    if staging.len() < count {
+        staging.resize(count, 0);
+    }
+    driver.copy_to_host(pointer, &mut staging[..count])?;
+    Ok(count)
 }
 
 fn handle(request: &Request, driver: &Driver, session: &mut Session) -> Result<Reply, String> {
@@ -179,17 +237,10 @@ fn handle(request: &Request, driver: &Driver, session: &mut Session) -> Result<R
             Ok(Reply::Done)
         }
         Request::CopyToDevice { handle, offset, payload } => {
-            let pointer = session
-                .address(*handle, *offset)
-                .ok_or_else(|| format!("handle {handle} was never allocated"))?;
-            driver.copy_to_device(pointer, payload)?;
-            Ok(Reply::Done)
+            copy_to_device(driver, session, *handle, *offset, payload)
         }
-        Request::CopyToHost { handle, offset, bytes } => {
-            let pointer = session
-                .address(*handle, *offset)
-                .ok_or_else(|| format!("handle {handle} was never allocated"))?;
-            Ok(Reply::Payload { payload: driver.copy_to_host(pointer, *bytes)? })
+        Request::CopyToHost { .. } => {
+            Err("a copy to the host is answered from the staging buffer in serve".into())
         }
         Request::LoadModule { digest, payload } => {
             if let Some(found) = session.modules.get(digest) {

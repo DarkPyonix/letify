@@ -13,7 +13,7 @@ from ...errors import ProviderUnavailable
 from ..cas import Backend
 from .filesystem import FilesystemBackend
 from .layout import BLOB_PREFIX, REF_PREFIX, blob_key, ref_key
-from .objects import GCSBackend, ModalBackend, S3Backend
+from .objects import GCSBackend, ModalBackend
 
 #: Backend name to the class that implements it. A provider's ``store_backend`` returns
 #: one of these keys.
@@ -21,7 +21,6 @@ BACKENDS: dict[str, type[Backend]] = {
     "filesystem": FilesystemBackend,
     "shell": FilesystemBackend,
     "gcs": GCSBackend,
-    "s3": S3Backend,
     "modal": ModalBackend,
 }
 
@@ -52,7 +51,6 @@ __all__ = [
     "FilesystemBackend",
     "GCSBackend",
     "ModalBackend",
-    "S3Backend",
     "blob_key",
     "build",
     "default_location",

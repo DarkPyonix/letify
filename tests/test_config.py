@@ -15,19 +15,19 @@ from pathlib import Path
 import pytest
 
 import letify
-from letify.config import CONFIG_NAME, inventory, load, writer
-from letify.config.secrets import from_keyring, resolve_secret
+from letify.config import CONFIG_DIRECTORY, CONFIG_FILE, inventory, load, writer
+from letify.config.secrets import account_directory, resolve_secret
 
 
 @pytest.fixture
 def home_file(monkeypatch, tmp_path: Path):
-    """Write a ~/.letify and point Path.home at the directory holding it."""
+    """Write ~/.letify/config.toml and point Path.home at the directory holding it."""
     home = tmp_path / "home"
-    home.mkdir()
+    (home / CONFIG_DIRECTORY).mkdir(parents=True)
     monkeypatch.setattr(Path, "home", classmethod(lambda cls: home))
 
     def write(body: str) -> Path:
-        path = home / CONFIG_NAME
+        path = home / CONFIG_DIRECTORY / CONFIG_FILE
         path.write_text(body, encoding="utf-8")
         return path
 
@@ -108,11 +108,17 @@ def test_an_alias_that_is_not_an_identifier_is_refused(config_file) -> None:
         load(path, home=False)
 
 
-def test_a_provider_entry_without_a_kind_is_refused(config_file) -> None:
-    # kind is what selects the provider class, so there is nothing to build without it.
-    path = config_file('[lab]\naddress = "gpu.example.edu"\n')
+def test_a_provider_entry_without_a_kind_is_refused(home_file, config_file) -> None:
+    # kind is what selects the provider class, so there is nothing to build without it. A
+    # project table may leave it out to take it from the home entry, so there the refusal
+    # names how to declare the account instead.
+    project = config_file('[lab]\naddress = "gpu.example.edu"\n')
+    with pytest.raises(letify.ConfigError, match="letify login"):
+        load(project, home=False)
+
+    home_file('[lab]\naddress = "gpu.example.edu"\n')
     with pytest.raises(letify.ConfigError, match="has no 'kind' field"):
-        load(path, home=False)
+        load(project)
 
 
 def test_malformed_toml_names_the_file_it_could_not_read(config_file) -> None:
@@ -136,6 +142,57 @@ def test_a_missing_configuration_file_is_not_an_error(tmp_path: Path) -> None:
 # -- Spec: Configuration, credential fields ------------------------------------
 
 
+def test_letify_state_is_a_directory_at_home_and_in_the_project(home_file, tmp_path) -> None:
+    # One directory per side, so a provider's credentials and state have somewhere to live
+    # next to the configuration instead of in a file of their own.
+    assert (CONFIG_DIRECTORY, CONFIG_FILE) == (".letify", "config.toml")
+    home_file('[lab]\nkind = "shell"\naddress = "gpu.example.edu"\n')
+    project = tmp_path / "project" / ".letify"
+    project.mkdir(parents=True)
+    (project / "config.toml").write_text("[lab]\n", encoding="utf-8")
+    config = load(project)
+    assert config.sources == [
+        Path.home() / ".letify" / "config.toml",
+        project / "config.toml",
+    ]
+    assert config.providers["lab"].option("address") == "gpu.example.edu"
+
+
+def test_a_configuration_may_be_named_by_its_directory_or_its_file(config_file) -> None:
+    directory = config_file('[box]\nkind = "local"\n')
+    assert "box" in load(directory, home=False).providers
+    assert "box" in load(directory / "config.toml", home=False).providers
+
+
+def test_a_credential_is_read_from_the_account_directory(home_file) -> None:
+    # The file is named after the field, in the alias's own directory, so a token never
+    # appears in either config.toml.
+    account = account_directory("elice_a100")
+    assert account == Path.home() / ".letify" / "accounts" / "elice_a100"
+    account.mkdir(parents=True)
+    (account / "access_token").write_text("from-the-file\n", encoding="utf-8")
+    assert resolve_secret({}, "access_token", alias="elice_a100") == "from-the-file"
+
+
+def test_an_environment_variable_wins_over_the_account_file(home_file, monkeypatch) -> None:
+    account = account_directory("elice_a100")
+    account.mkdir(parents=True)
+    (account / "access_token").write_text("from-the-file", encoding="utf-8")
+    monkeypatch.setenv("LETIFY_TEST_TOKEN", "from-the-environment")
+    options = {"access_token_env": "LETIFY_TEST_TOKEN"}
+    assert resolve_secret(options, "access_token", alias="elice_a100") == "from-the-environment"
+
+
+def test_a_provider_entry_resolves_its_own_account_directory(home_file, config_file) -> None:
+    # A provider asks for a field by name and never needs to know where credentials live.
+    account = account_directory("lab")
+    account.mkdir(parents=True)
+    (account / "auth_key").write_text("tskey", encoding="utf-8")
+    home_file('[lab]\nkind = "tunnel"\naddress = "h"\n')
+    entry = load(config_file("[lab]\n")).providers["lab"]
+    assert entry.secret("auth_key") == "tskey"
+
+
 def test_a_secret_is_read_from_the_environment_first(monkeypatch) -> None:
     monkeypatch.setenv("LETIFY_TEST_TOKEN", "from-the-environment")
     options = {
@@ -143,19 +200,6 @@ def test_a_secret_is_read_from_the_environment_first(monkeypatch) -> None:
         "access_token": "from-the-file",
     }
     assert resolve_secret(options, "access_token") == "from-the-environment"
-
-
-def test_a_secret_falls_back_to_the_keyring(fake_keyring, monkeypatch) -> None:
-    # The keyring is the second form, tried when the environment variable is unset.
-    monkeypatch.delenv("LETIFY_TEST_TOKEN", raising=False)
-    keyring = fake_keyring({("letify", "researcher"): "from-the-keyring"})
-    options = {
-        "access_token_env": "LETIFY_TEST_TOKEN",
-        "access_token_keyring": "letify/researcher",
-        "access_token": "from-the-file",
-    }
-    assert resolve_secret(options, "access_token") == "from-the-keyring"
-    assert keyring.asked == [("letify", "researcher")]
 
 
 def test_a_literal_secret_is_accepted_last(monkeypatch) -> None:
@@ -168,19 +212,6 @@ def test_a_literal_secret_is_accepted_last(monkeypatch) -> None:
 def test_a_credential_that_is_nowhere_returns_the_default() -> None:
     assert resolve_secret({}, "access_token") is None
     assert resolve_secret({}, "access_token", "fallback") == "fallback"
-
-
-def test_a_keyring_entry_names_a_service_and_a_user(fake_keyring) -> None:
-    fake_keyring({("letify", "researcher"): "value"})
-    # Without the user half there is nothing to look up, so this is not a lookup miss.
-    assert from_keyring("letify") is None
-
-
-def test_the_keyring_package_is_optional(no_module) -> None:
-    # keyring is an extra, so a missing install has to leave the other two forms working
-    # rather than raising.
-    no_module("keyring")
-    assert from_keyring("letify/researcher") is None
 
 
 def test_a_provider_entry_resolves_its_own_credentials(launcher_from, monkeypatch) -> None:
@@ -222,6 +253,43 @@ def test_an_alias_block_is_replaced_without_disturbing_the_rest_of_the_file() ->
     assert updated.count("[lab]") == 1
 
 
+LAYOUT_FILE = """# lab machines
+[defaults]
+name = "nvfp4"
+
+[dept_gpu]
+kind = "shell"
+address = "gpu.example.edu"
+port = 2222
+user = "me"
+persistent = true
+
+# cards letify may use
+[dept_gpu.devices]
+Tesla_P100 = { indices = "0-7" }
+
+[other]
+kind = "modal"
+"""
+
+
+def test_rewriting_an_account_keeps_its_key_order_and_the_blank_lines() -> None:
+    # Spec "Logging in": the file is the user's, so a rewrite changes values, not layout.
+    options = {
+        "kind": "shell",
+        "address": "gpu.example.edu",
+        "persistent": True,
+        "port": 2222,
+        "user": "me",
+        "workspace": "/workspace",
+    }
+    updated = writer.write_block(LAYOUT_FILE, "dept_gpu", options)
+    expected = LAYOUT_FILE.replace(
+        "persistent = true\n", 'persistent = true\nworkspace = "/workspace"\n'
+    )
+    assert updated == expected
+
+
 def test_a_new_alias_block_is_appended_and_the_file_stays_parseable() -> None:
     updated = writer.write_block("", "lab", {"kind": "shell", "port": 2222, "persistent": True})
     parsed = tomllib.loads(updated)
@@ -249,29 +317,73 @@ def test_a_value_is_written_in_the_toml_type_it_came_in_as() -> None:
     assert parsed["x"]["gpus"] == ["A100", "H100"]
 
 
-def test_a_project_reference_to_an_account_this_machine_does_not_have_says_what_to_run(
-    tmp_path,
-) -> None:
-    # The point of the reference is that a teammate can tell what to set up.
-    project = tmp_path / ".letify"
-    project.write_text('[lab]\nkind = "shell"\nfrom_home = true\n', encoding="utf-8")
-    with pytest.raises(letify.ConfigError, match="letify login shell lab"):
-        load(project, home=False)
+# -- Spec: The two files ---------------------------------------------------------
 
 
-def test_a_reference_is_satisfied_by_the_home_file(tmp_path, monkeypatch) -> None:
-    home = tmp_path / "home"
-    home.mkdir()
-    (home / ".letify").write_text(
-        '[lab]\nkind = "shell"\naddress = "gpu.example.edu"\n', encoding="utf-8"
+def test_a_home_account_the_project_does_not_name_is_not_available(home_file, config_file) -> None:
+    # The home file is what this machine has. The project chooses from it.
+    home_file('[lab]\nkind = "shell"\naddress = "gpu.example.edu"\n')
+    config = load(config_file('[other]\nkind = "local"\n'))
+    assert "lab" not in config.providers
+    assert config.order == ["other", "local"]
+
+
+def test_naming_the_alias_is_enough_to_use_a_home_account(home_file, config_file) -> None:
+    # An empty table brings every setting with it, kind included.
+    home_file('[lab]\nkind = "shell"\naddress = "gpu.example.edu"\nuser = "researcher"\n')
+    config = load(config_file("[lab]\n"))
+    entry = config.providers["lab"]
+    assert entry.kind == "shell"
+    assert entry.option("address") == "gpu.example.edu"
+    assert entry.option("user") == "researcher"
+
+
+def test_a_global_home_account_is_available_without_being_named(home_file, config_file) -> None:
+    home_file(
+        '[colab_pro]\nkind = "colab"\nglobal = true\n'
+        '[lab]\nkind = "shell"\naddress = "gpu.example.edu"\n'
     )
-    monkeypatch.setattr(Path, "home", classmethod(lambda cls: home))
-    project = tmp_path / ".letify"
-    project.write_text('[lab]\nkind = "shell"\nfrom_home = true\n', encoding="utf-8")
-    config = load(project)
-    assert config.providers["lab"].option("address") == "gpu.example.edu"
-    # The marker is not a connection detail and must not reach the provider.
-    assert config.providers["lab"].option("from_home") is None
+    config = load(config_file('[other]\nkind = "local"\n'))
+    assert "colab_pro" in config.providers
+    assert "lab" not in config.providers
+    # The marker says where an account is visible, not how to connect to it.
+    assert config.providers["colab_pro"].option("global") is None
+
+
+def test_with_no_project_file_only_global_accounts_and_local_exist(
+    home_file, tmp_path, monkeypatch
+) -> None:
+    home_file(
+        '[colab_pro]\nkind = "colab"\nglobal = true\n'
+        '[lab]\nkind = "shell"\naddress = "gpu.example.edu"\n'
+    )
+    empty = tmp_path / "no-project"
+    empty.mkdir()
+    monkeypatch.chdir(empty)
+    config = load()
+    assert sorted(config.providers) == ["colab_pro", "local"]
+
+
+def test_a_project_cannot_make_an_account_global(home_file, config_file) -> None:
+    # Only the home file decides what every repository on the machine can reach, so the
+    # marker is not read from a project and does not reach the provider.
+    home_file('[lab]\nkind = "shell"\naddress = "gpu.example.edu"\n')
+    config = load(config_file("[lab]\nglobal = true\n"))
+    assert config.providers["lab"].option("global") is None
+
+
+def test_naming_an_account_this_machine_does_not_have_says_what_to_run(
+    home_file, config_file
+) -> None:
+    # With no kind in the project and no home entry, there is nothing to take the kind from.
+    home_file('[other]\nkind = "local"\n')
+    with pytest.raises(letify.ConfigError, match="letify login"):
+        load(config_file("[lab]\n"))
+
+
+def test_a_project_table_with_a_kind_needs_no_home_entry(config_file) -> None:
+    config = load(config_file('[box]\nkind = "local"\n'), home=False)
+    assert config.providers["box"].kind == "local"
 
 
 def test_an_option_with_no_value_is_left_out_of_the_block() -> None:
@@ -376,3 +488,20 @@ def test_the_older_gpu_list_still_means_one_of_each(launcher_from) -> None:
     lab = let.provider("lab")
     assert lab.inventory["A100"].count == 1
     assert lab.inventory["A100"].chooses_indices is False
+
+
+# -- Spec: Workspace root ------------------------------------------------------
+
+
+def test_a_workspace_is_read_from_the_home_file(home_file, config_file) -> None:
+    home_file('[lab]\nkind = "shell"\naddress = "gpu.example.edu"\nworkspace = "/workspace/me"\n')
+    project = config_file("[lab]\n")
+    assert load(project).providers["lab"].option("workspace") == "/workspace/me"
+
+
+def test_a_project_file_that_sets_a_workspace_is_refused(home_file, config_file) -> None:
+    # A repository cannot know the write rules of every machine its users reach.
+    home_file('[lab]\nkind = "shell"\naddress = "gpu.example.edu"\n')
+    project = config_file('[lab]\nworkspace = "/workspace/me"\n')
+    with pytest.raises(letify.ConfigError, match=r"workspace.*home"):
+        load(project)

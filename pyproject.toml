@@ -1,6 +1,6 @@
 [project]
 name = "letify"
-version = "1.0.0"
+version = "1.1.0"
 description = "Declarations that become infrastructure."
 readme = "README.md"
 requires-python = ">=3.11"
@@ -21,25 +21,6 @@ dependencies = [
     "cloudpickle>=3.0",
     "blake3>=0.4",
 ]
-
-# Disabled for the first release. google-colab-cli has no release that supports Python 3.11, so
-# declaring it made the whole project unresolvable on 3.11, which letify supports.
-# [project.optional-dependencies]
-# colab = ["google-colab-cli>=0.1"]
-# modal = ["modal>=0.64"]
-# shell = ["paramiko>=3.4", "httpx>=0.27"]
-# gcs = ["google-cloud-storage>=2.14"]
-# s3 = ["boto3>=1.34"]
-# keyring = ["keyring>=24.0"]
-# all = [
-#     "google-colab-cli>=0.1",
-#     "modal>=0.64",
-#     "paramiko>=3.4",
-#     "httpx>=0.27",
-#     "google-cloud-storage>=2.14",
-#     "boto3>=1.34",
-#     "keyring>=24.0",
-# ]
 
 [project.urls]
 Homepage = "https://github.com/DarkPyonix/letify"
@@ -71,6 +52,17 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["letify"]
+# letify-core binaries are gitignored build products. CI copies them into letify/remoting/lib/
+# with letify-core/build.py before building each platform wheel, and artifacts includes them.
+artifacts = ["letify/remoting/lib/*"]
+
+[tool.hatch.build.targets.sdist]
+exclude = ["letify/remoting/lib", "letify-core/target"]
+
+# The fallback type for Launcher.providers. It is a top level module because a project's generated
+# stub replaces it by that name.
+[tool.hatch.build.targets.wheel.force-include]
+"letify_providers.py" = "letify_providers.py"
 
 [tool.ruff]
 line-length = 100

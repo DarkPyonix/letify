@@ -9,10 +9,10 @@
 ## Install
 
 ```bash
-uv add "letify[colab]"
+uv add letify
 ```
 
-Pick the extra that matches where you want to run. `colab`, `modal`, `shell` for SSH machines, or `all`.
+This one install covers every provider. You also need [uv](https://docs.astral.sh/uv/) installed, because letify runs provider tools such as the Colab CLI through uv, outside your `.venv`.
 
 You do not need a provider at all to follow this guide. The `local` provider always exists, so you can try the whole flow on your own machine first.
 
@@ -34,13 +34,22 @@ That already went through the real path: the function was serialized, sent to a 
 
 ## Declare an account
 
-Accounts live in `~/.letify`, not in your repository, because they belong to your machine.
+The easiest way is `letify login`. It writes the account to `~/.letify/config.toml` and names the alias in the project's `.letify/config.toml`.
+
+```bash
+letify login colab colab_a
+```
+
+Accounts live in `~/.letify/config.toml`, not in your repository, because they belong to your machine. The entry looks like this.
 
 ```toml
 [colab_a]
 kind = "colab"
 account = "you@example.com"
+key = "~/.ssh/id_letify"
 ```
+
+`key` is the SSH key letify installs on each Colab runtime so it can open a direct link instead of sending every call through `colab exec`. The login generates `~/.ssh/id_letify` when it is missing and never overwrites an existing key. `--key PATH` picks another key.
 
 For a lab server:
 
@@ -52,7 +61,16 @@ user = "researcher"
 key = "~/.ssh/id_ed25519"
 ```
 
-> 🔐 Never write a token into this file if the file is tracked by Git. Use `access_token_env = "MY_TOKEN"` to name an environment variable, or `access_token_keyring = "service/user"` for the OS keyring.
+> 🔐 Never write a token into `config.toml`. `letify login` stores it in `~/.letify/accounts/<alias>/`. Use `access_token_env = "MY_TOKEN"` to read it from an environment variable instead.
+
+The project's `.letify/config.toml` names the accounts the project uses. An empty table is enough, and `letify login` writes it for you.
+
+```toml
+[colab_a]
+[lab_a100]
+```
+
+An account whose home entry has `global = true` needs no project table, and neither does `local`.
 
 The alias, `colab_a` here, has to be a Python identifier, because you reach providers by attribute. `colab-a` is rejected with a message telling you to use `colab_a`.
 
@@ -138,18 +156,21 @@ async def train(lr, bs):
     ...
     return {"lr": lr, "bs": bs, "loss": loss}
 
+configs = [dict(lr=lr, bs=bs) for lr in (1e-4, 3e-4, 1e-3) for bs in (16, 32)]
+
 async def main():
-    async for result in train(letify.grid(lr=[1e-4, 3e-4, 1e-3], bs=[16, 32])):
-        print(result)
+    with let.keep_alive():
+        for finished in asyncio.as_completed([train(**c) for c in configs]):
+            print(await finished)
 
 asyncio.run(main())
 ```
 
-Six points run as wide as the account has cards for, which the provider entry declares and nothing on the declaration repeats. Three cards means the sweep finishes in roughly a third of the wall clock time. See [Sweeps and capacity](05-sweeps.md).
+Each configuration is one call. The six calls run as wide as the account has cards for, which the provider entry declares and nothing on the declaration repeats, and `keep_alive` lets later calls reuse the sessions earlier ones started. Three cards means the six finish in roughly a third of the wall clock time. See [Concurrency and capacity](05-concurrency.md).
 
 ## What to know before going further
 
-**A call needs nothing around it.** The session starts on the call and ends when the call finishes, so there is no scope to open and nothing to tear down. Declare `lifetime="process"` when a run of separate calls should share one session.
+**A call needs nothing around it.** The session starts on the call and ends when the call finishes, so there is no scope to open and nothing to tear down. Wrap calls in `with let.keep_alive():` when a run of separate calls should share one session.
 
 **Your script has to stay alive.** There is no detached mode. If the local process exits, the remote session shuts itself down within the lease grace period. For a long run, write checkpoints to a volume so a restart resumes. See [Cost control](06-cost.md).
 

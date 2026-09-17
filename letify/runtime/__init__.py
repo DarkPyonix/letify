@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from .bootstrap import env_archive_path, install_source, sync_lock_source
+from .bootstrap import env_archive_path, project_files, sync_command, sync_source
 from .channel import Channel, OneShotChannel, PersistentChannel
 from .lease import GRACE, INTERVAL, Lease
 from .pool import POLL_INTERVAL, RuntimePool
@@ -19,6 +19,7 @@ __all__ = [
     "Runtime",
     "RuntimePool",
     "env_archive_path",
-    "install_source",
-    "sync_lock_source",
+    "project_files",
+    "sync_command",
+    "sync_source",
 ]

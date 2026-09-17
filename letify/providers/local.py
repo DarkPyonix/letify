@@ -20,7 +20,7 @@ import subprocess
 import sys
 from collections.abc import Mapping
 from functools import cache
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from ..declare.instance import Instance
 from .base import Provider
@@ -42,17 +42,17 @@ class Local(Provider):
     #: Nothing crosses a network, so there is no round trip to pay.
     has_fast_path = True
 
-    #: The device is in this machine, so there is no second machine to install on.
-    needs_remote_agent = False
-
     #: A subprocess with pipes, so the object and blob tables persist.
     persistent_channel = True
 
     #: This machine already runs in its environment.
-    prepares_env = False
+    remote_env = False
 
     #: A local subprocess ends with this process and costs nothing.
     needs_lease = False
+
+    #: The worker keeps the working directory of the process that started it.
+    prepares_workspace = False
 
     #: Nothing to run out of, which is a different answer from an unknown balance.
     usage_unit = "hours"
@@ -84,19 +84,46 @@ class Local(Provider):
         return super().refresh()
 
     def busy(self) -> tuple[int, ...]:
-        """Ask this machine which cards another process is computing on.
+        """Ask this machine which cards another user is computing on.
 
         Excluding this process, because a session asking for a second card must not see its
-        own first one as taken.
+        own first one as taken. The login user is the current user, the one running letify.
         """
         import os
 
         from ..runtime import telemetry
 
-        return telemetry.busy_indices(exclude_pids={os.getpid()})
+        owners: dict[int, tuple[str, ...]] = {}
+        busy = telemetry.busy_indices(
+            exclude_pids={os.getpid(), *self.worker_pids()}, owners_out=owners
+        )
+        self.last_busy_owners = owners
+        return busy
+
+    reads_machine = True
+
+    def read_machine(self) -> tuple[list[Any], dict[int, tuple[str, tuple[str, ...]]]]:
+        """This machine's cards and who holds them, read with nvidia-smi here."""
+        import os
+
+        from ..runtime import telemetry
+
+        def run(command: tuple[str, ...]) -> str:
+            if command == telemetry.SMI_COMMAND:
+                return telemetry.read_smi()
+            return telemetry._run(command)
+
+        return telemetry.read_machine(run, {os.getpid(), *self.worker_pids()})
 
     def store_backend(self) -> str:
         return "filesystem"
+
+    @property
+    def workspace_root(self) -> str:
+        """The default root, where a volume without ``mount`` lands. ``workspace`` is not used."""
+        from ..runtime import bootstrap
+
+        return bootstrap.DEFAULT_WORKSPACE_ROOT
 
     def open_channel(self, runtime: Runtime) -> Channel:
         """A Python subprocess of this machine, with pipes for framed requests.
@@ -107,10 +134,15 @@ class Local(Provider):
         """
         from ..runtime.channel import PersistentChannel
 
-        interpreter = self.config.option("python") or sys.executable
+        interpreter = sys.executable
         from ..protocol.worker import BOOTSTRAP
 
         return PersistentChannel([str(interpreter), "-u", "-c", BOOTSTRAP], name=runtime.name)
+
+    def device_channel(self, runtime: Runtime) -> Channel:
+        """The session's call worker subprocess, which hosts the PyTorch device executor."""
+        assert runtime.channel is not None
+        return runtime.channel
 
 
 __all__ = ["Local"]

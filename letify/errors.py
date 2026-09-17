@@ -14,7 +14,7 @@ class LetifyError(Exception):
 
 
 class ConfigError(LetifyError):
-    """The .letify file is missing, malformed, or names an unknown provider kind."""
+    """A .letify config.toml is malformed, or names an unknown provider kind."""
 
 
 class ProviderUnavailable(LetifyError):
@@ -40,17 +40,48 @@ class NotRunning(LetifyError):
     """A declared function was invoked outside a ``with let.run():`` scope."""
 
 
+#: How many trailing stderr lines a RuntimeFailure message carries.
+STDERR_TAIL_LINES = 40
+
+
+def _with_cause(message: str, command: str, stderr: str) -> str:
+    """Append the command and the last lines of its stderr, unless already present."""
+    if command and command not in message:
+        message = f"{message}\ncommand: {command}"
+    lines = stderr.strip().splitlines()
+    if lines:
+        message = f"{message}\nstderr (last {STDERR_TAIL_LINES} lines):\n" + "\n".join(
+            lines[-STDERR_TAIL_LINES:]
+        )
+    return message
+
+
 class RuntimeFailure(LetifyError):
     """The remote session failed. Retryable on a fresh runtime."""
 
     def __init__(self, message: str, *, command: str = "", stderr: str = ""):
         self.command = command
         self.stderr = stderr
-        super().__init__(message)
+        super().__init__(_with_cause(message, command, stderr))
 
 
 class RuntimeLost(RuntimeFailure):
     """A runtime believed to be alive is gone. Always retryable."""
+
+
+class SpotPreempted(RuntimeLost):
+    """The provider stopped or deleted a spot machine that letify did not stop.
+
+    An infrastructure failure, so it is retried like any other. ``machine`` names the
+    machine, ``state`` is its last status or ``deleted``, and ``at`` is when it was seen, in
+    Unix seconds.
+    """
+
+    def __init__(self, message: str, *, machine: str, state: str, at: float):
+        self.machine = machine
+        self.state = state
+        self.at = at
+        super().__init__(message)
 
 
 class RemoteError(LetifyError):
@@ -75,12 +106,13 @@ class ProtocolError(LetifyError):
     """
 
 
-class HandleScopeError(LetifyError):
-    """A handle from one runtime was passed to a call on another runtime.
+class InsufficientDevices(LetifyError):
+    """The devices a call needs cannot be allocated, and nothing running would free them.
 
-    Handles are pointers into one process and one CUDA context, so they cannot
-    cross that boundary. Materialize the value or route the call to the runtime
-    that owns it.
+    Raised instead of waiting when every holder of the accelerator is an idle session kept by
+    ``let.keep_alive()``, when the cards are taken by another process, or when a call asks for
+    more devices than the account declares. Not retried, because a retry asks for the same
+    devices from the same inventory.
     """
 
 
@@ -89,4 +121,15 @@ class UnsupportedMode(LetifyError):
 
     Raised, for example, when ``host="local"`` is asked for on a provider with no
     low-latency data path. letify never downgrades silently.
+    """
+
+
+class EnvironmentFailure(RuntimeFailure):
+    """uv could not be installed on a runtime, or ``uv sync`` failed there. Retryable."""
+
+
+class InterpreterMismatch(LetifyError):
+    """The runtime's Python major.minor differs from this process, or would.
+
+    Not retried, because a fresh runtime builds the same interpreter.
     """

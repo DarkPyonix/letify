@@ -46,7 +46,7 @@ rtt min/avg/max/mdev = 148.0/149.6/151.2/1.3 ms
 @pytest.fixture
 def built_core(tmp_path: Path, monkeypatch) -> Path:
     """Stand in for a built letify-core library, which is a Rust build product."""
-    library = tmp_path / "lib" / CORE_NAMES.get(sys.platform, "libletify_shim.so")
+    library = tmp_path / "lib" / CORE_NAMES.get(sys.platform, "libletify_driver.so")
     library.parent.mkdir(parents=True)
     library.write_bytes(b"not really a shared library")
     monkeypatch.setenv("LETIFY_CORE_PATH", str(library))
@@ -133,7 +133,7 @@ def test_a_probe_of_this_machine_reports_what_is_present() -> None:
 
 
 def test_forwarding_is_refused_when_there_is_nothing_to_run(monkeypatch) -> None:
-    # The refusal names the way out: build letify-core, or ship the function instead.
+    # The refusal names the way out: a platform wheel, or ship the function instead.
     monkeypatch.delenv("LETIFY_CORE_PATH", raising=False)
     monkeypatch.setattr(probe_module, "core_path", lambda: None)
     with pytest.raises(letify.UnsupportedMode) as caught:
@@ -172,7 +172,7 @@ def test_an_environment_override_pointing_nowhere_is_ignored(monkeypatch, tmp_pa
 
 def test_a_library_installed_beside_the_package_is_found(monkeypatch) -> None:
     monkeypatch.delenv("LETIFY_CORE_PATH", raising=False)
-    name = CORE_NAMES.get(sys.platform, "libletify_shim.so")
+    name = CORE_NAMES.get(sys.platform, "libletify_driver.so")
     library = Path(probe_module.__file__).resolve().parent / "lib" / name
     # letify-core may or may not be built in this checkout, and both are honest states.
     placed = not library.exists()
@@ -185,6 +185,27 @@ def test_a_library_installed_beside_the_package_is_found(monkeypatch) -> None:
     finally:
         if placed:
             library.unlink()
+
+
+def test_the_macos_library_takes_the_name_build_py_installs() -> None:
+    assert CORE_NAMES["darwin"] == "libletify_driver.dylib"
+
+
+def test_an_agent_bundled_in_the_wheel_is_found_before_path(
+    monkeypatch, tmp_path, patch_which
+) -> None:
+    agent = tmp_path / probe_module.AGENT_NAME
+    agent.write_bytes(b"not really an executable")
+    monkeypatch.setattr(probe_module, "LIB_DIR", tmp_path)
+    patch_which(probe_module, present=False)
+    assert probe_module.agent_path() == agent
+    assert probe(remote=True).agent is True
+
+
+def test_an_agent_on_path_is_used_when_none_is_bundled(monkeypatch, tmp_path, patch_which) -> None:
+    monkeypatch.setattr(probe_module, "LIB_DIR", tmp_path)
+    patch_which(probe_module, present=["letify-agent"])
+    assert probe_module.agent_path() == Path("/usr/bin/letify-agent")
 
 
 # -- Spec: Efficiency model, measuring the round trip --------------------------
@@ -225,7 +246,11 @@ def test_naming_a_host_makes_the_probe_measure_it(patch_run, patch_which) -> Non
     assert capability.agent is True
 
 
-def test_a_host_with_no_agent_on_it_cannot_serve_forwarding(patch_run, patch_which) -> None:
+def test_a_host_with_no_agent_on_it_cannot_serve_forwarding(
+    patch_run, patch_which, monkeypatch, tmp_path
+) -> None:
+    # A letify-core build on the developer's machine must not decide this answer.
+    monkeypatch.setattr(probe_module, "LIB_DIR", tmp_path)
     patch_which(probe_module, present=False)
     patch_run(probe_module, result=FakeCompleted(stdout=LINUX_PING))
     assert probe("gpu.lab.example.edu").agent is False
@@ -239,7 +264,7 @@ def test_nothing_can_be_injected_before_letify_core_is_built(monkeypatch) -> Non
     monkeypatch.setattr(loader, "core_path", lambda: None)
     outcome = inject()
     assert bool(outcome) is False
-    assert "letify-core/build.py" in outcome.instructions
+    assert "platform" in outcome.instructions
     assert "host='remote'" in outcome.instructions
     assert repr(outcome) == "<Injection active=False>"
 
@@ -305,9 +330,9 @@ def test_the_preload_command_is_reported_for_the_platform_it_runs_on(monkeypatch
     assert "inject()" in preload_command("train.py")
 
 
-def test_the_preload_command_says_to_build_letify_core_first(monkeypatch) -> None:
+def test_the_preload_command_says_letify_core_is_missing(monkeypatch) -> None:
     monkeypatch.setattr(loader, "core_path", lambda: None)
-    assert "build.py" in preload_command()
+    assert "platform wheel" in preload_command()
 
 
 def test_an_injection_that_did_nothing_is_false() -> None:

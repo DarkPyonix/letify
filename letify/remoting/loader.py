@@ -47,8 +47,8 @@ def inject(agent: str | None = None) -> Injection:
     if path is None:
         return Injection(
             False,
-            "letify-core is not built. Run `python letify-core/build.py` to build it, or declare "
-            "host='remote' to ship the function instead.",
+            "letify-core is not in this install. Install a letify wheel built for this platform, "
+            "or declare host='remote' to ship the function instead.",
         )
 
     if agent:
@@ -81,7 +81,7 @@ def preload_command(script: str = "your_script.py", agent: str = "host:7654") ->
     """The command that runs a script with letify-core in front of the driver."""
     path = core_path()
     if path is None:
-        return "python letify-core/build.py   # build letify-core first"
+        return "# letify-core is not in this install: use a platform wheel of letify"
     if sys.platform.startswith("win"):
         return f"python {script}   # letify.remoting.inject() handles this on Windows"
     return f"LD_PRELOAD={path} LETIFY_AGENT={agent} python {script}"

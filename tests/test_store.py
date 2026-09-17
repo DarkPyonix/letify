@@ -3,16 +3,19 @@
 Spec sections pinned here: "Storage", "Content addressed layout", "Blob granularity",
 "Materializing into a runtime" and "Backends".
 
-The filesystem backend is the real one throughout. The three cloud backends are driven
-through in-memory stand-ins from conftest, because a bucket needs an account; what is
-still real there is the key layout and the operations letify performs.
+The filesystem backend is the real one throughout. The gcs backend talks HTTP to a Cloud
+Storage endpoint served on loopback by conftest, and the Modal volume backend talks to the
+standard library stand-in for the Modal adapter, because a bucket needs an account; what
+is still real there is the key layout, the clients and the operations letify performs.
 """
 
 from __future__ import annotations
 
 import io
 import tarfile
+import types
 from pathlib import Path
+from urllib.parse import unquote
 
 import pytest
 
@@ -20,9 +23,9 @@ import letify
 from letify.store import backends
 from letify.store.backends import layout
 from letify.store.backends.filesystem import FilesystemBackend
-from letify.store.backends.objects import GCSBackend, ModalBackend, S3Backend
+from letify.store.backends.objects import GCSBackend, ModalBackend
 from letify.store.cas import Backend, BlobInfo, Store
-from letify.store.volume import CHECKPOINT_REF, DEFAULT_MOUNT, ENV_REF, Volume
+from letify.store.volume import CHECKPOINT_REF, ENV_REF, Volume
 
 
 @pytest.fixture
@@ -49,7 +52,7 @@ def volume(let: letify.Launcher, tmp_path: Path) -> Volume:
 
 @pytest.fixture
 def remote_cpu(let: letify.Launcher) -> letify.Instance:
-    return let.providers.local.CPU.on_host("remote")
+    return let.providers.local.CPU._placed("remote")
 
 
 # -- Spec: Content addressed layout --------------------------------------------
@@ -195,7 +198,6 @@ def test_an_unknown_backend_lists_the_ones_that_exist() -> None:
         ("shell", "root"),
         ("modal", "volume_name"),
         ("gcs", "bucket"),
-        ("s3", "bucket"),
     ],
 )
 def test_each_backend_has_a_default_location(backend: str, option: str) -> None:
@@ -227,7 +229,7 @@ def test_a_filesystem_ref_survives_a_rewrite(tmp_path: Path) -> None:
 
 
 def test_every_backend_answers_the_missing_question_with_one_listing() -> None:
-    for cls in (FilesystemBackend, GCSBackend, S3Backend, ModalBackend):
+    for cls in (FilesystemBackend, GCSBackend, ModalBackend):
         assert cls.missing is not Backend.missing, cls.__name__
 
 
@@ -242,9 +244,9 @@ def test_the_default_missing_answer_asks_once_per_digest(tmp_path: Path) -> None
 
 
 def test_a_bucket_backend_keeps_the_documented_layout_under_its_prefix(fake_gcs) -> None:
-    backend = GCSBackend("study-bucket", prefix="letify")
+    backend = GCSBackend("study-bucket", prefix="letify", endpoint=fake_gcs.endpoint)
     backend.put("ab12", b"payload")
-    assert "letify/blobs/ab/ab12" in fake_gcs
+    assert fake_gcs.objects["letify/blobs/ab/ab12"] == b"payload"
     assert backend.has("ab12") is True
     assert backend.has("nope") is False
     assert backend.get("ab12") == b"payload"
@@ -256,73 +258,215 @@ def test_a_bucket_backend_keeps_the_documented_layout_under_its_prefix(fake_gcs)
 
 
 def test_a_bucket_backend_can_be_used_without_a_prefix(fake_gcs) -> None:
-    GCSBackend("study-bucket", prefix="").put("ab12", b"payload")
-    assert "blobs/ab/ab12" in fake_gcs
+    GCSBackend("study-bucket", prefix="", endpoint=fake_gcs.endpoint).put("ab12", b"payload")
+    assert "blobs/ab/ab12" in fake_gcs.objects
 
 
-def test_an_s3_backend_keeps_the_documented_layout(fake_boto3) -> None:
-    # This covers Elice Data Hub as well as Amazon S3, because the S3 API is what object
-    # stores agree on.
-    backend = S3Backend("study-bucket", endpoint_url="https://datahub.example")
-    backend.put("ab12", b"payload")
-    assert "letify/blobs/ab/ab12" in fake_boto3.store
-    assert backend.has("ab12") is True
-    assert backend.has("absent") is False
-    assert backend.get("ab12") == b"payload"
-    assert list(backend.list_digests()) == ["ab12"]
-    assert backend.missing(["ab12", "absent"]) == ["absent"]
-    backend.write_ref("ckpt/run", "ab12")
-    assert backend.read_ref("ckpt/run") == "ab12"
-    assert backend.read_ref("ckpt/absent") is None
-    assert fake_boto3.clients[0].options["endpoint_url"] == "https://datahub.example"
+def test_a_bucket_listing_follows_every_page(fake_gcs) -> None:
+    # Spec "Google login for gcs": missing() is one listing, and a listing is paged.
+    backend = GCSBackend("study-bucket", endpoint=fake_gcs.endpoint)
+    held = [f"{n:02x}{'0' * 30}" for n in range(5)]
+    for digest in held:
+        backend.put(digest, digest.encode())
+    before = len(fake_gcs.requests)
+    assert backend.missing([*held, "ff" + "0" * 30]) == ["ff" + "0" * 30]
+    pages = [r for r in fake_gcs.requests[before:] if r["path"].endswith("/o")]
+    assert len(pages) == 3
+    assert all(r["query"]["prefix"] == "letify/blobs/" for r in pages)
 
 
-def test_an_s3_endpoint_can_come_from_the_environment(fake_boto3, monkeypatch) -> None:
-    # An S3 compatible provider is reached by endpoint, and that belongs outside the
-    # tracked configuration.
-    monkeypatch.setenv("LETIFY_S3_ENDPOINT", "https://from-the-environment")
-    S3Backend("study-bucket")
-    assert fake_boto3.clients[0].options["endpoint_url"] == "https://from-the-environment"
+def test_a_bucket_request_carries_the_borrowed_token(fake_gcs) -> None:
+    GCSBackend("study-bucket", endpoint=fake_gcs.endpoint).has("ab12")
+    assert fake_gcs.requests[-1]["authorization"] == "Bearer token-1"
 
 
-def test_a_modal_volume_backend_keeps_the_documented_layout(fake_modal) -> None:
-    fake_modal()
-    backend = ModalBackend("letify-study")
-    backend.put("ab12", b"payload")
-    assert backend.has("ab12") is True
-    assert backend.has("absent") is False
-    assert backend.get("ab12") == b"payload"
-    assert list(backend.list_digests()) == ["ab12"]
-    assert backend.missing(["ab12", "absent"]) == ["absent"]
-    backend.write_ref("ckpt/run", "ab12")
-    assert backend.read_ref("ckpt/run") == "ab12"
-    assert backend.read_ref("ckpt/absent") is None
+def test_a_bucket_that_refuses_the_token_is_a_runtime_failure(fake_gcs, monkeypatch) -> None:
+    monkeypatch.setenv("GOOGLE_OAUTH_ACCESS_TOKEN", "stale")
+    backend = GCSBackend("study-bucket", endpoint=fake_gcs.endpoint)
+    with pytest.raises(letify.RuntimeFailure, match="401"):
+        backend.get("ab12")
 
 
-# -- Spec: Packaging, a backend whose package is absent ------------------------
+# -- Spec: Google login for gcs ------------------------------------------------
 
 
-@pytest.mark.parametrize(
-    ("cls", "argument", "module", "extra"),
-    [
-        (GCSBackend, "bucket", "google.cloud", "gcs"),
-        (S3Backend, "bucket", "boto3", "s3"),
-        (ModalBackend, "volume", "modal", "modal"),
-    ],
-)
-def test_a_backend_whose_package_is_absent_says_how_to_install_it(
-    cls, argument: str, module: str, extra: str, no_module
+@pytest.fixture
+def no_google_login(monkeypatch, tmp_path: Path) -> Path:
+    """No token variable, no credentials file and no gcloud: a machine with no login."""
+    from letify.store.backends import google_auth
+
+    monkeypatch.delenv("GOOGLE_OAUTH_ACCESS_TOKEN", raising=False)
+    monkeypatch.delenv("GOOGLE_APPLICATION_CREDENTIALS", raising=False)
+    monkeypatch.setenv("CLOUDSDK_CONFIG", str(tmp_path / "gcloud"))
+    monkeypatch.setattr(google_auth.shutil, "which", lambda name: None)
+    return tmp_path / "gcloud"
+
+
+def test_no_google_login_names_the_command_that_makes_one(no_google_login) -> None:
+    from letify.store.backends.google_auth import TokenSource
+
+    with pytest.raises(letify.ProviderUnavailable, match="application-default login"):
+        TokenSource().token()
+
+
+def test_application_default_credentials_are_refreshed_over_http(
+    fake_gcs, no_google_login, monkeypatch
 ) -> None:
-    no_module(module)
-    with pytest.raises(letify.ProviderUnavailable, match=f"letify\\[{extra}\\]"):
-        cls(argument)
+    import json
+
+    from letify.store.backends.google_auth import TokenSource
+
+    no_google_login.mkdir()
+    (no_google_login / "application_default_credentials.json").write_text(
+        json.dumps(
+            {
+                "type": "authorized_user",
+                "client_id": "client-1",
+                "client_secret": "secret-1",
+                "refresh_token": "refresh-1",
+                "token_uri": f"{fake_gcs.endpoint}/token",
+            }
+        ),
+        encoding="utf-8",
+    )
+    source = TokenSource()
+    assert source.token() == "token-1"
+    # Reused until shortly before it expires, so a second request asks for nothing.
+    assert source.token() == "token-1"
+    assert len(fake_gcs.refresh_grants) == 1
+    assert fake_gcs.refresh_grants[0]["grant_type"] == "refresh_token"
+    assert fake_gcs.refresh_grants[0]["refresh_token"] == "refresh-1"
+
+
+def test_a_service_account_key_file_is_refused_with_its_reason(
+    no_google_login, tmp_path, monkeypatch
+) -> None:
+    from letify.store.backends.google_auth import TokenSource
+
+    key = tmp_path / "key.json"
+    key.write_text('{"type": "service_account"}', encoding="utf-8")
+    monkeypatch.setenv("GOOGLE_APPLICATION_CREDENTIALS", str(key))
+    with pytest.raises(letify.ProviderUnavailable, match="activate-service-account"):
+        TokenSource().token()
+
+
+def test_gcloud_is_asked_when_nothing_else_answers(no_google_login, monkeypatch) -> None:
+    from letify.store.backends import google_auth
+
+    asked: list[list[str]] = []
+
+    def run(command, **kwargs):
+        asked.append(command)
+        return types.SimpleNamespace(returncode=0, stdout="token-from-gcloud\n", stderr="")
+
+    monkeypatch.setattr(google_auth.shutil, "which", lambda name: "/usr/bin/gcloud")
+    monkeypatch.setattr(google_auth.subprocess, "run", run)
+    assert google_auth.TokenSource().token() == "token-from-gcloud"
+    assert asked == [["/usr/bin/gcloud", "auth", "print-access-token"]]
+
+
+def test_a_modal_volume_backend_keeps_the_documented_layout(isolated_home, fake_modal) -> None:
+    backend = ModalBackend("letify-study", account="modal_lab")
+    try:
+        assert list(backend.list_digests()) == []
+        backend.put("ab12", b"payload")
+        assert backend.has("ab12") is True
+        assert backend.has("absent") is False
+        assert backend.get("ab12") == b"payload"
+        assert list(backend.list_digests()) == ["ab12"]
+        assert backend.missing(["ab12", "absent"]) == ["absent"]
+        backend.write_ref("ckpt/run", "ab12")
+        assert backend.read_ref("ckpt/run") == "ab12"
+        assert backend.read_ref("ckpt/absent") is None
+    finally:
+        backend.close()
+    # Spec "Modal adapter": the volume is reached as the account, through the adapter.
+    expected = Path.home() / ".letify" / "accounts" / "modal_lab" / "modal.toml"
+    assert fake_modal.env()["MODAL_CONFIG_PATH"] == str(expected)
+    assert {r["volume"] for r in fake_modal.requests("volume_put")} == {"letify-study"}
+
+
+def test_a_modal_volume_is_asked_for_as_version_2(isolated_home, fake_modal) -> None:
+    # Spec "Backends": a v1 volume loses files above 4 MiB on read, so every volume op
+    # names version 2, which is what the adapter creates a missing volume as.
+    backend = ModalBackend("letify-study", account="modal_lab")
+    try:
+        backend.put("ab12", b"payload")
+        backend.get("ab12")
+        backend.has("ab12")
+        backend.delete("ab12")
+    finally:
+        backend.close()
+    volume_ops = [r for r in fake_modal.requests() if r["op"].startswith("volume_")]
+    assert volume_ops
+    assert {r["version"] for r in volume_ops} == {2}
+
+
+def test_a_modal_backend_removes_what_it_wrote(isolated_home, fake_modal) -> None:
+    backend = ModalBackend("letify-study", account="modal_lab")
+    try:
+        backend.put("ab12", b"payload")
+        backend.delete("ab12")
+        assert backend.has("ab12") is False
+        # Removing what is already gone is not an error.
+        backend.delete("ab12")
+    finally:
+        backend.close()
+    assert len(fake_modal.requests("volume_delete")) == 2
+
+
+def test_reading_a_modal_blob_that_is_absent_is_a_runtime_failure(
+    isolated_home, fake_modal
+) -> None:
+    backend = ModalBackend("letify-study", account="modal_lab")
+    try:
+        with pytest.raises(letify.RuntimeFailure, match="does not exist"):
+            backend.get("absent")
+    finally:
+        backend.close()
+
+
+# -- Spec: Packaging, a backend whose tool is absent ---------------------------
+
+
+def test_a_modal_backend_without_uv_says_uv_is_needed(isolated_home, patch_which) -> None:
+    from letify import tools
+
+    patch_which(tools, present=False)
+    with pytest.raises(letify.ProviderUnavailable, match="uv was not found"):
+        ModalBackend("volume", account="modal_lab")
+
+
+def test_a_modal_backend_with_no_account_is_a_configuration_error() -> None:
+    with pytest.raises(letify.ConfigError, match="account"):
+        ModalBackend("volume")
+
+
+def test_a_volume_on_a_modal_provider_acts_as_that_account(isolated_home, fake_modal) -> None:
+    from conftest import provider_of
+
+    from letify.providers.modal import Modal
+
+    volume = Volume(provider_of(Modal, "modal_lab"), "cache")
+    backend = volume.store.backend
+    assert isinstance(backend, ModalBackend)
+    assert backend.account == "modal_lab"
+    assert backend.volume_name == "letify-cache"
+
+
+def test_a_volume_elsewhere_naming_the_modal_backend_needs_an_account(let) -> None:
+    volume = Volume(let.providers.local, "cache", {"backend": "modal"})
+    with pytest.raises(letify.ConfigError, match="account"):
+        volume.store  # noqa: B018
 
 
 # -- Spec: Storage, volumes ----------------------------------------------------
 
 
 def test_a_volume_mounts_where_the_runtime_keeps_materialized_files(let, tmp_path) -> None:
-    assert Volume(let.providers.local, "cache", {"root": str(tmp_path)}).mount == DEFAULT_MOUNT
+    # Spec "Workspace root": local uses no workspace, so the default root holds its volumes.
+    default = Volume(let.providers.local, "cache", {"root": str(tmp_path)}).mount
+    assert default == "~/.letify-runtime/volumes/cache"
     volume = Volume(let.providers.local, "cache", {"mount": "/mnt/study"})
     assert volume.mount == "/mnt/study"
     assert volume.key == "local/cache"
@@ -464,15 +608,154 @@ def test_an_environment_installed_inside_a_runtime_is_cached_for_the_next_sessio
     let.pool.shutdown()
 
 
+# -- Spec: Materializing into a runtime, the runtime pulls from the backend -----
+
+
+@pytest.fixture
+def bucket_volume(let, fake_gcs, tmp_path):
+    """A gcs volume on the local provider, its bucket served on loopback."""
+    return let.providers.local.volume(
+        "bucket",
+        backend="gcs",
+        bucket=fake_gcs.bucket,
+        endpoint=fake_gcs.endpoint,
+        sts_endpoint=f"{fake_gcs.endpoint}/v1/token",
+        mount=str(tmp_path / "mount"),
+    )
+
+
+def test_a_runtime_pulls_a_blob_straight_from_the_bucket(
+    let, remote_cpu, bucket_volume, fake_gcs, tmp_path, live
+) -> None:
+    # Bytes never pass through the local process on the way in: the worker downloads them.
+    info = bucket_volume.store.put_bytes(b"model weights")
+    runtime = live(let, remote_cpu)
+    before = len(fake_gcs.downloads())
+
+    remote = bucket_volume.materialize(runtime, info.digest)
+
+    assert Path(remote.path).read_bytes() == b"model weights"
+    assert remote.size == len(b"model weights")
+    pulled = fake_gcs.downloads()[before:]
+    assert len(pulled) == 1
+    # Downscoped from the local login rather than the login itself.
+    assert pulled[0]["authorization"] == "Bearer down-token-1"
+    let.pool.shutdown()
+
+
+def test_the_read_token_is_bounded_to_the_volume_bucket_and_prefix(
+    let, remote_cpu, bucket_volume, fake_gcs, live
+) -> None:
+    import json
+
+    info = bucket_volume.store.put_bytes(b"epoch 1")
+    bucket_volume.materialize(live(let, remote_cpu), info.digest)
+
+    exchange = fake_gcs.exchanges[-1]
+    assert exchange["subject_token"] == "token-1"
+    boundary = json.loads(exchange["options"])["accessBoundary"]["accessBoundaryRules"][0]
+    assert boundary["availablePermissions"] == ["inRole:roles/storage.objectViewer"]
+    assert boundary["availableResource"].endswith(f"/buckets/{fake_gcs.bucket}")
+    assert "objects/letify/" in boundary["availabilityCondition"]["expression"]
+    let.pool.shutdown()
+
+
+def test_the_pull_token_is_kept_nowhere_once_the_pull_finishes(
+    let, remote_cpu, bucket_volume, fake_gcs, tmp_path, live
+) -> None:
+    info = bucket_volume.store.put_bytes(b"secret-free weights")
+    runtime = live(let, remote_cpu)
+    remote = bucket_volume.materialize(runtime, info.digest)
+
+    # Not on disk beside what was pulled.
+    for path in (tmp_path / "mount").rglob("*"):
+        if path.is_file():
+            assert b"down-token-1" not in path.read_bytes()
+    # Not in the worker's memory or environment. The token is assembled inside the check,
+    # so the exec request carrying it does not contain it.
+    runtime.exec(
+        "import gc, os\n"
+        "_needle = 'down-' + 'token-1'\n"
+        "assert not any(_needle in v for v in os.environ.values())\n"
+        "assert not any(isinstance(o, dict) and _needle in repr(o.get('headers'))"
+        " for o in gc.get_objects())\n"
+    )
+    assert Path(remote.path).is_file()
+    let.pool.shutdown()
+
+
+def test_a_cached_environment_is_pulled_and_unpacked_by_the_runtime(
+    fake_gcs, tmp_path, uv_project
+) -> None:
+    # The archive the first session stored is what the next session pulls.
+    import shutil
+
+    from conftest import PreparingLocal, provider_of
+
+    from letify.runtime import bootstrap
+
+    provider = provider_of(PreparingLocal, "lab", persistent=False)
+    env = letify.Env()
+    mount = tmp_path / "mount"
+    volume = provider.volume(
+        "bucket",
+        backend="gcs",
+        bucket=fake_gcs.bucket,
+        endpoint=fake_gcs.endpoint,
+        sts_endpoint=f"{fake_gcs.endpoint}/v1/token",
+        mount=str(mount),
+    )
+    from letify.declare.instance import Instance
+
+    instance = Instance(provider, gpu=None)._placed("remote")
+    provider.start(instance, env, name="lab-1", volumes=(volume,)).shutdown()
+    assert not [r for r in fake_gcs.downloads() if "/blobs/" in unquote(r["path"])]
+
+    shutil.rmtree(Path(bootstrap.DEFAULT_WORKSPACE_ROOT) / "project")
+    runtime = provider.start(instance, env, name="lab-2", volumes=(volume,))
+    try:
+        assert runtime.env_source == "archive"
+        # The ref is read by this process with its own login; the blob is read by the
+        # runtime with the downscoped token.
+        blobs = [r for r in fake_gcs.downloads() if "/blobs/" in unquote(r["path"])]
+        assert [r["authorization"] for r in blobs] == ["Bearer down-token-1"]
+    finally:
+        runtime.shutdown()
+
+
+def test_a_backend_the_runtime_cannot_reach_offers_no_pull(tmp_path) -> None:
+    # So the filesystem backend writes through the channel instead.
+    assert FilesystemBackend(tmp_path / "store").pull_source("ab12") is None
+
+
+def test_a_refused_token_exchange_sends_no_token_at_all(
+    let, remote_cpu, fake_gcs, tmp_path, live
+) -> None:
+    volume = let.providers.local.volume(
+        "bucket",
+        backend="gcs",
+        bucket=fake_gcs.bucket,
+        endpoint=fake_gcs.endpoint,
+        sts_endpoint=f"{fake_gcs.endpoint}/no-such-exchange",
+        mount=str(tmp_path / "mount"),
+    )
+    info = volume.store.put_bytes(b"weights")
+    runtime = live(let, remote_cpu)
+    with pytest.raises(letify.RuntimeFailure, match="downscop"):
+        volume.materialize(runtime, info.digest)
+    assert fake_gcs.downloads() == []
+    let.pool.shutdown()
+
+
 # -- Spec: Materializing into a runtime, the declaration names the session ------
 
 
 def test_a_checkpoint_is_taken_from_the_session_the_declaration_used(
-    let, remote_cpu, volume, tmp_path
+    let, cpu, volume, tmp_path
 ) -> None:
     # The caller names the declaration. Which session ran the call is letify's answer, and
     # it is the only one holding the file.
-    @let.function(device=remote_cpu, lifetime="process", volumes=[volume])
+    @let.function(device=cpu, host=letify.remote, volumes=[volume])
     def write_a_file(path: str) -> str:
         from pathlib import Path as P
 
@@ -480,15 +763,15 @@ def test_a_checkpoint_is_taken_from_the_session_the_declaration_used(
         P(path).write_bytes(b"weights")
         return path
 
-    written = write_a_file(path=str(tmp_path / "out" / "adapter.pt"))
-    digest = volume.absorb(write_a_file, written, "run-1")
+    with let.keep_alive():
+        written = write_a_file(path=str(tmp_path / "out" / "adapter.pt"))
+        digest = volume.absorb(write_a_file, written, "run-1")
     assert volume.latest_checkpoint("run-1") == digest
     assert volume.store.get_bytes(digest) == b"weights"
-    let.pool.shutdown()
 
 
 def test_a_checkpoint_is_put_back_into_the_session_the_declaration_will_use(
-    let, remote_cpu, volume, tmp_path
+    let, cpu, volume, tmp_path
 ) -> None:
     # Before the call rather than after, because the training function looks for it as an
     # ordinary path. The session it lands in has to be the one the call is handed.
@@ -497,33 +780,33 @@ def test_a_checkpoint_is_put_back_into_the_session_the_declaration_will_use(
     volume.put_checkpoint("run-2", source)
     target = str(tmp_path / "inside" / "resume.pt")
 
-    @let.function(device=remote_cpu, lifetime="process", volumes=[volume])
+    @let.function(device=cpu, host=letify.remote, volumes=[volume])
     def read_it_back(path: str) -> bytes:
         from pathlib import Path as P
 
         return P(path).read_bytes()
 
-    assert volume.resume(read_it_back, "run-2", target) is not None
-    assert read_it_back(path=target) == b"seed"
-    let.pool.shutdown()
+    with let.keep_alive():
+        assert volume.resume(read_it_back, "run-2", target) is not None
+        assert read_it_back(path=target) == b"seed"
 
 
 def test_resuming_a_name_nothing_was_stored_under_reports_nothing(
-    let, remote_cpu, volume, tmp_path
+    let, cpu, volume, tmp_path
 ) -> None:
     # Nothing to put back is an answer rather than a failure: a first run has no checkpoint.
-    @let.function(device=remote_cpu, lifetime="process", volumes=[volume])
+    @let.function(device=cpu, host=letify.remote, volumes=[volume])
     def anything() -> int:
         return 1
 
-    assert volume.resume(anything, "never-written", str(tmp_path / "x.pt")) is None
-    let.pool.shutdown()
+    with let.keep_alive():
+        assert volume.resume(anything, "never-written", str(tmp_path / "x.pt")) is None
 
 
-def test_a_declaration_asked_twice_is_given_one_session(let, remote_cpu, volume, tmp_path) -> None:
+def test_a_declaration_asked_twice_is_given_one_session(let, cpu, volume, tmp_path) -> None:
     # Otherwise moving a checkpoint in and then out would cross two sessions, and the second
     # would not hold the file the first wrote.
-    @let.function(device=remote_cpu, lifetime="process", volumes=[volume])
+    @let.function(device=cpu, host=letify.remote, volumes=[volume])
     def note(path: str) -> str:
         from pathlib import Path as P
 
@@ -531,8 +814,35 @@ def test_a_declaration_asked_twice_is_given_one_session(let, remote_cpu, volume,
         P(path).write_bytes(b"once")
         return path
 
-    written = note(path=str(tmp_path / "twice" / "a.pt"))
-    volume.absorb(note, written, "run-3")
-    volume.absorb(note, written, "run-3")
-    assert let.status()["live"] == 1
-    let.pool.shutdown()
+    with let.keep_alive():
+        written = note(path=str(tmp_path / "twice" / "a.pt"))
+        volume.absorb(note, written, "run-3")
+        volume.absorb(note, written, "run-3")
+        assert let.status()["live"] == 1
+
+
+def test_moving_a_checkpoint_outside_keep_alive_is_refused(let, cpu, volume, tmp_path) -> None:
+    # The session would end as soon as the call returned, so a resumed checkpoint would vanish
+    # before the call that needs it.
+    source = tmp_path / "seed.pt"
+    source.write_bytes(b"seed")
+    volume.put_checkpoint("run-4", source)
+
+    @let.function(device=cpu, host=letify.remote, volumes=[volume])
+    def anything() -> int:
+        return 1
+
+    with pytest.raises(letify.UnsupportedMode, match="keep_alive"):
+        volume.resume(anything, "run-4", str(tmp_path / "x.pt"))
+    assert let.pool.live == []
+
+
+def test_the_gcs_backend_imports_no_cloud_sdk(no_module, fake_gcs) -> None:
+    # Spec "Packaging": the gcs blob store uses a standard library client.
+    no_module("google", "google.cloud", "google.cloud.storage")
+    assert GCSBackend("study-bucket", endpoint=fake_gcs.endpoint).has("ab12") is False
+
+
+def test_there_is_no_s3_backend() -> None:
+    # Not a requested feature, and boto3 is a dependency letify does not take.
+    assert "s3" not in backends.BACKENDS

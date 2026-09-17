@@ -7,7 +7,6 @@ from .backends import (
     FilesystemBackend,
     GCSBackend,
     ModalBackend,
-    S3Backend,
     build,
 )
 from .cas import Backend, BlobInfo, Store
@@ -20,7 +19,6 @@ __all__ = [
     "FilesystemBackend",
     "GCSBackend",
     "ModalBackend",
-    "S3Backend",
     "Store",
     "Volume",
     "build",

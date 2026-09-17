@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import shutil
 import subprocess
+from collections.abc import Callable
 from dataclasses import dataclass
 
 #: What is asked of nvidia-smi, in this order. Kept to readings every driver reports.
@@ -150,23 +151,96 @@ APPS_COMMAND = (
 
 UUID_COMMAND = ("nvidia-smi", "--query-gpu=index,uuid", "--format=csv,noheader,nounits")
 
+#: One shell script that lists the compute processes, the owner of each one visible here and
+#: the login user. The owners are read in the same command as the listing, so a process id
+#: cannot be reused in between. A process id with no /proc entry prints no owner line.
+OWNERS_SCRIPT = (
+    "command -v stat >/dev/null || exit 127; "
+    f"apps=$({' '.join(APPS_COMMAND)}) || exit $?; "
+    "printf '%s\\n' \"$apps\"; "
+    "echo '#owners'; "
+    "for pid in $(printf '%s\\n' \"$apps\" | cut -d, -f2); do "
+    'owner=$(stat -c %U "/proc/$pid" 2>/dev/null) && echo "$pid $owner"; '
+    "done; "
+    "echo '#login'; "
+    "id -un || exit 1"
+)
 
-def busy_indices(exclude_pids: set[int] | None = None) -> tuple[int, ...]:
-    """Device indices another process is currently computing on.
+OWNERS_COMMAND = ("sh", "-c", OWNERS_SCRIPT)
+
+#: The owner named for a process whose owner could not be read.
+UNKNOWN_OWNER = "unknown"
+
+
+def busy_indices(
+    exclude_pids: set[int] | None = None,
+    run: Callable[[tuple[str, ...]], str] | None = None,
+    owners_out: dict[int, tuple[str, ...]] | None = None,
+) -> tuple[int, ...]:
+    """Device indices another user is currently computing on.
 
     Registered is permission, not availability: a card a colleague is training on is not
     something to fight over. Compute processes are read rather than utilization, because a
-    card between steps reads as idle and is not.
+    card between steps reads as idle and is not. A process owned by the login user does not
+    count, except when the login user is root, which many people share.
 
     ``exclude_pids`` leaves out processes letify itself started, so a session asking for a
-    second card does not see its own as taken.
+    second card does not see its own as taken. ``run`` answers one command with its output,
+    and defaults to running it on this machine. A remote provider passes a runner that asks
+    its own machine and raises when the command cannot run. ``owners_out``, when given, is
+    filled with the owners of the processes on each busy index.
     """
-    mine = exclude_pids or set()
-    uuids = _uuid_to_index()
+    runner = run or _run
+    uuids = parse_uuids(runner(UUID_COMMAND))
     if not uuids:
         return ()
-    taken: set[int] = set()
-    for line in _run(APPS_COMMAND).splitlines():
+    return parse_busy(runner(OWNERS_COMMAND), uuids, exclude_pids, owners_out)
+
+
+def parse_uuids(output: str) -> dict[str, int]:
+    """Map each card's uuid to its index, because compute apps are reported by uuid."""
+    table: dict[str, int] = {}
+    for line in output.splitlines():
+        fields = [part.strip() for part in line.split(",")]
+        if len(fields) < 2 or not fields[0].isdigit():
+            continue
+        table[fields[1]] = int(fields[0])
+    return table
+
+
+def parse_holders(
+    output: str,
+    uuids: dict[str, int],
+    exclude_pids: set[int] | None = None,
+) -> dict[int, tuple[str, tuple[str, ...]]]:
+    """Who holds each card, read from the output of ``OWNERS_COMMAND``.
+
+    Every index in ``uuids`` gets ``("others", users)`` when another user computes on it,
+    ``("mine", ())`` when only the login user's own processes or this client's workers do,
+    and ``("free", ())`` otherwise. The login user rule is the busy check's: when the login
+    user is root, a root process that is not one of this client's workers is another user's.
+
+    Raises ``RuntimeFailure`` when the output carries no login user, because without it no
+    process can be told apart from the login user's own.
+    """
+    from ..errors import RuntimeFailure
+
+    apps, _, rest = output.partition("#owners")
+    owner_lines, _, login_lines = rest.partition("#login")
+    login = login_lines.strip()
+    if not login:
+        raise RuntimeFailure(
+            "the busy check could not read the login user, so which cards are free is unknown"
+        )
+    owner_of: dict[int, str] = {}
+    for line in owner_lines.splitlines():
+        pid_text, _, user = line.strip().partition(" ")
+        if pid_text.isdigit() and user:
+            owner_of[int(pid_text)] = user.strip()
+    workers = exclude_pids or set()
+    taken: dict[int, set[str]] = {}
+    mine: set[int] = set()
+    for line in apps.splitlines():
         fields = [part.strip() for part in line.split(",")]
         if len(fields) < 2 or fields[0] not in uuids:
             continue
@@ -174,20 +248,62 @@ def busy_indices(exclude_pids: set[int] | None = None) -> tuple[int, ...]:
             pid = int(fields[1])
         except ValueError:
             continue
-        if pid not in mine:
-            taken.add(uuids[fields[0]])
+        index = uuids[fields[0]]
+        owner = owner_of.get(pid)
+        if pid in workers or (owner is not None and owner == login and login != "root"):
+            mine.add(index)
+            continue
+        taken.setdefault(index, set()).add(owner or UNKNOWN_OWNER)
+    holders: dict[int, tuple[str, tuple[str, ...]]] = {}
+    for index in sorted(uuids.values()):
+        if index in taken:
+            holders[index] = ("others", tuple(sorted(taken[index])))
+        elif index in mine:
+            holders[index] = ("mine", ())
+        else:
+            holders[index] = ("free", ())
+    return holders
+
+
+def parse_busy(
+    output: str,
+    uuids: dict[str, int],
+    exclude_pids: set[int] | None = None,
+    owners_out: dict[int, tuple[str, ...]] | None = None,
+) -> tuple[int, ...]:
+    """The indices another user computes on, read from the output of ``OWNERS_COMMAND``.
+
+    Raises ``RuntimeFailure`` when the output carries no login user, because without it no
+    process can be told apart from the login user's own.
+    """
+    holders = parse_holders(output, uuids, exclude_pids)
+    taken = {index: users for index, (holder, users) in holders.items() if holder == "others"}
+    if owners_out is not None:
+        owners_out.update(taken)
     return tuple(sorted(taken))
 
 
-def _uuid_to_index() -> dict[str, int]:
-    """Map each card's uuid to its index, because compute apps are reported by uuid."""
-    table: dict[str, int] = {}
-    for line in _run(UUID_COMMAND).splitlines():
-        fields = [part.strip() for part in line.split(",")]
-        if len(fields) < 2 or not fields[0].isdigit():
-            continue
-        table[fields[1]] = int(fields[0])
-    return table
+def read_machine(
+    run: Callable[[tuple[str, ...]], str],
+    exclude_pids: set[int] | None = None,
+) -> tuple[list[DeviceLoad], dict[int, tuple[str, tuple[str, ...]]]]:
+    """Every card's load and who holds it, from the three read-only nvidia-smi queries.
+
+    ``run`` answers one command with its output. The load query failing raises, because
+    then there is nothing to report. The owner queries failing leaves the holders empty,
+    which a caller prints as unknown, because the load is still worth showing.
+    """
+    from ..errors import LetifyError
+
+    devices = parse_smi(run(SMI_COMMAND))
+    if not devices:
+        return devices, {}
+    try:
+        uuids = parse_uuids(run(UUID_COMMAND))
+        holders = parse_holders(run(OWNERS_COMMAND), uuids, exclude_pids) if uuids else {}
+    except LetifyError:
+        holders = {}
+    return devices, holders
 
 
 def _run(command: tuple[str, ...]) -> str:
@@ -208,13 +324,20 @@ def local_load() -> list[DeviceLoad]:
 
 __all__ = [
     "APPS_COMMAND",
+    "OWNERS_COMMAND",
+    "OWNERS_SCRIPT",
     "SMI_COMMAND",
     "SMI_FIELDS",
     "SMI_TIMEOUT",
+    "UNKNOWN_OWNER",
     "UUID_COMMAND",
     "DeviceLoad",
     "busy_indices",
     "local_load",
+    "parse_busy",
+    "parse_holders",
     "parse_smi",
+    "parse_uuids",
+    "read_machine",
     "read_smi",
 ]

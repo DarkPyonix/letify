@@ -10,10 +10,11 @@ hub, and 40 to 60 seconds from a bucket in the same infrastructure as the runtim
 of that time is billed as GPU time, which is why a cache tier is not optional for short
 sessions.
 
-Materializing goes through the runtime's channel rather than asking the runtime to
-reach the bucket itself. That works with every backend and needs no credentials on the
-far side, at the cost of the bytes passing through this process. A provider whose
-runtime can read the bucket directly should override that.
+Materializing has the runtime pull straight from the backend, with a short-lived read
+token this process derives from its own login and sends over the channel, so the bytes do
+not pass through this process. A backend the runtime has no network path to offers no
+pull, and then the bytes go through the channel. Writes from this process, such as
+``absorb`` and ``cache_env_from``, go to the backend directly.
 """
 
 from __future__ import annotations
@@ -22,6 +23,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from .. import protocol
 from .cas import Store
 
 if TYPE_CHECKING:
@@ -30,8 +32,53 @@ if TYPE_CHECKING:
     from ..providers.base import Provider
     from ..runtime.session import Runtime
 
-#: Where a runtime keeps the files a volume materializes.
-DEFAULT_MOUNT = "/opt/letify"
+#: The file in a volume directory that records what a persistent runtime already holds.
+MANIFEST = ".letify-manifest.json"
+
+
+def _held_source(manifest: str, destination: str, digest: str) -> str:
+    """Source answering the destination's path and size when it still holds ``digest``.
+
+    Spec "Volumes on a persistent runtime": the manifest entry must name the digest, and
+    the file must still have the recorded size and modification time.
+    """
+    return (
+        "import json, os\n"
+        f"_path = os.path.expanduser({destination!r})\n"
+        "__letify_value__ = None\n"
+        "try:\n"
+        f"    with open(os.path.expanduser({manifest!r})) as _handle:\n"
+        "        _entry = json.load(_handle).get(_path)\n"
+        "    _stat = os.stat(_path)\n"
+        f"    if _entry and _entry['digest'] == {digest!r} and _entry['size'] == _stat.st_size"
+        " and _entry['mtime_ns'] == _stat.st_mtime_ns:\n"
+        "        __letify_value__ = {'path': _path, 'size': _stat.st_size}\n"
+        "except (OSError, ValueError, KeyError, TypeError):\n"
+        "    pass\n"
+    )
+
+
+def _record_source(manifest: str, destination: str, digest: str) -> str:
+    """Source recording a written destination in the manifest, replaced atomically."""
+    return (
+        "import json, os\n"
+        f"_path = os.path.expanduser({destination!r})\n"
+        f"_manifest = os.path.expanduser({manifest!r})\n"
+        "try:\n"
+        "    with open(_manifest) as _handle:\n"
+        "        _entries = json.load(_handle)\n"
+        "except (OSError, ValueError):\n"
+        "    _entries = {}\n"
+        "_stat = os.stat(_path)\n"
+        f"_entries[_path] = {{'digest': {digest!r}, 'size': _stat.st_size,"
+        " 'mtime_ns': _stat.st_mtime_ns}\n"
+        "os.makedirs(os.path.dirname(_manifest), exist_ok=True)\n"
+        "_temporary = '%s.%d' % (_manifest, os.getpid())\n"
+        "with open(_temporary, 'w') as _handle:\n"
+        "    json.dump(_entries, _handle)\n"
+        "os.replace(_temporary, _manifest)\n"
+    )
+
 
 #: Ref names letify itself uses. The rest of the namespace belongs to the user.
 ENV_REF = "env/{key}"
@@ -65,7 +112,19 @@ class Volume:
 
     @property
     def mount(self) -> str:
-        return str(self.options.get("mount", DEFAULT_MOUNT))
+        """The volume directory, ``<workspace root>/volumes/<name>``, before ``~`` is expanded.
+
+        The ``mount`` option names another directory for this volume.
+        """
+        return self.directory(None)
+
+    def directory(self, runtime: Runtime | None) -> str:
+        """The volume directory, under the root a booted runtime expanded when there is one."""
+        configured = self.options.get("mount")
+        if configured:
+            return str(configured)
+        root = getattr(runtime, "workspace", None) or self.provider.workspace_root
+        return f"{root.rstrip('/')}/volumes/{self.name}"
 
     @property
     def key(self) -> str:
@@ -83,36 +142,40 @@ class Volume:
             }
             option, value = backends.default_location(backend, self.name)
             options.setdefault(option, value)
+            if backend == "modal" and self.provider.kind == "modal":
+                # A Modal volume acts as the account that owns it unless told otherwise.
+                options.setdefault("account", self.provider.alias)
             self._store = Store(backends.build(backend, **options))
         return self._store
 
     # -- environments --------------------------------------------------------
 
-    def env_ref(self, env: Env) -> str:
-        return ENV_REF.format(key=env.key)
+    def env_ref(self, env: Env, platform: str | None = None) -> str:
+        """``env/<env key>-<platform>``, or ``env/<env key>`` where no platform is named."""
+        key = env.key if platform is None else f"{env.key}-{platform}"
+        return ENV_REF.format(key=key)
 
-    def cached_env(self, env: Env) -> str | None:
+    def cached_env(self, env: Env, platform: str | None = None) -> str | None:
         """Digest of the prebuilt environment archive, if one was stored."""
-        return self.store.resolve(self.env_ref(env))
+        return self.store.resolve(self.env_ref(env, platform))
 
-    def cache_env(self, env: Env, root: str | Path) -> str:
+    def cache_env(self, env: Env, root: str | Path, platform: str | None = None) -> str:
         """Pack an installed environment and remember it under its env key.
 
-        One archive replaces tens of thousands of file transfers. The key is the hash of
-        the lock file, so the same declaration reuses the same archive and a changed
-        lock file builds a new one.
+        One archive replaces tens of thousands of file transfers. The env key covers the
+        uv files and the Python version, and the platform names the machine, so the same
+        declaration on the same kind of machine reuses the same archive.
         """
-        return self.store.put_tree(root, key=self.env_ref(env)).digest
+        return self.store.put_tree(root, key=self.env_ref(env, platform)).digest
 
-    def cache_env_from(self, target: Any, env: Env, path: str) -> str:
-        """Pack an environment that was installed inside a runtime and store it.
+    def cache_env_from(self, target: Any, env: Env, path: str, platform: str | None = None) -> str:
+        """Pack an environment that was built inside a runtime and store it.
 
-        This is how the first session pays the installation cost and every later one
-        skips it.
+        This is how the first session pays the sync and every later one skips it.
         """
         payload, _digest = _session(target).pack_dir(path)
         info = self.store.put_bytes(payload)
-        self.store.point(self.env_ref(env), info.digest)
+        self.store.point(self.env_ref(env, platform), info.digest)
         return info.digest
 
     # -- checkpoints ---------------------------------------------------------
@@ -164,11 +227,42 @@ class Volume:
         *,
         path: str | None = None,
         unpack: bool = False,
+        target: str | None = None,
+        links: bool = False,
     ) -> RemoteFile:
-        """Write a blob into the runtime, optionally unpacking it at the mount."""
+        """Put a blob inside the runtime, optionally unpacking it at ``target``.
+
+        ``target`` defaults to the volume directory. ``links`` allows symlinks to absolute
+        paths in the archive, which an environment archive needs. The runtime pulls the blob
+        from the backend itself when the backend offers a pull and the channel keeps a worker
+        alive to perform it. Otherwise the bytes go through the channel.
+        """
+        directory = self.directory(runtime)
+        destination = path or f"{directory.rstrip('/')}/blobs/{digest[:2]}/{digest}"
+        into = target or directory
+        manifest = f"{directory.rstrip('/')}/{MANIFEST}"
+        tracked = self.provider.persistent and not unpack
+        if tracked:
+            held = runtime.eval(_held_source(manifest, destination, digest), timeout=120)
+            if held is not None:
+                return protocol.RemoteFile(path=held["path"], digest=digest, size=held["size"])
+        written = self._write(runtime, digest, destination, unpack, into, links)
+        if tracked:
+            runtime.eval(_record_source(manifest, destination, digest), timeout=120)
+        return written
+
+    def _write(
+        self, runtime: Runtime, digest: str, destination: str, unpack: bool, into: str, links: bool
+    ) -> RemoteFile:
+        """Send one blob to a destination, pulled by the runtime when the backend allows."""
+        if runtime.persistent_channel:
+            source = self.store.backend.pull_source(digest)
+            if source is not None:
+                return runtime.pull(
+                    source, destination, digest=digest, unpack=unpack, target=into, links=links
+                )
         payload = self.store.get_bytes(digest)
-        target = path or f"{self.mount.rstrip('/')}/blobs/{digest[:2]}/{digest}"
-        return runtime.put_bytes(payload, target, unpack=unpack, target=self.mount)
+        return runtime.put_bytes(payload, destination, unpack=unpack, target=into, links=links)
 
     def materialize_ref(
         self, runtime: Runtime, ref: str, *, unpack: bool = False
@@ -196,4 +290,4 @@ class Volume:
         return f"<Volume {self.key} on {self.provider.store_backend()}>"
 
 
-__all__ = ["CHECKPOINT_REF", "DEFAULT_MOUNT", "ENV_REF", "Volume"]
+__all__ = ["CHECKPOINT_REF", "ENV_REF", "MANIFEST", "Volume"]
