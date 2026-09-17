@@ -508,6 +508,27 @@ def test_a_runtime_boots_its_channel_then_arms_its_lease(tmp_path: Path) -> None
     assert runtime.lease is None
 
 
+def test_a_boot_that_fails_stops_the_runtime_it_started(tmp_path: Path) -> None:
+    # Spec "Sessions": a session started for a runtime does not outlive a failed boot. The
+    # Kaggle run this pins was left alive by a boot that died in uv sync, and the next
+    # start then found the notebook's one session taken.
+    class FailingLocal(LeasingLocal):
+        stopped: ClassVar[list[str]] = []
+
+        def add_worker_pid(self, pid: int) -> None:
+            raise letify.errors.RuntimeFailure("the boot fails after the channel is open")
+
+        def stop(self, runtime) -> None:
+            self.stopped.append(runtime.name)
+            super().stop(runtime)
+
+    provider = provider_of(FailingLocal, "lab")
+    instance = Instance(provider, gpu=None)._placed("remote")
+    with pytest.raises(letify.errors.RuntimeFailure, match="after the channel is open"):
+        provider.start(instance, Env(lock=str(tmp_path / "absent.lock")), name="lab-1")
+    assert provider.stopped == ["lab-1"]
+
+
 def test_a_volume_with_no_cached_archive_is_passed_over(uv_project: Path, tmp_path: Path) -> None:
     # Spec "Blob granularity": the archive is keyed by the environment and the platform, so
     # a volume that does not hold this one is not the place to look.

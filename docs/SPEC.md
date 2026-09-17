@@ -148,6 +148,8 @@ letify owns one notebook per account, created once with `CreateKernelWithSetting
 
 There is no API token, no `kaggle.json` and no session URL registered by hand: the internal endpoints treat an API key as anonymous and answer empty, so the cookie is the whole credential.
 
+An internal call that fails raises `RuntimeFailure` naming the endpoint, the HTTP status and the `message` of Kaggle's reply when it carries one, so a refused start says what Kaggle refused. The cookie never appears in the error.
+
 The accelerators letify offers are the fixed set `discover` returns, `CPU`, `P100` and `T4` and the `TPU_V3_8`, all of which the web app lets a session start with. No call is made to list them, because Kaggle assigns the card the session gets.
 
 `Shell` and its subclasses default to ephemeral because a machine's disk policy is not knowable in advance. Assuming ephemeral costs time, since letify rebuilds the environment each runtime and the work still succeeds; assuming persistent fails outright when the disk turns out to be wiped. A configuration entry overrides it with `persistent = true`.
@@ -725,6 +727,8 @@ A runtime boots in seven steps:
 7. Attach volumes.
 
 Step 3 is skipped where `prepares_workspace` is false, and steps 4 and 5 where `remote_env` is false. Both are the local provider alone: its worker is a subprocess of this process, so it keeps the working directory it was started in and already runs in the project's environment. No other provider turns either off, and no account setting can.
+
+A boot that fails at any step shuts the runtime down before the error propagates: the channel is closed and the provider's `stop` is called, so a session, sandbox or run started for the runtime does not outlive the failure. A second start after a failed one therefore finds nothing left behind by the first.
 
 Step 6 runs everywhere, with nothing to turn it off. cloudpickle ships a function defined in `__main__` as bytecode, which does not load across Python minor versions, so a worker whose version differs cannot run the call at all. Skipping the check only moves the failure to a place that reads as the user's bug. On the local provider the worker is this interpreter, so the check passes without a round trip. Steps 1 to 5 run on the bootstrap interpreter and use only the standard library, as Channels describes.
 

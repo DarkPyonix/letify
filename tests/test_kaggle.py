@@ -394,6 +394,24 @@ def test_a_session_is_started_with_internet_access(fake_kaggle) -> None:
     assert runs[0]["compute"]["internet"] == {"isEnabled": True}
 
 
+def test_a_refused_kaggle_call_names_the_status_and_the_message(fake_kaggle) -> None:
+    """Spec "Kaggle session token chain": a refused call says what Kaggle answered.
+
+    An error that says only "HTTPError" hides whether the notebook's session is taken, the
+    cookie is stale or the account lacks a right, which are three different next steps.
+    """
+    from letify.errors import RuntimeFailure
+
+    fake_kaggle.refuse["GetOrCreateKernelSession"] = (409, "Kernel session already running")
+    with pytest.raises(RuntimeFailure) as raised:
+        session_channel(fake_kaggle)
+    text = str(raised.value)
+    assert "GetOrCreateKernelSession" in text
+    assert "409" in text
+    assert "Kernel session already running" in text
+    assert "ka_sessionid" not in text
+
+
 def test_every_rest_request_carries_the_session_token_in_the_path_not_a_header(
     fake_kaggle,
 ) -> None:
