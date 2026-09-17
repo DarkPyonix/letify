@@ -227,6 +227,9 @@ def sync_source(
         "if _letify_uv is None and os.path.isfile(os.path.join(_letify_bin, 'uv')):",
         "    _letify_uv = os.path.join(_letify_bin, 'uv')",
         "if _letify_uv is None:",
+        "    if shutil.which('curl') is None and shutil.which('wget') is None:",
+        f"        raise RuntimeError('uv cannot be installed on {name}: its installer needs "
+        f"curl or wget on PATH, and neither is present. Install one, or put uv on PATH.')",
         "    _letify_text = ''",
         "    try:",
         # astral.sh answers Python's default urllib agent with 403, so letify names itself.
