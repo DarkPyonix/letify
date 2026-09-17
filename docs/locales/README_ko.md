@@ -280,11 +280,11 @@ Provider
 | 🇰🇷 `Elice` | persistent | 한국 GPU 클라우드, 초 단위 과금 |
 | 🏅 `Kaggle` | ephemeral | 주간 무료 GPU 시간, `host=letify.remote` 전용 |
 
-**Kaggle.** kaggle.com의 Settings, API에서 API 토큰을 만든 뒤 `letify login kaggle kaggle_a`를 실행합니다. 토큰은 화면에 표시되지 않게 입력받고, `kaggle.json` 경로를 넣어도 됩니다. letify는 토큰을 `~/.letify/accounts/kaggle_a/`에 보관하고 읽기 전용인 `kaggle quota` 호출로 확인합니다. `letify usage kaggle_a`는 이번 주에 남은 GPU 시간을 보여 줍니다. Kaggle 선언에는 `host=letify.remote`를 써야 합니다. Kaggle은 터널을 금지하므로 `host=letify.local`은 타입 오류이고, 데코레이터가 실행될 때 예외가 납니다.
+**Kaggle.** 브라우저에서 kaggle.com에 로그인한 뒤 그 탭의 `Cookie` 요청 헤더를 복사하고(개발자 도구, Network, 아무 kaggle.com 요청), `letify login kaggle kaggle_a`를 실행합니다. 쿠키는 화면에 표시되지 않게 입력받고, `--cookie`로 값이나 값을 담은 파일을 넘겨도 됩니다. letify는 네트워크 호출 전에 쿠키의 형태와 만료를 검사하고, 계정을 돌려주는 요청 하나로 확인한 뒤 `~/.letify/accounts/kaggle_a/cookie`에 0600 권한으로 보관합니다. 쿠키는 그것을 만든 브라우저 로그인으로부터 30일 뒤에 만료되고, letify가 하는 어떤 일도 이를 연장하지 않습니다. `letify providers`와 `letify usage kaggle_a`는 `cookie expires in N days`를 보여 주고, 만료된 쿠키로 실행하면 다시 로그인해서 `letify login kaggle kaggle_a`를 반복하라는 오류로 멈춥니다. `letify usage kaggle_a`는 이번 주에 남은 GPU 시간도 보여 줍니다.
 
-한 단계가 더 있고, Kaggle에서 사람이 해야 하는 것은 이것뿐입니다. Kaggle 편집기에서 Run, Kaggle Jupyter Server로 세션을 시작하고, Colab Compatible URL을 복사한 뒤 `letify login kaggle kaggle_a --connect '<URL>'`을 실행합니다. 그 URL은 편집기에만 있습니다. Kaggle API로 세션을 시작하고 끌 수는 있지만 그 세션의 주소는 돌려주지 않고, 세션 앞의 프록시는 편집기가 발급한 토큰만 받습니다. 세션이 등록되지 않은 계정으로 호출하면 거부하면서 이 안내를 보여 줍니다.
+Kaggle 편집기에서 할 일은 없습니다. letify가 계정에 비공개 노트북을 만들어 세션을 직접 시작하고, 프로그램이 끝나면 세션을 끝냅니다. 세션은 커널 셀 하나 안에서 워커 하나를 돌리고, 프레임은 base64 줄로 오갑니다. 서울에서 측정해 올리기 약 9 MiB/s, 내리기 약 1.5 MiB/s입니다. letify는 그 세션에서 선언된 환경을 `uv sync`로 만들고, 파일을 주고받고, 워커의 인터프리터를 검사하고, Kaggle이 세션을 끝낼 때까지 호출을 실행합니다. 세션은 20분 동안 쓰지 않거나 12시간이 지나면 끝납니다. keep-alive는 보내지 않습니다.
 
-그다음부터 Kaggle은 다른 프로바이더와 같습니다. letify가 선언된 환경을 세션에서 `uv sync`로 만들고, 작업 디렉터리에 들어가고, 파일을 주고받고, 워커의 인터프리터를 검사합니다. 세션의 GPU를 기록하고, Kaggle이 세션을 끝낼 때까지 호출을 그 세션에서 실행합니다. 세션은 20분 동안 쓰지 않거나 12시간이 지나면 끝납니다. 그러면 새 URL을 등록하라는 오류를 내고, 세션을 억지로 유지하지 않습니다.
+Kaggle 선언에는 `host=letify.remote`를 써야 합니다. Kaggle은 인바운드 포트를 제공하지 않고 letify는 세션에서 밖으로 링크를 열지 않으므로, 그 커널 채널이 letify가 세션에 여는 유일한 링크이고, 이 채널은 디바이스 스트림을 감당하지 못합니다. 그래서 `host=letify.local`은 타입 오류이고, 데코레이터가 실행될 때 예외가 납니다.
 
 **letify가 가장 빠른 연결 방법을 찾습니다.** `Shell` 계열 머신에 대해 letify는 여러 연결 방법을 동시에 시도하고, 성공한 것 중 가장 빠른 방법을 씁니다.
 

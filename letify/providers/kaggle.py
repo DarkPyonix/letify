@@ -703,7 +703,8 @@ class Kaggle(Provider):
     #: A session carries one worker for the runtime, so the object and blob tables survive.
     persistent_channel = True
 
-    #: No device stream can reach a Kaggle session without a tunnel, which Kaggle forbids.
+    #: The kernel channel is the only link to a session, and it cannot carry a device
+    #: stream: Kaggle offers no inbound port and letify dials no link out of the session.
     serves_host_local = False
 
     usage_unit = "GPU hours"
@@ -743,8 +744,9 @@ class Kaggle(Provider):
         """Refuse ``host="local"``, which reaches here only through ``let.providers.any``."""
         if instance.placement is Host.local:
             raise UnsupportedMode(
-                f"{self.alias} cannot serve host='local': Kaggle forbids tunnels and port "
-                f"forwarding, so no device stream reaches the session. Use host='remote'."
+                f"{self.alias} cannot serve host='local': the kernel channel is the only "
+                f"link to a Kaggle session and it cannot carry a device stream. Use "
+                f"host='remote'."
             )
 
     def __init__(self, config: ProviderConfig):
