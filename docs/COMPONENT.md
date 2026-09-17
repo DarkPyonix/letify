@@ -128,6 +128,7 @@ Four classes share the frame model:
 |---|---|
 | `wire.Sender`, `wire.Receiver` | The 16 byte frame header, a message as a protocol 5 pickle plus out-of-band buffers in 8 MiB `DATA` frames, and reassembly per stream. The same file runs inside the worker |
 | `Connection` | One pipe pair's open requests. Waiting threads take turns reading frames, so `stat` and `lease` are answered during a long call. Worker output is written live to this process's stdout and stderr |
+| `Pipeline` | One stream carrying several requests in order, each answered in order, with at most 8 unanswered. The `data_put` pieces of a call's project data travel on one, so the link does not idle for a reply between pieces |
 | `FramedChannel` | Sending the worker source, waiting for `HELLO`, the move to another interpreter, timeouts |
 | `PersistentChannel`, `SandboxChannel` | How the bytes move: a subprocess's pipes, or a Modal sandbox through the adapter as base64 lines until its data channel, a TCP connection through a Modal encrypted port, takes the frames over |
 
