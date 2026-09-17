@@ -382,6 +382,18 @@ def test_a_program_runs_on_the_registered_session_in_the_kernel_letify_created(
     assert all(fake_kaggle.token not in " ".join(run["argv"]) for run in runs)
 
 
+def test_a_session_is_started_with_internet_access(fake_kaggle) -> None:
+    """Spec "Kaggle Jupyter Server session": the run asks for internet access.
+
+    A Kaggle session has no network unless the run asks for it, and the environment step
+    then fails downloading from PyPI, which is how a live run on develop died.
+    """
+    session_channel(fake_kaggle)
+    runs = [body for path, body in fake_kaggle.cloud_calls if path.endswith("CommitAndRun")]
+    assert len(runs) == 1
+    assert runs[0]["compute"]["internet"] == {"isEnabled": True}
+
+
 def test_every_rest_request_carries_the_session_token_in_the_path_not_a_header(
     fake_kaggle,
 ) -> None:
