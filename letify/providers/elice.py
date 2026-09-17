@@ -853,6 +853,16 @@ class Elice(Shell):
             if status == wanted:
                 return record
             if time.monotonic() >= deadline:
+                if status == "queued":
+                    # Elice has not placed the machine on a host: a capacity answer, like a
+                    # refused spot launch. Spec "Elice machines", Start step 4.
+                    type_name = record.get("instance_type") or "its instance type"
+                    raise ProviderUnavailable(
+                        self.kind,
+                        f"Elice machine {machine} ({type_name}) is still queued after "
+                        f"{limit:.0f} s: the zone has no capacity to place it right now. "
+                        "Retry later, or choose another instance type",
+                    )
                 raise RuntimeFailure(
                     f"Elice machine {machine} is still {status} after {limit:.0f} s, not {wanted}"
                 )
