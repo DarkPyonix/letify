@@ -22,7 +22,6 @@ from __future__ import annotations
 
 import os
 import sys
-import threading
 import urllib.parse
 
 UNREACHABLE = 4
@@ -144,24 +143,15 @@ def main() -> int:
         stream.write(text)
         stream.flush()
 
-    closed = threading.Event()
-
-    def stdin_hook(_message: dict) -> None:
-        """Answer the cell's read with the next line letify wrote to this process."""
-        line = sys.stdin.readline()
-        if not line:
-            closed.set()
-            # An empty reply ends the cell's loop through EOFError on its next read.
-            client.input("")
-            return
-        client.input(line.rstrip("\n"))
-
     try:
+        # No stdin_hook: the client's own default reads this process's standard input with
+        # input(), turns EOFError into the kernel's EOF character, and sends the reply
+        # through the websocket client's `input` method. That method is not on the wrapper
+        # this module holds, so a hook written here could not answer a request at all.
         client.execute_interactive(
             SHIM % {"stub": STUB},
             allow_stdin=True,
             output_hook=output_hook,
-            stdin_hook=stdin_hook,
             timeout=None,
         )
     except Exception as exc:
@@ -173,7 +163,9 @@ def main() -> int:
         except Exception:
             pass
 
-    return 0 if closed.is_set() else CELL_ENDED
+    # The cell ends when letify closes this process's standard input, which the default
+    # hook turns into the EOF the shim's loop breaks on.
+    return 0
 
 
 if __name__ == "__main__":
