@@ -56,15 +56,6 @@ MODAL = Tool(
     pins=("modal>=1.0,<2",),
 )
 
-#: The official Kaggle CLI. Release 2.x reads an access token from ``KAGGLE_API_TOKEN`` and a
-#: legacy ``kaggle.json`` from ``KAGGLE_CONFIG_DIR``, and has the read-only ``quota`` command.
-KAGGLE = Tool(
-    package="kaggle",
-    executable="kaggle",
-    python="3.13",
-    pins=("kaggle>=2.2,<3",),
-)
-
 #: The environment the Kaggle adapter runs in. ``jupyter-kernel-client`` below 1.0 is the
 #: release whose ``KernelClient`` the Colab CLI also uses.
 KAGGLE_KERNEL = Tool(
@@ -76,9 +67,6 @@ KAGGLE_KERNEL = Tool(
 
 #: The Kaggle adapter file, run by path so it needs nothing of letify's own environment.
 KAGGLE_ADAPTER = Path(__file__).parent / "providers" / "kaggle_adapter.py"
-
-#: Variables that would make the Kaggle CLI act as someone other than the account's files say.
-KAGGLE_OVERRIDES = ("KAGGLE_API_TOKEN", "KAGGLE_USERNAME", "KAGGLE_KEY", "KAGGLE_CONFIG_DIR")
 
 #: The adapter file, run by path so it needs nothing of letify's own environment.
 MODAL_ADAPTER = Path(__file__).parent / "providers" / "modal_adapter.py"
@@ -185,34 +173,14 @@ def modal_environment(alias: str) -> dict[str, str]:
     return env
 
 
-def kaggle_environment(alias: str) -> dict[str, str]:
-    """The environment the Kaggle CLI runs in for one account.
-
-    ``HOME`` and ``KAGGLE_CONFIG_DIR`` are the account directory, so ``kaggle.json`` and the
-    CLI's fallback ``~/.kaggle/access_token`` are this account's. ``KAGGLE_API_TOKEN`` names
-    the ``access_token`` file by path when there is one, which keeps the token itself out of
-    the environment. Variables naming another account's credentials are removed.
-    """
-    env = {key: value for key, value in environment(alias).items() if key not in KAGGLE_OVERRIDES}
-    home = account_directory(alias)
-    env["KAGGLE_CONFIG_DIR"] = str(home)
-    token = home / "access_token"
-    if token.is_file():
-        env["KAGGLE_API_TOKEN"] = str(token)
-    return env
-
-
 __all__ = [
     "COLAB",
-    "KAGGLE",
-    "KAGGLE_OVERRIDES",
     "MODAL",
     "MODAL_ADAPTER",
     "Tool",
     "command",
     "environment",
     "find_uv",
-    "kaggle_environment",
     "missing_uv_message",
     "modal_adapter_command",
     "modal_config_path",
