@@ -1039,6 +1039,32 @@ def test_the_default_installer_is_the_official_standalone_script_over_https() ->
     assert bootstrap.UV_INSTALLER == "https://astral.sh/uv/install.sh"
 
 
+def test_a_runtime_with_neither_curl_nor_wget_fails_early_naming_them(tmp_path: Path) -> None:
+    """Spec "uv on the runtime": the installer needs curl or wget, so the worker checks first.
+
+    With uv, curl and wget all off PATH, the worker must refuse before running the installer
+    and say curl or wget is required, rather than let the installer fail with an obscure error.
+    """
+    home = tmp_path / "home"
+    home.mkdir()
+    empty = tmp_path / "empty-path"
+    empty.mkdir()
+    source = bootstrap.sync_source(
+        Env(), bootstrap.project_files(Env()), root=str(tmp_path / "proj")
+    )
+    script = tmp_path / "boot.py"
+    script.write_text(source, encoding="utf-8")
+    result = subprocess.run(
+        [sys.executable, str(script)],
+        env={"HOME": str(home), "PATH": str(empty)},
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert result.returncode != 0
+    assert "curl or wget" in result.stderr
+
+
 def test_a_runtime_without_uv_installs_it_under_home_and_then_syncs(
     uv_project: Path, tmp_path: Path
 ) -> None:
