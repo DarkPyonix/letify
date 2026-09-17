@@ -7,6 +7,7 @@ conftest.py and the test asserts on the command, the environment and the files w
 
 from __future__ import annotations
 
+import base64
 import json
 import sys
 import tomllib
@@ -46,194 +47,127 @@ def kaggle_cli(patch_which, patch_run):
 # -- Spec: Logging in, kaggle ------------------------------------------------------
 
 
-def test_an_access_token_is_kept_in_the_account_directory_and_checked_read_only(
-    isolated_home, kaggle_cli, capsys
+COOKIE_EXP = "2099-01-01T00:00:00Z"
+
+
+def make_client_token(exp_iso: str) -> str:
+    def part(obj: dict) -> str:
+        return base64.urlsafe_b64encode(json.dumps(obj).encode()).decode().rstrip("=")
+
+    header = part({"alg": "none", "typ": "JWT"})
+    return f"{header}.{part({'sub': 'irack000', 'exp': exp_iso})}."
+
+
+def make_cookie(exp_iso: str = COOKIE_EXP, drop: list[str] | None = None) -> str:
+    jar = {
+        "ka_sessionid": "sid",
+        "XSRF-TOKEN": "xtok",
+        "__Host-KAGGLEID": "kid",
+        "build-hash": "bh",
+        "CLIENT-TOKEN": make_client_token(exp_iso),
+    }
+    for name in drop or []:
+        jar.pop(name, None)
+    return "; ".join(f"{name}={value}" for name, value in jar.items())
+
+
+@pytest.fixture
+def accept_cookie(monkeypatch):
+    """Answer the online cookie check with a display name, and record the cookies checked."""
+    seen: list[str] = []
+
+    def fake(cookie: str) -> str:
+        seen.append(cookie)
+        return "\ubb38\ucc44\uc6b4 (IRACK)"
+
+    monkeypatch.setattr("letify.providers.kaggle.verify_cookie", fake)
+    return seen
+
+
+def test_a_cookie_is_kept_owner_only_and_never_in_the_config(
+    isolated_home, accept_cookie, capsys
 ) -> None:
-    recorder = kaggle_cli()
-    code = main(["login", "kaggle", "kaggle_a", "--token", ACCESS_TOKEN, "--no-input"])
-    assert code == 0
+    cookie = make_cookie()
+    assert main(["login", "kaggle", "kaggle_a", "--cookie", cookie, "--no-input"]) == 0
 
-    token = account("kaggle_a") / "access_token"
-    assert token.read_text(encoding="utf-8").strip() == ACCESS_TOKEN
+    stored = account("kaggle_a") / "cookie"
+    assert stored.read_text(encoding="utf-8").strip() == cookie
     if sys.platform != "win32":
-        assert token.stat().st_mode & 0o777 == 0o600
-
-    call = recorder.calls[-1]
-    assert call["command"][:3] == ["/usr/bin/uv", "tool", "run"]
-    assert "kaggle" in call["command"]
-    assert call["command"][-3:] == ["quota", "--format", "json"]
-    assert ACCESS_TOKEN not in " ".join(call["command"])
-    assert call["env"]["KAGGLE_API_TOKEN"] == str(token)
-    assert call["env"]["KAGGLE_CONFIG_DIR"] == str(account("kaggle_a"))
-    assert call["env"]["HOME"] == str(account("kaggle_a"))
-
+        assert stored.stat().st_mode & 0o777 == 0o600
     assert home_config()["kaggle_a"] == {"kind": "kaggle"}
     text = (Path.home() / ".letify" / "config.toml").read_text(encoding="utf-8")
-    assert ACCESS_TOKEN not in text
-    captured = capsys.readouterr()
-    assert ACCESS_TOKEN not in captured.out + captured.err
+    assert "CLIENT-TOKEN" not in text
+    out = capsys.readouterr()
+    assert "ka_sessionid" not in out.out + out.err
+    assert accept_cookie == [cookie]
 
 
-def test_a_legacy_kaggle_json_given_as_text_is_written_as_kaggle_json(
-    isolated_home, kaggle_cli
+def test_an_expired_cookie_is_refused_with_nothing_written(
+    isolated_home, accept_cookie, capsys
 ) -> None:
-    recorder = kaggle_cli()
-    code = main(["login", "kaggle", "kaggle_a", "--token", json.dumps(LEGACY), "--no-input"])
-    assert code == 0
-    written = account("kaggle_a") / "kaggle.json"
-    assert json.loads(written.read_text(encoding="utf-8")) == LEGACY
-    if sys.platform != "win32":
-        assert written.stat().st_mode & 0o777 == 0o600
-    assert not (account("kaggle_a") / "access_token").exists()
-    assert "KAGGLE_API_TOKEN" not in recorder.calls[-1]["env"]
+    expired = make_cookie("2000-01-01T00:00:00Z")
+    assert main(["login", "kaggle", "kaggle_a", "--cookie", expired, "--no-input"]) == 1
+    assert "expired" in capsys.readouterr().err
+    assert not (Path.home() / ".letify" / "config.toml").exists()
+    assert not (account("kaggle_a") / "cookie").exists()
+    assert accept_cookie == []  # an expired cookie is never sent to be checked
 
 
-def test_a_legacy_kaggle_json_given_as_a_path_is_read_from_that_file(
-    isolated_home, kaggle_cli, tmp_path
+def test_a_cookie_missing_a_required_name_is_refused(isolated_home, accept_cookie, capsys) -> None:
+    partial = make_cookie(drop=["ka_sessionid"])
+    assert main(["login", "kaggle", "kaggle_a", "--cookie", partial, "--no-input"]) == 1
+    assert "missing" in capsys.readouterr().err
+    assert not (account("kaggle_a") / "cookie").exists()
+
+
+def test_a_cookie_the_account_check_rejects_writes_nothing(
+    isolated_home, monkeypatch, capsys
 ) -> None:
-    kaggle_cli()
-    downloaded = tmp_path / "Downloads" / "kaggle.json"
-    downloaded.parent.mkdir()
-    downloaded.write_text(json.dumps(LEGACY), encoding="utf-8")
-    assert main(["login", "kaggle", "kaggle_a", "--token", str(downloaded), "--no-input"]) == 0
-    written = account("kaggle_a") / "kaggle.json"
-    assert json.loads(written.read_text(encoding="utf-8")) == LEGACY
+    def reject(cookie: str) -> str:
+        raise ValueError("the Kaggle cookie was refused; log in to kaggle.com for a fresh one")
 
-
-def test_a_kaggle_json_without_a_key_is_refused_with_nothing_written(
-    isolated_home, kaggle_cli, capsys
-) -> None:
-    recorder = kaggle_cli()
-    body = json.dumps({"username": "researcher"})
-    assert main(["login", "kaggle", "kaggle_a", "--token", body, "--no-input"]) == 1
-    assert "key" in capsys.readouterr().err
-    assert recorder.calls == []
+    monkeypatch.setattr("letify.providers.kaggle.verify_cookie", reject)
+    assert main(["login", "kaggle", "kaggle_a", "--cookie", make_cookie(), "--no-input"]) == 1
+    assert "refused" in capsys.readouterr().err
+    assert not (account("kaggle_a") / "cookie").exists()
     assert not (Path.home() / ".letify" / "config.toml").exists()
 
 
-def test_credentials_of_another_account_in_the_environment_are_not_passed_on(
-    isolated_home, kaggle_cli, monkeypatch
-) -> None:
-    monkeypatch.setenv("KAGGLE_USERNAME", "someone-else")
-    monkeypatch.setenv("KAGGLE_KEY", "their-key")
-    monkeypatch.setenv("KAGGLE_API_TOKEN", "their-token")
-    recorder = kaggle_cli()
-    assert main(["login", "kaggle", "kaggle_a", "--token", json.dumps(LEGACY), "--no-input"]) == 0
-    env = recorder.calls[-1]["env"]
-    assert "KAGGLE_USERNAME" not in env
-    assert "KAGGLE_KEY" not in env
-    assert "KAGGLE_API_TOKEN" not in env
-
-
-def test_a_token_the_kaggle_cli_rejects_writes_nothing_and_hides_the_token(
-    isolated_home, kaggle_cli, capsys
-) -> None:
-    kaggle_cli(FakeCompleted(returncode=1, stderr=f"401 Unauthorized for token {ACCESS_TOKEN}"))
-    assert main(["login", "kaggle", "kaggle_a", "--token", ACCESS_TOKEN, "--no-input"]) == 1
-    err = capsys.readouterr().err
-    assert "exited 1" in err
-    assert "401 Unauthorized" in err
-    assert ACCESS_TOKEN not in err
-    assert "***" in err
-    assert not (account("kaggle_a") / "access_token").exists()
-    assert not (Path.home() / ".letify" / "config.toml").exists()
-
-
-def test_no_input_without_a_token_refuses(isolated_home, kaggle_cli, capsys) -> None:
-    recorder = kaggle_cli()
+def test_no_input_without_a_cookie_refuses(isolated_home, accept_cookie, capsys) -> None:
     assert main(["login", "kaggle", "kaggle_a", "--no-input"]) == 1
-    assert "--token" in capsys.readouterr().err
-    assert recorder.calls == []
+    assert "--cookie" in capsys.readouterr().err
 
 
-def test_with_a_terminal_the_token_is_asked_for_with_hidden_input(
-    isolated_home, kaggle_cli, monkeypatch
+def test_with_a_terminal_the_cookie_is_asked_for_hidden(
+    isolated_home, accept_cookie, monkeypatch
 ) -> None:
-    kaggle_cli()
+    cookie = make_cookie()
     prompts: list[str] = []
 
     def hidden(prompt: str) -> str:
         prompts.append(prompt)
-        return ACCESS_TOKEN
+        return cookie
 
     monkeypatch.setattr(login, "read_password", hidden)
     monkeypatch.setattr(login, "read_line", lambda prompt: pytest.fail("asked in the clear"))
     assert main(["login", "kaggle", "kaggle_a"]) == 0
-    assert prompts == ["Kaggle API token, or the path to kaggle.json: "]
-    assert (account("kaggle_a") / "access_token").is_file()
+    assert prompts == [login.KAGGLE_COOKIE_PROMPT]
+    assert (account("kaggle_a") / "cookie").is_file()
 
 
-def test_logging_in_to_kaggle_without_uv_says_how_to_get_it(
-    isolated_home, patch_which, capsys
-) -> None:
-    from letify import tools
-
-    patch_which(tools, present=False)
-    assert main(["login", "kaggle", "kaggle_a", "--token", ACCESS_TOKEN, "--no-input"]) == 1
-    assert "uv was not found" in capsys.readouterr().err
+def test_a_cookie_can_be_read_from_a_file(isolated_home, accept_cookie, tmp_path) -> None:
+    cookie = make_cookie()
+    path = tmp_path / "kaggle_cookie.txt"
+    path.write_text(cookie, encoding="utf-8")
+    assert main(["login", "kaggle", "kaggle_a", "--cookie", str(path), "--no-input"]) == 0
+    assert (account("kaggle_a") / "cookie").read_text(encoding="utf-8").strip() == cookie
 
 
-def test_the_session_url_is_kept_owner_only_and_never_in_the_config(
-    fake_kaggle, kaggle_cli, capsys
-) -> None:
-    # The URL has to name a live session now, because a --connect login reads its GPUs.
-    kaggle_cli()
-    url = fake_kaggle.url
-    code = main(
-        ["login", "kaggle", "kaggle_b", "--token", ACCESS_TOKEN, "--connect", url, "--no-input"]
-    )
-    assert code == 0
-    stored = account("kaggle_b") / "jupyter_url"
-    assert stored.read_text(encoding="utf-8").strip() == url
-    if sys.platform != "win32":
-        assert stored.stat().st_mode & 0o777 == 0o600
-    assert fake_kaggle.token not in (Path.home() / ".letify" / "config.toml").read_text(
-        encoding="utf-8"
-    )
-    captured = capsys.readouterr()
-    assert fake_kaggle.token not in captured.out + captured.err
-
-
-def test_a_session_url_that_is_not_http_is_refused(isolated_home, kaggle_cli, capsys) -> None:
-    kaggle_cli()
-    code = main(
-        ["login", "kaggle", "kaggle_a", "--token", ACCESS_TOKEN, "--connect", "kkb", "--no-input"]
-    )
-    assert code == 1
-    assert "http" in capsys.readouterr().err
-    assert not (Path.home() / ".letify" / "config.toml").exists()
-
-
-def test_a_new_session_url_on_a_declared_account_replaces_only_the_url(
-    fake_kaggle, kaggle_cli
-) -> None:
-    recorder = kaggle_cli()
-    assert main(["login", "kaggle", "kaggle_b", "--token", ACCESS_TOKEN, "--no-input"]) == 0
-    calls = len(recorder.calls)
-    url = fake_kaggle.url
-    assert main(["login", "kaggle", "kaggle_b", "--connect", url, "--no-input"]) == 0
-    assert (account("kaggle_b") / "jupyter_url").read_text(encoding="utf-8").strip() == url
-    assert (account("kaggle_b") / "access_token").read_text(encoding="utf-8") == ACCESS_TOKEN
-    assert len(recorder.calls) == calls
-
-
-def test_a_kaggle_login_records_the_workspace_without_a_remote_check(
-    isolated_home, kaggle_cli
-) -> None:
-    kaggle_cli()
-    code = main(
-        [
-            "login",
-            "kaggle",
-            "kaggle_a",
-            "--token",
-            ACCESS_TOKEN,
-            "--workspace",
-            "/kaggle/working/letify",
-            "--no-input",
-        ]
-    )
-    assert code == 0
+def test_a_kaggle_login_records_the_workspace(isolated_home, accept_cookie) -> None:
+    assert main(
+        ["login", "kaggle", "kaggle_a", "--cookie", make_cookie(),
+         "--workspace", "/kaggle/working/letify", "--no-input"]
+    ) == 0
     assert home_config()["kaggle_a"]["workspace"] == "/kaggle/working/letify"
 
 
@@ -595,88 +529,6 @@ def test_stopping_deletes_the_kernel_and_leaves_the_session_running(fake_kaggle)
     assert fake_kaggle.kernels == set()
     assert len(fake_kaggle.made("DELETE", "/api/kernels/")) == 1
     assert fake_kaggle.made("GET", "/api/status")
-
-
-# -- Spec: Recording devices at login for Kaggle -----------------------------------
-
-
-def fake_smi(tmp_path, monkeypatch, output: str | None) -> None:
-    """Put a fake nvidia-smi, or none, on the PATH the session programs see."""
-    folder = tmp_path / "session-bin"
-    folder.mkdir()
-    if output is not None:
-        tool = folder / "nvidia-smi"
-        tool.write_text(f"#!/bin/sh\nprintf '{output}'\n", encoding="utf-8")
-        tool.chmod(0o755)
-    monkeypatch.setenv("PATH", str(folder))
-
-
-@pytest.mark.skipif(sys.platform == "win32", reason="the fake nvidia-smi is a shell script")
-def test_a_connect_login_records_a_count_per_accelerator(
-    fake_kaggle, kaggle_cli, tmp_path, monkeypatch
-) -> None:
-    kaggle_cli()
-    fake_smi(tmp_path, monkeypatch, "0, Tesla T4, 15360 MiB\\n1, Tesla T4, 15360 MiB\\n")
-    code = main(
-        [
-            "login",
-            "kaggle",
-            "kaggle_b",
-            "--token",
-            ACCESS_TOKEN,
-            "--connect",
-            fake_kaggle.url,
-            "--no-input",
-        ]
-    )
-    assert code == 0
-    assert home_config()["kaggle_b"]["devices"] == {"T4": {"count": 2}}
-    assert fake_kaggle.kernels == set()
-
-
-def test_a_connect_login_to_a_cpu_session_writes_no_devices_table(
-    fake_kaggle, kaggle_cli, tmp_path, monkeypatch, capsys
-) -> None:
-    kaggle_cli()
-    fake_smi(tmp_path, monkeypatch, None)
-    code = main(
-        [
-            "login",
-            "kaggle",
-            "kaggle_b",
-            "--token",
-            ACCESS_TOKEN,
-            "--connect",
-            fake_kaggle.url,
-            "--no-input",
-        ]
-    )
-    assert code == 0
-    assert "devices" not in home_config()["kaggle_b"]
-    assert "nvidia-smi" in capsys.readouterr().out
-
-
-def test_a_connect_login_to_an_ended_session_writes_nothing(
-    fake_kaggle, kaggle_cli, capsys
-) -> None:
-    kaggle_cli()
-    fake_kaggle.end_session()
-    code = main(
-        [
-            "login",
-            "kaggle",
-            "kaggle_b",
-            "--token",
-            ACCESS_TOKEN,
-            "--connect",
-            fake_kaggle.url,
-            "--no-input",
-        ]
-    )
-    assert code == 1
-    assert "letify login kaggle kaggle_b --connect" in capsys.readouterr().err
-    assert not (account("kaggle_b") / "access_token").exists()
-    assert not (account("kaggle_b") / "jupyter_url").exists()
 
 
 def test_kaggle_never_opts_out_of_preparing_the_runtime(fake_kaggle) -> None:

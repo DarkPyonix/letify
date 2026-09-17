@@ -810,63 +810,60 @@ def redact(text: str, secrets_in_text: list[str]) -> str:
     return text
 
 
-def kaggle_account(answers: Answers) -> dict[str, Any]:
-    """Keep the Kaggle API token in the account directory and prove it with a read-only call.
+#: The cookie file and the prompt for it. The cookie is the whole Kaggle credential.
+KAGGLE_COOKIE = "cookie"
+KAGGLE_COOKIE_PROMPT = "Kaggle cookie (from a logged-in kaggle.com tab): "
 
-    The token file is written before the check, because the Kaggle CLI reads it from there.
-    A check that fails removes what this attempt wrote, so nothing is left behind.
-    """
-    from .. import tools
 
-    uv = tools.find_uv()
-    if uv is None:
-        raise LoginError(tools.missing_uv_message())
-    connect = answers.get("connect")
-    url = None
-    if isinstance(connect, str) and connect:
-        url = valid_session_url(answers.alias, connect)
-    given = answers.token or (read_password(KAGGLE_TOKEN_PROMPT) if answers.interactive else None)
-    if not given:
+def read_kaggle_cookie(answers: Answers, given: str | None) -> str:
+    """Return the cookie string, from the value given, a file it names, or a prompt."""
+    text = (given or "").strip()
+    if not text and answers.interactive:
+        text = read_password(KAGGLE_COOKIE_PROMPT).strip()
+    if not text:
         raise LoginError(
-            f"{answers.alias} needs a Kaggle API token from kaggle.com Settings, API. "
-            f"Pass --token or drop --no-input."
+            f"{answers.alias} needs the Kaggle cookie of a logged-in kaggle.com tab. "
+            f"Copy it from the browser, then pass --cookie or drop --no-input."
         )
-    name, content, hidden = read_kaggle_token(answers.alias, given)
+    candidate = Path(text).expanduser()
+    if len(text) < 4096 and "=" not in text and candidate.is_file():
+        try:
+            text = candidate.read_text(encoding="utf-8").strip()
+        except OSError as exc:
+            raise LoginError(f"{answers.alias}: {candidate} could not be read: {exc}") from None
+    return text
+
+
+def kaggle_account(answers: Answers) -> dict[str, Any]:
+    """Store the browser session cookie and prove it names a live login.
+
+    The cookie is the whole account: only the web session principal can mint the Jupyter
+    proxy token, so an API key is useless here. The cookie is checked for shape and expiry
+    before any network call, then proven with a read of the account. Nothing is written
+    until the check passes.
+    """
+    from ..providers import kaggle as kg
+
+    given = answers.get(KAGGLE_COOKIE) or answers.token
+    cookie = read_kaggle_cookie(answers, given if isinstance(given, str) else None)
+    try:
+        kg.require_cookie_shape(cookie)
+        expiry = kg.cookie_expiry(cookie)
+    except ValueError as exc:
+        raise LoginError(f"{answers.alias}: {exc}") from None
+    if kg.cookie_days_left(cookie) <= 0:
+        raise LoginError(
+            f"{answers.alias}: that Kaggle cookie expired on {expiry:%Y-%m-%d}; log in to "
+            f"kaggle.com again and copy a fresh cookie"
+        )
+    try:
+        kg.verify_cookie(cookie)
+    except ValueError as exc:
+        raise LoginError(f"{answers.alias}: {exc}") from None
+
     options: dict[str, Any] = {"kind": answers.kind}
     record_workspace(answers, options)
-
-    directory = secrets.account_directory(answers.alias)
-    written = [name] if not (directory / name).exists() else []
-    store_secret(answers.alias, name, content)
-    try:
-        result = subprocess.run(
-            [*tools.command(tools.KAGGLE, uv), *KAGGLE_CHECK],
-            capture_output=True,
-            text=True,
-            timeout=120,
-            env=tools.kaggle_environment(answers.alias),
-        )
-    except (OSError, subprocess.SubprocessError) as exc:
-        forget_files(answers.alias, written)
-        raise LoginError(
-            f"the Kaggle CLI could not be run, so nothing was written: {redact(str(exc), hidden)}"
-        ) from None
-    if result.returncode != 0:
-        forget_files(answers.alias, written)
-        detail = redact((result.stderr or result.stdout or "").strip()[-2000:], hidden)
-        raise LoginError(
-            f"the Kaggle token check exited {result.returncode}, so nothing was written: {detail}"
-        )
-    if url is not None:
-        try:
-            devices = kaggle_devices(answers.alias, url)
-        except LetifyError:
-            forget_files(answers.alias, written)
-            raise
-        store_secret(answers.alias, KAGGLE_SESSION_URL, url)
-        if devices:
-            # Written by log_in as its own [<alias>.devices] table.
-            options["devices"] = devices
+    store_secret(answers.alias, KAGGLE_COOKIE, cookie)
     return options
 
 

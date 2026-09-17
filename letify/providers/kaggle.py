@@ -182,6 +182,45 @@ def cookie_days_left(cookie: str, now: datetime | None = None) -> float:
     return (cookie_expiry(cookie) - moment).total_seconds() / 86400.0
 
 
+#: The internal Kaggle service surface the web app uses, authenticated by the session cookie.
+KAGGLE_INTERNAL = "https://www.kaggle.com/api/i/"
+
+
+def cookie_headers(cookie: str) -> dict[str, str]:
+    """Headers that authenticate an internal Kaggle call as the cookie's session."""
+    jar = require_cookie_shape(cookie)
+    return {
+        "Content-Type": "application/json",
+        "cookie": cookie,
+        "x-xsrf-token": jar["XSRF-TOKEN"],
+        "x-kaggle-build-version": jar.get("build-hash", "1"),
+    }
+
+
+def verify_cookie(cookie: str) -> str:
+    """Prove the cookie is a live login by reading the account, and return its display name.
+
+    ``users.UsersService/GetCurrentUser`` answers with the account only for a real web
+    session; an anonymous or stale cookie comes back empty. Raises ``ValueError`` when the
+    call fails or the cookie is not accepted, so the caller can refuse the login.
+    """
+    request = urllib.request.Request(
+        KAGGLE_INTERNAL + "users.UsersService/GetCurrentUser",
+        data=b"{}", method="POST", headers=cookie_headers(cookie),
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=REST_TIMEOUT) as response:
+            body = json.loads(response.read())
+    except (urllib.error.URLError, OSError, ValueError) as exc:
+        raise ValueError(f"the Kaggle cookie could not be checked: {type(exc).__name__}") from None
+    name = body.get("displayName") or (body.get("user") or {}).get("displayName")
+    if not name:
+        raise ValueError(
+            "the Kaggle cookie was refused; log in to kaggle.com and copy a fresh cookie"
+        )
+    return str(name)
+
+
 def adapter_command() -> list[str]:
     """The argument list that starts the Kaggle adapter through uv."""
     uv = tools.find_uv()

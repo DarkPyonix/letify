@@ -101,9 +101,14 @@ def build_parser() -> argparse.ArgumentParser:
     log_in.add_argument(
         "--connect",
         metavar="TOKEN",
+        help="the token 'letify client shell connect' printed, for tunnel",
+    )
+    log_in.add_argument(
+        "--cookie",
+        metavar="COOKIE",
         help=(
-            "the token 'letify client shell connect' printed, for tunnel; the Colab Compatible "
-            "URL of a running Kaggle Jupyter Server session, for kaggle"
+            "the browser cookie of a logged-in kaggle.com tab, or a file holding it, for "
+            "kaggle; this is the whole Kaggle credential"
         ),
     )
     log_in.add_argument(
@@ -445,6 +450,7 @@ def _dispatch(args: argparse.Namespace) -> int:
                 "workspace": args.workspace,
                 "profile": args.profile,
                 "connect": args.connect,
+                "cookie": args.cookie,
                 "indices": args.indices,
                 "detect_devices": args.detect_devices,
             },
