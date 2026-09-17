@@ -321,7 +321,8 @@ def _data_collect(data, placed):
             if not stat.S_ISREG(info.st_mode):
                 continue
             known = placed.get(full)
-            if known is not None and known[1:] == (info.st_ino, info.st_size, info.st_mtime_ns):
+            # The placed record ends with the cache stamp, which is not part of the comparison.
+            if known is not None and known[1:4] == (info.st_ino, info.st_size, info.st_mtime_ns):
                 continue
             digest = _data_hash_file(full)
             if known is not None and known[0] == digest:
