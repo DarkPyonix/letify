@@ -2,7 +2,7 @@
   "name": "letify-status",
   "displayName": "letify Status",
   "description": "letify quota and GPU activity in the status bar, read from the letify CLI.",
-  "version": "1.1.0",
+  "version": "1.1.1",
   "publisher": "letify",
   "license": "SEE LICENSE IN LICENSE",
   "repository": {
