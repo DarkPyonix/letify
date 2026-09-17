@@ -677,12 +677,14 @@ def _data_register(data):
         _DATA_CALLS[state["dir"]] = state
         for path in list(state["pending"]):
             _data_place(state, path)
-    if state["pending"]:
-        # Only a call still waiting for bytes needs the patch, the manifest on disk and the
-        # wrappers. A call whose files are all placed reads the real file system.
-        _data_install_patch()
-        _data_write_manifest(state)
-        _data_observe(state)
+        if state["pending"]:
+            # Only a call still waiting for bytes needs the patch, the manifest on disk and
+            # the wrappers. A call whose files are all placed reads the real file system.
+            # Inside the lock: the data thread moves a path out of pending and into placed
+            # as each blob completes, and the manifest is written from both maps.
+            _data_install_patch()
+            _data_write_manifest(state)
+            _data_observe(state)
     return state
 
 
@@ -1028,10 +1030,12 @@ def _data_write_manifest(state):
     no channel of its own to ask on.
     """
     import json
+    # Copies of both maps, so neither the data thread placing a file nor a future caller
+    # that forgets the lock can change one while it is being read.
     entries = {}
-    for path, (_digest, size) in state["pending"].items():
+    for path, (_digest, size) in list(state["pending"].items()):
         entries[path] = size
-    for path in state["placed"]:
+    for path in list(state["placed"]):
         entries.setdefault(path, os.path.getsize(path) if os.path.isfile(path) else 0)
     try:
         with open(os.path.join(state["dir"], ".letify-pending.json"), "w") as handle:
