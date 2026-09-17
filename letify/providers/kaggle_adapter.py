@@ -12,10 +12,11 @@ worker reads as its standard input. The worker already writes its frames as base
 because the channel sets ``text_frames``, so the shim passes those out unchanged.
 
 Input: ``LETIFY_JUPYTER_URL`` and ``LETIFY_KERNEL_ID``. The URL is read from the environment so
-it never appears in a process list.
+it never appears in a process list. The URL is the routed proxy URL, whose token rides in the
+path, because the proxy rejects a token sent only as a header.
 
-Exit 4 when the server or kernel could not be reached, 5 when the cell ended by itself, and 0
-when letify closed the bridge's standard input.
+Exit 4 when the server or kernel could not be reached, and 0 when letify closed the bridge's
+standard input.
 """
 
 from __future__ import annotations
@@ -26,11 +27,6 @@ import threading
 import urllib.parse
 
 UNREACHABLE = 4
-CELL_ENDED = 5
-RAISED = 3
-
-#: Seconds one program may run when the caller names none.
-DEFAULT_PROGRAM_TIMEOUT = 3600.0
 
 #: The stub the shim starts the worker with, the one Channels describes: a byte count line,
 #: then that many bytes of source.
@@ -82,37 +78,9 @@ _worker.wait()
 """
 
 
-def one_program(client, source: str, timeout: float) -> int:
-    """Run one program in the kernel and exit, which is what a login needs.
-
-    Recording the session's devices happens before any runtime exists, so there is no
-    channel to carry frames and no worker to keep alive. Selected by
-    ``LETIFY_ADAPTER_MODE=program``, never by the presence of another variable: a duration
-    that also decides which mode runs is two meanings in one name, which is how a provider
-    once came to skip a check it should have run.
-    """
-    try:
-        reply = client.execute(source, timeout=timeout)
-    except Exception as exc:
-        print(f"the execution did not finish: {type(exc).__name__}: {exc}", file=sys.stderr)
-        return UNREACHABLE
-
-    for output in reply.get("outputs") or []:
-        kind = output.get("output_type")
-        if kind == "stream":
-            stream = sys.stdout if output.get("name") == "stdout" else sys.stderr
-            stream.write(output.get("text") or "")
-        elif kind == "error":
-            sys.stderr.write("\n".join(output.get("traceback") or []) + "\n")
-    sys.stdout.flush()
-    return 0 if reply.get("status") == "ok" else RAISED
-
-
 def main() -> int:
     url = os.environ["LETIFY_JUPYTER_URL"]
     kernel = os.environ["LETIFY_KERNEL_ID"]
-    mode = os.environ.get("LETIFY_ADAPTER_MODE", "bridge")
-    timeout = float(os.environ.get("LETIFY_TIMEOUT") or DEFAULT_PROGRAM_TIMEOUT)
     parts = urllib.parse.urlsplit(url)
     base = urllib.parse.urlunsplit((parts.scheme, parts.netloc, parts.path.rstrip("/"), "", ""))
     token = dict(urllib.parse.parse_qsl(parts.query)).get("token", "")
@@ -125,15 +93,6 @@ def main() -> int:
     except Exception as exc:  # any failure to attach means the session cannot be used
         print(f"the kernel could not be reached: {type(exc).__name__}", file=sys.stderr)
         return UNREACHABLE
-
-    if mode == "program":
-        try:
-            return one_program(client, sys.stdin.read(), timeout)
-        finally:
-            try:
-                client.stop(shutdown_kernel=False)
-            except Exception:
-                pass
 
     return bridge(client)
 

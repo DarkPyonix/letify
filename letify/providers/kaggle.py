@@ -1,10 +1,17 @@
-"""Kaggle, one Kaggle account reached through the official Kaggle CLI run by uv.
+"""Kaggle, one Kaggle account reached through the browser session cookie.
 
-This module owns the account's accelerator list, its remaining weekly quota read from
-``kaggle quota --format json`` and the channel to a registered Kaggle Jupyter Server
-session. It does not own the login, which is in ``letify.config.login``, or the kernel
-execution itself, which is in ``kaggle_adapter.py``. It opens no tunnel or port forward of
-any kind, and it sends no keep-alive request.
+This module owns the cookie the account is declared with, the token chain that turns the
+cookie into a live Jupyter proxy URL, the weekly accelerator quota read from the internal
+API, and the channel to a worker kept alive in one kernel cell of the session letify starts.
+It does not own the login, which is in ``letify.config.login``, or the kernel execution
+itself, which is in ``kaggle_adapter.py``. It opens no tunnel or port forward of any kind,
+and it sends no keep-alive request.
+
+The cookie is the whole credential. Only the web session principal can mint the Jupyter
+proxy token: the internal endpoints treat an API key as anonymous and answer empty. So there
+is no API token, no ``kaggle.json`` and no session URL registered by hand. letify starts an
+interactive session on a notebook it owns, reads the routed proxy URL through Firebase and
+Firestore, and opens the channel over it.
 """
 
 from __future__ import annotations
@@ -12,9 +19,8 @@ from __future__ import annotations
 import base64
 import binascii
 import json
-import os
 import re
-import subprocess
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -24,7 +30,7 @@ from typing import TYPE_CHECKING, Any
 
 from .. import tools
 from ..config import ProviderConfig
-from ..config.secrets import account_directory
+from ..config.secrets import account_directory, write_secret
 from ..declare.instance import Host, Instance
 from ..errors import (
     ConfigError,
@@ -39,62 +45,69 @@ from ..runtime.channel import Connection, FramedChannel
 from .base import Provider
 from .usage import Usage
 
-#: Seconds one REST request to the session may take.
+#: Seconds one REST request to Kaggle or to the proxy may take.
 REST_TIMEOUT = 30
 
-#: A program's timeout when the caller gives none, and the adapter's extra allowance on top.
-DEFAULT_PROGRAM_TIMEOUT = 3600.0
-ADAPTER_GRACE = 60.0
+#: Seconds to wait for a freshly started session to publish its Jupyter proxy URL.
+SESSION_START_TIMEOUT = 300.0
 
 if TYPE_CHECKING:
     from ..runtime.channel import Channel
     from ..runtime.session import Runtime
 
-#: Accelerators a Kaggle session can be started with, and the memory of one card.
-GPUS = {"P100": {"vram_gb": 16}, "T4": {"vram_gb": 16}}
+#: Accelerators a Kaggle session can be started with, the memory of one card, and the name
+#: the internal API knows the card by. Both are ones the web app offers, so a session can be
+#: started on either. CPU is the empty compute, so it carries no accelerator name.
+GPUS = {
+    "P100": {"vram_gb": 16, "accelerator": "NVIDIA_TESLA_P100"},
+    "T4": {"vram_gb": 16, "accelerator": "NVIDIA_TESLA_T4"},
+}
 TPUS = ("TPU_V3_8",)
 
-#: The read-only call that answers the weekly quota.
-QUOTA = ("quota", "--format", "json")
+#: The internal Kaggle service surface the web app uses, authenticated by the session cookie.
+KAGGLE_INTERNAL = "https://www.kaggle.com/api/i/"
+KERNELS_SERVICE = "kernels.KernelsService/"
+USERS_SERVICE = "users.UsersService/"
 
+#: The host that routes to a session's Jupyter server, and the language id for Python.
+JUPYTER_PROXY_HOST = "https://kkb-production.jupyter-proxy.kaggle.net"
+PYTHON_LANGUAGE_ID = 8
 
-def hours(value: Any) -> float | None:
-    """Read a figure such as ``3.25h`` as hours."""
-    text = str(value or "").strip().removesuffix("h").strip()
-    try:
-        return float(text)
-    except ValueError:
-        return None
+#: The Firebase exchange and the Firestore document that carries the proxy URL.
+IDENTITY_TOOLKIT = "https://identitytoolkit.googleapis.com/v1/accounts:signInWithCustomToken"
+FIRESTORE_BASE = "https://firestore.googleapis.com/v1/"
+FIRESTORE_DOCUMENT = (
+    "projects/kkb-production/databases/(default)/documents/sessions/{sid}/data/JupyterURL"
+)
 
-
-def parse_quota(output: str) -> dict[str, dict[str, Any]]:
-    """The quota rows keyed by resource, from output that may carry warnings before the JSON."""
-    start = output.find("[")
-    if start < 0:
-        return {}
-    try:
-        rows = json.loads(output[start:])
-    except ValueError:
-        return {}
-    if not isinstance(rows, list):
-        return {}
-    return {
-        str(row.get("resource")).upper(): row
-        for row in rows
-        if isinstance(row, dict) and row.get("resource")
+#: The title letify gives the notebook it owns, and the trivial body that makes a session
+#: runnable. A freshly created empty notebook cancels its own session because it has nothing
+#: to run, so the session is started with one committed cell.
+NOTEBOOK_TITLE = "letify runtime"
+NOTEBOOK_BODY = json.dumps(
+    {
+        "cells": [
+            {
+                "cell_type": "code",
+                "source": "pass\n",
+                "metadata": {},
+                "outputs": [],
+                "execution_count": None,
+            }
+        ],
+        "metadata": {
+            "kernelspec": {"name": "python3", "display_name": "Python 3", "language": "python"},
+            "language_info": {"name": "python"},
+        },
+        "nbformat": 4,
+        "nbformat_minor": 5,
     }
+)
 
 
-class KaggleSessionEnded(RuntimeLost):
-    """The registered Kaggle Jupyter Server session no longer answers."""
-
-
-def session_url(alias: str) -> str | None:
-    """The Colab Compatible URL registered with ``--connect``, or None."""
-    path = account_directory(alias) / "jupyter_url"
-    if not path.is_file():
-        return None
-    return path.read_text(encoding="utf-8").strip() or None
+def urlopen(request: urllib.request.Request, timeout: float = REST_TIMEOUT) -> Any:
+    """Open one request. One seam, so a test can stand in for every live Kaggle service."""
+    return urllib.request.urlopen(request, timeout=timeout)
 
 
 def read_cookie(alias: str) -> str | None:
@@ -106,7 +119,11 @@ def read_cookie(alias: str) -> str | None:
 
 
 def split_url(url: str) -> tuple[str, str | None]:
-    """The server base, which is the URL without its query, and the ``token`` parameter."""
+    """The server base, which is the URL without its query, and the ``token`` parameter.
+
+    A routed proxy URL carries the token in its path, not a query, so the token is None and
+    the base is the whole URL. A loopback test URL may still carry ``?token=``.
+    """
     parts = urllib.parse.urlsplit(url)
     base = urllib.parse.urlunsplit((parts.scheme, parts.netloc, parts.path.rstrip("/"), "", ""))
     token = dict(urllib.parse.parse_qsl(parts.query)).get("token")
@@ -190,10 +207,6 @@ def cookie_days_left(cookie: str, now: datetime | None = None) -> float:
     return (cookie_expiry(cookie) - moment).total_seconds() / 86400.0
 
 
-#: The internal Kaggle service surface the web app uses, authenticated by the session cookie.
-KAGGLE_INTERNAL = "https://www.kaggle.com/api/i/"
-
-
 def cookie_headers(cookie: str) -> dict[str, str]:
     """Headers that authenticate an internal Kaggle call as the cookie's session."""
     jar = require_cookie_shape(cookie)
@@ -213,11 +226,11 @@ def verify_cookie(cookie: str) -> str:
     call fails or the cookie is not accepted, so the caller can refuse the login.
     """
     request = urllib.request.Request(
-        KAGGLE_INTERNAL + "users.UsersService/GetCurrentUser",
+        KAGGLE_INTERNAL + USERS_SERVICE + "GetCurrentUser",
         data=b"{}", method="POST", headers=cookie_headers(cookie),
     )
     try:
-        with urllib.request.urlopen(request, timeout=REST_TIMEOUT) as response:
+        with urlopen(request) as response:
             body = json.loads(response.read())
     except (urllib.error.URLError, OSError, ValueError) as exc:
         raise ValueError(f"the Kaggle cookie could not be checked: {type(exc).__name__}") from None
@@ -227,6 +240,231 @@ def verify_cookie(cookie: str) -> str:
             "the Kaggle cookie was refused; log in to kaggle.com and copy a fresh cookie"
         )
     return str(name)
+
+
+def require_live_cookie(alias: str) -> str:
+    """The cookie for a run, or a ``ConfigError`` telling the user to log in again.
+
+    Spec "Kaggle account": a run whose cookie is missing or past its ``exp`` cannot mint the
+    proxy token, so it is refused here rather than failing deeper. The message names the one
+    fact letify has, the expiry, and never states the session ended for another reason.
+    """
+    cookie = read_cookie(alias)
+    if cookie is None:
+        raise ConfigError(
+            f"{alias} has no Kaggle cookie. Log in to kaggle.com, copy the cookie of that "
+            f"tab, and run: letify login kaggle {alias}"
+        )
+    try:
+        require_cookie_shape(cookie)
+        left = cookie_days_left(cookie)
+    except ValueError as exc:
+        raise ConfigError(f"{alias}: {exc}") from None
+    if left <= 0:
+        raise ConfigError(
+            f"{alias}: the Kaggle cookie has expired. Log in to kaggle.com again and run: "
+            f"letify login kaggle {alias}"
+        )
+    return cookie
+
+
+class KaggleSessionEnded(RuntimeLost):
+    """The Kaggle Jupyter Server session no longer answers."""
+
+
+def _call(cookie: str, path: str, body: dict[str, Any]) -> dict[str, Any]:
+    """One internal Kaggle call as the cookie's session, returning the decoded reply."""
+    request = urllib.request.Request(
+        KAGGLE_INTERNAL + path, data=json.dumps(body).encode(), method="POST",
+        headers=cookie_headers(cookie),
+    )
+    try:
+        with urlopen(request) as response:
+            reply = json.loads(response.read())
+    except (urllib.error.URLError, OSError, ValueError) as exc:
+        raise RuntimeFailure(f"Kaggle {path} failed: {type(exc).__name__}") from None
+    if not isinstance(reply, dict):
+        raise RuntimeFailure(f"Kaggle {path} returned an unexpected reply")
+    return reply
+
+
+def _post(url: str, body: dict[str, Any], headers: dict[str, str]) -> dict[str, Any]:
+    request = urllib.request.Request(
+        url, data=json.dumps(body).encode(), method="POST",
+        headers={**headers, "Content-Type": "application/json"},
+    )
+    with urlopen(request) as response:
+        return json.loads(response.read())
+
+
+def notebook_id(alias: str, cookie: str) -> int:
+    """The id of the notebook letify owns for this account, creating it once and reusing it.
+
+    letify runs on a notebook it controls, not one the user picks, so it can commit the body
+    a session needs to start. The id is kept in the account directory so the same notebook is
+    reused rather than a new one created for every run.
+    """
+    path = account_directory(alias) / "notebook_id"
+    if path.is_file():
+        try:
+            return int(path.read_text(encoding="utf-8").strip())
+        except ValueError:
+            pass
+    reply = _call(
+        cookie,
+        KERNELS_SERVICE + "CreateKernelWithSettings",
+        {
+            "title": NOTEBOOK_TITLE,
+            "kernelLanguageId": PYTHON_LANGUAGE_ID,
+            "isPrivate": True,
+            "sourceType": "EDITOR_TYPE_NOTEBOOK",
+        },
+    )
+    kernel = reply.get("id")
+    if kernel is None:
+        raise RuntimeFailure(f"{alias}: Kaggle did not return a notebook id")
+    write_secret(alias, "notebook_id", str(int(kernel)))
+    return int(kernel)
+
+
+def start_run(cookie: str, kernel_id: int, accelerator: str | None) -> int:
+    """Start an interactive session on the notebook and return its run id.
+
+    ``CommitAndRun`` is what the editor's Run does: it commits the notebook body and starts
+    the session in one call. ``CreateKernelSession`` on an empty notebook wedges it, so this
+    is the call that reliably starts a session letify controls. Empty compute is a CPU
+    session; an accelerator name asks for that card.
+    """
+    session = _call(cookie, KERNELS_SERVICE + "GetOrCreateKernelSession", {"kernelId": kernel_id})
+    sequence = (session.get("draft") or {}).get("sequence")
+    compute: dict[str, Any] = {"internet": {"isEnabled": False}}
+    if accelerator:
+        compute["accelerator"] = accelerator
+    reply = _call(
+        cookie,
+        KERNELS_SERVICE + "CommitAndRun",
+        {
+            "dataSources": [],
+            "isLanguageTemplate": False,
+            "newText": NOTEBOOK_BODY,
+            "newTitle": NOTEBOOK_TITLE,
+            "scriptId": kernel_id,
+            "scriptLanguageName": "LANGUAGE_PYTHON",
+            "editorType": "EDITOR_TYPE_NOTEBOOK",
+            "sequence": sequence,
+            "compute": compute,
+            "versionName": "letify",
+            "versionType": "INTERACTIVE",
+            "isImport": True,
+        },
+    )
+    run = reply.get("kernelRunId")
+    if run is None:
+        raise RuntimeFailure("Kaggle did not start a session run")
+    return int(run)
+
+
+def firebase_id_token(cookie: str) -> str:
+    """Exchange the session's Firebase custom token for an id token that reads Firestore.
+
+    The custom token is minted only for a live web principal, so an empty one means the
+    cookie is not that. That is reported as a config error, because a fresh login is the fix.
+    """
+    config = _call(cookie, KERNELS_SERVICE + "GetFirebaseConfig", {})
+    api_key = config.get("apiKey")
+    auth = _call(cookie, KERNELS_SERVICE + "GetFirebaseAuthToken", {})
+    custom = auth.get("authToken")
+    if not api_key or not custom:
+        raise ConfigError(
+            "the Kaggle cookie is not a live login, so no Firebase token was minted. Log in "
+            "to kaggle.com again and re-run letify login kaggle."
+        )
+    try:
+        exchanged = _post(
+            IDENTITY_TOOLKIT + "?key=" + urllib.parse.quote(api_key),
+            {"token": custom, "returnSecureToken": True},
+            {},
+        )
+    except (urllib.error.URLError, OSError, ValueError) as exc:
+        raise RuntimeFailure(f"the Firebase exchange failed: {type(exc).__name__}") from None
+    token = exchanged.get("idToken")
+    if not token:
+        raise RuntimeFailure("the Firebase exchange returned no id token")
+    return str(token)
+
+
+def webtier_session(cookie: str, id_token: str, run_id: int) -> str:
+    """Register the Firestore auth for this run and return its web tier session id."""
+    reply = _call(
+        cookie,
+        KERNELS_SERVICE + "UpdateUserKernelFirestoreAuth",
+        {"firebaseIdToken": id_token, "kernelRunId": run_id},
+    )
+    sid = reply.get("sessionId")
+    if not sid:
+        raise RuntimeFailure("Kaggle did not register the Firestore session")
+    return str(sid)
+
+
+#: The proxy token in the Firestore document, either as a query parameter or in the path.
+_PROXY_TOKEN = re.compile(r'token=([^"&\\]+)')
+_PROXY_PATH = re.compile(r'/k/\d+/([^/"]+)/proxy')
+
+
+def jupyter_token(id_token: str, webtier: str, deadline: float) -> str:
+    """Poll Firestore for the session's JupyterURL and return the proxy token from it.
+
+    A session takes a little while to publish the document after it starts, so this waits
+    until the deadline rather than failing on the first empty read.
+    """
+    url = FIRESTORE_BASE + urllib.parse.quote(
+        FIRESTORE_DOCUMENT.format(sid=webtier), safe="/()"
+    )
+    request = urllib.request.Request(url, headers={"Authorization": "Bearer " + id_token})
+    while True:
+        try:
+            with urlopen(request) as response:
+                document = response.read().decode("utf-8", "replace")
+        except urllib.error.HTTPError as exc:
+            if exc.code not in (403, 404):
+                raise RuntimeFailure(f"reading the Jupyter URL failed: {exc.code}") from None
+            document = ""
+        except (urllib.error.URLError, OSError) as exc:
+            raise RuntimeFailure(f"reading the Jupyter URL failed: {type(exc).__name__}") from None
+        match = _PROXY_TOKEN.search(document) or _PROXY_PATH.search(document)
+        if match:
+            return match.group(1)
+        if time.monotonic() >= deadline:
+            raise KaggleSessionEnded(
+                "the Kaggle session did not publish a Jupyter URL in time. It may have failed "
+                "to start or run out of quota. Try again, or check the account's quota with "
+                "letify usage."
+            )
+        time.sleep(3)
+
+
+def live_session_url(alias: str, cookie: str, accelerator: str | None) -> tuple[int, str]:
+    """Start a session and return its run id and routed Jupyter proxy URL.
+
+    The whole token chain lives here: start the run, exchange the Firebase token, register
+    the Firestore auth, read the proxy token and build the routed URL. The token rides in the
+    URL path because the proxy rejects it as a header.
+    """
+    kernel = notebook_id(alias, cookie)
+    run = start_run(cookie, kernel, accelerator)
+    id_token = firebase_id_token(cookie)
+    webtier = webtier_session(cookie, id_token, run)
+    deadline = time.monotonic() + SESSION_START_TIMEOUT
+    token = jupyter_token(id_token, webtier, deadline)
+    return run, f"{JUPYTER_PROXY_HOST}/k/{run}/{token}/proxy"
+
+
+def cancel_run(cookie: str, run_id: int) -> None:
+    """End a session run, best effort, so its accelerator quota is released."""
+    try:
+        _call(cookie, KERNELS_SERVICE + "CancelKernelSession", {"kernelSessionId": run_id})
+    except RuntimeFailure:
+        pass
 
 
 def adapter_command() -> list[str]:
@@ -254,7 +492,7 @@ class Session:
             request.add_header("Authorization", f"token {self.token}")
         if data is not None:
             request.add_header("Content-Type", "application/json")
-        with urllib.request.urlopen(request, timeout=REST_TIMEOUT) as response:
+        with urlopen(request) as response:
             return response.read()
 
     def alive(self) -> bool:
@@ -265,20 +503,27 @@ class Session:
             return False
         return True
 
+    def wait_alive(self, timeout: float | None = None) -> None:
+        """Wait until ``/api/status`` answers, so the first kernel is not refused."""
+        deadline = time.monotonic() + (SESSION_START_TIMEOUT if timeout is None else timeout)
+        while not self.alive():
+            if time.monotonic() >= deadline:
+                raise self.ended()
+            time.sleep(3)
+
     def ended(self) -> KaggleSessionEnded:
         """The runtime is lost, named without claiming which of the two causes it was.
 
-        The proxy answers 404 for an ended session, for a registered URL that no longer
-        routes, and for a session id that never existed, so a status read that is not 200
-        cannot tell them apart. Saying the session ended would state as fact something
-        this read does not establish.
+        The proxy answers 404 for an ended session, for a URL that no longer routes, and for
+        a session id that never existed, so a status read that is not 200 cannot tell them
+        apart. Saying the session ended would state as fact something this read does not
+        establish.
         """
         return KaggleSessionEnded(
-            f"{self.alias}: the Kaggle Jupyter Server session at {self.host} did not answer. "
-            f"It may have ended, since Kaggle ends a session after 20 minutes idle or at its "
-            f"12 hour limit, or the registered URL may no longer route to it. Start a new "
-            f"session in the Kaggle editor with Run, Kaggle Jupyter Server, then run: "
-            f"letify login kaggle {self.alias} --connect <new Colab Compatible URL>"
+            f"{self.alias}: the Kaggle Jupyter Server session did not answer. It may have "
+            f"ended, since Kaggle ends a session after 20 minutes idle or at its 12 hour "
+            f"limit, or the session may have failed to start. Run the function again to start "
+            f"a new session."
         )
 
     def create_kernel(self) -> str:
@@ -290,8 +535,7 @@ class Session:
             if not self.alive():
                 raise self.ended() from None
             raise RuntimeFailure(
-                f"{self.alias}: the Kaggle session at {self.host} refused a new kernel: "
-                f"{type(exc).__name__}"
+                f"{self.alias}: the Kaggle session refused a new kernel: {type(exc).__name__}"
             ) from None
         return str(reply["id"])
 
@@ -301,41 +545,6 @@ class Session:
             self._request("DELETE", f"/api/kernels/{urllib.parse.quote(kernel)}")
         except (urllib.error.URLError, OSError, ValueError):
             pass
-
-    def run(self, kernel: str, source: str, timeout: float | None) -> str:
-        """Run one program through the adapter and return its standard output."""
-        env = dict(os.environ)
-        env["LETIFY_JUPYTER_URL"] = self._url
-        env["LETIFY_KERNEL_ID"] = kernel
-        env["LETIFY_ADAPTER_MODE"] = "program"
-        env["LETIFY_TIMEOUT"] = str(timeout or DEFAULT_PROGRAM_TIMEOUT)
-        process = subprocess.Popen(
-            adapter_command(),
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            env=env,
-        )
-        limit = (timeout or DEFAULT_PROGRAM_TIMEOUT) + ADAPTER_GRACE
-        try:
-            stdout, stderr = process.communicate(source, timeout=limit)
-        except subprocess.TimeoutExpired:
-            process.kill()
-            stdout, stderr = process.communicate()
-            code = None
-        else:
-            code = process.returncode
-        if code == 0:
-            return stdout
-        if code == 3:
-            raise RuntimeFailure(
-                f"{self.alias}: a program raised on the Kaggle session", stderr=stderr
-            )
-        if not self.alive():
-            raise self.ended()
-        reason = "timed out" if code is None else f"exited {code}"
-        raise RuntimeFailure(f"{self.alias}: the Kaggle adapter {reason}", stderr=stderr)
 
 
 class KaggleChannel(FramedChannel):
@@ -360,11 +569,14 @@ class KaggleChannel(FramedChannel):
         self.name = name
         #: Asked whether the session is still there when the worker stops answering.
         self.session = session
-        self._process: subprocess.Popen[bytes] | None = None
+        self._process: Any = None
         self._connection = None
         self._raw = bytearray()
 
     def start(self) -> None:
+        import os
+        import subprocess
+
         if self._connection is not None:
             return
         try:
@@ -461,6 +673,8 @@ class KaggleChannel(FramedChannel):
             self._process.kill()
 
     def close(self) -> None:
+        import subprocess
+
         process = self._process
         self._connection = None
         if process is None:
@@ -486,13 +700,16 @@ class Kaggle(Provider):
     has_fast_path = False
     needs_lease = False
 
-    @property
-    def persistent_channel(self) -> bool:  # type: ignore[override]
-        """A registered session keeps one worker, so the object and blob tables survive."""
-        return session_url(self.alias) is not None
+    #: A session carries one worker for the runtime, so the object and blob tables survive.
+    persistent_channel = True
 
     #: No device stream can reach a Kaggle session without a tunnel, which Kaggle forbids.
     serves_host_local = False
+
+    usage_unit = "GPU hours"
+    usage_source = "the weekly accelerator quota the Kaggle cookie reads"
+
+    default_workspace = "/kaggle/working/letify"
 
     def account_note(self) -> str | None:
         """How the account's cookie is doing, for `letify providers`."""
@@ -506,11 +723,6 @@ class Kaggle(Provider):
         if left <= 0:
             return "cookie EXPIRED; log in again"
         return f"cookie expires in {int(left)} days"
-
-    usage_unit = "GPU hours"
-    usage_source = "kaggle quota, the weekly accelerator quota endpoint"
-
-    default_workspace = "/kaggle/working/letify"
 
     def available(self) -> bool:
         return tools.find_uv() is not None
@@ -537,46 +749,18 @@ class Kaggle(Provider):
 
     def __init__(self, config: ProviderConfig):
         super().__init__(config)
-        #: The session and kernel id each runtime runs its programs in.
-        self._kernels: dict[str, tuple[Session, str, KaggleChannel]] = {}
-
-    def cli(self, *args: str, cwd: str | None = None) -> str:
-        """Run one Kaggle CLI command as this account and return its output."""
-        uv = tools.find_uv()
-        if uv is None:
-            raise ProviderUnavailable(self.kind, tools.missing_uv_message())
-        shown = " ".join([tools.KAGGLE.executable, *args])
-        result = subprocess.run(
-            [*tools.command(tools.KAGGLE, uv), *args],
-            capture_output=True,
-            text=True,
-            timeout=300,
-            cwd=cwd,
-            env=tools.kaggle_environment(self.alias),
-        )
-        if result.returncode != 0:
-            detail = self.redact((result.stderr or result.stdout or "").strip())
-            raise RuntimeFailure(
-                f"{self.alias}: `{shown}` exited {result.returncode}", command=shown, stderr=detail
-            )
-        return result.stdout
-
-    def redact(self, text: str) -> str:
-        for secret in self._secrets():
-            text = text.replace(secret, "***")
-        return text
+        #: The session, kernel, channel and run id each runtime runs its programs in.
+        self._kernels: dict[str, tuple[Session, str, KaggleChannel, int]] = {}
 
     def open_channel(self, runtime: Runtime) -> Channel:
-        """One worker in one cell of the registered session, behind the adapter bridge."""
-        url = session_url(self.alias)
-        if url is None:
-            raise ConfigError(
-                f"{self.alias} has no registered Kaggle Jupyter Server session. Kaggle's API "
-                f"returns no address for a session it starts, so start it in the Kaggle "
-                f"editor with Run, Kaggle Jupyter Server, then register its Colab Compatible "
-                f"URL with `letify login kaggle {self.alias} --connect '<URL>'`."
-            )
+        """Start a session from the cookie and open one worker in one cell of it."""
+        cookie = require_live_cookie(self.alias)
+        instance = getattr(runtime, "instance", None)
+        gpu = getattr(instance, "gpu", None)
+        accelerator = GPUS[gpu]["accelerator"] if gpu in GPUS else None
+        run, url = live_session_url(self.alias, cookie, accelerator)
         session = Session(self.alias, url)
+        session.wait_alive()
         kernel = session.create_kernel()
         channel = KaggleChannel(
             adapter_command(),
@@ -584,97 +768,88 @@ class Kaggle(Provider):
             name=runtime.name,
             session=session,
         )
-        self._kernels[runtime.name] = (session, kernel, channel)
+        self._kernels[runtime.name] = (session, kernel, channel, run)
         return channel
 
     def stop(self, runtime: Runtime) -> None:
-        """Close the bridge, then delete the kernel letify created.
+        """Close the bridge, delete the kernel, then cancel the session run.
 
         In that order: closing the bridge's standard input ends the cell's read loop, so the
-        worker exits on its own rather than being cut off mid frame. The session itself is
-        the user's and keeps running.
+        worker exits on its own rather than being cut off mid frame. The run is letify's own,
+        started for this runtime, so cancelling it releases the accelerator quota it holds.
         """
         held = self._kernels.pop(runtime.name, None)
         if held is None:
             return
-        session, kernel, channel = held
+        session, kernel, channel, run = held
         try:
             channel.close()
         except OSError:
             pass
         session.delete_kernel(kernel)
-
-    def _secrets(self) -> list[str]:
-        """Values in the account's credential files, to hide from error output."""
-        directory = account_directory(self.alias)
-        found: list[str] = []
-        token = directory / "access_token"
-        if token.is_file():
-            found.append(token.read_text(encoding="utf-8").strip())
-        legacy = directory / "kaggle.json"
-        if legacy.is_file():
-            try:
-                found.append(str(json.loads(legacy.read_text(encoding="utf-8")).get("key", "")))
-            except (ValueError, AttributeError):
-                pass
-        return [value for value in found if value]
+        cookie = read_cookie(self.alias)
+        if cookie is not None:
+            cancel_run(cookie, run)
 
     def report_usage(self) -> Usage:
-        uv = tools.find_uv()
-        if uv is None:
-            raise ProviderUnavailable(self.kind, tools.missing_uv_message())
-        command = [*tools.command(tools.KAGGLE, uv), *QUOTA]
-        shown = " ".join([tools.KAGGLE.executable, *QUOTA])
-        result = subprocess.run(
-            command,
-            capture_output=True,
-            text=True,
-            timeout=120,
-            env=tools.kaggle_environment(self.alias),
-        )
-        if result.returncode != 0:
-            detail = (result.stderr or result.stdout or "").strip()
-            for secret in self._secrets():
-                detail = detail.replace(secret, "***")
-            raise RuntimeFailure(
-                f"{self.alias}: `{shown}` exited {result.returncode}", command=shown, stderr=detail
-            )
-        rows = parse_quota(result.stdout)
-        gpu = rows.get("GPU")
-        if gpu is None:
-            raise RuntimeFailure(f"{self.alias}: `{shown}` reported no GPU quota", command=shown)
+        """The weekly accelerator quota, read from the cookie rather than any API key."""
+        cookie = require_live_cookie(self.alias)
+        stats = _call(cookie, KERNELS_SERVICE + "GetAcceleratorQuotaStatistics", {})
+        gpu = stats.get("gpuQuota")
+        if not isinstance(gpu, dict):
+            raise RuntimeFailure(f"{self.alias}: Kaggle reported no GPU quota")
+        total = _seconds_to_hours(gpu.get("totalTimeAllowed"))
+        used = _seconds_to_hours(gpu.get("timeUsed"))
+        remaining = None if total is None or used is None else max(total - used, 0.0)
         notes = []
-        refresh = gpu.get("refreshAt") or gpu.get("refresh_at")
+        refresh = stats.get("quotaRefreshTime")
         if refresh:
             notes.append(f"resets {refresh}")
-        tpu = rows.get("TPU")
-        if tpu is not None:
-            notes.append(
-                f"TPU {hours(tpu.get('used')):g} h used, {hours(tpu.get('remaining')):g} h left "
-                f"of {hours(tpu.get('total')):g}"
-            )
+        tpu = stats.get("tpuQuota")
+        if isinstance(tpu, dict):
+            tpu_total = _seconds_to_hours(tpu.get("totalTimeAllowed"))
+            tpu_used = _seconds_to_hours(tpu.get("timeUsed"))
+            if tpu_total is not None and tpu_used is not None:
+                notes.append(
+                    f"TPU {tpu_used:g} h used, {max(tpu_total - tpu_used, 0.0):g} h left "
+                    f"of {tpu_total:g}"
+                )
         return Usage(
             alias=self.alias,
             kind=self.kind,
             unit=self.usage_unit,
             source=self.usage_source,
-            remaining=hours(gpu.get("remaining")),
-            limit=hours(gpu.get("total")),
-            used=hours(gpu.get("used")),
+            remaining=remaining,
+            limit=total,
+            used=used,
             note="; ".join(notes) or None,
         )
 
 
+def _seconds_to_hours(value: Any) -> float | None:
+    """Read a duration such as ``216000s`` or ``216000`` as hours."""
+    text = str(value or "").strip().removesuffix("s").strip()
+    try:
+        return float(text) / 3600.0
+    except ValueError:
+        return None
+
+
 __all__ = [
     "GPUS",
-    "QUOTA",
     "TPUS",
     "Kaggle",
     "KaggleSessionEnded",
     "Session",
     "adapter_command",
-    "hours",
-    "parse_quota",
-    "session_url",
+    "cancel_run",
+    "cookie_days_left",
+    "cookie_expiry",
+    "cookie_headers",
+    "live_session_url",
+    "read_cookie",
+    "require_cookie_shape",
+    "require_live_cookie",
     "split_url",
+    "verify_cookie",
 ]
