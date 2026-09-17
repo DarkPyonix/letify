@@ -960,10 +960,16 @@ def _data_install_patch():
         if state is None:
             return ()
         prefix = text.rstrip("/") + "/"
+        # Snapshot the pending map under the lock the data thread writes it with, then
+        # iterate the snapshot. The data thread deletes a path from the live map as each
+        # blob completes, so iterating the live map would raise "dictionary changed size
+        # during iteration" mid listing. Spec "What the body sees before a file arrives".
+        with _DATA_READY:
+            pending = list(state["pending"].items())
         found = []
-        for pending in state["pending"]:
-            if pending.startswith(prefix) and "/" not in pending[len(prefix):]:
-                found.append((pending[len(prefix):], state["pending"][pending][1]))
+        for path, (_digest, size) in pending:
+            if path.startswith(prefix) and "/" not in path[len(prefix):]:
+                found.append((path[len(prefix):], size))
         return found
 
     def listed(path="."):

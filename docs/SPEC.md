@@ -946,6 +946,8 @@ The patch lives in the worker process, so a body that forks, including a PyTorch
 
 The worker writes that manifest, installs the patch and wraps the loader while holding the same lock the data thread takes to place a file. The data thread moves a path out of the pending map and into the placed map as each blob completes, so a writer reading the live maps could see a path in neither of them, or fail outright because a map changed size while it was being read.
 
+The body thread reads the pending map only through a snapshot it takes under that same lock, and iterates the snapshot rather than the live map. A directory listing therefore never observes a map that the data thread is changing size, so `os.listdir` and `os.scandir` cannot fail mid listing.
+
 #### When a blob does not arrive <!-- id: project-data-streaming-failures -->
 
 - **A blob that never arrives.** A `data_want` unanswered for `data_wait_timeout` seconds on the account, 600 by default, fails that open with `RuntimeFailure` naming the relative path and the digest. The call is not killed, because the body may handle it; the failure is infrastructure, so a retry of the call is allowed.
