@@ -432,6 +432,27 @@ def session_channel(fake_kaggle, name: str = "letify-t4-1"):
     return provider, runtime, provider.open_channel(runtime)
 
 
+def test_a_registered_session_carries_one_worker_for_the_whole_runtime(fake_kaggle) -> None:
+    """Spec "Kaggle Jupyter Server session": one worker in one cell, not one per program.
+
+    A one-shot channel starts a fresh process per request, so nothing it builds survives.
+    The worker the session keeps is what gives Kaggle an object table, a blob table that
+    holds a large argument across calls, and project data detection, all of which the spec
+    grants to a persistent channel and to nothing else.
+    """
+    provider, _runtime, channel = session_channel(fake_kaggle)
+    assert channel.persistent is True
+    assert provider.persistent_channel is True
+
+    # State the first request leaves behind has to be there for the second one.
+    channel.request({"op": "exec", "source": "LETIFY_KEPT = 6 * 7\n"})
+    value, _logs = channel.request({"op": "eval", "source": "__letify_value__ = LETIFY_KEPT\n"})
+    assert value == 42
+
+    # One kernel for the runtime, however many requests crossed it.
+    assert len(fake_kaggle.made("POST", "/api/kernels")) == 1
+
+
 def test_a_program_runs_on_the_registered_session_in_the_kernel_letify_created(
     fake_kaggle,
 ) -> None:

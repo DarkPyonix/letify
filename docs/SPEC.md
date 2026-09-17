@@ -100,7 +100,7 @@ A provider is built from one entry in the configuration file and reached by attr
 | `Shell` | ephemeral, overridable | yes | persistent | `filesystem` |
 | `Tunnel` | ephemeral, overridable | yes | persistent | `filesystem` |
 | `Elice` | ephemeral | yes | persistent | `filesystem` |
-| `Kaggle` | ephemeral | no | one-shot, on the session the user registered | `filesystem` |
+| `Kaggle` | ephemeral | no | persistent, in one cell of the session the user registered | `filesystem` |
 
 ### Kaggle <!-- id: kaggle-provider -->
 
@@ -115,15 +115,19 @@ Two sources decide this, and they say different things. Kaggle staff answered a 
 
 #### Kaggle Jupyter Server session <!-- id: kaggle-session -->
 
-> A declared function runs on the Kaggle Jupyter Server session the user started, through the URL registered with `--connect`, one program per request over a one-shot channel.
+> A declared function runs on the Kaggle Jupyter Server session the user started, through the URL registered with `--connect`, on one worker kept alive inside a single kernel cell whose frames travel as base64 lines.
 
 The user starts the session in the Kaggle editor with Run, Kaggle Jupyter Server, choosing the accelerator there, and registers its Colab Compatible URL. letify never starts, extends or stops that session, so `create_session` does nothing and `needs_lease` is false.
 
 The URL is split into the server base, the URL without its query string, and the token, the `token` query parameter when present. Every REST request goes to `<base>/api/...` with `token=<token>` in the query and `Authorization: token <token>`, through the standard library HTTP client. The full URL and the token never appear in a message, a log or a command line; a message names only the host.
 
 1. **Start.** `open_channel` reads `<base>/api/status`. It then creates one kernel with `POST <base>/api/kernels` and body `{"name": "python3"}` and keeps its id for the runtime. `stop` deletes it with `DELETE <base>/api/kernels/<id>`, best effort.
-2. **A program.** Each program is run by the Kaggle adapter, `letify/providers/kaggle_adapter.py`, started by `uv run --no-project --python 3.13 --with "jupyter-kernel-client<1" python -P`. It receives the URL, the kernel id and the timeout in the environment variables `LETIFY_JUPYTER_URL`, `LETIFY_KERNEL_ID` and `LETIFY_TIMEOUT`, and the program source on standard input. It runs the source in that kernel and writes the kernel's `stdout` stream to its standard output and the `stderr` stream and any error traceback to its standard error. It exits 0 when the execution reply status is `ok`, 3 when the program raised, and 4 when the server could not be reached. The letify process never imports `jupyter_kernel_client`.
-3. **Failure.** Exit 3 raises `RuntimeFailure` carrying the adapter's standard error. Exit 4, any other exit, or a timeout makes the provider read `<base>/api/status` again. When that read fails or returns anything other than 200, `KaggleSessionEnded` is raised. It is a `RuntimeLost`, and its message says the session has ended, names the two usual causes (20 minutes idle, the 12 hour limit) and tells the user to start a new session with Run, Kaggle Jupyter Server and run `letify login kaggle <alias> --connect <new URL>`. When the status read still succeeds, `RuntimeFailure` is raised with the adapter's standard error.
+2. **The worker.** The session carries one worker for the life of the runtime, not one program per request. The Kaggle adapter, `letify/providers/kaggle_adapter.py`, is a bridge process started by `uv run --no-project --python 3.13 --with "jupyter-kernel-client<1" python -P`, and it receives the URL and the kernel id in the environment variables `LETIFY_JUPYTER_URL` and `LETIFY_KERNEL_ID`. It executes one cell in that kernel which reads a byte count line and then the worker source from the cell's own standard input, exactly as the bootstrap stub of Channels does, and that cell runs until the runtime ends. The bridge then moves bytes in both directions: what it reads on its standard input it hands to the cell by answering the kernel's `input_request`, and every `stream` message the cell writes it copies to its standard output. The letify process never imports `jupyter_kernel_client`.
+
+   The channel is a `FramedChannel` with `text_frames` set, so the worker writes each frame as a base64 line, as the Modal sandbox already does for the same reason: a kernel's `stream` messages carry text, not bytes. `persistent_channel` is therefore true for an account with a registered session, which is what gives Kaggle an object table, a blob table that keeps a large argument across calls, and the option of `host="local"` if a link ever makes it worth using.
+
+   Two behaviours of the kernel protocol are what make one cell enough, and both are verified rather than assumed: a `stream` message reaches the client while the cell is still running, and a cell blocked on input raises `input_request` as many times as it reads. The measurement is in the pull request for branch `feat/kaggle-persistent-channel`.
+3. **Failure.** The bridge exiting is the worker dying, so every blocked read ends as a lost channel does, with the bridge's standard error as the detail. The provider then reads `<base>/api/status` once. When that read fails or answers anything other than 200, `KaggleSessionEnded` is raised. It is a `RuntimeLost`, and its message says the session has ended, names the two usual causes (20 minutes idle, the 12 hour limit) and tells the user to start a new session with Run, Kaggle Jupyter Server and run `letify login kaggle <alias> --connect <new URL>`. When the status read still succeeds the session is alive and the worker is not, so `RuntimeFailure` is raised with the bridge's standard error. A session Kaggle ends mid call is therefore reported as the lost runtime it is, rather than as the call's own failure.
 4. **Files.** `put_file`, `get_file` and `pack_dir` use the Jupyter contents API and `/files/<path>` exactly as the Colab fallback describes, with the Kaggle token authentication above instead of the Colab proxy token.
 5. **Environment.** The session builds the environment like any other runtime: uv is installed, and `uv sync` runs with this process's Python minor version, so the interpreter check compares like with like. The default workspace root is `/kaggle/working/letify`.
 
@@ -832,7 +836,7 @@ Nothing hands a session to the caller. There is no call that returns one, no arg
 
 The declared function is sent with cloudpickle, which serializes its closure variables, the globals it references, its default arguments and the call's arguments. letify's pickler intercepts every `os.PathLike` among them through `reducer_override`. Nothing is declared: the function's own references are the declaration.
 
-Detection runs on a persistent channel only. A one-shot channel has no worker to hold a cache, so its paths travel as plain paths.
+Detection runs on a persistent channel only. A one-shot channel has no worker to hold a cache, so its paths travel as plain paths. A Kaggle account with a registered session has a persistent channel, so a call to one carries its project data like any other provider's does.
 
 #### Which paths are data <!-- id: project-data-detection -->
 
