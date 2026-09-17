@@ -493,6 +493,30 @@ def test_data_observe_false_turns_the_wrappers_off(
     assert train(root) == 4
 
 
+def test_the_worker_does_not_import_torch_to_observe(launcher_from, project) -> None:
+    """Spec "Observing the read order on the runtime": the wrapper is lazy.
+
+    The worker installs the DataLoader wrapper by hooking the body's own import of
+    ``torch.utils.data``, never by importing PyTorch itself. A call whose body never touches
+    PyTorch leaves torch unimported in the worker, so the wrapper's import never sits on the
+    call's path and never delays the body or stalls the background sender.
+    """
+    write_torch(project)
+    let = streaming(launcher_from, data_first_wave_mib=0)
+    root = dataset(project, 3, size=1 << 16)
+
+    @let.function(device=let.providers.lab.CPU, host=letify.remote)
+    def touched(directory: Path) -> bool:
+        import sys
+
+        # The body reads a file, so the call has pending data and the observe setup runs.
+        # It still imports nothing of PyTorch, because the body does not.
+        (directory / "000.bin").read_bytes()
+        return "torch" in sys.modules
+
+    assert touched(root) is False
+
+
 # -- Spec: When a blob does not arrive ---------------------------------------------
 
 
