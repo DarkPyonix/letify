@@ -274,13 +274,11 @@ class Collector:
         for placed in self.placed.values():
             if placed.directory:
                 dirs.append(placed.runtime)
-                # An output location gets writable copies, so the body can rewrite a file.
                 links.extend(
-                    [f"{placed.runtime}/{rel}", digest, placed.output]
-                    for rel, digest, _s, _f in placed.entries
+                    [f"{placed.runtime}/{rel}", digest] for rel, digest, _s, _f in placed.entries
                 )
             elif placed.entries:
-                links.append([placed.runtime, placed.entries[0][1], False])
+                links.append([placed.runtime, placed.entries[0][1]])
             else:
                 dirs.append(placed.runtime.rsplit("/", 1)[0])
             if placed.output:

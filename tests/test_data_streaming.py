@@ -2,8 +2,8 @@
 
 Spec sections pinned here: "The send order and the first wave", "Observing the read order
 on the runtime", "Streaming the rest while the call runs", "What the body sees before a
-file arrives", "When a blob does not arrive" and "Ordering with write-back and the cache
-budget".
+file arrives", "When a blob does not arrive", "Ordering with write-back and the cache
+budget" and "Copy on write".
 
 Everything runs through the Local provider and the real framed worker, so the worker's
 pending patch, its data thread and the background sender are the real ones. The only
@@ -467,6 +467,27 @@ def test_a_piece_whose_digest_does_not_match_fails_the_call(
     assert "arrived with digest" in str(failure.value)
 
 
+def test_a_warm_repeat_of_a_single_file_input_places_the_file(
+    launcher_from, project, capsys
+) -> None:
+    """Spec "Streaming the rest while the call runs": a call whose files the runtime holds
+    places every file before the body starts. A single file input has no directory of its
+    own in the request, so the worker makes its parent when no manifest travelled."""
+    let = streaming(launcher_from)
+    state = project / "state.txt"
+    state.write_text("before", encoding="utf-8")
+
+    # The timeout is the net: a file never placed leaves the body's open waiting.
+    @let.function(device=let.providers.lab.CPU, host=letify.remote, timeout=10)
+    def read(target: Path) -> tuple[int, str]:
+        return target.stat().st_size, target.read_text(encoding="utf-8")
+
+    assert read(state) == (6, "before")
+    capsys.readouterr()
+    assert read(state) == (6, "before")
+    assert "1 files 0.0 MiB already on the runtime" in data_line(capsys.readouterr().err)
+
+
 # -- Spec: What the body sees before a file arrives -------------------------------
 
 
@@ -501,8 +522,8 @@ def test_the_size_of_a_file_that_has_not_arrived_is_its_final_size(
 
 
 def test_a_file_is_never_seen_half_written(launcher_from, project) -> None:
-    """A file inside a directory is copied rather than linked, because the body may rewrite
-    it, and a copy straight to its runtime path can be stat'd with only some of its bytes."""
+    """A file is copied where a hard link fails, and a copy straight to its runtime path can
+    be stat'd with only some of its bytes, so it is copied beside and renamed into place."""
     let = streaming(launcher_from, data_first_wave_mib=0)
     root = dataset(project, 24, size=1 << 18)
 
@@ -890,3 +911,128 @@ def test_a_call_whose_files_are_all_held_carries_no_streaming_machinery(
     assert "order" not in data, data.keys()
     assert "observe" not in data, data.keys()
     assert [entry for entry in seen if entry["op"] == "data_stats"] == []
+
+
+# -- Spec: Copy on write ------------------------------------------------------------
+
+
+def blob_of(path: Path) -> Path:
+    """The runtime cache file that holds the current bytes of a local file."""
+    digest = pathdata.hash_file(path, path.stat().st_size)
+    return Path.home() / ".letify-runtime" / "data" / "blobs" / digest[:2] / digest
+
+
+def test_a_rewritten_file_in_a_directory_input_leaves_the_cache_blob_intact(
+    launcher_from, project
+) -> None:
+    let = streaming(launcher_from)
+    root = dataset(project, 3, size=1 << 16)
+    original = (root / "000.bin").read_bytes()
+    blob = blob_of(root / "000.bin")
+
+    @let.function(device=let.providers.lab.CPU, host=letify.remote)
+    def count(directory: Path) -> int:
+        return len(list(directory.iterdir()))
+
+    @let.function(device=let.providers.lab.CPU, host=letify.remote)
+    def rewrite(directory: Path) -> bytes:
+        (directory / "000.bin").write_bytes(b"changed")
+        return (directory / "000.bin").read_bytes()
+
+    # The first call makes the second a warm repeat, where nothing arrives during the call.
+    assert count(root) == 3
+    assert rewrite(root) == b"changed"
+    assert (root / "000.bin").read_bytes() == b"changed"
+    assert blob.read_bytes() == original
+
+
+def test_each_way_of_opening_for_writing_gets_a_private_copy(
+    launcher_from, project, capsys
+) -> None:
+    let = streaming(launcher_from)
+    root = dataset(project, 5, size=1 << 16)
+    originals = {p.name: p.read_bytes() for p in root.iterdir()}
+    blobs = {p.name: blob_of(p) for p in root.iterdir()}
+
+    @let.function(device=let.providers.lab.CPU, host=letify.remote)
+    def write_four_ways(directory: Path) -> dict[str, int]:
+        import os
+
+        with open(directory / "000.bin", "ab") as handle:
+            handle.write(b"appended")
+        descriptor = os.open(directory / "001.bin", os.O_WRONLY | os.O_APPEND)
+        try:
+            os.write(descriptor, b"appended")
+        finally:
+            os.close(descriptor)
+        (directory / "002.bin").write_bytes(b"replaced")
+        with open(directory / "003.bin", "w", encoding="utf-8") as handle:
+            handle.write("truncated")
+        (directory / "004.bin").read_bytes()
+        return {p.name: p.stat().st_nlink for p in sorted(directory.iterdir())}
+
+    links = write_four_ways(root)
+    # A written file is a private copy, and the file only read is still the cache link.
+    assert {name: count == 1 for name, count in links.items()} == {
+        "000.bin": True, "001.bin": True, "002.bin": True, "003.bin": True, "004.bin": False,
+    }
+    assert (root / "000.bin").read_bytes() == originals["000.bin"] + b"appended"
+    assert (root / "001.bin").read_bytes() == originals["001.bin"] + b"appended"
+    assert (root / "002.bin").read_bytes() == b"replaced"
+    assert (root / "003.bin").read_bytes() == b"truncated"
+    assert (root / "004.bin").read_bytes() == originals["004.bin"]
+    for name, blob in blobs.items():
+        assert blob.read_bytes() == originals[name], name
+    assert "wrote back 4 files" in capsys.readouterr().err
+
+
+def test_a_same_size_overwrite_right_after_the_copy_is_written_back(
+    launcher_from, project
+) -> None:
+    """Spec "Copy on write": a converted file is hashed after the call whatever its stat says.
+
+    The body writes within microseconds of the copy, which is inside one tick of the file
+    system clock, and keeps the size, so inode, size and modification time cannot tell it.
+    """
+    let = streaming(launcher_from)
+    root = dataset(project, 1, size=1 << 16)
+
+    @let.function(device=let.providers.lab.CPU, host=letify.remote)
+    def flip_first_byte(directory: Path) -> None:
+        with open(directory / "000.bin", "r+b") as handle:
+            handle.write(b"\xff")
+
+    flip_first_byte(root)
+    assert (root / "000.bin").read_bytes()[:1] == b"\xff"
+
+
+def test_a_child_process_writing_through_the_link_drops_the_blob_from_the_cache(
+    launcher_from, project
+) -> None:
+    """Spec "Copy on write": the accepted gap.
+
+    A program the body starts sees the link. When it can write despite the read-only mode,
+    the bytes land in the cache file, so the write-back copies the changed file out and the
+    check after the call removes that cache file.
+    """
+    let = streaming(launcher_from)
+    root = dataset(project, 2, size=1 << 16)
+    original = (root / "000.bin").read_bytes()
+    blob = blob_of(root / "000.bin")
+    untouched = blob_of(root / "001.bin")
+
+    @let.function(device=let.providers.lab.CPU, host=letify.remote)
+    def append_in_a_shell(directory: Path) -> int:
+        import os
+        import subprocess
+
+        target = directory / "000.bin"
+        # A root process ignores the read-only mode; this stands in for it.
+        os.chmod(target, 0o644)
+        subprocess.run(["sh", "-c", f"printf x >> '{target}'"], check=True)
+        return target.stat().st_nlink
+
+    assert append_in_a_shell(root) > 1
+    assert (root / "000.bin").read_bytes() == original + b"x"
+    assert not blob.exists()
+    assert untouched.exists()

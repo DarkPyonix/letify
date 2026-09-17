@@ -321,7 +321,8 @@ def _data_collect(data, placed):
             if not stat.S_ISREG(info.st_mode):
                 continue
             known = placed.get(full)
-            if known is not None and known[1:] == (info.st_ino, info.st_size, info.st_mtime_ns):
+            # The placed record ends with the cache stamp, which is not part of the comparison.
+            if known is not None and known[1:4] == (info.st_ino, info.st_size, info.st_mtime_ns):
                 continue
             digest = _data_hash_file(full)
             if known is not None and known[0] == digest:
@@ -628,6 +629,9 @@ _DATA_MISS_AHEAD = 32
 #: Marks a file being copied into place. It is never listed and never read.
 _DATA_PARTIAL = ".letify-placing."
 
+#: The ``os.open`` flags that mean the body will write. Spec "Copy on write".
+_DATA_WRITE_FLAGS = os.O_WRONLY | os.O_RDWR | os.O_APPEND | os.O_TRUNC
+
 
 def _data_register(data):
     """Build the call's layout from its manifest, place what has arrived, and patch reads.
@@ -642,7 +646,8 @@ def _data_register(data):
         "placed": {},
         "pending": {},
         "by_digest": {},
-        "copy": {},
+        "converting": set(),
+        "linked": 0,
         "order": {},
         "arrived": 0,
         "wait": float(data.get("wait") or 600.0),
@@ -660,8 +665,6 @@ def _data_register(data):
         state["order"][digest] = index
     for directory in data.get("dirs", ()):
         os.makedirs(directory, exist_ok=True)
-    for path, digest, copy in data.get("links", ()):
-        state["copy"][path] = bool(copy)
     manifest = data.get("manifest") or {}
     for path, entry in manifest.items():
         digest, size = entry[0], int(entry[1])
@@ -670,19 +673,23 @@ def _data_register(data):
         os.makedirs(os.path.dirname(path), exist_ok=True)
     if not manifest:
         # No manifest travelled, so every link the call carries is already in the cache.
-        for path, digest, _copy in data.get("links", ()):
+        for path, digest in data.get("links", ()):
             state["pending"][path] = (digest, 0)
             state["by_digest"].setdefault(digest, []).append(path)
+            # A single file input names no directory of its own in the request.
+            os.makedirs(os.path.dirname(path), exist_ok=True)
     with _DATA_READY:
         _DATA_CALLS[state["dir"]] = state
         for path in list(state["pending"]):
             _data_place(state, path)
-        if state["pending"]:
-            # Only a call still waiting for bytes needs the patch, the manifest on disk and
-            # the wrappers. A call whose files are all placed reads the real file system.
-            # Inside the lock: the data thread moves a path out of pending and into placed
-            # as each blob completes, and the manifest is written from both maps.
+        if state["pending"] or state["linked"]:
+            # A call still waiting for bytes needs the patch to answer from the manifest,
+            # and a call that placed a link needs it for copy on write. Spec "Copy on write".
             _data_install_patch()
+        if state["pending"]:
+            # Only a call still waiting for bytes needs the manifest on disk and the
+            # wrappers. Inside the lock: the data thread moves a path out of pending and
+            # into placed as each blob completes, and the manifest is written from both maps.
             _data_write_manifest(state)
             _data_observe(state)
     return state
@@ -726,13 +733,14 @@ def _data_place_now(state, path, entry):
         os.utime(source)
     except OSError:
         pass
+    # A link for every entry, a directory's included: the body's first open for writing
+    # turns it into a private copy. Spec "Materializing and the rewritten path".
     linked = False
-    if not state["copy"].get(path, False):
-        try:
-            os.link(source, path)
-            linked = True
-        except OSError:
-            pass
+    try:
+        os.link(source, path)
+        linked = True
+    except OSError:
+        pass
     if not linked:
         # Copied to a name of its own and renamed into place, so a reader never stats a
         # file that is half written. Spec "What the body sees before a file arrives".
@@ -749,8 +757,46 @@ def _data_place_now(state, path, entry):
     info = os.stat(path)
     cached = (info.st_size, info.st_mtime_ns) if linked else None
     state["placed"][path] = (digest, info.st_ino, info.st_size, info.st_mtime_ns, cached)
+    state["linked"] += linked
     del state["pending"][path]
     return True
+
+
+def _data_private(state, path):
+    """Replace the link at ``path`` with a private copy before the body writes to it.
+
+    Spec "Copy on write". The copy is made beside the link and renamed over it, so no
+    reader sees it half written, and the cache file is never opened for writing.
+    """
+    with _DATA_READY:
+        while path in state["converting"]:
+            _DATA_READY.wait(0.5)
+        known = state["placed"].get(path)
+        if known is None or known[4] is None:
+            return
+        state["converting"].add(path)
+    import shutil
+    partial = "%s%s%d" % (path, _DATA_PARTIAL, os.getpid())
+    converted = False
+    _DATA_PLACING.on = True
+    try:
+        shutil.copyfile(path, partial)
+        os.replace(partial, path)
+        converted = True
+    except OSError:
+        try:
+            os.remove(partial)
+        except OSError:
+            pass
+    finally:
+        _DATA_PLACING.on = False
+        with _DATA_READY:
+            state["converting"].discard(path)
+            if converted:
+                # No inode, size or time to compare against: the write-back hashes it,
+                # because the body's first write may land inside the same clock tick.
+                state["placed"][path] = (known[0], None, None, None, None)
+            _DATA_READY.notify_all()
 
 
 def _data_arrived(blobs, digest):
@@ -920,33 +966,62 @@ def _data_install_patch():
         except TypeError:
             return None
 
-    def pending_of(path):
+    def call_of(path):
+        """The running call a path belongs to and the absolute path, or None."""
         if not _DATA_CALLS or getattr(_DATA_PLACING, "on", False):
             return None
         text = full(path)
         if text is None:
             return None
         state = _data_state_for(text)
-        if state is None:
+        return (state, text) if state is not None else None
+
+    def pending_of(path):
+        found = call_of(path)
+        if found is None:
             return None
-        entry = _data_pending_entry(state, text)
-        return (state, text, entry) if entry is not None else None
+        entry = _data_pending_entry(found[0], found[1])
+        return (found[0], found[1], entry) if entry is not None else None
 
     def wait_for(path):
         found = pending_of(path)
         if found is not None:
             _data_wait(found[1])
 
+    def ready_for(path, writes):
+        """Wait for the file, then give the body its own copy when it means to write."""
+        found = call_of(path)
+        if found is None:
+            return
+        state, text = found
+        if _data_pending_entry(state, text) is not None:
+            _data_wait(text)
+        if writes:
+            _data_private(state, text)
+
+    def mode_writes(mode):
+        try:
+            return any(letter in mode for letter in "wax+")
+        except TypeError:
+            return False
+
     def opened(file, *args, **kwargs):
-        wait_for(file)
+        mode = kwargs["mode"] if "mode" in kwargs else (args[0] if args else "r")
+        ready_for(file, mode_writes(mode))
         return real["open"](file, *args, **kwargs)
 
     def io_opened(file, *args, **kwargs):
-        wait_for(file)
+        mode = kwargs["mode"] if "mode" in kwargs else (args[0] if args else "r")
+        ready_for(file, mode_writes(mode))
         return real["io_open"](file, *args, **kwargs)
 
     def os_opened(path, *args, **kwargs):
-        wait_for(path)
+        flags = kwargs["flags"] if "flags" in kwargs else (args[0] if args else 0)
+        try:
+            writes = bool(flags & _DATA_WRITE_FLAGS)
+        except TypeError:
+            writes = False
+        ready_for(path, writes)
         return real["os_open"](path, *args, **kwargs)
 
     def names_of(path):
@@ -988,8 +1063,9 @@ def _data_install_patch():
     def scanned(path="."):
         pending = names_of(path)
         found = real["scandir"](path)
-        if not pending:
+        if not pending and call_of(path) is None:
             return found
+        # Inside a running call the copy of a conversion is never listed either.
         entries = [entry for entry in found if _DATA_PARTIAL not in entry.name]
         held = {entry.name for entry in entries}
         prefix = full(path).rstrip("/") + "/"

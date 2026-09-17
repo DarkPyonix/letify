@@ -608,6 +608,25 @@ def test_a_file_deleted_on_the_runtime_stays_on_the_client(let, cpu, project) ->
     assert (run / "new.log").read_text(encoding="utf-8") == "new"
 
 
+def test_a_file_the_body_did_not_change_is_not_read_after_the_call(let, cpu, project, capsys) -> None:
+    """Spec "Writing back": a placed file whose inode, size and modification time are those
+    recorded at placement is unchanged and is not read. Made unreadable by the body, it
+    fails the call if the write-back hashes it anyway."""
+    run = project / "runs"
+    run.mkdir()
+    (run / "kept.bin").write_bytes(b"k" * 4096)
+
+    @let.function(device=cpu, host=letify.remote)
+    def hide(out: Path) -> int:
+        import os
+
+        os.chmod(out / "kept.bin", 0)
+        return 1
+
+    assert hide(run) == 1
+    assert "wrote back 0 files" in wrote_back(capsys.readouterr().err)[0]
+
+
 def test_a_file_written_in_place_through_its_link_is_dropped_from_the_runtime_cache(
     let, cpu, project
 ) -> None:
