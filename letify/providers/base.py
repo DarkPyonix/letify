@@ -434,7 +434,16 @@ class Provider(abc.ABC):
             volumes=tuple(volumes),
             held_devices=held,
         )
-        runtime.boot()
+        try:
+            runtime.boot()
+        except BaseException:
+            # Spec "Sessions": what was started for the runtime dies with the failed boot,
+            # so the next start does not find a session, sandbox or run left behind.
+            try:
+                runtime.shutdown()
+            except Exception:
+                pass
+            raise
         return runtime
 
     #: What forwarding would cost here, in milliseconds of round trip. Set where it

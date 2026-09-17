@@ -272,6 +272,16 @@ class KaggleSessionEnded(RuntimeLost):
     """The Kaggle Jupyter Server session no longer answers."""
 
 
+def _reply_message(error: urllib.error.HTTPError) -> str:
+    """The ``message`` of an error reply's JSON body, or empty. Never the request's cookie."""
+    try:
+        body = json.loads(error.read()[:4096])
+    except (OSError, ValueError):
+        return ""
+    message = body.get("message") if isinstance(body, dict) else None
+    return message.strip()[:200] if isinstance(message, str) else ""
+
+
 def _call(cookie: str, path: str, body: dict[str, Any]) -> dict[str, Any]:
     """One internal Kaggle call as the cookie's session, returning the decoded reply."""
     request = urllib.request.Request(
@@ -281,6 +291,12 @@ def _call(cookie: str, path: str, body: dict[str, Any]) -> dict[str, Any]:
     try:
         with urlopen(request) as response:
             reply = json.loads(response.read())
+    except urllib.error.HTTPError as exc:
+        # The status and Kaggle's own message, so a refused start says what was refused.
+        detail = _reply_message(exc)
+        raise RuntimeFailure(
+            f"Kaggle {path} failed: HTTP {exc.code}" + (f", {detail}" if detail else "")
+        ) from None
     except (urllib.error.URLError, OSError, ValueError) as exc:
         raise RuntimeFailure(f"Kaggle {path} failed: {type(exc).__name__}") from None
     if not isinstance(reply, dict):
