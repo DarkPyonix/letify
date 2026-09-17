@@ -667,7 +667,19 @@ class KaggleChannel(FramedChannel):
             raise self._verdict(exc) from exc
 
     def _startup_failure(self, expired: bool, cause: Exception) -> Exception:
-        """A worker that never said hello, answered by the same question as a later death."""
+        """A worker that never said hello: the watchdog's own kill is named as such, and any
+        other death is answered by the same question as a later one."""
+        if expired:
+            from ..runtime.channel import STARTUP_TIMEOUT
+
+            # The bridge died because letify killed it, so the shim's traceback below is the
+            # effect and not the cause. Spec "Kaggle Jupyter Server session", Failure.
+            return RuntimeFailure(
+                f"{self.name}: the Kaggle worker did not say hello within "
+                f"{STARTUP_TIMEOUT:.0f} s, so letify killed the bridge. A slow machine or "
+                f"proxy needs a longer wait",
+                stderr=self._raw_text(),
+            )
         return self._verdict(cause)
 
     def _verdict(self, cause: Exception) -> Exception:
