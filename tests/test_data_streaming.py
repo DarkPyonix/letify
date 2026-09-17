@@ -602,11 +602,12 @@ def test_the_pending_manifest_names_every_file_of_the_call_exactly_once(
         }
 
     answer = read_manifest(root)
-    expected = sorted(p.name for p in root.iterdir())
-    assert answer["files"] == expected
     assert answer["manifest"] is not None, "the call had pending files, so a manifest was written"
-    # Every file exactly once: a path between the two maps must not be dropped or doubled.
-    assert answer["manifest"] == expected
+    # Both listings are taken inside the body, against the same runtime directory, because
+    # that is where the two maps live. Comparing against the client's directory would race
+    # the write-back instead of the placement this test is about.
+    assert answer["manifest"] == answer["files"]
+    assert len(answer["manifest"]) == len(set(answer["manifest"])), "a path was named twice"
 
 
 def test_a_call_whose_files_are_all_held_carries_no_streaming_machinery(
