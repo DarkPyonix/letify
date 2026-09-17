@@ -957,6 +957,8 @@ The worker writes that manifest, installs the patch and wraps the loader while h
 
 The body thread reads the pending map only through a snapshot it takes under that same lock, and iterates the snapshot rather than the live map. A directory listing therefore never observes a map that the data thread is changing size, so `os.listdir` and `os.scandir` cannot fail mid listing.
 
+A listing takes the pending snapshot first and reads the real directory second. The data thread places a file before it removes the path from the pending map, both under the lock, so a file placed between the two steps is in the snapshot if it was still pending, and on disk if it was not. A listing is therefore complete at every moment of the call, not only once streaming settles.
+
 #### When a blob does not arrive <!-- id: project-data-streaming-failures -->
 
 - **A blob that never arrives.** A `data_want` unanswered for `data_wait_timeout` seconds on the account, 600 by default, fails that open with `RuntimeFailure` naming the relative path and the digest. The call is not killed, because the body may handle it; the failure is infrastructure, so a retry of the call is allowed.
