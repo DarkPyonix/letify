@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import os
 import sys
+import threading
 import urllib.parse
 
 UNREACHABLE = 4
@@ -134,37 +135,86 @@ def main() -> int:
             except Exception:
                 pass
 
-    def output_hook(message: dict) -> None:
-        """Every stream message the cell writes goes out as it arrives."""
-        if message.get("msg_type") != "stream":
-            return
-        text = message.get("content", {}).get("text") or ""
-        stream = sys.stdout if message["content"].get("name") == "stdout" else sys.stderr
-        stream.write(text)
-        stream.flush()
+    return bridge(client)
 
+
+def bridge(client) -> int:
+    """Carry frames between this process and one long-lived cell, until standard input ends.
+
+    The two directions run on two threads, each owning one kernel channel, because the one
+    thing the bridge must never do is answer an input request from the same loop that reads
+    the cell's output. The client's own ``execute_interactive`` does exactly that: its default
+    stdin hook blocks in ``input()`` inside the execute loop, and while it blocks the loop
+    cannot drain iopub. The worker announces itself with a stream message on iopub, so the
+    first blocked read holds that hello behind an input request the channel will not answer
+    until it has seen the hello. That is a deadlock, and it returns on every large response
+    too, where the cell reads the next request while the worker is still writing output.
+
+    So iopub is drained on this thread and stdin is answered on another. Each ZMQ socket is
+    then touched by one thread only, which the sockets require. ``blocking`` is the low-level
+    client under the wrapper, the one that carries ``execute``, ``input`` and the per-channel
+    reads.
+    """
+    from queue import Empty
+
+    blocking = client._manager.client
+    msg_id = blocking.execute(SHIM % {"stub": STUB}, allow_stdin=True)
+    done = threading.Event()
+
+    def answer_stdin() -> None:
+        """One line of this process's standard input answers one input request, in order.
+
+        End of input sends the kernel's EOF character, which the shim's ``input()`` raises on,
+        so its loop breaks and the cell ends. The pairing the shim relies on holds because the
+        cell issues one request per read and this sends one reply per request.
+        """
+        while not done.is_set():
+            try:
+                request = blocking.get_stdin_msg(timeout=1)
+            except Empty:
+                continue
+            if request["parent_header"].get("msg_id") != msg_id:
+                continue
+            if request.get("msg_type") not in ("input_request", None):
+                continue
+            line = sys.stdin.readline()
+            try:
+                blocking.input(line.rstrip("\n") if line else "\x04")
+            except Exception:
+                return
+
+    reader = threading.Thread(target=answer_stdin, daemon=True)
+    reader.start()
     try:
-        # No stdin_hook: the client's own default reads this process's standard input with
-        # input(), turns EOFError into the kernel's EOF character, and sends the reply
-        # through the websocket client's `input` method. That method is not on the wrapper
-        # this module holds, so a hook written here could not answer a request at all.
-        client.execute_interactive(
-            SHIM % {"stub": STUB},
-            allow_stdin=True,
-            output_hook=output_hook,
-            timeout=None,
-        )
+        while True:
+            try:
+                message = blocking.get_iopub_msg(timeout=1)
+            except Empty:
+                continue
+            if message["parent_header"].get("msg_id") != msg_id:
+                continue
+            if message.get("msg_type") == "stream":
+                text = message["content"].get("text") or ""
+                stream = sys.stdout if message["content"].get("name") == "stdout" else sys.stderr
+                stream.write(text)
+                stream.flush()
+            elif (
+                message.get("msg_type") == "status"
+                and message["content"].get("execution_state") == "idle"
+            ):
+                break
     except Exception as exc:
         print(f"the cell did not finish: {type(exc).__name__}: {exc}", file=sys.stderr)
         return UNREACHABLE
     finally:
+        done.set()
         try:
             client.stop(shutdown_kernel=False)
         except Exception:
             pass
 
-    # The cell ends when letify closes this process's standard input, which the default
-    # hook turns into the EOF the shim's loop breaks on.
+    # The cell ends when letify closes this process's standard input, which the stdin thread
+    # turns into the EOF character the shim's loop breaks on.
     return 0
 
 
