@@ -138,7 +138,7 @@ No request is sent to keep the session alive. A session that Kaggle ends for bei
 
 > letify turns the account's cookie into a live routed Jupyter proxy URL, because only the web session principal can mint that token.
 
-letify owns one notebook per account, created once with `CreateKernelWithSettings` and its id kept in the account directory, so it can commit the body a session needs. The chain, all on `https://www.kaggle.com/api/i/`, authenticated by the cookie:
+letify owns one notebook per account, created once with `CreateKernelWithSettings` and its id kept in the account directory, so it can commit the body a session needs. A notebook deleted on kaggle.com still answers `GetKernel`, so the kept id cannot be checked ahead of time; instead a start Kaggle refuses with HTTP 403 means the account may no longer commit to that notebook, and letify creates a new one, keeps its id in place of the old, and starts the session on it once. A second 403 is raised, because the refusal is then the account's and not the notebook's. The chain, all on `https://www.kaggle.com/api/i/`, authenticated by the cookie:
 
 1. `GetOrCreateKernelSession {kernelId}` reads the notebook's draft sequence.
 2. `CommitAndRun` commits a trivial notebook body and starts the interactive session, returning the run id. This is what the editor's Run does. `CreateKernelSession` on an empty notebook wedges it, so `CommitAndRun` is the call that reliably starts a session letify controls. Empty compute is a CPU session; an accelerator name (`NVIDIA_TESLA_P100` or `NVIDIA_TESLA_T4`) asks for that card.
