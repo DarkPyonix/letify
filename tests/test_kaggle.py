@@ -348,6 +348,45 @@ def session_channel(fake_kaggle, name: str = "letify-t4-1"):
     return provider, runtime, provider.open_channel(runtime)
 
 
+def test_a_notebook_deleted_on_kaggle_is_replaced_by_a_new_one(fake_kaggle) -> None:
+    """Spec "Kaggle session token chain": a refused start means letify owns a new notebook.
+
+    The id of the notebook letify owns is kept in the account directory, and a notebook the
+    user deleted on kaggle.com still answers every read, so the kept id cannot be checked
+    ahead of time. Kaggle refuses the start on it with HTTP 403, and without this the
+    account is stuck on that answer until someone deletes the file by hand.
+    """
+    from letify.config.secrets import account_directory, write_secret
+
+    stale = 134000099
+    write_secret("kaggle_a", "notebook_id", str(stale))
+    fake_kaggle.deleted_notebook = stale
+
+    _provider, _runtime, channel = session_channel(fake_kaggle)
+    value, _logs = channel.request({"op": "eval", "source": "__letify_value__ = 6 * 7"})
+    assert value == 42
+
+    created = [path for path, _body in fake_kaggle.cloud_calls if path.endswith("WithSettings")]
+    assert len(created) == 1, "the deleted notebook is replaced once, not on every start"
+    kept = (account_directory("kaggle_a") / "notebook_id").read_text(encoding="utf-8").strip()
+    assert int(kept) == fake_kaggle.NOTEBOOK_ID
+
+
+def test_a_start_refused_twice_is_not_retried_again(fake_kaggle) -> None:
+    """Spec "Kaggle session token chain": a second 403 is the account's answer, not a
+    notebook's, so letify raises it rather than creating notebooks in a loop."""
+    from letify.errors import RuntimeFailure
+
+    fake_kaggle.refuse["GetOrCreateKernelSession"] = (403, "Permission denied")
+    with pytest.raises(RuntimeFailure) as raised:
+        session_channel(fake_kaggle)
+    assert "403" in str(raised.value)
+    # One notebook, the account's own: a notebook created a moment ago cannot be a deleted
+    # one, so its refusal is not retried on yet another new notebook.
+    created = [path for path, _body in fake_kaggle.cloud_calls if path.endswith("WithSettings")]
+    assert len(created) == 1
+
+
 def test_a_registered_session_carries_one_worker_for_the_whole_runtime(fake_kaggle) -> None:
     """Spec "Kaggle Jupyter Server session": one worker in one cell, not one per program.
 
