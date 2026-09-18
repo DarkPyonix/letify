@@ -282,6 +282,14 @@ def _reply_message(error: urllib.error.HTTPError) -> str:
     return message.strip()[:200] if isinstance(message, str) else ""
 
 
+class _Refused(RuntimeFailure):
+    """A call Kaggle answered with an HTTP error, carrying the status the caller reads."""
+
+    def __init__(self, message: str, *, status: int):
+        self.status = status
+        super().__init__(message)
+
+
 def _call(cookie: str, path: str, body: dict[str, Any]) -> dict[str, Any]:
     """One internal Kaggle call as the cookie's session, returning the decoded reply."""
     request = urllib.request.Request(
@@ -294,8 +302,9 @@ def _call(cookie: str, path: str, body: dict[str, Any]) -> dict[str, Any]:
     except urllib.error.HTTPError as exc:
         # The status and Kaggle's own message, so a refused start says what was refused.
         detail = _reply_message(exc)
-        raise RuntimeFailure(
-            f"Kaggle {path} failed: HTTP {exc.code}" + (f", {detail}" if detail else "")
+        raise _Refused(
+            f"Kaggle {path} failed: HTTP {exc.code}" + (f", {detail}" if detail else ""),
+            status=exc.code,
         ) from None
     except (urllib.error.URLError, OSError, ValueError) as exc:
         raise RuntimeFailure(f"Kaggle {path} failed: {type(exc).__name__}") from None
@@ -320,12 +329,23 @@ def notebook_id(alias: str, cookie: str) -> int:
     a session needs to start. The id is kept in the account directory so the same notebook is
     reused rather than a new one created for every run.
     """
+    kept = kept_notebook(alias)
+    return kept if kept is not None else new_notebook(alias, cookie)
+
+
+def kept_notebook(alias: str) -> int | None:
+    """The notebook id kept for this account, or None when there is none to reuse."""
     path = account_directory(alias) / "notebook_id"
-    if path.is_file():
-        try:
-            return int(path.read_text(encoding="utf-8").strip())
-        except ValueError:
-            pass
+    if not path.is_file():
+        return None
+    try:
+        return int(path.read_text(encoding="utf-8").strip())
+    except ValueError:
+        return None
+
+
+def new_notebook(alias: str, cookie: str) -> int:
+    """Create a notebook for this account and keep its id, replacing any id kept before."""
     reply = _call(
         cookie,
         KERNELS_SERVICE + "CreateKernelWithSettings",
@@ -468,8 +488,18 @@ def live_session_url(alias: str, cookie: str, accelerator: str | None) -> tuple[
     the Firestore auth, read the proxy token and build the routed URL. The token rides in the
     URL path because the proxy rejects it as a header.
     """
-    kernel = notebook_id(alias, cookie)
-    run = start_run(cookie, kernel, accelerator)
+    kept = kept_notebook(alias)
+    kernel = kept if kept is not None else new_notebook(alias, cookie)
+    try:
+        run = start_run(cookie, kernel, accelerator)
+    except _Refused as refused:
+        # A notebook whose id was kept from an earlier run and that this account may no
+        # longer commit to is one deleted on kaggle.com, so letify owns a new one and
+        # starts there. A notebook created a moment ago cannot be that, so its refusal is
+        # the account's answer and is raised. Spec "Kaggle session token chain".
+        if refused.status != 403 or kept is None:
+            raise
+        run = start_run(cookie, new_notebook(alias, cookie), accelerator)
     id_token = firebase_id_token(cookie)
     webtier = webtier_session(cookie, id_token, run)
     deadline = time.monotonic() + SESSION_START_TIMEOUT
@@ -636,7 +666,12 @@ class KaggleChannel(FramedChannel):
         piece = view[: self.WRITE_LIMIT]
         process = self._process
         assert process is not None and process.stdin is not None
-        process.stdin.write(base64.b64encode(piece) + b"\n")
+        line = memoryview(base64.b64encode(piece) + b"\n")
+        # The pipe is unbuffered, and a blocking write into a full pipe returns short when
+        # a signal such as SIGCHLD arrives while it waits. The line goes in until every
+        # byte of it is in the pipe. Spec "Kaggle Jupyter Server session".
+        while line:
+            line = line[process.stdin.write(line) :]
         process.stdin.flush()
         return piece.nbytes
 

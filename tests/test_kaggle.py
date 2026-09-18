@@ -13,6 +13,7 @@ import json
 import sys
 import tomllib
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -347,6 +348,45 @@ def session_channel(fake_kaggle, name: str = "letify-t4-1"):
     return provider, runtime, provider.open_channel(runtime)
 
 
+def test_a_notebook_deleted_on_kaggle_is_replaced_by_a_new_one(fake_kaggle) -> None:
+    """Spec "Kaggle session token chain": a refused start means letify owns a new notebook.
+
+    The id of the notebook letify owns is kept in the account directory, and a notebook the
+    user deleted on kaggle.com still answers every read, so the kept id cannot be checked
+    ahead of time. Kaggle refuses the start on it with HTTP 403, and without this the
+    account is stuck on that answer until someone deletes the file by hand.
+    """
+    from letify.config.secrets import account_directory, write_secret
+
+    stale = 134000099
+    write_secret("kaggle_a", "notebook_id", str(stale))
+    fake_kaggle.deleted_notebook = stale
+
+    _provider, _runtime, channel = session_channel(fake_kaggle)
+    value, _logs = channel.request({"op": "eval", "source": "__letify_value__ = 6 * 7"})
+    assert value == 42
+
+    created = [path for path, _body in fake_kaggle.cloud_calls if path.endswith("WithSettings")]
+    assert len(created) == 1, "the deleted notebook is replaced once, not on every start"
+    kept = (account_directory("kaggle_a") / "notebook_id").read_text(encoding="utf-8").strip()
+    assert int(kept) == fake_kaggle.NOTEBOOK_ID
+
+
+def test_a_start_refused_twice_is_not_retried_again(fake_kaggle) -> None:
+    """Spec "Kaggle session token chain": a second 403 is the account's answer, not a
+    notebook's, so letify raises it rather than creating notebooks in a loop."""
+    from letify.errors import RuntimeFailure
+
+    fake_kaggle.refuse["GetOrCreateKernelSession"] = (403, "Permission denied")
+    with pytest.raises(RuntimeFailure) as raised:
+        session_channel(fake_kaggle)
+    assert "403" in str(raised.value)
+    # One notebook, the account's own: a notebook created a moment ago cannot be a deleted
+    # one, so its refusal is not retried on yet another new notebook.
+    created = [path for path, _body in fake_kaggle.cloud_calls if path.endswith("WithSettings")]
+    assert len(created) == 1
+
+
 def test_a_registered_session_carries_one_worker_for_the_whole_runtime(fake_kaggle) -> None:
     """Spec "Kaggle Jupyter Server session": one worker in one cell, not one per program.
 
@@ -380,6 +420,50 @@ def test_a_program_runs_on_the_registered_session_in_the_kernel_letify_created(
     runs = [json.loads(line) for line in fake_kaggle.log.read_text().splitlines()]
     assert {run["kernel"] for run in runs} == fake_kaggle.kernels
     assert all(fake_kaggle.token not in " ".join(run["argv"]) for run in runs)
+
+
+def test_the_worker_source_reaches_the_bridge_when_a_pipe_write_returns_short(
+    fake_kaggle, monkeypatch
+) -> None:
+    """Spec "Kaggle Jupyter Server session": a line the pipe took only part of is continued.
+
+    The bridge's standard input is an unbuffered pipe. A blocking write into a full pipe
+    returns the count it managed when a signal arrives while it waits, and SIGCHLD arrives
+    exactly then in a full suite run: PyTorch leaves a SIGCHLD handler in this process once
+    a DataLoader has forked workers, and an earlier test's worker exits while the 160 KB
+    worker source is going in. A channel that takes the count for the whole line hands the
+    bridge a source with no end, and the worker never says hello.
+    """
+    import subprocess
+
+    from letify.runtime import channel as channel_module
+
+    class ShortWriting:
+        """A raw pipe that takes at most 4 KiB per write, as one interrupted by a signal does."""
+
+        def __init__(self, raw: Any):
+            self._raw = raw
+
+        def write(self, data: Any) -> int:
+            return self._raw.write(memoryview(data)[:4096])
+
+        def __getattr__(self, name: str) -> Any:
+            return getattr(self._raw, name)
+
+    real_popen = subprocess.Popen
+
+    def popen(*args: Any, **kwargs: Any) -> Any:
+        process = real_popen(*args, **kwargs)
+        if kwargs.get("bufsize") == 0 and process.stdin is not None:
+            process.stdin = ShortWriting(process.stdin)
+        return process
+
+    monkeypatch.setattr(subprocess, "Popen", popen)
+    # Only so the run without the fix fails in seconds rather than in the startup timeout.
+    monkeypatch.setattr(channel_module, "STARTUP_TIMEOUT", 5.0)
+    _provider, _runtime, channel = session_channel(fake_kaggle)
+    value, _logs = channel.request({"op": "eval", "source": "__letify_value__ = 6 * 7"})
+    assert value == 42
 
 
 def test_a_session_is_started_with_internet_access(fake_kaggle) -> None:

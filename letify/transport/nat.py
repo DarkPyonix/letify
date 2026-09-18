@@ -30,6 +30,13 @@ HELLO = b"LETIFY-PUNCH1"
 TOKEN_BYTES = 16
 CHUNK = 64 * 1024
 ANSWER_MARKER = "LETIFY-ANSWER "
+#: What a non-blocking ``connect_ex`` returns when the dial is under way. Windows answers
+#: with its own would-block code instead of EINPROGRESS.
+_DIAL_IN_PROGRESS = frozenset(
+    code
+    for code in (0, errno.EINPROGRESS, errno.EWOULDBLOCK, getattr(errno, "WSAEWOULDBLOCK", None))
+    if code is not None
+)
 
 
 class Cancelled(Exception):
@@ -190,7 +197,13 @@ def punch(
         if connector is None and time.time() >= retry_at:
             connector = reusable_socket(port)
             connector.setblocking(False)
-            connector.connect_ex(tuple(peer))
+            # A dial refused before any packet leaves, EADDRNOTAVAIL when the peer's SYN
+            # has already taken the port pair, leaves a socket that looks writable with no
+            # pending error. It is not a connection, so it is dropped and dialed again.
+            if connector.connect_ex(tuple(peer)) not in _DIAL_IN_PROGRESS:
+                connector.close()
+                connector = None
+                retry_at = time.time() + 0.2
         readers = [listener, *candidates]
         writers = [connector] if connector is not None else []
         readable, writable, _ = select.select(readers, writers, [], 0.05)

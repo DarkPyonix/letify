@@ -96,6 +96,46 @@ def test_two_sides_that_connect_at_an_agreed_time_keep_the_same_connection() -> 
         sock.close()
 
 
+def test_a_dial_the_kernel_refuses_at_once_is_not_taken_for_a_connection() -> None:
+    """Spec "Transport, Rendezvous: the simultaneous open": a dial that fails before any
+    packet is sent is closed and repeated, not chosen.
+
+    When the peer's SYN reaches the listener first, the port pair is taken and the dial
+    fails at once with EADDRNOTAVAIL. The socket still looks writable with no pending error,
+    so a punch that trusts that would write its hello into a socket connected to nobody and
+    die with a broken pipe while the peer's connection sits in the listener's queue.
+    """
+    peer_listener = nat.reusable_socket(0, "127.0.0.1")
+    peer_listener.listen(4)
+    peer_port = peer_listener.getsockname()[1]
+    holder = nat.reusable_socket(0)
+    port = holder.getsockname()[1]
+    # The port pair (port, peer_port) is in use before the punch dials it.
+    taken = nat.reusable_socket(port)
+    taken.connect(("127.0.0.1", peer_port))
+    taken_far, _ = peer_listener.accept()
+    token = b"d" * 16
+    arrived: dict[str, socket.socket] = {}
+
+    def peer_completes_its_own_dial() -> None:
+        # Over loopback the taken pair is also the peer's own pair seen from its side, so
+        # the peer dials from a fresh port. What the punch sees is the same: its dial is
+        # refused, and a connection then arrives on its listener.
+        time.sleep(0.25)
+        arrived["sock"] = socket.create_connection(("127.0.0.1", port))
+
+    threading.Thread(target=peer_completes_its_own_dial, daemon=True).start()
+    try:
+        chosen = nat.punch(
+            port, ("127.0.0.1", peer_port), token, initiator=True, start_at=0, window=5.0
+        )
+        assert nat.recv_exact(arrived["sock"], len(nat.HELLO) + 16) == nat.HELLO + token
+        chosen.close()
+    finally:
+        for sock in (taken, taken_far, peer_listener, holder, *arrived.values()):
+            sock.close()
+
+
 def test_a_punch_that_meets_nobody_gives_up_at_the_end_of_its_window() -> None:
     with pytest.raises(TimeoutError):
         nat.punch(free_port(), ("127.0.0.1", 9), b"t" * 16, initiator=False, start_at=0, window=0.3)
