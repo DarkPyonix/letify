@@ -13,6 +13,7 @@ import json
 import sys
 import tomllib
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -380,6 +381,50 @@ def test_a_program_runs_on_the_registered_session_in_the_kernel_letify_created(
     runs = [json.loads(line) for line in fake_kaggle.log.read_text().splitlines()]
     assert {run["kernel"] for run in runs} == fake_kaggle.kernels
     assert all(fake_kaggle.token not in " ".join(run["argv"]) for run in runs)
+
+
+def test_the_worker_source_reaches_the_bridge_when_a_pipe_write_returns_short(
+    fake_kaggle, monkeypatch
+) -> None:
+    """Spec "Kaggle Jupyter Server session": a line the pipe took only part of is continued.
+
+    The bridge's standard input is an unbuffered pipe. A blocking write into a full pipe
+    returns the count it managed when a signal arrives while it waits, and SIGCHLD arrives
+    exactly then in a full suite run: PyTorch leaves a SIGCHLD handler in this process once
+    a DataLoader has forked workers, and an earlier test's worker exits while the 160 KB
+    worker source is going in. A channel that takes the count for the whole line hands the
+    bridge a source with no end, and the worker never says hello.
+    """
+    import subprocess
+
+    from letify.runtime import channel as channel_module
+
+    class ShortWriting:
+        """A raw pipe that takes at most 4 KiB per write, as one interrupted by a signal does."""
+
+        def __init__(self, raw: Any):
+            self._raw = raw
+
+        def write(self, data: Any) -> int:
+            return self._raw.write(memoryview(data)[:4096])
+
+        def __getattr__(self, name: str) -> Any:
+            return getattr(self._raw, name)
+
+    real_popen = subprocess.Popen
+
+    def popen(*args: Any, **kwargs: Any) -> Any:
+        process = real_popen(*args, **kwargs)
+        if kwargs.get("bufsize") == 0 and process.stdin is not None:
+            process.stdin = ShortWriting(process.stdin)
+        return process
+
+    monkeypatch.setattr(subprocess, "Popen", popen)
+    # Only so the run without the fix fails in seconds rather than in the startup timeout.
+    monkeypatch.setattr(channel_module, "STARTUP_TIMEOUT", 5.0)
+    _provider, _runtime, channel = session_channel(fake_kaggle)
+    value, _logs = channel.request({"op": "eval", "source": "__letify_value__ = 6 * 7"})
+    assert value == 42
 
 
 def test_a_session_is_started_with_internet_access(fake_kaggle) -> None:
