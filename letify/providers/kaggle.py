@@ -636,7 +636,12 @@ class KaggleChannel(FramedChannel):
         piece = view[: self.WRITE_LIMIT]
         process = self._process
         assert process is not None and process.stdin is not None
-        process.stdin.write(base64.b64encode(piece) + b"\n")
+        line = memoryview(base64.b64encode(piece) + b"\n")
+        # The pipe is unbuffered, and a blocking write into a full pipe returns short when
+        # a signal such as SIGCHLD arrives while it waits. The line goes in until every
+        # byte of it is in the pipe. Spec "Kaggle Jupyter Server session".
+        while line:
+            line = line[process.stdin.write(line) :]
         process.stdin.flush()
         return piece.nbytes
 
