@@ -1464,6 +1464,9 @@ class FakeKaggleCloud:
         self.ended = False
         #: Endpoint name to (HTTP status, message) for internal calls the fake refuses.
         self.refuse: dict[str, tuple[int, str]] = {}
+        #: A notebook id deleted on kaggle.com. Starting a session on it is refused the way
+        #: Kaggle refuses one, while every other notebook of the account still works.
+        self.deleted_notebook: int | None = None
         self._lock = threading.Lock()
         self._uuid = uuid
         self._route = re.compile(r"^/k/(?P<run>[^/]+)/(?P<token>[^/]+)/proxy(?P<rest>.*)$")
@@ -1522,6 +1525,9 @@ class FakeKaggleCloud:
         body = json.loads(request.data) if request.data else {}
         self.cloud_calls.append((path, body))
         refused = self.refuse.get(path.rsplit("/", 1)[-1])
+        deleted = self.deleted_notebook
+        if refused is None and deleted is not None and body.get("kernelId") == deleted:
+            refused = (403, "Permission 'kernels.update' was denied")
         if refused is not None:
             import io
             import urllib.error
