@@ -147,7 +147,7 @@ class Shell(Provider):
             return str(given)
         from ..install import find
 
-        return find("tailcat") or "tailcat"
+        return find("tailcat", link_cache=False) or "tailcat"
 
     def remote_command(self, command: str) -> str:
         """The command a link runs on the machine, which a provider may wrap.

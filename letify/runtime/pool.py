@@ -16,6 +16,7 @@ process stops pushing it forward.
 
 from __future__ import annotations
 
+import sys
 import threading
 import time
 import uuid
@@ -93,6 +94,16 @@ class RuntimePool:
         key = f"{instance.key}|{env.key}"
         while True:
             with self._guard:
+                for existing_key, bucket in self._runtimes.items():
+                    if existing_key != key:
+                        for existing in bucket:
+                            if existing.instance.key == instance.key:
+                                print(
+                                    f"letify: pool key mismatch session={existing.name} "
+                                    f"existing={existing_key} requested={key}; keeping session",
+                                    file=sys.stderr,
+                                    flush=True,
+                                )
                 for runtime in self._runtimes.get(key, ()):
                     if not runtime.busy:
                         runtime.busy = True
@@ -193,13 +204,23 @@ class RuntimePool:
             with self._free:
                 self._free.notify_all()
             return
-        self.discard(runtime)
+        self.discard(runtime, reason="call_complete", idle_only=True)
 
-    def discard(self, runtime: Runtime) -> None:
+    def discard(
+        self,
+        runtime: Runtime,
+        *,
+        reason: str = "explicit_discard",
+        idle_only: bool = False,
+    ) -> bool:
         """Shut a runtime down and give its devices back, whatever state it was in."""
         with self._guard:
+            if idle_only and (runtime.busy or self._hold_depth > 0):
+                return False
             bucket = self._runtimes.get(runtime.key, [])
             present = runtime in bucket
+            if idle_only and not present:
+                return False
             if present:
                 bucket.remove(runtime)
         if present:
@@ -207,11 +228,12 @@ class RuntimePool:
                 runtime.instance.accelerator, runtime.held_devices, runtime.instance.devices
             )
         try:
-            runtime.shutdown()
+            runtime.shutdown(reason=reason)
         except LetifyError:
             pass
         with self._free:
             self._free.notify_all()
+        return True
 
     def _start(
         self,
@@ -228,6 +250,7 @@ class RuntimePool:
             instance, env, name=name, volumes=tuple(volumes), held=held
         )
         runtime.busy = True
+        runtime._pool_key = key
         with self._guard:
             self._runtimes.setdefault(key, []).append(runtime)
         return runtime
@@ -248,8 +271,8 @@ class RuntimePool:
             ]
         stopped = []
         for runtime in candidates:
-            self.discard(runtime)
-            stopped.append(runtime.name)
+            if self.discard(runtime, reason="last_hold_closed", idle_only=True):
+                stopped.append(runtime.name)
         return stopped
 
     def shutdown(self) -> list[str]:
@@ -266,7 +289,7 @@ class RuntimePool:
                 runtime.instance.accelerator, runtime.held_devices, runtime.instance.devices
             )
             try:
-                runtime.shutdown()
+                runtime.shutdown(reason="pool_shutdown")
             except LetifyError:
                 pass
         with self._free:

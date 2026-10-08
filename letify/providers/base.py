@@ -440,7 +440,7 @@ class Provider(abc.ABC):
             # Spec "Sessions": what was started for the runtime dies with the failed boot,
             # so the next start does not find a session, sandbox or run left behind.
             try:
-                runtime.shutdown()
+                runtime.shutdown(reason="boot_failure")
             except Exception:
                 pass
             raise

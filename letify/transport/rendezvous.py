@@ -76,6 +76,7 @@ class ColabRendezvous(CommandRendezvous):
     def __init__(self, run: Callable[[str, float], str], public_key: str | None = None):
         self._run = run
         self.public_key = public_key
+        self.binary: str | None = None
 
     def unavailable(self) -> str | None:
         # The VM authorizes the account's public key; without one SSH cannot log in.
@@ -85,6 +86,8 @@ class ColabRendezvous(CommandRendezvous):
         extra: dict[str, Any] = {"start_sshd": True}
         if self.public_key:
             extra["authorized_key"] = self.public_key
+        if self.binary is not None:
+            extra["binary"] = self.binary
         return extra
 
     def run_python(self, source: str, timeout: float) -> str:
