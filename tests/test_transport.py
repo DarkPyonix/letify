@@ -16,7 +16,13 @@ from conftest import FakeProbe, FakeStrategy, StunServer
 
 import letify
 from letify.transport import nat
-from letify.transport.pipeline import Fingerprint, LinkCache, LinkFloor, Pipeline, network_fingerprint
+from letify.transport.pipeline import (
+    Fingerprint,
+    LinkCache,
+    LinkFloor,
+    Pipeline,
+    network_fingerprint,
+)
 from letify.transport.probe import Probe, ProbeResult
 
 MIB = 1024 * 1024
@@ -509,7 +515,8 @@ def test_a_round_trip_above_the_floor_is_refused_even_with_fast_throughput(isola
     slow_round_trip = FakeStrategy("tailcat", 3, result=result(20, 20, rtt=500.0))
     floor = LinkFloor(min_bps=0.0, max_rtt_ms=300.0)
     broken = FakeStrategy("tcp_punch", 2, error="unreachable")
-    with pytest.raises(letify.ProviderUnavailable, match="round trip 500.0 ms above the floor"):
+    expected = "round trip 500.0 ms above the floor"
+    with pytest.raises(letify.ProviderUnavailable, match=expected):
         pipeline([broken, slow_round_trip], floor=floor).connect()
 
 

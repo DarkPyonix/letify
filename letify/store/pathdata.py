@@ -962,10 +962,10 @@ def _stream(runtime: Runtime, payload: dict[str, Any]) -> Any:
 __all__ = [
     "CHUNK",
     "Collector",
-    "WriteBack",
     "DigestCache",
     "Plan",
     "Stream",
+    "WriteBack",
     "allowed_roots",
     "data_bucket",
     "hash_file",

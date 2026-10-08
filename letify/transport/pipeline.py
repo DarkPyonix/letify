@@ -471,14 +471,10 @@ class Pipeline:
                 if measured is not None:
                     floored = self.floor.violations(measured)
                     if floored:
-                        self._say(f"rejected {link.strategy}: below the floor: {', '.join(floored)}")
+                        below = f"{link.strategy}: below the floor: {', '.join(floored)}"
+                        self._say(f"rejected {below}")
                         _close(link)
-                        raise ProviderUnavailable(
-                            "shell",
-                            self._explain(
-                                [*reasons, f"{link.strategy}: below the floor: {', '.join(floored)}"]
-                            ),
-                        )
+                        raise ProviderUnavailable("shell", self._explain([*reasons, below]))
                 self._say(f"chose {link.strategy}: only one connected")
             return link, measured
 
