@@ -148,6 +148,30 @@ def test_a_cookie_can_be_read_from_a_file(isolated_home, accept_cookie, tmp_path
     assert (account("kaggle_a") / "cookie").read_text(encoding="utf-8").strip() == cookie
 
 
+def test_a_login_with_username_and_key_also_writes_the_api_token(
+    isolated_home, accept_cookie
+) -> None:
+    """Spec "Kaggle account": the API token is optional and stored beside the cookie."""
+    import json
+
+    assert main(
+        ["login", "kaggle", "kaggle_a", "--cookie", make_cookie(), "--username", "irack000",
+         "--key", "fake-api-key", "--no-input"]
+    ) == 0
+    token_path = account("kaggle_a") / "kaggle.json"
+    assert json.loads(token_path.read_text(encoding="utf-8")) == {
+        "username": "irack000",
+        "key": "fake-api-key",
+    }
+    if sys.platform != "win32":
+        assert token_path.stat().st_mode & 0o777 == 0o600
+
+
+def test_a_login_with_only_the_cookie_writes_no_token(isolated_home, accept_cookie) -> None:
+    assert main(["login", "kaggle", "kaggle_a", "--cookie", make_cookie(), "--no-input"]) == 0
+    assert not (account("kaggle_a") / "kaggle.json").exists()
+
+
 def test_a_kaggle_login_records_the_workspace(isolated_home, accept_cookie) -> None:
     assert main(
         ["login", "kaggle", "kaggle_a", "--cookie", make_cookie(),
@@ -183,6 +207,19 @@ def test_the_account_note_reports_days_left_on_the_cookie(isolated_home) -> None
 
 def test_the_account_note_flags_a_missing_cookie(isolated_home) -> None:
     assert "no cookie" in (kaggle_provider().account_note() or "")
+
+
+def test_a_run_refuses_to_start_with_under_an_hour_left_on_the_cookie(isolated_home) -> None:
+    """Spec "Kaggle account": starting a session the cookie cannot outlive is refused."""
+    import letify
+    from datetime import UTC, datetime, timedelta
+
+    from letify.config.secrets import write_secret
+
+    soon = datetime.now(UTC) + timedelta(minutes=30)
+    write_secret("kaggle_a", "cookie", make_cookie(soon.strftime("%Y-%m-%dT%H:%M:%SZ")))
+    with pytest.raises(letify.ConfigError, match="hour"):
+        kaggle_provider().usage()
 
 
 def test_the_account_note_flags_an_expired_cookie(isolated_home) -> None:
@@ -348,41 +385,32 @@ def session_channel(fake_kaggle, name: str = "letify-t4-1"):
     return provider, runtime, provider.open_channel(runtime)
 
 
-def test_a_notebook_deleted_on_kaggle_is_replaced_by_a_new_one(fake_kaggle) -> None:
-    """Spec "Kaggle session token chain": a refused start means letify owns a new notebook.
+def test_a_fresh_notebook_is_created_for_every_run_not_reused(fake_kaggle) -> None:
+    """Spec "Kaggle session token chain": no notebook id is kept across runs.
 
-    The id of the notebook letify owns is kept in the account directory, and a notebook the
-    user deleted on kaggle.com still answers every read, so the kept id cannot be checked
-    ahead of time. Kaggle refuses the start on it with HTTP 403, and without this the
-    account is stuck on that answer until someone deletes the file by hand.
+    Reusing a notebook on disk was what let a notebook deleted on kaggle.com wedge the
+    account. A fresh notebook is created for each run instead, so there is nothing to go
+    stale and nothing kept in the account directory.
     """
-    from letify.config.secrets import account_directory, write_secret
+    from letify.config.secrets import account_directory
 
-    stale = 134000099
-    write_secret("kaggle_a", "notebook_id", str(stale))
-    fake_kaggle.deleted_notebook = stale
-
-    _provider, _runtime, channel = session_channel(fake_kaggle)
-    value, _logs = channel.request({"op": "eval", "source": "__letify_value__ = 6 * 7"})
-    assert value == 42
+    session_channel(fake_kaggle, name="letify-t4-1")
+    session_channel(fake_kaggle, name="letify-t4-2")
 
     created = [path for path, _body in fake_kaggle.cloud_calls if path.endswith("WithSettings")]
-    assert len(created) == 1, "the deleted notebook is replaced once, not on every start"
-    kept = (account_directory("kaggle_a") / "notebook_id").read_text(encoding="utf-8").strip()
-    assert int(kept) == fake_kaggle.NOTEBOOK_ID
+    assert len(created) == 2, "each run creates its own notebook"
+    assert not (account_directory("kaggle_a") / "notebook_id").exists()
 
 
-def test_a_start_refused_twice_is_not_retried_again(fake_kaggle) -> None:
-    """Spec "Kaggle session token chain": a second 403 is the account's answer, not a
-    notebook's, so letify raises it rather than creating notebooks in a loop."""
+def test_a_refused_start_is_raised_without_retrying(fake_kaggle) -> None:
+    """Spec "Kaggle session token chain": a refusal on a notebook created moments ago for
+    this run alone is the account's own answer, so it is raised rather than retried."""
     from letify.errors import RuntimeFailure
 
     fake_kaggle.refuse["GetOrCreateKernelSession"] = (403, "Permission denied")
     with pytest.raises(RuntimeFailure) as raised:
         session_channel(fake_kaggle)
     assert "403" in str(raised.value)
-    # One notebook, the account's own: a notebook created a moment ago cannot be a deleted
-    # one, so its refusal is not retried on yet another new notebook.
     created = [path for path, _body in fake_kaggle.cloud_calls if path.endswith("WithSettings")]
     assert len(created) == 1
 
@@ -640,11 +668,15 @@ def test_files_move_as_worker_requests_rather_than_through_the_contents_api(
     assert not fake_kaggle.made("PUT", "/api/contents/")
 
 
-def test_stopping_deletes_the_kernel_and_cancels_the_run(fake_kaggle) -> None:
-    """Spec "Kaggle Jupyter Server session": the run is letify's own, so stop cancels it.
+def test_stopping_deletes_the_kernel_cancels_the_run_and_deletes_the_notebook(
+    fake_kaggle,
+) -> None:
+    """Spec "Kaggle Jupyter Server session": the run is letify's own, so stop cancels it,
+    and the notebook it created for the run is deleted too, by the cookie alone.
 
-    letify starts the session for the runtime, so ending the runtime cancels the run to
-    release the accelerator quota it holds, after deleting the kernel it created.
+    No API token is involved: ``DeleteKernel`` is the same credential that created the
+    notebook with ``CreateKernelWithSettings``, so a run is deleted whether or not the
+    account ever logged in with a token.
     """
     provider, runtime, _channel = session_channel(fake_kaggle)
     assert len(fake_kaggle.kernels) == 1
@@ -652,6 +684,49 @@ def test_stopping_deletes_the_kernel_and_cancels_the_run(fake_kaggle) -> None:
     assert fake_kaggle.kernels == set()
     assert len(fake_kaggle.made("DELETE", "/api/kernels/")) == 1
     assert fake_kaggle.cancelled == [fake_kaggle.RUN_ID]
+    assert fake_kaggle.deleted == [fake_kaggle.NOTEBOOK_ID]
+
+
+def test_stopping_never_needs_the_cli_when_the_account_has_no_token(
+    fake_kaggle, fake_kaggle_cli
+) -> None:
+    """The cookie-based delete is enough on its own, so an account with only the cookie
+    never reaches the CLI at all."""
+    provider, runtime, _channel = session_channel(fake_kaggle)
+    provider.stop(runtime)
+    assert fake_kaggle.deleted == [fake_kaggle.NOTEBOOK_ID]
+    assert fake_kaggle_cli.calls == []
+
+
+def test_a_failed_cookie_delete_falls_back_to_the_cli_with_a_token(
+    fake_kaggle, fake_kaggle_cli, kaggle_api_token
+) -> None:
+    """Spec "Kaggle session token chain": the CLI is only the fallback, tried when the
+    cookie-based delete fails and the account happens to have a token."""
+    fake_kaggle.refuse["DeleteKernel"] = (500, "internal error")
+    provider, runtime, _channel = session_channel(fake_kaggle)
+    provider.stop(runtime)
+
+    assert fake_kaggle.deleted == []
+    deletes = [call for call in fake_kaggle_cli.calls if "delete" in call]
+    assert len(deletes) == 1
+    assert deletes[0][-2:] == ["-y", "irack000/letify-runtime"]
+    assert "kernels" in deletes[0]
+
+
+def test_a_notebook_neither_delete_reaches_is_warned_about_by_name(
+    fake_kaggle, capsys
+) -> None:
+    """Spec "Kaggle session token chain": when both deletes are unavailable, stop warns by
+    the notebook's slug or id, and never prints the cookie."""
+    fake_kaggle.refuse["DeleteKernel"] = (500, "internal error")
+    provider, runtime, _channel = session_channel(fake_kaggle)
+    provider.stop(runtime)
+
+    err = capsys.readouterr().err
+    assert "letify-runtime" in err
+    assert "delete it by hand" in err
+    assert fake_kaggle.token not in err
 
 
 def test_kaggle_never_opts_out_of_preparing_the_runtime(fake_kaggle) -> None:

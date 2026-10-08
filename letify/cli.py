@@ -57,7 +57,9 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         help="port forward SSH dials at --address when it differs from --port, for tunnel",
     )
-    log_in.add_argument("--key", help="SSH private key path")
+    log_in.add_argument(
+        "--key", help="SSH private key path; with --username, the Kaggle API token instead"
+    )
     log_in.add_argument(
         "--auth",
         choices=login.AUTH_METHODS,
@@ -89,6 +91,13 @@ def build_parser() -> argparse.ArgumentParser:
         "--billing-endpoint", dest="billing_endpoint", help="Elice billing API base URL"
     )
     log_in.add_argument("--account", help="account email, for Colab")
+    log_in.add_argument(
+        "--username",
+        help=(
+            "Kaggle username, with --key the API token from Settings > API on kaggle.com; "
+            "optional, widens what the official CLI covers for this account"
+        ),
+    )
     log_in.add_argument(
         "--workspace",
         metavar="PATH",
@@ -447,6 +456,7 @@ def _dispatch(args: argparse.Namespace) -> int:
                 "organization": args.organization,
                 "billing_endpoint": args.billing_endpoint,
                 "account": args.account,
+                "username": args.username,
                 "workspace": args.workspace,
                 "profile": args.profile,
                 "connect": args.connect,

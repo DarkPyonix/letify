@@ -1,17 +1,22 @@
-"""Kaggle, one Kaggle account reached through the browser session cookie.
+"""Kaggle, one Kaggle account reached through the browser session cookie and, optionally,
+an API token.
 
 This module owns the cookie the account is declared with, the token chain that turns the
-cookie into a live Jupyter proxy URL, the weekly accelerator quota read from the internal
-API, and the channel to a worker kept alive in one kernel cell of the session letify starts.
-It does not own the login, which is in ``letify.config.login``, or the kernel execution
-itself, which is in ``kaggle_adapter.py``. It opens no tunnel or port forward of any kind,
-and it sends no keep-alive request.
+cookie into a live Jupyter proxy URL, the ephemeral notebook created for each run and
+deleted when it ends, the weekly accelerator quota, and the channel to a worker kept alive
+in one kernel cell of the session letify starts. It does not own the login, which is in
+``letify.config.login``, or the kernel execution itself, which is in ``kaggle_adapter.py``.
+It opens no tunnel or port forward of any kind, and it sends no keep-alive request.
 
-The cookie is the whole credential. Only the web session principal can mint the Jupyter
-proxy token: the internal endpoints treat an API key as anonymous and answer empty. So there
-is no API token, no ``kaggle.json`` and no session URL registered by hand. letify starts an
-interactive session on a notebook it owns, reads the routed proxy URL through Firebase and
-Firestore, and opens the channel over it.
+The cookie is the credential for one thing only: minting the live Jupyter proxy URL. Only
+the web session principal can do that, since the internal endpoints that mint it treat an
+API key as anonymous and answer empty. Everything else that does not need the live session,
+deleting the notebook a run created and reading the weekly quota, goes through the official
+Kaggle CLI instead, authenticated by the API token in ``kaggle.json``, when the account was
+logged in with one. The token is optional: an account with only the cookie still runs, it
+just falls back to the cookie for the parts the CLI would otherwise cover. letify starts an
+interactive session on a notebook it creates for that run alone, reads the routed proxy URL
+through Firebase and Firestore, and opens the channel over it.
 """
 
 from __future__ import annotations
@@ -30,7 +35,7 @@ from typing import TYPE_CHECKING, Any
 
 from .. import tools
 from ..config import ProviderConfig
-from ..config.secrets import account_directory, write_secret
+from ..config.secrets import account_directory
 from ..declare.instance import Host, Instance
 from ..errors import (
     ConfigError,
@@ -50,6 +55,11 @@ REST_TIMEOUT = 30
 
 #: Seconds to wait for a freshly started session to publish its Jupyter proxy URL.
 SESSION_START_TIMEOUT = 300.0
+
+#: The least time left on the cookie's exp claim that a run may start with. A run that
+#: starts closer to expiry than this risks the cookie dying mid session, with no way to
+#: extend it and no way for letify to tell the difference from any other lost runtime.
+MIN_COOKIE_HOURS = 1.0
 
 if TYPE_CHECKING:
     from ..runtime.channel import Channel
@@ -265,6 +275,12 @@ def require_live_cookie(alias: str) -> str:
             f"{alias}: the Kaggle cookie has expired. Log in to kaggle.com again and run: "
             f"letify login kaggle {alias}"
         )
+    if left * 24 < MIN_COOKIE_HOURS:
+        raise ConfigError(
+            f"{alias}: the Kaggle cookie expires in under {MIN_COOKIE_HOURS:.0f} hour, too "
+            f"little to start and run a session. Log in to kaggle.com again and run: "
+            f"letify login kaggle {alias}"
+        )
     return cookie
 
 
@@ -322,30 +338,15 @@ def _post(url: str, body: dict[str, Any], headers: dict[str, str]) -> dict[str, 
         return json.loads(response.read())
 
 
-def notebook_id(alias: str, cookie: str) -> int:
-    """The id of the notebook letify owns for this account, creating it once and reusing it.
+def new_notebook(alias: str, cookie: str) -> tuple[int, str | None]:
+    """Create one ephemeral notebook for this run and return its id and its URL slug.
 
-    letify runs on a notebook it controls, not one the user picks, so it can commit the body
-    a session needs to start. The id is kept in the account directory so the same notebook is
-    reused rather than a new one created for every run.
+    Spec "Kaggle session token chain": a notebook is created fresh for every run and
+    deleted when the run ends, so none is kept across runs and there is nothing on disk to
+    go stale. The slug, when Kaggle returns one, is what the official CLI's
+    ``kernels delete`` addresses the notebook by; a run on an account with no API token
+    simply never deletes it through the CLI.
     """
-    kept = kept_notebook(alias)
-    return kept if kept is not None else new_notebook(alias, cookie)
-
-
-def kept_notebook(alias: str) -> int | None:
-    """The notebook id kept for this account, or None when there is none to reuse."""
-    path = account_directory(alias) / "notebook_id"
-    if not path.is_file():
-        return None
-    try:
-        return int(path.read_text(encoding="utf-8").strip())
-    except ValueError:
-        return None
-
-
-def new_notebook(alias: str, cookie: str) -> int:
-    """Create a notebook for this account and keep its id, replacing any id kept before."""
     reply = _call(
         cookie,
         KERNELS_SERVICE + "CreateKernelWithSettings",
@@ -359,8 +360,8 @@ def new_notebook(alias: str, cookie: str) -> int:
     kernel = reply.get("id")
     if kernel is None:
         raise RuntimeFailure(f"{alias}: Kaggle did not return a notebook id")
-    write_secret(alias, "notebook_id", str(int(kernel)))
-    return int(kernel)
+    slug = reply.get("currentUrlSlug")
+    return int(kernel), (str(slug) if slug else None)
 
 
 def start_run(cookie: str, kernel_id: int, accelerator: str | None) -> int:
@@ -481,30 +482,25 @@ def jupyter_token(id_token: str, webtier: str, deadline: float) -> str:
         time.sleep(3)
 
 
-def live_session_url(alias: str, cookie: str, accelerator: str | None) -> tuple[int, str]:
-    """Start a session and return its run id and routed Jupyter proxy URL.
+def live_session_url(
+    alias: str, cookie: str, accelerator: str | None
+) -> tuple[int, str, int, str | None]:
+    """Create this run's ephemeral notebook and return its run id, proxy URL, notebook id
+    and slug.
 
-    The whole token chain lives here: start the run, exchange the Firebase token, register
-    the Firestore auth, read the proxy token and build the routed URL. The token rides in the
-    URL path because the proxy rejects it as a header.
+    The whole token chain lives here: create the notebook, start the run, exchange the
+    Firebase token, register the Firestore auth, read the proxy token and build the routed
+    URL. The token rides in the URL path because the proxy rejects it as a header. A refused
+    start is raised as is: the notebook was created a moment ago for this run alone, so a
+    403 on it is the account's own answer, not a stale notebook's.
     """
-    kept = kept_notebook(alias)
-    kernel = kept if kept is not None else new_notebook(alias, cookie)
-    try:
-        run = start_run(cookie, kernel, accelerator)
-    except _Refused as refused:
-        # A notebook whose id was kept from an earlier run and that this account may no
-        # longer commit to is one deleted on kaggle.com, so letify owns a new one and
-        # starts there. A notebook created a moment ago cannot be that, so its refusal is
-        # the account's answer and is raised. Spec "Kaggle session token chain".
-        if refused.status != 403 or kept is None:
-            raise
-        run = start_run(cookie, new_notebook(alias, cookie), accelerator)
+    kernel, slug = new_notebook(alias, cookie)
+    run = start_run(cookie, kernel, accelerator)
     id_token = firebase_id_token(cookie)
     webtier = webtier_session(cookie, id_token, run)
     deadline = time.monotonic() + SESSION_START_TIMEOUT
     token = jupyter_token(id_token, webtier, deadline)
-    return run, f"{JUPYTER_PROXY_HOST}/k/{run}/{token}/proxy"
+    return run, f"{JUPYTER_PROXY_HOST}/k/{run}/{token}/proxy", kernel, slug
 
 
 def cancel_run(cookie: str, run_id: int) -> None:
@@ -513,6 +509,92 @@ def cancel_run(cookie: str, run_id: int) -> None:
         _call(cookie, KERNELS_SERVICE + "CancelKernelSession", {"kernelSessionId": run_id})
     except RuntimeFailure:
         pass
+
+
+def delete_notebook(cookie: str, kernel_id: int) -> bool:
+    """Delete the ephemeral notebook through the cookie, the same credential that created it.
+
+    Spec "Kaggle session token chain": ``kernels.KernelsService/DeleteKernel`` sits beside
+    ``CreateKernelWithSettings`` on the same internal service, so the field name is assumed
+    to be ``kernelId`` by analogy with every other call in this chain, not confirmed against
+    a live account. Returns whether the call was answered without error; never raises,
+    because the accelerator quota is already released by cancelling the run, and a notebook
+    this call fails to delete is not a new failure for the runtime that just ended.
+    """
+    try:
+        _call(cookie, KERNELS_SERVICE + "DeleteKernel", {"kernelId": kernel_id})
+    except RuntimeFailure:
+        return False
+    return True
+
+
+def read_api_username(alias: str) -> str | None:
+    """The username in the account's ``kaggle.json``, or None when it has no API token.
+
+    The token is optional: a login with only the cookie still works. It is never needed to
+    delete the notebook, since the cookie does that; it only widens what the official CLI
+    covers as a second attempt when the cookie-based delete fails.
+    """
+    path = tools.kaggle_config_path(alias)
+    if not path.is_file():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    username = data.get("username") if isinstance(data, dict) else None
+    return str(username) if username else None
+
+
+def delete_notebook_via_cli(alias: str, slug: str | None) -> bool:
+    """Delete the ephemeral notebook through the official CLI, best effort.
+
+    Only a fallback: the cookie-based ``delete_notebook`` is tried first, since it needs no
+    token and is the same credential that created the notebook. This runs only when the
+    account has a token and Kaggle gave this notebook a slug. Returns whether the command
+    exited 0; never raises.
+    """
+    if not slug:
+        return False
+    username = read_api_username(alias)
+    if username is None:
+        return False
+    uv = tools.find_uv()
+    if uv is None:
+        return False
+    import subprocess
+
+    try:
+        result = subprocess.run(
+            [*tools.kaggle_cli_command(uv), "kernels", "delete", "-y", f"{username}/{slug}"],
+            env=tools.kaggle_cli_environment(alias),
+            capture_output=True,
+            timeout=REST_TIMEOUT,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return result.returncode == 0
+
+
+def delete_notebook_best_effort(alias: str, cookie: str | None, kernel_id: int, slug: str | None) -> None:
+    """Delete the run's notebook, by the cookie first and the CLI only if that fails.
+
+    Never raises: the two calls it tries are both best effort on their own, and a notebook
+    left behind is reported with a warning that names the notebook, never the cookie, so the
+    user can delete it by hand on kaggle.com.
+    """
+    if cookie is not None and delete_notebook(cookie, kernel_id):
+        return
+    if delete_notebook_via_cli(alias, slug):
+        return
+    import sys
+
+    name = f"slug {slug}" if slug else f"id {kernel_id}"
+    print(
+        f"letify: {alias}: could not delete the Kaggle notebook ({name}); delete it by hand "
+        f"on kaggle.com",
+        file=sys.stderr,
+    )
 
 
 def adapter_command() -> list[str]:
@@ -833,16 +915,22 @@ class Kaggle(Provider):
 
     def __init__(self, config: ProviderConfig):
         super().__init__(config)
-        #: The session, kernel, channel and run id each runtime runs its programs in.
-        self._kernels: dict[str, tuple[Session, str, KaggleChannel, int]] = {}
+        #: The session, kernel, channel, run id, notebook id and notebook slug each runtime
+        #: runs its programs in. The notebook is this runtime's own, created in
+        #: ``open_channel`` and deleted in ``stop``.
+        self._kernels: dict[str, tuple[Session, str, KaggleChannel, int, int, str | None]] = {}
 
     def open_channel(self, runtime: Runtime) -> Channel:
-        """Start a session from the cookie and open one worker in one cell of it."""
+        """Start a session from the cookie and open one worker in one cell of it.
+
+        The notebook is created fresh for this runtime alone, never reused from an earlier
+        one: spec "Kaggle session token chain".
+        """
         cookie = require_live_cookie(self.alias)
         instance = getattr(runtime, "instance", None)
         gpu = getattr(instance, "gpu", None)
         accelerator = GPUS[gpu]["accelerator"] if gpu in GPUS else None
-        run, url = live_session_url(self.alias, cookie, accelerator)
+        run, url, notebook, slug = live_session_url(self.alias, cookie, accelerator)
         session = Session(self.alias, url)
         session.wait_alive()
         kernel = session.create_kernel()
@@ -852,20 +940,23 @@ class Kaggle(Provider):
             name=runtime.name,
             session=session,
         )
-        self._kernels[runtime.name] = (session, kernel, channel, run)
+        self._kernels[runtime.name] = (session, kernel, channel, run, notebook, slug)
         return channel
 
     def stop(self, runtime: Runtime) -> None:
-        """Close the bridge, delete the kernel, then cancel the session run.
+        """Close the bridge, delete the kernel, cancel the session run, delete the notebook.
 
         In that order: closing the bridge's standard input ends the cell's read loop, so the
         worker exits on its own rather than being cut off mid frame. The run is letify's own,
         started for this runtime, so cancelling it releases the accelerator quota it holds.
+        The notebook created for this run is then deleted, by the cookie first and the
+        official CLI only if that fails, so a notebook is deleted whether or not the account
+        has an API token. Spec "Kaggle session token chain".
         """
         held = self._kernels.pop(runtime.name, None)
         if held is None:
             return
-        session, kernel, channel, run = held
+        session, kernel, channel, run, notebook, slug = held
         try:
             channel.close()
         except OSError:
@@ -874,6 +965,7 @@ class Kaggle(Provider):
         cookie = read_cookie(self.alias)
         if cookie is not None:
             cancel_run(cookie, run)
+        delete_notebook_best_effort(self.alias, cookie, notebook, slug)
 
     def report_usage(self) -> Usage:
         """The weekly accelerator quota, read from the cookie rather than any API key."""
@@ -930,7 +1022,11 @@ __all__ = [
     "cookie_days_left",
     "cookie_expiry",
     "cookie_headers",
+    "delete_notebook",
+    "delete_notebook_best_effort",
+    "delete_notebook_via_cli",
     "live_session_url",
+    "read_api_username",
     "read_cookie",
     "require_cookie_shape",
     "require_live_cookie",
