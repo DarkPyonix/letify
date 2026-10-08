@@ -1275,6 +1275,24 @@ def test_a_lease_stops_renewing_once_the_session_is_gone(renewal_recorder) -> No
     assert len(renewal_recorder.renewals) == 2
 
 
+def test_a_lease_survives_a_transient_renewal_failure(renewal_recorder) -> None:
+    # A renewal reply delayed behind a large transfer, or any other round trip that
+    # merely times out, is not the session going away. The loop keeps trying rather
+    # than giving up on the first bad cycle.
+    renewal_recorder.transient_for = 3
+    lease = Lease(renewal_recorder, interval=0.02, grace=90.0)
+    lease.arm()
+    try:
+        deadline = time.monotonic() + 5
+        while len(renewal_recorder.renewals) < 3 and time.monotonic() < deadline:
+            time.sleep(0.01)
+    finally:
+        lease.release()
+    # The thread survived the leading transient failures and renewed once they stopped.
+    assert len(renewal_recorder.renewals) >= 3
+    assert renewal_recorder.renewals[0] == 90.0
+
+
 # -- Spec: Pooling -------------------------------------------------------------
 
 
