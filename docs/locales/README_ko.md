@@ -161,6 +161,7 @@ letify login shell lab_a100
 [colab_pro_plus]
 kind = "colab"
 account = "you@example.com"
+min_mib_per_s = 0.05
 
 [lab_a100]
 kind = "shell"
@@ -169,6 +170,8 @@ user = "researcher"
 key = "~/.ssh/id_ed25519"
 persistent = true
 ```
+
+연결 파이프라인의 기본 기준은 양방향 `10 MiB/s`, RTT `300 ms`입니다. Colab의 측정된 지속 전송 최고값은 올리기 `8.8 MiB/s`, 내리기 `10.7 MiB/s`라서 기본 기준을 통과하지 못합니다. 위 계정의 `min_mib_per_s = 0.05`는 느린 연결을 명시적으로 허용하는 예시입니다. 실제 측정에 맞춰 `min_mib_per_s`와 `max_rtt_ms`를 설정하세요. 측정된 링크가 모두 기준 미달이면 측정하지 않은 fallback으로 바꾸지 않고 연결을 거부합니다.
 
 프로젝트의 `.letify/config.toml`에는 alias만 들어갑니다. 이 줄이 있어야 그 계정을 이 프로젝트에서 쓸 수 있습니다.
 
