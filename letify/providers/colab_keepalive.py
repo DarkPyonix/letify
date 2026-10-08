@@ -16,6 +16,7 @@ import signal
 import subprocess
 import sys
 import threading
+import time
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
@@ -55,29 +56,62 @@ def account_lock(directory: Path) -> Iterator[None]:
 def wake(config: dict[str, Any]) -> float:
     """Wake once and return the delay until the next attempt."""
     command = [*config["command"], "exec", "-s", config["session"]]
+    start = time.monotonic()
+    result = None
+    exc = None
     try:
         with account_lock(Path(config["directory"])):
             result = subprocess.run(
                 command, input="pass\n", capture_output=True, text=True, timeout=WAKE_TIMEOUT
             )
-        if result.returncode == 0:
-            return SUCCESS_INTERVAL
-        detail = f"exited {result.returncode}; stderr={json.dumps(result.stderr or '')}"
-    except (OSError, subprocess.TimeoutExpired) as exc:
-        stderr = getattr(exc, "stderr", "") or ""
-        if isinstance(stderr, bytes):
-            stderr = stderr.decode(errors="replace")
-        detail = f"{type(exc).__name__}: {exc}; stderr={json.dumps(stderr)}"
+    except (OSError, subprocess.TimeoutExpired) as caught:
+        exc = caught
+    duration = time.monotonic() - start
+
+    if result is not None:
+        returncode = result.returncode
+        stderr_raw = result.stderr or ""
+        stderr_short = stderr_raw.strip().splitlines()[-1] if stderr_raw.strip() else ""
+    else:
+        returncode = getattr(exc, "returncode", -1)
+        stderr_raw = getattr(exc, "stderr", "") or ""
+        if isinstance(stderr_raw, bytes):
+            stderr_raw = stderr_raw.decode(errors="replace")
+        stderr_short = f"{type(exc).__name__}: {exc}"
+
+    entry = record(
+        config,
+        "wake",
+        command=shlex.join(command),
+        returncode=returncode,
+        stderr=stderr_short,
+        duration_s=round(duration, 3),
+    )
+    timestamp = entry["timestamp"]
+
+    if returncode == 0:
+        print(
+            f"{timestamp} letify: wake {config['session']} command={shlex.join(command)} "
+            f"exit=0 duration={duration:.2f}s",
+            file=sys.stderr,
+            flush=True,
+        )
+        return SUCCESS_INTERVAL
+
+    if exc is not None:
+        detail = f"{type(exc).__name__}: {exc}; stderr={json.dumps(stderr_raw)}"
+    else:
+        detail = f"exited {returncode}; stderr={json.dumps(stderr_raw)}"
     print(
-        f"letify: wake {config['session']} command={shlex.join(command)} failed: {detail}; "
-        f"retry in {FAILURE_INTERVAL:g} s",
+        f"{timestamp} letify: wake {config['session']} command={shlex.join(command)} "
+        f"failed: {detail}; duration={duration:.2f}s; retry in {FAILURE_INTERVAL:g} s",
         file=sys.stderr,
         flush=True,
     )
     return FAILURE_INTERVAL
 
 
-def record(config: dict[str, Any], event: str) -> None:
+def record(config: dict[str, Any], event: str, **extra: Any) -> dict[str, Any]:
     """Append a lifecycle record to the CLI account's session history."""
     directory = Path(config["directory"]) / "history"
     directory.mkdir(parents=True, exist_ok=True)
@@ -86,11 +120,14 @@ def record(config: dict[str, Any], event: str) -> None:
         "event_type": event,
         "pid": os.getpid(),
         "source": "letify",
+        **extra,
     }
     with (directory / f"{config['session']}.jsonl").open("a", encoding="utf-8") as handle:
         handle.write(json.dumps(body) + "\n")
         handle.flush()
         os.fsync(handle.fileno())
+    return body
+
 
 
 def run(config: dict[str, Any]) -> None:
