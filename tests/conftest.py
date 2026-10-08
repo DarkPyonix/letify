@@ -1684,7 +1684,6 @@ class FakeKaggleCLI:
 
     def run(self, command: list[str], **kwargs: Any) -> FakeCompleted:
         self.calls.append(list(command))
-        name = command[-1] if "delete" not in command else "kernels delete"
         for marker in self.fail:
             if marker in command:
                 return FakeCompleted(returncode=1, stdout="", stderr="refused")

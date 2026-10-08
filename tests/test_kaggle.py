@@ -211,9 +211,9 @@ def test_the_account_note_flags_a_missing_cookie(isolated_home) -> None:
 
 def test_a_run_refuses_to_start_with_under_an_hour_left_on_the_cookie(isolated_home) -> None:
     """Spec "Kaggle account": starting a session the cookie cannot outlive is refused."""
-    import letify
     from datetime import UTC, datetime, timedelta
 
+    import letify
     from letify.config.secrets import write_secret
 
     soon = datetime.now(UTC) + timedelta(minutes=30)

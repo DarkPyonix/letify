@@ -624,6 +624,7 @@ def test_the_provider_uses_the_durable_tailcat_after_uv_prunes_the_project_link(
 ) -> None:
     # Spec "Installing external tools": provider execution uses the durable copy.
     from conftest import provider_of
+
     from letify.providers.colab import Colab
 
     publish_tailcat(monkeypatch, releases, tar_gz([("tailcat", FAKE_TAILCAT, "file")]))
@@ -649,7 +650,7 @@ def test_colab_verifies_the_release_on_the_runtime_before_installing(
     scope = {}
     source = install.remote_tailcat_source()
     if corrupt:
-        with pytest.raises(RuntimeError, match="tailcat.*SHA-256"):
+        with pytest.raises(RuntimeError, match=r"tailcat.*SHA-256"):
             exec(source, scope)
         assert not cached("tailcat", setup.TAILCAT_VERSION).exists()
     else:
@@ -659,5 +660,5 @@ def test_colab_verifies_the_release_on_the_runtime_before_installing(
         assert path == cached("tailcat", setup.TAILCAT_VERSION)
         path.chmod(0o755)
         path.write_bytes(b"tampered")
-        with pytest.raises(RuntimeError, match="tailcat.*SHA-256"):
+        with pytest.raises(RuntimeError, match=r"tailcat.*SHA-256"):
             exec(source, {})

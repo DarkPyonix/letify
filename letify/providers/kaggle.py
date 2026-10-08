@@ -576,7 +576,9 @@ def delete_notebook_via_cli(alias: str, slug: str | None) -> bool:
     return result.returncode == 0
 
 
-def delete_notebook_best_effort(alias: str, cookie: str | None, kernel_id: int, slug: str | None) -> None:
+def delete_notebook_best_effort(
+    alias: str, cookie: str | None, kernel_id: int, slug: str | None
+) -> None:
     """Delete the run's notebook, by the cookie first and the CLI only if that fails.
 
     Never raises: the two calls it tries are both best effort on their own, and a notebook

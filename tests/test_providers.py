@@ -2640,7 +2640,8 @@ def test_colab_prepares_tailcat_before_the_connection_race(
     # Spec "Colab", Runtime tools: installation failure cannot silently lose the race.
     from letify import install
     patch_which(tools_module, present=True)
-    recorder = patch_run(colab_module, result=FakeCompleted(stdout='LETIFY-TAILCAT "/remote/tailcat"\n'))
+    found = FakeCompleted(stdout='LETIFY-TAILCAT "/remote/tailcat"\n')
+    recorder = patch_run(colab_module, result=found)
     monkeypatch.setattr(install, "find", lambda *a, **k: "/local/tailcat")
     key = Path.home() / "id.pub"
     key.write_text("ssh-ed25519 AAAA")
@@ -2681,7 +2682,7 @@ def test_a_daemon_that_exits_before_ready_fails_creation_and_cleans_up(
     recorder = patch_run(colab_module)
     children = patch_popen(colab_module, [])
     provider = provider_of(Colab)
-    with pytest.raises(letify.RuntimeFailure, match="keep-alive.*ready"):
+    with pytest.raises(letify.RuntimeFailure, match=r"keep-alive.*ready"):
         provider.create_session(provider.cpu, "live")
     assert children[0].terminated
     assert recorder.command == [*COLAB_CLI, "stop", "-s", "live"]

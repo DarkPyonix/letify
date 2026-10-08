@@ -2082,7 +2082,9 @@ def test_a_spawned_child_inside_a_call_runs_a_target_defined_in_the_callers_main
     assert namespace["spawn_two"]() == ([(0, 10), (1, 11)], [0, 0])
 
 
-def test_idle_release_rechecks_a_session_acquired_after_the_idle_snapshot(let, remote_cpu, monkeypatch):
+def test_idle_release_rechecks_a_session_acquired_after_the_idle_snapshot(
+    let, remote_cpu, monkeypatch
+):
     # Spec "Pooling": a new holder cannot lose a runtime selected by idle release.
     pool = let.pool
     pool.hold()
