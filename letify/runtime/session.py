@@ -18,6 +18,7 @@ depends on what the provider charges for.
 
 from __future__ import annotations
 
+import datetime
 import json
 import sys
 import time
@@ -165,10 +166,11 @@ class Runtime:
 
     def shutdown(self, *, reason: str = "explicit_shutdown") -> None:
         """Stop everything that bills for this runtime and explain the decision."""
+        timestamp = datetime.datetime.now(datetime.UTC).isoformat()
         print(
-            f"letify: discarding {self.name} provider={self.provider.alias} "
+            f"{timestamp} letify: discarding {self.name} provider={self.provider.alias} "
             f"key={self.key} busy={self.busy} reason={reason.split(':', 1)[0]} "
-            f"detail={json.dumps(reason)}",
+            f"timestamp={timestamp} detail={json.dumps(reason)}",
             file=sys.stderr,
             flush=True,
         )

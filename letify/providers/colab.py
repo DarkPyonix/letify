@@ -44,7 +44,7 @@ from typing import TYPE_CHECKING, Any
 from .. import tools
 from ..config.secrets import account_directory
 from ..declare.instance import Instance
-from ..errors import ProviderUnavailable, RuntimeFailure
+from ..errors import ProviderUnavailable, RuntimeFailure, RuntimeLost
 from .shell import Shell
 from .usage import Usage
 
@@ -450,6 +450,34 @@ class Colab(Shell):
             # Stopping is best effort. A session that is already gone is fine.
             pass
 
+    def diagnose(self, runtime: Runtime, failure: Exception) -> Exception:
+        """Turn a failure on a reclaimed Colab runtime into ``ColabSessionReclaimed``."""
+        msg = f"{runtime.name}: the provider reclaimed the runtime rather than letify ending it"
+        stderr = getattr(failure, "stderr", "") or ""
+        if "appears to be lost" in stderr or f"Session '{runtime.name}' not found" in stderr:
+            return ColabSessionReclaimed(msg)
+        history_file = (
+            account_directory(self.alias)
+            / ".config"
+            / "colab-cli"
+            / "history"
+            / f"{runtime.name}.jsonl"
+        )
+        if history_file.is_file():
+            try:
+                for line in history_file.read_text(encoding="utf-8").splitlines():
+                    if "appears to be lost" in line or "404" in line:
+                        return ColabSessionReclaimed(msg)
+            except OSError:
+                pass
+        try:
+            active = self.sessions()
+        except (RuntimeFailure, ProviderUnavailable):
+            active = None
+        if active is not None and runtime.name not in active:
+            return ColabSessionReclaimed(msg)
+        return failure
+
     def open_channel(self, runtime: Runtime) -> Channel:
         from ..runtime.channel import OneShotChannel
         from .colab_files import ColabFiles
@@ -465,4 +493,17 @@ class Colab(Shell):
         return super().open_channel(runtime)
 
 
-__all__ = ["ALIASES", "DRIVER_LIBRARY_PATH", "GPUS", "TPUS", "Colab"]
+class ColabSessionReclaimed(RuntimeLost):
+    """The Colab runtime was reclaimed by the provider."""
+
+
+__all__ = [
+    "ALIASES",
+    "DRIVER_LIBRARY_PATH",
+    "GPUS",
+    "TPUS",
+    "Colab",
+    "ColabSessionReclaimed",
+]
+
+
