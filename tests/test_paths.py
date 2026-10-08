@@ -47,7 +47,7 @@ def test_declared_paths_list_cannot_drift() -> None:
         "eci.yaml",
         "cookie",
         "access_token",
-        "kaggle.json",
+        "username",
         "notebook_id",
         "known_hosts",
         "link.json",

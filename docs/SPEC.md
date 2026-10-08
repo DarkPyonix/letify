@@ -1513,7 +1513,7 @@ Local filesystem modifications are consolidated under the single root `~/.letify
 | Path | Purpose | Movable by |
 |---|---|---|
 | `~/.letify/config.toml` | Machine configuration declaring accounts and global providers | `LETIFY_CONFIG` environment variable or project `.letify/config.toml` |
-| `~/.letify/accounts/<alias>/` | Account credentials and secrets (mode 0700 directory, mode 0600 files). Holds secret files only: `token.json`, `modal.toml`, `eci.yaml`, `cookie`, `access_token`, `kaggle.json`, `notebook_id`, `known_hosts`, `link.json`, `password`. Never contains CLI cache directories or python packages | not movable |
+| `~/.letify/accounts/<alias>/` | Account credentials and secrets (mode 0700 directory, mode 0600 files). Holds secret files only: `token.json`, `modal.toml`, `eci.yaml`, `cookie`, `access_token`, `username`, `notebook_id`, `known_hosts`, `link.json`, `password`. Never contains CLI cache directories or python packages | not movable |
 | `~/.letify/tools/<tool>/<version>/` | Installed standalone binaries (`tailcat`, `eci`). Older versions under `~/.letify/tools/<tool>/` are automatically pruned on install | not movable |
 | `~/.letify/cache/digests.json` | Local project file digest cache. Falls back to reading `~/.cache/letify/digests.json` if it exists from an earlier install | not movable |
 | `~/.letify/cache/storage/<name>` | Filesystem storage backend root for store `<name>`. Falls back to reading `~/.cache/letify/<name>` if it exists | not movable |
