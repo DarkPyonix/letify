@@ -37,7 +37,7 @@ ALLOWED_ACCOUNT_CREDENTIAL_FILES = frozenset(
         "eci.yaml",
         "cookie",
         "access_token",
-        "kaggle.json",
+        "username",
         "notebook_id",
         "known_hosts",
         "link.json",
