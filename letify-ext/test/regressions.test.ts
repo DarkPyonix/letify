@@ -24,6 +24,7 @@ describe("safe polling", () => {
     const sessions = parseSessions([{ alias: "colab", kind: "colab", sessions: ["live-cpu"], reason: null }]);
     const status = parseStatus({ name: "letify", live: 0, busy: 0, devices: {}, runtimes: [] });
     expect(activityStatusText([], status, sessions, {}, 10)).toContain("1 session");
+    expect(activityStatusText([], status, sessions, {}, 10)).toContain("GPU unknown");
     expect(runtimesCard(status, sessions)).toContain("live-cpu");
     expect(runtimesCard(status, sessions)).toContain("Provider sessions");
     expect(status.live).toBe(0);
