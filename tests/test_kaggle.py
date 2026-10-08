@@ -303,6 +303,11 @@ def test_a_kaggle_gpu_instance_declares_its_card_count(name, devices) -> None:
     assert instance.tpu is None
     assert instance.devices == devices
     assert instance.vram_gb == 16
+    assert instance.provider.devices_of(name).count == devices
+    assert instance.provider.reserve(instance) == ()
+    assert instance.provider.reserve(instance) is None
+    instance.provider.unreserve(name, (), devices)
+    assert instance.provider.reserve(instance) == ()
 
 
 def test_a_kaggle_account_is_a_known_provider_kind() -> None:
