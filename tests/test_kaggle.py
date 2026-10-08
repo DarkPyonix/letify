@@ -197,12 +197,15 @@ def test_a_kaggle_account_is_a_known_provider_kind() -> None:
     assert KINDS["kaggle"] is Kaggle
 
 
-def test_the_account_note_reports_days_left_on_the_cookie(isolated_home) -> None:
-    """Spec "Kaggle account": the listing shows how many days the cookie has left."""
+def test_the_account_note_reports_the_exp_claim_without_checking_it_live(isolated_home) -> None:
+    """Spec "Kaggle account": the listing reads only the exp claim, with no network call,
+    and says so, since that claim is not proof the cookie still works."""
     from letify.config.secrets import write_secret
 
     write_secret("kaggle_a", "cookie", make_cookie())  # far-future expiry
-    assert "cookie expires in" in (kaggle_provider().account_note() or "")
+    note = kaggle_provider().account_note() or ""
+    assert "exp claim says" in note
+    assert "not checked live" in note
 
 
 def test_the_account_note_flags_a_missing_cookie(isolated_home) -> None:
@@ -247,7 +250,60 @@ def test_kaggle_usage_reads_the_weekly_quota_from_the_cookie(fake_kaggle) -> Non
     assert any(path.endswith("GetAcceleratorQuotaStatistics") for path in called)
 
 
+def test_a_cookie_unexpired_but_refused_online_is_reported_as_that(
+    fake_kaggle, monkeypatch
+) -> None:
+    """Spec "Kaggle account": the exp claim can say days are left while Kaggle has already
+    invalidated the cookie server side; the online check is what catches that, not exp.
+    """
+    import letify
+    from conftest import _Reply
+    from letify.providers import kaggle as kaggle_module
+
+    def answer(request, timeout=None):
+        if request.full_url.endswith("GetCurrentUser"):
+            return _Reply({})  # no displayName: Kaggle treats this cookie as anonymous
+        return fake_kaggle.urlopen(request, timeout)
+
+    monkeypatch.setattr(kaggle_module, "urlopen", answer)
+    with pytest.raises(letify.ConfigError, match="has not expired, but Kaggle no longer accepts"):
+        kaggle_provider().usage()
+
+
+def test_a_session_is_refused_the_same_way_an_already_dead_cookie_is(
+    fake_kaggle, monkeypatch
+) -> None:
+    """The same online check guards starting a session, not only reading usage."""
+    import letify
+    from conftest import _Reply
+    from letify.providers import kaggle as kaggle_module
+
+    def answer(request, timeout=None):
+        if request.full_url.endswith("GetCurrentUser"):
+            return _Reply({})
+        return fake_kaggle.urlopen(request, timeout)
+
+    monkeypatch.setattr(kaggle_module, "urlopen", answer)
+    with pytest.raises(letify.ConfigError, match="Kaggle no longer accepts"):
+        session_channel(fake_kaggle)
+
+
+def test_the_online_check_is_not_repeated_within_the_liveness_ttl(fake_kaggle) -> None:
+    """Spec "Kaggle account": one GetCurrentUser call covers several session starts made
+    close together, not one per start."""
+    provider = kaggle_provider()
+    runtime_a = type("R", (), {"name": "letify-t4-a"})()
+    runtime_b = type("R", (), {"name": "letify-t4-b"})()
+    provider.open_channel(runtime_a)
+    provider.open_channel(runtime_b)
+
+    checks = [path for path, _body in fake_kaggle.cloud_calls if path.endswith("GetCurrentUser")]
+    assert len(checks) == 1
+
+
 def test_a_failed_quota_call_is_an_infrastructure_error(fake_kaggle, monkeypatch) -> None:
+    """A liveness check or a quota call that could not complete at all is not evidence the
+    cookie is bad, so it is reported as the infrastructure failure it is."""
     import letify
     from letify.providers import kaggle as kaggle_module
 
