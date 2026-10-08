@@ -473,7 +473,7 @@ def test_the_colab_cli_keeps_its_login_in_the_account_directory(
     recorder = patch_run(colab_module)
     provider_of(Colab, "colab_a").sessions()
     env = recorder.calls[-1]["env"]
-    assert env["HOME"] == str(Path.home() / ".letify" / "accounts" / "colab_a")
+    assert env["HOME"] == str(Path.home() / ".letify" / "cache" / "tools" / "colab_a")
     assert "COLAB_ACCOUNT" not in env
 
 
@@ -751,7 +751,7 @@ def test_ssh_commands_share_one_connection_and_prefer_fast_ciphers(
     from letify.transport.strategies import Target
 
     monkeypatch.setattr(sshopts, "WINDOWS", platform == "nt")
-    # The pytest temporary directory is too long for a socket path, so the /tmp default is used.
+    monkeypatch.setattr(sshopts, "SOCKET_LIMIT", 500)
     monkeypatch.delenv("XDG_RUNTIME_DIR", raising=False)
     provider = provider_of(Shell, "lab", address="gpu.lab.example.edu", user="researcher")
     for command in (
@@ -761,7 +761,7 @@ def test_ssh_commands_share_one_connection_and_prefer_fast_ciphers(
         assert "Ciphers=^aes128-gcm@openssh.com,chacha20-poly1305@openssh.com" in command
         assert not any(part.startswith("Compression=yes") for part in command)
         tag = hashlib.sha256(b"lab").hexdigest()[:8]
-        control = Path(f"/tmp/letify-{os.getuid()}") / f"{tag}-%C"
+        control = Path.home() / ".letify" / "ssh" / f"{tag}-%C"
         if platform == "nt":
             assert not any(part.startswith("Control") for part in command)
         else:
@@ -776,21 +776,22 @@ def control_options(command: list[str]) -> list[str]:
     return [part for part in command if part.startswith("Control")]
 
 
-def test_a_control_socket_fits_the_socket_limit_for_a_very_long_home(
+def test_a_control_socket_lives_under_letify_ssh_when_runtime_dir_is_unset(
     tmp_path: Path, monkeypatch
 ) -> None:
-    # Spec "SSH authentication": sockets live in a short per-user directory.
+    # Spec "SSH authentication": sockets live in ~/.letify/ssh when XDG_RUNTIME_DIR is unset.
     from letify.transport import sshopts
 
     monkeypatch.setattr(sshopts, "WINDOWS", False)
     monkeypatch.delenv("XDG_RUNTIME_DIR", raising=False)
-    home = tmp_path / ("h" * 150)
+    monkeypatch.setattr(sshopts, "SOCKET_LIMIT", 500)
+    home = tmp_path / "home"
     monkeypatch.setattr(Path, "home", classmethod(lambda cls: home))
     command = sshopts.options("a-rather-long-account-alias-for-the-lab-machine")
     (path,) = [part[len("ControlPath=") :] for part in command if part.startswith("ControlPath=")]
     expanded = path.replace("%C", "0" * 40)
     assert len(expanded.encode()) + 17 < sshopts.SOCKET_LIMIT
-    assert Path(path).parent == Path(f"/tmp/letify-{os.getuid()}")
+    assert Path(path).parent == home / ".letify" / "ssh"
 
 
 def test_sharing_is_left_out_when_the_socket_path_would_exceed_the_limit(
