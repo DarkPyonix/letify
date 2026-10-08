@@ -220,6 +220,74 @@ def test_a_worker_call_whose_body_imports_letify_while_running_names_the_reason(
     assert "letify is not installed" in reply["error"] and "uv add letify" in reply["error"]
 
 
+def test_a_body_that_imports_a_shipped_module_names_the_reason(tmp_path: Path) -> None:
+    # Spec "Module shipping": a module Env.ship() sends by value never lands on the
+    # runtime's sys.path, so an import inside the body, as opposed to a global the
+    # function closes over, finds nothing there even though the call itself loads.
+    package = tmp_path / "shippkg"
+    package.mkdir()
+    (package / "__init__.py").write_text("def helper_value():\n    return 42\n", encoding="utf-8")
+    sys.path.insert(0, str(tmp_path))
+    try:
+        shippkg = import_module("shippkg")
+        cloudpickle.register_pickle_by_value(shippkg)
+
+        def work() -> int:
+            import shippkg
+
+            return shippkg.helper_value()
+
+        stdout = run_script(driver.build(work, (), {}))
+        with pytest.raises(letify.RemoteError, match=r"'shippkg' is not importable.*Env\.ship"):
+            codec.parse(stdout, runtime_key="one-shot")
+    finally:
+        cloudpickle.unregister_pickle_by_value(shippkg)
+        sys.path.remove(str(tmp_path))
+        sys.modules.pop("shippkg", None)
+
+
+def test_a_class_sent_by_value_is_not_the_class_the_runtime_imports(tmp_path: Path) -> None:
+    # Spec "Module shipping": by-value shipping reconstructs a class instead of looking
+    # it up by import, so it is a distinct object from the same-named class the runtime
+    # imports by reference. This pins the documented limit, not a fix: issubclass across
+    # the two fails on purpose, and the workaround is to stop shipping the module by
+    # value and install it in the runtime instead.
+    sender_dir = tmp_path / "sender"
+    sender_dir.mkdir()
+    (sender_dir / "shipcls.py").write_text(
+        "class Base:\n    pass\n\n\nclass Derived(Base):\n    pass\n", encoding="utf-8"
+    )
+    remote_dir = tmp_path / "remote"
+    remote_dir.mkdir()
+    (remote_dir / "shipcls.py").write_text("class Base:\n    pass\n", encoding="utf-8")
+
+    sys.path.insert(0, str(sender_dir))
+    try:
+        shipcls = import_module("shipcls")
+        cloudpickle.register_pickle_by_value(shipcls)
+
+        def work(derived: type) -> bool:
+            import shipcls
+
+            return issubclass(derived, shipcls.Base)
+
+        env = {**os.environ, "PYTHONPATH": str(remote_dir)}
+        stdout = subprocess.run(
+            [sys.executable, "-c", driver.build(work, (shipcls.Derived,), {})],
+            capture_output=True,
+            text=True,
+            timeout=120,
+            env=env,
+            cwd=remote_dir,
+        ).stdout
+        _logs, value = codec.parse(stdout, runtime_key="one-shot")
+        assert value is False
+    finally:
+        cloudpickle.unregister_pickle_by_value(shipcls)
+        sys.path.remove(str(sender_dir))
+        sys.modules.pop("shipcls", None)
+
+
 def test_a_reference_names_what_it_points_at() -> None:
     assert repr(Blob("0123456789abcdef", 2048)) == "<Blob 01234567 2048 bytes>"
     assert repr(RemoteFile("/opt/letify/x.bin", "abc", 10)) == (
