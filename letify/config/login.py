@@ -775,53 +775,38 @@ def read_kaggle_cookie(answers: Answers, given: str | None) -> str:
     return text
 
 
-#: ``kaggle.json`` keys for the API token, and the prompts for them when a terminal asks.
-KAGGLE_USERNAME_PROMPT = "Kaggle username: "
-KAGGLE_KEY_PROMPT = "Kaggle API key, from Settings > API on kaggle.com: "
-
-#: What kaggle.com puts in front of the key it shows. The official CLI reads the rest.
-KAGGLE_KEY_PREFIX = "KGAT_"
+#: The notebook owner and verbatim API token prompts.
+KAGGLE_USERNAME_PROMPT = "Kaggle username (notebook owner): "
+KAGGLE_KEY_PROMPT = "Kaggle API token exactly as shown on kaggle.com, including KGAT_: "
 
 
 def read_kaggle_token(
     answers: Answers, given_username: str | None, given_key: str | None
 ) -> tuple[str, str]:
-    """Return the username and key, from the values given or a prompt; never from a file.
+    """Return the notebook owner and verbatim token, refusing malformed token input.
 
-    Both are required: the cookie starts and ends the interactive session and mints its
-    Jupyter proxy URL, and everything else, deleting the notebook a run created and reading
-    the weekly quota, goes through the official CLI, which needs this token. An account
-    with only the cookie cannot do either, so login refuses rather than declaring an
-    account that would fail the first time it tries.
+    The owner addresses notebook deletion; only the token authenticates the CLI. Validate
+    the prefix and a nonempty whitespace-free body without imposing an unproven length.
     """
     username = (given_username or "").strip()
     if not username and answers.interactive:
         username = read_line(KAGGLE_USERNAME_PROMPT).strip()
-    key = (given_key or "").strip()
+    key = given_key or ""
     if not key and answers.interactive:
-        key = read_password(KAGGLE_KEY_PROMPT).strip()
-    # kaggle.com shows the key with this prefix, and the official CLI reads it without.
-    if key.startswith(KAGGLE_KEY_PREFIX):
-        key = key[len(KAGGLE_KEY_PREFIX) :]
+        key = read_password(KAGGLE_KEY_PROMPT)
     if not username or not key:
         raise LoginError(
-            f"{answers.alias} needs the Kaggle API token too: pass --username and --key, "
-            f"the pair from Settings > API on kaggle.com, or drop --no-input."
+            f"{answers.alias} needs the Kaggle API token and notebook owner: pass "
+            f"--username <owner> and --key <KGAT_token> from kaggle.com, or drop --no-input."
+        )
+    if not key.startswith("KGAT_") or len(key) <= len("KGAT_") or any(
+        character.isspace() for character in key
+    ):
+        raise LoginError(
+            f"{answers.alias}: paste the Kaggle API token exactly as shown on kaggle.com, "
+            f"including KGAT_ and its nonempty body, with no whitespace."
         )
     return username, key
-
-
-def write_kaggle_token(alias: str, username: str, key: str) -> None:
-    """Write ``kaggle.json`` in the account directory, the shape the official CLI reads."""
-    import json
-
-    from .. import tools
-
-    path = tools.kaggle_config_path(alias)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps({"username": username, "key": key}), encoding="utf-8")
-    if sys.platform != "win32":
-        path.chmod(0o600)
 
 
 def kaggle_account(answers: Answers) -> dict[str, Any]:
@@ -831,7 +816,7 @@ def kaggle_account(answers: Answers) -> dict[str, Any]:
     session and mints its Jupyter proxy URL; it is checked for shape and expiry before any
     network call, then proven with a read of the account. The API token runs the official
     CLI for everything else, deleting the notebook a run created and reading the weekly
-    quota; it is checked for presence only, since proving it would mean calling the CLI
+    quota; it is checked for shape only, since proving it would mean calling the CLI
     from inside login, which this function leaves to the first command that uses it.
     Nothing is written until every check passes.
     """
@@ -858,7 +843,8 @@ def kaggle_account(answers: Answers) -> dict[str, Any]:
     options: dict[str, Any] = {"kind": answers.kind}
     record_workspace(answers, options)
     store_secret(answers.alias, KAGGLE_COOKIE, cookie)
-    write_kaggle_token(answers.alias, username, key)
+    store_secret(answers.alias, "api_token", key)
+    store_secret(answers.alias, "username", username)
     return options
 
 
