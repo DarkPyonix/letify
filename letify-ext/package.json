@@ -58,8 +58,8 @@
       "properties": {
         "letify.command": {
           "type": "string",
-          "default": "uv run letify",
-          "description": "Command that runs the letify CLI, split on spaces. Runs in the first workspace folder."
+          "default": "uv run --frozen --no-sync letify",
+          "description": "Command that runs the letify CLI, split on spaces. Runs in the first workspace folder. uv run always uses --frozen --no-sync and requires letify to be installed."
         },
         "letify.usageIntervalSeconds": {
           "type": "number",
@@ -71,7 +71,7 @@
           "type": "number",
           "default": 10,
           "minimum": 2,
-          "description": "Seconds between reads of letify utilization and status while the letify view is visible."
+          "description": "Seconds between reads of letify utilization, status and sessions while the letify view is visible."
         },
         "letify.warningPercent": {
           "type": "number",

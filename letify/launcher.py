@@ -477,6 +477,28 @@ class Launcher:
             answers = list(pool.map(read, wanted))
         return [row for rows in answers for row in rows]
 
+    def sessions(self) -> list[dict[str, Any]]:
+        """List provider-owned sessions without opening a runtime.
+
+        Spec "Provider session discovery".
+        """
+        rows: list[dict[str, Any]] = []
+        for alias in self.config.order:
+            try:
+                provider = self.provider(alias)
+                supported = provider.kind == "colab"
+                rows.append(
+                    {
+                        "alias": alias,
+                        "kind": provider.kind,
+                        "sessions": provider.sessions() if supported else [],
+                        "reason": None if supported else "session discovery is not supported",
+                    }
+                )
+            except LetifyError as exc:
+                rows.append({"alias": alias, "sessions": [], "unavailable": str(exc)})
+        return rows
+
     def status(self) -> dict[str, Any]:
         """What is running right now, and what it is costing.
 
