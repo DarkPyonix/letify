@@ -112,6 +112,7 @@ class Channel(abc.ABC):
         kwargs: dict,
         *,
         timeout: float | None = None,
+        modules: Sequence[str] = (),
     ) -> tuple[Any, str]:
         """Run one function call inside the runtime."""
         head, buffers = protocol.dumps_call_parts(fn, args, kwargs)
@@ -908,10 +909,11 @@ class OneShotChannel(Channel):
         kwargs: dict,
         *,
         timeout: float | None = None,
+        modules: Sequence[str] = (),
     ) -> tuple[Any, str]:
         from ..protocol import driver
 
-        source = driver.build(fn, args, kwargs)
+        source = driver.build(fn, args, kwargs, modules=modules)
         stdout = self._run(source, timeout)
         logs, value = protocol.parse(stdout, runtime_key=self.name)
         return value, logs
