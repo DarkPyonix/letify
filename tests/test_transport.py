@@ -637,3 +637,22 @@ def test_floor_rejections_name_both_account_overrides():
     assert any("round trip 500.0 ms" in text for text in violations)
     assert "min_mib_per_s" in ", ".join(violations)
     assert "max_rtt_ms" in ", ".join(violations)
+
+
+# Spec: Transport, Link floor.
+def test_a_cached_floor_rejection_cannot_accept_a_lone_failed_probe(isolated_home, monkeypatch):
+    cache = LinkCache("lab")
+    cache.save("tailcat", result(20, 20), Fingerprint("203.0.113.7", "eth0"))
+    slow = FakeStrategy("tailcat", 3, result=result(2.6, 0.1, 177.4))
+    fallback = FakeStrategy("fallback", 4, probed=False, error="fallback unavailable")
+    attempt = slow.attempt
+
+    def reconnect(target, cancel=None):
+        if slow.attempts:
+            slow.probe_error = True
+        return attempt(target, cancel=cancel)
+
+    monkeypatch.setattr(slow, "attempt", reconnect)
+    with pytest.raises(letify.ProviderUnavailable, match="tailcat: below the floor"):
+        pipeline([slow, fallback], cache=cache, floor=LinkFloor.default()).connect()
+    assert all(link.closed for link in slow.links)
