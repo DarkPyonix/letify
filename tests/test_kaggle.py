@@ -222,6 +222,50 @@ def test_a_token_pasted_with_the_kgat_prefix_is_stored_verbatim(
     assert stored == "KGAT_" + thirty_two
 
 
+def test_a_renewal_asks_for_the_token_and_blank_keeps_the_stored_one(
+    isolated_home, accept_cookie, monkeypatch
+) -> None:
+    """Spec "Kaggle account": a renewal asks for each credential; blank keeps what is stored.
+
+    The cookie is a thirty day session and the token lasts until it is rotated, so renewing
+    the expired one must not demand the other. Reusing a stored token without asking made
+    renewal a no-op, which left an account stuck on a token Kaggle had stopped accepting.
+    """
+    first = make_cookie()
+    assert main(
+        ["login", "kaggle", "kaggle_a", "--cookie", first,
+         "--username", "irack000", "--key", "KGAT_first", "--no-input"]
+    ) == 0
+    assert (account("kaggle_a") / "access_token").read_text(encoding="utf-8") == "KGAT_first"
+
+    second = make_cookie()
+    asked: list[str] = []
+
+    def hidden(prompt: str) -> str:
+        asked.append(prompt)
+        # Blank for the token keeps the stored one; the cookie is the one being renewed.
+        return "" if prompt.startswith(login.KAGGLE_TOKEN_PROMPT) else second
+
+    monkeypatch.setattr(login, "read_password", hidden)
+    monkeypatch.setattr(login, "read_line", lambda prompt: "irack000")
+    assert main(["login", "kaggle", "kaggle_a", "--replace"]) == 0
+    assert any(prompt.startswith(login.KAGGLE_TOKEN_PROMPT) for prompt in asked), (
+        "a renewal has to ask rather than reuse"
+    )
+    assert (account("kaggle_a") / "access_token").read_text(encoding="utf-8") == "KGAT_first"
+    assert (account("kaggle_a") / "cookie").read_text(encoding="utf-8").strip() == second
+
+
+def test_a_renewal_with_nothing_stored_refuses_a_blank_token(
+    isolated_home, accept_cookie, monkeypatch
+) -> None:
+    """Spec "Kaggle account": a blank answer with nothing stored is refused."""
+    monkeypatch.setattr(login, "read_password", lambda prompt: "")
+    monkeypatch.setattr(login, "read_line", lambda prompt: "irack000")
+    assert main(["login", "kaggle", "kaggle_a"]) == 1
+    assert not (account("kaggle_a") / "access_token").exists()
+
+
 def test_a_cookie_can_be_read_from_a_file(isolated_home, accept_cookie, tmp_path) -> None:
     cookie = make_cookie()
     path = tmp_path / "kaggle_cookie.txt"
@@ -976,10 +1020,15 @@ def test_a_token_body_is_not_restricted_to_the_measured_length(
     assert (account("kaggle_a") / "access_token").read_text() == "KGAT_synthetic"
 
 
-def test_login_reuses_the_existing_access_token_without_asking_for_it(
+def test_a_login_that_asks_nothing_keeps_the_stored_token(
     isolated_home, accept_cookie, monkeypatch
 ) -> None:
-    """Spec "Kaggle": an existing account keeps its token when adding the owner."""
+    """Spec "Kaggle account": a blank answer, or no prompt at all, keeps the stored token.
+
+    An interactive renewal asks for the token so a dead credential can be replaced, which
+    test_a_renewal_asks_for_the_token_and_blank_keeps_the_stored_one pins. With every other
+    credential supplied and no terminal to ask at, the stored token stands unchanged.
+    """
     from letify.config.secrets import write_secret
 
     token_path = write_secret("kaggle_a", "access_token", API_TOKEN)
@@ -990,7 +1039,7 @@ def test_login_reuses_the_existing_access_token_without_asking_for_it(
 
     monkeypatch.setattr(login, "read_password", refuse_prompt)
     assert main(["login", "kaggle", "kaggle_a", "--cookie", make_cookie(),
-                 "--username", "irack000"]) == 0
+                 "--username", "irack000", "--no-input"]) == 0
     assert token_path.read_bytes() == original
     assert (account("kaggle_a") / "username").read_text() == "irack000"
     assert not (account("kaggle_a") / "api_token").exists()
