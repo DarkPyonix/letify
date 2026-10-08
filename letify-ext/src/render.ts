@@ -9,6 +9,7 @@ import { DayBucket, gpuMean } from "./history";
 import {
   Device,
   Status,
+  SessionRow,
   UsageRow,
   UtilizationRow,
   escapeHtml as e,
@@ -23,10 +24,16 @@ import {
 
 const pct = (share: number) => `${Math.round(share * 100)}%`;
 
-function gauge(share: number, marker: number | null): string {
+function gauge(share: number | null, marker: number | null): string {
+  if (share === null) return `<div class="gauge unknown" aria-label="unknown"></div>`;
+  share = Math.max(0, Math.min(1, share));
   const mark = marker === null ? "" : `<span class="mark" style="left:${(marker * 100).toFixed(1)}%"></span>`;
   const level = share >= 0.95 ? "error" : share >= 0.8 ? "warning" : "ok";
   return `<div class="gauge"><span class="fill ${level}" style="width:${(share * 100).toFixed(1)}%"></span>${mark}</div>`;
+}
+
+function metric(label: string, value: string, share: number | null, marker: number | null = null): string {
+  return `<div class="metric"><span class="metric-label">${e(label)}</span>${gauge(share, marker)}<span class="numeric">${e(value)}</span></div>`;
 }
 
 function stamp(seconds: number): string {
@@ -44,8 +51,8 @@ export function quotaCard(row: UsageRow, now: number): string {
   const left = shareLeft(row);
   const elapsed = periodElapsed(row, now);
   if (left !== null) {
-    lines.push(`<div class="row"><span>${pct(1 - left)} used</span><span>${e(formatAmount(row.remaining, row.unit))} left of ${e(formatAmount(row.limit ?? 0, row.unit))}</span></div>`);
-    lines.push(gauge(1 - left, elapsed));
+    lines.push(`<div class="row"><span>Remaining</span><span class="numeric">${e(formatAmount(row.remaining, row.unit))} left of ${e(formatAmount(row.limit ?? 0, row.unit))}</span></div>`);
+    lines.push(metric("Quota", pct(1 - left) + " used", 1 - left, elapsed));
   } else {
     lines.push(`<div class="row"><span>${e(formatAmount(row.remaining, row.unit))} left</span></div>`);
   }
@@ -68,7 +75,7 @@ export function quotaCard(row: UsageRow, now: number): string {
         ? `${formatAmount(r.remaining, r.unit)} left of ${formatAmount(r.limit, r.unit)}`
         : `${formatAmount(r.remaining, r.unit)} left`;
     lines.push(`<div class="row resource"><span>${e(r.name)}</span><span>${e(amount)}</span></div>`);
-    if (r.remaining !== null && r.limit) lines.push(gauge(Math.max(0, Math.min(1, 1 - r.remaining / r.limit)), null));
+    if (r.remaining !== null && r.limit) lines.push(metric(r.name, pct(1 - r.remaining / r.limit) + " used", 1 - r.remaining / r.limit));
     if (r.resets_at !== null) lines.push(`<div class="muted">Resets in ${formatDuration(r.resets_at - now)}, ${stamp(r.resets_at)}</div>`);
   }
   return `<div class="card">${lines.join("")}</div>`;
@@ -84,12 +91,12 @@ function deviceBlock(alias: string, device: Device, status: Status | null): stri
     holder,
   ].filter(Boolean).join(" · ");
   const memText = device.memory_total_gb
-    ? `${(device.memory_used_gb ?? 0).toFixed(1)}/${device.memory_total_gb.toFixed(1)} GiB`
+    ? `${device.memory_used_gb === null ? "unknown" : device.memory_used_gb.toFixed(1)}/${device.memory_total_gb.toFixed(1)} GiB`
     : "memory unknown";
   return `<div class="device">
 <div class="row"><span>gpu${device.index} ${e(device.name)}</span><span class="muted">${e(facts)}</span></div>
-<div class="row small"><span>util ${util === null ? "unknown" : `${Math.round(util)}%`}</span></div>${gauge((util ?? 0) / 100, null)}
-<div class="row small"><span>mem ${memText}</span></div>${gauge((mem ?? 0) / 100, null)}
+${metric("GPU", util === null ? "unknown" : `${Math.round(util)}%`, util === null ? null : util / 100)}
+${metric("MEM", memText + (mem === null ? "" : ` · ${Math.round(mem)}%`), mem === null ? null : mem / 100)}
 </div>`;
 }
 
@@ -99,18 +106,14 @@ export function gpuCard(row: UtilizationRow, status: Status | null): string {
   if (row.devices.length === 0) {
     return `<div class="card">${title}<div class="muted">${e(row.reason ?? "nothing reported")}</div></div>`;
   }
-  return `<div class="card">${title}${row.devices.map((d) => deviceBlock(row.alias, d, status)).join("")}</div>`;
+  return `<div class="card">${title}${row.devices.map((d) => deviceBlock(row.alias, d, status)).join("")}<div class="processes"><b>Processes</b><div class="muted">Process details are not provided by the CLI</div></div></div>`;
 }
 
-export function runtimesCard(status: Status | null): string {
-  if (!status) return `<div class="card muted">No status read yet</div>`;
-  if (status.runtimes.length === 0) {
-    return `<div class="card"><div class="title"><b>Runtimes</b></div><div class="muted">No live runtime in this project's process</div></div>`;
-  }
-  const rows = status.runtimes
-    .map((r) => `<div class="row"><span>${e(r.name)} <span class="muted">${e(r.provider)}.${e(r.accelerator)}</span></span><span>${r.busy ? "busy" : `idle ${formatDuration(r.idle_seconds)}`}</span></div>`)
-    .join("");
-  return `<div class="card"><div class="title"><b>Runtimes</b> <span class="muted">${status.live} live, ${status.busy} busy</span></div>${rows}</div>`;
+export function runtimesCard(status: Status | null, sessions: SessionRow[] = []): string {
+  const processRows = status?.runtimes.map((r) => `<div class="row"><span>${e(r.name)} <span class="muted">${e(r.provider)}.${e(r.accelerator)}</span></span><span>${r.busy ? "busy" : `idle ${formatDuration(r.idle_seconds)}`}</span></div>`).join("");
+  const process = `<div class="card"><div class="title"><b>Process runtimes</b>${status ? `<span class="muted"> ${status.live} live, ${status.busy} busy</span>` : ""}</div>${processRows || `<div class="muted">${status ? "No live runtime in this project's process" : "No status read yet"}</div>`}</div>`;
+  const providerRows = sessions.map((row) => `<div class="session-row"><b>${e(row.alias)}</b> <span class="muted">${e(row.kind)}</span>${row.sessions.map((name) => `<div>${e(name)}</div>`).join("") || `<div class="muted">${e(row.unavailable ?? row.reason ?? "No active sessions")}</div>`}</div>`).join("");
+  return process + `<div class="card"><div class="title"><b>Provider sessions</b></div>${providerRows || `<div class="muted">No session discovery read yet</div>`}</div>`;
 }
 
 export function historyChart(history: DayBucket[], kind: "gpu" | "quota"): string {
@@ -127,7 +130,7 @@ export function historyChart(history: DayBucket[], kind: "gpu" | "quota"): strin
 }
 
 export const STYLE = `
-body{font-family:var(--vscode-font-family);font-size:var(--vscode-font-size);color:var(--vscode-foreground);padding:6px 10px}
+body{background:var(--vscode-editor-background);font-family:var(--vscode-font-family);font-size:var(--vscode-font-size);color:var(--vscode-foreground);padding:6px 10px}
 .tabs{display:flex;gap:4px;margin-bottom:8px}
 .tabs button{background:transparent;color:var(--vscode-foreground);border:0;border-bottom:2px solid transparent;padding:4px 8px;cursor:pointer}
 .tabs button.active{border-bottom-color:var(--vscode-focusBorder);font-weight:600}
@@ -141,7 +144,14 @@ body{font-family:var(--vscode-font-family);font-size:var(--vscode-font-size);col
 .fill.warning{background:var(--vscode-editorWarning-foreground)}
 .fill.error{background:var(--vscode-editorError-foreground)}
 .mark{position:absolute;top:-2px;bottom:-2px;width:2px;background:var(--vscode-foreground)}
-.device{margin-top:6px}
+.device{margin-top:8px;padding-top:6px;border-top:1px solid var(--vscode-panel-border)}
+.metric{display:grid;grid-template-columns:5ch minmax(40px,1fr) minmax(9ch,auto);gap:8px;align-items:center;margin:4px 0;font-family:var(--vscode-editor-font-family,monospace);font-variant-numeric:tabular-nums}
+.metric .gauge{height:10px;margin:0;background:var(--vscode-textBlockQuote-background,var(--vscode-input-background));border:1px solid var(--vscode-panel-border)}
+.metric-label{color:var(--vscode-descriptionForeground)}
+.numeric{text-align:right;white-space:nowrap;font-variant-numeric:tabular-nums}
+.fill.ok{background:var(--vscode-charts-green,var(--vscode-progressBar-background))}
+.processes,.session-row{margin-top:8px;padding-top:6px;border-top:1px solid var(--vscode-panel-border)}
+@media(max-width:360px){.metric{grid-template-columns:5ch minmax(30px,1fr)}.numeric{grid-column:2;white-space:normal}.row{flex-wrap:wrap}}
 .resource{margin-top:6px}
 .chart{display:flex;align-items:flex-end;gap:2px;height:48px}
 .bar{flex:1;background:var(--vscode-charts-blue,var(--vscode-progressBar-background));min-width:3px}

@@ -1158,8 +1158,8 @@ def test_the_modal_adapter_runs_in_its_own_uv_environment_with_a_pinned_modal() 
     command = tools_module.modal_adapter_command("/usr/bin/uv")
     assert command[:6] == ["/usr/bin/uv", "run", "--no-project", "--python", "3.12", "--with"]
     assert command[6] == "modal>=1.0,<2"
-    assert command[7:9] == ["python", "-P"]
-    assert Path(command[9]) == Path(modal_module.__file__).with_name("modal_adapter.py")
+    assert command[7:11] == ["--frozen", "--no-sync", "python", "-P"]
+    assert Path(command[11]) == Path(modal_module.__file__).with_name("modal_adapter.py")
 
 
 def test_a_sibling_modal_module_does_not_shadow_the_modal_package(tmp_path: Path) -> None:

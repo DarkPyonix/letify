@@ -33,6 +33,10 @@ def build_parser() -> argparse.ArgumentParser:
     devices_parser.add_argument("--json", action="store_true", help="print the records unformatted")
     status_parser = sub.add_parser("status", help="show live runtimes and what they are costing")
     status_parser.add_argument("--json", action="store_true", help="print the records unformatted")
+    sessions_parser = sub.add_parser("sessions", help="list provider-owned sessions")
+    sessions_parser.add_argument(
+        "--json", action="store_true", help="print the records unformatted"
+    )
     sub.add_parser("stubs", help="write the provider types an editor completes")
 
     usage = sub.add_parser("usage", help="show what each account has left")
@@ -543,6 +547,16 @@ def _dispatch(args: argparse.Namespace) -> int:
             return 0
         rows = [[alias, ", ".join(str(name) for name in names)] for alias, names in table.items()]
         sys.stdout.write(render.table(["PROVIDER", "ACCELERATORS"], rows, _out()))
+        return 0
+
+    if args.command == "sessions":
+        rows = let.sessions()
+        if args.json:
+            return _json(rows)
+        for row in rows:
+            names = ", ".join(row["sessions"])
+            detail = row.get("unavailable") or row.get("reason") or names or "no active sessions"
+            print(f"{row['alias']}  {detail}")
         return 0
 
     if args.command == "status":

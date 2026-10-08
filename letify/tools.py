@@ -147,6 +147,8 @@ def script_command(tool: Tool, uv: str, script: Path) -> list[str]:
         "--python",
         tool.python,
         *pinned,
+        "--frozen",
+        "--no-sync",
         "python",
         "-P",
         str(script),
