@@ -37,6 +37,41 @@ def test_the_efficiency_formula_is_on_the_command_line(capsys) -> None:
     assert "52.6% of a direct run" in capsys.readouterr().out
 
 
+
+def test_login_leaves_an_existing_account_alone_and_names_replace(isolated_home, capsys) -> None:
+    """Spec "Logging in": an existing alias is untouched, and the command says what renews it.
+
+    A second repository naming an account that was set up once must not be asked anything,
+    so the default is to leave it alone. The user still has to be told how to renew a
+    credential, or an expired one is a dead end.
+    """
+    (Path.home() / ".letify" / "config.toml").write_text(
+        '[lab]\nkind = "shell"\naddress = "gpu.example.edu"\n', encoding="utf-8"
+    )
+    assert main(["login", "shell", "lab", "--no-input"]) == 0
+    assert "--replace" in capsys.readouterr().out
+
+
+def test_login_replace_runs_the_flow_again_for_an_existing_account(
+    isolated_home, capsys, patch_run
+) -> None:
+    """Spec "Logging in": --replace asks for every credential again and rewrites the account."""
+    (Path.home() / ".letify" / "config.toml").write_text(
+        '[lab]\nkind = "shell"\naddress = "stale.example.edu"\n', encoding="utf-8"
+    )
+    patch_run(login, result=machine())
+    code = main(
+        ["login", "shell", "lab", "--address", "fresh.example.edu", "--replace",
+         "--skip-key-install", "--no-input"]
+    )
+    assert code == 0
+    out = capsys.readouterr().out
+    assert "--replace" not in out
+    home = (Path.home() / ".letify" / "config.toml").read_text(encoding="utf-8")
+    assert "fresh.example.edu" in home
+    assert "stale.example.edu" not in home
+
+
 def test_the_efficiency_subcommand_needs_no_configuration(isolated_home, capsys) -> None:
     # It is arithmetic, so it answers before any account is declared.
     assert main(["efficiency", "4.0", "1", "150"]) == 0
