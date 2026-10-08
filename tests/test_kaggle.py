@@ -127,6 +127,20 @@ def test_a_login_missing_only_the_key_is_refused(isolated_home, accept_cookie, c
     assert not (account("kaggle_a") / "cookie").exists()
 
 
+@pytest.mark.parametrize("owner", [None, "", "   "])
+def test_login_refuses_a_missing_owner_before_declaring_the_account(
+    isolated_home, accept_cookie, capsys, owner
+) -> None:
+    """Spec "Kaggle": a declared account must carry its notebook deletion owner."""
+    owner_args = [] if owner is None else ["--username", owner]
+    assert main(["login", "kaggle", "kaggle_a", "--cookie", make_cookie(),
+                 "--key", API_TOKEN, *owner_args, "--no-input"]) == 1
+    assert "notebook owner" in capsys.readouterr().err
+    assert not account("kaggle_a").exists()
+    assert not (Path.home() / ".letify" / "config.toml").exists()
+    assert accept_cookie == []
+
+
 def test_an_expired_cookie_is_refused_with_nothing_written(
     isolated_home, accept_cookie, capsys
 ) -> None:
@@ -268,6 +282,7 @@ def test_a_run_refuses_to_start_with_under_an_hour_left_on_the_cookie(isolated_h
     import letify
     from letify.config.secrets import write_secret
 
+    write_secret("kaggle_a", "username", "irack000")
     soon = datetime.now(UTC) + timedelta(minutes=30)
     write_secret("kaggle_a", "cookie", make_cookie(soon.strftime("%Y-%m-%dT%H:%M:%SZ")))
     runtime = type("R", (), {"name": "letify-t4-1"})()
@@ -786,6 +801,51 @@ def test_stopping_cancels_the_run_through_the_cookie_and_deletes_the_notebook_vi
     assert "kernels" in deletes[0]
 
 
+def test_stop_deletes_the_notebook_for_an_account_declared_through_login(
+    fake_kaggle, fake_kaggle_cli, capsys
+) -> None:
+    """Spec "Kaggle session token chain": login supplies the owner used by stop."""
+    for path in account("kaggle_a").iterdir():
+        path.unlink()
+    account("kaggle_a").rmdir()
+    assert main(["login", "kaggle", "kaggle_a", "--cookie", make_cookie(),
+                 "--username", "login_owner", "--key", API_TOKEN, "--no-input"]) == 0
+    assert home_config()["kaggle_a"] == {"kind": "kaggle"}
+    assert (account("kaggle_a") / "username").read_text() == "login_owner"
+    assert (account("kaggle_a") / "access_token").read_text() == API_TOKEN
+    assert (account("kaggle_a") / "cookie").read_text() == make_cookie()
+
+    provider, runtime, _channel = session_channel(fake_kaggle)
+    provider.stop(runtime)
+
+    assert fake_kaggle.kernels == set()
+    assert fake_kaggle.cancelled == [fake_kaggle.RUN_ID]
+    assert len(fake_kaggle_cli.calls) == 1
+    assert fake_kaggle_cli.calls[0][-4:] == [
+        "kernels", "delete", "-y", "login_owner/letify-runtime"
+    ]
+    assert fake_kaggle_cli.environments[0]["KAGGLE_API_TOKEN"] == API_TOKEN
+    assert "delete it by hand" not in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("contents", [None, b"", b" \n", b"\xff"])
+def test_a_session_without_a_readable_owner_is_refused_before_creating_a_notebook(
+    fake_kaggle, contents
+) -> None:
+    """Spec "Kaggle": an incomplete account cannot create an undeletable notebook."""
+    from letify.errors import ConfigError
+
+    owner_path = account("kaggle_a") / "username"
+    if contents is None:
+        owner_path.unlink()
+    else:
+        owner_path.write_bytes(contents)
+    with pytest.raises(ConfigError, match=r"letify login kaggle kaggle_a.*--username"):
+        session_channel(fake_kaggle)
+    assert fake_kaggle.cloud_calls == []
+    assert fake_kaggle.kernels == set()
+
+
 def test_a_notebook_is_warned_about_by_name_when_the_cli_delete_fails(
     fake_kaggle, fake_kaggle_cli, capsys
 ) -> None:
@@ -949,3 +1009,25 @@ def test_a_september_access_token_file_authenticates_quota_without_login(
     assert fake_kaggle_cli.environments[0]["KAGGLE_API_TOKEN"] == API_TOKEN
     assert all(API_TOKEN not in argument and str(token_path) not in argument
                for argument in fake_kaggle_cli.calls[0])
+
+
+@pytest.mark.parametrize("contents", [API_TOKEN + "\n", "  " + API_TOKEN + "\r\n", " \n"])
+def test_reading_a_stored_api_token_strips_surrounding_whitespace(isolated_home, contents) -> None:
+    """Spec "Kaggle": stored token files may have trailing newlines."""
+    from letify.config.secrets import write_secret
+    from letify.providers.kaggle import read_api_token
+
+    write_secret("kaggle_a", "access_token", contents)
+    assert read_api_token("kaggle_a") == (contents.strip() or None)
+
+
+def test_a_stored_token_with_a_newline_authenticates_cli_deletion(
+    fake_kaggle_cli, kaggle_api_token
+) -> None:
+    """Spec "Kaggle": the CLI receives the token without file whitespace."""
+    from letify.providers.kaggle import delete_notebook_via_cli
+
+    kaggle_api_token.write_text(API_TOKEN + "\n", encoding="utf-8")
+    assert delete_notebook_via_cli("kaggle_a", "notebook63516d2758") is True
+    assert fake_kaggle_cli.calls[0][-1] == "irack000/notebook63516d2758"
+    assert fake_kaggle_cli.environments[0]["KAGGLE_API_TOKEN"] == API_TOKEN

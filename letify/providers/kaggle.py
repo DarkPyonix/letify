@@ -520,9 +520,9 @@ def cancel_run(cookie: str, run_id: int) -> None:
 
 
 def read_api_token(alias: str) -> str | None:
-    """Read the account's verbatim API token, or None when the file is unreadable or empty."""
+    """Read the account's API token with file whitespace stripped, or None if unavailable."""
     try:
-        token = (account_directory(alias) / "access_token").read_text(encoding="utf-8")
+        token = (account_directory(alias) / "access_token").read_text(encoding="utf-8").strip()
     except (OSError, UnicodeError):
         return None
     return token or None
@@ -544,6 +544,15 @@ def require_api_token(alias: str) -> str:
     return token
 
 
+def read_notebook_owner(alias: str) -> str | None:
+    """Read the public notebook owner saved by login, or None if unavailable."""
+    try:
+        owner = (account_directory(alias) / "username").read_text(encoding="utf-8").strip()
+    except (OSError, UnicodeError):
+        return None
+    return owner or None
+
+
 def delete_notebook_via_cli(alias: str, slug: str | None) -> bool:
     """Delete the ephemeral notebook through the official CLI, the only way it is deleted.
 
@@ -558,11 +567,8 @@ def delete_notebook_via_cli(alias: str, slug: str | None) -> bool:
     token = read_api_token(alias)
     if token is None:
         return False
-    try:
-        username = (account_directory(alias) / "username").read_text(encoding="utf-8").strip()
-    except (OSError, UnicodeError):
-        return False
-    if not username:
+    username = read_notebook_owner(alias)
+    if username is None:
         return False
     uv = tools.find_uv()
     if uv is None:
@@ -1036,6 +1042,11 @@ class Kaggle(Provider):
         The notebook is created fresh for this runtime alone, never reused from an earlier
         one: spec "Kaggle session token chain".
         """
+        if read_notebook_owner(self.alias) is None:
+            raise ConfigError(
+                f"{self.alias} has no Kaggle notebook owner. Log in again with: "
+                f"letify login kaggle {self.alias} --username <owner>"
+            )
         cookie = self._require_live_cookie()
         instance = getattr(runtime, "instance", None)
         gpu = getattr(instance, "gpu", None)
