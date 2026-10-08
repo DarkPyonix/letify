@@ -255,6 +255,14 @@ def verify_cookie(cookie: str) -> str:
 def require_live_cookie(alias: str) -> str:
     """The cookie for a run, or a ``ConfigError`` telling the user to log in again.
 
+    Checks only what the cookie itself states: its shape, and its ``exp`` claim. That claim
+    is not proof the cookie still works, since Kaggle has been seen to invalidate a session
+    server side well before ``exp``, with the claim left unchanged; a cookie this check
+    passes can still be refused by Kaggle itself. ``Kaggle._require_live_cookie`` is what
+    confirms liveness online, with ``verify_cookie``, for the two paths that are about to
+    make a call the cookie must actually be live for. This function on its own is for a read
+    that does not reach the network, such as ``account_note``.
+
     Spec "Kaggle account": a run whose cookie is missing or past its ``exp`` cannot mint the
     proxy token, so it is refused here rather than failing deeper. The message names the one
     fact letify has, the expiry, and never states the session ended for another reason.
@@ -516,10 +524,13 @@ def delete_notebook(cookie: str, kernel_id: int) -> bool:
 
     Spec "Kaggle session token chain": ``kernels.KernelsService/DeleteKernel`` sits beside
     ``CreateKernelWithSettings`` on the same internal service, so the field name is assumed
-    to be ``kernelId`` by analogy with every other call in this chain, not confirmed against
-    a live account. Returns whether the call was answered without error; never raises,
-    because the accelerator quota is already released by cancelling the run, and a notebook
-    this call fails to delete is not a new failure for the runtime that just ended.
+    to be ``kernelId`` by analogy with every other call in this chain. This still needs
+    confirming against an account whose cookie is actually live: an attempt to check it hit
+    an already-refused cookie, where every internal call answered HTTP 400 regardless of
+    body, so nothing was learned about the field name itself. Returns whether the call was
+    answered without error; never raises, because the accelerator quota is already released
+    by cancelling the run, and a notebook this call fails to delete is not a new failure for
+    the runtime that just ended.
     """
     try:
         _call(cookie, KERNELS_SERVICE + "DeleteKernel", {"kernelId": kernel_id})
@@ -877,7 +888,12 @@ class Kaggle(Provider):
     default_workspace = "/kaggle/working/letify"
 
     def account_note(self) -> str | None:
-        """How the account's cookie is doing, for `letify providers`."""
+        """How the account's cookie is doing, for `letify providers`, with no network call.
+
+        This is the cookie's own ``exp`` claim, not a confirmed answer: Kaggle can refuse a
+        cookie before ``exp`` passes, and this note cannot tell that apart from a cookie
+        that still works. ``letify usage`` makes the one call that actually checks.
+        """
         cookie = read_cookie(self.alias)
         if cookie is None:
             return "no cookie; run letify login kaggle"
@@ -887,7 +903,7 @@ class Kaggle(Provider):
             return "cookie unreadable; log in again"
         if left <= 0:
             return "cookie EXPIRED; log in again"
-        return f"cookie expires in {int(left)} days"
+        return f"cookie's exp claim says {int(left)} days left (not checked live; see letify usage)"
 
     def available(self) -> bool:
         return tools.find_uv() is not None
@@ -913,12 +929,50 @@ class Kaggle(Provider):
                 f"host='remote'."
             )
 
+    #: How long a cookie confirmed live with ``verify_cookie`` is trusted before it is
+    #: checked online again. Starting several runtimes in quick succession then costs one
+    #: round trip, not one per runtime.
+    COOKIE_LIVENESS_TTL = 60.0
+
     def __init__(self, config: ProviderConfig):
         super().__init__(config)
         #: The session, kernel, channel, run id, notebook id and notebook slug each runtime
         #: runs its programs in. The notebook is this runtime's own, created in
         #: ``open_channel`` and deleted in ``stop``.
         self._kernels: dict[str, tuple[Session, str, KaggleChannel, int, int, str | None]] = {}
+        #: Monotonic time of the last confirmed-live cookie check, or None before the first.
+        self._cookie_checked_at: float | None = None
+
+    def _require_live_cookie(self) -> str:
+        """The account's cookie, confirmed live with Kaggle, not only unexpired.
+
+        Spec "Kaggle account": the ``exp`` claim ``require_live_cookie`` checks is not proof
+        the session still works, so a cookie that passes it is also checked online with
+        ``verify_cookie`` here, once per ``COOKIE_LIVENESS_TTL``. A cookie Kaggle refuses is
+        reported as that, separately from an expired one, because the fix the user needs to
+        hear is the same either way, log in again, but stating it ended for the wrong reason
+        would be stating something this check does not establish.
+        """
+        cookie = require_live_cookie(self.alias)
+        now = time.monotonic()
+        checked = self._cookie_checked_at
+        if checked is not None and now - checked < self.COOKIE_LIVENESS_TTL:
+            return cookie
+        try:
+            verify_cookie(cookie)
+        except ValueError as exc:
+            if "could not be checked" in str(exc):
+                # The check itself did not complete, a transport problem rather than an
+                # answer from Kaggle, so this is not evidence the cookie is bad: the call
+                # that was about to be made reports its own failure instead.
+                raise RuntimeFailure(f"{self.alias}: {exc}") from None
+            raise ConfigError(
+                f"{self.alias}: the Kaggle cookie has not expired, but Kaggle no longer "
+                f"accepts it. Log in to kaggle.com again and run: letify login kaggle "
+                f"{self.alias}"
+            ) from None
+        self._cookie_checked_at = now
+        return cookie
 
     def open_channel(self, runtime: Runtime) -> Channel:
         """Start a session from the cookie and open one worker in one cell of it.
@@ -926,7 +980,7 @@ class Kaggle(Provider):
         The notebook is created fresh for this runtime alone, never reused from an earlier
         one: spec "Kaggle session token chain".
         """
-        cookie = require_live_cookie(self.alias)
+        cookie = self._require_live_cookie()
         instance = getattr(runtime, "instance", None)
         gpu = getattr(instance, "gpu", None)
         accelerator = GPUS[gpu]["accelerator"] if gpu in GPUS else None
@@ -968,8 +1022,13 @@ class Kaggle(Provider):
         delete_notebook_best_effort(self.alias, cookie, notebook, slug)
 
     def report_usage(self) -> Usage:
-        """The weekly accelerator quota, read from the cookie rather than any API key."""
-        cookie = require_live_cookie(self.alias)
+        """The weekly accelerator quota, read from the cookie rather than any API key.
+
+        Confirms the cookie is live first, with the same online check ``open_channel``
+        makes, so a dead cookie is reported as that rather than as a confusing refusal from
+        the quota call itself.
+        """
+        cookie = self._require_live_cookie()
         stats = _call(cookie, KERNELS_SERVICE + "GetAcceleratorQuotaStatistics", {})
         gpu = stats.get("gpuQuota")
         if not isinstance(gpu, dict):
