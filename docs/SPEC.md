@@ -1175,7 +1175,7 @@ The worker looks for `uv` on `PATH`, then at `<workspace root>/uv-bin/uv`. When 
 
 ### uv cache <!-- id: uv-cache -->
 
-> The runtime's uv cache, its managed Pythons and its tool installs all sit under the workspace root, `<workspace root>/uv-cache`, `<workspace root>/uv-python` and `<workspace root>/uv-tool`, on every provider, persistent or ephemeral.
+> uv's package cache and tool installs sit under the workspace root. Managed Pythons use `<workspace root>/uv-python` by default, or the project tree when an ephemeral environment is archived.
 
 uv installs a package into a `.venv` by hard linking it from its cache, and falls back to a full copy when the cache is on another filesystem. A container's home directory is often an overlay while the workspace root is a mounted disk, so the default cache under `~/.cache/uv` makes every new env key copy the whole environment on a persistent provider. uv's defaults for its managed Python interpreters, `~/.local/share/uv/python`, and for `uv tool run`, `~/.local/share/uv/tools`, sit under the home directory the same way, and some accounts can write nothing there at all: a workspace root such as `/workspace` on a department GPU server is the one path they may write to, so letify's own uv calls have to stay inside it whether or not the machine survives the session.
 
@@ -1466,7 +1466,8 @@ Everything letify writes on the runtime is under the root:
 | `<workspace root>/project/<env key>` | the project files `uv sync` reads, and the `.venv` it builds, except on `modal`, as Environment on the sandbox disk describes |
 | `<workspace root>/project/.<digest>.tar.gz` | an environment archive while it is unpacked, removed once the `.venv` starts |
 | `<workspace root>/uv-cache` | uv's package cache, on every provider, as uv cache describes |
-| `<workspace root>/uv-python` | the Python interpreters uv downloads to match `Env.python`, as uv cache describes |
+| `<workspace root>/uv-python` | the Python interpreters uv downloads to match `Env.python` when the environment is not archived, as uv cache describes |
+| `<project directory>/.letify-python` | managed Python interpreters included in an ephemeral environment archive, unless `Env.vars` sets their directory |
 | `<workspace root>/uv-tool` | tool environments `uv tool run` builds, as uv cache describes |
 | `<workspace root>/uv-bin` | the `uv` binary itself, installed here when none is already on `PATH`, as uv on the runtime describes |
 | `<workspace root>/volumes/<volume name>` | a volume's materialized blobs and project data |
