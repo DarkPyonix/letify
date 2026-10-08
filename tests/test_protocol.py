@@ -15,7 +15,6 @@ import sys
 from contextlib import contextmanager
 from importlib import import_module
 from pathlib import Path
-from typing import Any
 
 import cloudpickle
 import pytest
@@ -334,7 +333,7 @@ def test_a_blob_argument_defined_in_the_run_script_ships_by_value(tmp_path: Path
         "        self.payload = payload\n"
         "\n"
         "\n"
-        "let = letify.Launcher(%r, home=False, announce=False)\n"
+        f"let = letify.Launcher({str(project)!r}, home=False, announce=False)\n"
         "\n"
         "\n"
         "@let.function(device=let.providers.local.CPU, host='remote')\n"
@@ -345,7 +344,7 @@ def test_a_blob_argument_defined_in_the_run_script_ships_by_value(tmp_path: Path
         "argument = LocalMainClass(os.urandom(200))\n"
         "result = read_payload(argument)\n"
         "assert result == argument.payload\n"
-        "print('OK')\n" % str(project)
+        "print('OK')\n"
     )
     completed = subprocess.run(
         [sys.executable, str(script)],

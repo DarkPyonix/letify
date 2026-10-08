@@ -1540,7 +1540,8 @@ def _call(request):
         # the same name reached the call fine as a global. Say so, because the
         # bare ModuleNotFoundError reads as a missing dependency rather than as
         # this shape of call.
-        raise ModuleNotFoundError(_SHIP_IS_NOT_INSTALL.format(name=exc.name), name=exc.name) from exc
+        explained = _SHIP_IS_NOT_INSTALL.format(name=exc.name)
+        raise ModuleNotFoundError(explained, name=exc.name) from exc
     return {"ok": True, "value": value}
 
 
