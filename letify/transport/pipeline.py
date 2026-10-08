@@ -40,6 +40,15 @@ DEFAULT_MIN_MIB_PER_S = 10.0
 DEFAULT_MAX_RTT_MS = 300.0
 
 
+class _BelowFloor(ProviderUnavailable):
+    """Every connected strategy measured below the floor.
+
+    Spec "Choosing a link": this does not end the race, because a strategy still
+    connecting may clear the floor. The race raises it only once nothing is left to wait
+    for, and it reaches the caller as the ``ProviderUnavailable`` it is.
+    """
+
+
 @dataclass(frozen=True)
 class LinkFloor:
     """The slowest link an account accepts. A probe below this fails the connection."""
@@ -402,43 +411,86 @@ class Pipeline:
 
         probed = {i for i, s in enumerate(applicable) if getattr(s, "probed", True)}
         deadline = time.monotonic() + self.timeout
-        with condition:
-            while len(outcomes) < len(applicable):
-                connected = [i for i, o in outcomes.items() if not isinstance(o, Exception)]
-                if state["first"] is None and probed <= outcomes.keys() and connected:
-                    # Every probed strategy failed, so an unprobed one is all that is left.
-                    break
-                now = time.monotonic()
-                limit = deadline if state["first"] is None else state["first"] + self.grace
-                if now >= limit:
-                    break
-                condition.wait(limit - now)
-            state["decided"] = True
-            settled = dict(outcomes)
-        for index, event in enumerate(cancels):
-            if index not in settled:
-                event.set()
+        held = {s.name for s in applicable if not getattr(s, "probed", True)}
+        #: Strategies already offered to _choose, so a later round considers only new ones.
+        seen: set[int] = set()
+        rejected: _BelowFloor | None = None
 
-        connected = []
+        # Spec "Choosing a link": the race is not over until a link is accepted. A round
+        # that ends with every connected strategy below the floor drops the grace period
+        # and waits out the rest of the timeout for the strategies still connecting.
+        while True:
+            with condition:
+                while len(outcomes) < len(applicable):
+                    fresh = [
+                        index
+                        for index, outcome in outcomes.items()
+                        if index not in seen and not isinstance(outcome, Exception)
+                    ]
+                    if state["first"] is None and probed <= outcomes.keys() and fresh:
+                        # Every probed strategy failed, so an unprobed one is all that is left.
+                        break
+                    now = time.monotonic()
+                    limit = deadline if state["first"] is None else state["first"] + self.grace
+                    if now >= limit:
+                        break
+                    condition.wait(limit - now)
+                settled = dict(outcomes)
+
+            connected = []
+            for index, strategy in enumerate(applicable):
+                if index in seen or index not in settled:
+                    continue
+                seen.add(index)
+                outcome = settled[index]
+                if isinstance(outcome, Exception):
+                    reasons.append(f"{strategy.name}: {outcome}")
+                else:
+                    connected.append(outcome)
+
+            if connected:
+                connected.sort(key=lambda link: link.rank)
+                try:
+                    chosen, measured = self._choose(connected, reasons, held)
+                except _BelowFloor as below:
+                    rejected = below
+                else:
+                    with condition:
+                        state["decided"] = True
+                    for index, event in enumerate(cancels):
+                        if index not in seen:
+                            event.set()
+                    self._report_unsettled(applicable, seen, reasons)
+                    first = state["first_name"]
+                    if first is not None and first != chosen.strategy:
+                        self._say(f"switching from {first} to {chosen.strategy}")
+                    return chosen, measured
+
+            if len(seen) == len(applicable) or time.monotonic() >= deadline:
+                break
+            # Nothing acceptable yet, so the strategies still connecting get the rest of
+            # the timeout rather than the grace period that a rejected link started.
+            with condition:
+                state["first"] = None
+                state["first_name"] = None
+
+        with condition:
+            state["decided"] = True
+        for index, event in enumerate(cancels):
+            if index not in seen:
+                event.set()
+        self._report_unsettled(applicable, seen, reasons)
+        if rejected is not None:
+            raise rejected
+        self._say("no strategy connected")
+        raise ProviderUnavailable("shell", self._explain(reasons))
+
+    def _report_unsettled(self, applicable: list[Any], seen: set[int], reasons: list[str]) -> None:
+        """Name every strategy that had not connected when the choice was made."""
         for index, strategy in enumerate(applicable):
-            outcome = settled.get(index)
-            if outcome is None:
+            if index not in seen:
                 reasons.append(f"{strategy.name}: did not connect in time")
                 self._say(f"{strategy.name} timed out: not connected when the choice was made")
-            elif isinstance(outcome, Exception):
-                reasons.append(f"{strategy.name}: {outcome}")
-            else:
-                connected.append(outcome)
-        if not connected:
-            self._say("no strategy connected")
-            raise ProviderUnavailable("shell", self._explain(reasons))
-        connected.sort(key=lambda link: link.rank)
-        held = {s.name for s in applicable if not getattr(s, "probed", True)}
-        chosen, measured = self._choose(connected, reasons, held)
-        first = state["first_name"]
-        if first is not None and first != chosen.strategy:
-            self._say(f"switching from {first} to {chosen.strategy}")
-        return chosen, measured
 
     def _measure(self, link: Any) -> ProbeResult | None:
         """Probe a link and print the numbers. None when the link cannot carry the probe."""
@@ -470,7 +522,7 @@ class Pipeline:
                 measured = None
             if measured is None and floored_out:
                 _close(link)
-                raise ProviderUnavailable("shell", self._explain(reasons))
+                raise _BelowFloor("shell", self._explain(reasons))
             if link.strategy in held:
                 self._fall_back(link)
             else:
@@ -480,7 +532,8 @@ class Pipeline:
                         below = f"{link.strategy}: below the floor: {', '.join(floored)}"
                         self._say(f"rejected {below}")
                         _close(link)
-                        raise ProviderUnavailable("shell", self._explain([*reasons, below]))
+                        reasons.append(below)
+                        raise _BelowFloor("shell", self._explain(reasons))
                 self._say(f"chose {link.strategy}: only one connected")
             return link, measured
 
@@ -502,7 +555,9 @@ class Pipeline:
             floored = self.floor.violations(measured)
             if floored:
                 self._say(f"rejected {link.strategy}: below the floor: {', '.join(floored)}")
-                floored_out.append(f"{link.strategy}: below the floor: {', '.join(floored)}")
+                below = f"{link.strategy}: below the floor: {', '.join(floored)}"
+                floored_out.append(below)
+                reasons.append(below)
                 _close(link)
             else:
                 above_floor.append((link, measured))
@@ -534,8 +589,8 @@ class Pipeline:
             for link in unprobed:
                 _close(link)
             self._say("every probe was below the floor")
-            raise ProviderUnavailable(
-                "shell", self._explain([*reasons, "every probe was below the floor", *floored_out])
+            raise _BelowFloor(
+                "shell", self._explain([*reasons, "every probe was below the floor"])
             )
         elif unprobed:
             chosen, measured = unprobed[0], None

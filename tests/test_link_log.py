@@ -6,9 +6,11 @@ Strategies and probes are the fakes from conftest, so delays and numbers are con
 
 from __future__ import annotations
 
+import pytest
 from conftest import FakeProbe, FakeStrategy
 
 import letify
+from letify.errors import ProviderUnavailable
 from letify.transport.pipeline import Fingerprint, LinkCache, LinkFloor, Pipeline
 from letify.transport.probe import ProbeResult
 
@@ -192,3 +194,32 @@ def test_a_quiet_launcher_prints_no_connection_lines(config_file, capsys) -> Non
     letify.Launcher(config_file(body), home=False, announce=False).provider("lab").connect()
     captured = capsys.readouterr()
     assert (captured.out, captured.err) == ("", "")
+
+
+# -- Spec: Choosing a link, the race is not over until a link is accepted ----------
+
+
+def test_a_strategy_rejected_by_the_floor_does_not_end_the_race() -> None:
+    # The reported Colab run: tcp_punch connected at 10.7 s and was rejected by the floor,
+    # and tailcat connected 2 s later and was closed unprobed, so the connection failed
+    # although tailcat was acceptable. Spec "Choosing a link".
+    floor = LinkFloor(min_bps=10 * MIB, max_rtt_ms=300.0)
+    punch = FakeStrategy("tcp_punch", 2, delay=0.05, result=result(8.1, 0.2, rtt=138.0))
+    tailcat = FakeStrategy("tailcat", 3, delay=0.45, result=result(24.0, 20.0))
+
+    chosen = pipeline([punch, tailcat], grace=0.2, floor=floor).connect()
+
+    assert chosen.strategy == "tailcat"
+
+
+def test_the_connection_still_fails_when_the_later_strategy_is_also_below_the_floor() -> None:
+    # Spec "Choosing a link": waiting longer is not accepting less. Every strategy settles
+    # below the floor, so the connection fails and names both rejections.
+    floor = LinkFloor(min_bps=10 * MIB, max_rtt_ms=300.0)
+    punch = FakeStrategy("tcp_punch", 2, delay=0.05, result=result(8.1, 0.2, rtt=138.0))
+    tailcat = FakeStrategy("tailcat", 3, delay=0.45, result=result(4.0, 0.1))
+
+    with pytest.raises(ProviderUnavailable) as raised:
+        pipeline([punch, tailcat], grace=0.2, floor=floor).connect()
+
+    assert "tcp_punch" in str(raised.value) and "tailcat" in str(raised.value)
