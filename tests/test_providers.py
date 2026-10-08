@@ -2828,7 +2828,9 @@ def test_colab_rendezvous_completes_while_a_wake_holds_the_account_lock(
     }
     waking = threading.Thread(target=lambda: daemon.wake(config))
     punching = threading.Thread(
-        target=lambda: answers.append(provider.rendezvous(runtime).exchange({"kind": "tcp_punch"}, 30))
+        target=lambda: answers.append(
+            provider.rendezvous(runtime).exchange({"kind": "tcp_punch"}, 30)
+        )
     )
     waking.start()
     try:
