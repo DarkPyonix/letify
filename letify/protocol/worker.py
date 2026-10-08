@@ -195,6 +195,16 @@ _NO_LETIFY = (
     "the project with 'uv add letify' so uv.lock carries it into the runtime."
 )
 
+_SHIP_IS_NOT_INSTALL = (
+    "{name!r} is not importable in this runtime while the call's body was running. "
+    "Env.ship() sends a module by value: an object from it that the function captures "
+    "as a global is carried inside the call's payload, but the module itself is never "
+    "installed in the runtime, so 'import {name}' inside the function body has nothing "
+    "to find. Reference the name as a global the function closes over instead of "
+    "importing it inside the body, or install the package in the runtime's environment "
+    "(name it in uv.lock) so it can be imported there by reference."
+)
+
 
 def _ship_main_to_children(cloudpickle):
     """Let a child process the body spawns rebuild what the caller's __main__ defined.
@@ -1523,7 +1533,14 @@ def _call(request):
         # refers to it when loaded, so the same explanation applies.
         if (exc.name or "").split(".")[0] == "letify":
             raise ModuleNotFoundError(_NO_LETIFY, name=exc.name) from exc
-        raise
+        # A package Env.ship() sends by value never lands on this runtime's
+        # sys.path: cloudpickle only puts a captured global in the payload, it
+        # does not install anything. An import statement inside the body still
+        # runs against this interpreter's own path and fails here, even though
+        # the same name reached the call fine as a global. Say so, because the
+        # bare ModuleNotFoundError reads as a missing dependency rather than as
+        # this shape of call.
+        raise ModuleNotFoundError(_SHIP_IS_NOT_INSTALL.format(name=exc.name), name=exc.name) from exc
     return {"ok": True, "value": value}
 
 
