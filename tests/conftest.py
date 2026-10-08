@@ -209,6 +209,13 @@ def patch_run(monkeypatch):
     def patch(module: Any, **kwargs: Any) -> RunRecorder:
         recorder = RunRecorder(**kwargs)
         monkeypatch.setattr(module.subprocess, "run", recorder)
+        if module.__name__ == "letify.providers.colab":
+            monkeypatch.setattr(
+                module.subprocess, "Popen",
+                lambda command, **options: FakeProcess(
+                    list(command), ["LETIFY-KEEP-ALIVE ready\n"], **options
+                ),
+            )
         return recorder
 
     return patch

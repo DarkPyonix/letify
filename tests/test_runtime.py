@@ -2080,3 +2080,46 @@ def test_a_spawned_child_inside_a_call_runs_a_target_defined_in_the_callers_main
     namespace = {"__name__": "__main__", "let": let, "letify": letify}
     exec(compile(_MAIN_SCRIPT, "user_script.py", "exec"), namespace)
     assert namespace["spawn_two"]() == ([(0, 10), (1, 11)], [0, 0])
+
+
+def test_idle_release_rechecks_a_session_acquired_after_the_idle_snapshot(let, remote_cpu, monkeypatch):
+    # Spec "Pooling": a new holder cannot lose a runtime selected by idle release.
+    pool = let.pool
+    pool.hold()
+    runtime = pool.acquire(remote_cpu, Env())
+    pool.release(runtime)
+    original = pool.discard
+    def reacquire_then_discard(candidate, **kwargs):
+        pool.hold()
+        assert pool.acquire(remote_cpu, Env()) is runtime
+        return original(candidate, **kwargs)
+    monkeypatch.setattr(pool, "discard", reacquire_then_discard)
+    pool.unhold()
+    assert pool.live == [runtime]
+    assert runtime.busy
+
+
+def test_runtime_disposal_names_its_reason_and_the_registered_key(let, remote_cpu, capsys):
+    # Spec "Pooling": future teardown reports carry an actionable decision reason.
+    pool = let.pool
+    runtime = pool.acquire(remote_cpu, Env())
+    key = runtime.key
+    pool.release(runtime)
+    output = capsys.readouterr().err
+    assert f"discarding {runtime.name}" in output
+    assert "reason=call_complete" in output and f"key={key}" in output
+
+
+def test_a_runtime_keeps_its_registered_key_when_project_files_change(let, remote_cpu, tmp_path):
+    # Spec "Pooling": mutating an Env input must not hide the registered runtime on removal.
+    project = tmp_path / "declared"
+    project.mkdir()
+    lock = project / "uv.lock"
+    lock.write_text("first")
+    env = Env(lock=str(lock))
+    runtime = let.pool.acquire(remote_cpu, env)
+    key = runtime.key
+    lock.write_text("second")
+    assert runtime.key == key
+    let.pool.release(runtime)
+    assert let.pool.live == []

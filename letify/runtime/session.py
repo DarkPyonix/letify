@@ -18,6 +18,8 @@ depends on what the provider charges for.
 
 from __future__ import annotations
 
+import json
+import sys
 import time
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
@@ -99,10 +101,12 @@ class Runtime:
 
     # -- identity ------------------------------------------------------------
 
+    _pool_key: str | None = field(default=None, repr=False)
+
     @property
     def key(self) -> str:
         """Pool key. Runtimes with equal keys are interchangeable."""
-        return f"{self.instance.key}|{self.env.key}"
+        return self._pool_key or f"{self.instance.key}|{self.env.key}"
 
     @property
     def idle_for(self) -> float:
@@ -137,7 +141,7 @@ class Runtime:
             self.check_interpreter()
         except InterpreterMismatch:
             # Not retried, so nothing else would end this session.
-            self.shutdown()
+            self.shutdown(reason="interpreter_mismatch")
             raise
         self.keep_blobs_on_disk()
         for volume in self.volumes:
@@ -159,8 +163,15 @@ class Runtime:
             timeout=120,
         )
 
-    def shutdown(self) -> None:
-        """Stop everything that bills for this runtime."""
+    def shutdown(self, *, reason: str = "explicit_shutdown") -> None:
+        """Stop everything that bills for this runtime and explain the decision."""
+        print(
+            f"letify: discarding {self.name} provider={self.provider.alias} "
+            f"key={self.key} busy={self.busy} reason={reason.split(':', 1)[0]} "
+            f"detail={json.dumps(reason)}",
+            file=sys.stderr,
+            flush=True,
+        )
         self.ready = False
         if self.device_client is not None:
             client, self.device_client = self.device_client, None

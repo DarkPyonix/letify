@@ -2632,3 +2632,56 @@ def test_every_provider_start_accepts_the_keywords_the_pool_passes() -> None:
         parameters = inspect.signature(cls.start).parameters
         missing = wanted - parameters.keys()
         assert not missing, f"{cls.__name__}.start lacks {sorted(missing)}"
+
+
+def test_colab_prepares_tailcat_before_the_connection_race(
+    isolated_home, patch_which, patch_run, monkeypatch
+) -> None:
+    # Spec "Colab", Runtime tools: installation failure cannot silently lose the race.
+    from letify import install
+    patch_which(tools_module, present=True)
+    recorder = patch_run(colab_module, result=FakeCompleted(stdout='LETIFY-TAILCAT "/remote/tailcat"\n'))
+    monkeypatch.setattr(install, "find", lambda *a, **k: "/local/tailcat")
+    key = Path.home() / "id.pub"
+    key.write_text("ssh-ed25519 AAAA")
+    provider = provider_of(Colab, key=str(key)[:-4])
+    runtime = type("R", (), {"name": "live"})()
+    target = provider.target(runtime)
+    assert recorder.command == [*COLAB_CLI, "exec", "-s", "live"]
+    assert "SHA-256" in recorder.calls[-1]["input"]
+    assert target.rendezvous.extras()["binary"] == "/remote/tailcat"
+    patch_run(colab_module, result=FakeCompleted(returncode=1, stderr="tailcat SHA-256 mismatch"))
+    with pytest.raises(letify.RuntimeFailure, match="SHA-256"):
+        provider.target(type("R", (), {"name": "another"})())
+
+
+def test_colab_requires_the_daemon_to_acknowledge_startup(
+    isolated_home, patch_which, patch_run
+) -> None:
+    # Spec "Colab", Keep-alive supervision: the detached child starts outside uv.
+    patch_which(tools_module, present=True)
+    recorder = patch_run(colab_module)
+    provider = provider_of(Colab)
+    provider.create_session(provider.cpu, "live")
+    assert "live" in provider.__dict__["_keep_alive"]
+    child = provider.__dict__["_keep_alive"]["live"]
+    assert child.command[0] == sys.executable
+    assert child.kwargs["start_new_session"] is True
+    assert "colab_keepalive.py" in child.command[1]
+    provider.stop(type("R", (), {"name": "live"})())
+    assert child.terminated
+    assert recorder.command == [*COLAB_CLI, "stop", "-s", "live"]
+
+
+def test_a_daemon_that_exits_before_ready_fails_creation_and_cleans_up(
+    isolated_home, patch_which, patch_run, patch_popen
+) -> None:
+    # Spec "Colab": missing readiness is an explicit startup failure.
+    patch_which(tools_module, present=True)
+    recorder = patch_run(colab_module)
+    children = patch_popen(colab_module, [])
+    provider = provider_of(Colab)
+    with pytest.raises(letify.RuntimeFailure, match="keep-alive.*ready"):
+        provider.create_session(provider.cpu, "live")
+    assert children[0].terminated
+    assert recorder.command == [*COLAB_CLI, "stop", "-s", "live"]

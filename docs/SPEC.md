@@ -750,6 +750,8 @@ How many sessions may exist is the provider's inventory and nothing else. Starti
 
 A session is never a value the caller holds. Pooling, reuse and teardown are decided from the declaration and the `keep_alive` block around it, so there is no call that starts a session, none that returns one, and none that takes one. `Runtime` exists, and letify hands it to a provider and to a volume, but it does not appear in anything a user writes.
 
+A runtime being used cannot be selected by idle release. Idle release rechecks `busy` and the pool hold while holding the pool guard, and removes the runtime before releasing that guard. Each disposal prints the session name, registered pool key, provider, reason and busy state. Reasons distinguish call completion, the last hold closing, infrastructure failure, explicit discard, failed boot and process shutdown. Registration retains the acquisition key even if project files change later. A mismatch at acquisition logs the existing and requested keys without discarding a live runtime.
+
 ### Lifetime
 
 > A session ends with the call that needed it. `with let.keep_alive():` keeps sessions for the length of a block. Nothing else decides.
@@ -1338,6 +1340,12 @@ The key is per session. letify generates a new ed25519 key pair for each session
 > Colab is a `Shell` whose rendezvous is `colab exec`. It has no forward SSH, and its fallback is `colab exec` with the Colab file API.
 
 The Colab CLI runs as `uv tool run --from google-colab-cli colab`, with `jupyter-kernel-client<1` pinned, because release 0.6.0 of the CLI calls an API that jupyter-kernel-client 1.0 removed. `colab new` and `colab stop` manage the session. `Colab.sessions()` reads `colab sessions` and returns the first word of each listing line. The CLI prints a session as `[<name>] <id> | Hardware: <hardware> | Variant: <variant>`, so a first word in square brackets gives the name inside them. A line starting with `[colab]` is a message from the CLI, such as `[colab] No active sessions found on server.`, and names no session, so an account with no session returns an empty list.
+
+**Runtime tools.** Before the Colab provider enters the connection race, a locally available `tailcat` requires the runtime to install the Linux release pinned by `letify.install.TAILCAT_VERSION`, `TAILCAT_RELEASE` and `TAILCAT_SHA256`. The provider owns preparation because a failed installation must stop connection rather than lose one racing strategy silently. The runtime selects its own architecture, verifies the archive SHA-256, extracts only a regular `tailcat` member into `~/.letify/tools/tailcat/<version>/tailcat`, and verifies the cached binary against its recorded SHA-256 on reuse. The rendezvous runs that absolute path. Installation errors name the tool and verification failure and propagate before the race.
+
+**Keep-alive supervision.** letify starts its own detached, standard library daemon after `colab new`, outside the short-lived CLI process. Startup succeeds only after the daemon records `keep_alive_started` in the account's `.config/colab-cli/history/<session>.jsonl` and acknowledges readiness within 10 seconds. Daemon standard error is retained beside that history as `<session>.letify.log`. It wakes the kernel with `colab exec -s <session>` every 60 seconds after success, and 5 seconds after failure. Each wake has a 120 second command timeout. A file lock at the account's `.config/colab-cli/letify-wake.lock` covers the whole command, including initial provider exec commands, so processes sharing that CLI state cannot wake concurrently. Failures log the command, exit status and standard error in one escaped line. A failed wake does not discard the runtime. The daemon stops when the provider stops the session or the owning process disappears. Successful pings or wakes do not establish that Colab will retain the VM. The cause of the reported reclamation remains unknown.
+
+The Colab CLI package itself is unpinned; only `jupyter-kernel-client<1` is pinned. A CLI release change requires compatibility verification and is not part of this change.
 
 Colab limits outbound UDP to roughly 200 packets per second, so rank 3 is expected to lose the probe there. It stays in the list because the ratio rule removes it without a special case.
 
@@ -1981,7 +1989,7 @@ The header ends `busy` while a call runs and `idle` otherwise. `cards` is left o
 **Lookup.** When letify needs a tool it takes the first of:
 
 1. The project environment: `<venv>/bin/<tool>`, or `<venv>\Scripts\<tool>.exe` on Windows. The environment is `sys.prefix` when letify runs inside a virtual environment, and otherwise `.venv` in the working directory when it holds `pyvenv.cfg`. A link letify made for another version is skipped here and replaced in step 2.
-2. The cache for the pinned version, `~/.letify/tools/<tool>/<version>/<tool>` (`.exe` on Windows). A hit is linked into the project environment as below.
+2. The cache for the pinned version, `~/.letify/tools/<tool>/<version>/<tool>` (`.exe` on Windows). A hit is linked into the project environment as below. Provider execution of letify-managed `tailcat` uses the durable cache path even while a project link exists. The project link is optional convenience; `uv sync` cannot remove the copy under `~/.letify/tools/tailcat/<version>/tailcat`.
 3. `PATH`. A user's own install is used as it is and never replaced.
 4. The confirmed install.
 

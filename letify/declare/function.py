@@ -161,7 +161,9 @@ class Function(Generic[R]):
                 # provider may name the failure first, such as a spot preemption.
                 exc = runtime.provider.diagnose(runtime, failure)
                 last = exc
-                launcher.pool.discard(runtime)
+                launcher.pool.discard(
+                    runtime, reason=f"infrastructure_failure:{type(exc).__name__}: {exc}"
+                )
                 if attempt == self.retries:
                     if isinstance(exc, SpotPreempted):
                         raise exc from failure
@@ -205,7 +207,9 @@ class Function(Generic[R]):
             _report_deferred(client.stats.snapshot() - before)
         except (RuntimeFailure, ProtocolError) as failure:
             named = runtime.provider.diagnose(runtime, failure)
-            launcher.pool.discard(runtime)
+            launcher.pool.discard(
+                runtime, reason=f"infrastructure_failure:{type(named).__name__}: {named}"
+            )
             if named is failure:
                 raise
             raise named from failure
