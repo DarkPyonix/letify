@@ -99,7 +99,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--username",
         help=(
             "Kaggle username, with --key the API token from Settings > API on kaggle.com; "
-            "optional, widens what the official CLI covers for this account"
+            "required, for everything the official CLI covers that the cookie does not"
         ),
     )
     log_in.add_argument(
@@ -121,7 +121,7 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="COOKIE",
         help=(
             "the browser cookie of a logged-in kaggle.com tab, or a file holding it, for "
-            "kaggle; this is the whole Kaggle credential"
+            "kaggle; required alongside --username/--key, which the official CLI needs"
         ),
     )
     log_in.add_argument(

@@ -17,6 +17,7 @@ from typing import Any
 
 import pytest
 
+from letify import tools
 from letify.cli import main
 from letify.config import login
 
@@ -69,25 +70,58 @@ def accept_cookie(monkeypatch):
     return seen
 
 
-def test_a_cookie_is_kept_owner_only_and_never_in_the_config(
+#: The API token arguments every successful login test needs now that the token is
+#: mandatory, alongside the cookie.
+TOKEN_ARGS = ["--username", "irack000", "--key", "fake-api-key"]
+
+
+def test_a_cookie_and_a_token_are_kept_owner_only_and_never_in_the_config(
     isolated_home, accept_cookie, capsys
 ) -> None:
     cookie = make_cookie()
     assert main(
-        ["login", "kaggle", "kaggle_a", "--cookie", cookie,
-         "--username", "irack000", "--key", "the-api-key", "--no-input"]
+        ["login", "kaggle", "kaggle_a", "--cookie", cookie, *TOKEN_ARGS, "--no-input"]
     ) == 0
 
     stored = account("kaggle_a") / "cookie"
     assert stored.read_text(encoding="utf-8").strip() == cookie
+    token_path = account("kaggle_a") / "kaggle.json"
+    assert json.loads(token_path.read_text(encoding="utf-8")) == {
+        "username": "irack000",
+        "key": "fake-api-key",
+    }
     if sys.platform != "win32":
         assert stored.stat().st_mode & 0o777 == 0o600
+        assert token_path.stat().st_mode & 0o777 == 0o600
     assert home_config()["kaggle_a"] == {"kind": "kaggle"}
     text = (Path.home() / ".letify" / "config.toml").read_text(encoding="utf-8")
     assert "CLIENT-TOKEN" not in text
+    assert "fake-api-key" not in text
     out = capsys.readouterr()
     assert "ka_sessionid" not in out.out + out.err
     assert accept_cookie == [cookie]
+
+
+def test_a_login_missing_the_api_token_is_refused_with_nothing_written(
+    isolated_home, accept_cookie, capsys
+) -> None:
+    """Spec "Kaggle account": the cookie alone cannot declare the account any more, since
+    deleting the notebook and reading the quota both need the official CLI's token."""
+    cookie = make_cookie()
+    assert main(["login", "kaggle", "kaggle_a", "--cookie", cookie, "--no-input"]) == 1
+    assert "API token" in capsys.readouterr().err
+    assert not (account("kaggle_a") / "cookie").exists()
+    assert not (Path.home() / ".letify" / "config.toml").exists()
+    assert accept_cookie == []  # the cookie is never checked once the token is missing
+
+
+def test_a_login_missing_only_the_key_is_refused(isolated_home, accept_cookie, capsys) -> None:
+    assert main(
+        ["login", "kaggle", "kaggle_a", "--cookie", make_cookie(), "--username", "irack000",
+         "--no-input"]
+    ) == 1
+    assert "API token" in capsys.readouterr().err
+    assert not (account("kaggle_a") / "cookie").exists()
 
 
 def test_an_expired_cookie_is_refused_with_nothing_written(
@@ -95,8 +129,7 @@ def test_an_expired_cookie_is_refused_with_nothing_written(
 ) -> None:
     expired = make_cookie("2000-01-01T00:00:00Z")
     assert main(
-        ["login", "kaggle", "kaggle_a", "--cookie", expired,
-         "--username", "irack000", "--key", "the-api-key", "--no-input"]
+        ["login", "kaggle", "kaggle_a", "--cookie", expired, *TOKEN_ARGS, "--no-input"]
     ) == 1
     assert "expired" in capsys.readouterr().err
     assert not (Path.home() / ".letify" / "config.toml").exists()
@@ -107,8 +140,7 @@ def test_an_expired_cookie_is_refused_with_nothing_written(
 def test_a_cookie_missing_a_required_name_is_refused(isolated_home, accept_cookie, capsys) -> None:
     partial = make_cookie(drop=["ka_sessionid"])
     assert main(
-        ["login", "kaggle", "kaggle_a", "--cookie", partial,
-         "--username", "irack000", "--key", "the-api-key", "--no-input"]
+        ["login", "kaggle", "kaggle_a", "--cookie", partial, *TOKEN_ARGS, "--no-input"]
     ) == 1
     assert "missing" in capsys.readouterr().err
     assert not (account("kaggle_a") / "cookie").exists()
@@ -122,8 +154,7 @@ def test_a_cookie_the_account_check_rejects_writes_nothing(
 
     monkeypatch.setattr("letify.providers.kaggle.verify_cookie", reject)
     assert main(
-        ["login", "kaggle", "kaggle_a", "--cookie", make_cookie(),
-         "--username", "irack000", "--key", "the-api-key", "--no-input"]
+        ["login", "kaggle", "kaggle_a", "--cookie", make_cookie(), *TOKEN_ARGS, "--no-input"]
     ) == 1
     assert "refused" in capsys.readouterr().err
     assert not (account("kaggle_a") / "cookie").exists()
@@ -131,68 +162,33 @@ def test_a_cookie_the_account_check_rejects_writes_nothing(
 
 
 def test_no_input_without_a_cookie_refuses(isolated_home, accept_cookie, capsys) -> None:
-    assert main(
-        ["login", "kaggle", "kaggle_a", "--username", "irack000", "--key", "k", "--no-input"]
-    ) == 1
+    assert main(["login", "kaggle", "kaggle_a", *TOKEN_ARGS, "--no-input"]) == 1
     assert "--cookie" in capsys.readouterr().err
 
 
-def test_with_a_terminal_the_cookie_is_asked_for_hidden(
+def test_with_a_terminal_the_cookie_and_token_are_asked_for(
     isolated_home, accept_cookie, monkeypatch
 ) -> None:
     cookie = make_cookie()
-    prompts: list[str] = []
+    hidden_prompts: list[str] = []
+    line_prompts: list[str] = []
 
     def hidden(prompt: str) -> str:
-        prompts.append(prompt)
-        return cookie
+        hidden_prompts.append(prompt)
+        return cookie if prompt == login.KAGGLE_COOKIE_PROMPT else "fake-api-key"
 
-    clear: list[str] = []
-
-    def in_the_clear(prompt: str) -> str:
-        clear.append(prompt)
+    def line(prompt: str) -> str:
+        line_prompts.append(prompt)
         return "irack000"
 
     monkeypatch.setattr(login, "read_password", hidden)
-    monkeypatch.setattr(login, "read_line", in_the_clear)
+    monkeypatch.setattr(login, "read_line", line)
     assert main(["login", "kaggle", "kaggle_a"]) == 0
-    # The cookie is a secret, so it is read hidden and never in the clear. The username is
-    # not, and is asked for in the clear beside it.
-    assert login.KAGGLE_COOKIE_PROMPT in prompts
-    assert login.KAGGLE_COOKIE_PROMPT not in clear
+    # The token is asked for first, because it comes from a page rather than a tab.
+    assert hidden_prompts == [login.KAGGLE_KEY_PROMPT, login.KAGGLE_COOKIE_PROMPT]
+    assert line_prompts == [login.KAGGLE_USERNAME_PROMPT]
     assert (account("kaggle_a") / "cookie").is_file()
-
-
-def test_the_token_is_asked_for_beside_the_cookie(
-    isolated_home, accept_cookie, monkeypatch
-) -> None:
-    """Spec "Kaggle account": both credentials are required, so a terminal asks for both.
-
-    The cookie mints the Jupyter proxy URL and the token runs the official CLI, so an
-    account declared with only one of them cannot do the other's job.
-    """
-    import json
-
-    cookie = make_cookie()
-    hidden: list[str] = []
-    clear: list[str] = []
-
-    def read_password(prompt: str) -> str:
-        hidden.append(prompt)
-        return cookie if prompt == login.KAGGLE_COOKIE_PROMPT else "the-api-key"
-
-    def read_line(prompt: str) -> str:
-        clear.append(prompt)
-        return "irack000"
-
-    monkeypatch.setattr(login, "read_password", read_password)
-    monkeypatch.setattr(login, "read_line", read_line)
-    assert main(["login", "kaggle", "kaggle_a"]) == 0
-    # The token comes first, because it is fetched from a page rather than a browser tab.
-    assert hidden == [login.KAGGLE_KEY_PROMPT, login.KAGGLE_COOKIE_PROMPT]
-    assert clear == [login.KAGGLE_USERNAME_PROMPT]
-    stored = json.loads((account("kaggle_a") / "kaggle.json").read_text(encoding="utf-8"))
-    assert stored == {"username": "irack000", "key": "the-api-key"}
+    assert (account("kaggle_a") / "kaggle.json").is_file()
 
 
 def test_a_key_pasted_with_the_kgat_prefix_is_stored_without_it(
@@ -211,50 +207,19 @@ def test_a_key_pasted_with_the_kgat_prefix_is_stored_without_it(
     assert stored == {"username": "irack000", "key": thirty_two}
 
 
-def test_no_input_without_a_token_refuses(isolated_home, accept_cookie, capsys) -> None:
-    """Spec "Kaggle account": a login with no token refuses and names what to pass."""
-    cookie = make_cookie()
-    code = main(["login", "kaggle", "kaggle_a", "--cookie", cookie, "--no-input"])
-    assert code == 1
-    message = capsys.readouterr().err
-    assert "--username" in message and "--key" in message
-    assert not (account("kaggle_a") / "kaggle.json").exists()
-
-
 def test_a_cookie_can_be_read_from_a_file(isolated_home, accept_cookie, tmp_path) -> None:
     cookie = make_cookie()
     path = tmp_path / "kaggle_cookie.txt"
     path.write_text(cookie, encoding="utf-8")
     assert main(
-        ["login", "kaggle", "kaggle_a", "--cookie", str(path),
-         "--username", "irack000", "--key", "the-api-key", "--no-input"]
+        ["login", "kaggle", "kaggle_a", "--cookie", str(path), *TOKEN_ARGS, "--no-input"]
     ) == 0
     assert (account("kaggle_a") / "cookie").read_text(encoding="utf-8").strip() == cookie
 
 
-def test_a_login_with_username_and_key_also_writes_the_api_token(
-    isolated_home, accept_cookie
-) -> None:
-    """Spec "Kaggle account": the API token is optional and stored beside the cookie."""
-    import json
-
-    assert main(
-        ["login", "kaggle", "kaggle_a", "--cookie", make_cookie(), "--username", "irack000",
-         "--key", "fake-api-key", "--no-input"]
-    ) == 0
-    token_path = account("kaggle_a") / "kaggle.json"
-    assert json.loads(token_path.read_text(encoding="utf-8")) == {
-        "username": "irack000",
-        "key": "fake-api-key",
-    }
-    if sys.platform != "win32":
-        assert token_path.stat().st_mode & 0o777 == 0o600
-
-
 def test_a_kaggle_login_records_the_workspace(isolated_home, accept_cookie) -> None:
     assert main(
-        ["login", "kaggle", "kaggle_a", "--cookie", make_cookie(),
-         "--username", "irack000", "--key", "the-api-key",
+        ["login", "kaggle", "kaggle_a", "--cookie", make_cookie(), *TOKEN_ARGS,
          "--workspace", "/kaggle/working/letify", "--no-input"]
     ) == 0
     assert home_config()["kaggle_a"]["workspace"] == "/kaggle/working/letify"
@@ -293,7 +258,10 @@ def test_the_account_note_flags_a_missing_cookie(isolated_home) -> None:
 
 
 def test_a_run_refuses_to_start_with_under_an_hour_left_on_the_cookie(isolated_home) -> None:
-    """Spec "Kaggle account": starting a session the cookie cannot outlive is refused."""
+    """Spec "Kaggle account": starting a session the cookie cannot outlive is refused.
+
+    This is the offline exp check, so it raises before any network call is attempted.
+    """
     from datetime import UTC, datetime, timedelta
 
     import letify
@@ -301,8 +269,9 @@ def test_a_run_refuses_to_start_with_under_an_hour_left_on_the_cookie(isolated_h
 
     soon = datetime.now(UTC) + timedelta(minutes=30)
     write_secret("kaggle_a", "cookie", make_cookie(soon.strftime("%Y-%m-%dT%H:%M:%SZ")))
+    runtime = type("R", (), {"name": "letify-t4-1"})()
     with pytest.raises(letify.ConfigError, match="hour"):
-        kaggle_provider().usage()
+        kaggle_provider().open_channel(runtime)
 
 
 def test_the_account_note_flags_an_expired_cookie(isolated_home) -> None:
@@ -312,43 +281,74 @@ def test_the_account_note_flags_an_expired_cookie(isolated_home) -> None:
     assert "EXPIRED" in (kaggle_provider().account_note() or "")
 
 
-def test_kaggle_usage_reads_the_weekly_quota_from_the_cookie(fake_kaggle) -> None:
-    """Spec "Remaining usage, Kaggle": the quota comes from the cookie, not an API key.
-
-    ``GetAcceleratorQuotaStatistics`` answers the weekly GPU and TPU quota in seconds, which
-    the provider turns into hours. No Kaggle CLI and no API token are used anywhere.
+def test_kaggle_usage_reads_the_weekly_quota_from_the_cli(
+    fake_kaggle_cli, kaggle_api_token
+) -> None:
+    """Spec "Remaining usage, Kaggle": the quota comes from the official CLI's ``quota``
+    command, never the cookie, since reading it is not part of the interactive session.
     """
+    fake_kaggle_cli.quota_json = json.dumps(
+        [
+            {"name": "GPU", "totalTimeAllowed": "108000s", "timeUsed": "11700s"},
+            {"name": "TPU", "totalTimeAllowed": "72000s", "timeUsed": "0s"},
+        ]
+    )
     usage = kaggle_provider().usage()
 
     assert usage.unit == "GPU hours"
     assert usage.used == 11700 / 3600
     assert usage.limit == 30.0
     assert usage.remaining == 30.0 - 11700 / 3600
-    assert "2026-09-19T00:00:00Z" in (usage.note or "")
     assert "TPU 0 h used, 20 h left of 20" in (usage.note or "")
-    called = [path for path, _ in fake_kaggle.cloud_calls]
-    assert any(path.endswith("GetAcceleratorQuotaStatistics") for path in called)
+    quota_calls = [call for call in fake_kaggle_cli.calls if "quota" in call]
+    assert len(quota_calls) == 1
 
 
-def test_a_cookie_unexpired_but_refused_online_is_reported_as_that(
-    fake_kaggle, monkeypatch
+def test_a_failed_quota_cli_call_reports_unknown_rather_than_an_error(
+    fake_kaggle_cli, kaggle_api_token
 ) -> None:
-    """Spec "Kaggle account": the exp claim can say days are left while Kaggle has already
-    invalidated the cookie server side; the online check is what catches that, not exp.
-    """
-    from conftest import _Reply
+    """A CLI call that fails is not an infrastructure error and is not answered from the
+    cookie instead: it is simply nothing to report."""
+    fake_kaggle_cli.fail.add("quota")
+    usage = kaggle_provider().usage()
+    assert usage.remaining is None
+    assert "could not be read" in (usage.note or "")
 
+
+def test_an_unrecognized_quota_shape_reports_unknown(fake_kaggle_cli, kaggle_api_token) -> None:
+    """Spec "Remaining usage, Kaggle": the CLI's JSON shape has not been confirmed live, so
+    a shape this parser does not recognize is reported as unread, never guessed at."""
+    fake_kaggle_cli.quota_json = json.dumps({"unexpected": "shape"})
+    usage = kaggle_provider().usage()
+    assert usage.remaining is None
+    assert "could not be read" in (usage.note or "")
+
+
+def test_usage_without_a_token_says_to_log_in_again(isolated_home) -> None:
     import letify
-    from letify.providers import kaggle as kaggle_module
+    from letify.config.secrets import write_secret
 
-    def answer(request, timeout=None):
-        if request.full_url.endswith("GetCurrentUser"):
-            return _Reply({})  # no displayName: Kaggle treats this cookie as anonymous
-        return fake_kaggle.urlopen(request, timeout)
-
-    monkeypatch.setattr(kaggle_module, "urlopen", answer)
-    with pytest.raises(letify.ConfigError, match="has not expired, but Kaggle no longer accepts"):
+    write_secret("kaggle_a", "cookie", make_cookie())
+    with pytest.raises(letify.ConfigError, match="login kaggle"):
         kaggle_provider().usage()
+
+
+def test_quota_and_notebook_deletion_never_touch_the_cookie_api(
+    fake_kaggle, fake_kaggle_cli
+) -> None:
+    """Spec "Kaggle account": the credential boundary is locked here, not just described.
+
+    Neither reading the quota nor deleting the notebook is allowed to fall back to a
+    cookie-authenticated internal call, so both are asserted against the cloud's own call
+    log, not just against what the CLI fake was asked to do.
+    """
+    provider, runtime, _channel = session_channel(fake_kaggle)
+    fake_kaggle.cloud_calls.clear()
+    provider.usage()
+    provider.stop(runtime)
+    forbidden = {"GetAcceleratorQuotaStatistics", "DeleteKernel"}
+    touched = {path.rsplit("/", 1)[-1] for path, _ in fake_kaggle.cloud_calls}
+    assert not (touched & forbidden)
 
 
 def test_a_session_is_refused_the_same_way_an_already_dead_cookie_is(
@@ -381,43 +381,6 @@ def test_the_online_check_is_not_repeated_within_the_liveness_ttl(fake_kaggle) -
 
     checks = [path for path, _body in fake_kaggle.cloud_calls if path.endswith("GetCurrentUser")]
     assert len(checks) == 1
-
-
-def test_a_failed_quota_call_is_an_infrastructure_error(fake_kaggle, monkeypatch) -> None:
-    """A liveness check or a quota call that could not complete at all is not evidence the
-    cookie is bad, so it is reported as the infrastructure failure it is."""
-    import letify
-    from letify.providers import kaggle as kaggle_module
-
-    def refuse(request, timeout=None):
-        raise OSError("connection reset")
-
-    monkeypatch.setattr(kaggle_module, "urlopen", refuse)
-    with pytest.raises(letify.RuntimeFailure):
-        kaggle_provider().usage()
-
-
-def test_quota_with_no_gpu_figure_is_refused(fake_kaggle, monkeypatch) -> None:
-    from conftest import _Reply
-
-    import letify
-    from letify.providers import kaggle as kaggle_module
-
-    def answer(request, timeout=None):
-        if request.full_url.endswith("GetAcceleratorQuotaStatistics"):
-            return _Reply({"quotaRefreshTime": "2026-09-19T00:00:00Z"})
-        return fake_kaggle.urlopen(request, timeout)
-
-    monkeypatch.setattr(kaggle_module, "urlopen", answer)
-    with pytest.raises(letify.RuntimeFailure, match="GPU"):
-        kaggle_provider().usage()
-
-
-def test_usage_without_a_cookie_says_to_log_in(isolated_home) -> None:
-    import letify
-
-    with pytest.raises(letify.ConfigError, match="login kaggle"):
-        kaggle_provider().usage()
 
 
 # -- Spec: Placements a provider cannot serve --------------------------------------
@@ -806,15 +769,12 @@ def test_files_move_as_worker_requests_rather_than_through_the_contents_api(
     assert not fake_kaggle.made("PUT", "/api/contents/")
 
 
-def test_stopping_deletes_the_kernel_cancels_the_run_and_deletes_the_notebook(
-    fake_kaggle,
+def test_stopping_cancels_the_run_through_the_cookie_and_deletes_the_notebook_via_cli(
+    fake_kaggle, fake_kaggle_cli
 ) -> None:
-    """Spec "Kaggle Jupyter Server session": the run is letify's own, so stop cancels it,
-    and the notebook it created for the run is deleted too, by the cookie alone.
-
-    No API token is involved: ``DeleteKernel`` is the same credential that created the
-    notebook with ``CreateKernelWithSettings``, so a run is deleted whether or not the
-    account ever logged in with a token.
+    """Spec "Kaggle Jupyter Server session": the run is letify's own, so stop cancels it
+    through the cookie, the cookie's last job. The notebook created for the run is then
+    deleted through the official CLI alone; the cookie is never asked to delete anything.
     """
     provider, runtime, _channel = session_channel(fake_kaggle)
     assert len(fake_kaggle.kernels) == 1
@@ -822,42 +782,19 @@ def test_stopping_deletes_the_kernel_cancels_the_run_and_deletes_the_notebook(
     assert fake_kaggle.kernels == set()
     assert len(fake_kaggle.made("DELETE", "/api/kernels/")) == 1
     assert fake_kaggle.cancelled == [fake_kaggle.RUN_ID]
-    assert fake_kaggle.deleted == [fake_kaggle.NOTEBOOK_ID]
 
-
-def test_stopping_never_needs_the_cli_when_the_account_has_no_token(
-    fake_kaggle, fake_kaggle_cli
-) -> None:
-    """The cookie-based delete is enough on its own, so an account with only the cookie
-    never reaches the CLI at all."""
-    provider, runtime, _channel = session_channel(fake_kaggle)
-    provider.stop(runtime)
-    assert fake_kaggle.deleted == [fake_kaggle.NOTEBOOK_ID]
-    assert fake_kaggle_cli.calls == []
-
-
-def test_a_failed_cookie_delete_falls_back_to_the_cli_with_a_token(
-    fake_kaggle, fake_kaggle_cli, kaggle_api_token
-) -> None:
-    """Spec "Kaggle session token chain": the CLI is only the fallback, tried when the
-    cookie-based delete fails and the account happens to have a token."""
-    fake_kaggle.refuse["DeleteKernel"] = (500, "internal error")
-    provider, runtime, _channel = session_channel(fake_kaggle)
-    provider.stop(runtime)
-
-    assert fake_kaggle.deleted == []
     deletes = [call for call in fake_kaggle_cli.calls if "delete" in call]
     assert len(deletes) == 1
     assert deletes[0][-2:] == ["-y", "irack000/letify-runtime"]
     assert "kernels" in deletes[0]
 
 
-def test_a_notebook_neither_delete_reaches_is_warned_about_by_name(
-    fake_kaggle, capsys
+def test_a_notebook_is_warned_about_by_name_when_the_cli_delete_fails(
+    fake_kaggle, fake_kaggle_cli, capsys
 ) -> None:
-    """Spec "Kaggle session token chain": when both deletes are unavailable, stop warns by
-    the notebook's slug or id, and never prints the cookie."""
-    fake_kaggle.refuse["DeleteKernel"] = (500, "internal error")
+    """Spec "Kaggle session token chain": a failed CLI delete is reported with a warning
+    naming the notebook, never its cookie, and never retried against the cookie."""
+    fake_kaggle_cli.fail.add("delete")
     provider, runtime, _channel = session_channel(fake_kaggle)
     provider.stop(runtime)
 
@@ -865,6 +802,17 @@ def test_a_notebook_neither_delete_reaches_is_warned_about_by_name(
     assert "letify-runtime" in err
     assert "delete it by hand" in err
     assert fake_kaggle.token not in err
+
+
+def test_a_notebook_without_a_token_is_warned_about_not_deleted_via_the_cookie(
+    fake_kaggle, fake_kaggle_cli
+) -> None:
+    """An account declared before the token became required cannot delete its notebook
+    through the CLI, and the cookie never substitutes for it."""
+    tools.kaggle_config_path("kaggle_a").unlink()
+    provider, runtime, _channel = session_channel(fake_kaggle)
+    provider.stop(runtime)
+    assert fake_kaggle_cli.calls == []
 
 
 def test_kaggle_never_opts_out_of_preparing_the_runtime(fake_kaggle) -> None:

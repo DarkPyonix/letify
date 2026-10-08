@@ -1652,12 +1652,20 @@ def fake_kaggle(isolated_home, monkeypatch, tmp_path: Path):
     """A Kaggle account whose whole token chain and session are faked for alias ``kaggle_a``.
 
     The fake adapter in ``tests/fake_kaggle_adapter.py`` keeps the real adapter's contract and
-    runs the worker in a local interpreter, so the driver programs are the real ones.
+    runs the worker in a local interpreter, so the driver programs are the real ones. The
+    account also gets an API token, since login requires one: a test of the no-token path
+    removes ``kaggle.json`` itself after this fixture runs.
     """
+    from letify import tools
     from letify.config.secrets import write_secret
     from letify.providers import kaggle as kaggle_module
 
     write_secret("kaggle_a", "cookie", kaggle_test_cookie())
+    token_path = tools.kaggle_config_path("kaggle_a")
+    token_path.parent.mkdir(parents=True, exist_ok=True)
+    token_path.write_text(
+        json.dumps({"username": "irack000", "key": "fake-api-key"}), encoding="utf-8"
+    )
     cloud = FakeKaggleCloud()
     monkeypatch.setattr(kaggle_module, "urlopen", cloud.urlopen)
     monkeypatch.setattr(kaggle_module, "JUPYTER_PROXY_HOST", cloud.proxy_host)
@@ -1681,12 +1689,16 @@ class FakeKaggleCLI:
     def __init__(self):
         self.calls: list[list[str]] = []
         self.fail: set[str] = set()
+        #: Standard output a ``quota`` call answers with, as JSON text.
+        self.quota_json = "{}"
 
     def run(self, command: list[str], **kwargs: Any) -> FakeCompleted:
         self.calls.append(list(command))
         for marker in self.fail:
             if marker in command:
                 return FakeCompleted(returncode=1, stdout="", stderr="refused")
+        if "quota" in command:
+            return FakeCompleted(returncode=0, stdout=self.quota_json, stderr="")
         return FakeCompleted(returncode=0, stdout="{}", stderr="")
 
 
