@@ -168,8 +168,7 @@ def kaggle_cli_command(uv: str) -> list[str]:
 def kaggle_cli_environment(alias: str) -> dict[str, str]:
     """Pass this account's verbatim token to the CLI through its child environment."""
     env = dict(os.environ)
-    env.pop("KAGGLE_CONFIG_DIR", None)
-    token = (account_directory(alias) / "api_token").read_text(encoding="utf-8")
+    token = (account_directory(alias) / "access_token").read_text(encoding="utf-8")
     env["KAGGLE_API_TOKEN"] = token
     return env
 

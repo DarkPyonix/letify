@@ -522,7 +522,7 @@ def cancel_run(cookie: str, run_id: int) -> None:
 def read_api_token(alias: str) -> str | None:
     """Read the account's verbatim API token, or None when the file is unreadable or empty."""
     try:
-        token = (account_directory(alias) / "api_token").read_text(encoding="utf-8")
+        token = (account_directory(alias) / "access_token").read_text(encoding="utf-8")
     except (OSError, UnicodeError):
         return None
     return token or None
@@ -532,8 +532,8 @@ def require_api_token(alias: str) -> str:
     """The account's API token, or a ``ConfigError`` telling the user to log in again.
 
     Spec "Kaggle account": deleting the notebook a run created and reading the weekly quota
-    go through the official CLI only, with no cookie-based fallback, so an account declared
-    before the token became required cannot do either until it logs in again.
+    go through the official CLI only, with no cookie-based fallback, so an account without
+    the access_token file cannot do either until it logs in again.
     """
     token = read_api_token(alias)
     if token is None:
@@ -1082,7 +1082,7 @@ class Kaggle(Provider):
 
         Spec "Remaining usage, Kaggle": this never touches the cookie, which is reserved
         for the interactive session and its Jupyter proxy URL. ``require_api_token`` raises
-        when the account was declared before the token became required.
+        when the account has no readable access_token file.
         """
         require_api_token(self.alias)
         text = run_cli_quota(self.alias)

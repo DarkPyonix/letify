@@ -751,7 +751,7 @@ def colab_account(answers: Answers) -> dict[str, Any]:
     return options
 
 
-#: The cookie file and the prompt for it. The cookie is the whole Kaggle credential.
+#: The browser cookie file and its prompt.
 KAGGLE_COOKIE = "cookie"
 KAGGLE_COOKIE_PROMPT = "Kaggle cookie (from a logged-in kaggle.com tab): "
 
@@ -776,8 +776,8 @@ def read_kaggle_cookie(answers: Answers, given: str | None) -> str:
 
 
 #: The notebook owner and verbatim API token prompts.
-KAGGLE_USERNAME_PROMPT = "Kaggle username (notebook owner): "
-KAGGLE_KEY_PROMPT = "Kaggle API token exactly as shown on kaggle.com, including KGAT_: "
+KAGGLE_OWNER_PROMPT = "Kaggle username (notebook owner): "
+KAGGLE_TOKEN_PROMPT = "Kaggle API token exactly as shown on kaggle.com, including KGAT_: "
 
 
 def read_kaggle_token(
@@ -790,10 +790,12 @@ def read_kaggle_token(
     """
     username = (given_username or "").strip()
     if not username and answers.interactive:
-        username = read_line(KAGGLE_USERNAME_PROMPT).strip()
-    key = given_key or ""
+        username = read_line(KAGGLE_OWNER_PROMPT).strip()
+    from ..providers.kaggle import read_api_token
+
+    key = given_key if given_key is not None else (read_api_token(answers.alias) or "")
     if not key and answers.interactive:
-        key = read_password(KAGGLE_KEY_PROMPT)
+        key = read_password(KAGGLE_TOKEN_PROMPT)
     if not username or not key:
         raise LoginError(
             f"{answers.alias} needs the Kaggle API token and notebook owner: pass "
@@ -843,7 +845,7 @@ def kaggle_account(answers: Answers) -> dict[str, Any]:
     options: dict[str, Any] = {"kind": answers.kind}
     record_workspace(answers, options)
     store_secret(answers.alias, KAGGLE_COOKIE, cookie)
-    store_secret(answers.alias, "api_token", key)
+    store_secret(answers.alias, "access_token", key)
     store_secret(answers.alias, "username", username)
     return options
 
