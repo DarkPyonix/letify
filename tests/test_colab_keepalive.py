@@ -99,3 +99,25 @@ def test_every_wake_records_history_and_logs_duration_with_timestamp(tmp_path, p
     assert "duration=" in log
     assert "exit=0" in log
 
+
+
+def test_a_wake_skips_a_busy_account_without_running_a_command(tmp_path, patch_run, capsys):
+    # Spec "Colab", Rendezvous scheduling: wakes never queue behind a busy account.
+    from letify.providers import colab_keepalive as daemon
+
+    recorder = patch_run(daemon)
+    config = {"command": ["colab"], "session": "live", "directory": str(tmp_path)}
+    delays = []
+    thread = threading.Thread(target=lambda: delays.append(daemon.wake(config)))
+    with daemon.account_lock(tmp_path):
+        thread.start()
+        thread.join(2)
+        skipped = delays == [60.0]
+        calls = list(recorder.calls)
+    thread.join(2)
+    assert skipped
+    assert calls == []
+    event = json.loads((tmp_path / "history" / "live.jsonl").read_text().splitlines()[-1])
+    assert event["event_type"] == "wake_skipped"
+    assert event["reason"] == "account_busy"
+    assert "skipped" in capsys.readouterr().err
