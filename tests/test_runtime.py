@@ -2125,3 +2125,90 @@ def test_a_runtime_keeps_its_registered_key_when_project_files_change(let, remot
     assert runtime.key == key
     let.pool.release(runtime)
     assert let.pool.live == []
+
+
+# -- Spec: Materializing into a runtime, automatic environment archive ----------
+
+
+@pytest.mark.parametrize("bucket", [False, True])
+def test_an_ephemeral_account_restores_an_environment_without_declared_volumes(
+    isolated_home, uv_project, tmp_path, fake_gcs, bucket
+) -> None:
+    options = {"persistent": False}
+    if bucket:
+        options.update(
+            bucket=fake_gcs.bucket,
+            bucket_prefix="automatic-env",
+            bucket_endpoint=fake_gcs.endpoint,
+            sts_endpoint=f"{fake_gcs.endpoint}/v1/token",
+        )
+    provider = provider_of(PreparingLocal, "lab", **options)
+    env = Env()
+    first = provider.start(remote_instance(provider), env, name="lab-1")
+    try:
+        assert first.env_source == "sync"
+        first.call(reports_interpreter(), (), {})
+    finally:
+        first.shutdown()
+    shutil.rmtree(Path(bootstrap.DEFAULT_WORKSPACE_ROOT))
+    # A new provider object and an empty VM disk must still find the durable ref.
+    replacement = provider_of(PreparingLocal, "lab", **options)
+    second = replacement.start(remote_instance(replacement), env, name="lab-2")
+    try:
+        assert second.env_source == "archive"
+        executable, version, imported = second.call(reports_interpreter(), (), {})[0]
+        assert Path(executable).parent == remote_projects() / env.key / ".venv" / "bin"
+        assert version == bootstrap.local_python()
+        assert Path(imported).is_relative_to(remote_projects() / env.key / ".venv")
+        assert second.volumes == ()
+        if bucket:
+            from urllib.parse import unquote
+
+            blobs = [r for r in fake_gcs.downloads() if "/blobs/" in unquote(r["path"])]
+            assert [r["authorization"] for r in blobs] == ["Bearer down-token-1"]
+            assert all("automatic-env/" in unquote(r["path"]) for r in blobs)
+    finally:
+        second.shutdown()
+
+
+def test_an_ephemeral_sync_keeps_managed_python_inside_the_environment_archive(
+    isolated_home, uv_project, tmp_path, monkeypatch
+) -> None:
+    # The real uv wrapper records the directory passed to the build, without downloading
+    # another Python. Its interpreter tree must be packed with the environment on eviction.
+    import shlex
+
+    binary = shutil.which("uv")
+    tools = tmp_path / "tools"
+    tools.mkdir()
+    recorded = tmp_path / "python-dir"
+    wrapper = tools / "uv"
+    wrapper.write_text(
+        '#!/bin/sh\n'
+        f'printf "%s" "$UV_PYTHON_INSTALL_DIR" > {shlex.quote(str(recorded))}\n'
+        f'exec {shlex.quote(binary)} "$@"\n'
+    )
+    wrapper.chmod(0o755)
+    monkeypatch.setenv("PATH", str(tools) + os.pathsep + os.environ["PATH"])
+    provider = provider_of(PreparingLocal, "lab", persistent=False)
+    runtime = provider.start(remote_instance(provider), Env(), name="lab-1")
+    try:
+        assert Path(recorded.read_text()) == remote_projects() / runtime.env.key / ".letify-python"
+    finally:
+        runtime.shutdown()
+
+
+def test_a_failed_interpreter_switch_does_not_publish_an_environment_archive(
+    uv_project, tmp_path, monkeypatch
+) -> None:
+    provider = provider_of(PreparingLocal, "lab", persistent=False)
+    volume = provider.volume("cache", backend="filesystem", root=str(tmp_path / "store"))
+
+    def fail_switch(self, python):
+        raise RuntimeFailure("interpreter switch failed")
+
+    monkeypatch.setattr(PersistentChannel, "switch_interpreter", fail_switch)
+    with pytest.raises(RuntimeFailure, match="interpreter switch failed"):
+        provider.start(remote_instance(provider), Env(), name="lab-1", volumes=(volume,))
+    assert list(volume.store.backend.list_digests()) == []
+    assert volume.cached_env(Env(), sys.platform + "-" + __import__("platform").machine()) is None

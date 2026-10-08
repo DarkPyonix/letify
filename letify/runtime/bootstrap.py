@@ -15,6 +15,7 @@ from __future__ import annotations
 import base64
 import shlex
 import sys
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 from ..errors import ConfigError, InterpreterMismatch
@@ -215,6 +216,41 @@ def venv_check_source(python: str, archive: str | None = None) -> str:
     return "\n".join(lines) + "\n"
 
 
+def pull_source(
+    source: dict[str, object], path: str, *, unpack: bool = False,
+    target: str | None = None, links: bool = False,
+) -> str:
+    """A one-shot standard-library pull that returns metadata without relaying bytes."""
+    return (
+        "import os, shutil, tarfile, urllib.request\n"
+        f"_path = {path!r}\n"
+        "os.makedirs(os.path.dirname(_path) or '.', exist_ok=True)\n"
+        f"_fetch = urllib.request.Request({source['url']!r}, "
+        f"headers={dict(source.get('headers') or {})!r})\n"
+        "try:\n"
+        "    with urllib.request.urlopen(_fetch, timeout=3600) as _response, "
+        "open(_path + '.partial', 'wb') as _out:\n"
+        "        shutil.copyfileobj(_response, _out, 1 << 20)\n"
+        "finally:\n"
+        "    _fetch = None\n"
+        "os.replace(_path + '.partial', _path)\n"
+        f"if {unpack!r}:\n"
+        f"    _target = {target or str(Path(path).parent)!r}\n"
+        "    os.makedirs(_target, exist_ok=True)\n"
+        "    with tarfile.open(_path, 'r:gz') as _archive:\n"
+        "        _root = os.path.realpath(_target)\n"
+        "        for _member in _archive.getmembers():\n"
+        "            _destination = os.path.realpath(os.path.join(_root, _member.name))\n"
+        "            if os.path.commonpath([_root, _destination]) != _root:\n"
+        "                raise ValueError('archive member would escape the destination')\n"
+        "        try:\n"
+        f"            _archive.extractall(_target, filter={'tar' if links else 'data'!r})\n"
+        "        except TypeError:\n"
+        "            _archive.extractall(_target)\n"
+        "__letify_value__ = {'path': _path, 'size': os.path.getsize(_path)}\n"
+    )
+
+
 def sync_source(
     env: Env,
     files: dict[str, bytes],
@@ -223,6 +259,7 @@ def sync_source(
     workspace: str | None = None,
     name: str = "this runtime",
     installer: str = UV_INSTALLER,
+    archive: bool = False,
 ) -> str:
     """Source that writes the project files, finds or installs uv, and runs the sync.
 
@@ -231,6 +268,9 @@ def sync_source(
     "Remote paths letify writes": this applies for every provider, persistent or
     ephemeral, not only so uv can hard link into the project ``.venv`` on a persistent
     one, but because the workspace root may be the only path the account can write to.
+
+    ``archive`` keeps the default managed Python directory inside the project tree.
+    Declared uv directories still take precedence.
 
     It raises ``RuntimeError`` with ``uv could not be installed on <name>`` or ``uv sync
     failed on <name>`` so the local side can name the step that failed.
@@ -277,7 +317,11 @@ def sync_source(
         "_letify_uv_env = dict(os.environ)",
     ]
     declared = dict(env.variables)
-    for key, value in uv_env(workspace).items():
+    directories = uv_env(workspace)
+    if archive:
+        # Keep an interpreter uv downloads inside the tree sent to the next VM.
+        directories["UV_PYTHON_INSTALL_DIR"] = f"{root.rstrip('/')}/.letify-python"
+    for key, value in directories.items():
         if key not in declared:
             lines.append(f"_letify_uv_env[{key!r}] = os.path.expanduser({value!r})")
     lines += [
