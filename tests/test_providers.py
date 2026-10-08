@@ -473,7 +473,7 @@ def test_the_colab_cli_keeps_its_login_in_the_account_directory(
     recorder = patch_run(colab_module)
     provider_of(Colab, "colab_a").sessions()
     env = recorder.calls[-1]["env"]
-    assert env["HOME"] == str(Path.home() / ".letify" / "accounts" / "colab_a")
+    assert env["HOME"] == str(Path.home() / ".letify" / "cache" / "tools" / "colab_a")
     assert "COLAB_ACCOUNT" not in env
 
 
@@ -751,7 +751,7 @@ def test_ssh_commands_share_one_connection_and_prefer_fast_ciphers(
     from letify.transport.strategies import Target
 
     monkeypatch.setattr(sshopts, "WINDOWS", platform == "nt")
-    # The pytest temporary directory is too long for a socket path, so the /tmp default is used.
+    monkeypatch.setattr(sshopts, "SOCKET_LIMIT", 500)
     monkeypatch.delenv("XDG_RUNTIME_DIR", raising=False)
     provider = provider_of(Shell, "lab", address="gpu.lab.example.edu", user="researcher")
     for command in (
@@ -761,7 +761,7 @@ def test_ssh_commands_share_one_connection_and_prefer_fast_ciphers(
         assert "Ciphers=^aes128-gcm@openssh.com,chacha20-poly1305@openssh.com" in command
         assert not any(part.startswith("Compression=yes") for part in command)
         tag = hashlib.sha256(b"lab").hexdigest()[:8]
-        control = Path(f"/tmp/letify-{os.getuid()}") / f"{tag}-%C"
+        control = Path.home() / ".letify" / "ssh" / f"{tag}-%C"
         if platform == "nt":
             assert not any(part.startswith("Control") for part in command)
         else:
@@ -776,21 +776,22 @@ def control_options(command: list[str]) -> list[str]:
     return [part for part in command if part.startswith("Control")]
 
 
-def test_a_control_socket_fits_the_socket_limit_for_a_very_long_home(
+def test_a_control_socket_lives_under_letify_ssh_when_runtime_dir_is_unset(
     tmp_path: Path, monkeypatch
 ) -> None:
-    # Spec "SSH authentication": sockets live in a short per-user directory.
+    # Spec "SSH authentication": sockets live in ~/.letify/ssh when XDG_RUNTIME_DIR is unset.
     from letify.transport import sshopts
 
     monkeypatch.setattr(sshopts, "WINDOWS", False)
     monkeypatch.delenv("XDG_RUNTIME_DIR", raising=False)
-    home = tmp_path / ("h" * 150)
+    monkeypatch.setattr(sshopts, "SOCKET_LIMIT", 500)
+    home = tmp_path / "home"
     monkeypatch.setattr(Path, "home", classmethod(lambda cls: home))
     command = sshopts.options("a-rather-long-account-alias-for-the-lab-machine")
     (path,) = [part[len("ControlPath=") :] for part in command if part.startswith("ControlPath=")]
     expanded = path.replace("%C", "0" * 40)
     assert len(expanded.encode()) + 17 < sshopts.SOCKET_LIMIT
-    assert Path(path).parent == Path(f"/tmp/letify-{os.getuid()}")
+    assert Path(path).parent == home / ".letify" / "ssh"
 
 
 def test_sharing_is_left_out_when_the_socket_path_would_exceed_the_limit(
@@ -1158,8 +1159,8 @@ def test_the_modal_adapter_runs_in_its_own_uv_environment_with_a_pinned_modal() 
     command = tools_module.modal_adapter_command("/usr/bin/uv")
     assert command[:6] == ["/usr/bin/uv", "run", "--no-project", "--python", "3.12", "--with"]
     assert command[6] == "modal>=1.0,<2"
-    assert command[7:9] == ["python", "-P"]
-    assert Path(command[9]) == Path(modal_module.__file__).with_name("modal_adapter.py")
+    assert command[7:11] == ["--frozen", "--no-sync", "python", "-P"]
+    assert Path(command[11]) == Path(modal_module.__file__).with_name("modal_adapter.py")
 
 
 def test_a_sibling_modal_module_does_not_shadow_the_modal_package(tmp_path: Path) -> None:
@@ -2632,3 +2633,109 @@ def test_every_provider_start_accepts_the_keywords_the_pool_passes() -> None:
         parameters = inspect.signature(cls.start).parameters
         missing = wanted - parameters.keys()
         assert not missing, f"{cls.__name__}.start lacks {sorted(missing)}"
+
+
+def test_colab_prepares_tailcat_before_the_connection_race(
+    isolated_home, patch_which, patch_run, monkeypatch
+) -> None:
+    # Spec "Colab", Runtime tools: installation failure cannot silently lose the race.
+    from letify import install
+    patch_which(tools_module, present=True)
+    found = FakeCompleted(stdout='LETIFY-TAILCAT "/remote/tailcat"\n')
+    recorder = patch_run(colab_module, result=found)
+    monkeypatch.setattr(install, "find", lambda *a, **k: "/local/tailcat")
+    key = Path.home() / "id.pub"
+    key.write_text("ssh-ed25519 AAAA")
+    provider = provider_of(Colab, key=str(key)[:-4])
+    runtime = type("R", (), {"name": "live"})()
+    target = provider.target(runtime)
+    assert recorder.command == [*COLAB_CLI, "exec", "-s", "live"]
+    assert "SHA-256" in recorder.calls[-1]["input"]
+    assert target.rendezvous.extras()["binary"] == "/remote/tailcat"
+    patch_run(colab_module, result=FakeCompleted(returncode=1, stderr="tailcat SHA-256 mismatch"))
+    with pytest.raises(letify.RuntimeFailure, match="SHA-256"):
+        provider.target(type("R", (), {"name": "another"})())
+
+
+def test_colab_requires_the_daemon_to_acknowledge_startup(
+    isolated_home, patch_which, patch_run
+) -> None:
+    # Spec "Colab", Keep-alive supervision: the detached child starts outside uv.
+    patch_which(tools_module, present=True)
+    recorder = patch_run(colab_module)
+    provider = provider_of(Colab)
+    provider.create_session(provider.cpu, "live")
+    assert "live" in provider.__dict__["_keep_alive"]
+    child = provider.__dict__["_keep_alive"]["live"]
+    assert child.command[0] == sys.executable
+    assert child.kwargs["start_new_session"] is True
+    assert "colab_keepalive.py" in child.command[1]
+    provider.stop(type("R", (), {"name": "live"})())
+    assert child.terminated
+    assert recorder.command == [*COLAB_CLI, "stop", "-s", "live"]
+
+
+def test_a_daemon_that_exits_before_ready_fails_creation_and_cleans_up(
+    isolated_home, patch_which, patch_run, patch_popen
+) -> None:
+    # Spec "Colab": missing readiness is an explicit startup failure.
+    patch_which(tools_module, present=True)
+    recorder = patch_run(colab_module)
+    children = patch_popen(colab_module, [])
+    provider = provider_of(Colab)
+    with pytest.raises(letify.RuntimeFailure, match=r"keep-alive.*ready"):
+        provider.create_session(provider.cpu, "live")
+    assert children[0].terminated
+    assert recorder.command == [*COLAB_CLI, "stop", "-s", "live"]
+
+
+def test_colab_diagnose_identifies_provider_reclamation_when_session_is_missing(
+    isolated_home, patch_which, patch_run
+) -> None:
+    # Spec "Colab", Keep-alive supervision: provider reclamation is diagnosed explicitly.
+    patch_which(tools_module, present=True)
+    provider = provider_of(Colab)
+    runtime = type("R", (), {"name": "reclaimed-session"})()
+    failure = letify.RuntimeLost("reclaimed-session: the worker pipe is closed")
+    patch_run(
+        colab_module,
+        result=FakeCompleted(stdout="[other-session] id | Hardware: CPU | Variant: DEFAULT\n"),
+    )
+    diagnosed = provider.diagnose(runtime, failure)
+    from letify.providers.colab import ColabSessionReclaimed
+
+    assert isinstance(diagnosed, ColabSessionReclaimed)
+    assert "the provider reclaimed the runtime rather than letify ending it" in str(diagnosed)
+
+
+def test_colab_diagnose_identifies_provider_reclamation_from_cli_stderr(
+    isolated_home, patch_which, patch_run
+) -> None:
+    # Spec "Colab", Keep-alive supervision: CLI output indicating lost session names reclamation.
+    patch_which(tools_module, present=True)
+    provider = provider_of(Colab)
+    runtime = type("R", (), {"name": "lost-session"})()
+    stderr = "[colab] Session 'lost-session' appears to be lost (404/401). Cleaning up."
+    failure = letify.RuntimeFailure("exec failed", stderr=stderr)
+    diagnosed = provider.diagnose(runtime, failure)
+    from letify.providers.colab import ColabSessionReclaimed
+
+    assert isinstance(diagnosed, ColabSessionReclaimed)
+    assert "the provider reclaimed the runtime rather than letify ending it" in str(diagnosed)
+
+
+def test_colab_diagnose_leaves_other_failures_unchanged_when_session_remains(
+    isolated_home, patch_which, patch_run
+) -> None:
+    # Spec "Colab", Keep-alive supervision: failures on existing sessions are returned unchanged.
+    patch_which(tools_module, present=True)
+    provider = provider_of(Colab)
+    runtime = type("R", (), {"name": "active-session"})()
+    failure = letify.RuntimeLost("active-session: transient error")
+    patch_run(
+        colab_module,
+        result=FakeCompleted(stdout="[active-session] id | Hardware: CPU | Variant: DEFAULT\n"),
+    )
+    diagnosed = provider.diagnose(runtime, failure)
+    assert diagnosed is failure
+

@@ -82,6 +82,27 @@ export interface Status {
   runtimes: Runtime[];
 }
 
+export interface SessionRow {
+  alias: string;
+  kind: string;
+  sessions: string[];
+  reason: string | null;
+  unavailable?: string;
+}
+
+/** Provider names are independent of the current process pool. */
+export function parseSessions(data: unknown): SessionRow[] {
+  if (!Array.isArray(data)) throw new Error("letify sessions --json did not print a list");
+  return data.map((raw) => {
+    if (!raw || typeof raw.alias !== "string" || !Array.isArray(raw.sessions)
+      || !raw.sessions.every((name: unknown) => typeof name === "string")) {
+      throw new Error("letify sessions --json printed an invalid session row");
+    }
+    return { alias: raw.alias, kind: str(raw.kind) ?? "", sessions: raw.sessions,
+      reason: str(raw.reason), ...(typeof raw.unavailable === "string" ? { unavailable: raw.unavailable } : {}) };
+  });
+}
+
 export type Severity = "ok" | "warning" | "error";
 
 function num(value: unknown): number | null {
@@ -159,6 +180,22 @@ export function parseStatus(data: unknown): Status {
     throw new Error("letify status --json did not print an object");
   }
   const raw = data as Record<string, unknown>;
+  if (typeof raw.name !== "string" || num(raw.live) === null || num(raw.busy) === null
+    || !Array.isArray(raw.runtimes) || !raw.devices || typeof raw.devices !== "object" || Array.isArray(raw.devices)) {
+    throw new Error("letify status --json printed an invalid status object");
+  }
+  const inventories = Object.values(raw.devices as Record<string, unknown>);
+  if (inventories.some((inventory) => !inventory || typeof inventory !== "object" || Array.isArray(inventory)
+    || Object.values(inventory).some((entry) => !entry || num(entry.count) === null
+      || num(entry.reserved) === null || !Array.isArray(entry.indices)
+      || !entry.indices.every((index: unknown) => typeof index === "number" && Number.isInteger(index))))
+    || raw.runtimes.some((runtime) => !runtime || typeof runtime.name !== "string"
+      || typeof runtime.provider !== "string" || typeof runtime.accelerator !== "string"
+      || typeof runtime.placement !== "string" || typeof runtime.busy !== "boolean"
+      || typeof runtime.persistent_channel !== "boolean" || num(runtime.idle_seconds) === null
+      || !Array.isArray(runtime.devices))) {
+    throw new Error("letify status --json printed invalid runtime or device records");
+  }
   return {
     name: str(raw.name) ?? "",
     live: num(raw.live) ?? 0,
@@ -328,4 +365,15 @@ export function escapeHtml(text: string): string {
     .replace(/>/g, "&gt;")
     .replace(/"/g, "&quot;")
     .replace(/'/g, "&#39;");
+}
+
+/** Compact activity and failure indicators, including provider sessions without telemetry. */
+export function activityStatusText(rows: UtilizationRow[], status: Status | null, sessions: SessionRow[],
+  errors: Record<string, string>, busyPercent: number): string {
+  const count = sessions.reduce((sum, row) => sum + row.sessions.length, 0);
+  const failed = ["utilization", "status", "sessions"].some((key) => errors[key])
+    || rows.some((row) => row.unavailable) || sessions.some((row) => row.unavailable);
+  const summary = gpuSummary(rows, status, busyPercent);
+  const activity = count > 0 && summary.total === 0 && summary.reserved === 0 ? "GPU unknown" : gpuStatusText(summary);
+  return `${activity}${count ? ` · ${count} session${count === 1 ? "" : "s"}` : ""}${failed ? " $(error) letify error" : ""}`;
 }

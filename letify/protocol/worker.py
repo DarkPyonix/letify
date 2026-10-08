@@ -195,6 +195,16 @@ _NO_LETIFY = (
     "the project with 'uv add letify' so uv.lock carries it into the runtime."
 )
 
+_SHIP_IS_NOT_INSTALL = (
+    "{name!r} is not importable in this runtime while the call's body was running. "
+    "Env.ship() sends a module by value: an object from it that the function captures "
+    "as a global is carried inside the call's payload, but the module itself is never "
+    "installed in the runtime, so 'import {name}' inside the function body has nothing "
+    "to find. Reference the name as a global the function closes over instead of "
+    "importing it inside the body, or install the package in the runtime's environment "
+    "(name it in uv.lock) so it can be imported there by reference."
+)
+
 
 def _ship_main_to_children(cloudpickle):
     """Let a child process the body spawns rebuild what the caller's __main__ defined.
@@ -271,6 +281,8 @@ def _op_call(request):
         import shutil
         _data_unregister(state)
         _data_check_cache(data, state["placed"])
+        _DATA_POLL_SEEN.pop(data["dir"], None)
+        _DATA_POLL_SENT.pop(data["dir"], None)
         shutil.rmtree(data["dir"], ignore_errors=True)
 
 
@@ -370,6 +382,129 @@ def _data_check_cache(data, placed):
 def _op_data_written(request):
     """The write-back list of a returned call, removed as it is answered."""
     return {"ok": True, "value": _DATA_WRITTEN.pop(request["dir"], {})}
+
+
+# What the last output poll of a running call saw, by call directory: the size and the
+# modification time in nanoseconds per output file, and the digest already reported per file.
+_DATA_POLL_SEEN = {}
+_DATA_POLL_SENT = {}
+
+
+def _op_data_output_poll(request):
+    """The output files of a running call that are complete and not yet reported.
+
+    Spec "Writing back", the background write-back. A file is complete when no process has
+    it open any more and its size and its modification time in nanoseconds are what the
+    poll before saw. The open check is what decides it, because a writer that pauses
+    between two writes leaves the size and the time unchanged while the file is still half
+    written. A file found complete is hashed and copied into the file blob cache, so the
+    local process can fetch it with the same ``data_stream`` request the final write-back
+    uses. The copy leaves the output file where it is, because the body may still write
+    the next version of it.
+    """
+    import stat
+    call_dir = request["dir"]
+    before = _DATA_POLL_SEEN.get(call_dir) or {}
+    reported = _DATA_POLL_SENT.setdefault(call_dir, {})
+    held = _data_open_files()
+    now = {}
+    written = {}
+    for output in request["outputs"]:
+        files = []
+        for rel, full in _data_output_files(output):
+            try:
+                info = os.lstat(full)
+            except OSError:
+                continue
+            if not stat.S_ISREG(info.st_mode):
+                continue
+            stamp = (info.st_size, info.st_mtime_ns)
+            now[full] = stamp
+            if held is not None and (info.st_dev, info.st_ino) in held:
+                # Still open somewhere, so the writer is not done with it.
+                continue
+            if before.get(full) != stamp:
+                # Seen once only, so it may still be growing: it waits for the next poll.
+                continue
+            if reported.get(full) == stamp:
+                continue
+            try:
+                digest = _data_hash_file(full)
+                _data_copy_into_cache(request["blobs"], full, digest)
+            except OSError:
+                continue
+            reported[full] = stamp
+            files.append([rel, digest, info.st_size])
+        if files:
+            written[output] = files
+    _DATA_POLL_SEEN[call_dir] = now
+    return {"ok": True, "value": written}
+
+
+def _data_open_files():
+    """The device and inode of every file any process on this machine holds open.
+
+    Spec "Writing back". Read from ``/proc``, which is how a close is observed without
+    hooking it: an output file with no descriptor left pointing at it has been closed by
+    the body and by anything the body started. None where ``/proc`` is not there, and the
+    poll then rests on the size and the time alone.
+    """
+    if not os.path.isdir("/proc/self/fd"):
+        return None
+    held = set()
+    for entry in os.listdir("/proc"):
+        if not entry.isdigit():
+            continue
+        directory = "/proc/%s/fd" % entry
+        try:
+            names = os.listdir(directory)
+        except OSError:
+            continue
+        for name in names:
+            try:
+                info = os.stat(os.path.join(directory, name))
+            except OSError:
+                continue
+            held.add((info.st_dev, info.st_ino))
+    return held
+
+
+def _data_output_files(output):
+    """Each regular file under an output's runtime path, as relative path and full path."""
+    skipped = (".git", ".venv", "__pycache__")
+    if os.path.isfile(output) and not os.path.islink(output):
+        return [("", output)]
+    if not (os.path.isdir(output) and not os.path.islink(output)):
+        return []
+    found = []
+    for directory, names, entries in os.walk(output, followlinks=False):
+        names[:] = [name for name in names if name not in skipped]
+        for name in entries:
+            if _DATA_PARTIAL in name:
+                continue
+            full = os.path.join(directory, name)
+            found.append((os.path.relpath(full, output).replace(os.sep, "/"), full))
+    found.sort()
+    return found
+
+
+def _data_copy_into_cache(blobs, path, digest):
+    """Copy a complete output file into the file blob cache, unless its digest is held."""
+    import shutil
+    final = _data_file(blobs, digest)
+    try:
+        if os.stat(final).st_size == os.stat(path).st_size:
+            return
+    except OSError:
+        pass
+    os.makedirs(os.path.dirname(final), exist_ok=True)
+    partial = "%s.partial.%d" % (final, os.getpid())
+    shutil.copyfile(path, partial)
+    try:
+        os.chmod(partial, 0o444)
+    except OSError:
+        pass
+    os.replace(partial, final)
 
 
 #: Bytes of one piece of a streamed file blob, one ``DATA`` frame each.
@@ -1398,7 +1533,15 @@ def _call(request):
         # refers to it when loaded, so the same explanation applies.
         if (exc.name or "").split(".")[0] == "letify":
             raise ModuleNotFoundError(_NO_LETIFY, name=exc.name) from exc
-        raise
+        # A package Env.ship() sends by value never lands on this runtime's
+        # sys.path: cloudpickle only puts a captured global in the payload, it
+        # does not install anything. An import statement inside the body still
+        # runs against this interpreter's own path and fails here, even though
+        # the same name reached the call fine as a global. Say so, because the
+        # bare ModuleNotFoundError reads as a missing dependency rather than as
+        # this shape of call.
+        explained = _SHIP_IS_NOT_INSTALL.format(name=exc.name)
+        raise ModuleNotFoundError(explained, name=exc.name) from exc
     return {"ok": True, "value": value}
 
 
@@ -1737,6 +1880,7 @@ _OPS = {
     "data_evict": _op_data_evict,
     "data_cache": _op_data_cache,
     "data_written": _op_data_written,
+    "data_output_poll": _op_data_output_poll,
     "data_stream": _op_data_stream,
     "data_stats": _op_data_stats,
     "blob_dir": _op_blob_dir,

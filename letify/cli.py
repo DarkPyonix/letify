@@ -9,7 +9,10 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
+import shutil
 import sys
+from pathlib import Path
 
 from . import __version__, render
 from .config import login
@@ -33,6 +36,10 @@ def build_parser() -> argparse.ArgumentParser:
     devices_parser.add_argument("--json", action="store_true", help="print the records unformatted")
     status_parser = sub.add_parser("status", help="show live runtimes and what they are costing")
     status_parser.add_argument("--json", action="store_true", help="print the records unformatted")
+    sessions_parser = sub.add_parser("sessions", help="list provider-owned sessions")
+    sessions_parser.add_argument(
+        "--json", action="store_true", help="print the records unformatted"
+    )
     sub.add_parser("stubs", help="write the provider types an editor completes")
 
     usage = sub.add_parser("usage", help="show what each account has left")
@@ -57,7 +64,9 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         help="port forward SSH dials at --address when it differs from --port, for tunnel",
     )
-    log_in.add_argument("--key", help="SSH private key path")
+    log_in.add_argument(
+        "--key", help="SSH private key path; with --username, the Kaggle API token instead"
+    )
     log_in.add_argument(
         "--auth",
         choices=login.AUTH_METHODS,
@@ -90,6 +99,13 @@ def build_parser() -> argparse.ArgumentParser:
     )
     log_in.add_argument("--account", help="account email, for Colab")
     log_in.add_argument(
+        "--username",
+        help=(
+            "Kaggle username, with --key the API token from Settings > API on kaggle.com; "
+            "required, for everything the official CLI covers that the cookie does not"
+        ),
+    )
+    log_in.add_argument(
         "--workspace",
         metavar="PATH",
         help="the one directory letify writes under on the machine; checked for shell and tunnel",
@@ -108,7 +124,7 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="COOKIE",
         help=(
             "the browser cookie of a logged-in kaggle.com tab, or a file holding it, for "
-            "kaggle; this is the whole Kaggle credential"
+            "kaggle; required alongside --username/--key, which the official CLI needs"
         ),
     )
     log_in.add_argument(
@@ -135,6 +151,11 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="ask an already declared machine for its GPUs again and replace its devices table",
     )
+    log_in.add_argument(
+        "--replace",
+        action="store_true",
+        help="run the login again for an alias that already exists, to renew its credentials",
+    )
 
     log_out = sub.add_parser("logout", help="remove an account from this machine")
     log_out.add_argument("alias", help="provider alias to forget")
@@ -143,8 +164,13 @@ def build_parser() -> argparse.ArgumentParser:
     check.add_argument("alias", help="provider alias from the configuration")
 
     cache = sub.add_parser("cache", help="show the data caches, or clear a provider's")
-    cache.add_argument("action", nargs="?", choices=("clear",), help="clear a runtime cache")
-    cache.add_argument("alias", nargs="?", help="provider alias whose runtime cache to clear")
+    cache.add_argument(
+        "action",
+        nargs="?",
+        choices=("clear", "clean"),
+        help="clear a runtime cache or local cache",
+    )
+    cache.add_argument("alias", nargs="?", help="provider alias or local cache target to clear")
     cache.add_argument("--json", action="store_true", help="print the records unformatted")
 
     probe = sub.add_parser("probe", help="measure whether host='local' is worth using")
@@ -311,26 +337,114 @@ def _data_cache_request(let: Launcher, alias: str, clear: bool) -> dict:
             let.pool.release(runtime)
 
 
+def _measure_tree(path: Path) -> tuple[int, int]:
+    """Return (file_count, total_bytes) for all files under path."""
+    if not path.exists():
+        return 0, 0
+    if path.is_file():
+        return 1, path.stat().st_size
+    files = 0
+    total_bytes = 0
+    for root, _, filenames in os.walk(path):
+        for name in filenames:
+            p = Path(root) / name
+            try:
+                stat_res = p.stat(follow_symlinks=False)
+                files += 1
+                total_bytes += stat_res.st_size
+            except OSError:
+                pass
+    return files, total_bytes
+
+
 def _cache(let: Launcher, args: argparse.Namespace) -> int:
     """Spec "The cache command"."""
+    from .paths import (
+        accounts_directory,
+        cache_directory,
+        local_runtime_directory,
+        local_tmp_directory,
+        ssh_control_directory,
+        tools_directory,
+    )
     from .store import pathdata
 
     mib = 1 << 20
-    if args.action == "clear":
-        if not args.alias:
-            _fail("name the provider whose runtime cache to clear: letify cache clear <alias>")
+    local_trees: dict[str, tuple[Path, bool]] = {
+        "cache": (cache_directory(), True),
+        "tools": (tools_directory(), True),
+        "tmp": (local_tmp_directory(), True),
+        "ssh": (ssh_control_directory(), True),
+        "runtime": (local_runtime_directory(), True),
+        "accounts": (accounts_directory(), False),
+    }
+
+    if args.action in ("clear", "clean"):
+        target = args.alias
+        if not target:
+            _fail("name the provider or local tree to clear: letify cache clear <target>")
             return 1
-        result = _data_cache_request(let, args.alias, True)
+        if target in ("accounts", "config", "config.toml"):
+            _fail(f"refused: {target} holds credentials or configuration and cannot be cleaned")
+            return 1
+
+        local_targets = ("cache", "tools", "tmp", "ssh", "runtime", "all")
+        if target in local_targets:
+            to_clean = ["cache", "tools", "tmp", "runtime"] if target == "all" else [target]
+            total_removed = 0
+            total_removed_bytes = 0
+            for item in to_clean:
+                dir_path, cleanable = local_trees[item]
+                if cleanable and dir_path.exists():
+                    cnt, sz = _measure_tree(dir_path)
+                    total_removed += cnt
+                    total_removed_bytes += sz
+                    for entry in list(dir_path.iterdir()):
+                        if entry.is_dir():
+                            shutil.rmtree(entry, ignore_errors=True)
+                        else:
+                            entry.unlink(missing_ok=True)
+            if args.json:
+                return _json(
+                    {
+                        "target": target,
+                        "removed": total_removed,
+                        "removed_bytes": total_removed_bytes,
+                    }
+                )
+            print(
+                f"{target}: removed {total_removed} files "
+                f"{total_removed_bytes / mib:.1f} MiB"
+            )
+            return 0
+
+        # Provider target
+        try:
+            result = _data_cache_request(let, target, True)
+        except LetifyError as exc:
+            _fail(str(exc))
+            return 1
         if args.json:
-            return _json({"alias": args.alias, **result})
+            return _json({"alias": target, **result})
         print(
-            f"{args.alias}: removed {result['removed']} files "
+            f"{target}: removed {result['removed']} files "
             f"{result['removed_bytes'] / mib:.1f} MiB"
         )
         return 0
+
     digests = pathdata.DigestCache()
     pruned = digests.prune()
     digests.save()
+
+    local_stats: dict[str, dict] = {}
+    for name, (path, cleanable) in local_trees.items():
+        count, size_bytes = _measure_tree(path)
+        local_stats[name] = {
+            "files": count,
+            "bytes": size_bytes,
+            "cleanable": cleanable,
+        }
+
     records: list[dict] = []
     for alias in let.config.order:
         try:
@@ -351,10 +465,23 @@ def _cache(let: Launcher, args: argparse.Namespace) -> int:
                 "budget": result["budget"],
             }
         )
-    record = {"digests": {"entries": len(digests), "pruned": pruned}, "providers": records}
+    record = {
+        "digests": {"entries": len(digests), "pruned": pruned},
+        "local": local_stats,
+        "providers": records,
+    }
     if args.json:
         return _json(record)
+
     print(f"digest cache: {len(digests)} entries, {pruned} pruned")
+
+    local_rows = []
+    for name, (_path, cleanable) in local_trees.items():
+        st = local_stats[name]
+        clean_str = "yes" if cleanable else "no (credentials)"
+        local_rows.append([name, str(st["files"]), f"{st['bytes'] / mib:.1f} MiB", clean_str])
+    sys.stdout.write(render.table(["LOCAL", "FILES", "SIZE", "CLEANABLE"], local_rows, _out()))
+
     rows = []
     for row in records:
         if "unavailable" in row:
@@ -447,6 +574,7 @@ def _dispatch(args: argparse.Namespace) -> int:
                 "organization": args.organization,
                 "billing_endpoint": args.billing_endpoint,
                 "account": args.account,
+                "username": args.username,
                 "workspace": args.workspace,
                 "profile": args.profile,
                 "connect": args.connect,
@@ -457,6 +585,7 @@ def _dispatch(args: argparse.Namespace) -> int:
             token=args.token,
             interactive=args.interactive,
             install_key=args.install_key,
+            replace=args.replace,
         )
         try:
             fresh, home, project = login.log_in(answers, project=args.config)
@@ -464,9 +593,14 @@ def _dispatch(args: argparse.Namespace) -> int:
             _fail(str(exc))
             return 1
         if fresh:
-            _say("ok", f"{alias} declared in {home}")
+            what = "renewed" if args.replace else "declared"
+            _say("ok", f"{alias} {what} in {home}")
         else:
-            _say("warn", f"{alias} was already declared in {home}, so nothing was asked for")
+            _say(
+                "warn",
+                f"{alias} was already declared in {home}, so nothing was asked for. "
+                f"Pass --replace to renew its credentials",
+            )
         _say("ok", f"{alias} referenced in {project}, which is safe to commit")
         return 0
 
@@ -533,6 +667,16 @@ def _dispatch(args: argparse.Namespace) -> int:
             return 0
         rows = [[alias, ", ".join(str(name) for name in names)] for alias, names in table.items()]
         sys.stdout.write(render.table(["PROVIDER", "ACCELERATORS"], rows, _out()))
+        return 0
+
+    if args.command == "sessions":
+        rows = let.sessions()
+        if args.json:
+            return _json(rows)
+        for row in rows:
+            names = ", ".join(row["sessions"])
+            detail = row.get("unavailable") or row.get("reason") or names or "no active sessions"
+            print(f"{row['alias']}  {detail}")
         return 0
 
     if args.command == "status":

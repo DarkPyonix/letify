@@ -466,7 +466,7 @@ def test_a_volume_elsewhere_naming_the_modal_backend_needs_an_account(let) -> No
 def test_a_volume_mounts_where_the_runtime_keeps_materialized_files(let, tmp_path) -> None:
     # Spec "Workspace root": local uses no workspace, so the default root holds its volumes.
     default = Volume(let.providers.local, "cache", {"root": str(tmp_path)}).mount
-    assert default == "~/.letify-runtime/volumes/cache"
+    assert default == "~/.letify/runtime/volumes/cache"
     volume = Volume(let.providers.local, "cache", {"mount": "/mnt/study"})
     assert volume.mount == "/mnt/study"
     assert volume.key == "local/cache"
@@ -846,3 +846,32 @@ def test_the_gcs_backend_imports_no_cloud_sdk(no_module, fake_gcs) -> None:
 def test_there_is_no_s3_backend() -> None:
     # Not a requested feature, and boto3 is a dependency letify does not take.
     assert "s3" not in backends.BACKENDS
+
+
+def test_a_one_shot_runtime_pulls_an_archive_without_relaying_it_through_the_client(
+    let, remote_cpu, bucket_volume, fake_gcs, tmp_path, live, monkeypatch
+) -> None:
+    # Spec "Materializing into a runtime": Colab's exec fallback still pulls directly.
+    from conftest import local_one_shot_runner
+
+    from letify.runtime.channel import OneShotChannel
+
+    tree = tmp_path / "model"
+    tree.mkdir()
+    (tree / "weights.bin").write_bytes(b"cached weights")
+    info = bucket_volume.store.put_tree(tree)
+    runtime = live(let, remote_cpu)
+    runtime.channel.close()
+    runtime.channel = OneShotChannel(local_one_shot_runner(), name="one-shot")
+
+    def refuse_relay(digest):
+        raise AssertionError("the client must not download the blob")
+
+    monkeypatch.setattr(bucket_volume.store.backend, "get", refuse_relay)
+    written = bucket_volume.materialize(runtime, info.digest, unpack=True)
+    assert Path(written.path).is_file()
+    restored = Path(bucket_volume.directory(runtime)) / "model" / "weights.bin"
+    assert restored.read_bytes() == b"cached weights"
+    blobs = [r for r in fake_gcs.downloads() if "/blobs/" in unquote(r["path"])]
+    assert [r["authorization"] for r in blobs] == ["Bearer down-token-1"]
+    let.pool.shutdown()

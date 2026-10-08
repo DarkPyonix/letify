@@ -209,6 +209,13 @@ def patch_run(monkeypatch):
     def patch(module: Any, **kwargs: Any) -> RunRecorder:
         recorder = RunRecorder(**kwargs)
         monkeypatch.setattr(module.subprocess, "run", recorder)
+        if module.__name__ == "letify.providers.colab":
+            monkeypatch.setattr(
+                module.subprocess, "Popen",
+                lambda command, **options: FakeProcess(
+                    list(command), ["LETIFY-KEEP-ALIVE ready\n"], **options
+                ),
+            )
         return recorder
 
     return patch
@@ -353,8 +360,15 @@ class RenewalRecorder:
     def __init__(self) -> None:
         self.renewals: list[float] = []
         self.fail_after: int | None = None
+        #: Number of leading attempts that fail with a transient error, such as a renewal
+        #: reply delayed behind a large transfer, before renewals resume.
+        self.transient_for: int = 0
+        self._attempts = 0
 
     def request(self, payload: dict[str, Any], *, timeout: float | None = None) -> float:
+        self._attempts += 1
+        if self._attempts <= self.transient_for:
+            raise letify.RuntimeFailure("recorded-runtime: the call exceeded 60s")
         if self.fail_after is not None and len(self.renewals) >= self.fail_after:
             raise letify.RuntimeLost("the session is gone")
         self.renewals.append(float(payload["grace"]))
@@ -1461,6 +1475,8 @@ class FakeKaggleCloud:
         self.kernels: set[str] = set()
         self.cloud_calls: list[tuple[str, dict[str, Any]]] = []
         self.cancelled: list[int] = []
+        #: Notebook ids deleted through the cookie's ``DeleteKernel`` call.
+        self.deleted: list[int] = []
         self.ended = False
         #: Endpoint name to (HTTP status, message) for internal calls the fake refuses.
         self.refuse: dict[str, tuple[int, str]] = {}
@@ -1550,6 +1566,9 @@ class FakeKaggleCloud:
         if path.endswith("CancelKernelSession"):
             self.cancelled.append(int(body.get("kernelSessionId")))
             return _Reply({})
+        if path.endswith("DeleteKernel"):
+            self.deleted.append(int(body.get("kernelId")))
+            return _Reply({})
         if path.endswith("GetAcceleratorQuotaStatistics"):
             return _Reply(
                 {
@@ -1633,12 +1652,16 @@ def fake_kaggle(isolated_home, monkeypatch, tmp_path: Path):
     """A Kaggle account whose whole token chain and session are faked for alias ``kaggle_a``.
 
     The fake adapter in ``tests/fake_kaggle_adapter.py`` keeps the real adapter's contract and
-    runs the worker in a local interpreter, so the driver programs are the real ones.
+    runs the worker in a local interpreter, so the driver programs are the real ones. The
+    account also gets an API token, since login requires one: a test of the no-token path
+    removes ``api_token`` itself after this fixture runs.
     """
     from letify.config.secrets import write_secret
     from letify.providers import kaggle as kaggle_module
 
     write_secret("kaggle_a", "cookie", kaggle_test_cookie())
+    write_secret("kaggle_a", "access_token", "KGAT_" + "a" * 32)
+    write_secret("kaggle_a", "username", "irack000")
     cloud = FakeKaggleCloud()
     monkeypatch.setattr(kaggle_module, "urlopen", cloud.urlopen)
     monkeypatch.setattr(kaggle_module, "JUPYTER_PROXY_HOST", cloud.proxy_host)
@@ -1649,3 +1672,59 @@ def fake_kaggle(isolated_home, monkeypatch, tmp_path: Path):
     monkeypatch.setenv("FAKE_KAGGLE_LOG", str(cloud.log))
     yield cloud
     cloud.close()
+
+
+class FakeKaggleCLI:
+    """Stands in for the official ``kaggle`` CLI, by replacing ``subprocess.run`` in the
+    Kaggle provider module.
+
+    Records every command it was asked to run. ``kernels delete`` and ``quota`` are the two
+    commands the provider uses; both answer success unless ``fail`` names the subcommand.
+    """
+
+    def __init__(self):
+        self.calls: list[list[str]] = []
+        self.environments: list[dict[str, str]] = []
+        self.fail: set[str] = set()
+        #: Standard output a ``quota`` call answers with, as JSON text.
+        self.quota_json = json.dumps([
+            {"resource": "GPU", "used": "0.00h", "remaining": "60.00h", "total": "60.00h",
+             "refreshAt": "2026-10-10T00:00:00"},
+            {"resource": "TPU", "used": "0.00h", "remaining": "20.00h", "total": "20.00h",
+             "refreshAt": "2026-10-10T00:00:00"},
+        ])
+
+    def run(self, command: list[str], **kwargs: Any) -> FakeCompleted:
+        self.calls.append(list(command))
+        environment = dict(kwargs.get("env") or {})
+        self.environments.append(environment)
+        if not environment.get("KAGGLE_API_TOKEN"):
+            return FakeCompleted(returncode=1, stdout="", stderr="Authentication required")
+        for marker in self.fail:
+            if marker in command:
+                return FakeCompleted(returncode=1, stdout="", stderr="refused")
+        if "quota" in command:
+            return FakeCompleted(returncode=0, stdout=self.quota_json, stderr="")
+        return FakeCompleted(returncode=0, stdout="{}", stderr="")
+
+
+@pytest.fixture
+def fake_kaggle_cli(monkeypatch):
+    """Intercept every call the Kaggle provider makes to the official CLI."""
+    from letify.providers import kaggle as kaggle_module
+
+    cli = FakeKaggleCLI()
+    monkeypatch.setattr(kaggle_module.tools, "find_uv", lambda: "uv")
+    import subprocess as subprocess_module
+
+    monkeypatch.setattr(subprocess_module, "run", cli.run)
+    return cli
+
+
+@pytest.fixture
+def kaggle_api_token(isolated_home):
+    """Write a Kaggle API token for alias ``kaggle_a``, as ``letify login kaggle`` would."""
+    from letify.config.secrets import write_secret
+
+    write_secret("kaggle_a", "username", "irack000")
+    return write_secret("kaggle_a", "access_token", "KGAT_" + "a" * 32)

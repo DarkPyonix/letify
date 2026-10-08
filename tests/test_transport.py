@@ -16,10 +16,19 @@ from conftest import FakeProbe, FakeStrategy, StunServer
 
 import letify
 from letify.transport import nat
-from letify.transport.pipeline import Fingerprint, LinkCache, Pipeline, network_fingerprint
+from letify.transport.pipeline import (
+    Fingerprint,
+    LinkCache,
+    LinkFloor,
+    Pipeline,
+    network_fingerprint,
+)
 from letify.transport.probe import Probe, ProbeResult
 
 MIB = 1024 * 1024
+#: No test here is about the floor itself, so it is opened wide; the floor's own tests pass
+#: one explicitly.
+NO_FLOOR = LinkFloor(min_bps=0.0, max_rtt_ms=float("inf"))
 
 
 def result(up: float, down: float, rtt: float = 5.0) -> ProbeResult:
@@ -30,7 +39,7 @@ def fingerprint(ip: str | None = "203.0.113.7", interface: str | None = "eth0"):
     return lambda: Fingerprint(public_ip=ip, interface=interface)
 
 
-def pipeline(strategies, *, cache=None, grace=0.2, fp=None, probe=None) -> Pipeline:
+def pipeline(strategies, *, cache=None, grace=0.2, fp=None, probe=None, floor=NO_FLOOR) -> Pipeline:
     return Pipeline(
         strategies,
         target=None,
@@ -40,6 +49,7 @@ def pipeline(strategies, *, cache=None, grace=0.2, fp=None, probe=None) -> Pipel
         fingerprint=fp or fingerprint(),
         grace=grace,
         timeout=5.0,
+        floor=floor,
     )
 
 
@@ -242,9 +252,10 @@ def test_a_probed_link_is_spliced_to_the_ssh_server_after_the_probe() -> None:
 # -- Spec: Transport, Choosing a link ---------------------------------------------
 
 
-def test_a_lone_applicable_strategy_is_used_without_a_race_a_probe_or_the_cache(
-    isolated_home,
-) -> None:
+def test_a_lone_applicable_strategy_is_used_without_a_race_or_the_cache(isolated_home) -> None:
+    """Spec "Choosing a link": with nothing to compare against, a lone strategy is not
+    raced and not cached. It is still probed and held to the floor, [Link floor]: there
+    is no alternative to fall back to, but a slow link is still a failure, not one."""
     direct = FakeStrategy("direct_ssh", 1, result=result(10, 10))
     skipped = FakeStrategy("tcp_punch", 2, unmet="no rendezvous")
     probe = FakeProbe()
@@ -252,8 +263,25 @@ def test_a_lone_applicable_strategy_is_used_without_a_race_a_probe_or_the_cache(
     link = pipeline([direct, skipped], cache=cache, probe=probe).connect()
     assert link.strategy == "direct_ssh"
     assert (direct.assumed, direct.attempts, skipped.attempts) == (1, 0, 0)
-    assert probe.measured == []
+    assert probe.measured == ["direct_ssh"]
     assert cache.load() is None
+
+
+def test_a_lone_strategy_below_the_floor_fails_the_connection(isolated_home) -> None:
+    slow = FakeStrategy("direct_ssh", 1, result=result(1.9, 1.9, rtt=99.6))
+    with pytest.raises(letify.ProviderUnavailable, match="below the floor"):
+        pipeline([slow], floor=LinkFloor.default()).connect()
+
+
+def test_a_lone_strategy_that_cannot_be_probed_is_not_held_to_the_floor(isolated_home) -> None:
+    # The provider fallback, such as Colab's own path, carries no probe to measure.
+    fallback = FakeStrategy("fallback", 4, probed=False)
+    assert pipeline([fallback], floor=LinkFloor.default()).connect().strategy == "fallback"
+
+
+def test_a_lone_strategy_whose_probe_fails_is_still_used(isolated_home) -> None:
+    broken = FakeStrategy("direct_ssh", 1, probe_error=True)
+    assert pipeline([broken], floor=LinkFloor.default()).connect().strategy == "direct_ssh"
 
 
 def test_the_lowest_rank_wins_when_it_is_not_far_slower_than_the_fastest(isolated_home) -> None:
@@ -455,6 +483,95 @@ def test_a_cache_file_that_does_not_parse_is_ignored(isolated_home) -> None:
     cache = LinkCache("lab")
     cache.path.parent.mkdir(parents=True)
     cache.path.write_text("{not json")
+    assert cache.load() is None
+
+
+# -- Spec: Transport, Link floor ---------------------------------------------------
+
+
+def test_a_relayed_strategy_below_the_floor_is_refused_even_though_it_connected(
+    isolated_home,
+) -> None:
+    """Spec "Link floor": a strategy below the default floor is a failure, not a fallback,
+    even when it is the only probed strategy left. This is the reported case: a Tailcat
+    relay measures 1.9 MiB/s, 99.6 ms against a direct LAN link that measures 51 MiB/s."""
+    relay = FakeStrategy("tailcat", 3, result=result(1.9, 1.9, rtt=99.6))
+    broken = FakeStrategy("tcp_punch", 2, error="no mapping")
+    floor = LinkFloor.default()
+    with pytest.raises(letify.ProviderUnavailable, match="below the floor"):
+        pipeline([broken, relay], floor=floor).connect()
+
+
+def test_a_relayed_strategy_is_refused_when_a_faster_one_also_connected(isolated_home) -> None:
+    direct = FakeStrategy("direct_ssh", 1, result=result(51, 51, rtt=0.2))
+    relay = FakeStrategy("tailcat", 3, result=result(1.9, 1.9, rtt=99.6))
+    floor = LinkFloor.default()
+    chosen = pipeline([direct, relay], floor=floor).connect()
+    assert chosen.strategy == "direct_ssh"
+    assert relay.links[0].closed
+
+
+def test_a_round_trip_above_the_floor_is_refused_even_with_fast_throughput(isolated_home) -> None:
+    slow_round_trip = FakeStrategy("tailcat", 3, result=result(20, 20, rtt=500.0))
+    floor = LinkFloor(min_bps=0.0, max_rtt_ms=300.0)
+    broken = FakeStrategy("tcp_punch", 2, error="unreachable")
+    expected = "round trip 500.0 ms above the floor"
+    with pytest.raises(letify.ProviderUnavailable, match=expected):
+        pipeline([broken, slow_round_trip], floor=floor).connect()
+
+
+def test_the_default_floor_is_five_mib_per_second_and_three_hundred_ms() -> None:
+    floor = LinkFloor.default()
+    assert floor.min_bps == 5.0 * MIB
+    assert floor.max_rtt_ms == 300.0
+
+
+def test_a_cached_strategy_below_the_floor_is_rejected_and_the_race_runs(isolated_home) -> None:
+    cache = LinkCache("lab")
+    cache.save("tailcat", result(1.9, 1.9, rtt=99.6), Fingerprint("203.0.113.7", "eth0"))
+    direct = FakeStrategy("direct_ssh", 1, result=result(51, 51, rtt=0.2))
+    relay = FakeStrategy("tailcat", 3, result=result(1.9, 1.9, rtt=99.6))
+    chosen = pipeline([direct, relay], cache=cache, floor=LinkFloor.default()).connect()
+    assert chosen.strategy == "direct_ssh"
+    assert cache.load().strategy == "direct_ssh"
+
+
+# -- Spec: Transport, Link cache: staleness and format ------------------------------
+
+
+def test_a_stale_cache_entry_runs_the_full_race_even_on_the_same_network(isolated_home) -> None:
+    cache = LinkCache("lab")
+    cache.save(
+        "tailcat", result(20, 20), Fingerprint("203.0.113.7", "eth0"), cached_at=time.time() - 7200
+    )
+    punch = FakeStrategy("tcp_punch", 2, result=result(30, 30))
+    tailcat = FakeStrategy("tailcat", 3, result=result(20, 20))
+    chosen = pipeline([punch, tailcat], cache=cache).connect()
+    assert chosen.strategy == "tcp_punch"
+    assert tailcat.attempts == 1
+
+
+def test_a_fresh_cache_entry_is_not_raced_again(isolated_home) -> None:
+    cache = LinkCache("lab")
+    cache.save("tailcat", result(20, 20), Fingerprint("203.0.113.7", "eth0"))
+    punch = FakeStrategy("tcp_punch", 2, result=result(30, 30))
+    tailcat = FakeStrategy("tailcat", 3, result=result(20, 20))
+    assert pipeline([punch, tailcat], cache=cache).connect().strategy == "tailcat"
+    assert punch.attempts == 0
+
+
+def test_a_cache_file_in_an_older_format_is_ignored_and_remeasured(isolated_home) -> None:
+    cache = LinkCache("lab")
+    cache.path.parent.mkdir(parents=True)
+    cache.path.write_text(
+        json.dumps(
+            {
+                "strategy": "tailcat",
+                "probe": result(20, 20).to_dict(),
+                "fingerprint": {"public_ip": "203.0.113.7", "interface": "eth0"},
+            }
+        )
+    )
     assert cache.load() is None
 
 

@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import os
 import shutil
+import signal
 import subprocess
 import sys
 import threading
@@ -326,6 +327,59 @@ def test_a_request_on_a_runtime_whose_channel_is_shut_says_so(let, remote_cpu, l
         runtime.stat()
     with pytest.raises(RuntimeFailure, match="the channel is not open"):
         runtime.call(returns_pid(), (), {})
+
+
+# -- Spec: Sessions, process exit ----------------------------------------------
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="SIGTERM is not a Windows signal")
+def test_sigterm_shuts_the_pool_down_then_chains_to_what_was_there(
+    let, remote_cpu, live
+) -> None:
+    # atexit does not run on a signal, so a process killed with SIGTERM would otherwise
+    # leave its runtime running and billing. The chain matters too: something else may
+    # already be handling SIGTERM, such as a supervisor's own cleanup, and that must
+    # still run.
+    runtime = live(let, remote_cpu)
+    assert runtime.ready is True
+    previous_calls: list[int] = []
+    signal.signal(signal.SIGTERM, lambda signum, frame: previous_calls.append(signum))
+    try:
+        let._register_at_exit()
+        handler = signal.getsignal(signal.SIGTERM)
+        assert handler is not None
+        handler(signal.SIGTERM, None)
+    finally:
+        signal.signal(signal.SIGTERM, signal.SIG_DFL)
+    assert runtime.ready is False
+    assert previous_calls == [signal.SIGTERM]
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="SIGTERM is not a Windows signal")
+def test_registering_signal_handlers_twice_does_not_chain_to_itself(let) -> None:
+    # The same guard that keeps atexit.register from being called twice must cover the
+    # signal handlers too, or a second registration would wrap the first and double up
+    # the pool shutdown, or chain into itself.
+    before = signal.getsignal(signal.SIGTERM)
+    try:
+        let._register_at_exit()
+        once = signal.getsignal(signal.SIGTERM)
+        let._register_at_exit()
+        assert signal.getsignal(signal.SIGTERM) is once
+    finally:
+        signal.signal(signal.SIGTERM, before)
+
+
+def test_sigint_is_left_to_the_interpreter(let) -> None:
+    # SIGINT is how a notebook kernel delivers an interrupt into the user's running cell.
+    # Shutting the pool down there would end a session the user meant to keep after
+    # dismissing one KeyboardInterrupt, so letify never installs a handler for it.
+    before = signal.getsignal(signal.SIGINT)
+    try:
+        let._register_at_exit()
+        assert signal.getsignal(signal.SIGINT) is before
+    finally:
+        signal.signal(signal.SIGINT, before)
 
 
 def test_installation_is_skipped_where_the_machine_already_runs_in_the_environment(let) -> None:
@@ -645,13 +699,16 @@ def test_a_persistent_provider_syncs_with_the_uv_cache_under_the_workspace_root(
         runtime.shutdown()
 
 
-def test_an_ephemeral_provider_keeps_the_default_uv_cache(uv_project: Path) -> None:
-    # Spec "uv cache": an ephemeral runtime's disk goes with it, so nothing is moved.
+def test_an_ephemeral_provider_still_redirects_the_uv_cache_to_the_workspace(
+    uv_project: Path,
+) -> None:
+    # Spec "Remote paths letify writes": the workspace root may be the only writable
+    # path even on an ephemeral provider, so the redirect applies there too.
     provider = provider_of(PreparingLocal, "lab", persistent=False)
     runtime = provider.start(remote_instance(provider), Env(), name="lab-1")
     try:
         assert runtime.env_source == "sync"
-        assert not (Path(bootstrap.DEFAULT_WORKSPACE_ROOT) / "uv-cache").exists()
+        assert (Path(bootstrap.DEFAULT_WORKSPACE_ROOT) / "uv-cache").exists()
     finally:
         runtime.shutdown()
 
@@ -932,6 +989,42 @@ def test_the_sync_source_carries_the_declared_refinements(uv_project: Path) -> N
     assert "'torch'" in source
     assert "'nvidia-smi'" in source
     assert "'HF_HOME': '/opt/cache'" in source
+
+
+def test_the_sync_source_never_names_a_path_outside_the_workspace_root(
+    uv_project: Path,
+) -> None:
+    # Spec "Remote paths letify writes": the only remote paths a sync introduces derive
+    # from the workspace root, so neither uv's default cache nor its default bin dir,
+    # both under plain $HOME, may appear in the source sent to the runtime.
+    env = Env()
+    source = bootstrap.sync_source(env, bootstrap.project_files(env), workspace="/workspace")
+    assert "~/.local" not in source
+    assert "~/.cache" not in source
+    assert "/workspace/uv-cache" in source
+    assert "/workspace/uv-python" in source
+    assert "/workspace/uv-tool" in source
+    assert "/workspace/uv-bin" in source
+
+
+def test_uv_env_points_every_uv_directory_under_the_workspace_root() -> None:
+    assert bootstrap.uv_env("/workspace") == {
+        "UV_CACHE_DIR": "/workspace/uv-cache",
+        "UV_PYTHON_INSTALL_DIR": "/workspace/uv-python",
+        "UV_TOOL_DIR": "/workspace/uv-tool",
+    }
+    assert bootstrap.uv_bin_dir("/workspace") == "/workspace/uv-bin"
+
+
+def test_declared_variables_still_win_over_the_workspace_uv_redirect(
+    uv_project: Path,
+) -> None:
+    # Spec "Remote paths letify writes": an explicit Env.vars entry is the user's own
+    # choice and is not overridden by the workspace redirect.
+    env = Env().vars(UV_CACHE_DIR="/elsewhere/cache")
+    source = bootstrap.sync_source(env, bootstrap.project_files(env), workspace="/workspace")
+    assert "/workspace/uv-cache" not in source
+    assert "'UV_CACHE_DIR': '/elsewhere/cache'" in source
     assert "'--system'" not in source
 
 
@@ -1086,7 +1179,7 @@ def test_a_runtime_with_neither_curl_nor_wget_fails_early_naming_them(tmp_path: 
     assert "curl or wget" in result.stderr
 
 
-def test_a_runtime_without_uv_installs_it_under_home_and_then_syncs(
+def test_a_runtime_without_uv_installs_it_under_the_workspace_root_and_then_syncs(
     uv_project: Path, tmp_path: Path
 ) -> None:
     home = tmp_path / "home"
@@ -1110,7 +1203,12 @@ def test_a_runtime_without_uv_installs_it_under_home_and_then_syncs(
     )
     result = run_without_uv(source, home)
     assert result.returncode == 0, result.stderr
-    assert (home / ".local" / "bin" / "uv").is_file()
+    # Spec "Remote paths letify writes": the installer is told to write under the
+    # workspace root, not its own default of ~/.local/bin. uv_project patches
+    # bootstrap.DEFAULT_WORKSPACE_ROOT to an absolute path for this test module, so the
+    # install lands there rather than under HOME.
+    assert (Path(bootstrap.DEFAULT_WORKSPACE_ROOT) / "uv-bin" / "uv").is_file()
+    assert not (home / ".local" / "bin" / "uv").exists()
     assert record.read_text(encoding="utf-8").split() == [
         "sync",
         "--frozen",
@@ -1273,6 +1371,24 @@ def test_a_lease_stops_renewing_once_the_session_is_gone(renewal_recorder) -> No
     lease.release()
     # Two renewals happened and then the loop stopped, rather than retrying forever.
     assert len(renewal_recorder.renewals) == 2
+
+
+def test_a_lease_survives_a_transient_renewal_failure(renewal_recorder) -> None:
+    # A renewal reply delayed behind a large transfer, or any other round trip that
+    # merely times out, is not the session going away. The loop keeps trying rather
+    # than giving up on the first bad cycle.
+    renewal_recorder.transient_for = 3
+    lease = Lease(renewal_recorder, interval=0.02, grace=90.0)
+    lease.arm()
+    try:
+        deadline = time.monotonic() + 5
+        while len(renewal_recorder.renewals) < 3 and time.monotonic() < deadline:
+            time.sleep(0.01)
+    finally:
+        lease.release()
+    # The thread survived the leading transient failures and renewed once they stopped.
+    assert len(renewal_recorder.renewals) >= 3
+    assert renewal_recorder.renewals[0] == 90.0
 
 
 # -- Spec: Pooling -------------------------------------------------------------
@@ -1849,7 +1965,7 @@ def test_a_worker_of_this_client_marks_its_card_as_the_login_users() -> None:
 # -- environment on the sandbox disk: spec "Environment on the sandbox disk" --------------
 
 
-def test_a_provider_with_an_env_root_builds_the_venv_there_with_the_default_uv_cache(
+def test_a_provider_with_an_env_root_builds_the_venv_there_but_the_uv_cache_in_the_workspace(
     uv_project: Path, tmp_path: Path
 ) -> None:
     disk = tmp_path / "sandbox-disk"
@@ -1865,7 +1981,9 @@ def test_a_provider_with_an_env_root_builds_the_venv_there_with_the_default_uv_c
         assert Path(imported).is_relative_to(venv)
         assert runtime.env_source == "sync"
         assert not (remote_projects() / env.key).exists()
-        assert not (Path(bootstrap.DEFAULT_WORKSPACE_ROOT) / "uv-cache").exists()
+        # Spec "Remote paths letify writes": an env root moves the .venv off the
+        # workspace root, but uv's own cache stays under the workspace root.
+        assert (Path(bootstrap.DEFAULT_WORKSPACE_ROOT) / "uv-cache").exists()
     finally:
         runtime.shutdown()
 
@@ -1962,3 +2080,137 @@ def test_a_spawned_child_inside_a_call_runs_a_target_defined_in_the_callers_main
     namespace = {"__name__": "__main__", "let": let, "letify": letify}
     exec(compile(_MAIN_SCRIPT, "user_script.py", "exec"), namespace)
     assert namespace["spawn_two"]() == ([(0, 10), (1, 11)], [0, 0])
+
+
+def test_idle_release_rechecks_a_session_acquired_after_the_idle_snapshot(
+    let, remote_cpu, monkeypatch
+):
+    # Spec "Pooling": a new holder cannot lose a runtime selected by idle release.
+    pool = let.pool
+    pool.hold()
+    runtime = pool.acquire(remote_cpu, Env())
+    pool.release(runtime)
+    original = pool.discard
+    def reacquire_then_discard(candidate, **kwargs):
+        pool.hold()
+        assert pool.acquire(remote_cpu, Env()) is runtime
+        return original(candidate, **kwargs)
+    monkeypatch.setattr(pool, "discard", reacquire_then_discard)
+    pool.unhold()
+    assert pool.live == [runtime]
+    assert runtime.busy
+
+
+def test_runtime_disposal_names_its_reason_and_the_registered_key(let, remote_cpu, capsys):
+    # Spec "Pooling": future teardown reports carry an actionable decision reason.
+    pool = let.pool
+    runtime = pool.acquire(remote_cpu, Env())
+    key = runtime.key
+    pool.release(runtime)
+    output = capsys.readouterr().err
+    assert f"discarding {runtime.name}" in output
+    assert "reason=call_complete" in output and f"key={key}" in output
+    assert "timestamp=" in output
+
+
+
+def test_a_runtime_keeps_its_registered_key_when_project_files_change(let, remote_cpu, tmp_path):
+    # Spec "Pooling": mutating an Env input must not hide the registered runtime on removal.
+    project = tmp_path / "declared"
+    project.mkdir()
+    lock = project / "uv.lock"
+    lock.write_text("first")
+    env = Env(lock=str(lock))
+    runtime = let.pool.acquire(remote_cpu, env)
+    key = runtime.key
+    lock.write_text("second")
+    assert runtime.key == key
+    let.pool.release(runtime)
+    assert let.pool.live == []
+
+
+# -- Spec: Materializing into a runtime, automatic environment archive ----------
+
+
+@pytest.mark.parametrize("bucket", [False, True])
+def test_an_ephemeral_account_restores_an_environment_without_declared_volumes(
+    isolated_home, uv_project, tmp_path, fake_gcs, bucket
+) -> None:
+    options = {"persistent": False}
+    if bucket:
+        options.update(
+            bucket=fake_gcs.bucket,
+            bucket_prefix="automatic-env",
+            bucket_endpoint=fake_gcs.endpoint,
+            sts_endpoint=f"{fake_gcs.endpoint}/v1/token",
+        )
+    provider = provider_of(PreparingLocal, "lab", **options)
+    env = Env()
+    first = provider.start(remote_instance(provider), env, name="lab-1")
+    try:
+        assert first.env_source == "sync"
+        first.call(reports_interpreter(), (), {})
+    finally:
+        first.shutdown()
+    shutil.rmtree(Path(bootstrap.DEFAULT_WORKSPACE_ROOT))
+    # A new provider object and an empty VM disk must still find the durable ref.
+    replacement = provider_of(PreparingLocal, "lab", **options)
+    second = replacement.start(remote_instance(replacement), env, name="lab-2")
+    try:
+        assert second.env_source == "archive"
+        executable, version, imported = second.call(reports_interpreter(), (), {})[0]
+        assert Path(executable).parent == remote_projects() / env.key / ".venv" / "bin"
+        assert version == bootstrap.local_python()
+        assert Path(imported).is_relative_to(remote_projects() / env.key / ".venv")
+        assert second.volumes == ()
+        if bucket:
+            from urllib.parse import unquote
+
+            blobs = [r for r in fake_gcs.downloads() if "/blobs/" in unquote(r["path"])]
+            assert [r["authorization"] for r in blobs] == ["Bearer down-token-1"]
+            assert all("automatic-env/" in unquote(r["path"]) for r in blobs)
+    finally:
+        second.shutdown()
+
+
+def test_an_ephemeral_sync_keeps_managed_python_inside_the_environment_archive(
+    isolated_home, uv_project, tmp_path, monkeypatch
+) -> None:
+    # The real uv wrapper records the directory passed to the build, without downloading
+    # another Python. Its interpreter tree must be packed with the environment on eviction.
+    import shlex
+
+    binary = shutil.which("uv")
+    tools = tmp_path / "tools"
+    tools.mkdir()
+    recorded = tmp_path / "python-dir"
+    wrapper = tools / "uv"
+    wrapper.write_text(
+        '#!/bin/sh\n'
+        f'printf "%s" "$UV_PYTHON_INSTALL_DIR" > {shlex.quote(str(recorded))}\n'
+        f'exec {shlex.quote(binary)} "$@"\n'
+    )
+    wrapper.chmod(0o755)
+    monkeypatch.setenv("PATH", str(tools) + os.pathsep + os.environ["PATH"])
+    provider = provider_of(PreparingLocal, "lab", persistent=False)
+    runtime = provider.start(remote_instance(provider), Env(), name="lab-1")
+    try:
+        assert Path(recorded.read_text()) == remote_projects() / runtime.env.key / ".letify-python"
+    finally:
+        runtime.shutdown()
+
+
+def test_a_failed_interpreter_switch_does_not_publish_an_environment_archive(
+    uv_project, tmp_path, monkeypatch
+) -> None:
+    provider = provider_of(PreparingLocal, "lab", persistent=False)
+    volume = provider.volume("cache", backend="filesystem", root=str(tmp_path / "store"))
+
+    def fail_switch(self, python):
+        raise RuntimeFailure("interpreter switch failed")
+
+    monkeypatch.setattr(PersistentChannel, "switch_interpreter", fail_switch)
+    with pytest.raises(RuntimeFailure, match="interpreter switch failed"):
+        provider.start(remote_instance(provider), Env(), name="lab-1", volumes=(volume,))
+    assert list(volume.store.backend.list_digests()) == []
+    assert volume.cached_env(Env(), sys.platform + "-" + __import__("platform").machine()) is None

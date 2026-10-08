@@ -7,14 +7,17 @@
 
 import * as vscode from "vscode";
 
+import { poll } from "./poll";
 import { runLetify } from "./cli";
 import { DayBucket, recordSample } from "./history";
 import {
   Status,
+  SessionRow,
+  parseSessions,
+  activityStatusText,
   UsageRow,
   UtilizationRow,
   formatAmount,
-  gpuStatusText,
   holderLabel,
   isReserved,
   gpuSummary,
@@ -35,6 +38,7 @@ interface State {
   usage: UsageRow[];
   utilization: UtilizationRow[];
   status: Status | null;
+  sessions: SessionRow[];
   errors: Record<string, string>;
   asOf: number | null;
 }
@@ -42,7 +46,7 @@ interface State {
 type Tab = "quota" | "gpu" | "runtimes";
 
 export function activate(context: vscode.ExtensionContext): void {
-  const state: State = { usage: [], utilization: [], status: null, errors: {}, asOf: null };
+  const state: State = { usage: [], utilization: [], status: null, sessions: [], errors: {}, asOf: null };
   const quotaItem = vscode.window.createStatusBarItem("letify.quota", vscode.StatusBarAlignment.Right, 100);
   const gpuItem = vscode.window.createStatusBarItem("letify.gpu", vscode.StatusBarAlignment.Right, 99);
   quotaItem.name = "letify quota";
@@ -56,16 +60,8 @@ export function activate(context: vscode.ExtensionContext): void {
   const cwd = () => vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
   const history = (): DayBucket[] => context.globalState.get<DayBucket[]>(HISTORY_KEY, []);
 
-  const read = async (subcommand: string): Promise<unknown | undefined> => {
-    try {
-      const data = await runLetify(config().get<string>("command", "uv run letify"), subcommand, cwd());
-      delete state.errors[subcommand];
-      return data;
-    } catch (error) {
-      state.errors[subcommand] = error instanceof Error ? error.message : String(error);
-      return undefined;
-    }
-  };
+  const read = (subcommand: string): Promise<unknown> =>
+    runLetify(config().get<string>("command", "uv run --frozen --no-sync letify"), subcommand, cwd());
 
   const tooltip = (body: string): vscode.MarkdownString => {
     const md = new vscode.MarkdownString(body);
@@ -77,7 +73,11 @@ export function activate(context: vscode.ExtensionContext): void {
 
   const footer = (markdown: boolean): string => {
     const time = state.asOf ? new Date(state.asOf * 1000).toLocaleTimeString() : "never";
-    const errors = Object.values(state.errors).map((m) => escapeHtml(m));
+    const errors = [
+      ...Object.values(state.errors),
+      ...[...state.usage, ...state.utilization, ...state.sessions]
+        .filter((row) => row.unavailable).map((row) => `${row.alias}: ${row.unavailable}`),
+    ].map((m) => escapeHtml(m));
     if (markdown) {
       const lines = errors.map((m) => `$(error) ${m}`);
       lines.push(`From ${escapeHtml(state.status?.name || "this workspace")} · as of ${time} · [Refresh](command:letify.refresh) · [Settings](command:letify.openSettings)`);
@@ -106,9 +106,9 @@ export function activate(context: vscode.ExtensionContext): void {
     const cfg = config();
     const worst = mostConstrained(state.usage);
     const level = severity(worst ? shareLeft(worst) : null, cfg.get("warningPercent", 20), cfg.get("errorPercent", 5));
-    quotaItem.text = `$(pulse) ${state.errors.usage && state.usage.length === 0 ? "letify error" : quotaStatusText(state.usage, now)}`;
+    quotaItem.text = `$(pulse) ${state.errors.usage || state.usage.some((row) => row.unavailable) ? "letify error" : quotaStatusText(state.usage, now)}`;
     quotaItem.backgroundColor =
-      level === "error"
+      state.errors.usage || state.usage.some((row) => row.unavailable) || level === "error"
         ? new vscode.ThemeColor("statusBarItem.errorBackground")
         : level === "warning"
           ? new vscode.ThemeColor("statusBarItem.warningBackground")
@@ -121,7 +121,8 @@ export function activate(context: vscode.ExtensionContext): void {
       ].join("\n\n"),
     );
     const summary = gpuSummary(state.utilization, state.status, cfg.get("busyPercent", 10));
-    gpuItem.text = `$(server) ${gpuStatusText(summary)}`;
+    gpuItem.text = `$(server) ${activityStatusText(state.utilization, state.status, state.sessions, state.errors, cfg.get("busyPercent", 10))}`;
+    gpuItem.backgroundColor = gpuItem.text.includes("$(error)") ? new vscode.ThemeColor("statusBarItem.errorBackground") : undefined;
     const deviceLines = state.utilization.flatMap((row) =>
       row.devices.length
         ? row.devices.map((d) => {
@@ -130,7 +131,7 @@ export function activate(context: vscode.ExtensionContext): void {
           })
         : [`**${escapeHtml(row.alias)}${row.accelerator ? `.${escapeHtml(row.accelerator)}` : ""}** ${escapeHtml(row.reason ?? row.unavailable ?? "")}`],
     );
-    gpuItem.tooltip = tooltip([`**letify GPU activity** · ${summary.reserved} reserved by letify`, ...deviceLines, footer(true)].join("\n\n"));
+    gpuItem.tooltip = tooltip([`**letify GPU activity** · ${summary.reserved} reserved by letify`, ...deviceLines, ...state.sessions.flatMap((row) => row.sessions.map((name) => `**${escapeHtml(row.alias)}** session ${escapeHtml(name)}`)), footer(true)].join("\n\n"));
     cfg.get("showQuota", true) ? quotaItem.show() : quotaItem.hide();
     cfg.get("showGpu", true) ? gpuItem.show() : gpuItem.hide();
   };
@@ -147,7 +148,7 @@ export function activate(context: vscode.ExtensionContext): void {
     } else if (tab === "gpu") {
       body = (state.utilization.length ? state.utilization.map((r) => gpuCard(r, state.status)).join("") : `<div class="card muted">No accelerator declared, or nothing read yet</div>`) + historyChart(history(), "gpu");
     } else {
-      body = runtimesCard(state.status);
+      body = runtimesCard(state.status, state.sessions);
     }
     const nonce = Math.random().toString(36).slice(2);
     view.webview.html = `<!doctype html><html><head><meta charset="utf-8">
@@ -162,25 +163,14 @@ export function activate(context: vscode.ExtensionContext): void {
     renderView();
   };
 
-  const refreshUsage = async () => {
-    const data = await read("usage");
-    if (data !== undefined) {
-      try {
-        state.usage = parseUsage(data);
-      } catch (error) {
-        state.errors.usage = (error as Error).message;
-      }
-    }
-  };
+  const refreshUsage = () => poll(state, "usage", read, parseUsage);
 
   const refreshGpu = async () => {
-    const [util, status] = await Promise.all([read("utilization"), read("status")]);
-    try {
-      if (util !== undefined) state.utilization = parseUtilization(util);
-      if (status !== undefined) state.status = parseStatus(status);
-    } catch (error) {
-      state.errors.utilization = (error as Error).message;
-    }
+    await Promise.all([
+      poll(state, "utilization", read, parseUtilization),
+      poll(state, "status", read, parseStatus),
+      poll(state, "sessions", read, parseSessions),
+    ]);
   };
 
   const sample = async () => {
@@ -267,6 +257,7 @@ export function activate(context: vscode.ExtensionContext): void {
       if (event.affectsConfiguration("letify")) {
         schedule();
         render();
+        void refreshAll();
       }
     }),
   );

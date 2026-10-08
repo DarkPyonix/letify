@@ -296,7 +296,10 @@ def test_an_ephemeral_account_with_a_bucket_pulls_from_it_and_uploads_once(
     assert size(root) == 3000
     assert uploads() == 3
     # A new ephemeral machine holds nothing, which on Local means removing its cache.
-    shutil.rmtree(Path.home() / ".letify-runtime" / "data")
+    runtime_data = Path.home() / ".letify" / "runtime" / "data"
+    if not runtime_data.exists():
+        runtime_data = Path.home() / ".letify-runtime" / "data"
+    shutil.rmtree(runtime_data)
     before = len(fake_gcs.downloads())
 
     assert size(root) == 3000
@@ -312,8 +315,15 @@ def test_an_ephemeral_account_with_a_bucket_pulls_from_it_and_uploads_once(
 # -- Spec: Runtime data cache budget -------------------------------------------------
 
 
+def _blobs_root() -> Path:
+    old = Path.home() / ".letify-runtime" / "data" / "blobs"
+    if old.exists():
+        return old
+    return Path.home() / ".letify" / "runtime" / "data" / "blobs"
+
+
 def blob_files() -> dict[str, int]:
-    root = Path.home() / ".letify-runtime" / "data" / "blobs"
+    root = _blobs_root()
     return {p.name: p.stat().st_nlink for p in root.glob("*/*") if ".partial." not in p.name}
 
 
@@ -322,7 +332,7 @@ def age_blobs(seconds: float) -> None:
     import time
 
     past = time.time() - seconds
-    for path in (Path.home() / ".letify-runtime" / "data" / "blobs").glob("*/*"):
+    for path in _blobs_root().glob("*/*"):
         os.utime(path, (past, past))
 
 
@@ -391,7 +401,7 @@ def test_a_linked_or_recent_blob_is_not_evicted(launcher_from, project, tmp_path
     age_blobs(3600)
     linked = pathdata.hash_file(project / "linked.bin", 4096)
     # A running call's directory holds a hard link; this one stands in for it.
-    cache_file = Path.home() / ".letify-runtime" / "data" / "blobs" / linked[:2] / linked
+    cache_file = _blobs_root() / linked[:2] / linked
     (tmp_path / "running-call-link").hardlink_to(cache_file)
     (project / "recent.bin").write_bytes(b"r" * 4096)
     size(project / "recent.bin")
@@ -767,6 +777,6 @@ def test_blobs_a_write_back_adds_keep_the_cache_within_its_budget(
     assert (project / "runs" / "model.bin").read_bytes() == b"m" * (8 << 10)
     held = blob_files()
     assert set(held) == {pathdata.hash_file(project / "runs" / "model.bin", 8 << 10)}
-    root = Path.home() / ".letify-runtime" / "data" / "blobs"
+    root = _blobs_root()
     assert sum(p.stat().st_size for p in root.glob("*/*")) <= 20 << 10
     assert len(evictions(capsys.readouterr().err)) == 1

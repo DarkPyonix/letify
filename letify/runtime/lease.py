@@ -57,13 +57,24 @@ class Lease:
                 return
 
     def _renew(self) -> bool:
-        from ..errors import LetifyError
+        from ..errors import LetifyError, RuntimeLost
 
         try:
             self.runtime.request({"op": "lease", "grace": self.grace}, timeout=60)
-        except LetifyError:
+        except RuntimeLost:
             # The session is gone. The pool notices on its next call.
             return False
+        except LetifyError as exc:
+            # A round trip that merely timed out, such as a renewal reply delayed behind
+            # a large transfer, is not the session going away. Giving up here would let
+            # one slow cycle stop the renewer for good, so this logs and tries again on
+            # the next interval instead.
+            import sys
+
+            print(
+                f"letify: lease renewal for {self.runtime.name} failed, retrying: {exc}",
+                file=sys.stderr,
+            )
         return True
 
 

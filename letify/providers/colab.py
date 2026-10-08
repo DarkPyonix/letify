@@ -29,7 +29,11 @@ from __future__ import annotations
 
 import datetime
 import json
+import os
+import queue
 import subprocess
+import sys
+import threading
 import time
 import urllib.parse
 import urllib.request
@@ -40,7 +44,7 @@ from typing import TYPE_CHECKING, Any
 from .. import tools
 from ..config.secrets import account_directory
 from ..declare.instance import Instance
-from ..errors import ProviderUnavailable, RuntimeFailure
+from ..errors import ProviderUnavailable, RuntimeFailure, RuntimeLost
 from .shell import Shell
 from .usage import Usage
 
@@ -147,7 +151,9 @@ class Colab(Shell):
         note: str | None = None
         remaining: float | None = None
         rate: float | None = None
-        token_file = account_directory(self.alias) / ".config" / "colab-cli" / "token.json"
+        token_file = account_directory(self.alias) / "token.json"
+        if not token_file.is_file():
+            token_file = account_directory(self.alias) / ".config" / "colab-cli" / "token.json"
         try:
             stored = json.loads(token_file.read_text(encoding="utf-8"))
         except (OSError, ValueError):
@@ -272,7 +278,10 @@ class Colab(Shell):
         return env
 
     def _exec(self, session: str, source: str, timeout: float | None) -> str:
-        return self._cli("exec", "-s", session, stdin=source, timeout=timeout)
+        from .colab_keepalive import account_lock
+
+        with account_lock(account_directory(self.alias) / ".config" / "colab-cli"):
+            return self._cli("exec", "-s", session, stdin=source, timeout=timeout)
 
     def sessions(self) -> list[str]:
         """Names of the sessions this account currently holds."""
@@ -321,6 +330,20 @@ class Colab(Shell):
     def target(self, runtime: Runtime | None = None) -> Target:
         target = super().target(runtime)
         target.user = self.user or "root"
+        if runtime is not None and target.rendezvous.unavailable() is None:
+            from .. import install
+
+            if install.find("tailcat", link_cache=False) or self.config.option("tailcat_binary"):
+                output = self._exec(runtime.name, install.remote_tailcat_source(), 180)
+                for line in output.splitlines():
+                    if line.startswith("LETIFY-TAILCAT "):
+                        target.rendezvous.binary = json.loads(line[len("LETIFY-TAILCAT ") :])
+                        break
+                else:
+                    raise RuntimeFailure(
+                        "tailcat installation gave no verified binary path",
+                        stderr=output.strip(),
+                    )
         if runtime is not None:
             # Each runtime is a new VM with a new host key.
             target.host_key_alias = f"letify-{self.alias}-{runtime.name}"
@@ -355,14 +378,107 @@ class Colab(Shell):
         elif instance.tpu:
             args += ["--tpu", instance.tpu]
         self._cli(*args, timeout=900)
+        try:
+            self._start_keep_alive(name)
+        except BaseException:
+            try:
+                self._cli("stop", "-s", name, timeout=180)
+            except (RuntimeFailure, ProviderUnavailable):
+                pass
+            raise
+
+    def _start_keep_alive(self, name: str) -> None:
+        """Start an owned daemon and require its recorded readiness within 10 seconds."""
+        from . import colab_keepalive
+
+        directory = account_directory(self.alias) / ".config" / "colab-cli"
+        history = directory / "history"
+        history.mkdir(parents=True, exist_ok=True)
+        config = {
+            "command": self._colab(),
+            "session": name,
+            "directory": str(directory),
+            "owner": os.getpid(),
+        }
+        options = (
+            {"start_new_session": True}
+            if os.name != "nt"
+            else {"creationflags": 0x00000008 | 0x00000200}
+        )
+        with (history / f"{name}.letify.log").open("a", encoding="utf-8") as log:
+            process = subprocess.Popen(
+                [sys.executable, str(Path(colab_keepalive.__file__).resolve()), json.dumps(config)],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=log,
+                text=True,
+                env=self._env(),
+                **options,
+            )
+        answer: queue.Queue[str] = queue.Queue()
+
+        def read_ready() -> None:
+            answer.put(process.stdout.readline().strip())
+
+        threading.Thread(target=read_ready, daemon=True).start()
+        try:
+            if answer.get(timeout=10) != colab_keepalive.READY or process.poll() is not None:
+                raise RuntimeFailure(f"Colab keep-alive did not become ready; see {log.name}")
+        except (queue.Empty, RuntimeFailure) as exc:
+            process.terminate()
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait(timeout=5)
+            raise RuntimeFailure(f"Colab keep-alive did not become ready; see {log.name}") from exc
+        finally:
+            process.stdout.close()
+        self.__dict__.setdefault("_keep_alive", {})[name] = process
 
     def stop(self, runtime: Runtime) -> None:
+        process = self.__dict__.get("_keep_alive", {}).pop(runtime.name, None)
+        if process is not None:
+            process.terminate()
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait(timeout=5)
         self.close_link(runtime)
         try:
             self._cli("stop", "-s", runtime.name, timeout=180)
         except (RuntimeFailure, ProviderUnavailable):
             # Stopping is best effort. A session that is already gone is fine.
             pass
+
+    def diagnose(self, runtime: Runtime, failure: Exception) -> Exception:
+        """Turn a failure on a reclaimed Colab runtime into ``ColabSessionReclaimed``."""
+        msg = f"{runtime.name}: the provider reclaimed the runtime rather than letify ending it"
+        stderr = getattr(failure, "stderr", "") or ""
+        if "appears to be lost" in stderr or f"Session '{runtime.name}' not found" in stderr:
+            return ColabSessionReclaimed(msg)
+        history_file = (
+            account_directory(self.alias)
+            / ".config"
+            / "colab-cli"
+            / "history"
+            / f"{runtime.name}.jsonl"
+        )
+        if history_file.is_file():
+            try:
+                for line in history_file.read_text(encoding="utf-8").splitlines():
+                    if "appears to be lost" in line or "404" in line:
+                        return ColabSessionReclaimed(msg)
+            except OSError:
+                pass
+        try:
+            active = self.sessions()
+        except (RuntimeFailure, ProviderUnavailable):
+            active = None
+        if active is not None and runtime.name not in active:
+            return ColabSessionReclaimed(msg)
+        return failure
 
     def open_channel(self, runtime: Runtime) -> Channel:
         from ..runtime.channel import OneShotChannel
@@ -379,4 +495,17 @@ class Colab(Shell):
         return super().open_channel(runtime)
 
 
-__all__ = ["ALIASES", "DRIVER_LIBRARY_PATH", "GPUS", "TPUS", "Colab"]
+class ColabSessionReclaimed(RuntimeLost):
+    """The Colab runtime was reclaimed by the provider."""
+
+
+__all__ = [
+    "ALIASES",
+    "DRIVER_LIBRARY_PATH",
+    "GPUS",
+    "TPUS",
+    "Colab",
+    "ColabSessionReclaimed",
+]
+
+

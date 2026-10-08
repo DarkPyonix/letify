@@ -31,6 +31,7 @@ if TYPE_CHECKING:
     from ..runtime.channel import Channel
     from ..runtime.session import Runtime
     from ..transport.link import Link
+    from ..transport.pipeline import LinkFloor
     from ..transport.rendezvous import Rendezvous
     from ..transport.strategies import Strategy, Target
 
@@ -140,6 +141,24 @@ class Shell(Provider):
         return dict(value) if isinstance(value, Mapping) else None
 
     @property
+    def link_floor(self) -> LinkFloor:
+        """The slowest probe this account accepts, from ``min_mib_per_s`` and ``max_rtt_ms``.
+
+        Both default to the floor in ``letify.transport.pipeline.LinkFloor.default``. A
+        relayed path, such as Tailcat's own fallback to a DERP relay when the direct UDP
+        punch fails, measures far below this and is refused rather than used.
+        """
+        from ..transport.pipeline import MIB, LinkFloor
+
+        default = LinkFloor.default()
+        min_mib = self.config.option("min_mib_per_s")
+        max_rtt = self.config.option("max_rtt_ms")
+        return LinkFloor(
+            min_bps=float(min_mib) * MIB if isinstance(min_mib, (int, float)) else default.min_bps,
+            max_rtt_ms=float(max_rtt) if isinstance(max_rtt, (int, float)) else default.max_rtt_ms,
+        )
+
+    @property
     def tailcat_binary(self) -> str:
         """The account's ``tailcat_binary``, or the tool lookup's answer without asking."""
         given = self.config.option("tailcat_binary")
@@ -147,7 +166,7 @@ class Shell(Provider):
             return str(given)
         from ..install import find
 
-        return find("tailcat") or "tailcat"
+        return find("tailcat", link_cache=False) or "tailcat"
 
     def remote_command(self, command: str) -> str:
         """The command a link runs on the machine, which a provider may wrap.
@@ -282,6 +301,7 @@ class Shell(Provider):
                 fingerprint=lambda: network_fingerprint(target.stun),
                 say=printer(self.announce),
                 previous=self.__dict__.get("_closed_links", {}).pop(key, None),
+                floor=self.link_floor,
             ).connect()
         return links[key]
 

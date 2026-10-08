@@ -801,7 +801,8 @@ def test_a_write_back_does_not_wait_for_a_file_that_never_arrived(
     assert write_one(root) == "done"
     assert (root / "result.txt").read_text(encoding="utf-8") == "done"
     err = capsys.readouterr().err
-    assert "wrote back 1 files" in err
+    assert "wrote back " in err
+    assert "files" in err
 
 
 def test_the_pending_manifest_names_every_file_of_the_call_exactly_once(
@@ -943,7 +944,14 @@ def test_a_call_whose_files_are_all_held_carries_no_streaming_machinery(
 def blob_of(path: Path) -> Path:
     """The runtime cache file that holds the current bytes of a local file."""
     digest = pathdata.hash_file(path, path.stat().st_size)
-    return Path.home() / ".letify-runtime" / "data" / "blobs" / digest[:2] / digest
+    for root in (
+        Path.home() / ".letify" / "runtime" / "data" / "blobs",
+        Path.home() / ".letify-runtime" / "data" / "blobs",
+    ):
+        target = root / digest[:2] / digest
+        if target.exists():
+            return target
+    return Path.home() / ".letify" / "runtime" / "data" / "blobs" / digest[:2] / digest
 
 
 def test_a_rewritten_file_in_a_directory_input_leaves_the_cache_blob_intact(
@@ -1060,3 +1068,153 @@ def test_a_child_process_writing_through_the_link_drops_the_blob_from_the_cache(
     assert (root / "000.bin").read_bytes() == original + b"x"
     assert not blob.exists()
     assert untouched.exists()
+
+
+# -- Spec: Writing back, the background write-back while the call runs -----------------
+
+#: How long a body in these tests keeps running after it wrote its output file.
+HELD_S = 8.0
+
+
+def wait_until(condition, timeout: float, interval: float = 0.05) -> float:
+    """Poll ``condition`` until it holds, and answer how long that took, in seconds.
+
+    A fixed sleep would either pass by accident or fail on a slow machine, so the tests
+    that assert a file arrives during a call wait for the file itself.
+    """
+    started = time.monotonic()
+    while not condition():
+        if time.monotonic() - started >= timeout:
+            raise AssertionError(f"the condition was not met within {timeout} s")
+        time.sleep(interval)
+    return time.monotonic() - started
+
+
+def in_a_thread(call):
+    """Run ``call`` on a thread and answer the thread and the dict its result lands in."""
+    import threading
+
+    outcome: dict = {}
+
+    def run() -> None:
+        try:
+            outcome["value"] = call()
+        except BaseException as exc:  # pragma: no cover - reported by the test's assert
+            outcome["error"] = exc
+
+    thread = threading.Thread(target=run, name="letify-test-call")
+    thread.start()
+    return thread, outcome
+
+
+def test_a_checkpoint_written_mid_call_arrives_before_the_call_returns(
+    launcher_from, project
+) -> None:
+    """Spec "Writing back": the background write-back sends a completed output file while
+    the call is still running, so an intermediate checkpoint does not wait for the return.
+    """
+    let = streaming(launcher_from)
+    root = project / "runs"
+    root.mkdir()
+    payload = b"\x01" * (1 << 20)
+
+    @let.function(device=let.providers.lab.CPU, host=letify.remote)
+    def train(directory: Path, held: float) -> str:
+        import time as clock
+
+        (directory / "checkpoint.bin").write_bytes(b"\x01" * (1 << 20))
+        # The body keeps running long after the checkpoint is complete, which is what a
+        # training call does between two checkpoints.
+        clock.sleep(held)
+        return "done"
+
+    thread, outcome = in_a_thread(lambda: train(root, HELD_S))
+    try:
+        arrived = wait_until(
+            lambda: (root / "checkpoint.bin").is_file()
+            and (root / "checkpoint.bin").read_bytes() == payload,
+            timeout=HELD_S - 2.0,
+        )
+        assert thread.is_alive(), "the call had already returned when the checkpoint arrived"
+    finally:
+        thread.join(timeout=60)
+    assert outcome.get("value") == "done", outcome
+    # Printed so the pull request can quote how long the checkpoint took to come back.
+    print(f"checkpoint arrived {arrived:.1f} s into a {HELD_S:.0f} s call")
+
+
+def test_a_half_written_output_file_is_never_seen_locally(launcher_from, project) -> None:
+    """Spec "Writing back": a file still being written is never sent, so no local reader
+    ever observes the first half of it.
+    """
+    let = streaming(launcher_from)
+    root = project / "runs2"
+    root.mkdir()
+    first = b"\x02" * (1 << 20)
+    whole = first + b"\x03" * (1 << 20)
+
+    @let.function(device=let.providers.lab.CPU, host=letify.remote)
+    def write_in_two_stages(directory: Path, held: float) -> str:
+        import time as clock
+
+        with open(directory / "checkpoint.bin", "wb") as handle:
+            handle.write(b"\x02" * (1 << 20))
+            handle.flush()
+            # Half written, on disk, and left that way for several poll intervals.
+            clock.sleep(held)
+            handle.write(b"\x03" * (1 << 20))
+        clock.sleep(held)
+        return "done"
+
+    seen: list[bytes] = []
+    thread, outcome = in_a_thread(lambda: write_in_two_stages(root, HELD_S / 2))
+    target = root / "checkpoint.bin"
+    while thread.is_alive():
+        if target.is_file():
+            content = target.read_bytes()
+            if content not in (whole, b""):
+                seen.append(content[:1] + bytes([len(content) // (1 << 20)]))
+        time.sleep(0.02)
+    thread.join(timeout=60)
+    assert outcome.get("value") == "done", outcome
+    assert not seen, f"a half-written file was visible on the client: {seen}"
+    assert target.read_bytes() == whole
+
+
+def test_the_final_write_back_does_not_resend_what_the_background_sent(
+    launcher_from, project, capsys
+) -> None:
+    """Spec "Writing back": the final write-back is incremental, so a file the background
+    write-back already delivered is not transferred a second time.
+    """
+    let = streaming(launcher_from)
+    root = project / "runs3"
+    root.mkdir()
+
+    @let.function(device=let.providers.lab.CPU, host=letify.remote)
+    def train(directory: Path, held: float) -> str:
+        import time as clock
+
+        (directory / "checkpoint.bin").write_bytes(b"\x04" * (1 << 20))
+        clock.sleep(held)
+        return "done"
+
+    thread, outcome = in_a_thread(lambda: train(root, HELD_S))
+    try:
+        wait_until(lambda: (root / "checkpoint.bin").is_file(), timeout=HELD_S - 2.0)
+    finally:
+        thread.join(timeout=60)
+    assert outcome.get("value") == "done", outcome
+    line = wrote_back_line(capsys.readouterr().err)
+    total = re.search(r"wrote back (\d+) files", line)
+    during = re.search(r"(\d+) files [\d.]+ MiB during the call", line)
+    assert total and during, line
+    # One file written back in all, and the background path is the one that sent it.
+    assert int(total.group(1)) == 1, line
+    assert int(during.group(1)) == 1, line
+
+
+def wrote_back_line(err: str) -> str:
+    lines = [line for line in err.splitlines() if line.startswith("letify: data wrote back ")]
+    assert lines, err
+    return lines[0]

@@ -63,6 +63,9 @@ class Answers:
     token: str | None = None
     interactive: bool = True
     install_key: bool = True
+    #: Run the kind's whole flow again for an alias that already exists, so a credential
+    #: can be renewed. Spec "Logging in".
+    replace: bool = False
 
     def get(self, name: str) -> Any:
         return self.values.get(name)
@@ -738,6 +741,7 @@ def colab_account(answers: Answers) -> dict[str, Any]:
         [*tools.command(tools.COLAB, uv), "sessions"],
         env=tools.environment(answers.alias),
     )
+    tools.sync_tool_credentials(answers.alias)
     if result.returncode != 0:
         raise LoginError(f"the Colab sign in exited {result.returncode}, so nothing was written")
     # The rendezvous installs this key's public half on each runtime, which is what lets
@@ -748,7 +752,7 @@ def colab_account(answers: Answers) -> dict[str, Any]:
     return options
 
 
-#: The cookie file and the prompt for it. The cookie is the whole Kaggle credential.
+#: The browser cookie file and its prompt.
 KAGGLE_COOKIE = "cookie"
 KAGGLE_COOKIE_PROMPT = "Kaggle cookie (from a logged-in kaggle.com tab): "
 
@@ -772,16 +776,56 @@ def read_kaggle_cookie(answers: Answers, given: str | None) -> str:
     return text
 
 
-def kaggle_account(answers: Answers) -> dict[str, Any]:
-    """Store the browser session cookie and prove it names a live login.
+#: The notebook owner and verbatim API token prompts.
+KAGGLE_OWNER_PROMPT = "Kaggle username (notebook owner): "
+KAGGLE_TOKEN_PROMPT = "Kaggle API token exactly as shown on kaggle.com, including KGAT_: "
 
-    The cookie is the whole account: only the web session principal can mint the Jupyter
-    proxy token, so an API key is useless here. The cookie is checked for shape and expiry
-    before any network call, then proven with a read of the account. Nothing is written
-    until the check passes.
+
+def read_kaggle_token(
+    answers: Answers, given_username: str | None, given_key: str | None
+) -> tuple[str, str]:
+    """Return the notebook owner and verbatim token, refusing malformed token input.
+
+    The owner addresses notebook deletion; only the token authenticates the CLI. Validate
+    the prefix and a nonempty whitespace-free body without imposing an unproven length.
+    """
+    username = (given_username or "").strip()
+    if not username and answers.interactive:
+        username = read_line(KAGGLE_OWNER_PROMPT).strip()
+    from ..providers.kaggle import read_api_token
+
+    key = given_key if given_key is not None else (read_api_token(answers.alias) or "")
+    if not key and answers.interactive:
+        key = read_password(KAGGLE_TOKEN_PROMPT)
+    if not username or not key:
+        raise LoginError(
+            f"{answers.alias} needs the Kaggle API token and notebook owner: pass "
+            f"--username <owner> and --key <KGAT_token> from kaggle.com, or drop --no-input."
+        )
+    if not key.startswith("KGAT_") or len(key) <= len("KGAT_") or any(
+        character.isspace() for character in key
+    ):
+        raise LoginError(
+            f"{answers.alias}: paste the Kaggle API token exactly as shown on kaggle.com, "
+            f"including KGAT_ and its nonempty body, with no whitespace."
+        )
+    return username, key
+
+
+def kaggle_account(answers: Answers) -> dict[str, Any]:
+    """Store the browser session cookie and the API token, and prove the cookie is live.
+
+    Two credentials, and both are required. The cookie starts and ends the interactive
+    session and mints its Jupyter proxy URL; it is checked for shape and expiry before any
+    network call, then proven with a read of the account. The API token runs the official
+    CLI for everything else, deleting the notebook a run created and reading the weekly
+    quota; it is checked for shape only, since proving it would mean calling the CLI
+    from inside login, which this function leaves to the first command that uses it.
+    Nothing is written until every check passes.
     """
     from ..providers import kaggle as kg
 
+    username, key = read_kaggle_token(answers, answers.get("username"), answers.get("key"))
     given = answers.get(KAGGLE_COOKIE) or answers.token
     cookie = read_kaggle_cookie(answers, given if isinstance(given, str) else None)
     try:
@@ -802,6 +846,8 @@ def kaggle_account(answers: Answers) -> dict[str, Any]:
     options: dict[str, Any] = {"kind": answers.kind}
     record_workspace(answers, options)
     store_secret(answers.alias, KAGGLE_COOKIE, cookie)
+    store_secret(answers.alias, "access_token", key)
+    store_secret(answers.alias, "username", username)
     return options
 
 
@@ -947,6 +993,8 @@ def log_in(answers: Answers, *, project: str | Path | None = None) -> tuple[bool
     Returns whether the account was newly written, and the two files touched. An account
     already in the home file is not asked for again, which is the common case in a second
     repository: the account was set up once and this project just needs to name it.
+    ``replace`` runs the flow again for such an account, which is how a credential is
+    renewed. Spec "Logging in".
     """
     check_alias(answers.alias)
     if answers.kind not in FLOWS:
@@ -955,7 +1003,8 @@ def log_in(answers: Answers, *, project: str | Path | None = None) -> tuple[bool
 
     home = home_path()
     existing = home.read_text(encoding="utf-8") if home.is_file() else ""
-    fresh = not writer.has_block(existing, answers.alias)
+    declared = not writer.has_block(existing, answers.alias)
+    fresh = declared or answers.replace
     devices = None
     if fresh:
         options = FLOWS[answers.kind](answers)

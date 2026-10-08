@@ -15,6 +15,7 @@ from __future__ import annotations
 import base64
 import shlex
 import sys
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 from ..errors import ConfigError, InterpreterMismatch
@@ -98,9 +99,30 @@ def env_archive_path(mount: str, digest: str) -> str:
     return f"{mount.rstrip('/')}/blobs/{digest[:2]}/{digest}"
 
 
-def uv_cache_dir(workspace_root: str) -> str:
-    """The uv cache a persistent provider syncs with, before ``~`` is expanded there."""
-    return f"{workspace_root.rstrip('/')}/uv-cache"
+def uv_bin_dir(workspace_root: str) -> str:
+    """Where letify installs the uv binary itself, before ``~`` is expanded there.
+
+    Spec "Remote paths letify writes": the installer is told to put uv under the
+    workspace root rather than its own default of ``~/.local/bin``, because the
+    workspace root is the only path some accounts can write to.
+    """
+    return f"{workspace_root.rstrip('/')}/uv-bin"
+
+
+def uv_env(workspace_root: str) -> dict[str, str]:
+    """Where letify points uv's cache, its managed Pythons and its tool installs.
+
+    All three sit under the workspace root, before ``~`` is expanded there. Spec "Remote
+    paths letify writes": this applies on every sync, whether the provider is persistent
+    or ephemeral, because an ephemeral VM disappearing does not make its workspace root
+    any less the only path some accounts can write to.
+    """
+    root = workspace_root.rstrip("/")
+    return {
+        "UV_CACHE_DIR": f"{root}/uv-cache",
+        "UV_PYTHON_INSTALL_DIR": f"{root}/uv-python",
+        "UV_TOOL_DIR": f"{root}/uv-tool",
+    }
 
 
 def project_dir(workspace_root: str, env: Env) -> str:
@@ -194,25 +216,67 @@ def venv_check_source(python: str, archive: str | None = None) -> str:
     return "\n".join(lines) + "\n"
 
 
+def pull_source(
+    source: dict[str, object], path: str, *, unpack: bool = False,
+    target: str | None = None, links: bool = False,
+) -> str:
+    """A one-shot standard-library pull that returns metadata without relaying bytes."""
+    return (
+        "import os, shutil, tarfile, urllib.request\n"
+        f"_path = {path!r}\n"
+        "os.makedirs(os.path.dirname(_path) or '.', exist_ok=True)\n"
+        f"_fetch = urllib.request.Request({source['url']!r}, "
+        f"headers={dict(source.get('headers') or {})!r})\n"
+        "try:\n"
+        "    with urllib.request.urlopen(_fetch, timeout=3600) as _response, "
+        "open(_path + '.partial', 'wb') as _out:\n"
+        "        shutil.copyfileobj(_response, _out, 1 << 20)\n"
+        "finally:\n"
+        "    _fetch = None\n"
+        "os.replace(_path + '.partial', _path)\n"
+        f"if {unpack!r}:\n"
+        f"    _target = {target or str(Path(path).parent)!r}\n"
+        "    os.makedirs(_target, exist_ok=True)\n"
+        "    with tarfile.open(_path, 'r:gz') as _archive:\n"
+        "        _root = os.path.realpath(_target)\n"
+        "        for _member in _archive.getmembers():\n"
+        "            _destination = os.path.realpath(os.path.join(_root, _member.name))\n"
+        "            if os.path.commonpath([_root, _destination]) != _root:\n"
+        "                raise ValueError('archive member would escape the destination')\n"
+        "        try:\n"
+        f"            _archive.extractall(_target, filter={'tar' if links else 'data'!r})\n"
+        "        except TypeError:\n"
+        "            _archive.extractall(_target)\n"
+        "__letify_value__ = {'path': _path, 'size': os.path.getsize(_path)}\n"
+    )
+
+
 def sync_source(
     env: Env,
     files: dict[str, bytes],
     *,
     root: str | None = None,
+    workspace: str | None = None,
     name: str = "this runtime",
     installer: str = UV_INSTALLER,
-    cache_dir: str | None = None,
+    archive: bool = False,
 ) -> str:
     """Source that writes the project files, finds or installs uv, and runs the sync.
 
-    ``cache_dir`` becomes ``UV_CACHE_DIR`` for the uv commands only, unless the declared
-    variables already name one. Spec "uv cache": a persistent provider passes
-    ``<workspace root>/uv-cache`` so uv hard links into the project ``.venv``.
+    ``workspace`` names the root uv's cache, its managed Pythons, its tool installs and
+    its own binary all sit under, unless the declared variables already name one. Spec
+    "Remote paths letify writes": this applies for every provider, persistent or
+    ephemeral, not only so uv can hard link into the project ``.venv`` on a persistent
+    one, but because the workspace root may be the only path the account can write to.
+
+    ``archive`` keeps the default managed Python directory inside the project tree.
+    Declared uv directories still take precedence.
 
     It raises ``RuntimeError`` with ``uv could not be installed on <name>`` or ``uv sync
     failed on <name>`` so the local side can name the step that failed.
     """
     root = root or project_dir(DEFAULT_WORKSPACE_ROOT, env)
+    workspace = workspace or DEFAULT_WORKSPACE_ROOT
     encoded = {key: base64.b64encode(value).decode() for key, value in files.items()}
     sync_args = sync_command(env)[1:]
     tail = f"'\\n'.join(_letify_text.strip().splitlines()[-{TAIL_LINES}:])"
@@ -223,7 +287,7 @@ def sync_source(
         "    with open(os.path.join(_letify_root, _letify_name), 'wb') as _letify_file:",
         "        _letify_file.write(base64.b64decode(_letify_payload))",
         "_letify_uv = shutil.which('uv')",
-        "_letify_bin = os.path.expanduser('~/.local/bin')",
+        f"_letify_bin = os.path.expanduser({uv_bin_dir(workspace)!r})",
         "if _letify_uv is None and os.path.isfile(os.path.join(_letify_bin, 'uv')):",
         "    _letify_uv = os.path.join(_letify_bin, 'uv')",
         "if _letify_uv is None:",
@@ -252,8 +316,14 @@ def sync_source(
         "    _letify_uv = os.path.join(_letify_bin, 'uv')",
         "_letify_uv_env = dict(os.environ)",
     ]
-    if cache_dir and "UV_CACHE_DIR" not in dict(env.variables):
-        lines.append(f"_letify_uv_env['UV_CACHE_DIR'] = os.path.expanduser({cache_dir!r})")
+    declared = dict(env.variables)
+    directories = uv_env(workspace)
+    if archive:
+        # Keep an interpreter uv downloads inside the tree sent to the next VM.
+        directories["UV_PYTHON_INSTALL_DIR"] = f"{root.rstrip('/')}/.letify-python"
+    for key, value in directories.items():
+        if key not in declared:
+            lines.append(f"_letify_uv_env[{key!r}] = os.path.expanduser({value!r})")
     lines += [
         f"_letify_command = [_letify_uv] + {sync_args!r}",
         "_letify_done = subprocess.run(_letify_command, cwd=_letify_root, capture_output=True,"
@@ -291,6 +361,7 @@ __all__ = [
     "project_files",
     "sync_command",
     "sync_source",
-    "uv_cache_dir",
+    "uv_bin_dir",
+    "uv_env",
     "venv_check_source",
 ]

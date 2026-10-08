@@ -1,17 +1,21 @@
-"""Kaggle, one Kaggle account reached through the browser session cookie.
+"""Kaggle, one Kaggle account reached through the browser session cookie and the API token.
 
 This module owns the cookie the account is declared with, the token chain that turns the
-cookie into a live Jupyter proxy URL, the weekly accelerator quota read from the internal
-API, and the channel to a worker kept alive in one kernel cell of the session letify starts.
-It does not own the login, which is in ``letify.config.login``, or the kernel execution
-itself, which is in ``kaggle_adapter.py``. It opens no tunnel or port forward of any kind,
-and it sends no keep-alive request.
+cookie into a live Jupyter proxy URL, the ephemeral notebook created for each run, the
+weekly accelerator quota, and the channel to a worker kept alive in one kernel cell of the
+session letify starts. It does not own the login, which is in ``letify.config.login``, or
+the kernel execution itself, which is in ``kaggle_adapter.py``. It opens no tunnel or port
+forward of any kind, and it sends no keep-alive request.
 
-The cookie is the whole credential. Only the web session principal can mint the Jupyter
-proxy token: the internal endpoints treat an API key as anonymous and answer empty. So there
-is no API token, no ``kaggle.json`` and no session URL registered by hand. letify starts an
-interactive session on a notebook it owns, reads the routed proxy URL through Firebase and
-Firestore, and opens the channel over it.
+Two credentials, both required, with a boundary kept on purpose: the cookie is for the
+interactive session alone, starting it, minting its Jupyter proxy URL through Firebase and
+Firestore, and ending it. Only the web session principal can do any of that, since the
+internal endpoints that mint the proxy token treat an API key as anonymous and answer
+empty. Everything else, deleting the notebook a run created and reading the weekly quota,
+goes through the official Kaggle CLI instead, authenticated by the API token in
+``KAGGLE_API_TOKEN``, and never falls back to the cookie: an account declared before the token
+became required is refused with a ``ConfigError`` at the point that needs it, not served
+from the cookie as a substitute.
 """
 
 from __future__ import annotations
@@ -19,6 +23,7 @@ from __future__ import annotations
 import base64
 import binascii
 import json
+import math
 import re
 import time
 import urllib.error
@@ -30,7 +35,7 @@ from typing import TYPE_CHECKING, Any
 
 from .. import tools
 from ..config import ProviderConfig
-from ..config.secrets import account_directory, write_secret
+from ..config.secrets import account_directory
 from ..declare.instance import Host, Instance
 from ..errors import (
     ConfigError,
@@ -50,6 +55,11 @@ REST_TIMEOUT = 30
 
 #: Seconds to wait for a freshly started session to publish its Jupyter proxy URL.
 SESSION_START_TIMEOUT = 300.0
+
+#: The least time left on the cookie's exp claim that a run may start with. A run that
+#: starts closer to expiry than this risks the cookie dying mid session, with no way to
+#: extend it and no way for letify to tell the difference from any other lost runtime.
+MIN_COOKIE_HOURS = 1.0
 
 if TYPE_CHECKING:
     from ..runtime.channel import Channel
@@ -245,6 +255,14 @@ def verify_cookie(cookie: str) -> str:
 def require_live_cookie(alias: str) -> str:
     """The cookie for a run, or a ``ConfigError`` telling the user to log in again.
 
+    Checks only what the cookie itself states: its shape, and its ``exp`` claim. That claim
+    is not proof the cookie still works, since Kaggle has been seen to invalidate a session
+    server side well before ``exp``, with the claim left unchanged; a cookie this check
+    passes can still be refused by Kaggle itself. ``Kaggle._require_live_cookie`` is what
+    confirms liveness online, with ``verify_cookie``, for the two paths that are about to
+    make a call the cookie must actually be live for. This function on its own is for a read
+    that does not reach the network, such as ``account_note``.
+
     Spec "Kaggle account": a run whose cookie is missing or past its ``exp`` cannot mint the
     proxy token, so it is refused here rather than failing deeper. The message names the one
     fact letify has, the expiry, and never states the session ended for another reason.
@@ -263,6 +281,12 @@ def require_live_cookie(alias: str) -> str:
     if left <= 0:
         raise ConfigError(
             f"{alias}: the Kaggle cookie has expired. Log in to kaggle.com again and run: "
+            f"letify login kaggle {alias}"
+        )
+    if left * 24 < MIN_COOKIE_HOURS:
+        raise ConfigError(
+            f"{alias}: the Kaggle cookie expires in under {MIN_COOKIE_HOURS:.0f} hour, too "
+            f"little to start and run a session. Log in to kaggle.com again and run: "
             f"letify login kaggle {alias}"
         )
     return cookie
@@ -322,30 +346,15 @@ def _post(url: str, body: dict[str, Any], headers: dict[str, str]) -> dict[str, 
         return json.loads(response.read())
 
 
-def notebook_id(alias: str, cookie: str) -> int:
-    """The id of the notebook letify owns for this account, creating it once and reusing it.
+def new_notebook(alias: str, cookie: str) -> tuple[int, str | None]:
+    """Create one ephemeral notebook for this run and return its id and its URL slug.
 
-    letify runs on a notebook it controls, not one the user picks, so it can commit the body
-    a session needs to start. The id is kept in the account directory so the same notebook is
-    reused rather than a new one created for every run.
+    Spec "Kaggle session token chain": a notebook is created fresh for every run and
+    deleted when the run ends, so none is kept across runs and there is nothing on disk to
+    go stale. The returned slug is confirmed on the live account and is what the CLI's
+    ``kernels delete`` addresses the notebook by; a run on an account with no API token
+    simply never deletes it through the CLI.
     """
-    kept = kept_notebook(alias)
-    return kept if kept is not None else new_notebook(alias, cookie)
-
-
-def kept_notebook(alias: str) -> int | None:
-    """The notebook id kept for this account, or None when there is none to reuse."""
-    path = account_directory(alias) / "notebook_id"
-    if not path.is_file():
-        return None
-    try:
-        return int(path.read_text(encoding="utf-8").strip())
-    except ValueError:
-        return None
-
-
-def new_notebook(alias: str, cookie: str) -> int:
-    """Create a notebook for this account and keep its id, replacing any id kept before."""
     reply = _call(
         cookie,
         KERNELS_SERVICE + "CreateKernelWithSettings",
@@ -359,8 +368,8 @@ def new_notebook(alias: str, cookie: str) -> int:
     kernel = reply.get("id")
     if kernel is None:
         raise RuntimeFailure(f"{alias}: Kaggle did not return a notebook id")
-    write_secret(alias, "notebook_id", str(int(kernel)))
-    return int(kernel)
+    slug = reply.get("currentUrlSlug")
+    return int(kernel), (str(slug) if slug else None)
 
 
 def start_run(cookie: str, kernel_id: int, accelerator: str | None) -> int:
@@ -481,30 +490,25 @@ def jupyter_token(id_token: str, webtier: str, deadline: float) -> str:
         time.sleep(3)
 
 
-def live_session_url(alias: str, cookie: str, accelerator: str | None) -> tuple[int, str]:
-    """Start a session and return its run id and routed Jupyter proxy URL.
+def live_session_url(
+    alias: str, cookie: str, accelerator: str | None
+) -> tuple[int, str, int, str | None]:
+    """Create this run's ephemeral notebook and return its run id, proxy URL, notebook id
+    and slug.
 
-    The whole token chain lives here: start the run, exchange the Firebase token, register
-    the Firestore auth, read the proxy token and build the routed URL. The token rides in the
-    URL path because the proxy rejects it as a header.
+    The whole token chain lives here: create the notebook, start the run, exchange the
+    Firebase token, register the Firestore auth, read the proxy token and build the routed
+    URL. The token rides in the URL path because the proxy rejects it as a header. A refused
+    start is raised as is: the notebook was created a moment ago for this run alone, so a
+    403 on it is the account's own answer, not a stale notebook's.
     """
-    kept = kept_notebook(alias)
-    kernel = kept if kept is not None else new_notebook(alias, cookie)
-    try:
-        run = start_run(cookie, kernel, accelerator)
-    except _Refused as refused:
-        # A notebook whose id was kept from an earlier run and that this account may no
-        # longer commit to is one deleted on kaggle.com, so letify owns a new one and
-        # starts there. A notebook created a moment ago cannot be that, so its refusal is
-        # the account's answer and is raised. Spec "Kaggle session token chain".
-        if refused.status != 403 or kept is None:
-            raise
-        run = start_run(cookie, new_notebook(alias, cookie), accelerator)
+    kernel, slug = new_notebook(alias, cookie)
+    run = start_run(cookie, kernel, accelerator)
     id_token = firebase_id_token(cookie)
     webtier = webtier_session(cookie, id_token, run)
     deadline = time.monotonic() + SESSION_START_TIMEOUT
     token = jupyter_token(id_token, webtier, deadline)
-    return run, f"{JUPYTER_PROXY_HOST}/k/{run}/{token}/proxy"
+    return run, f"{JUPYTER_PROXY_HOST}/k/{run}/{token}/proxy", kernel, slug
 
 
 def cancel_run(cookie: str, run_id: int) -> None:
@@ -513,6 +517,151 @@ def cancel_run(cookie: str, run_id: int) -> None:
         _call(cookie, KERNELS_SERVICE + "CancelKernelSession", {"kernelSessionId": run_id})
     except RuntimeFailure:
         pass
+
+
+def read_api_token(alias: str) -> str | None:
+    """Read the account's verbatim API token, or None when the file is unreadable or empty."""
+    try:
+        token = (account_directory(alias) / "access_token").read_text(encoding="utf-8")
+    except (OSError, UnicodeError):
+        return None
+    return token or None
+
+
+def require_api_token(alias: str) -> str:
+    """The account's API token, or a ``ConfigError`` telling the user to log in again.
+
+    Spec "Kaggle account": deleting the notebook a run created and reading the weekly quota
+    go through the official CLI only, with no cookie-based fallback, so an account without
+    the access_token file cannot do either until it logs in again.
+    """
+    token = read_api_token(alias)
+    if token is None:
+        raise ConfigError(
+            f"{alias} has no Kaggle API token. Log in again with: letify login kaggle "
+            f"{alias} --username <owner> --key <KGAT_token>, exactly as shown on kaggle.com"
+        )
+    return token
+
+
+def delete_notebook_via_cli(alias: str, slug: str | None) -> bool:
+    """Delete the ephemeral notebook through the official CLI, the only way it is deleted.
+
+    Spec "Kaggle session token chain": the cookie is for the interactive session alone, so
+    deleting the notebook afterward never touches it, win or lose. Returns whether the
+    command exited 0; never raises, because the accelerator quota is already released by
+    cancelling the run, and a notebook this call fails to delete is not a new failure for
+    the runtime that just ended.
+    """
+    if not slug:
+        return False
+    token = read_api_token(alias)
+    if token is None:
+        return False
+    try:
+        username = (account_directory(alias) / "username").read_text(encoding="utf-8").strip()
+    except (OSError, UnicodeError):
+        return False
+    if not username:
+        return False
+    uv = tools.find_uv()
+    if uv is None:
+        return False
+    import subprocess
+
+    try:
+        result = subprocess.run(
+            [*tools.kaggle_cli_command(uv), "kernels", "delete", "-y", f"{username}/{slug}"],
+            env=tools.kaggle_cli_environment(alias),
+            capture_output=True,
+            timeout=REST_TIMEOUT,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return result.returncode == 0
+
+
+def delete_notebook_best_effort(alias: str, kernel_id: int, slug: str | None) -> None:
+    """Delete the run's notebook through the official CLI, best effort.
+
+    Never raises. A notebook the CLI could not delete, for want of a token, of uv, of a
+    slug, or because the command itself failed, is reported with a warning naming it by
+    slug or id, never by its cookie, so the user can delete it by hand on kaggle.com.
+    """
+    if delete_notebook_via_cli(alias, slug):
+        return
+    import sys
+
+    name = f"slug {slug}" if slug else f"id {kernel_id}"
+    print(
+        f"letify: {alias}: could not delete the Kaggle notebook ({name}); delete it by hand "
+        f"on kaggle.com",
+        file=sys.stderr,
+    )
+
+
+def run_cli_quota(alias: str) -> str | None:
+    """Run ``kaggle quota --format json`` and return its standard output, or None.
+
+    Spec "Remaining usage, Kaggle": quota is read through the official CLI only, with no
+    cookie fallback, so a missing token, a missing uv, or a non-zero exit all mean there is
+    nothing to report rather than a reason to ask the cookie instead.
+    """
+    token = read_api_token(alias)
+    if token is None:
+        return None
+    uv = tools.find_uv()
+    if uv is None:
+        return None
+    import subprocess
+
+    try:
+        result = subprocess.run(
+            [*tools.kaggle_cli_command(uv), "quota", "--format", "json"],
+            env=tools.kaggle_cli_environment(alias),
+            capture_output=True,
+            text=True,
+            timeout=REST_TIMEOUT,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return result.stdout if result.returncode == 0 else None
+
+
+def _parse_cli_quota(text: str) -> dict[str, dict[str, float]] | None:
+    """Parse the measured CLI list schema, returning None for unreadable quota output.
+
+    Hour values are supplied directly. The naive refresh timestamp has no established
+    timezone, so it cannot establish Unix seconds for Usage.resets_at.
+    """
+    try:
+        rows = json.loads(text)
+        if not isinstance(rows, list):
+            return None
+        result: dict[str, dict[str, float]] = {}
+        for row in rows:
+            if not isinstance(row, dict):
+                return None
+            resource = row.get("resource")
+            if resource not in ("GPU", "TPU"):
+                return None
+            name = resource.lower()
+            if name in result:
+                return None
+            datetime.fromisoformat(row["refreshAt"])
+            hours = {}
+            for field in ("used", "remaining", "total"):
+                value = row[field]
+                if not isinstance(value, str) or not value.endswith("h"):
+                    return None
+                number = float(value[:-1])
+                if not math.isfinite(number) or number < 0:
+                    return None
+                hours[field] = number
+            result[name] = hours
+        return result if "gpu" in result else None
+    except (ValueError, KeyError, TypeError):
+        return None
 
 
 def adapter_command() -> list[str]:
@@ -790,12 +939,17 @@ class Kaggle(Provider):
     serves_host_local = False
 
     usage_unit = "GPU hours"
-    usage_source = "the weekly accelerator quota the Kaggle cookie reads"
+    usage_source = "the weekly accelerator quota the official Kaggle CLI's quota command reads"
 
     default_workspace = "/kaggle/working/letify"
 
     def account_note(self) -> str | None:
-        """How the account's cookie is doing, for `letify providers`."""
+        """How the account's cookie is doing, for `letify providers`, with no network call.
+
+        This is the cookie's own ``exp`` claim, not a confirmed answer: Kaggle can refuse a
+        cookie before ``exp`` passes, and this note cannot tell that apart from a cookie
+        that still works. ``letify usage`` makes the one call that actually checks.
+        """
         cookie = read_cookie(self.alias)
         if cookie is None:
             return "no cookie; run letify login kaggle"
@@ -805,7 +959,7 @@ class Kaggle(Provider):
             return "cookie unreadable; log in again"
         if left <= 0:
             return "cookie EXPIRED; log in again"
-        return f"cookie expires in {int(left)} days"
+        return f"cookie's exp claim says {int(left)} days left (not checked live; see letify usage)"
 
     def available(self) -> bool:
         return tools.find_uv() is not None
@@ -831,18 +985,62 @@ class Kaggle(Provider):
                 f"host='remote'."
             )
 
+    #: How long a cookie confirmed live with ``verify_cookie`` is trusted before it is
+    #: checked online again. Starting several runtimes in quick succession then costs one
+    #: round trip, not one per runtime.
+    COOKIE_LIVENESS_TTL = 60.0
+
     def __init__(self, config: ProviderConfig):
         super().__init__(config)
-        #: The session, kernel, channel and run id each runtime runs its programs in.
-        self._kernels: dict[str, tuple[Session, str, KaggleChannel, int]] = {}
+        #: The session, kernel, channel, run id, notebook id and notebook slug each runtime
+        #: runs its programs in. The notebook is this runtime's own, created in
+        #: ``open_channel`` and deleted in ``stop``.
+        self._kernels: dict[str, tuple[Session, str, KaggleChannel, int, int, str | None]] = {}
+        #: Monotonic time of the last confirmed-live cookie check, or None before the first.
+        self._cookie_checked_at: float | None = None
+
+    def _require_live_cookie(self) -> str:
+        """The account's cookie, confirmed live with Kaggle, not only unexpired.
+
+        Spec "Kaggle account": the ``exp`` claim ``require_live_cookie`` checks is not proof
+        the session still works, so a cookie that passes it is also checked online with
+        ``verify_cookie`` here, once per ``COOKIE_LIVENESS_TTL``. A cookie Kaggle refuses is
+        reported as that, separately from an expired one, because the fix the user needs to
+        hear is the same either way, log in again, but stating it ended for the wrong reason
+        would be stating something this check does not establish.
+        """
+        cookie = require_live_cookie(self.alias)
+        now = time.monotonic()
+        checked = self._cookie_checked_at
+        if checked is not None and now - checked < self.COOKIE_LIVENESS_TTL:
+            return cookie
+        try:
+            verify_cookie(cookie)
+        except ValueError as exc:
+            if "could not be checked" in str(exc):
+                # The check itself did not complete, a transport problem rather than an
+                # answer from Kaggle, so this is not evidence the cookie is bad: the call
+                # that was about to be made reports its own failure instead.
+                raise RuntimeFailure(f"{self.alias}: {exc}") from None
+            raise ConfigError(
+                f"{self.alias}: the Kaggle cookie has not expired, but Kaggle no longer "
+                f"accepts it. Log in to kaggle.com again and run: letify login kaggle "
+                f"{self.alias}"
+            ) from None
+        self._cookie_checked_at = now
+        return cookie
 
     def open_channel(self, runtime: Runtime) -> Channel:
-        """Start a session from the cookie and open one worker in one cell of it."""
-        cookie = require_live_cookie(self.alias)
+        """Start a session from the cookie and open one worker in one cell of it.
+
+        The notebook is created fresh for this runtime alone, never reused from an earlier
+        one: spec "Kaggle session token chain".
+        """
+        cookie = self._require_live_cookie()
         instance = getattr(runtime, "instance", None)
         gpu = getattr(instance, "gpu", None)
         accelerator = GPUS[gpu]["accelerator"] if gpu in GPUS else None
-        run, url = live_session_url(self.alias, cookie, accelerator)
+        run, url, notebook, slug = live_session_url(self.alias, cookie, accelerator)
         session = Session(self.alias, url)
         session.wait_alive()
         kernel = session.create_kernel()
@@ -852,20 +1050,23 @@ class Kaggle(Provider):
             name=runtime.name,
             session=session,
         )
-        self._kernels[runtime.name] = (session, kernel, channel, run)
+        self._kernels[runtime.name] = (session, kernel, channel, run, notebook, slug)
         return channel
 
     def stop(self, runtime: Runtime) -> None:
-        """Close the bridge, delete the kernel, then cancel the session run.
+        """Close the bridge, delete the kernel, cancel the session run, delete the notebook.
 
         In that order: closing the bridge's standard input ends the cell's read loop, so the
         worker exits on its own rather than being cut off mid frame. The run is letify's own,
-        started for this runtime, so cancelling it releases the accelerator quota it holds.
+        started for this runtime, so cancelling it releases the accelerator quota it holds;
+        that is the cookie's last job, ending the session it started. The notebook created
+        for this run is then deleted, through the official CLI alone, with no cookie
+        involved at all. Spec "Kaggle session token chain".
         """
         held = self._kernels.pop(runtime.name, None)
         if held is None:
             return
-        session, kernel, channel, run = held
+        session, kernel, channel, run, notebook, slug = held
         try:
             channel.close()
         except OSError:
@@ -874,49 +1075,57 @@ class Kaggle(Provider):
         cookie = read_cookie(self.alias)
         if cookie is not None:
             cancel_run(cookie, run)
+        delete_notebook_best_effort(self.alias, notebook, slug)
 
     def report_usage(self) -> Usage:
-        """The weekly accelerator quota, read from the cookie rather than any API key."""
-        cookie = require_live_cookie(self.alias)
-        stats = _call(cookie, KERNELS_SERVICE + "GetAcceleratorQuotaStatistics", {})
-        gpu = stats.get("gpuQuota")
-        if not isinstance(gpu, dict):
-            raise RuntimeFailure(f"{self.alias}: Kaggle reported no GPU quota")
-        total = _seconds_to_hours(gpu.get("totalTimeAllowed"))
-        used = _seconds_to_hours(gpu.get("timeUsed"))
-        remaining = None if total is None or used is None else max(total - used, 0.0)
+        """The weekly accelerator quota, read through the official CLI alone.
+
+        Spec "Remaining usage, Kaggle": this never touches the cookie, which is reserved
+        for the interactive session and its Jupyter proxy URL. ``require_api_token`` raises
+        when the account has no readable access_token file.
+        """
+        require_api_token(self.alias)
+        text = run_cli_quota(self.alias)
+        parsed = _parse_cli_quota(text) if text is not None else None
+        if parsed is None:
+            return Usage(
+                alias=self.alias,
+                kind=self.kind,
+                unit=self.usage_unit,
+                source=self.usage_source,
+                remaining=None,
+                note="the Kaggle CLI's quota output could not be read",
+            )
+        gpu = parsed["gpu"]
+        total, used = gpu["total"], gpu["used"]
         notes = []
-        refresh = stats.get("quotaRefreshTime")
-        if refresh:
-            notes.append(f"resets {refresh}")
-        tpu = stats.get("tpuQuota")
-        if isinstance(tpu, dict):
-            tpu_total = _seconds_to_hours(tpu.get("totalTimeAllowed"))
-            tpu_used = _seconds_to_hours(tpu.get("timeUsed"))
-            if tpu_total is not None and tpu_used is not None:
-                notes.append(
-                    f"TPU {tpu_used:g} h used, {max(tpu_total - tpu_used, 0.0):g} h left "
-                    f"of {tpu_total:g}"
-                )
+        tpu = parsed.get("tpu")
+        if tpu is not None:
+            notes.append(
+                f"TPU {tpu['used']:g} h used, {tpu['remaining']:g} h "
+                f"left of {tpu['total']:g}"
+            )
         return Usage(
             alias=self.alias,
             kind=self.kind,
             unit=self.usage_unit,
             source=self.usage_source,
-            remaining=remaining,
+            remaining=gpu["remaining"],
             limit=total,
             used=used,
             note="; ".join(notes) or None,
+            resources=(
+                ({
+                    "name": "TPU",
+                    "unit": "TPU hours",
+                    "remaining": tpu["remaining"],
+                    "used": tpu["used"],
+                    "limit": tpu["total"],
+                    "resets_at": None,
+                },)
+                if tpu is not None else ()
+            ),
         )
-
-
-def _seconds_to_hours(value: Any) -> float | None:
-    """Read a duration such as ``216000s`` or ``216000`` as hours."""
-    text = str(value or "").strip().removesuffix("s").strip()
-    try:
-        return float(text) / 3600.0
-    except ValueError:
-        return None
 
 
 __all__ = [
@@ -930,10 +1139,15 @@ __all__ = [
     "cookie_days_left",
     "cookie_expiry",
     "cookie_headers",
+    "delete_notebook_best_effort",
+    "delete_notebook_via_cli",
     "live_session_url",
+    "read_api_token",
     "read_cookie",
+    "require_api_token",
     "require_cookie_shape",
     "require_live_cookie",
+    "run_cli_quota",
     "split_url",
     "verify_cookie",
 ]

@@ -18,6 +18,9 @@ depends on what the provider charges for.
 
 from __future__ import annotations
 
+import datetime
+import json
+import sys
 import time
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
@@ -99,10 +102,12 @@ class Runtime:
 
     # -- identity ------------------------------------------------------------
 
+    _pool_key: str | None = field(default=None, repr=False)
+
     @property
     def key(self) -> str:
         """Pool key. Runtimes with equal keys are interchangeable."""
-        return f"{self.instance.key}|{self.env.key}"
+        return self._pool_key or f"{self.instance.key}|{self.env.key}"
 
     @property
     def idle_for(self) -> float:
@@ -137,8 +142,17 @@ class Runtime:
             self.check_interpreter()
         except InterpreterMismatch:
             # Not retried, so nothing else would end this session.
-            self.shutdown()
+            self.shutdown(reason="interpreter_mismatch")
             raise
+        if self.env_source == "sync" and not self.provider.persistent:
+            from . import bootstrap
+
+            root = bootstrap.project_dir(
+                self.provider.env_root or self.workspace or self.provider.workspace_root, self.env
+            )
+            self._environment_volumes()[0].cache_env_from(
+                self, self.env, root, platform=self.platform
+            )
         self.keep_blobs_on_disk()
         for volume in self.volumes:
             self.attach(volume)
@@ -159,8 +173,16 @@ class Runtime:
             timeout=120,
         )
 
-    def shutdown(self) -> None:
-        """Stop everything that bills for this runtime."""
+    def shutdown(self, *, reason: str = "explicit_shutdown") -> None:
+        """Stop everything that bills for this runtime and explain the decision."""
+        timestamp = datetime.datetime.now(datetime.UTC).isoformat()
+        print(
+            f"{timestamp} letify: discarding {self.name} provider={self.provider.alias} "
+            f"key={self.key} busy={self.busy} reason={reason.split(':', 1)[0]} "
+            f"timestamp={timestamp} detail={json.dumps(reason)}",
+            file=sys.stderr,
+            flush=True,
+        )
         self.ready = False
         if self.device_client is not None:
             client, self.device_client = self.device_client, None
@@ -300,13 +322,20 @@ class Runtime:
                 )
         self.last_used = time.monotonic()
         outcome = None
+        # Each output file comes back as soon as it is complete, while the call still
+        # runs, so a long call's checkpoints do not wait for its return. Spec "Writing back".
+        back = pathdata.WriteBack(self, collector, blobs) if collector.outputs else None
+        if back is not None:
+            back.start()
         try:
             outcome = self.channel.request(request, timeout=timeout)
         finally:
+            if back is not None:
+                back.cancel()
             added = self._finish_data(stream, call_dir)
             try:
                 if outcome is not None and collector.outputs:
-                    added += pathdata.write_back(self, collector, blobs)
+                    added += pathdata.write_back(self, collector, blobs, back)
             finally:
                 if added:
                     pathdata.evict(self, blobs)
@@ -491,18 +520,26 @@ class Runtime:
         ``source`` is what ``Backend.pull_source`` answered: a URL and headers carrying a
         short-lived token. The worker drops both once the download finishes.
         """
-        value = self.request(
-            {
-                "op": "pull",
-                "url": source["url"],
-                "headers": dict(source.get("headers") or {}),
-                "path": path,
-                "unpack": unpack,
-                "target": target,
-                "links": links,
-            },
-            timeout=3600,
-        )
+        if not self.persistent_channel:
+            from . import bootstrap
+
+            value = self.eval(
+                bootstrap.pull_source(source, path, unpack=unpack, target=target, links=links),
+                timeout=3600,
+            )
+        else:
+            value = self.request(
+                {
+                    "op": "pull",
+                    "url": source["url"],
+                    "headers": dict(source.get("headers") or {}),
+                    "path": path,
+                    "unpack": unpack,
+                    "target": target,
+                    "links": links,
+                },
+                timeout=3600,
+            )
         return protocol.RemoteFile(path=value["path"], digest=digest, size=value["size"])
 
     def put_file(self, local: str | Path, path: str, **kwargs: Any) -> protocol.RemoteFile:
@@ -553,6 +590,16 @@ class Runtime:
 
         self.workspace = self.eval(bootstrap.workspace_source(root), timeout=120)
 
+    def _environment_volumes(self) -> tuple[Volume, ...]:
+        """Explicit archive volumes, or the automatic cache for an ephemeral provider."""
+        if self.provider.persistent:
+            return ()
+        if self.volumes:
+            return self.volumes
+        from ..store.volume import environment_volume
+
+        return (environment_volume(self.provider),)
+
     def install_env(self) -> None:
         """Build the project's environment in the session and move the worker onto it.
 
@@ -576,7 +623,7 @@ class Runtime:
 
         # Spec "Volumes on a persistent runtime": the .venv is already on the runtime's
         # disk, so an archive is neither restored nor packed there.
-        archives = () if self.provider.persistent else self.volumes
+        archives = self._environment_volumes()
         for volume in archives:
             digest = volume.cached_env(self.env, self.platform)
             if not digest:
@@ -591,11 +638,12 @@ class Runtime:
 
         if self.env_source != "archive":
             workspace = self.workspace or self.provider.workspace_root
-            # Spec "Environment on the sandbox disk": an env root keeps uv's default cache.
-            persistent_cache = self.provider.persistent and env_root is None
-            cache = bootstrap.uv_cache_dir(workspace) if persistent_cache else None
+            # Spec "Remote paths letify writes": uv's cache, its managed Pythons, its tool
+            # installs and its own binary stay under the workspace root regardless of an
+            # env root or whether the provider is persistent or ephemeral.
             source = bootstrap.sync_source(
-                self.env, files, root=root, name=self.name, cache_dir=cache
+                self.env, files, root=root, name=self.name, workspace=workspace,
+                archive=bool(archives),
             )
             try:
                 self.eval(source, timeout=3600)
@@ -605,8 +653,6 @@ class Runtime:
                     message.removeprefix("RuntimeError: "), stderr=exc.remote_traceback
                 ) from exc
             self.env_source = "sync"
-            if archives:
-                archives[0].cache_env_from(self, self.env, where["root"], platform=self.platform)
         self.python = where["python"]
         self.channel.switch_interpreter(where["python"])
 
@@ -639,8 +685,13 @@ class Runtime:
 
 
 def _pickled(value: Any, immutable: bool) -> dict[str, Any]:
-    """A ``put_blob`` message for a value: its protocol 5 pickle and out-of-band buffers."""
-    head, buffers = protocol.wire.pickle_parts(value)
+    """A ``put_blob`` message for a value: its protocol 5 pickle and out-of-band buffers.
+
+    Pickled with ``codec.pickle_value_parts``, cloudpickle underneath, so a class or
+    function the caller defined locally ships by value instead of by name, the same as
+    it does when it is small enough to travel inlined in the call payload.
+    """
+    head, buffers = protocol.codec.pickle_value_parts(value)
     return {"kind": "pickle", "immutable": immutable, "head": head, "buffers": buffers}
 
 

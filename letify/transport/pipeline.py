@@ -27,8 +27,46 @@ GRACE_SECONDS = 2.0
 REJECT_RATIO = 0.25
 #: A cached strategy is kept while its probe reaches this share of the cached throughput.
 CACHE_RATIO = 0.5
+#: Seconds a cached choice is trusted before the pipeline races again, so a strategy that
+#: has become faster, or a cached strategy that has quietly degraded, is not stuck forever.
+CACHE_TTL_SECONDS = 3600.0
 
 MIB = 1024 * 1024
+#: The default floor: a link under 5 MiB/s in either direction, or over 300 ms round trip,
+#: is a failure rather than a connection. See docs/INTENT.md, "A slow link is a failure,
+#: not a fallback", and docs/NETWORK.md, "Connection pipeline measurements", for the
+#: measured gap this is set against: a direct LAN or campus link runs 50 to 100 MiB/s at
+#: under 1 ms, a relayed Tailcat path has been measured at 1 to 2 MiB/s at 69 to 99 ms.
+DEFAULT_MIN_MIB_PER_S = 5.0
+DEFAULT_MAX_RTT_MS = 300.0
+
+
+@dataclass(frozen=True)
+class LinkFloor:
+    """The slowest link an account accepts. A probe below this fails the connection."""
+
+    min_bps: float
+    max_rtt_ms: float
+
+    @classmethod
+    def default(cls) -> LinkFloor:
+        return cls(min_bps=DEFAULT_MIN_MIB_PER_S * MIB, max_rtt_ms=DEFAULT_MAX_RTT_MS)
+
+    def violations(self, result: ProbeResult) -> list[str]:
+        """Each direction, or the round trip, that the probe failed to clear."""
+        found = _below(
+            [
+                ("up", result.upload_bps, self.min_bps),
+                ("down", result.download_bps, self.min_bps),
+            ],
+            1.0,
+            "the floor",
+        )
+        if result.rtt_ms > self.max_rtt_ms:
+            found.append(
+                f"round trip {result.rtt_ms:.1f} ms above the floor {self.max_rtt_ms:.0f} ms"
+            )
+        return found
 
 
 @dataclass(frozen=True)
@@ -52,11 +90,18 @@ def network_fingerprint(
     return Fingerprint(public_ip, nat.default_route_interface())
 
 
+#: The cache file's format. A file carrying another value, or none, is ignored and
+#: remeasured rather than read with the wrong field meanings.
+CACHE_VERSION = 2
+
+
 @dataclass(frozen=True)
 class CachedLink:
     strategy: str
     probe: ProbeResult
     fingerprint: Fingerprint
+    #: When the choice was written, ``time.time()``. Used to expire the cache.
+    cached_at: float
 
 
 class LinkCache:
@@ -72,19 +117,31 @@ class LinkCache:
     def load(self) -> CachedLink | None:
         try:
             data = json.loads(self.path.read_text(encoding="utf-8"))
+            if int(data["version"]) != CACHE_VERSION:
+                return None
             return CachedLink(
                 strategy=str(data["strategy"]),
                 probe=ProbeResult.from_dict(data["probe"]),
                 fingerprint=Fingerprint(**data["fingerprint"]),
+                cached_at=float(data["cached_at"]),
             )
         except (OSError, ValueError, KeyError, TypeError):
             return None
 
-    def save(self, strategy: str, probe: ProbeResult, fingerprint: Fingerprint) -> None:
+    def save(
+        self,
+        strategy: str,
+        probe: ProbeResult,
+        fingerprint: Fingerprint,
+        *,
+        cached_at: float | None = None,
+    ) -> None:
         body = {
+            "version": CACHE_VERSION,
             "strategy": strategy,
             "probe": probe.to_dict(),
             "fingerprint": {"public_ip": fingerprint.public_ip, "interface": fingerprint.interface},
+            "cached_at": cached_at if cached_at is not None else time.time(),
         }
         write_secret(self.alias, "link.json", json.dumps(body, indent=2))
 
@@ -133,6 +190,8 @@ class Pipeline:
         timeout: float = 60.0,
         say: Say = say,
         previous: str | None = None,
+        floor: LinkFloor | None = None,
+        cache_ttl: float = CACHE_TTL_SECONDS,
     ):
         self.strategies = list(strategies)
         self.target = target
@@ -145,6 +204,9 @@ class Pipeline:
         self.say = say
         #: The strategy of a closed link to this account, when this connects to it again.
         self.previous = previous
+        #: The slowest probe this account accepts. A probe below it fails the connection.
+        self.floor = floor or LinkFloor.default()
+        self.cache_ttl = cache_ttl
 
     def _label(self, strategy: Any) -> str:
         """The strategy's name in a log line, with forward SSH's address and port."""
@@ -176,11 +238,35 @@ class Pipeline:
             self.say(f"connecting to {self.alias}: no strategy applies{skipped_note}")
             raise ProviderUnavailable("shell", self._explain(reasons))
         if len(applicable) == 1:
+            strategy = applicable[0]
             self.say(
-                f"connecting to {self.alias}: using {self._label(applicable[0])} alone, "
-                f"without a race{skipped_note}"
+                f"connecting to {self.alias}: using {self._label(strategy)} alone, "
+                f"without a race or a cache{skipped_note}"
             )
-            return applicable[0].assume(self.target)
+            link = strategy.assume(self.target)
+            if not getattr(strategy, "probed", True):
+                # The provider fallback cannot carry the probe, so there is nothing to
+                # hold it to the floor with; its own slowness is the accepted cost of
+                # having no better path, not a hidden one.
+                return link
+            try:
+                measured = self._measure(link)
+            except Exception:
+                # Nothing to compare against, so a failed probe does not reject the only
+                # strategy there is; the floor still applies when the probe itself works.
+                return link
+            if measured is not None:
+                floored = self.floor.violations(measured)
+                if floored:
+                    self._say(f"rejected {link.strategy}: below the floor: {', '.join(floored)}")
+                    _close(link)
+                    raise ProviderUnavailable(
+                        "shell",
+                        self._explain(
+                            [*reasons, f"{link.strategy}: below the floor: {', '.join(floored)}"]
+                        ),
+                    )
+            return link
 
         network = self.fingerprint() if self.cache is not None else None
         if self.cache is not None and network is not None:
@@ -214,6 +300,13 @@ class Pipeline:
         if not network.matches(entry.fingerprint):
             self._say(f"cached {name} rejected: network fingerprint changed")
             return None
+        age = time.time() - entry.cached_at
+        if age > self.cache_ttl:
+            self._say(
+                f"cached {name} rejected: stale, cached {age:.0f} s ago "
+                f"(over {self.cache_ttl:.0f} s), racing again so a faster strategy is retried"
+            )
+            return None
         strategy = next((s for s in applicable if s.name == name), None)
         if strategy is None:
             self._say(f"cached {name} rejected: it is not applicable")
@@ -238,6 +331,11 @@ class Pipeline:
             return None
         if measured is None:
             self._say(f"cached {name} rejected: it cannot carry the probe")
+            _close(link)
+            return None
+        floored = self.floor.violations(measured)
+        if floored:
+            self._say(f"cached {name} rejected: below the floor: {', '.join(floored)}")
             _close(link)
             return None
         short = _below(
@@ -370,6 +468,13 @@ class Pipeline:
             if link.strategy in held:
                 self._fall_back(link)
             else:
+                if measured is not None:
+                    floored = self.floor.violations(measured)
+                    if floored:
+                        below = f"{link.strategy}: below the floor: {', '.join(floored)}"
+                        self._say(f"rejected {below}")
+                        _close(link)
+                        raise ProviderUnavailable("shell", self._explain([*reasons, below]))
                 self._say(f"chose {link.strategy}: only one connected")
             return link, measured
 
@@ -385,6 +490,18 @@ class Pipeline:
                 unprobed.append(link)
             else:
                 probed.append((link, measured))
+
+        floored_out: list[str] = []
+        above_floor: list[tuple[Any, ProbeResult]] = []
+        for link, measured in probed:
+            floored = self.floor.violations(measured)
+            if floored:
+                self._say(f"rejected {link.strategy}: below the floor: {', '.join(floored)}")
+                floored_out.append(f"{link.strategy}: below the floor: {', '.join(floored)}")
+                _close(link)
+            else:
+                above_floor.append((link, measured))
+        probed = above_floor
 
         if probed:
             fastest_up = max(result.upload_bps for _, result in probed)
@@ -411,6 +528,11 @@ class Pipeline:
         elif unprobed:
             chosen, measured = unprobed[0], None
             self._fall_back(chosen)
+        elif floored_out:
+            self._say("every probe was below the floor")
+            raise ProviderUnavailable(
+                "shell", self._explain([*reasons, "every probe was below the floor", *floored_out])
+            )
         else:
             self._say("every probe failed")
             raise ProviderUnavailable("shell", self._explain([*reasons, "every probe failed"]))
@@ -423,4 +545,11 @@ class Pipeline:
         return f"no connection strategy reached {self.alias}: " + "; ".join(reasons)
 
 
-__all__ = ["CachedLink", "Fingerprint", "LinkCache", "Pipeline", "network_fingerprint"]
+__all__ = [
+    "CachedLink",
+    "Fingerprint",
+    "LinkCache",
+    "LinkFloor",
+    "Pipeline",
+    "network_fingerprint",
+]

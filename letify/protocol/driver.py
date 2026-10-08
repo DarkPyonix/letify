@@ -27,6 +27,15 @@ _NO_LETIFY = (
     "to letify (for example through letify.session_cache), cannot be loaded. Add it to "
     "the project with 'uv add letify' so uv.lock carries it into the runtime."
 )
+_SHIP_IS_NOT_INSTALL = (
+    "{{name!r}} is not importable in this runtime while the call's body was running. "
+    "Env.ship() sends a module by value: an object from it that the function captures "
+    "as a global is carried inside the call's payload, but the module itself is never "
+    "installed in the runtime, so 'import {{name}}' inside the function body has nothing "
+    "to find. Reference the name as a global the function closes over instead of "
+    "importing it inside the body, or install the package in the runtime's environment "
+    "(name it in uv.lock) so it can be imported there by reference."
+)
 
 def _emit(obj):
     try:
@@ -73,13 +82,15 @@ else:
             import asyncio
             value = asyncio.run(value)
     except BaseException as exc:
-        _missing = (
-            isinstance(exc, ModuleNotFoundError)
-            and (exc.name or "").split(".")[0] == "letify"
-        )
+        if isinstance(exc, ModuleNotFoundError) and (exc.name or "").split(".")[0] == "letify":
+            _error = _NO_LETIFY
+        elif isinstance(exc, ModuleNotFoundError):
+            _error = _SHIP_IS_NOT_INSTALL.format(name=exc.name)
+        else:
+            _error = "{{}}: {{}}".format(type(exc).__name__, exc)
         _emit({{
             "ok": False,
-            "error": _NO_LETIFY if _missing else "{{}}: {{}}".format(type(exc).__name__, exc),
+            "error": _error,
             "traceback": traceback.format_exc(),
         }})
     else:

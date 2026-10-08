@@ -477,6 +477,28 @@ class Launcher:
             answers = list(pool.map(read, wanted))
         return [row for rows in answers for row in rows]
 
+    def sessions(self) -> list[dict[str, Any]]:
+        """List provider-owned sessions without opening a runtime.
+
+        Spec "Provider session discovery".
+        """
+        rows: list[dict[str, Any]] = []
+        for alias in self.config.order:
+            try:
+                provider = self.provider(alias)
+                supported = provider.kind == "colab"
+                rows.append(
+                    {
+                        "alias": alias,
+                        "kind": provider.kind,
+                        "sessions": provider.sessions() if supported else [],
+                        "reason": None if supported else "session discovery is not supported",
+                    }
+                )
+            except LetifyError as exc:
+                rows.append({"alias": alias, "sessions": [], "unavailable": str(exc)})
+        return rows
+
     def status(self) -> dict[str, Any]:
         """What is running right now, and what it is costing.
 
@@ -569,13 +591,56 @@ class Launcher:
         """Make sure nothing survives this process.
 
         The lease already covers a crash, and this covers an ordinary exit that
-        happens while a hold is still open.
+        happens while a hold is still open, plus SIGTERM and SIGHUP, which do not
+        run ``atexit`` callbacks on their own.
         """
         with self._guard:
             if self._at_exit_registered:
                 return
             self._at_exit_registered = True
         atexit.register(self.pool.shutdown)
+        self._register_signal_handlers()
+
+    def _register_signal_handlers(self) -> None:
+        """Shut the pool down on SIGTERM and SIGHUP before the process dies.
+
+        ``SIGKILL``, the out of memory killer and a power cut run no code at all,
+        which is what the lease is for. SIGTERM and SIGHUP do run code, but only if
+        something installs a handler: the default action terminates the process
+        without one. SIGINT is left alone; in a notebook it is how the kernel
+        delivers an interrupt into the user's running cell, and shutting the pool
+        down there would end a session the user meant to keep after dismissing one
+        ``KeyboardInterrupt``.
+
+        ``signal.signal`` only works on the main thread. A launcher built on a
+        worker thread is silently skipped here and relies on ``atexit`` or the
+        lease instead.
+        """
+        if threading.current_thread() is not threading.main_thread():
+            return
+
+        import os
+        import signal
+
+        for attr in ("SIGTERM", "SIGHUP"):
+            number = getattr(signal, attr, None)
+            if number is None:
+                continue
+            previous = signal.getsignal(number)
+
+            def _handle(signum: int, frame: Any, previous: Any = previous) -> None:
+                try:
+                    self.pool.shutdown()
+                except Exception:
+                    pass
+                if callable(previous):
+                    previous(signum, frame)
+                elif previous == signal.SIG_DFL:
+                    signal.signal(signum, signal.SIG_DFL)
+                    os.kill(os.getpid(), signum)
+                # SIG_IGN: nothing further happens, matching the previous disposition.
+
+            signal.signal(number, _handle)
 
     def __repr__(self) -> str:
         return f"<Launcher {self.name} providers={len(self.config.providers)}>"

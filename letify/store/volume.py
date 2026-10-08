@@ -85,6 +85,22 @@ ENV_REF = "env/{key}"
 CHECKPOINT_REF = "ckpt/{name}"
 
 
+def environment_volume(provider: Provider) -> Volume:
+    """The automatic environment store when an ephemeral declaration names no volumes.
+
+    Spec "Materializing into a runtime": reuse the account's data bucket, or keep the
+    archive on the client without requiring a bucket or a volume declaration.
+    """
+    from .backends.filesystem import FilesystemBackend
+    from .pathdata import data_bucket
+
+    backend = data_bucket(provider)
+    if backend is None:
+        root = Path.home() / ".cache" / "letify" / "environments" / provider.kind / provider.alias
+        backend = FilesystemBackend(root)
+    return Volume(provider, "environments", _store=Store(backend))
+
+
 def _session(target: Any) -> Runtime:
     """The live session behind a declaration, or a session given directly.
 
@@ -234,8 +250,9 @@ class Volume:
 
         ``target`` defaults to the volume directory. ``links`` allows symlinks to absolute
         paths in the archive, which an environment archive needs. The runtime pulls the blob
-        from the backend itself when the backend offers a pull and the channel keeps a worker
-        alive to perform it. Otherwise the bytes go through the channel.
+        from the backend itself when the backend offers a pull. A one-shot channel runs a
+        download command instead of keeping a worker alive. Otherwise the bytes go through
+        the channel.
         """
         directory = self.directory(runtime)
         destination = path or f"{directory.rstrip('/')}/blobs/{digest[:2]}/{digest}"
@@ -255,12 +272,11 @@ class Volume:
         self, runtime: Runtime, digest: str, destination: str, unpack: bool, into: str, links: bool
     ) -> RemoteFile:
         """Send one blob to a destination, pulled by the runtime when the backend allows."""
-        if runtime.persistent_channel:
-            source = self.store.backend.pull_source(digest)
-            if source is not None:
-                return runtime.pull(
-                    source, destination, digest=digest, unpack=unpack, target=into, links=links
-                )
+        source = self.store.backend.pull_source(digest)
+        if source is not None:
+            return runtime.pull(
+                source, destination, digest=digest, unpack=unpack, target=into, links=links
+            )
         payload = self.store.get_bytes(digest)
         return runtime.put_bytes(payload, destination, unpack=unpack, target=into, links=links)
 

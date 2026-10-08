@@ -269,7 +269,11 @@ class ReverseSSH(Strategy):
     def attempt(self, target: Target, cancel: threading.Event | None = None) -> Link:
         keys = self.keys or AuthorizedKeys()
         keys.purge(target.alias)
-        directory = Path(tempfile.mkdtemp(prefix="letify-reverse-"))
+        from ..paths import local_tmp_directory
+
+        tmp_dir = local_tmp_directory()
+        tmp_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+        directory = Path(tempfile.mkdtemp(prefix="letify-reverse-", dir=tmp_dir))
         private = directory / "id_session"
         result = subprocess.run(
             [

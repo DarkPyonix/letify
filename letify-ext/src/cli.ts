@@ -16,8 +16,28 @@ export function splitCommand(command: string): string[] {
   return command.trim().split(/\s+/).filter(Boolean);
 }
 
+/** Freeze uv project execution even when a user retains an older command setting. */
+export function safeCommand(command: string): string[] {
+  const parts = splitCommand(command);
+  const executable = parts[0]?.split(/[\\/]/).pop()?.toLowerCase();
+  if (executable !== "uv" && executable !== "uv.exe") return parts;
+  const run = parts.indexOf("run");
+  if (run < 1 || parts.slice(1, run).some((p) => ["tool", "sync", "pip", "add", "remove"].includes(p))) {
+    throw new Error("letify.command must use uv run for read-only polling");
+  }
+  const flags = ["--frozen", "--no-sync"].filter((flag) => !parts.includes(flag));
+  parts.splice(run + 1, 0, ...flags);
+  return parts;
+}
+
 export function runLetify(command: string, subcommand: string, cwd: string | undefined): Promise<unknown> {
-  const [program, ...base] = splitCommand(command);
+  let parts: string[];
+  try {
+    parts = safeCommand(command);
+  } catch (error) {
+    return Promise.reject(error);
+  }
+  const [program, ...base] = parts;
   if (!program) return Promise.reject(new Error("letify.command is empty"));
   const args = [...base, subcommand, "--json"];
   return new Promise((resolve, reject) => {

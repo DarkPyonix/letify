@@ -6,7 +6,6 @@ until the backend that needs it is actually constructed.
 
 from __future__ import annotations
 
-from pathlib import Path
 from typing import Any
 
 from ...errors import ProviderUnavailable
@@ -37,7 +36,9 @@ def build(backend: str, **options: Any) -> Backend:
 def default_location(backend: str, name: str) -> tuple[str, str]:
     """The option a backend needs when the configuration leaves it out."""
     if backend in ("filesystem", "shell"):
-        return "root", str(Path.home() / ".cache" / "letify" / name)
+        from ...paths import storage_cache_directory
+
+        return "root", str(storage_cache_directory(name))
     if backend == "modal":
         return "volume_name", f"letify-{name}"
     return "bucket", name

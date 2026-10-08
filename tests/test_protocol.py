@@ -220,6 +220,74 @@ def test_a_worker_call_whose_body_imports_letify_while_running_names_the_reason(
     assert "letify is not installed" in reply["error"] and "uv add letify" in reply["error"]
 
 
+def test_a_body_that_imports_a_shipped_module_names_the_reason(tmp_path: Path) -> None:
+    # Spec "Module shipping": a module Env.ship() sends by value never lands on the
+    # runtime's sys.path, so an import inside the body, as opposed to a global the
+    # function closes over, finds nothing there even though the call itself loads.
+    package = tmp_path / "shippkg"
+    package.mkdir()
+    (package / "__init__.py").write_text("def helper_value():\n    return 42\n", encoding="utf-8")
+    sys.path.insert(0, str(tmp_path))
+    try:
+        shippkg = import_module("shippkg")
+        cloudpickle.register_pickle_by_value(shippkg)
+
+        def work() -> int:
+            import shippkg
+
+            return shippkg.helper_value()
+
+        stdout = run_script(driver.build(work, (), {}))
+        with pytest.raises(letify.RemoteError, match=r"'shippkg' is not importable.*Env\.ship"):
+            codec.parse(stdout, runtime_key="one-shot")
+    finally:
+        cloudpickle.unregister_pickle_by_value(shippkg)
+        sys.path.remove(str(tmp_path))
+        sys.modules.pop("shippkg", None)
+
+
+def test_a_class_sent_by_value_is_not_the_class_the_runtime_imports(tmp_path: Path) -> None:
+    # Spec "Module shipping": by-value shipping reconstructs a class instead of looking
+    # it up by import, so it is a distinct object from the same-named class the runtime
+    # imports by reference. This pins the documented limit, not a fix: issubclass across
+    # the two fails on purpose, and the workaround is to stop shipping the module by
+    # value and install it in the runtime instead.
+    sender_dir = tmp_path / "sender"
+    sender_dir.mkdir()
+    (sender_dir / "shipcls.py").write_text(
+        "class Base:\n    pass\n\n\nclass Derived(Base):\n    pass\n", encoding="utf-8"
+    )
+    remote_dir = tmp_path / "remote"
+    remote_dir.mkdir()
+    (remote_dir / "shipcls.py").write_text("class Base:\n    pass\n", encoding="utf-8")
+
+    sys.path.insert(0, str(sender_dir))
+    try:
+        shipcls = import_module("shipcls")
+        cloudpickle.register_pickle_by_value(shipcls)
+
+        def work(derived: type) -> bool:
+            import shipcls
+
+            return issubclass(derived, shipcls.Base)
+
+        env = {**os.environ, "PYTHONPATH": str(remote_dir)}
+        stdout = subprocess.run(
+            [sys.executable, "-c", driver.build(work, (shipcls.Derived,), {})],
+            capture_output=True,
+            text=True,
+            timeout=120,
+            env=env,
+            cwd=remote_dir,
+        ).stdout
+        _logs, value = codec.parse(stdout, runtime_key="one-shot")
+        assert value is False
+    finally:
+        cloudpickle.unregister_pickle_by_value(shipcls)
+        sys.path.remove(str(sender_dir))
+        sys.modules.pop("shipcls", None)
+
+
 def test_a_reference_names_what_it_points_at() -> None:
     assert repr(Blob("0123456789abcdef", 2048)) == "<Blob 01234567 2048 bytes>"
     assert repr(RemoteFile("/opt/letify/x.bin", "abc", 10)) == (
@@ -238,6 +306,55 @@ def test_the_worker_recognizes_a_blob_by_marker() -> None:
 def test_the_inline_limit_is_sixty_four_kilobytes() -> None:
     # Above this an argument is content addressed instead of travelling with the call.
     assert codec.INLINE_LIMIT == 64 * 1024
+
+
+def test_a_blob_argument_defined_in_the_run_script_ships_by_value(tmp_path: Path) -> None:
+    # Spec "Argument addressing": a large argument travels as a blob, pickled with its
+    # out-of-band buffers kept apart. The class here is defined in the run script's own
+    # __main__, exactly as reported: a class instance built in __main__ and passed as an
+    # argument too large to inline. The Local provider's worker is a separate process with
+    # its own __main__, which does not define this class, so a plain pickle that writes a
+    # class by name reference, __main__.LocalMainClass, fails to load there. The inline
+    # limit is lowered through an environment variable the script reads, so an ordinary
+    # sized argument takes the blob path without needing megabytes of real data.
+    project = tmp_path / "empty-project" / ".letify"
+    project.mkdir(parents=True)
+    script = tmp_path / "run_from_main.py"
+    script.write_text(
+        "import os\n"
+        "import letify\n"
+        "from letify import protocol\n"
+        "\n"
+        "protocol.INLINE_LIMIT = 64\n"
+        "\n"
+        "\n"
+        "class LocalMainClass:\n"
+        "    def __init__(self, payload):\n"
+        "        self.payload = payload\n"
+        "\n"
+        "\n"
+        f"let = letify.Launcher({str(project)!r}, home=False, announce=False)\n"
+        "\n"
+        "\n"
+        "@let.function(device=let.providers.local.CPU, host='remote')\n"
+        "def read_payload(obj):\n"
+        "    return obj.payload\n"
+        "\n"
+        "\n"
+        "argument = LocalMainClass(os.urandom(200))\n"
+        "result = read_payload(argument)\n"
+        "assert result == argument.payload\n"
+        "print('OK')\n"
+    )
+    completed = subprocess.run(
+        [sys.executable, str(script)],
+        capture_output=True,
+        text=True,
+        timeout=120,
+        cwd=tmp_path,
+    )
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+    assert "OK" in completed.stdout
 
 
 # -- Spec: Channels, frames ---------------------------------------------------
