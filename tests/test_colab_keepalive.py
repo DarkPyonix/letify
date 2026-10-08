@@ -77,3 +77,25 @@ def test_the_detached_daemon_records_startup_before_acknowledging(tmp_path):
         process.terminate()
         process.communicate(timeout=5)
     assert process.returncode == 0
+
+
+def test_every_wake_records_history_and_logs_duration_with_timestamp(tmp_path, patch_run, capsys):
+    from letify.providers import colab_keepalive as daemon
+
+    patch_run(daemon, result=FakeCompleted())
+    config = {"command": ["colab"], "session": "live", "directory": str(tmp_path)}
+    assert daemon.wake(config) == 60.0
+    history_file = tmp_path / "history" / "live.jsonl"
+    assert history_file.is_file()
+    lines = [json.loads(line) for line in history_file.read_text().splitlines()]
+    wake_event = lines[-1]
+    assert wake_event["event_type"] == "wake"
+    assert "colab exec -s live" in wake_event["command"]
+    assert wake_event["returncode"] == 0
+    assert "duration_s" in wake_event and isinstance(wake_event["duration_s"], float)
+    assert "timestamp" in wake_event
+    log = capsys.readouterr().err
+    assert "colab exec -s live" in log
+    assert "duration=" in log
+    assert "exit=0" in log
+

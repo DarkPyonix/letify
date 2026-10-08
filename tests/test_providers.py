@@ -2686,3 +2686,55 @@ def test_a_daemon_that_exits_before_ready_fails_creation_and_cleans_up(
         provider.create_session(provider.cpu, "live")
     assert children[0].terminated
     assert recorder.command == [*COLAB_CLI, "stop", "-s", "live"]
+
+
+def test_colab_diagnose_identifies_provider_reclamation_when_session_is_missing(
+    isolated_home, patch_which, patch_run
+) -> None:
+    # Spec "Colab", Keep-alive supervision: provider reclamation is diagnosed explicitly.
+    patch_which(tools_module, present=True)
+    provider = provider_of(Colab)
+    runtime = type("R", (), {"name": "reclaimed-session"})()
+    failure = letify.RuntimeLost("reclaimed-session: the worker pipe is closed")
+    patch_run(
+        colab_module,
+        result=FakeCompleted(stdout="[other-session] id | Hardware: CPU | Variant: DEFAULT\n"),
+    )
+    diagnosed = provider.diagnose(runtime, failure)
+    from letify.providers.colab import ColabSessionReclaimed
+
+    assert isinstance(diagnosed, ColabSessionReclaimed)
+    assert "the provider reclaimed the runtime rather than letify ending it" in str(diagnosed)
+
+
+def test_colab_diagnose_identifies_provider_reclamation_from_cli_stderr(
+    isolated_home, patch_which, patch_run
+) -> None:
+    # Spec "Colab", Keep-alive supervision: CLI output indicating lost session names reclamation.
+    patch_which(tools_module, present=True)
+    provider = provider_of(Colab)
+    runtime = type("R", (), {"name": "lost-session"})()
+    stderr = "[colab] Session 'lost-session' appears to be lost (404/401). Cleaning up."
+    failure = letify.RuntimeFailure("exec failed", stderr=stderr)
+    diagnosed = provider.diagnose(runtime, failure)
+    from letify.providers.colab import ColabSessionReclaimed
+
+    assert isinstance(diagnosed, ColabSessionReclaimed)
+    assert "the provider reclaimed the runtime rather than letify ending it" in str(diagnosed)
+
+
+def test_colab_diagnose_leaves_other_failures_unchanged_when_session_remains(
+    isolated_home, patch_which, patch_run
+) -> None:
+    # Spec "Colab", Keep-alive supervision: failures on existing sessions are returned unchanged.
+    patch_which(tools_module, present=True)
+    provider = provider_of(Colab)
+    runtime = type("R", (), {"name": "active-session"})()
+    failure = letify.RuntimeLost("active-session: transient error")
+    patch_run(
+        colab_module,
+        result=FakeCompleted(stdout="[active-session] id | Hardware: CPU | Variant: DEFAULT\n"),
+    )
+    diagnosed = provider.diagnose(runtime, failure)
+    assert diagnosed is failure
+

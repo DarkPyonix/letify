@@ -2110,6 +2110,8 @@ def test_runtime_disposal_names_its_reason_and_the_registered_key(let, remote_cp
     output = capsys.readouterr().err
     assert f"discarding {runtime.name}" in output
     assert "reason=call_complete" in output and f"key={key}" in output
+    assert "timestamp=" in output
+
 
 
 def test_a_runtime_keeps_its_registered_key_when_project_files_change(let, remote_cpu, tmp_path):
