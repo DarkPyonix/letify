@@ -699,13 +699,16 @@ def test_a_persistent_provider_syncs_with_the_uv_cache_under_the_workspace_root(
         runtime.shutdown()
 
 
-def test_an_ephemeral_provider_keeps_the_default_uv_cache(uv_project: Path) -> None:
-    # Spec "uv cache": an ephemeral runtime's disk goes with it, so nothing is moved.
+def test_an_ephemeral_provider_still_redirects_the_uv_cache_to_the_workspace(
+    uv_project: Path,
+) -> None:
+    # Spec "Remote paths letify writes": the workspace root may be the only writable
+    # path even on an ephemeral provider, so the redirect applies there too.
     provider = provider_of(PreparingLocal, "lab", persistent=False)
     runtime = provider.start(remote_instance(provider), Env(), name="lab-1")
     try:
         assert runtime.env_source == "sync"
-        assert not (Path(bootstrap.DEFAULT_WORKSPACE_ROOT) / "uv-cache").exists()
+        assert (Path(bootstrap.DEFAULT_WORKSPACE_ROOT) / "uv-cache").exists()
     finally:
         runtime.shutdown()
 
@@ -986,6 +989,42 @@ def test_the_sync_source_carries_the_declared_refinements(uv_project: Path) -> N
     assert "'torch'" in source
     assert "'nvidia-smi'" in source
     assert "'HF_HOME': '/opt/cache'" in source
+
+
+def test_the_sync_source_never_names_a_path_outside_the_workspace_root(
+    uv_project: Path,
+) -> None:
+    # Spec "Remote paths letify writes": the only remote paths a sync introduces derive
+    # from the workspace root, so neither uv's default cache nor its default bin dir,
+    # both under plain $HOME, may appear in the source sent to the runtime.
+    env = Env()
+    source = bootstrap.sync_source(env, bootstrap.project_files(env), workspace="/workspace")
+    assert "~/.local" not in source
+    assert "~/.cache" not in source
+    assert "/workspace/uv-cache" in source
+    assert "/workspace/uv-python" in source
+    assert "/workspace/uv-tool" in source
+    assert "/workspace/uv-bin" in source
+
+
+def test_uv_env_points_every_uv_directory_under_the_workspace_root() -> None:
+    assert bootstrap.uv_env("/workspace") == {
+        "UV_CACHE_DIR": "/workspace/uv-cache",
+        "UV_PYTHON_INSTALL_DIR": "/workspace/uv-python",
+        "UV_TOOL_DIR": "/workspace/uv-tool",
+    }
+    assert bootstrap.uv_bin_dir("/workspace") == "/workspace/uv-bin"
+
+
+def test_declared_variables_still_win_over_the_workspace_uv_redirect(
+    uv_project: Path,
+) -> None:
+    # Spec "Remote paths letify writes": an explicit Env.vars entry is the user's own
+    # choice and is not overridden by the workspace redirect.
+    env = Env().vars(UV_CACHE_DIR="/elsewhere/cache")
+    source = bootstrap.sync_source(env, bootstrap.project_files(env), workspace="/workspace")
+    assert "/workspace/uv-cache" not in source
+    assert "'UV_CACHE_DIR': '/elsewhere/cache'" in source
     assert "'--system'" not in source
 
 
@@ -1140,7 +1179,7 @@ def test_a_runtime_with_neither_curl_nor_wget_fails_early_naming_them(tmp_path: 
     assert "curl or wget" in result.stderr
 
 
-def test_a_runtime_without_uv_installs_it_under_home_and_then_syncs(
+def test_a_runtime_without_uv_installs_it_under_the_workspace_root_and_then_syncs(
     uv_project: Path, tmp_path: Path
 ) -> None:
     home = tmp_path / "home"
@@ -1164,7 +1203,12 @@ def test_a_runtime_without_uv_installs_it_under_home_and_then_syncs(
     )
     result = run_without_uv(source, home)
     assert result.returncode == 0, result.stderr
-    assert (home / ".local" / "bin" / "uv").is_file()
+    # Spec "Remote paths letify writes": the installer is told to write under the
+    # workspace root, not its own default of ~/.local/bin. uv_project patches
+    # bootstrap.DEFAULT_WORKSPACE_ROOT to an absolute path for this test module, so the
+    # install lands there rather than under HOME.
+    assert (Path(bootstrap.DEFAULT_WORKSPACE_ROOT) / "uv-bin" / "uv").is_file()
+    assert not (home / ".local" / "bin" / "uv").exists()
     assert record.read_text(encoding="utf-8").split() == [
         "sync",
         "--frozen",
@@ -1921,7 +1965,7 @@ def test_a_worker_of_this_client_marks_its_card_as_the_login_users() -> None:
 # -- environment on the sandbox disk: spec "Environment on the sandbox disk" --------------
 
 
-def test_a_provider_with_an_env_root_builds_the_venv_there_with_the_default_uv_cache(
+def test_a_provider_with_an_env_root_builds_the_venv_there_but_the_uv_cache_in_the_workspace(
     uv_project: Path, tmp_path: Path
 ) -> None:
     disk = tmp_path / "sandbox-disk"
@@ -1937,7 +1981,9 @@ def test_a_provider_with_an_env_root_builds_the_venv_there_with_the_default_uv_c
         assert Path(imported).is_relative_to(venv)
         assert runtime.env_source == "sync"
         assert not (remote_projects() / env.key).exists()
-        assert not (Path(bootstrap.DEFAULT_WORKSPACE_ROOT) / "uv-cache").exists()
+        # Spec "Remote paths letify writes": an env root moves the .venv off the
+        # workspace root, but uv's own cache stays under the workspace root.
+        assert (Path(bootstrap.DEFAULT_WORKSPACE_ROOT) / "uv-cache").exists()
     finally:
         runtime.shutdown()
 

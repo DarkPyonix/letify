@@ -1140,7 +1140,7 @@ A failed sync raises `EnvironmentFailure` saying `uv sync failed on <runtime>`, 
 A provider's `env_root` names where the project directory lives instead of the workspace root. It is None for every kind except `modal`, whose `env_root` is `/root/.letify-env`. When `env_root` is set:
 
 1. The project directory is `<env_root>/project/<env key>`.
-2. The sync sets no `UV_CACHE_DIR`, so uv uses its default cache under `~/.cache/uv` on the same disk and hard links from it.
+2. The sync still points `UV_CACHE_DIR` at `<workspace root>/uv-cache`, as uv cache describes, because that rule applies regardless of `env_root`. uv falls back to a full copy instead of a hard link when the cache and the `.venv` are on different disks, which is the case here.
 3. No environment archive is packed or restored, as on any persistent provider.
 
 The sandbox disk is discarded with the sandbox, so every Modal session syncs from the package index. Everything else under the workspace root, volumes, argument blobs and temporary files, stays on the volume.
@@ -1155,19 +1155,19 @@ Two declarations cannot diverge from the local process. Before any session start
 
 ### uv on the runtime <!-- id: uv-on-runtime -->
 
-> The runtime uses the uv it has, and installs uv under the home directory when it has none.
+> The runtime uses the uv it has, and installs uv under the workspace root when it has none.
 
-The worker looks for `uv` on `PATH`, then at `~/.local/bin/uv`. When neither exists it downloads `https://astral.sh/uv/install.sh` over HTTPS with the bootstrap interpreter's `urllib`, sending `User-Agent: letify/<version>` because astral.sh answers Python's default `Python-urllib` agent with 403, and runs it with `sh`, with `UV_INSTALL_DIR=~/.local/bin` and `UV_NO_MODIFY_PATH=1`. That is the same as `curl -LsSf https://astral.sh/uv/install.sh | env UV_INSTALL_DIR="$HOME/.local/bin" UV_NO_MODIFY_PATH=1 sh`, and letify fetches the script itself so it does not need `curl` to reach astral.sh. The installer script does need one, though: it downloads the uv binary with `curl` or `wget`. So before running it, the worker checks that one of the two is on `PATH`, and when neither is it raises `uv cannot be installed on <runtime>: its installer needs curl or wget on PATH, and neither is present` rather than letting the installer fail with an unclear message. It needs no root, because it writes only under the home directory. A failed download or a non-zero exit raises `EnvironmentFailure` saying `uv could not be installed on <runtime>` with the reason.
+The worker looks for `uv` on `PATH`, then at `<workspace root>/uv-bin/uv`. When neither exists it downloads `https://astral.sh/uv/install.sh` over HTTPS with the bootstrap interpreter's `urllib`, sending `User-Agent: letify/<version>` because astral.sh answers Python's default `Python-urllib` agent with 403, and runs it with `sh`, with `UV_INSTALL_DIR=<workspace root>/uv-bin` and `UV_NO_MODIFY_PATH=1`. That is the same as `curl -LsSf https://astral.sh/uv/install.sh | env UV_INSTALL_DIR="<workspace root>/uv-bin" UV_NO_MODIFY_PATH=1 sh`, and letify fetches the script itself so it does not need `curl` to reach astral.sh. The installer script does need one, though: it downloads the uv binary with `curl` or `wget`. So before running it, the worker checks that one of the two is on `PATH`, and when neither is it raises `uv cannot be installed on <runtime>: its installer needs curl or wget on PATH, and neither is present` rather than letting the installer fail with an unclear message. It writes only under the workspace root, so it needs no root and nothing outside the one directory an account may be restricted to. A failed download or a non-zero exit raises `EnvironmentFailure` saying `uv could not be installed on <runtime>` with the reason.
 
 ### uv cache <!-- id: uv-cache -->
 
-> On a persistent provider the runtime's uv cache is `<workspace root>/uv-cache`, on the same filesystem as every project `.venv`, so a new env key is built from hard links. An ephemeral provider keeps uv's default cache.
+> The runtime's uv cache, its managed Pythons and its tool installs all sit under the workspace root, `<workspace root>/uv-cache`, `<workspace root>/uv-python` and `<workspace root>/uv-tool`, on every provider, persistent or ephemeral.
 
-uv installs a package into a `.venv` by hard linking it from its cache, and falls back to a full copy when the cache is on another filesystem. A container's home directory is often an overlay while the workspace root is a mounted disk, so the default cache under `~/.cache/uv` makes every new env key copy the whole environment.
+uv installs a package into a `.venv` by hard linking it from its cache, and falls back to a full copy when the cache is on another filesystem. A container's home directory is often an overlay while the workspace root is a mounted disk, so the default cache under `~/.cache/uv` makes every new env key copy the whole environment on a persistent provider. uv's defaults for its managed Python interpreters, `~/.local/share/uv/python`, and for `uv tool run`, `~/.local/share/uv/tools`, sit under the home directory the same way, and some accounts can write nothing there at all: a workspace root such as `/workspace` on a department GPU server is the one path they may write to, so letify's own uv calls have to stay inside it whether or not the machine survives the session.
 
-The sync step sets `UV_CACHE_DIR=<workspace root>/uv-cache` for `uv sync` and `uv pip install` when the provider's `persistence` is `persistent` and it sets no `env_root`. On a runtime with a persistent workspace root the cache then outlives a container rebuild along with the projects built from it. An `Env.vars` entry naming `UV_CACHE_DIR` wins over this rule.
+The sync step sets `UV_CACHE_DIR`, `UV_PYTHON_INSTALL_DIR` and `UV_TOOL_DIR` under `<workspace root>` for `uv sync` and `uv pip install`, unconditionally: not only when the provider's `persistence` is `persistent`, and not only when it sets no `env_root`. An `Env.vars` entry naming one of the three wins over this rule for that variable.
 
-An ephemeral provider sets nothing. Its disk is discarded with the runtime, so a cache there is filled once per runtime wherever it lives, and moving it only matters when the home directory and the project are on different filesystems.
+On a runtime with a persistent workspace root the cache outlives a container rebuild along with the projects built from it. On an ephemeral provider the cache is filled once per runtime wherever it lives and discarded with it, but it is still written under the workspace root rather than the home directory, because the workspace root may be the only writable path.
 
 letify never deletes from the cache. The first sync on a runtime fills `<workspace root>/uv-cache` once, and a cache uv already had elsewhere is left in place. `uv cache prune` run with the same `UV_CACHE_DIR` removes entries no lock file needs any more; a file still hard linked from a `.venv` keeps its disk blocks until that `.venv` is removed as well.
 
@@ -1443,13 +1443,21 @@ Everything letify writes on the runtime is under the root:
 |---|---|
 | `<workspace root>/project/<env key>` | the project files `uv sync` reads, and the `.venv` it builds, except on `modal`, as Environment on the sandbox disk describes |
 | `<workspace root>/project/.<digest>.tar.gz` | an environment archive while it is unpacked, removed once the `.venv` starts |
-| `<workspace root>/uv-cache` | uv's cache on a persistent provider, as uv cache describes |
+| `<workspace root>/uv-cache` | uv's package cache, on every provider, as uv cache describes |
+| `<workspace root>/uv-python` | the Python interpreters uv downloads to match `Env.python`, as uv cache describes |
+| `<workspace root>/uv-tool` | tool environments `uv tool run` builds, as uv cache describes |
+| `<workspace root>/uv-bin` | the `uv` binary itself, installed here when none is already on `PATH`, as uv on the runtime describes |
 | `<workspace root>/volumes/<volume name>` | a volume's materialized blobs and project data |
 | `<workspace root>/blobs` | argument blobs on a persistent provider, as Argument blobs on a persistent disk describes |
 | `<workspace root>/data` | the file blob cache and the per-call data directories of Project data |
 | `<workspace root>/tmp` | temporary files, including the archive `pack_dir` builds on a one-shot channel; `TMPDIR` points here |
 
-The worker's working directory is the root, so a relative path in user code resolves under it. The uv installer is the one exception to the root: uv goes to `~/.local/bin`, as uv on the runtime describes, because it is shared by every account on that home directory.
+The worker's working directory is the root, so a relative path in user code resolves under it. letify writes nothing else on the runtime outside the workspace root, with two documented exceptions, both needed before a workspace root is known or reachable:
+
+1. **`~/.ssh/authorized_keys`**, appended to accept a reverse SSH connection: once by a Colab rendezvous installing the account's long-lived public key, as Transport describes, and once per session by a `reverse_ssh` account installing a session key removed again when the link closes. Either has to land where the remote machine's own `sshd` reads it, which is fixed by `sshd` itself, not by letify.
+2. **`/run/sshd`**, created so a freshly installed `sshd` has somewhere to keep its privilege separation directory, on a machine the connection pipeline finds with no SSH server already answering. `sshd` refuses to start without it, and the path is fixed by `sshd`, not by letify.
+
+Neither is configurable today; an account that cannot accept either exception reaches its runtime some other way, such as a pre-installed `sshd` or a Tailcat link, which needs neither.
 
 ### Generated provider types
 

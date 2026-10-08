@@ -598,11 +598,11 @@ class Runtime:
 
         if self.env_source != "archive":
             workspace = self.workspace or self.provider.workspace_root
-            # Spec "Environment on the sandbox disk": an env root keeps uv's default cache.
-            persistent_cache = self.provider.persistent and env_root is None
-            cache = bootstrap.uv_cache_dir(workspace) if persistent_cache else None
+            # Spec "Remote paths letify writes": uv's cache, its managed Pythons, its tool
+            # installs and its own binary stay under the workspace root regardless of an
+            # env root or whether the provider is persistent or ephemeral.
             source = bootstrap.sync_source(
-                self.env, files, root=root, name=self.name, cache_dir=cache
+                self.env, files, root=root, name=self.name, workspace=workspace
             )
             try:
                 self.eval(source, timeout=3600)
