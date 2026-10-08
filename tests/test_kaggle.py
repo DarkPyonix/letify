@@ -295,6 +295,16 @@ def kaggle_provider():
     return provider_of(Kaggle, "kaggle_a")
 
 
+@pytest.mark.parametrize("name, devices", [("T4", 2), ("P100", 1)])
+def test_a_kaggle_gpu_instance_declares_its_card_count(name, devices) -> None:
+    """Spec "Kaggle": the stable GPU names carry their session's card count."""
+    instance = getattr(kaggle_provider(), name)
+    assert instance.gpu == name
+    assert instance.tpu is None
+    assert instance.devices == devices
+    assert instance.vram_gb == 16
+
+
 def test_a_kaggle_account_is_a_known_provider_kind() -> None:
     from letify.providers import KINDS, Kaggle
 
@@ -540,6 +550,35 @@ def session_channel(fake_kaggle, name: str = "letify-t4-1"):
     provider = kaggle_provider()
     runtime = type("R", (), {"name": name})()
     return provider, runtime, provider.open_channel(runtime)
+
+
+@pytest.mark.parametrize("name, accelerator", [
+    ("TPU_V3_8", "TPU_V3_8"),
+    ("T4", "NVIDIA_TESLA_T4"),
+    ("P100", "NVIDIA_TESLA_P100"),
+    ("CPU", None),
+])
+def test_a_kaggle_instance_requests_its_declared_accelerator(
+    fake_kaggle, fake_kaggle_cli, name, accelerator
+) -> None:
+    """Spec "Kaggle": CommitAndRun requests the declared GPU, TPU or CPU session."""
+    provider = kaggle_provider()
+    instance = getattr(provider, name)._placed("remote")
+    if name == "TPU_V3_8":
+        assert instance.tpu == name
+        assert instance.gpu is None
+    runtime = type("R", (), {"name": f"letify-{name}-1", "instance": instance})()
+    try:
+        provider.open_channel(runtime)
+        runs = [body for path, body in fake_kaggle.cloud_calls if path.endswith("CommitAndRun")]
+        assert len(runs) == 1
+        compute = runs[0]["compute"]
+        if accelerator is None:
+            assert "accelerator" not in compute
+        else:
+            assert compute["accelerator"] == accelerator
+    finally:
+        provider.stop(runtime)
 
 
 def test_a_fresh_notebook_is_created_for_every_run_not_reused(fake_kaggle) -> None:
