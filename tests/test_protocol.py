@@ -15,6 +15,7 @@ import sys
 from contextlib import contextmanager
 from importlib import import_module
 from pathlib import Path
+from typing import Any
 
 import cloudpickle
 import pytest
@@ -238,6 +239,55 @@ def test_the_worker_recognizes_a_blob_by_marker() -> None:
 def test_the_inline_limit_is_sixty_four_kilobytes() -> None:
     # Above this an argument is content addressed instead of travelling with the call.
     assert codec.INLINE_LIMIT == 64 * 1024
+
+
+def test_a_blob_argument_defined_in_the_run_script_ships_by_value(tmp_path: Path) -> None:
+    # Spec "Argument addressing": a large argument travels as a blob, pickled with its
+    # out-of-band buffers kept apart. The class here is defined in the run script's own
+    # __main__, exactly as reported: a class instance built in __main__ and passed as an
+    # argument too large to inline. The Local provider's worker is a separate process with
+    # its own __main__, which does not define this class, so a plain pickle that writes a
+    # class by name reference, __main__.LocalMainClass, fails to load there. The inline
+    # limit is lowered through an environment variable the script reads, so an ordinary
+    # sized argument takes the blob path without needing megabytes of real data.
+    project = tmp_path / "empty-project" / ".letify"
+    project.mkdir(parents=True)
+    script = tmp_path / "run_from_main.py"
+    script.write_text(
+        "import os\n"
+        "import letify\n"
+        "from letify import protocol\n"
+        "\n"
+        "protocol.INLINE_LIMIT = 64\n"
+        "\n"
+        "\n"
+        "class LocalMainClass:\n"
+        "    def __init__(self, payload):\n"
+        "        self.payload = payload\n"
+        "\n"
+        "\n"
+        "let = letify.Launcher(%r, home=False, announce=False)\n"
+        "\n"
+        "\n"
+        "@let.function(device=let.providers.local.CPU, host='remote')\n"
+        "def read_payload(obj):\n"
+        "    return obj.payload\n"
+        "\n"
+        "\n"
+        "argument = LocalMainClass(os.urandom(200))\n"
+        "result = read_payload(argument)\n"
+        "assert result == argument.payload\n"
+        "print('OK')\n" % str(project)
+    )
+    completed = subprocess.run(
+        [sys.executable, str(script)],
+        capture_output=True,
+        text=True,
+        timeout=120,
+        cwd=tmp_path,
+    )
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+    assert "OK" in completed.stdout
 
 
 # -- Spec: Channels, frames ---------------------------------------------------
