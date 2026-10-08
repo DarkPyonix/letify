@@ -1461,6 +1461,8 @@ class FakeKaggleCloud:
         self.kernels: set[str] = set()
         self.cloud_calls: list[tuple[str, dict[str, Any]]] = []
         self.cancelled: list[int] = []
+        #: Notebook ids deleted through the cookie's ``DeleteKernel`` call.
+        self.deleted: list[int] = []
         self.ended = False
         #: Endpoint name to (HTTP status, message) for internal calls the fake refuses.
         self.refuse: dict[str, tuple[int, str]] = {}
@@ -1549,6 +1551,9 @@ class FakeKaggleCloud:
             return _Reply({"sessionId": f"webtier-{self.RUN_ID}"})
         if path.endswith("CancelKernelSession"):
             self.cancelled.append(int(body.get("kernelSessionId")))
+            return _Reply({})
+        if path.endswith("DeleteKernel"):
+            self.deleted.append(int(body.get("kernelId")))
             return _Reply({})
         if path.endswith("GetAcceleratorQuotaStatistics"):
             return _Reply(
@@ -1649,3 +1654,48 @@ def fake_kaggle(isolated_home, monkeypatch, tmp_path: Path):
     monkeypatch.setenv("FAKE_KAGGLE_LOG", str(cloud.log))
     yield cloud
     cloud.close()
+
+
+class FakeKaggleCLI:
+    """Stands in for the official ``kaggle`` CLI, by replacing ``subprocess.run`` in the
+    Kaggle provider module.
+
+    Records every command it was asked to run. ``kernels delete`` and ``quota`` are the two
+    commands the provider uses; both answer success unless ``fail`` names the subcommand.
+    """
+
+    def __init__(self):
+        self.calls: list[list[str]] = []
+        self.fail: set[str] = set()
+
+    def run(self, command: list[str], **kwargs: Any) -> FakeCompleted:
+        self.calls.append(list(command))
+        name = command[-1] if "delete" not in command else "kernels delete"
+        for marker in self.fail:
+            if marker in command:
+                return FakeCompleted(returncode=1, stdout="", stderr="refused")
+        return FakeCompleted(returncode=0, stdout="{}", stderr="")
+
+
+@pytest.fixture
+def fake_kaggle_cli(monkeypatch):
+    """Intercept every call the Kaggle provider makes to the official CLI."""
+    from letify.providers import kaggle as kaggle_module
+
+    cli = FakeKaggleCLI()
+    monkeypatch.setattr(kaggle_module.tools, "find_uv", lambda: "uv")
+    import subprocess as subprocess_module
+
+    monkeypatch.setattr(subprocess_module, "run", cli.run)
+    return cli
+
+
+@pytest.fixture
+def kaggle_api_token(isolated_home):
+    """Write a Kaggle API token for alias ``kaggle_a``, as ``letify login kaggle`` would."""
+    from letify import tools
+
+    path = tools.kaggle_config_path("kaggle_a")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({"username": "irack000", "key": "fake-api-key"}), encoding="utf-8")
+    return path
