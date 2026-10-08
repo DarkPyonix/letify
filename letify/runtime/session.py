@@ -143,6 +143,15 @@ class Runtime:
             # Not retried, so nothing else would end this session.
             self.shutdown(reason="interpreter_mismatch")
             raise
+        if self.env_source == "sync" and not self.provider.persistent:
+            from . import bootstrap
+
+            root = bootstrap.project_dir(
+                self.provider.env_root or self.workspace or self.provider.workspace_root, self.env
+            )
+            self._environment_volumes()[0].cache_env_from(
+                self, self.env, root, platform=self.platform
+            )
         self.keep_blobs_on_disk()
         for volume in self.volumes:
             self.attach(volume)
@@ -509,18 +518,26 @@ class Runtime:
         ``source`` is what ``Backend.pull_source`` answered: a URL and headers carrying a
         short-lived token. The worker drops both once the download finishes.
         """
-        value = self.request(
-            {
-                "op": "pull",
-                "url": source["url"],
-                "headers": dict(source.get("headers") or {}),
-                "path": path,
-                "unpack": unpack,
-                "target": target,
-                "links": links,
-            },
-            timeout=3600,
-        )
+        if not self.persistent_channel:
+            from . import bootstrap
+
+            value = self.eval(
+                bootstrap.pull_source(source, path, unpack=unpack, target=target, links=links),
+                timeout=3600,
+            )
+        else:
+            value = self.request(
+                {
+                    "op": "pull",
+                    "url": source["url"],
+                    "headers": dict(source.get("headers") or {}),
+                    "path": path,
+                    "unpack": unpack,
+                    "target": target,
+                    "links": links,
+                },
+                timeout=3600,
+            )
         return protocol.RemoteFile(path=value["path"], digest=digest, size=value["size"])
 
     def put_file(self, local: str | Path, path: str, **kwargs: Any) -> protocol.RemoteFile:
@@ -571,6 +588,16 @@ class Runtime:
 
         self.workspace = self.eval(bootstrap.workspace_source(root), timeout=120)
 
+    def _environment_volumes(self) -> tuple[Volume, ...]:
+        """Explicit archive volumes, or the automatic cache for an ephemeral provider."""
+        if self.provider.persistent:
+            return ()
+        if self.volumes:
+            return self.volumes
+        from ..store.volume import environment_volume
+
+        return (environment_volume(self.provider),)
+
     def install_env(self) -> None:
         """Build the project's environment in the session and move the worker onto it.
 
@@ -594,7 +621,7 @@ class Runtime:
 
         # Spec "Volumes on a persistent runtime": the .venv is already on the runtime's
         # disk, so an archive is neither restored nor packed there.
-        archives = () if self.provider.persistent else self.volumes
+        archives = self._environment_volumes()
         for volume in archives:
             digest = volume.cached_env(self.env, self.platform)
             if not digest:
@@ -613,7 +640,8 @@ class Runtime:
             # installs and its own binary stay under the workspace root regardless of an
             # env root or whether the provider is persistent or ephemeral.
             source = bootstrap.sync_source(
-                self.env, files, root=root, name=self.name, workspace=workspace
+                self.env, files, root=root, name=self.name, workspace=workspace,
+                archive=bool(archives),
             )
             try:
                 self.eval(source, timeout=3600)
@@ -623,8 +651,6 @@ class Runtime:
                     message.removeprefix("RuntimeError: "), stderr=exc.remote_traceback
                 ) from exc
             self.env_source = "sync"
-            if archives:
-                archives[0].cache_env_from(self, self.env, where["root"], platform=self.platform)
         self.python = where["python"]
         self.channel.switch_interpreter(where["python"])
 
