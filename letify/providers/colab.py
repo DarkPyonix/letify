@@ -281,7 +281,27 @@ class Colab(Shell):
         from .colab_keepalive import account_lock
 
         with account_lock(account_directory(self.alias) / ".config" / "colab-cli"):
-            return self._cli("exec", "-s", session, stdin=source, timeout=timeout)
+            try:
+                return self._cli("exec", "-s", session, stdin=source, timeout=timeout)
+            except subprocess.TimeoutExpired as exc:
+                stderr = exc.stderr or ""
+                if isinstance(stderr, bytes):
+                    stderr = stderr.decode(errors="replace")
+                raise RuntimeFailure(
+                    f"{session}: colab exec timed out after {timeout} s; "
+                    "the notebook kernel may be busy or not answering",
+                    command=" ".join([*self._colab(), "exec", "-s", session]),
+                    stderr=stderr,
+                ) from exc
+            except RuntimeFailure as exc:
+                if "Timeout waiting for reply" not in exc.stderr:
+                    raise
+                raise RuntimeFailure(
+                    f"{session}: colab exec did not receive a reply; "
+                    "the notebook kernel may be busy or not answering",
+                    command=exc.command,
+                    stderr=exc.stderr,
+                ) from exc
 
     def sessions(self) -> list[str]:
         """Names of the sessions this account currently holds."""
@@ -507,5 +527,3 @@ __all__ = [
     "Colab",
     "ColabSessionReclaimed",
 ]
-
-

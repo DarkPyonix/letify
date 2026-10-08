@@ -32,12 +32,11 @@ CACHE_RATIO = 0.5
 CACHE_TTL_SECONDS = 3600.0
 
 MIB = 1024 * 1024
-#: The default floor: a link under 5 MiB/s in either direction, or over 300 ms round trip,
+#: The default floor: a link under 10 MiB/s in either direction, or over 300 ms round trip,
 #: is a failure rather than a connection. See docs/INTENT.md, "A slow link is a failure,
-#: not a fallback", and docs/NETWORK.md, "Connection pipeline measurements", for the
-#: measured gap this is set against: a direct LAN or campus link runs 50 to 100 MiB/s at
-#: under 1 ms, a relayed Tailcat path has been measured at 1 to 2 MiB/s at 69 to 99 ms.
-DEFAULT_MIN_MIB_PER_S = 5.0
+#: not a fallback". Accounts can override the shared policy; providers cannot choose
+#: a lower default.
+DEFAULT_MIN_MIB_PER_S = 10.0
 DEFAULT_MAX_RTT_MS = 300.0
 
 
@@ -66,6 +65,8 @@ class LinkFloor:
             found.append(
                 f"round trip {result.rtt_ms:.1f} ms above the floor {self.max_rtt_ms:.0f} ms"
             )
+        if found:
+            found.append("account overrides: min_mib_per_s and max_rtt_ms")
         return found
 
 
@@ -270,7 +271,7 @@ class Pipeline:
 
         network = self.fingerprint() if self.cache is not None else None
         if self.cache is not None and network is not None:
-            kept = self._from_cache(applicable, network)
+            kept = self._from_cache(applicable, network, reasons)
             if kept is not None:
                 return kept
 
@@ -292,7 +293,7 @@ class Pipeline:
 
     # -- the cache -----------------------------------------------------------
 
-    def _from_cache(self, applicable: list[Any], network: Fingerprint) -> Any:
+    def _from_cache(self, applicable: list[Any], network: Fingerprint, reasons: list[str]) -> Any:
         entry = self.cache.load() if self.cache else None
         if entry is None:
             return None
@@ -336,6 +337,7 @@ class Pipeline:
         floored = self.floor.violations(measured)
         if floored:
             self._say(f"cached {name} rejected: below the floor: {', '.join(floored)}")
+            reasons.append(f"{name}: below the floor: {', '.join(floored)}")
             _close(link)
             return None
         short = _below(
@@ -459,12 +461,16 @@ class Pipeline:
         self, connected: list[Any], reasons: list[str], held: set[str]
     ) -> tuple[Any, ProbeResult | None]:
         """Pick among connected links. ``held`` names the strategies that cannot be probed."""
+        floored_out = [reason for reason in reasons if ": below the floor:" in reason]
         if len(connected) == 1:
             link = connected[0]
             try:
                 measured = self._measure(link)
             except Exception:
                 measured = None
+            if measured is None and floored_out:
+                _close(link)
+                raise ProviderUnavailable("shell", self._explain(reasons))
             if link.strategy in held:
                 self._fall_back(link)
             else:
@@ -491,7 +497,6 @@ class Pipeline:
             else:
                 probed.append((link, measured))
 
-        floored_out: list[str] = []
         above_floor: list[tuple[Any, ProbeResult]] = []
         for link, measured in probed:
             floored = self.floor.violations(measured)
@@ -525,14 +530,16 @@ class Pipeline:
                 self._say(f"chose {chosen.strategy}: only one connected and probed")
             else:
                 self._say(f"chose {chosen.strategy}: lowest rank within 25% of the fastest")
-        elif unprobed:
-            chosen, measured = unprobed[0], None
-            self._fall_back(chosen)
         elif floored_out:
+            for link in unprobed:
+                _close(link)
             self._say("every probe was below the floor")
             raise ProviderUnavailable(
                 "shell", self._explain([*reasons, "every probe was below the floor", *floored_out])
             )
+        elif unprobed:
+            chosen, measured = unprobed[0], None
+            self._fall_back(chosen)
         else:
             self._say("every probe failed")
             raise ProviderUnavailable("shell", self._explain([*reasons, "every probe failed"]))

@@ -520,9 +520,9 @@ def test_a_round_trip_above_the_floor_is_refused_even_with_fast_throughput(isola
         pipeline([broken, slow_round_trip], floor=floor).connect()
 
 
-def test_the_default_floor_is_five_mib_per_second_and_three_hundred_ms() -> None:
+def test_the_default_floor_is_ten_mib_per_second_and_three_hundred_ms() -> None:
     floor = LinkFloor.default()
-    assert floor.min_bps == 5.0 * MIB
+    assert floor.min_bps == 10.0 * MIB
     assert floor.max_rtt_ms == 300.0
 
 
@@ -589,3 +589,70 @@ def test_the_fingerprint_reads_the_public_address_from_stun(stun_server: StunSer
 
 def test_a_fingerprint_with_no_stun_answer_has_no_public_address() -> None:
     assert network_fingerprint(("127.0.0.1", 9), timeout=0.5).public_ip is None
+
+
+# Spec: Transport, Link floor.
+@pytest.mark.parametrize("up,down,rtt", [(2.6, 0.1, 177.4), (8.8, 10.7, 175.0)])
+def test_floor_rejection_cannot_select_an_unprobed_fallback(isolated_home, up, down, rtt):
+    slow = FakeStrategy("tailcat", 3, result=result(up, down, rtt))
+    fallback = FakeStrategy("fallback", 4, probed=False)
+    with pytest.raises(letify.ProviderUnavailable) as caught:
+        pipeline([slow, fallback], floor=LinkFloor.default()).connect()
+    message = str(caught.value)
+    assert "tailcat: below the floor" in message
+    assert f"up {up:.1f} MiB/s" in message
+    assert "10.0 MiB/s" in message
+    assert "min_mib_per_s" in message
+    assert "max_rtt_ms" in message
+    assert slow.links[0].closed
+    assert fallback.links[0].closed
+
+
+@pytest.mark.parametrize("race_fails", [False, True])
+def test_a_cached_floor_rejection_cannot_escape_to_an_unprobed_fallback(
+    isolated_home, monkeypatch, race_fails
+):
+    cache = LinkCache("lab")
+    cache.save("tailcat", result(20, 20), Fingerprint("203.0.113.7", "eth0"))
+    slow = FakeStrategy("tailcat", 3, result=result(2.6, 0.1, 177.4))
+    fallback = FakeStrategy("fallback", 4, probed=False)
+    attempt = slow.attempt
+
+    def reconnect(target, cancel=None):
+        if race_fails and slow.attempts:
+            raise OSError("connection lost after cached probe")
+        return attempt(target, cancel=cancel)
+
+    monkeypatch.setattr(slow, "attempt", reconnect)
+    with pytest.raises(letify.ProviderUnavailable, match="tailcat: below the floor"):
+        pipeline([slow, fallback], cache=cache, floor=LinkFloor.default()).connect()
+    assert all(link.closed for link in slow.links + fallback.links)
+    assert cache.load().probe == result(20, 20)
+
+
+def test_floor_rejections_name_both_account_overrides():
+    violations = LinkFloor.default().violations(result(2.6, 0.1, 500))
+    assert any("up 2.6 MiB/s" in text for text in violations)
+    assert any("down 0.1 MiB/s" in text for text in violations)
+    assert any("round trip 500.0 ms" in text for text in violations)
+    assert "min_mib_per_s" in ", ".join(violations)
+    assert "max_rtt_ms" in ", ".join(violations)
+
+
+# Spec: Transport, Link floor.
+def test_a_cached_floor_rejection_cannot_accept_a_lone_failed_probe(isolated_home, monkeypatch):
+    cache = LinkCache("lab")
+    cache.save("tailcat", result(20, 20), Fingerprint("203.0.113.7", "eth0"))
+    slow = FakeStrategy("tailcat", 3, result=result(2.6, 0.1, 177.4))
+    fallback = FakeStrategy("fallback", 4, probed=False, error="fallback unavailable")
+    attempt = slow.attempt
+
+    def reconnect(target, cancel=None):
+        if slow.attempts:
+            slow.probe_error = True
+        return attempt(target, cancel=cancel)
+
+    monkeypatch.setattr(slow, "attempt", reconnect)
+    with pytest.raises(letify.ProviderUnavailable, match="tailcat: below the floor"):
+        pipeline([slow, fallback], cache=cache, floor=LinkFloor.default()).connect()
+    assert all(link.closed for link in slow.links)
