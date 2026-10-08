@@ -278,30 +278,27 @@ class Colab(Shell):
         return env
 
     def _exec(self, session: str, source: str, timeout: float | None) -> str:
-        from .colab_keepalive import account_lock
-
-        with account_lock(account_directory(self.alias) / ".config" / "colab-cli"):
-            try:
-                return self._cli("exec", "-s", session, stdin=source, timeout=timeout)
-            except subprocess.TimeoutExpired as exc:
-                stderr = exc.stderr or ""
-                if isinstance(stderr, bytes):
-                    stderr = stderr.decode(errors="replace")
-                raise RuntimeFailure(
-                    f"{session}: colab exec timed out after {timeout} s; "
-                    "the notebook kernel may be busy or not answering",
-                    command=" ".join([*self._colab(), "exec", "-s", session]),
-                    stderr=stderr,
-                ) from exc
-            except RuntimeFailure as exc:
-                if "Timeout waiting for reply" not in exc.stderr:
-                    raise
-                raise RuntimeFailure(
-                    f"{session}: colab exec did not receive a reply; "
-                    "the notebook kernel may be busy or not answering",
-                    command=exc.command,
-                    stderr=exc.stderr,
-                ) from exc
+        try:
+            return self._cli("exec", "-s", session, stdin=source, timeout=timeout)
+        except subprocess.TimeoutExpired as exc:
+            stderr = exc.stderr or ""
+            if isinstance(stderr, bytes):
+                stderr = stderr.decode(errors="replace")
+            raise RuntimeFailure(
+                f"{session}: colab exec timed out after {timeout} s; "
+                "the notebook kernel may be busy or not answering",
+                command=" ".join([*self._colab(), "exec", "-s", session]),
+                stderr=stderr,
+            ) from exc
+        except RuntimeFailure as exc:
+            if "Timeout waiting for reply" not in exc.stderr:
+                raise
+            raise RuntimeFailure(
+                f"{session}: colab exec did not receive a reply; "
+                "the notebook kernel may be busy or not answering",
+                command=exc.command,
+                stderr=exc.stderr,
+            ) from exc
 
     def sessions(self) -> list[str]:
         """Names of the sessions this account currently holds."""
@@ -329,8 +326,27 @@ class Colab(Shell):
         from ..transport.rendezvous import ColabRendezvous
 
         name = runtime.name
+
+        def prepare_tailcat() -> str | None:
+            from .. import install
+
+            if not (
+                install.find("tailcat", link_cache=False) or self.config.option("tailcat_binary")
+            ):
+                return None
+            output = self._exec(name, install.remote_tailcat_source(), 180)
+            for line in output.splitlines():
+                if line.startswith("LETIFY-TAILCAT "):
+                    return json.loads(line[len("LETIFY-TAILCAT ") :])
+            raise RuntimeFailure(
+                "tailcat installation gave no verified binary path",
+                stderr=output.strip(),
+            )
+
         return ColabRendezvous(
-            lambda source, timeout: self._exec(name, source, timeout), self._public_key()
+            lambda source, timeout: self._exec(name, source, timeout),
+            self._public_key(),
+            prepare_tailcat=prepare_tailcat,
         )
 
     def fallback(self, runtime: Runtime | None = None) -> Callable[[], Link] | None:
@@ -350,20 +366,6 @@ class Colab(Shell):
     def target(self, runtime: Runtime | None = None) -> Target:
         target = super().target(runtime)
         target.user = self.user or "root"
-        if runtime is not None and target.rendezvous.unavailable() is None:
-            from .. import install
-
-            if install.find("tailcat", link_cache=False) or self.config.option("tailcat_binary"):
-                output = self._exec(runtime.name, install.remote_tailcat_source(), 180)
-                for line in output.splitlines():
-                    if line.startswith("LETIFY-TAILCAT "):
-                        target.rendezvous.binary = json.loads(line[len("LETIFY-TAILCAT ") :])
-                        break
-                else:
-                    raise RuntimeFailure(
-                        "tailcat installation gave no verified binary path",
-                        stderr=output.strip(),
-                    )
         if runtime is not None:
             # Each runtime is a new VM with a new host key.
             target.host_key_alias = f"letify-{self.alias}-{runtime.name}"
