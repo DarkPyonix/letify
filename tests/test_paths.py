@@ -302,3 +302,38 @@ def test_compatibility_fallbacks_for_migrated_paths(
     Colab(ProviderConfig("colab_compat", "colab", {}, 0))
     # It should find the token via fallback
     assert (acct / ".config" / "colab-cli" / "token.json").is_file()
+
+
+# -- Spec: Local machine, the filesystem storage backend root ----------------------
+
+
+def test_the_automatic_environment_store_sits_under_the_declared_cache(monkeypatch, tmp_path):
+    # Spec "Materializing into a runtime": the automatic archive store is the
+    # ~/.letify/cache/storage/<name> row with the name "environments", not a directory of
+    # its own under ~/.cache.
+    from letify.config.schema import ProviderConfig
+    from letify.providers.local import Local
+    from letify.store.volume import environment_volume
+
+    monkeypatch.setattr(Path, "home", staticmethod(lambda: tmp_path))
+    provider = Local(ProviderConfig("lab", "local", {}, 0))
+    volume = environment_volume(provider)
+    root = volume._store.backend.root
+
+    assert root == tmp_path / ".letify" / "cache" / "storage" / "environments" / "local" / "lab"
+    assert ".cache" not in root.parts
+
+
+def test_an_existing_environment_store_outside_the_root_is_still_read(monkeypatch, tmp_path):
+    # Spec "Materializing into a runtime": archives an earlier install left under
+    # ~/.cache/letify/environments are read rather than abandoned.
+    from letify.config.schema import ProviderConfig
+    from letify.providers.local import Local
+    from letify.store.volume import environment_volume
+
+    legacy = tmp_path / ".cache" / "letify" / "environments"
+    legacy.mkdir(parents=True)
+    monkeypatch.setattr(Path, "home", staticmethod(lambda: tmp_path))
+    provider = Local(ProviderConfig("lab", "local", {}, 0))
+
+    assert environment_volume(provider)._store.backend.root == legacy / "local" / "lab"

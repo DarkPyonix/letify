@@ -158,6 +158,13 @@ def uv_project(tmp_path: Path, monkeypatch) -> Path:
         subprocess.run([uv, "lock"], cwd=project, capture_output=True, check=True)
     monkeypatch.chdir(project)
     monkeypatch.setattr(bootstrap, "DEFAULT_WORKSPACE_ROOT", str(tmp_path / "runtime-workspace"))
+    # The automatic environment archive store lives under the user's own ~/.letify, so
+    # without this an archive a previous run published is found and a test that expects a
+    # sync sees "archive" instead. Spec "Materializing into a runtime".
+    from letify import paths
+
+    store = tmp_path / "storage"
+    monkeypatch.setattr(paths, "storage_cache_directory", lambda name: store / name)
     return project
 
 

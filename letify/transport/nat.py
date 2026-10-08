@@ -382,11 +382,10 @@ def begin(request: dict):
             stderr=subprocess.STDOUT,
             text=True,
         )
-        for line in process.stdout:
-            found = re.search(r"address:\s*(tc\S+)", line)
-            if found:
-                return {"address": found.group(1)}, process.wait
-        raise RuntimeError("tailcat serve exited without printing its address")
+        address = _match_then_drain(process, process.stdout, r"address:\s*(tc\S+)")
+        if address is None:
+            raise RuntimeError("tailcat serve exited without printing its address")
+        return {"address": address}, process.wait
     if kind == "reverse_ssh":
         # The directory is under the account's workspace root, which may start with ~.
         key = Path(os.path.expanduser(request["key_directory"])) / "letify_reverse"
@@ -405,12 +404,45 @@ def begin(request: dict):
             stderr=subprocess.PIPE,
             text=True,
         )  # fmt: skip
-        for line in process.stderr:
-            found = re.search(r"Allocated port (\d+)", line)
-            if found:
-                return {"port": int(found.group(1))}, process.wait
-        raise RuntimeError("ssh -R exited without allocating a port")
+        allocated = _match_then_drain(process, process.stderr, r"Allocated port (\d+)")
+        if allocated is None:
+            raise RuntimeError("ssh -R exited without allocating a port")
+        return {"port": int(allocated)}, process.wait
     raise ValueError(f"unknown rendezvous request {kind!r}")
+
+
+def _match_then_drain(process, stream, pattern: str) -> str | None:
+    """First capture of ``pattern`` in ``stream``, then keep draining it in the background.
+
+    A helper letify starts and reads one line from keeps writing afterwards. Its pipe holds
+    about 64 KiB, so once nobody reads it the helper blocks on its next write and stops
+    moving bytes. ``tailcat serve`` carries the SSH connection itself, so that stall shows
+    up as a link that connects and then measures far below the link underneath it. Reading
+    on and discarding keeps the writer running, and keeps ``process.wait`` from deadlocking
+    against a full pipe.
+
+    Returns None when the stream ends before the pattern appears.
+    """
+    expression = re.compile(pattern)
+    found = None
+    for line in stream:
+        match = expression.search(line)
+        if match:
+            found = match.group(1)
+            break
+    if found is None:
+        return None
+
+    def drain() -> None:
+        try:
+            for _ in stream:
+                pass
+        except (OSError, ValueError):
+            # The process ended and the stream was closed under us, which is the normal end.
+            pass
+
+    threading.Thread(target=drain, name="letify-drain", daemon=True).start()
+    return found
 
 
 def _authorize(public_key: str) -> None:
