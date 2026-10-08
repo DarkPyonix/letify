@@ -40,7 +40,11 @@ SESSIONS_FILE = (".config", "colab-cli", "sessions.json")
 
 def session_endpoint(alias: str, name: str) -> tuple[str, str]:
     """The proxy URL and token the Colab CLI recorded for one session of one account."""
-    path = account_directory(alias).joinpath(*SESSIONS_FILE)
+    from ..paths import tool_cache_home
+
+    path = tool_cache_home(alias).joinpath(*SESSIONS_FILE)
+    if not path.is_file():
+        path = account_directory(alias).joinpath(*SESSIONS_FILE)
     try:
         sessions = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError):

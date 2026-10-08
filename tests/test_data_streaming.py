@@ -944,7 +944,14 @@ def test_a_call_whose_files_are_all_held_carries_no_streaming_machinery(
 def blob_of(path: Path) -> Path:
     """The runtime cache file that holds the current bytes of a local file."""
     digest = pathdata.hash_file(path, path.stat().st_size)
-    return Path.home() / ".letify-runtime" / "data" / "blobs" / digest[:2] / digest
+    for root in (
+        Path.home() / ".letify" / "runtime" / "data" / "blobs",
+        Path.home() / ".letify-runtime" / "data" / "blobs",
+    ):
+        target = root / digest[:2] / digest
+        if target.exists():
+            return target
+    return Path.home() / ".letify" / "runtime" / "data" / "blobs" / digest[:2] / digest
 
 
 def test_a_rewritten_file_in_a_directory_input_leaves_the_cache_blob_intact(

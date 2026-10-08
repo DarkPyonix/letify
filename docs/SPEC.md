@@ -893,7 +893,7 @@ A directory is walked without following symbolic links to directories. Regular f
 
 Each file is one blob, named by the blake3 digest of its contents with 16 byte output, the digest of Argument addressing. A file of 64 MiB or more is hashed through a memory map with blake3's multithreaded update. A directory is a manifest: a list of relative POSIX path, digest and size per file, sorted by path.
 
-The local digest cache is `~/.cache/letify/digests.json`. An entry is keyed by the resolved path and holds size, modification time in nanoseconds, inode and digest. A file whose four stat fields match its entry is not read again. The file is replaced atomically after a call that added or changed an entry.
+The local digest cache is `~/.letify/cache/digests.json`. An entry is keyed by the resolved path and holds size, modification time in nanoseconds, inode and digest. A file whose four stat fields match its entry is not read again. The file is replaced atomically after a call that added or changed an entry. If `~/.cache/letify/digests.json` exists from an earlier install, it is read as a fallback.
 
 #### Where the bytes come from <!-- id: project-data-transfer -->
 
@@ -1086,11 +1086,13 @@ Sizes are in MiB with one decimal and `<budget>` in GiB with one decimal.
 
 #### The cache command <!-- id: project-data-cache-command -->
 
-`letify cache` shows the client digest cache and each provider's runtime file blob cache. `letify cache clear <alias>` empties one provider's runtime cache.
+`letify cache` shows the client digest cache, every local tree letify owns with its file count and size, and each provider's runtime file blob cache. `letify cache clear <target>` (or `letify cache clean <target>`) empties what is safe to clean. Credentials and configuration are never cleaned.
 
-`letify cache` first removes every digest cache entry whose file no longer exists, then prints the digest cache's entry count and how many were removed. For each provider in the configuration whose runtime disk persists between sessions, it starts a session on the provider's first instance, asks the worker with one `data_cache` request, and prints the alias, the blob count, the total size and the budget. A provider whose runtime disk does not persist is listed with `not kept between sessions` and no session is started. `--json` prints the same records.
+`letify cache` first removes every digest cache entry whose file no longer exists, then prints the digest cache's entry count and how many were removed. It measures every local directory under `~/.letify`: `cache` (including digest cache, filesystem stores, and redirected CLI homes), `tools` (installed binaries), `tmp` (temporary session files), `ssh` (multiplexing control sockets), `runtime` (local provider workspace), and `accounts` (credentials, marked non-cleanable). For each provider in the configuration whose runtime disk persists between sessions, it starts a session on the provider's first instance, asks the worker with one `data_cache` request, and prints the alias, the blob count, the total size and the budget. A provider whose runtime disk does not persist is listed with `not kept between sessions` and no session is started. `--json` prints the same records under `digests`, `local` and `providers`.
 
-`letify cache clear <alias>` starts a session on that provider and sends `data_cache` with `clear` set. The worker removes every committed blob whose link count is 1, ignoring the 600 second window, and the command prints `<alias>: removed <files> files <size>`.
+`letify cache clear <target>` (or `letify cache clean <target>`) clears caches:
+1. When `<target>` is a provider alias, it sends `data_cache` with `clear` set to that runtime. The worker removes committed blobs whose link count is 1, and the command prints `<alias>: removed <files> files <size>`.
+2. When `<target>` names a local cache target (`cache`, `tools`, `tmp`, `runtime`, or `all`), it clears the corresponding local directories under `~/.letify`. Targets `accounts` and `config.toml` are refused because credentials and configurations are never cleaned.
 
 The digest cache also drops entries whose file no longer exists each time it is saved.
 
@@ -1453,7 +1455,7 @@ When `workspace` is not set, the root is:
 | `shell`, `tunnel`, `elice` | `~/.letify-runtime` |
 | `colab` | `/content/letify` |
 | `modal` | `/letify`, where a Modal volume named `<app>-workspace` is mounted in every sandbox, so the root persists across sandboxes |
-| `local` | not used. A volume materialized on `local` without `mount` lands under `~/.letify-runtime` on this machine |
+| `local` | not used. A volume materialized on `local` without `mount` lands under `~/.letify/runtime` on this machine |
 
 A `modal` account with `workspace` set mounts the same volume at that path instead, when the path starts with `/`.
 
@@ -1471,13 +1473,63 @@ Everything letify writes on the runtime is under the root:
 | `<workspace root>/blobs` | argument blobs on a persistent provider, as Argument blobs on a persistent disk describes |
 | `<workspace root>/data` | the file blob cache and the per-call data directories of Project data |
 | `<workspace root>/tmp` | temporary files, including the archive `pack_dir` builds on a one-shot channel; `TMPDIR` points here |
+| `<workspace root>/bin/uv` | the uv binary installed when missing on the runtime, as uv on the runtime describes |
 
-The worker's working directory is the root, so a relative path in user code resolves under it. letify writes nothing else on the runtime outside the workspace root, with two documented exceptions, both needed before a workspace root is known or reachable:
+The worker's working directory is the root, so a relative path in user code resolves under it.
 
-1. **`~/.ssh/authorized_keys`**, appended to accept a reverse SSH connection: once by a Colab rendezvous installing the account's long-lived public key, as Transport describes, and once per session by a `reverse_ssh` account installing a session key removed again when the link closes. Either has to land where the remote machine's own `sshd` reads it, which is fixed by `sshd` itself, not by letify.
-2. **`/run/sshd`**, created so a freshly installed `sshd` has somewhere to keep its privilege separation directory, on a machine the connection pipeline finds with no SSH server already answering. `sshd` refuses to start without it, and the path is fixed by `sshd`, not by letify.
+### Declared filesystem paths <!-- id: declared-paths -->
 
-Neither is configurable today; an account that cannot accept either exception reaches its runtime some other way, such as a pre-installed `sshd` or a Tailcat link, which needs neither.
+> letify writes exclusively to declared directories: locally under ~/.letify, and on runtimes within the designated workspace root, with explicit documented exceptions for system SSH and daemon runtime directories.
+
+Every path letify creates or writes is declared here. The system temporary directory (/tmp, /var/tmp, or tempfile.gettempdir()) is never used, locally or on a runtime.
+
+#### Local machine
+
+Local filesystem modifications are consolidated under the single root `~/.letify`. The declared local paths are:
+
+| Path | Purpose | Movable by |
+|---|---|---|
+| `~/.letify/config.toml` | Machine configuration declaring accounts and global providers | `LETIFY_CONFIG` environment variable or project `.letify/config.toml` |
+| `~/.letify/accounts/<alias>/` | Account credentials and secrets (mode 0700 directory, mode 0600 files). Holds secret files only: `token.json`, `modal.toml`, `eci.yaml`, `cookie`, `access_token`, `kaggle.json`, `notebook_id`, `known_hosts`, `link.json`, `password`. Never contains CLI cache directories or python packages | not movable |
+| `~/.letify/tools/<tool>/<version>/` | Installed standalone binaries (`tailcat`, `eci`). Older versions under `~/.letify/tools/<tool>/` are automatically pruned on install | not movable |
+| `~/.letify/cache/digests.json` | Local project file digest cache. Falls back to reading `~/.cache/letify/digests.json` if it exists from an earlier install | not movable |
+| `~/.letify/cache/storage/<name>` | Filesystem storage backend root for store `<name>`. Falls back to reading `~/.cache/letify/<name>` if it exists | not movable |
+| `~/.letify/cache/tools/<alias>/` | Redirected `HOME` and `USERPROFILE` for provider CLIs (`colab`, `kaggle`). Mode 0700. Keeps CLI temporary files, packages, and `.config/` out of the credential directory. The CLI finds its token via a symbolic link pointing to `~/.letify/accounts/<alias>/token.json` (or copy fallback on systems without symlink support) | not movable |
+| `~/.letify/tmp/` | Temporary directory for ephemeral keys during reverse SSH negotiation and adapter stderr files. Mode 0700 | not movable |
+| `~/.letify/ssh/` | OpenSSH multiplexing control sockets (`ControlPath`). Mode 0700 | `XDG_RUNTIME_DIR` (moved to `$XDG_RUNTIME_DIR/letify`) |
+| `~/.letify/runtime/` | Local provider workspace root for calls and local volumes. Holds `data/blobs`, `data/calls`, `tmp`. Falls back to reading `~/.letify-runtime` if it exists | not movable |
+
+**Documented local exceptions:**
+
+1. `~/.ssh/id_letify` and `~/.ssh/id_letify.pub`: Default SSH key pair for authenticating to remote instances. Moved by `--key` or `key = ...`. Unavoidable because OpenSSH client commands require a key file, and keeping it in `~/.ssh` ensures it is shared across accounts and preserved across `letify logout`.
+2. `~/.ssh/authorized_keys`: Authorized keys line installed during reverse SSH rendezvous and purged on session teardown. Unavoidable because OpenSSH server authenticates incoming reverse SSH connections through this file.
+3. `<project>/.venv/bin/<tool>` and `<project>/.venv/bin/.letify-<tool>`: Symlink or launcher for external tools linked into the active project environment.
+4. `<project>/typings/letify_providers.pyi`: Generated type stub for editor completion. Moved by `typings = ...` or disabled by `LETIFY_STUBS=0`.
+
+#### Remote runtime
+
+Every remote write is constrained to the designated workspace root (`~/.letify-runtime` by default, or configured via `--workspace` on the account):
+
+| Path | Purpose | Movable by |
+|---|---|---|
+| `<workspace root>/tmp` | Remote temporary directory (`TMPDIR` points here) | account `workspace` setting |
+| `<workspace root>/data/blobs` | Content-addressed data cache for streaming datasets | account `workspace` setting |
+| `<workspace root>/data/calls` | Ephemeral call serialization buffers | account `workspace` setting |
+| `<workspace root>/project/<env key>` | Project files and virtual environment (`.venv`) | account `workspace` setting |
+| `<workspace root>/uv-cache` | Cache for `uv sync` on persistent providers | account `workspace` setting |
+| `<workspace root>/bin/uv` | Standalone `uv` binary installed when missing on the runtime | account `workspace` setting |
+| `<workspace root>/volumes/<name>` | Materialized volume blobs and data | account `workspace` setting |
+| `<workspace root>/blobs` | Argument blobs on persistent providers | account `workspace` setting |
+| `<workspace root>/tmp/letify-<hex>` | Ephemeral reverse SSH key directory on remote instance | account `workspace` setting |
+
+**Documented remote exceptions:**
+
+1. `~/.ssh/authorized_keys`: Holds `id_letify.pub` on the remote instance. Unavoidable because the SSH daemon requires an authorized key to accept SSH connections.
+2. `/run/sshd`: Privilege separation directory created when starting `sshd` on ephemeral containers. Unavoidable because OpenSSH daemon refuses to start without `/run/sshd`.
+
+#### Compatibility fallback duration
+
+Where paths have moved (`~/.cache/letify/digests.json`, `~/.cache/letify/<name>`, `~/.letify-runtime`, `account_directory/.config/colab-cli/token.json`), letify continues to read from the old location if it already exists. This fallback is maintained across minor releases until letify version 2.0.0.
 
 ### Generated provider types
 
@@ -1515,7 +1567,7 @@ An account that is already in the home file is not asked for again. `letify logi
 
 `letify logout <alias>` removes the account from `~/.letify/config.toml` and deletes `~/.letify/accounts/<alias>/` with everything in it. It leaves the project reference alone, because the repository still needs that account; what changed is only that this machine no longer has it.
 
-`letify login colab <alias>` signs in to Colab itself. It runs `colab sessions` through `uv tool run --python 3.13 --from google-colab-cli colab`, with `HOME` set to `~/.letify/accounts/<alias>/`. The Colab CLI keeps its token at a fixed path under its home directory, so the token lands in the account directory and the CLI refreshes it on later calls. Every later Colab command runs with the same `HOME`, which is what lets two Colab accounts live on one machine. uv's cache, Python installs and tools stay pinned to the real home, so a changed `HOME` downloads nothing again. A sign in that exits non zero writes nothing.
+`letify login colab <alias>` signs in to Colab itself. It runs `colab sessions` through `uv tool run --python 3.13 --from google-colab-cli colab`, with `HOME` set to `~/.letify/cache/tools/<alias>/`. The CLI writes its configuration and cache into this redirected directory, and its token lands at `token.json` in `~/.letify/accounts/<alias>/`, linked from `.config/colab-cli/token.json` in the cache home via a symbolic link. Every later Colab command runs with the same redirected `HOME`, keeping the account directory reserved for secrets only. uv's cache, Python installs and tools stay pinned to the real home, so a changed `HOME` downloads nothing again. A sign in that exits non zero writes nothing.
 
 After the sign in succeeds, the Colab login records `key`, the SSH private key whose public half the Colab rendezvous installs on each runtime at connect time, as described under [Colab](#colab-transport). The key is `--key` when given, and `~/.ssh/id_letify` otherwise, the same key a `shell` login generates. The key lives under `~/.ssh` rather than in the account directory because it is not a Colab credential: it authorizes only the throwaway VM, and `letify logout` must not delete a key other accounts use. A missing key is generated as an ed25519 pair with no passphrase. An existing key is used as it is and never regenerated. A Colab account already in the home file with no `key` is the one exception to not being asked for again: `letify login colab <alias>` ensures the key the same way and adds `key` to the entry, leaving its other fields alone, without signing in again.
 
@@ -1589,9 +1641,9 @@ So `letify login shell` sets up key authentication and treats the password as a 
 
 Every SSH command letify builds also carries `-o ControlMaster=auto`, `-o ControlPersist=60` and `-o ControlPath=<control directory>/<tag>-%C`, so the worker channel, the busy card check and every later command to the same machine share one authenticated connection, instead of paying about 0.24 s for a new one each. On Windows, where OpenSSH does not implement connection multiplexing, the three options are left out and each command opens its own connection.
 
-Control sockets live in a short per-user directory, not under the home directory, because a Unix domain socket path is limited to 108 bytes on Linux and 104 bytes on macOS, including the terminating byte:
+Control sockets live in a designated directory checked before use, constrained by the Unix domain socket path limit of 108 bytes on Linux and 104 bytes on macOS, including the terminating byte:
 
-- The control directory is `$XDG_RUNTIME_DIR/letify` when `XDG_RUNTIME_DIR` is set, and `/tmp/letify-<uid>` otherwise. It is created with mode 0700.
+- The control directory is `$XDG_RUNTIME_DIR/letify` when `XDG_RUNTIME_DIR` is set, and `~/.letify/ssh` otherwise. It is created with mode 0700. The system temporary directory (/tmp) is never used.
 - Before use, the directory is checked with `lstat`: it must be a directory, not a symbolic link, owned by the current user, and have no group or other permission bits. Any other state raises `ConfigError` and no SSH command is built.
 - `<tag>` is the first 8 hex digits of the SHA-256 of the account alias, so accounts that reach the same machine keep separate connections. `%C` expands to 40 hex digits.
 - The length checked is the path with `%C` expanded, plus the 17 bytes OpenSSH appends to name the temporary socket while it binds. If that reaches the platform limit, the three options are left out for that command and it opens its own connection. Every command also carries `-o Ciphers=^aes128-gcm@openssh.com,chacha20-poly1305@openssh.com`, which puts those two ciphers first in the client's default list, so a server that offers neither still connects. Compression stays off.

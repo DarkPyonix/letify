@@ -111,8 +111,105 @@ def command(tool: Tool, uv: str) -> list[str]:
     ]
 
 
+def _ensure_symlink(link_path: Path, target: Path) -> None:
+    link_path.parent.mkdir(parents=True, exist_ok=True)
+    if link_path.is_symlink() or link_path.exists():
+        try:
+            if link_path.resolve() == target.resolve():
+                return
+        except OSError:
+            pass
+        link_path.unlink()
+    try:
+        link_path.symlink_to(target)
+    except OSError:
+        shutil.copy2(target, link_path)
+
+
+def prepare_tool_links(alias: str) -> None:
+    """Link credential secrets from the account directory into the redirected tool home."""
+    from .paths import tool_cache_home
+
+    acct = account_directory(alias)
+    tool_home = tool_cache_home(alias)
+
+    # Colab token
+    token_account = acct / "token.json"
+    old_colab_token = acct / ".config" / "colab-cli" / "token.json"
+    if not token_account.exists() and old_colab_token.is_file():
+        token_account.write_bytes(old_colab_token.read_bytes())
+        if sys.platform != "win32":
+            token_account.chmod(0o600)
+    if token_account.is_file():
+        colab_config = tool_home / ".config" / "colab-cli"
+        colab_config.mkdir(parents=True, exist_ok=True)
+        link_target = colab_config / "token.json"
+        _ensure_symlink(link_target, token_account)
+
+    # Kaggle token
+    kaggle_account = acct / "kaggle.json"
+    if kaggle_account.is_file():
+        kaggle_dir = tool_home / ".kaggle"
+        kaggle_dir.mkdir(parents=True, exist_ok=True)
+        link_target = kaggle_dir / "kaggle.json"
+        _ensure_symlink(link_target, kaggle_account)
+
+
+def sync_tool_credentials(alias: str) -> None:
+    """Sync credentials written by provider CLIs back to the account directory."""
+    from .paths import ALLOWED_ACCOUNT_CREDENTIAL_FILES, tool_cache_home
+
+    acct = account_directory(alias)
+    tool_home = tool_cache_home(alias)
+
+    # Colab token written by colab sessions
+    colab_token = tool_home / ".config" / "colab-cli" / "token.json"
+    token_account = acct / "token.json"
+    if colab_token.is_file():
+        is_link_to_target = False
+        if colab_token.is_symlink():
+            try:
+                is_link_to_target = colab_token.resolve() == token_account.resolve()
+            except OSError:
+                is_link_to_target = False
+        if not is_link_to_target:
+            token_account.write_bytes(colab_token.read_bytes())
+            if sys.platform != "win32":
+                token_account.chmod(0o600)
+            colab_token.unlink()
+            _ensure_symlink(colab_token, token_account)
+
+    # Kaggle token if written
+    kaggle_token = tool_home / ".kaggle" / "kaggle.json"
+    kaggle_account = acct / "kaggle.json"
+    if kaggle_token.is_file():
+        is_link_to_target = False
+        if kaggle_token.is_symlink():
+            try:
+                is_link_to_target = kaggle_token.resolve() == kaggle_account.resolve()
+            except OSError:
+                is_link_to_target = False
+        if not is_link_to_target:
+            kaggle_account.write_bytes(kaggle_token.read_bytes())
+            if sys.platform != "win32":
+                kaggle_account.chmod(0o600)
+            kaggle_token.unlink()
+            _ensure_symlink(kaggle_token, kaggle_account)
+
+    # Clean non-credential files and directories from account directory
+    if acct.exists():
+        for item in list(acct.iterdir()):
+            if item.is_dir() or item.name not in ALLOWED_ACCOUNT_CREDENTIAL_FILES:
+                if item.is_dir():
+                    shutil.rmtree(item, ignore_errors=True)
+                else:
+                    item.unlink(missing_ok=True)
+
+
 def environment(alias: str) -> dict[str, str]:
-    """The environment a tool runs in for one account, with its home in the account directory."""
+    """The environment a tool runs in for one account, with its redirected tool home."""
+    from .paths import tool_cache_home
+
     env = dict(os.environ)
     if sys.platform != "win32":
         # On Windows uv keeps its cache under LOCALAPPDATA, which a changed HOME leaves alone.
@@ -122,14 +219,16 @@ def environment(alias: str) -> dict[str, str]:
         env.setdefault("UV_CACHE_DIR", str(cache / "uv"))
         env.setdefault("UV_PYTHON_INSTALL_DIR", str(data / "uv" / "python"))
         env.setdefault("UV_TOOL_DIR", str(data / "uv" / "tools"))
-    home = account_directory(alias)
-    home.mkdir(parents=True, exist_ok=True)
+    acct = account_directory(alias)
+    acct.mkdir(parents=True, exist_ok=True)
+    tool_home = tool_cache_home(alias)
+    tool_home.mkdir(parents=True, exist_ok=True)
     if sys.platform != "win32":
-        # The tool writes its token here with its own permissions, so the directory is
-        # what keeps other users out.
-        home.chmod(0o700)
-    env["HOME"] = str(home)
-    env["USERPROFILE"] = str(home)
+        acct.chmod(0o700)
+        tool_home.chmod(0o700)
+    prepare_tool_links(alias)
+    env["HOME"] = str(tool_home)
+    env["USERPROFILE"] = str(tool_home)
     return env
 
 
@@ -208,5 +307,7 @@ __all__ = [
     "modal_adapter_command",
     "modal_config_path",
     "modal_environment",
+    "prepare_tool_links",
     "script_command",
+    "sync_tool_credentials",
 ]

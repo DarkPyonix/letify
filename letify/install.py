@@ -519,6 +519,12 @@ def install(tool: str, *, say: Say = _say) -> Path:
         if final.exists():
             shutil.rmtree(final)
         os.replace(staging, final)
+        for entry in list(final.parent.iterdir()):
+            if entry.name != final.name and not entry.name.startswith("."):
+                if entry.is_dir():
+                    shutil.rmtree(entry, ignore_errors=True)
+                else:
+                    entry.unlink(missing_ok=True)
     except BaseException:
         shutil.rmtree(staging, ignore_errors=True)
         raise

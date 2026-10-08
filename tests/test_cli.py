@@ -570,7 +570,7 @@ def test_logging_in_to_colab_runs_the_colab_login_inside_the_account_directory(
     call = next(c for c in recorder.calls if c["command"][-1] == "sessions")
     assert call["command"][:3] == ["/usr/bin/uv", "tool", "run"]
     assert call["command"][-2:] == ["colab", "sessions"]
-    assert call["env"]["HOME"] == str(Path.home() / ".letify" / "accounts" / "colab_a")
+    assert call["env"]["HOME"] == str(Path.home() / ".letify" / "cache" / "tools" / "colab_a")
     home_file = (Path.home() / ".letify" / "config.toml").read_text(encoding="utf-8")
     assert "me@example.com" in home_file
     assert "token" not in home_file
