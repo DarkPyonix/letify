@@ -164,7 +164,12 @@ def build_parser() -> argparse.ArgumentParser:
     check.add_argument("alias", help="provider alias from the configuration")
 
     cache = sub.add_parser("cache", help="show the data caches, or clear a provider's")
-    cache.add_argument("action", nargs="?", choices=("clear", "clean"), help="clear a runtime cache or local cache")
+    cache.add_argument(
+        "action",
+        nargs="?",
+        choices=("clear", "clean"),
+        help="clear a runtime cache or local cache",
+    )
     cache.add_argument("alias", nargs="?", help="provider alias or local cache target to clear")
     cache.add_argument("--json", action="store_true", help="print the records unformatted")
 
@@ -400,7 +405,13 @@ def _cache(let: Launcher, args: argparse.Namespace) -> int:
                         else:
                             entry.unlink(missing_ok=True)
             if args.json:
-                return _json({"target": target, "removed": total_removed, "removed_bytes": total_removed_bytes})
+                return _json(
+                    {
+                        "target": target,
+                        "removed": total_removed,
+                        "removed_bytes": total_removed_bytes,
+                    }
+                )
             print(
                 f"{target}: removed {total_removed} files "
                 f"{total_removed_bytes / mib:.1f} MiB"
@@ -465,7 +476,7 @@ def _cache(let: Launcher, args: argparse.Namespace) -> int:
     print(f"digest cache: {len(digests)} entries, {pruned} pruned")
 
     local_rows = []
-    for name, (path, cleanable) in local_trees.items():
+    for name, (_path, cleanable) in local_trees.items():
         st = local_stats[name]
         clean_str = "yes" if cleanable else "no (credentials)"
         local_rows.append([name, str(st["files"]), f"{st['bytes'] / mib:.1f} MiB", clean_str])

@@ -11,13 +11,8 @@ from __future__ import annotations
 
 import json
 import os
-import shutil
-import stat
-import sys
 import tempfile
 from pathlib import Path
-
-import pytest
 
 import letify
 from letify import install
@@ -28,13 +23,8 @@ from letify.paths import (
     ALLOWED_ACCOUNT_CREDENTIAL_FILES,
     DECLARED_LOCAL_EXCEPTIONS,
     DECLARED_LOCAL_PATHS,
-    digest_cache_path,
     local_runtime_directory,
     local_runtime_root,
-    local_tmp_directory,
-    ssh_control_directory,
-    storage_cache_directory,
-    tool_cache_home,
 )
 from letify.transport import sshopts
 
@@ -49,7 +39,7 @@ def test_declared_paths_list_cannot_drift() -> None:
         "ssh",
         "runtime",
     }
-    assert DECLARED_LOCAL_PATHS == expected_local
+    assert expected_local == DECLARED_LOCAL_PATHS
 
     expected_credentials = {
         "token.json",
@@ -63,7 +53,7 @@ def test_declared_paths_list_cannot_drift() -> None:
         "link.json",
         "password",
     }
-    assert ALLOWED_ACCOUNT_CREDENTIAL_FILES == expected_credentials
+    assert expected_credentials == ALLOWED_ACCOUNT_CREDENTIAL_FILES
 
     assert "~/.ssh/id_letify" in DECLARED_LOCAL_EXCEPTIONS
     assert "~/.ssh/authorized_keys" in DECLARED_LOCAL_EXCEPTIONS
@@ -296,7 +286,6 @@ def test_compatibility_fallbacks_for_migrated_paths(
     assert new_store_loc == ("root", str(home / ".letify" / "cache" / "storage" / "new_store"))
 
     # 3. Local provider workspace root
-    from letify.providers.local import Local
 
     assert local_runtime_root() == "~/.letify/runtime"
     assert local_runtime_directory() == home / ".letify" / "runtime"
@@ -310,6 +299,6 @@ def test_compatibility_fallbacks_for_migrated_paths(
     from letify.config.schema import ProviderConfig
     from letify.providers.colab import Colab
 
-    colab = Colab(ProviderConfig("colab_compat", "colab", {}, 0))
+    Colab(ProviderConfig("colab_compat", "colab", {}, 0))
     # It should find the token via fallback
     assert (acct / ".config" / "colab-cli" / "token.json").is_file()

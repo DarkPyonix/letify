@@ -6,7 +6,6 @@ until the backend that needs it is actually constructed.
 
 from __future__ import annotations
 
-from pathlib import Path
 from typing import Any
 
 from ...errors import ProviderUnavailable
