@@ -73,7 +73,10 @@ def test_a_cookie_is_kept_owner_only_and_never_in_the_config(
     isolated_home, accept_cookie, capsys
 ) -> None:
     cookie = make_cookie()
-    assert main(["login", "kaggle", "kaggle_a", "--cookie", cookie, "--no-input"]) == 0
+    assert main(
+        ["login", "kaggle", "kaggle_a", "--cookie", cookie,
+         "--username", "irack000", "--key", "the-api-key", "--no-input"]
+    ) == 0
 
     stored = account("kaggle_a") / "cookie"
     assert stored.read_text(encoding="utf-8").strip() == cookie
@@ -91,7 +94,10 @@ def test_an_expired_cookie_is_refused_with_nothing_written(
     isolated_home, accept_cookie, capsys
 ) -> None:
     expired = make_cookie("2000-01-01T00:00:00Z")
-    assert main(["login", "kaggle", "kaggle_a", "--cookie", expired, "--no-input"]) == 1
+    assert main(
+        ["login", "kaggle", "kaggle_a", "--cookie", expired,
+         "--username", "irack000", "--key", "the-api-key", "--no-input"]
+    ) == 1
     assert "expired" in capsys.readouterr().err
     assert not (Path.home() / ".letify" / "config.toml").exists()
     assert not (account("kaggle_a") / "cookie").exists()
@@ -100,7 +106,10 @@ def test_an_expired_cookie_is_refused_with_nothing_written(
 
 def test_a_cookie_missing_a_required_name_is_refused(isolated_home, accept_cookie, capsys) -> None:
     partial = make_cookie(drop=["ka_sessionid"])
-    assert main(["login", "kaggle", "kaggle_a", "--cookie", partial, "--no-input"]) == 1
+    assert main(
+        ["login", "kaggle", "kaggle_a", "--cookie", partial,
+         "--username", "irack000", "--key", "the-api-key", "--no-input"]
+    ) == 1
     assert "missing" in capsys.readouterr().err
     assert not (account("kaggle_a") / "cookie").exists()
 
@@ -112,14 +121,19 @@ def test_a_cookie_the_account_check_rejects_writes_nothing(
         raise ValueError("the Kaggle cookie was refused; log in to kaggle.com for a fresh one")
 
     monkeypatch.setattr("letify.providers.kaggle.verify_cookie", reject)
-    assert main(["login", "kaggle", "kaggle_a", "--cookie", make_cookie(), "--no-input"]) == 1
+    assert main(
+        ["login", "kaggle", "kaggle_a", "--cookie", make_cookie(),
+         "--username", "irack000", "--key", "the-api-key", "--no-input"]
+    ) == 1
     assert "refused" in capsys.readouterr().err
     assert not (account("kaggle_a") / "cookie").exists()
     assert not (Path.home() / ".letify" / "config.toml").exists()
 
 
 def test_no_input_without_a_cookie_refuses(isolated_home, accept_cookie, capsys) -> None:
-    assert main(["login", "kaggle", "kaggle_a", "--no-input"]) == 1
+    assert main(
+        ["login", "kaggle", "kaggle_a", "--username", "irack000", "--key", "k", "--no-input"]
+    ) == 1
     assert "--cookie" in capsys.readouterr().err
 
 
@@ -133,18 +147,88 @@ def test_with_a_terminal_the_cookie_is_asked_for_hidden(
         prompts.append(prompt)
         return cookie
 
+    clear: list[str] = []
+
+    def in_the_clear(prompt: str) -> str:
+        clear.append(prompt)
+        return "irack000"
+
     monkeypatch.setattr(login, "read_password", hidden)
-    monkeypatch.setattr(login, "read_line", lambda prompt: pytest.fail("asked in the clear"))
+    monkeypatch.setattr(login, "read_line", in_the_clear)
     assert main(["login", "kaggle", "kaggle_a"]) == 0
-    assert prompts == [login.KAGGLE_COOKIE_PROMPT]
+    # The cookie is a secret, so it is read hidden and never in the clear. The username is
+    # not, and is asked for in the clear beside it.
+    assert login.KAGGLE_COOKIE_PROMPT in prompts
+    assert login.KAGGLE_COOKIE_PROMPT not in clear
     assert (account("kaggle_a") / "cookie").is_file()
+
+
+def test_the_token_is_asked_for_beside_the_cookie(
+    isolated_home, accept_cookie, monkeypatch
+) -> None:
+    """Spec "Kaggle account": both credentials are required, so a terminal asks for both.
+
+    The cookie mints the Jupyter proxy URL and the token runs the official CLI, so an
+    account declared with only one of them cannot do the other's job.
+    """
+    import json
+
+    cookie = make_cookie()
+    hidden: list[str] = []
+    clear: list[str] = []
+
+    def read_password(prompt: str) -> str:
+        hidden.append(prompt)
+        return cookie if prompt == login.KAGGLE_COOKIE_PROMPT else "the-api-key"
+
+    def read_line(prompt: str) -> str:
+        clear.append(prompt)
+        return "irack000"
+
+    monkeypatch.setattr(login, "read_password", read_password)
+    monkeypatch.setattr(login, "read_line", read_line)
+    assert main(["login", "kaggle", "kaggle_a"]) == 0
+    # The token comes first, because it is fetched from a page rather than a browser tab.
+    assert hidden == [login.KAGGLE_KEY_PROMPT, login.KAGGLE_COOKIE_PROMPT]
+    assert clear == [login.KAGGLE_USERNAME_PROMPT]
+    stored = json.loads((account("kaggle_a") / "kaggle.json").read_text(encoding="utf-8"))
+    assert stored == {"username": "irack000", "key": "the-api-key"}
+
+
+def test_a_key_pasted_with_the_kgat_prefix_is_stored_without_it(
+    isolated_home, accept_cookie
+) -> None:
+    """Spec "Kaggle account": kaggle.com shows the key prefixed, the CLI reads the rest."""
+    import json
+
+    thirty_two = "a1b2c3d4e5f60718293a4b5c6d7e8f90"
+    assert main(
+        ["login", "kaggle", "kaggle_a", "--cookie", make_cookie(),
+         "--username", "irack000", "--key", login.KAGGLE_KEY_PREFIX + thirty_two,
+         "--no-input"]
+    ) == 0
+    stored = json.loads((account("kaggle_a") / "kaggle.json").read_text(encoding="utf-8"))
+    assert stored == {"username": "irack000", "key": thirty_two}
+
+
+def test_no_input_without_a_token_refuses(isolated_home, accept_cookie, capsys) -> None:
+    """Spec "Kaggle account": a login with no token refuses and names what to pass."""
+    cookie = make_cookie()
+    code = main(["login", "kaggle", "kaggle_a", "--cookie", cookie, "--no-input"])
+    assert code == 1
+    message = capsys.readouterr().err
+    assert "--username" in message and "--key" in message
+    assert not (account("kaggle_a") / "kaggle.json").exists()
 
 
 def test_a_cookie_can_be_read_from_a_file(isolated_home, accept_cookie, tmp_path) -> None:
     cookie = make_cookie()
     path = tmp_path / "kaggle_cookie.txt"
     path.write_text(cookie, encoding="utf-8")
-    assert main(["login", "kaggle", "kaggle_a", "--cookie", str(path), "--no-input"]) == 0
+    assert main(
+        ["login", "kaggle", "kaggle_a", "--cookie", str(path),
+         "--username", "irack000", "--key", "the-api-key", "--no-input"]
+    ) == 0
     assert (account("kaggle_a") / "cookie").read_text(encoding="utf-8").strip() == cookie
 
 
@@ -167,14 +251,10 @@ def test_a_login_with_username_and_key_also_writes_the_api_token(
         assert token_path.stat().st_mode & 0o777 == 0o600
 
 
-def test_a_login_with_only_the_cookie_writes_no_token(isolated_home, accept_cookie) -> None:
-    assert main(["login", "kaggle", "kaggle_a", "--cookie", make_cookie(), "--no-input"]) == 0
-    assert not (account("kaggle_a") / "kaggle.json").exists()
-
-
 def test_a_kaggle_login_records_the_workspace(isolated_home, accept_cookie) -> None:
     assert main(
         ["login", "kaggle", "kaggle_a", "--cookie", make_cookie(),
+         "--username", "irack000", "--key", "the-api-key",
          "--workspace", "/kaggle/working/letify", "--no-input"]
     ) == 0
     assert home_config()["kaggle_a"]["workspace"] == "/kaggle/working/letify"
@@ -256,8 +336,9 @@ def test_a_cookie_unexpired_but_refused_online_is_reported_as_that(
     """Spec "Kaggle account": the exp claim can say days are left while Kaggle has already
     invalidated the cookie server side; the online check is what catches that, not exp.
     """
-    import letify
     from conftest import _Reply
+
+    import letify
     from letify.providers import kaggle as kaggle_module
 
     def answer(request, timeout=None):
@@ -274,8 +355,9 @@ def test_a_session_is_refused_the_same_way_an_already_dead_cookie_is(
     fake_kaggle, monkeypatch
 ) -> None:
     """The same online check guards starting a session, not only reading usage."""
-    import letify
     from conftest import _Reply
+
+    import letify
     from letify.providers import kaggle as kaggle_module
 
     def answer(request, timeout=None):

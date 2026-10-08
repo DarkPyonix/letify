@@ -773,16 +773,45 @@ def read_kaggle_cookie(answers: Answers, given: str | None) -> str:
 
 
 #: ``kaggle.json`` keys for the API token, and the prompts for them when a terminal asks.
-KAGGLE_USERNAME_PROMPT = "Kaggle username (blank to skip the API token): "
+KAGGLE_USERNAME_PROMPT = "Kaggle username: "
 KAGGLE_KEY_PROMPT = "Kaggle API key, from Settings > API on kaggle.com: "
+
+#: What kaggle.com puts in front of the key it shows. The official CLI reads the rest.
+KAGGLE_KEY_PREFIX = "KGAT_"
+
+
+def read_kaggle_token(answers: Answers) -> tuple[str, str]:
+    """The Kaggle username and API key, from the flags or from a prompt for each.
+
+    Both are required: the cookie cannot run the official CLI and the token cannot mint the
+    Jupyter proxy URL, so an account needs the pair. Spec "Kaggle account".
+    """
+    given = answers.get("username")
+    username = given.strip() if isinstance(given, str) else ""
+    if not username and answers.interactive:
+        username = read_line(KAGGLE_USERNAME_PROMPT).strip()
+    given = answers.get("key")
+    key = given.strip() if isinstance(given, str) else ""
+    if not key and answers.interactive:
+        key = read_password(KAGGLE_KEY_PROMPT).strip()
+    # kaggle.com shows the key with this prefix, and the official CLI reads it without.
+    if key.startswith(KAGGLE_KEY_PREFIX):
+        key = key[len(KAGGLE_KEY_PREFIX) :]
+    if not username or not key:
+        raise LoginError(
+            f"{answers.alias} needs the Kaggle API token beside the cookie. Make one at "
+            f"kaggle.com under Settings, API, then pass --username and --key, or drop "
+            f"--no-input to be asked for them."
+        )
+    return username, key
 
 
 def write_kaggle_token(alias: str, username: str, key: str) -> None:
     """Write ``kaggle.json`` in the account directory, the shape the official CLI reads.
 
-    The token is never required: it only widens what the official CLI covers for this
-    account (deleting the notebook a run created, reading the weekly quota), and a run with
-    just the cookie still works, falling back to the cookie-based path for both.
+    The token is required beside the cookie: it is what runs the official CLI for the work
+    that does not need the live web session, such as deleting the notebook a run created and
+    reading the weekly quota.
     """
     import json
 
@@ -806,6 +835,7 @@ def kaggle_account(answers: Answers) -> dict[str, Any]:
     """
     from ..providers import kaggle as kg
 
+    username, key = read_kaggle_token(answers)
     given = answers.get(KAGGLE_COOKIE) or answers.token
     cookie = read_kaggle_cookie(answers, given if isinstance(given, str) else None)
     try:
@@ -827,10 +857,7 @@ def kaggle_account(answers: Answers) -> dict[str, Any]:
     record_workspace(answers, options)
     store_secret(answers.alias, KAGGLE_COOKIE, cookie)
 
-    username = answers.get("username")
-    key = answers.get("key")
-    if isinstance(username, str) and username and isinstance(key, str) and key:
-        write_kaggle_token(answers.alias, username, key)
+    write_kaggle_token(answers.alias, username, key)
     return options
 
 
