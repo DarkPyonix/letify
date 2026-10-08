@@ -65,6 +65,11 @@ KAGGLE_KERNEL = Tool(
     pins=("jupyter-kernel-client<1",),
 )
 
+#: The official Kaggle CLI, run with the account's API token, never the cookie. It does
+#: everything that does not require the live web session: creating and deleting the
+#: ephemeral notebook, and reading the weekly quota.
+KAGGLE_CLI = Tool(package="kaggle", executable="kaggle", python="3.13")
+
 #: The Kaggle adapter file, run by path so it needs nothing of letify's own environment.
 KAGGLE_ADAPTER = Path(__file__).parent / "providers" / "kaggle_adapter.py"
 
@@ -153,6 +158,29 @@ def modal_adapter_command(uv: str) -> list[str]:
     return script_command(MODAL, uv, MODAL_ADAPTER)
 
 
+def kaggle_cli_command(uv: str) -> list[str]:
+    """The argument list that runs the official Kaggle CLI through uv."""
+    return command(KAGGLE_CLI, uv)
+
+
+def kaggle_config_path(alias: str) -> Path:
+    """``~/.letify/accounts/<alias>/kaggle.json``, the account's API token, when it has one."""
+    return account_directory(alias) / "kaggle.json"
+
+
+def kaggle_cli_environment(alias: str) -> dict[str, str]:
+    """The environment the Kaggle CLI runs in: its own config directory, not the real ``HOME``.
+
+    ``KAGGLE_CONFIG_DIR`` points the CLI at the account directory, where ``kaggle.json`` was
+    written at login, so two accounts on one machine never share a token.
+    """
+    env = dict(os.environ)
+    path = kaggle_config_path(alias)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    env["KAGGLE_CONFIG_DIR"] = str(path.parent)
+    return env
+
+
 def modal_config_path(alias: str) -> Path:
     """``~/.letify/accounts/<alias>/modal.toml``, where one account's Modal token lives."""
     return account_directory(alias) / "modal.toml"
@@ -175,12 +203,16 @@ def modal_environment(alias: str) -> dict[str, str]:
 
 __all__ = [
     "COLAB",
+    "KAGGLE_CLI",
     "MODAL",
     "MODAL_ADAPTER",
     "Tool",
     "command",
     "environment",
     "find_uv",
+    "kaggle_cli_command",
+    "kaggle_cli_environment",
+    "kaggle_config_path",
     "missing_uv_message",
     "modal_adapter_command",
     "modal_config_path",
