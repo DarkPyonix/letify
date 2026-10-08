@@ -639,6 +639,8 @@ The adapter never deploys an app. `create` starts `modal.App(app).run()` the fir
 
 The local side pickles `(function, args, kwargs)` with cloudpickle, protocol 5 and a `buffer_callback`, and sends `{"op": "call", "payload": <pickle>, "buffers": [<out-of-band buffers>]}` as one message in [frames](#frames). The outcome comes back as the message `{"ok": True, "value": <value>}` or `{"ok": False, "error": <text>, "traceback": <text>}`, so a large returned value travels as out-of-band buffers too.
 
+For a function defined in an IPython session, the session's user module is shipped by value, even when its name is not `__main__`. Referenced classes, functions and other definitions from any cell of that session travel with the call without `Env.ship()`. Installed modules imported by those cells retain their normal by-reference serialization. This applies to persistent and one-shot channels and requires no IPython installation in the runtime.
+
 Base64 appears only where a transport carries text: the one-shot driver, the Colab contents API, and the JSON lines of the Modal adapter.
 
 On a one-shot channel the call travels inside a driver script that prints its base64 encoded outcome between `__LETIFY_RESULT_BEGIN__` and `__LETIFY_RESULT_END__`, so it can be found in a stream that also carries the user's prints. Absence of the marker is not a protocol quirk: it means the remote process died, and letify reports that as `ProtocolError` naming the likely causes.
