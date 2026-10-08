@@ -73,7 +73,14 @@ class CommandRendezvous(Rendezvous):
 class ColabRendezvous(CommandRendezvous):
     """``colab exec`` on one runtime. A Colab VM has no SSH server, so each request starts one."""
 
-    def __init__(self, run: Callable[[str, float], str], public_key: str | None = None):
+    def __init__(
+        self,
+        run: Callable[[str, float], str],
+        public_key: str | None = None,
+        *,
+        prepare_tailcat: Callable[[], str | None] | None = None,
+    ):
+        self._prepare_tailcat = prepare_tailcat
         self._run = run
         self.public_key = public_key
         self.binary: str | None = None
@@ -86,9 +93,15 @@ class ColabRendezvous(CommandRendezvous):
         extra: dict[str, Any] = {"start_sshd": True}
         if self.public_key:
             extra["authorized_key"] = self.public_key
-        if self.binary is not None:
-            extra["binary"] = self.binary
         return extra
+
+    def exchange(self, request: dict[str, Any], timeout: float) -> dict[str, Any]:
+        if request.get("kind") == "tailcat":
+            if self.binary is None and self._prepare_tailcat is not None:
+                self.binary = self._prepare_tailcat()
+            if self.binary is not None:
+                request = {**request, "binary": self.binary}
+        return super().exchange(request, timeout)
 
     def run_python(self, source: str, timeout: float) -> str:
         return self._run(source, timeout)

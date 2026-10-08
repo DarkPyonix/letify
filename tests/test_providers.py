@@ -15,6 +15,7 @@ import hashlib
 import json
 import os
 import sys
+import threading
 from importlib import import_module
 from pathlib import Path
 
@@ -2635,14 +2636,16 @@ def test_every_provider_start_accepts_the_keywords_the_pool_passes() -> None:
         assert not missing, f"{cls.__name__}.start lacks {sorted(missing)}"
 
 
-def test_colab_prepares_tailcat_before_the_connection_race(
+def test_colab_prepares_verified_tailcat_only_when_its_strategy_requests_an_endpoint(
     isolated_home, patch_which, patch_run, monkeypatch
 ) -> None:
-    # Spec "Colab", Runtime tools: installation failure cannot silently lose the race.
+    # Spec "Colab", Runtime tools: lazy preparation keeps verification strict.
     from letify import install
 
     patch_which(tools_module, present=True)
-    found = FakeCompleted(stdout='LETIFY-TAILCAT "/remote/tailcat"\n')
+    found = FakeCompleted(
+        stdout='LETIFY-TAILCAT "/remote/tailcat"\nLETIFY-ANSWER {"address": "fake"}\n'
+    )
     recorder = patch_run(colab_module, result=found)
     monkeypatch.setattr(install, "find", lambda *a, **k: "/local/tailcat")
     key = Path.home() / "id.pub"
@@ -2650,12 +2653,16 @@ def test_colab_prepares_tailcat_before_the_connection_race(
     provider = provider_of(Colab, key=str(key)[:-4])
     runtime = type("R", (), {"name": "live"})()
     target = provider.target(runtime)
+    assert recorder.calls == []
+    target.rendezvous.tailcat_endpoint(22, 30)
     assert recorder.command == [*COLAB_CLI, "exec", "-s", "live"]
-    assert "SHA-256" in recorder.calls[-1]["input"]
-    assert target.rendezvous.extras()["binary"] == "/remote/tailcat"
+    assert "SHA-256" in recorder.calls[0]["input"]
+    assert '"binary": "/remote/tailcat"' in recorder.calls[-1]["input"]
+    assert "binary" not in target.rendezvous.extras()
+    assert target.rendezvous.binary == "/remote/tailcat"
     patch_run(colab_module, result=FakeCompleted(returncode=1, stderr="tailcat SHA-256 mismatch"))
     with pytest.raises(letify.RuntimeFailure, match="SHA-256"):
-        provider.target(type("R", (), {"name": "another"})())
+        provider.target(type("R", (), {"name": "another"})()).rendezvous.tailcat_endpoint(22, 30)
 
 
 def test_colab_requires_the_daemon_to_acknowledge_startup(
@@ -2791,3 +2798,91 @@ def test_colab_exec_command_timeout_names_its_limit_and_kernel(
     assert "notebook kernel" in str(caught.value)
     assert caught.value.stderr == "kernel stalled"
     assert caught.value.__cause__ is expired
+
+
+def test_colab_rendezvous_completes_while_a_wake_holds_the_account_lock(
+    isolated_home, patch_which, patch_run
+) -> None:
+    # Spec "Colab", Rendezvous scheduling: a running wake cannot delay a punch.
+    from letify.config.secrets import account_directory
+    from letify.providers import colab_keepalive as daemon
+
+    patch_which(tools_module, present=True)
+    provider = provider_of(Colab, "colab_a")
+    runtime = type("R", (), {"name": "live"})()
+    entered = threading.Event()
+    release = threading.Event()
+    answers = []
+
+    def respond(command):
+        if command[0] == "fake-wake":
+            entered.set()
+            assert release.wait(5)
+            return FakeCompleted()
+        return FakeCompleted(stdout='LETIFY-ANSWER {"pong": true}\n')
+
+    patch_run(colab_module, result=respond)
+    config = {
+        "command": ["fake-wake"], "session": "live",
+        "directory": str(account_directory(provider.alias) / ".config" / "colab-cli"),
+    }
+    waking = threading.Thread(target=lambda: daemon.wake(config))
+    punching = threading.Thread(
+        target=lambda: answers.append(
+            provider.rendezvous(runtime).exchange({"kind": "tcp_punch"}, 30)
+        )
+    )
+    waking.start()
+    try:
+        assert entered.wait(2)
+        punching.start()
+        punching.join(2)
+        assert answers == [{"pong": True}]
+        assert waking.is_alive()
+    finally:
+        release.set()
+        waking.join(2)
+        if punching.ident is not None:
+            punching.join(2)
+
+
+def test_colab_punch_rendezvous_completes_during_tailcat_installation(
+    isolated_home, patch_which, patch_run, monkeypatch
+) -> None:
+    # Spec "Colab", Runtime tools: installation cannot occupy the punch path.
+    from letify import install
+
+    patch_which(tools_module, present=True)
+    monkeypatch.setattr(install, "find", lambda *a, **k: "/local/tailcat")
+    key = Path.home() / "id.pub"
+    key.write_text("ssh-ed25519 AAAA")
+    provider = provider_of(Colab, key=str(key)[:-4])
+    recorder = patch_run(colab_module)
+    target = provider.target(type("R", (), {"name": "live"})())
+    assert recorder.calls == []
+    entered = threading.Event()
+    release = threading.Event()
+    endpoints = []
+
+    def respond(command):
+        source = recorder.calls[-1]["input"]
+        if "SHA-256" in source:
+            entered.set()
+            assert release.wait(5)
+            return FakeCompleted(stdout='LETIFY-TAILCAT "/remote/tailcat"\n')
+        return FakeCompleted(stdout='LETIFY-ANSWER {"address": "fake", "pong": true}\n')
+
+    recorder.result = respond
+    installing = threading.Thread(
+        target=lambda: endpoints.append(target.rendezvous.tailcat_endpoint(22, 30))
+    )
+    installing.start()
+    try:
+        assert entered.wait(2)
+        assert target.rendezvous.exchange({"kind": "tcp_punch"}, 30)["pong"] is True
+        assert installing.is_alive()
+        assert "binary" not in target.rendezvous.extras()
+    finally:
+        release.set()
+        installing.join(2)
+    assert endpoints == [("fake", 22)]
