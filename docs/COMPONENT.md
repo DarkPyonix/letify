@@ -94,7 +94,7 @@ Provider
 ├── Modal      persistent, a sandbox with framed pipes, reached through the Modal adapter
 └── Shell      ephemeral by default, SSH transport
     ├── Colab  Colab CLI for sessions, its SSH bridge or exec for the channel
-    ├── Tunnel Tailscale or frp first, then SSH
+    ├── Tunnel Tailcat UDP hole punch first, then SSH; no relay
     └── Elice  Elice Cloud API allocates, then SSH
 ```
 
