@@ -1205,15 +1205,25 @@ The worker reports `sys.version_info[:2]` in its ready line. After the environme
 
 ### Module shipping
 
-> Modules in the lock file are installed remotely by name. Modules that are not travel with the call.
+> Modules in the lock file are installed remotely by name. Modules named by `Env.ship()` are materialized on the runtime and imported by name.
 
-A package the lock file names is installed in the runtime and referenced by name. A package it does not name, such as the project's own code or an editable install, has to be sent by value, because the remote side either lacks it or holds an older copy. `Env.ship()` overrides the inference.
+A package the lock file names is installed in the runtime and referenced by name. A package it does not name, such as the project's own code or an editable install, travels with the call when named in `Env.ship()`.
 
-Sending a module by value means `cloudpickle.register_pickle_by_value(module)`: an object from that module, when it is captured as a global reference in the shipped function's closure, travels inside the call's payload. It does not install the module in the runtime and does not make it importable there. Two limits follow from that, and both are a property of by-value shipping, not a bug in it.
+A module named in `Env.ship()` is placed on the runtime inside the workspace root under `<workspace root>/modules`, and that directory is added to the worker's `sys.path` and `PYTHONPATH` before deserializing the call. Because the module is importable by name on both the local process and the runtime, functions, classes and objects from that module travel by reference rather than by value.
 
-A `from package import name` or `import package` statement that runs inside the declared function's body, rather than at module load time outside it, executes on the runtime's own interpreter against the runtime's own `sys.path`. A package named in `Env.ship()` is not on that path, so the import raises `ModuleNotFoundError` there even though the same package reached the call fine as a captured global. The worker recognizes this case (a `ModuleNotFoundError` raised while the call body runs, naming a module that was asked to ship by value) and raises with an explanation instead of the bare `ModuleNotFoundError`, saying to reference the name as a global captured at declaration time instead of importing it inside the body, or to install the package in the runtime's environment so it can be imported there by reference.
+Importing the shipped module inside the declared function's body (`from package import name` or `import package`) succeeds because `<workspace root>/modules` is on the interpreter's `sys.path`. Class identity across local arguments and runtime imports is preserved: a class passed as an argument and one imported on the runtime resolve to the same object in `sys.modules`, so `isinstance` and `issubclass` hold.
 
-A class sent by value becomes a distinct class object in the runtime: it is reconstructed from the payload, not looked up by import. When the runtime's own code imports the same name from the same package by reference, for example because that package is also installed in the runtime's environment, the two are not the same object, so `isinstance` and `issubclass` across them fail even though the class names and definitions match. There is no fix for this inside by-value shipping; the module has to be referenced by name on both sides for identity to hold, which means it has to be installed in the runtime and not shipped by value. `Env.ship()` is therefore for packages the runtime cannot install, and a package whose remote code branches on `isinstance` or `issubclass` of a shipped type has to be made installable in the runtime (an sdist or a local path dependency the lock file names) instead of shipped.
+A child process the body starts with `multiprocessing` (including the `spawn` and `forkserver` start methods) or `subprocess` finds the shipped module because `<workspace root>/modules` is set on `PYTHONPATH` in the process environment. On a one-shot channel, the driver script materializes the shipped module files under `<workspace root>/modules` and puts that directory on `sys.path` and `PYTHONPATH` before deserializing the call payload.
+
+The files of a shipped module are collected from the local filesystem through the module's `__file__` or `__path__`. Python source files (`.py`) and package data files are included. Directory entries named `__pycache__`, `.git` or `.venv`, compiled Python bytecode (`.pyc`, `.pyo`), temporary and editor swap files are excluded.
+
+Shipped files are transferred through the content addressed blob store under `<workspace root>/data/blobs`, reusing the digest cache and chunked pipeline transfer. Missing blobs are placed before the call runs. When all files of a shipped module already exist in the runtime's blob store from a prior call, zero file bytes are transferred and the cached blobs are linked into `<workspace root>/modules`. Every path written for shipped modules stays inside `<workspace root>/modules`.
+
+Limits:
+
+1. A module or package containing a compiled extension (`.so`, `.dylib`, `.pyd`, `.dll`) is refused at collection with `ConfigError`, naming the module and the compiled extension path. Compiled extensions are platform specific and must be installed via the lock file in the runtime environment instead.
+2. A module whose source files cannot be located on disk, such as a built-in C module, is refused at collection with `ConfigError`.
+3. A shipped module whose import has side effects requiring resources absent on the runtime fails on the runtime with an import error reporting the module and the cause. There is no silent fallback to by-value serialization.
 
 ## Transport
 
@@ -1543,6 +1553,7 @@ Every remote write is constrained to the designated workspace root (`~/.letify-r
 | `<workspace root>/bin/uv` | Standalone `uv` binary installed when missing on the runtime | account `workspace` setting |
 | `<workspace root>/volumes/<name>` | Materialized volume blobs and data | account `workspace` setting |
 | `<workspace root>/blobs` | Argument blobs on persistent providers | account `workspace` setting |
+| `<workspace root>/modules` | Shipped module sources placed on the runtime and added to sys.path | account `workspace` setting |
 | `<workspace root>/tmp/letify-<hex>` | Ephemeral reverse SSH key directory on remote instance | account `workspace` setting |
 
 **Documented remote exceptions:**
