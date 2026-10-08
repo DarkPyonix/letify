@@ -14,14 +14,12 @@ Spec "Module shipping":
 
 from __future__ import annotations
 
-import os
 import shutil
 import subprocess
 import sys
 from collections.abc import Generator
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any
 
 import pytest
 
@@ -50,7 +48,9 @@ def project(tmp_path: Path, monkeypatch) -> Path:
 
 
 @contextmanager
-def temporary_package(directory: Path, name: str, files: dict[str, str]) -> Generator[None, None, None]:
+def temporary_package(
+    directory: Path, name: str, files: dict[str, str]
+) -> Generator[None, None, None]:
     """Create a temporary importable package on sys.path and clean it up completely."""
     pkg_dir = directory / name
     pkg_dir.mkdir(parents=True, exist_ok=True)
@@ -125,7 +125,11 @@ def test_class_passed_as_argument_preserves_identity_and_issubclass(
 
 
 def test_shipped_module_files_travel_once_and_second_call_reuses_cache(
-    let: letify.Launcher, cpu: letify.Instance, project: Path, tmp_path: Path, capsys: pytest.CaptureFixture
+    let: letify.Launcher,
+    cpu: letify.Instance,
+    project: Path,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture,
 ) -> None:
     # Shipped modules travel through the content addressed blob store and are cached on the runtime.
     # The first call places the files; a second call finds them in the cache and transfers 0 blobs.
@@ -143,7 +147,7 @@ def test_shipped_module_files_travel_once_and_second_call_reuses_cache(
             return cache_pkg.helper()
 
         assert run_call() == 100
-        out1 = capsys.readouterr().err
+        capsys.readouterr()
 
         assert run_call() == 100
         out2 = capsys.readouterr().err
@@ -193,7 +197,8 @@ def test_compiled_extension_in_shipped_module_is_refused(
         def call_native() -> None:
             pass
 
-        with pytest.raises(letify.ConfigError, match=r"cannot ship 'native_pkg'.*compiled extension"):
+        expected = r"cannot ship 'native_pkg'.*compiled extension"
+        with pytest.raises(letify.ConfigError, match=expected):
             call_native()
 
 
@@ -212,6 +217,7 @@ def test_missing_module_in_ship_raises_config_error(
 
 def test_one_shot_driver_imports_shipped_module_and_preserves_subclass(tmp_path: Path) -> None:
     from importlib import import_module
+
     from letify.protocol import codec, driver
 
     files = {
@@ -229,5 +235,5 @@ def test_one_shot_driver_imports_shipped_module_and_preserves_subclass(tmp_path:
         source = driver.build(work, (mod.Derived,), {}, modules=("oneshot_pkg",))
         result = subprocess.run([sys.executable, "-c", source], capture_output=True, text=True)
         assert result.returncode == 0
-        logs, value = codec.parse(result.stdout, runtime_key="one-shot")
+        _logs, value = codec.parse(result.stdout, runtime_key="one-shot")
         assert value is True

@@ -228,7 +228,7 @@ def test_a_body_that_imports_a_shipped_module_succeeds_when_shipped(tmp_path: Pa
     (package / "__init__.py").write_text("def helper_value():\n    return 42\n", encoding="utf-8")
     sys.path.insert(0, str(tmp_path))
     try:
-        shippkg = import_module("shippkg")
+        import_module("shippkg")
 
         def work() -> int:
             import shippkg
@@ -265,7 +265,8 @@ def test_a_shipped_class_preserves_subclass_on_the_runtime(tmp_path: Path) -> No
             return issubclass(derived, shipcls.Base)
 
         stdout = subprocess.run(
-            [sys.executable, "-c", driver.build(work, (shipcls.Derived,), {}, modules=("shipcls",))],
+            [sys.executable, "-c",
+             driver.build(work, (shipcls.Derived,), {}, modules=("shipcls",))],
             capture_output=True,
             text=True,
             timeout=120,
