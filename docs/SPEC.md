@@ -1363,6 +1363,8 @@ The remote half of a punch, a Tailcat listener or a reverse forward is one stand
 
 Tailcat is run as `tailcat serve <port>` on the remote side, which prints `Server listening with new address: <address>`, and as `tailcat <address> <port>` in an SSH `ProxyCommand` on the user's side. It is applicable only when `tailcat` is on the user's PATH.
 
+The remote half reads that address line from the process's own output, and then keeps reading and discarding the rest of it for as long as the process lives. Any remote helper letify starts and reads a line from is drained the same way. A pipe holds about 64 KiB, so a helper whose output nobody reads blocks on its next write once that is full and stops moving bytes. For `tailcat serve` that shows up as a link that connects and then measures far below the link it is carried over, because the stall begins partway through the first transfer. Draining also means the continuation that waits for the process cannot deadlock against a full pipe.
+
 ### Reverse SSH <!-- id: reverse-ssh -->
 
 > An opt-in strategy for a remote machine that can reach the user's machine over SSH. It is not raced by default.
