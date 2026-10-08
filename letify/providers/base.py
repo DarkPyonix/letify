@@ -99,8 +99,8 @@ class Provider(abc.ABC):
         """What this account has, read from the entry's device table.
 
         This is the only thing that bounds how much runs at once. An entry that declares
-        nothing falls back to whatever the provider discovers, one of each, because a
-        provider that can be asked should not have to be told.
+        nothing falls back to the device counts of the shapes the provider discovers,
+        because a provider that can be asked should not have to be told.
         """
         if self._inventory is None:
             declared = read_table(self.config.options)
@@ -108,7 +108,7 @@ class Provider(abc.ABC):
                 # Keyed by what an instance calls itself, so a discovered shape and its
                 # inventory entry are the same name. A CPU shape reports "cpu".
                 declared = {
-                    instance.accelerator: Devices(instance.accelerator)
+                    instance.accelerator: Devices(instance.accelerator, count=instance.devices)
                     for instance in self.discover().values()
                 }
             self._inventory = declared
