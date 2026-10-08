@@ -63,6 +63,9 @@ class Answers:
     token: str | None = None
     interactive: bool = True
     install_key: bool = True
+    #: Run the kind's whole flow again for an alias that already exists, so a credential
+    #: can be renewed. Spec "Logging in".
+    replace: bool = False
 
     def get(self, name: str) -> Any:
         return self.values.get(name)
@@ -1001,6 +1004,8 @@ def log_in(answers: Answers, *, project: str | Path | None = None) -> tuple[bool
     Returns whether the account was newly written, and the two files touched. An account
     already in the home file is not asked for again, which is the common case in a second
     repository: the account was set up once and this project just needs to name it.
+    ``replace`` runs the flow again for such an account, which is how a credential is
+    renewed. Spec "Logging in".
     """
     check_alias(answers.alias)
     if answers.kind not in FLOWS:
@@ -1009,7 +1014,8 @@ def log_in(answers: Answers, *, project: str | Path | None = None) -> tuple[bool
 
     home = home_path()
     existing = home.read_text(encoding="utf-8") if home.is_file() else ""
-    fresh = not writer.has_block(existing, answers.alias)
+    declared = not writer.has_block(existing, answers.alias)
+    fresh = declared or answers.replace
     devices = None
     if fresh:
         options = FLOWS[answers.kind](answers)
