@@ -73,7 +73,10 @@ def test_a_cookie_is_kept_owner_only_and_never_in_the_config(
     isolated_home, accept_cookie, capsys
 ) -> None:
     cookie = make_cookie()
-    assert main(["login", "kaggle", "kaggle_a", "--cookie", cookie, "--username", "irack000", "--key", "the-api-key", "--no-input"]) == 0
+    assert main(
+        ["login", "kaggle", "kaggle_a", "--cookie", cookie,
+         "--username", "irack000", "--key", "the-api-key", "--no-input"]
+    ) == 0
 
     stored = account("kaggle_a") / "cookie"
     assert stored.read_text(encoding="utf-8").strip() == cookie
@@ -194,7 +197,10 @@ def test_a_cookie_can_be_read_from_a_file(isolated_home, accept_cookie, tmp_path
     cookie = make_cookie()
     path = tmp_path / "kaggle_cookie.txt"
     path.write_text(cookie, encoding="utf-8")
-    assert main(["login", "kaggle", "kaggle_a", "--cookie", str(path), "--username", "irack000", "--key", "the-api-key", "--no-input"]) == 0
+    assert main(
+        ["login", "kaggle", "kaggle_a", "--cookie", str(path),
+         "--username", "irack000", "--key", "the-api-key", "--no-input"]
+    ) == 0
     assert (account("kaggle_a") / "cookie").read_text(encoding="utf-8").strip() == cookie
 
 
