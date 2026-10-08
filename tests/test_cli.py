@@ -133,6 +133,7 @@ def test_every_subcommand_is_reachable_from_the_parser() -> None:
         "logout",
         "probe",
         "providers",
+        "sessions",
         "setup",
         "status",
         "stubs",
