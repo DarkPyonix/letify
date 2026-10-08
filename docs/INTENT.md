@@ -72,6 +72,7 @@ A report that omits one of the four is incomplete, and its claim stays open.
 - **The local process stays alive for the duration of a run.** letify does not offer detached execution. A detached run whose remote side is evicted loses its results, so the local process stays the owner and the durable artifacts are checkpoints in the store.
 - **Nothing is torn down by hand.** No release call and no shutdown call on the public surface. A call ends its own session, an idle one is reaped, and the lease covers a crash.
 - **No credential in a tracked file.** Accounts live in `~/.letify/config.toml`, and credentials live in the environment or in `~/.letify/accounts`.
+- **A slow link is a failure, not a fallback.** letify connects over a link fast enough for the work, or it refuses to connect and says why. A relayed or otherwise degraded path that merely completes is worse than no connection: it bills GPU hours while the transfer dominates the run, and the user cannot see that from the result. So no relay path is offered, and a measured link below the floor the account declares fails the connection.
 - **Colab accelerators require a paid entitlement.** The remote control features letify uses are permitted on paid plans while the compute unit balance is positive.
 
 ## Non-goals
