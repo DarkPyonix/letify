@@ -300,13 +300,20 @@ class Runtime:
                 )
         self.last_used = time.monotonic()
         outcome = None
+        # Each output file comes back as soon as it is complete, while the call still
+        # runs, so a long call's checkpoints do not wait for its return. Spec "Writing back".
+        back = pathdata.WriteBack(self, collector, blobs) if collector.outputs else None
+        if back is not None:
+            back.start()
         try:
             outcome = self.channel.request(request, timeout=timeout)
         finally:
+            if back is not None:
+                back.cancel()
             added = self._finish_data(stream, call_dir)
             try:
                 if outcome is not None and collector.outputs:
-                    added += pathdata.write_back(self, collector, blobs)
+                    added += pathdata.write_back(self, collector, blobs, back)
             finally:
                 if added:
                     pathdata.evict(self, blobs)
