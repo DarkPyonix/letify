@@ -2132,6 +2132,8 @@ An alias whose provider cannot be built prints `{"alias": <string>, "unavailable
 
 > `letify-ext/` is a VS Code extension that shows the remaining quota and GPU load in the status bar, read only through the JSON above.
 
+The extension is published under the `darkpyonix` publisher, which is the account that owns the repository, so its Marketplace identity is `darkpyonix.letify-status`. The `publisher` field of `letify-ext/package.json` has to match the account a release is pushed from, or `vsce` refuses the upload.
+
 The extension runs `uv run letify <command> --json` in the first workspace folder. The command is the setting `letify.command`. It reads usage every `letify.usageIntervalSeconds`, 60 by default, and utilization and status every `letify.utilizationIntervalSeconds`, 10 by default while its view is visible and at the usage interval otherwise. It makes no network call of its own and writes no credential anywhere.
 
 The quota status bar item shows the account with the lowest remaining share, `remaining / limit`, as `<alias> <percent>% left`, with `(<time to reset>)` when `resets_at` is known. An account with no limit is ranked after every account with one. The item turns to the warning color when the share left is below `letify.warningPercent`, 20 by default, and to the error color below `letify.errorPercent`, 5 by default. The GPU item shows `GPU <free>/<total> free <mean>%` when any device reports a `holder`, where a device is free when its `holder` is `free`. When no device reports one it shows `GPU <busy>/<total> busy <mean>%`, where a device is busy at `letify.busyPercent`, 10 by default, or above. The mean is over devices that report utilization.
