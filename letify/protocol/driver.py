@@ -13,12 +13,14 @@ is no blob table, so every large argument travels again on every call.
 from __future__ import annotations
 
 import base64
+from collections.abc import Sequence
+from pathlib import Path
 from typing import Any
 
 from .codec import BEGIN, END, PROTOCOL_VERSION, dumps_call
 
 _TEMPLATE = """
-import base64, pickle, sys, traceback
+import base64, os, pickle, sys, traceback
 _PAYLOAD = "{payload}"
 _BEGIN, _END = "{begin}", "{end}"
 _VERSION = {version}
@@ -27,15 +29,22 @@ _NO_LETIFY = (
     "to letify (for example through letify.session_cache), cannot be loaded. Add it to "
     "the project with 'uv add letify' so uv.lock carries it into the runtime."
 )
-_SHIP_IS_NOT_INSTALL = (
-    "{{name!r}} is not importable in this runtime while the call's body was running. "
-    "Env.ship() sends a module by value: an object from it that the function captures "
-    "as a global is carried inside the call's payload, but the module itself is never "
-    "installed in the runtime, so 'import {{name}}' inside the function body has nothing "
-    "to find. Reference the name as a global the function closes over instead of "
-    "importing it inside the body, or install the package in the runtime's environment "
-    "(name it in uv.lock) so it can be imported there by reference."
-)
+_MODULES = {modules_code}
+_WORKSPACE = {workspace_root!r}
+if _MODULES:
+    _modules_dir = os.path.join(os.path.expanduser(_WORKSPACE), "modules")
+    os.makedirs(_modules_dir, exist_ok=True)
+    for _rel, _b64 in _MODULES.items():
+        _target = os.path.join(_modules_dir, _rel)
+        os.makedirs(os.path.dirname(_target), exist_ok=True)
+        with open(_target, "wb") as _f:
+            _f.write(base64.b64decode(_b64))
+    if _modules_dir not in sys.path:
+        sys.path.insert(0, _modules_dir)
+    _existing = os.environ.get("PYTHONPATH", "")
+    _parts = [p for p in _existing.split(os.pathsep) if p]
+    if _modules_dir not in _parts:
+        os.environ["PYTHONPATH"] = os.pathsep.join([_modules_dir, *_parts])
 
 def _emit(obj):
     try:
@@ -84,8 +93,6 @@ else:
     except BaseException as exc:
         if isinstance(exc, ModuleNotFoundError) and (exc.name or "").split(".")[0] == "letify":
             _error = _NO_LETIFY
-        elif isinstance(exc, ModuleNotFoundError):
-            _error = _SHIP_IS_NOT_INSTALL.format(name=exc.name)
         else:
             _error = "{{}}: {{}}".format(type(exc).__name__, exc)
         _emit({{
@@ -98,14 +105,36 @@ else:
 """
 
 
-def build(fn: Any, args: tuple, kwargs: dict) -> str:
+def build(
+    fn: Any,
+    args: tuple,
+    kwargs: dict,
+    *,
+    modules: Sequence[str] = (),
+    workspace_root: str = "~/.letify-runtime",
+) -> str:
     """Return the script that runs one call and prints its outcome."""
     payload = base64.b64encode(dumps_call(fn, args, kwargs)).decode()
+    modules_dict: dict[str, str] = {}
+    if modules:
+        from ..store.pathdata import collect_module
+
+        modules_root = f"{workspace_root.rstrip('/')}/modules"
+        for mod_name in modules:
+            placed = collect_module(mod_name, modules_root)
+            prefix = mod_name.replace(".", "/")
+            for rel, _digest, _size, local in placed.entries:
+                content = Path(local).read_bytes()
+                target_rel = f"{prefix}/{rel}" if placed.directory else prefix + Path(local).suffix
+                modules_dict[target_rel] = base64.b64encode(content).decode("ascii")
+
     return _TEMPLATE.format(
         payload=payload,
         begin=BEGIN,
         end=END,
         version=PROTOCOL_VERSION,
+        modules_code=repr(modules_dict),
+        workspace_root=workspace_root,
     )
 
 

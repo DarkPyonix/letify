@@ -43,7 +43,7 @@ Packages named in the lock file are installed in the runtime and referenced by n
 letify infers this from the lock file. Override the inference only when you need to:
 
 ```python
-env = env.ship("mypkg")     # send this module by value
+env = env.ship("mypkg")     # ship this module to the runtime
 ```
 
 This is why editing code and rerunning is cheap. Code is a few hundred kilobytes; the environment and the data are the expensive parts, and they are cached.

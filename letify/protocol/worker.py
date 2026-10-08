@@ -195,16 +195,6 @@ _NO_LETIFY = (
     "the project with 'uv add letify' so uv.lock carries it into the runtime."
 )
 
-_SHIP_IS_NOT_INSTALL = (
-    "{name!r} is not importable in this runtime while the call's body was running. "
-    "Env.ship() sends a module by value: an object from it that the function captures "
-    "as a global is carried inside the call's payload, but the module itself is never "
-    "installed in the runtime, so 'import {name}' inside the function body has nothing "
-    "to find. Reference the name as a global the function closes over instead of "
-    "importing it inside the body, or install the package in the runtime's environment "
-    "(name it in uv.lock) so it can be imported there by reference."
-)
-
 
 def _ship_main_to_children(cloudpickle):
     """Let a child process the body spawns rebuild what the caller's __main__ defined.
@@ -266,6 +256,15 @@ def _reply(stream, outcome):
 
 def _op_call(request):
     data = request.pop("data", None)
+    modules_dir = request.pop("modules_dir", None)
+    if modules_dir:
+        modules_dir = os.path.expanduser(modules_dir)
+        if modules_dir not in sys.path:
+            sys.path.insert(0, modules_dir)
+        existing = os.environ.get("PYTHONPATH", "")
+        parts = [p for p in existing.split(os.pathsep) if p]
+        if modules_dir not in parts:
+            os.environ["PYTHONPATH"] = os.pathsep.join([modules_dir, *parts])
     if data is None:
         return _call(request)
     state = _data_register(data)
@@ -872,10 +871,18 @@ def _data_place_now(state, path, entry):
     # turns it into a private copy. Spec "Materializing and the rewritten path".
     linked = False
     try:
-        os.link(source, path)
-        linked = True
+        if os.path.exists(path) and os.stat(path).st_ino == os.stat(source).st_ino:
+            linked = True
     except OSError:
         pass
+    if not linked:
+        try:
+            if os.path.exists(path):
+                os.remove(path)
+            os.link(source, path)
+            linked = True
+        except OSError:
+            pass
     if not linked:
         # Copied to a name of its own and renamed into place, so a reader never stats a
         # file that is half written. Spec "What the body sees before a file arrives".
@@ -1533,15 +1540,7 @@ def _call(request):
         # refers to it when loaded, so the same explanation applies.
         if (exc.name or "").split(".")[0] == "letify":
             raise ModuleNotFoundError(_NO_LETIFY, name=exc.name) from exc
-        # A package Env.ship() sends by value never lands on this runtime's
-        # sys.path: cloudpickle only puts a captured global in the payload, it
-        # does not install anything. An import statement inside the body still
-        # runs against this interpreter's own path and fails here, even though
-        # the same name reached the call fine as a global. Say so, because the
-        # bare ModuleNotFoundError reads as a missing dependency rather than as
-        # this shape of call.
-        explained = _SHIP_IS_NOT_INSTALL.format(name=exc.name)
-        raise ModuleNotFoundError(explained, name=exc.name) from exc
+        raise
     return {"ok": True, "value": value}
 
 
