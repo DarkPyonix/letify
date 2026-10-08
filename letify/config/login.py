@@ -773,17 +773,35 @@ def read_kaggle_cookie(answers: Answers, given: str | None) -> str:
 
 
 #: ``kaggle.json`` keys for the API token, and the prompts for them when a terminal asks.
-KAGGLE_USERNAME_PROMPT = "Kaggle username (blank to skip the API token): "
+KAGGLE_USERNAME_PROMPT = "Kaggle username: "
 KAGGLE_KEY_PROMPT = "Kaggle API key, from Settings > API on kaggle.com: "
 
 
-def write_kaggle_token(alias: str, username: str, key: str) -> None:
-    """Write ``kaggle.json`` in the account directory, the shape the official CLI reads.
+def read_kaggle_token(answers: Answers, given_username: str | None, given_key: str | None) -> tuple[str, str]:
+    """Return the username and key, from the values given or a prompt; never from a file.
 
-    The token is never required: it only widens what the official CLI covers for this
-    account (deleting the notebook a run created, reading the weekly quota), and a run with
-    just the cookie still works, falling back to the cookie-based path for both.
+    Both are required: the cookie starts and ends the interactive session and mints its
+    Jupyter proxy URL, and everything else, deleting the notebook a run created and reading
+    the weekly quota, goes through the official CLI, which needs this token. An account
+    with only the cookie cannot do either, so login refuses rather than declaring an
+    account that would fail the first time it tries.
     """
+    username = (given_username or "").strip()
+    if not username and answers.interactive:
+        username = read_line(KAGGLE_USERNAME_PROMPT).strip()
+    key = (given_key or "").strip()
+    if not key and answers.interactive:
+        key = read_password(KAGGLE_KEY_PROMPT).strip()
+    if not username or not key:
+        raise LoginError(
+            f"{answers.alias} needs the Kaggle API token too: pass --username and --key, "
+            f"the pair from Settings > API on kaggle.com, or drop --no-input."
+        )
+    return username, key
+
+
+def write_kaggle_token(alias: str, username: str, key: str) -> None:
+    """Write ``kaggle.json`` in the account directory, the shape the official CLI reads."""
     import json
 
     from .. import tools
@@ -796,13 +814,15 @@ def write_kaggle_token(alias: str, username: str, key: str) -> None:
 
 
 def kaggle_account(answers: Answers) -> dict[str, Any]:
-    """Store the browser session cookie and prove it names a live login.
+    """Store the browser session cookie and the API token, and prove the cookie is live.
 
-    The cookie is checked for shape and expiry before any network call, then proven with a
-    read of the account. Nothing is written until the check passes. An API token
-    (``--username`` and ``--key``, the pair from Settings > API on kaggle.com) is stored
-    alongside it when given, so the official CLI can be used for everything that does not
-    need the live web session; the cookie stays the only way to mint the Jupyter proxy URL.
+    Two credentials, and both are required. The cookie starts and ends the interactive
+    session and mints its Jupyter proxy URL; it is checked for shape and expiry before any
+    network call, then proven with a read of the account. The API token runs the official
+    CLI for everything else, deleting the notebook a run created and reading the weekly
+    quota; it is checked for presence only, since proving it would mean calling the CLI
+    from inside login, which this function leaves to the first command that uses it.
+    Nothing is written until every check passes.
     """
     from ..providers import kaggle as kg
 
@@ -818,6 +838,7 @@ def kaggle_account(answers: Answers) -> dict[str, Any]:
             f"{answers.alias}: that Kaggle cookie expired on {expiry:%Y-%m-%d}; log in to "
             f"kaggle.com again and copy a fresh cookie"
         )
+    username, key = read_kaggle_token(answers, answers.get("username"), answers.get("key"))
     try:
         kg.verify_cookie(cookie)
     except ValueError as exc:
@@ -826,11 +847,7 @@ def kaggle_account(answers: Answers) -> dict[str, Any]:
     options: dict[str, Any] = {"kind": answers.kind}
     record_workspace(answers, options)
     store_secret(answers.alias, KAGGLE_COOKIE, cookie)
-
-    username = answers.get("username")
-    key = answers.get("key")
-    if isinstance(username, str) and username and isinstance(key, str) and key:
-        write_kaggle_token(answers.alias, username, key)
+    write_kaggle_token(answers.alias, username, key)
     return options
 
 
