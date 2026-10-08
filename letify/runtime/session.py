@@ -657,8 +657,13 @@ class Runtime:
 
 
 def _pickled(value: Any, immutable: bool) -> dict[str, Any]:
-    """A ``put_blob`` message for a value: its protocol 5 pickle and out-of-band buffers."""
-    head, buffers = protocol.wire.pickle_parts(value)
+    """A ``put_blob`` message for a value: its protocol 5 pickle and out-of-band buffers.
+
+    Pickled with ``codec.pickle_value_parts``, cloudpickle underneath, so a class or
+    function the caller defined locally ships by value instead of by name, the same as
+    it does when it is small enough to travel inlined in the call payload.
+    """
+    head, buffers = protocol.codec.pickle_value_parts(value)
     return {"kind": "pickle", "immutable": immutable, "head": head, "buffers": buffers}
 
 
