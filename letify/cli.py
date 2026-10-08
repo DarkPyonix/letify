@@ -148,6 +148,11 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="ask an already declared machine for its GPUs again and replace its devices table",
     )
+    log_in.add_argument(
+        "--replace",
+        action="store_true",
+        help="run the login again for an alias that already exists, to renew its credentials",
+    )
 
     log_out = sub.add_parser("logout", help="remove an account from this machine")
     log_out.add_argument("alias", help="provider alias to forget")
@@ -471,6 +476,7 @@ def _dispatch(args: argparse.Namespace) -> int:
             token=args.token,
             interactive=args.interactive,
             install_key=args.install_key,
+            replace=args.replace,
         )
         try:
             fresh, home, project = login.log_in(answers, project=args.config)
@@ -478,9 +484,14 @@ def _dispatch(args: argparse.Namespace) -> int:
             _fail(str(exc))
             return 1
         if fresh:
-            _say("ok", f"{alias} declared in {home}")
+            what = "renewed" if args.replace else "declared"
+            _say("ok", f"{alias} {what} in {home}")
         else:
-            _say("warn", f"{alias} was already declared in {home}, so nothing was asked for")
+            _say(
+                "warn",
+                f"{alias} was already declared in {home}, so nothing was asked for. "
+                f"Pass --replace to renew its credentials",
+            )
         _say("ok", f"{alias} referenced in {project}, which is safe to commit")
         return 0
 
