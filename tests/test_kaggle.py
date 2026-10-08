@@ -282,6 +282,7 @@ def test_a_run_refuses_to_start_with_under_an_hour_left_on_the_cookie(isolated_h
     import letify
     from letify.config.secrets import write_secret
 
+    write_secret("kaggle_a", "username", "irack000")
     soon = datetime.now(UTC) + timedelta(minutes=30)
     write_secret("kaggle_a", "cookie", make_cookie(soon.strftime("%Y-%m-%dT%H:%M:%SZ")))
     runtime = type("R", (), {"name": "letify-t4-1"})()
@@ -839,7 +840,7 @@ def test_a_session_without_a_readable_owner_is_refused_before_creating_a_noteboo
         owner_path.unlink()
     else:
         owner_path.write_bytes(contents)
-    with pytest.raises(ConfigError, match="letify login kaggle kaggle_a.*--username"):
+    with pytest.raises(ConfigError, match=r"letify login kaggle kaggle_a.*--username"):
         session_channel(fake_kaggle)
     assert fake_kaggle.cloud_calls == []
     assert fake_kaggle.kernels == set()
