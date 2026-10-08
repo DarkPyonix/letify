@@ -89,14 +89,18 @@ def environment_volume(provider: Provider) -> Volume:
     """The automatic environment store when an ephemeral declaration names no volumes.
 
     Spec "Materializing into a runtime": reuse the account's data bucket, or keep the
-    archive on the client without requiring a bucket or a volume declaration.
+    archive on the client without requiring a bucket or a volume declaration. The client
+    store is the declared ``~/.letify/cache/storage/<name>`` root with the name
+    ``environments``, so it stays under the single local root while still reading archives
+    an earlier install left under ``~/.cache/letify/environments``.
     """
+    from ..paths import storage_cache_directory
     from .backends.filesystem import FilesystemBackend
     from .pathdata import data_bucket
 
     backend = data_bucket(provider)
     if backend is None:
-        root = Path.home() / ".cache" / "letify" / "environments" / provider.kind / provider.alias
+        root = storage_cache_directory("environments") / provider.kind / provider.alias
         backend = FilesystemBackend(root)
     return Volume(provider, "environments", _store=Store(backend))
 
