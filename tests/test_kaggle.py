@@ -94,7 +94,10 @@ def test_an_expired_cookie_is_refused_with_nothing_written(
     isolated_home, accept_cookie, capsys
 ) -> None:
     expired = make_cookie("2000-01-01T00:00:00Z")
-    assert main(["login", "kaggle", "kaggle_a", "--cookie", expired, "--no-input"]) == 1
+    assert main(
+        ["login", "kaggle", "kaggle_a", "--cookie", expired,
+         "--username", "irack000", "--key", "the-api-key", "--no-input"]
+    ) == 1
     assert "expired" in capsys.readouterr().err
     assert not (Path.home() / ".letify" / "config.toml").exists()
     assert not (account("kaggle_a") / "cookie").exists()
@@ -103,7 +106,10 @@ def test_an_expired_cookie_is_refused_with_nothing_written(
 
 def test_a_cookie_missing_a_required_name_is_refused(isolated_home, accept_cookie, capsys) -> None:
     partial = make_cookie(drop=["ka_sessionid"])
-    assert main(["login", "kaggle", "kaggle_a", "--cookie", partial, "--no-input"]) == 1
+    assert main(
+        ["login", "kaggle", "kaggle_a", "--cookie", partial,
+         "--username", "irack000", "--key", "the-api-key", "--no-input"]
+    ) == 1
     assert "missing" in capsys.readouterr().err
     assert not (account("kaggle_a") / "cookie").exists()
 
@@ -115,14 +121,19 @@ def test_a_cookie_the_account_check_rejects_writes_nothing(
         raise ValueError("the Kaggle cookie was refused; log in to kaggle.com for a fresh one")
 
     monkeypatch.setattr("letify.providers.kaggle.verify_cookie", reject)
-    assert main(["login", "kaggle", "kaggle_a", "--cookie", make_cookie(), "--no-input"]) == 1
+    assert main(
+        ["login", "kaggle", "kaggle_a", "--cookie", make_cookie(),
+         "--username", "irack000", "--key", "the-api-key", "--no-input"]
+    ) == 1
     assert "refused" in capsys.readouterr().err
     assert not (account("kaggle_a") / "cookie").exists()
     assert not (Path.home() / ".letify" / "config.toml").exists()
 
 
 def test_no_input_without_a_cookie_refuses(isolated_home, accept_cookie, capsys) -> None:
-    assert main(["login", "kaggle", "kaggle_a", "--no-input"]) == 1
+    assert main(
+        ["login", "kaggle", "kaggle_a", "--username", "irack000", "--key", "k", "--no-input"]
+    ) == 1
     assert "--cookie" in capsys.readouterr().err
 
 
@@ -177,10 +188,27 @@ def test_the_token_is_asked_for_beside_the_cookie(
     monkeypatch.setattr(login, "read_password", read_password)
     monkeypatch.setattr(login, "read_line", read_line)
     assert main(["login", "kaggle", "kaggle_a"]) == 0
-    assert hidden == [login.KAGGLE_COOKIE_PROMPT, login.KAGGLE_KEY_PROMPT]
+    # The token comes first, because it is fetched from a page rather than a browser tab.
+    assert hidden == [login.KAGGLE_KEY_PROMPT, login.KAGGLE_COOKIE_PROMPT]
     assert clear == [login.KAGGLE_USERNAME_PROMPT]
     stored = json.loads((account("kaggle_a") / "kaggle.json").read_text(encoding="utf-8"))
     assert stored == {"username": "irack000", "key": "the-api-key"}
+
+
+def test_a_key_pasted_with_the_kgat_prefix_is_stored_without_it(
+    isolated_home, accept_cookie
+) -> None:
+    """Spec "Kaggle account": kaggle.com shows the key prefixed, the CLI reads the rest."""
+    import json
+
+    thirty_two = "a1b2c3d4e5f60718293a4b5c6d7e8f90"
+    assert main(
+        ["login", "kaggle", "kaggle_a", "--cookie", make_cookie(),
+         "--username", "irack000", "--key", login.KAGGLE_KEY_PREFIX + thirty_two,
+         "--no-input"]
+    ) == 0
+    stored = json.loads((account("kaggle_a") / "kaggle.json").read_text(encoding="utf-8"))
+    assert stored == {"username": "irack000", "key": thirty_two}
 
 
 def test_no_input_without_a_token_refuses(isolated_home, accept_cookie, capsys) -> None:
