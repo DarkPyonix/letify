@@ -776,6 +776,9 @@ def read_kaggle_cookie(answers: Answers, given: str | None) -> str:
 KAGGLE_USERNAME_PROMPT = "Kaggle username: "
 KAGGLE_KEY_PROMPT = "Kaggle API key, from Settings > API on kaggle.com: "
 
+#: What kaggle.com puts in front of the key it shows. The official CLI reads the rest.
+KAGGLE_KEY_PREFIX = "KGAT_"
+
 
 def read_kaggle_token(answers: Answers) -> tuple[str, str]:
     """The Kaggle username and API key, from the flags or from a prompt for each.
@@ -791,6 +794,9 @@ def read_kaggle_token(answers: Answers) -> tuple[str, str]:
     key = given.strip() if isinstance(given, str) else ""
     if not key and answers.interactive:
         key = read_password(KAGGLE_KEY_PROMPT).strip()
+    # kaggle.com shows the key with this prefix, and the official CLI reads it without.
+    if key.startswith(KAGGLE_KEY_PREFIX):
+        key = key[len(KAGGLE_KEY_PREFIX) :]
     if not username or not key:
         raise LoginError(
             f"{answers.alias} needs the Kaggle API token beside the cookie. Make one at "
@@ -829,6 +835,7 @@ def kaggle_account(answers: Answers) -> dict[str, Any]:
     """
     from ..providers import kaggle as kg
 
+    username, key = read_kaggle_token(answers)
     given = answers.get(KAGGLE_COOKIE) or answers.token
     cookie = read_kaggle_cookie(answers, given if isinstance(given, str) else None)
     try:
@@ -850,7 +857,6 @@ def kaggle_account(answers: Answers) -> dict[str, Any]:
     record_workspace(answers, options)
     store_secret(answers.alias, KAGGLE_COOKIE, cookie)
 
-    username, key = read_kaggle_token(answers)
     write_kaggle_token(answers.alias, username, key)
     return options
 
