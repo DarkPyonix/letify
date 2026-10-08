@@ -28,8 +28,8 @@ READY = "LETIFY-KEEP-ALIVE ready"
 
 
 @contextlib.contextmanager
-def account_lock(directory: Path) -> Iterator[None]:
-    """Serialize full kernel commands sharing one account's CLI state."""
+def account_lock(directory: Path, *, blocking: bool = True) -> Iterator[bool]:
+    """Serialize wakes sharing account CLI state, optionally without waiting."""
     directory.mkdir(parents=True, exist_ok=True)
     with (directory / "letify-wake.lock").open("a+b") as handle:
         if os.name == "nt":  # pragma: no cover - Windows file locking
@@ -38,13 +38,23 @@ def account_lock(directory: Path) -> Iterator[None]:
             handle.write(b"\0")
             handle.flush()
             handle.seek(0)
-            msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
+            try:
+                msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK if blocking else msvcrt.LK_NBLCK, 1)
+            except OSError:
+                if blocking:
+                    raise
+                yield False
+                return
         else:
             import fcntl
 
-            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            try:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | (0 if blocking else fcntl.LOCK_NB))
+            except BlockingIOError:
+                yield False
+                return
         try:
-            yield
+            yield True
         finally:
             if os.name == "nt":  # pragma: no cover - Windows file locking
                 handle.seek(0)
@@ -60,7 +70,15 @@ def wake(config: dict[str, Any]) -> float:
     result = None
     exc = None
     try:
-        with account_lock(Path(config["directory"])):
+        with account_lock(Path(config["directory"]), blocking=False) as acquired:
+            if not acquired:
+                entry = record(config, "wake_skipped", reason="account_busy")
+                print(
+                    f"{entry['timestamp']} letify: wake {config['session']} skipped: account busy",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                return SUCCESS_INTERVAL
             result = subprocess.run(
                 command, input="pass\n", capture_output=True, text=True, timeout=WAKE_TIMEOUT
             )

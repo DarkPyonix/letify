@@ -220,70 +220,60 @@ def test_a_worker_call_whose_body_imports_letify_while_running_names_the_reason(
     assert "letify is not installed" in reply["error"] and "uv add letify" in reply["error"]
 
 
-def test_a_body_that_imports_a_shipped_module_names_the_reason(tmp_path: Path) -> None:
-    # Spec "Module shipping": a module Env.ship() sends by value never lands on the
-    # runtime's sys.path, so an import inside the body, as opposed to a global the
-    # function closes over, finds nothing there even though the call itself loads.
+def test_a_body_that_imports_a_shipped_module_succeeds_when_shipped(tmp_path: Path) -> None:
+    # Spec "Module shipping": a module named in ship() is materialized under the workspace
+    # modules directory and placed on sys.path, so an import inside the body succeeds.
     package = tmp_path / "shippkg"
     package.mkdir()
     (package / "__init__.py").write_text("def helper_value():\n    return 42\n", encoding="utf-8")
     sys.path.insert(0, str(tmp_path))
     try:
-        shippkg = import_module("shippkg")
-        cloudpickle.register_pickle_by_value(shippkg)
+        import_module("shippkg")
 
         def work() -> int:
             import shippkg
 
             return shippkg.helper_value()
 
-        stdout = run_script(driver.build(work, (), {}))
-        with pytest.raises(letify.RemoteError, match=r"'shippkg' is not importable.*Env\.ship"):
-            codec.parse(stdout, runtime_key="one-shot")
+        stdout = run_script(driver.build(work, (), {}, modules=("shippkg",)))
+        assert codec.parse(stdout, runtime_key="one-shot")[1] == 42
+
+        stdout_missing = run_script(driver.build(work, (), {}))
+        with pytest.raises(letify.RemoteError, match=r"No module named 'shippkg'"):
+            codec.parse(stdout_missing, runtime_key="one-shot")
     finally:
-        cloudpickle.unregister_pickle_by_value(shippkg)
         sys.path.remove(str(tmp_path))
         sys.modules.pop("shippkg", None)
 
 
-def test_a_class_sent_by_value_is_not_the_class_the_runtime_imports(tmp_path: Path) -> None:
-    # Spec "Module shipping": by-value shipping reconstructs a class instead of looking
-    # it up by import, so it is a distinct object from the same-named class the runtime
-    # imports by reference. This pins the documented limit, not a fix: issubclass across
-    # the two fails on purpose, and the workaround is to stop shipping the module by
-    # value and install it in the runtime instead.
+def test_a_shipped_class_preserves_subclass_on_the_runtime(tmp_path: Path) -> None:
+    # Spec "Module shipping": shipped modules travel by reference and resolve to the same
+    # class in sys.modules, so issubclass across argument and runtime import holds.
     sender_dir = tmp_path / "sender"
     sender_dir.mkdir()
     (sender_dir / "shipcls.py").write_text(
         "class Base:\n    pass\n\n\nclass Derived(Base):\n    pass\n", encoding="utf-8"
     )
-    remote_dir = tmp_path / "remote"
-    remote_dir.mkdir()
-    (remote_dir / "shipcls.py").write_text("class Base:\n    pass\n", encoding="utf-8")
 
     sys.path.insert(0, str(sender_dir))
     try:
         shipcls = import_module("shipcls")
-        cloudpickle.register_pickle_by_value(shipcls)
 
         def work(derived: type) -> bool:
             import shipcls
 
             return issubclass(derived, shipcls.Base)
 
-        env = {**os.environ, "PYTHONPATH": str(remote_dir)}
         stdout = subprocess.run(
-            [sys.executable, "-c", driver.build(work, (shipcls.Derived,), {})],
+            [sys.executable, "-c",
+             driver.build(work, (shipcls.Derived,), {}, modules=("shipcls",))],
             capture_output=True,
             text=True,
             timeout=120,
-            env=env,
-            cwd=remote_dir,
         ).stdout
         _logs, value = codec.parse(stdout, runtime_key="one-shot")
-        assert value is False
+        assert value is True
     finally:
-        cloudpickle.unregister_pickle_by_value(shipcls)
         sys.path.remove(str(sender_dir))
         sys.modules.pop("shipcls", None)
 

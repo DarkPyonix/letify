@@ -19,10 +19,11 @@ import threading
 import time
 import tomllib
 from dataclasses import dataclass, field
+from importlib import import_module
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from ..errors import RemoteError, RuntimeFailure
+from ..errors import ConfigError, RemoteError, RuntimeFailure
 
 if TYPE_CHECKING:
     from ..providers.base import Provider
@@ -49,6 +50,9 @@ PROGRESS_THRESHOLD = 64 << 20
 
 #: Directory entries a directory walk never enters.
 SKIPPED = frozenset({".git", ".venv", "__pycache__"})
+
+#: Compiled extension suffixes that are platform specific and rejected for module shipping.
+COMPILED_EXTENSIONS = frozenset({".so", ".dylib", ".pyd", ".dll"})
 
 #: The first wave's limits, as spec "The send order and the first wave" sets them.
 FIRST_WAVE_MIB = 512.0
@@ -184,6 +188,105 @@ class Placed:
     output: bool = False
 
 
+def collect_module(
+    name: str,
+    modules_root: str,
+    cache: DigestCache | None = None,
+) -> Placed:
+    """Collect source and package data files for an importable module or package.
+
+    Raises ConfigError if the module cannot be imported, has no files on disk, or contains
+    compiled extensions (.so, .dylib, .pyd, .dll).
+    """
+    try:
+        module = import_module(name)
+    except ImportError as exc:
+        raise ConfigError(
+            f"cannot ship {name!r}, because it does not import here: {exc}. "
+            f"ship() names a module this process can import, not a file path."
+        ) from exc
+
+    mod_file = None
+    if getattr(module, "__file__", None):
+        try:
+            mod_file = Path(module.__file__).resolve()
+        except (OSError, RuntimeError):
+            mod_file = None
+
+    if mod_file and mod_file.suffix in COMPILED_EXTENSIONS:
+        raise ConfigError(
+            f"cannot ship {name!r}: compiled extension found ({mod_file}). "
+            f"Shipped modules must be pure Python; install platform-specific packages "
+            f"in the environment via uv.lock instead."
+        )
+
+    digest_cache = cache or DigestCache()
+    pkg_paths = getattr(module, "__path__", None)
+    if pkg_paths:
+        pkg_dir = None
+        for p in pkg_paths:
+            try:
+                candidate = Path(p).resolve()
+                if candidate.is_dir():
+                    pkg_dir = candidate
+                    break
+            except (OSError, RuntimeError):
+                continue
+        if pkg_dir is None and mod_file and mod_file.parent.is_dir():
+            pkg_dir = mod_file.parent
+
+        if pkg_dir is None or not pkg_dir.is_dir():
+            raise ConfigError(
+                f"cannot ship {name!r}: package directory not found on disk."
+            )
+
+        runtime_dir = f"{modules_root.rstrip('/')}/{name.replace('.', '/')}"
+        entries = []
+        for root_dir, dir_names, file_names in os.walk(pkg_dir, followlinks=False):
+            dir_names[:] = [
+                d for d in dir_names
+                if d not in SKIPPED and not d.startswith(".")
+            ]
+            for file_name in file_names:
+                file_path = Path(root_dir) / file_name
+                if file_path.suffix in COMPILED_EXTENSIONS:
+                    raise ConfigError(
+                        f"cannot ship {name!r}: compiled extension found ({file_path}). "
+                        f"Shipped modules must be pure Python; install platform-specific packages "
+                        f"in the environment via uv.lock instead."
+                    )
+                if (
+                    file_path.suffix in {".pyc", ".pyo", ".swp"}
+                    or file_name == ".DS_Store"
+                    or file_name.startswith(".#")
+                ):
+                    continue
+                if not file_path.is_file():
+                    continue
+                try:
+                    info = file_path.stat()
+                except OSError:
+                    continue
+                rel = file_path.relative_to(pkg_dir).as_posix()
+                digest = digest_cache.digest(file_path, info)
+                entries.append((rel, digest, info.st_size, str(file_path)))
+        entries.sort()
+        return Placed(pkg_dir, runtime_dir, True, entries=entries)
+
+    if mod_file and mod_file.is_file():
+        rel = f"{name.replace('.', '/')}{mod_file.suffix}"
+        runtime_file = f"{modules_root.rstrip('/')}/{rel}"
+        info = mod_file.stat()
+        digest = digest_cache.digest(mod_file, info)
+        entries = [(mod_file.name, digest, info.st_size, str(mod_file))]
+        return Placed(mod_file, runtime_file, False, entries=entries)
+
+    raise ConfigError(
+        f"cannot ship {name!r}: module has no source file on disk. "
+        f"Shipped modules must be Python source files or packages."
+    )
+
+
 class Collector:
     """Replaces local data paths in a pickled call with their runtime paths."""
 
@@ -272,10 +375,16 @@ class Collector:
         entries.sort()
         return entries
 
-    def request(self, blobs: str) -> dict[str, Any]:
+    def collect_module(self, name: str, modules_root: str) -> Placed:
+        """Collect source and package data files for a module named in Env.ship()."""
+        placed = collect_module(name, modules_root, cache=self.cache)
+        self.placed[f"module:{name}"] = placed
+        return placed
+
+    def request(self, blobs: str, *, extra_dirs: Any = ()) -> dict[str, Any]:
         """The ``data`` field of the call request: directories to make and links to place."""
         links = []
-        dirs = []
+        dirs = list(extra_dirs)
         outputs = []
         for placed in self.placed.values():
             if placed.directory:
@@ -292,7 +401,7 @@ class Collector:
         return {
             "dir": self.call_dir,
             "blobs": blobs,
-            "dirs": dirs,
+            "dirs": list(dict.fromkeys(dirs)),
             "links": links,
             "outputs": outputs,
         }

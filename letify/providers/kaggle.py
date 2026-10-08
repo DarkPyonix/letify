@@ -65,12 +65,12 @@ if TYPE_CHECKING:
     from ..runtime.channel import Channel
     from ..runtime.session import Runtime
 
-#: Accelerators a Kaggle session can be started with, the memory of one card, and the name
-#: the internal API knows the card by. Both are ones the web app offers, so a session can be
-#: started on either. CPU is the empty compute, so it carries no accelerator name.
+#: GPU session shapes, with memory per card, device count and the internal API name.
+#: P100 remains available through the API although the web UI no longer lists it.
+#: CPU is the empty compute, so it carries no accelerator name.
 GPUS = {
-    "P100": {"vram_gb": 16, "accelerator": "NVIDIA_TESLA_P100"},
-    "T4": {"vram_gb": 16, "accelerator": "NVIDIA_TESLA_T4"},
+    "P100": {"vram_gb": 16, "devices": 1, "accelerator": "NVIDIA_TESLA_P100"},
+    "T4": {"vram_gb": 16, "devices": 2, "accelerator": "NVIDIA_TESLA_T4"},
 }
 TPUS = ("TPU_V3_8",)
 
@@ -974,7 +974,10 @@ class Kaggle(Provider):
         """The fixed list of accelerators a Kaggle session offers. No call is made."""
         table: dict[str, Instance] = {"CPU": Instance(self, gpu=None)}
         table.update(
-            {name: Instance(self, gpu=name, vram_gb=spec["vram_gb"]) for name, spec in GPUS.items()}
+            {
+                name: Instance(self, gpu=name, vram_gb=spec["vram_gb"], devices=spec["devices"])
+                for name, spec in GPUS.items()
+            }
         )
         table.update({name: Instance(self, tpu=name) for name in TPUS})
         return table
@@ -1050,7 +1053,7 @@ class Kaggle(Provider):
         cookie = self._require_live_cookie()
         instance = getattr(runtime, "instance", None)
         gpu = getattr(instance, "gpu", None)
-        accelerator = GPUS[gpu]["accelerator"] if gpu in GPUS else None
+        accelerator = GPUS[gpu]["accelerator"] if gpu in GPUS else getattr(instance, "tpu", None)
         run, url, notebook, slug = live_session_url(self.alias, cookie, accelerator)
         session = Session(self.alias, url)
         session.wait_alive()

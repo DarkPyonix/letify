@@ -146,13 +146,6 @@ def prepare_tool_links(alias: str) -> None:
         link_target = colab_config / "token.json"
         _ensure_symlink(link_target, token_account)
 
-    # Kaggle token
-    kaggle_account = acct / "kaggle.json"
-    if kaggle_account.is_file():
-        kaggle_dir = tool_home / ".kaggle"
-        kaggle_dir.mkdir(parents=True, exist_ok=True)
-        link_target = kaggle_dir / "kaggle.json"
-        _ensure_symlink(link_target, kaggle_account)
 
 
 def sync_tool_credentials(alias: str) -> None:
@@ -179,22 +172,6 @@ def sync_tool_credentials(alias: str) -> None:
             colab_token.unlink()
             _ensure_symlink(colab_token, token_account)
 
-    # Kaggle token if written
-    kaggle_token = tool_home / ".kaggle" / "kaggle.json"
-    kaggle_account = acct / "kaggle.json"
-    if kaggle_token.is_file():
-        is_link_to_target = False
-        if kaggle_token.is_symlink():
-            try:
-                is_link_to_target = kaggle_token.resolve() == kaggle_account.resolve()
-            except OSError:
-                is_link_to_target = False
-        if not is_link_to_target:
-            kaggle_account.write_bytes(kaggle_token.read_bytes())
-            if sys.platform != "win32":
-                kaggle_account.chmod(0o600)
-            kaggle_token.unlink()
-            _ensure_symlink(kaggle_token, kaggle_account)
 
     # Clean non-credential files and directories from account directory
     if acct.exists():

@@ -222,6 +222,50 @@ def test_a_token_pasted_with_the_kgat_prefix_is_stored_verbatim(
     assert stored == "KGAT_" + thirty_two
 
 
+def test_a_renewal_asks_for_the_token_and_blank_keeps_the_stored_one(
+    isolated_home, accept_cookie, monkeypatch
+) -> None:
+    """Spec "Kaggle account": a renewal asks for each credential; blank keeps what is stored.
+
+    The cookie is a thirty day session and the token lasts until it is rotated, so renewing
+    the expired one must not demand the other. Reusing a stored token without asking made
+    renewal a no-op, which left an account stuck on a token Kaggle had stopped accepting.
+    """
+    first = make_cookie()
+    assert main(
+        ["login", "kaggle", "kaggle_a", "--cookie", first,
+         "--username", "irack000", "--key", "KGAT_first", "--no-input"]
+    ) == 0
+    assert (account("kaggle_a") / "access_token").read_text(encoding="utf-8") == "KGAT_first"
+
+    second = make_cookie()
+    asked: list[str] = []
+
+    def hidden(prompt: str) -> str:
+        asked.append(prompt)
+        # Blank for the token keeps the stored one; the cookie is the one being renewed.
+        return "" if prompt.startswith(login.KAGGLE_TOKEN_PROMPT) else second
+
+    monkeypatch.setattr(login, "read_password", hidden)
+    monkeypatch.setattr(login, "read_line", lambda prompt: "irack000")
+    assert main(["login", "kaggle", "kaggle_a", "--replace"]) == 0
+    assert any(prompt.startswith(login.KAGGLE_TOKEN_PROMPT) for prompt in asked), (
+        "a renewal has to ask rather than reuse"
+    )
+    assert (account("kaggle_a") / "access_token").read_text(encoding="utf-8") == "KGAT_first"
+    assert (account("kaggle_a") / "cookie").read_text(encoding="utf-8").strip() == second
+
+
+def test_a_renewal_with_nothing_stored_refuses_a_blank_token(
+    isolated_home, accept_cookie, monkeypatch
+) -> None:
+    """Spec "Kaggle account": a blank answer with nothing stored is refused."""
+    monkeypatch.setattr(login, "read_password", lambda prompt: "")
+    monkeypatch.setattr(login, "read_line", lambda prompt: "irack000")
+    assert main(["login", "kaggle", "kaggle_a"]) == 1
+    assert not (account("kaggle_a") / "access_token").exists()
+
+
 def test_a_cookie_can_be_read_from_a_file(isolated_home, accept_cookie, tmp_path) -> None:
     cookie = make_cookie()
     path = tmp_path / "kaggle_cookie.txt"
@@ -249,6 +293,21 @@ def kaggle_provider():
     from letify.providers import Kaggle
 
     return provider_of(Kaggle, "kaggle_a")
+
+
+@pytest.mark.parametrize("name, devices", [("T4", 2), ("P100", 1)])
+def test_a_kaggle_gpu_instance_declares_its_card_count(name, devices) -> None:
+    """Spec "Kaggle": the stable GPU names carry their session's card count."""
+    instance = getattr(kaggle_provider(), name)
+    assert instance.gpu == name
+    assert instance.tpu is None
+    assert instance.devices == devices
+    assert instance.vram_gb == 16
+    assert instance.provider.devices_of(name).count == devices
+    assert instance.provider.reserve(instance) == ()
+    assert instance.provider.reserve(instance) is None
+    instance.provider.unreserve(name, (), devices)
+    assert instance.provider.reserve(instance) == ()
 
 
 def test_a_kaggle_account_is_a_known_provider_kind() -> None:
@@ -496,6 +555,35 @@ def session_channel(fake_kaggle, name: str = "letify-t4-1"):
     provider = kaggle_provider()
     runtime = type("R", (), {"name": name})()
     return provider, runtime, provider.open_channel(runtime)
+
+
+@pytest.mark.parametrize("name, accelerator", [
+    ("TPU_V3_8", "TPU_V3_8"),
+    ("T4", "NVIDIA_TESLA_T4"),
+    ("P100", "NVIDIA_TESLA_P100"),
+    ("CPU", None),
+])
+def test_a_kaggle_instance_requests_its_declared_accelerator(
+    fake_kaggle, fake_kaggle_cli, name, accelerator
+) -> None:
+    """Spec "Kaggle": CommitAndRun requests the declared GPU, TPU or CPU session."""
+    provider = kaggle_provider()
+    instance = getattr(provider, name)._placed("remote")
+    if name == "TPU_V3_8":
+        assert instance.tpu == name
+        assert instance.gpu is None
+    runtime = type("R", (), {"name": f"letify-{name}-1", "instance": instance})()
+    try:
+        provider.open_channel(runtime)
+        runs = [body for path, body in fake_kaggle.cloud_calls if path.endswith("CommitAndRun")]
+        assert len(runs) == 1
+        compute = runs[0]["compute"]
+        if accelerator is None:
+            assert "accelerator" not in compute
+        else:
+            assert compute["accelerator"] == accelerator
+    finally:
+        provider.stop(runtime)
 
 
 def test_a_fresh_notebook_is_created_for_every_run_not_reused(fake_kaggle) -> None:
@@ -976,10 +1064,15 @@ def test_a_token_body_is_not_restricted_to_the_measured_length(
     assert (account("kaggle_a") / "access_token").read_text() == "KGAT_synthetic"
 
 
-def test_login_reuses_the_existing_access_token_without_asking_for_it(
+def test_a_login_that_asks_nothing_keeps_the_stored_token(
     isolated_home, accept_cookie, monkeypatch
 ) -> None:
-    """Spec "Kaggle": an existing account keeps its token when adding the owner."""
+    """Spec "Kaggle account": a blank answer, or no prompt at all, keeps the stored token.
+
+    An interactive renewal asks for the token so a dead credential can be replaced, which
+    test_a_renewal_asks_for_the_token_and_blank_keeps_the_stored_one pins. With every other
+    credential supplied and no terminal to ask at, the stored token stands unchanged.
+    """
     from letify.config.secrets import write_secret
 
     token_path = write_secret("kaggle_a", "access_token", API_TOKEN)
@@ -990,7 +1083,7 @@ def test_login_reuses_the_existing_access_token_without_asking_for_it(
 
     monkeypatch.setattr(login, "read_password", refuse_prompt)
     assert main(["login", "kaggle", "kaggle_a", "--cookie", make_cookie(),
-                 "--username", "irack000"]) == 0
+                 "--username", "irack000", "--no-input"]) == 0
     assert token_path.read_bytes() == original
     assert (account("kaggle_a") / "username").read_text() == "irack000"
     assert not (account("kaggle_a") / "api_token").exists()

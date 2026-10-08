@@ -756,12 +756,25 @@ def colab_account(answers: Answers) -> dict[str, Any]:
 KAGGLE_COOKIE = "cookie"
 KAGGLE_COOKIE_PROMPT = "Kaggle cookie (from a logged-in kaggle.com tab): "
 
+#: What each credential prompt adds on a renewal, where a blank answer keeps the stored
+#: one. Spec "Kaggle account".
+KAGGLE_KEEP_SUFFIX = "[blank keeps the stored one] "
 
-def read_kaggle_cookie(answers: Answers, given: str | None) -> str:
-    """Return the cookie string, from the value given, a file it names, or a prompt."""
+
+def read_kaggle_cookie(answers: Answers, given: str | None, stored: str | None = None) -> str:
+    """Return the cookie string, from the value given, a file it names, or a prompt.
+
+    On a renewal the prompt says a blank answer keeps ``stored``, so the cookie, which is a
+    thirty day session, can be replaced without repasting the token. Spec "Kaggle account".
+    """
     text = (given or "").strip()
     if not text and answers.interactive:
-        text = read_password(KAGGLE_COOKIE_PROMPT).strip()
+        prompt = KAGGLE_COOKIE_PROMPT
+        if stored:
+            prompt = f"{KAGGLE_COOKIE_PROMPT}{KAGGLE_KEEP_SUFFIX}"
+        text = read_password(prompt).strip()
+    if not text and stored:
+        return stored
     if not text:
         raise LoginError(
             f"{answers.alias} needs the Kaggle cookie of a logged-in kaggle.com tab. "
@@ -794,9 +807,15 @@ def read_kaggle_token(
         username = read_line(KAGGLE_OWNER_PROMPT).strip()
     from ..providers.kaggle import read_api_token
 
-    key = given_key if given_key is not None else (read_api_token(answers.alias) or "")
-    if not key and answers.interactive:
-        key = read_password(KAGGLE_TOKEN_PROMPT)
+    stored = read_api_token(answers.alias)
+    key = given_key or ""
+    if not key.strip() and answers.interactive:
+        prompt = KAGGLE_TOKEN_PROMPT
+        if stored:
+            prompt = f"{KAGGLE_TOKEN_PROMPT}{KAGGLE_KEEP_SUFFIX}"
+        key = read_password(prompt)
+    if not key.strip() and stored:
+        key = stored
     if not username or not key:
         raise LoginError(
             f"{answers.alias} needs the Kaggle API token and notebook owner: pass "
@@ -827,7 +846,11 @@ def kaggle_account(answers: Answers) -> dict[str, Any]:
 
     username, key = read_kaggle_token(answers, answers.get("username"), answers.get("key"))
     given = answers.get(KAGGLE_COOKIE) or answers.token
-    cookie = read_kaggle_cookie(answers, given if isinstance(given, str) else None)
+    cookie = read_kaggle_cookie(
+        answers,
+        given if isinstance(given, str) else None,
+        stored=stored_secret(answers.alias, KAGGLE_COOKIE),
+    )
     try:
         kg.require_cookie_shape(cookie)
         expiry = kg.cookie_expiry(cookie)
@@ -952,6 +975,15 @@ FLOWS = {
 def store_secret(alias: str, name: str, secret: str) -> None:
     """Keep a credential in ``~/.letify/accounts/<alias>/<name>``, readable by its owner only."""
     secrets.write_secret(alias, name, secret)
+
+
+def stored_secret(alias: str, name: str) -> str | None:
+    """The credential already in the account directory, or None when there is none to keep."""
+    try:
+        value = (secrets.account_directory(alias) / name).read_text(encoding="utf-8").strip()
+    except (OSError, UnicodeError):
+        return None
+    return value or None
 
 
 def forget_secret(alias: str) -> bool:

@@ -276,13 +276,11 @@ class Runtime:
         """
         if self.channel is None:
             raise RuntimeFailure(f"{self.name}: the channel is not open")
-        # Done here rather than at declaration time, because the registration lives in
-        # cloudpickle and a process can hold declarations with different environments.
-        if self.env.ship_modules:
-            protocol.codec.ship_by_value(self.env.ship_modules)
         if not self.persistent_channel:
             self.last_used = time.monotonic()
-            return self.channel.call(fn, args, kwargs, timeout=timeout)
+            return self.channel.call(
+                fn, args, kwargs, timeout=timeout, modules=self.env.ship_modules
+            )
         args, kwargs = self._externalize(args, kwargs)
         return self._call_with_data(fn, args, kwargs, timeout, data_order, data_first_wave)
 
@@ -308,17 +306,27 @@ class Runtime:
         assert self.channel is not None
         root = (self.workspace or self.provider.workspace_root).rstrip("/")
         call_dir = f"{root}/data/calls/{secrets.token_hex(8)}"
+        modules_root = f"{root}/modules"
         collector = pathdata.Collector(call_dir)
+        ship_digests: set[str] = set()
+        if self.env.ship_modules:
+            for name in self.env.ship_modules:
+                placed = collector.collect_module(name, modules_root)
+                for _rel, digest, _size, _loc in placed.entries:
+                    ship_digests.add(digest)
         head, buffers = protocol.dumps_call_parts(fn, args, kwargs, data=collector)
         request: dict[str, Any] = {"op": "call", "payload": head, "buffers": buffers}
         blobs = f"{root}/data/blobs"
         stream: pathdata.Stream | None = None
+        if self.env.ship_modules:
+            request["modules_dir"] = modules_root
         if collector.placed:
-            request["data"] = collector.request(blobs)
+            extra_dirs = [modules_root] if self.env.ship_modules else ()
+            request["data"] = collector.request(blobs, extra_dirs=extra_dirs)
             if collector.inputs:
                 stream = self._stream_data(
                     collector, request["data"], blobs, fn, args, kwargs,
-                    data_order, data_first_wave,
+                    data_order, data_first_wave, ship_digests=ship_digests,
                 )
         self.last_used = time.monotonic()
         outcome = None
@@ -351,6 +359,7 @@ class Runtime:
         kwargs: dict,
         data_order: Any,
         data_first_wave: int | None,
+        ship_digests: set[str] | None = None,
     ) -> Any:
         """Derive the send order, place the first wave, and start the background sender."""
         from ..store import pathdata, sendorder
@@ -367,6 +376,10 @@ class Runtime:
             files=int(option("data_first_wave_files", pathdata.FIRST_WAVE_FILES)),
             count=data_first_wave,
         )
+        if ship_digests:
+            needed = [d for d in plan.missing if d in ship_digests and d not in wave]
+            if needed:
+                wave = needed + wave
         stream = pathdata.Stream(self, blobs, plan)
         if not plan.missing:
             # Nothing to stream: the runtime holds every file, so the call places them all
