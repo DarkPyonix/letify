@@ -46,30 +46,29 @@ This is also the only provider family where call forwarding is worth offering. R
 
 ## Tunnel
 
-> For a machine behind NAT that cannot accept an inbound connection. Tailscale by default, frp when UDP is blocked.
+> For a machine behind NAT that cannot accept an inbound connection. Tailcat punches a direct UDP hole between the two sides and nothing else; no relay path is offered.
 
-### Why Tailscale is the default
+### Why Tailcat, and why only the direct punch
 
-It needs no server of your own. It authenticates from an auth key with no prompt, which is what makes it scriptable. It is a layer 3 tunnel, so any TCP port works without declaring it. And when UDP is blocked it relays over TCP 443 instead of failing.
+Tailcat, from Tailscale, needs no account and no server of your own, and letify runs it only to agree on addresses and to punch a direct UDP connection, never as a mesh VPN or a relay client. [Connection strategies](SPEC.md#connection-strategies) lists forward SSH, TCP hole punching, Tailcat's UDP hole punching, reverse SSH and the provider's own path; none of these is a relay, and none is meant to be.
 
-Costs to know about. The free personal plan covers 6 users with unlimited user devices, but only 1,000 ephemeral resource minutes per month, which is about 16 hours. Bringing up a Colab node on every session runs into that. The seventh user converts the whole tailnet to paid and bills every seat.
+The reason is the gap between a direct path and a relayed one, not a difference in reliability. A relayed Tailscale path has been measured as low as 2.2 Mbit/s across continents where the direct path expected 30 to 40 Mbit/s, and Tailscale states that its relay servers limit throughput for fairness; `lab_docker`, below, measured 2 MiB/s and 69 ms over a punched Tailcat link where a direct LAN connection on the same hardware measured 50 MiB/s and under 1 ms. A relayed path still completes, which is the problem: it bills GPU hours while the transfer dominates the run, and nothing in the result tells the user that happened. So letify does not add a relay path to fall back to, and holds every strategy, Tailcat's punch included, to the floor in [Link floor](SPEC.md#link-floor): a probe below 5 MiB/s or above 300 ms fails the connection rather than completing it. When Tailcat's own punch fails to reach the peer directly, the agent lets the attempt fail as the spec's Rendezvous section describes rather than falling through to Tailscale's own relay network, because letify's use of the `tailcat` binary is limited to one punch and one splice, not a joined tailnet.
 
-### Why frp is the fallback
-
-Tailscale's relay fallback is a performance trap rather than a failure. Throughput on a relayed path has been measured as low as 2.2 Mbit/s across continents, where the direct path expected 30 to 40 Mbit/s, and Tailscale states that its relay servers limit throughput for fairness. A relayed path also adds 5 ms to 30 ms.
-
-frp runs over TLS on port 443, supports arbitrary TCP as its main purpose, and is the easiest of the candidates to self-host. It needs a relay server with a public address, typically a small virtual machine at 4 to 6 USD per month, and relayed traffic counts against that machine's bandwidth twice.
+Costs to know about. Tailcat's free personal plan covers 6 users with unlimited user devices, but only 1,000 ephemeral resource minutes per month, which is about 16 hours. Bringing up a Colab node on every session runs into that. The seventh user converts the whole tailnet to paid and bills every seat.
 
 ### Candidates considered and rejected
 
+None of these were adopted, because each is either a relay by construction or needs a relay server to cross a NAT that blocks UDP, and letify's design is to fail a slow link rather than carry one:
+
 | Candidate | Why not |
 |---|---|
-| ngrok | 1 GB per month free, then 0.10 USD per GB. Uneconomical for dataset transfer. |
+| frp | Needs a relay server with a public address, typically a small virtual machine at 4 to 6 USD per month, and relayed traffic counts against that machine's bandwidth twice. A relay by construction, which is exactly what this design avoids. |
+| ngrok | 1 GB per month free, then 0.10 USD per GB. Uneconomical for dataset transfer, and a relay. |
 | Cloudflare Tunnel | No peer to peer path, requires the client side to install cloudflared too, and the documentation warns that persistent connections may close unexpectedly. |
 | ZeroTier | Always userspace crypto, so 200 to 400 Mbit/s at full CPU. Free tier narrowed to 10 devices and one network. Its Python binding has been unmaintained since 2022 and ships no wheel for current Python. |
-| Nebula | No TCP fallback at all, so a network that blocks UDP blocks it entirely. Needs a lighthouse with a public address. Managed Nebula is free to 100 hosts, which is why it stays on the list as an alternative. |
+| Nebula | No TCP fallback at all, so a network that blocks UDP blocks it entirely. Needs a lighthouse with a public address. |
 | Raw WireGuard | No NAT traversal of its own, so it needs a relay server and a small control plane written by hand. No TCP fallback. |
-| Headscale | A self-hosted Tailscale control plane. Removes the ephemeral minute limit, at the cost of a public server, TLS, and running your own relay, which Tailscale's own documentation calls an advanced operation. Worth it only if the free plan limit is actually reached. |
+| Headscale | A self-hosted Tailscale control plane, which still relays when the direct path fails. Removes the ephemeral minute limit, at the cost of a public server, TLS, and running your own relay, which Tailscale's own documentation calls an advanced operation. |
 
 ### MTU
 

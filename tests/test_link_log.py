@@ -9,17 +9,21 @@ from __future__ import annotations
 from conftest import FakeProbe, FakeStrategy
 
 import letify
-from letify.transport.pipeline import Fingerprint, LinkCache, Pipeline
+from letify.transport.pipeline import Fingerprint, LinkCache, LinkFloor, Pipeline
 from letify.transport.probe import ProbeResult
 
 MIB = 1024 * 1024
+#: No test here is about the floor itself, so it is opened wide.
+NO_FLOOR = LinkFloor(min_bps=0.0, max_rtt_ms=float("inf"))
 
 
 def result(up: float, down: float, rtt: float = 5.0) -> ProbeResult:
     return ProbeResult(rtt_ms=rtt, upload_bps=up * MIB, download_bps=down * MIB)
 
 
-def pipeline(strategies, *, cache=None, grace=0.2, interface="eth0", previous=None) -> Pipeline:
+def pipeline(
+    strategies, *, cache=None, grace=0.2, interface="eth0", previous=None, floor=NO_FLOOR
+) -> Pipeline:
     return Pipeline(
         strategies,
         target=None,
@@ -30,6 +34,7 @@ def pipeline(strategies, *, cache=None, grace=0.2, interface="eth0", previous=No
         grace=grace,
         timeout=5.0,
         previous=previous,
+        floor=floor,
     )
 
 
