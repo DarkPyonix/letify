@@ -147,7 +147,9 @@ class Colab(Shell):
         note: str | None = None
         remaining: float | None = None
         rate: float | None = None
-        token_file = account_directory(self.alias) / ".config" / "colab-cli" / "token.json"
+        token_file = account_directory(self.alias) / "token.json"
+        if not token_file.is_file():
+            token_file = account_directory(self.alias) / ".config" / "colab-cli" / "token.json"
         try:
             stored = json.loads(token_file.read_text(encoding="utf-8"))
         except (OSError, ValueError):

@@ -123,7 +123,11 @@ class Local(Provider):
         """The default root, where a volume without ``mount`` lands. ``workspace`` is not used."""
         from ..runtime import bootstrap
 
-        return bootstrap.DEFAULT_WORKSPACE_ROOT
+        if bootstrap.DEFAULT_WORKSPACE_ROOT != "~/.letify-runtime":
+            return bootstrap.DEFAULT_WORKSPACE_ROOT
+        from ..paths import local_runtime_root
+
+        return local_runtime_root()
 
     def open_channel(self, runtime: Runtime) -> Channel:
         """A Python subprocess of this machine, with pipes for framed requests.

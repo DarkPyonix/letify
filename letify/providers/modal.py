@@ -179,7 +179,11 @@ class Adapter:
             env = tools.modal_environment(self.alias)
         # A file rather than a pipe, so a chatty adapter cannot fill a pipe nobody reads and
         # block. It lives as long as the process, so a context manager cannot hold it.
-        self._stderr = tempfile.TemporaryFile()  # noqa: SIM115
+        from ..paths import local_tmp_directory
+
+        tmp_dir = local_tmp_directory()
+        tmp_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+        self._stderr = tempfile.TemporaryFile(dir=tmp_dir)  # noqa: SIM115
         try:
             self._process = subprocess.Popen(
                 command,

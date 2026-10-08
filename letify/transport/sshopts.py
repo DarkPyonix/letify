@@ -35,8 +35,9 @@ _TEMPORARY_SUFFIX = 17
 
 def control_directory() -> Path:
     """The per-user directory for control sockets, created and checked before use."""
-    runtime = os.environ.get("XDG_RUNTIME_DIR")
-    directory = Path(runtime) / "letify" if runtime else Path(f"/tmp/letify-{os.getuid()}")
+    from ..paths import ssh_control_directory
+
+    directory = ssh_control_directory()
     try:
         directory.mkdir(mode=0o700, exist_ok=True)
     except FileNotFoundError:

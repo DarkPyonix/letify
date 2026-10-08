@@ -113,10 +113,13 @@ class DigestCache:
     """File digests keyed by resolved path, reused while size, mtime and inode match."""
 
     def __init__(self, path: Path | None = None) -> None:
-        self.path = path or Path.home() / ".cache" / "letify" / "digests.json"
+        from ..paths import cache_directory, digest_cache_path
+
+        read_target = path or digest_cache_path()
+        self.path = path or (cache_directory() / "digests.json")
         self._dirty = False
         try:
-            self._entries: dict[str, list[Any]] = json.loads(self.path.read_text("utf-8"))
+            self._entries: dict[str, list[Any]] = json.loads(read_target.read_text("utf-8"))
         except (OSError, ValueError):
             self._entries = {}
 

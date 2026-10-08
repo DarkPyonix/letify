@@ -738,6 +738,7 @@ def colab_account(answers: Answers) -> dict[str, Any]:
         [*tools.command(tools.COLAB, uv), "sessions"],
         env=tools.environment(answers.alias),
     )
+    tools.sync_tool_credentials(answers.alias)
     if result.returncode != 0:
         raise LoginError(f"the Colab sign in exited {result.returncode}, so nothing was written")
     # The rendezvous installs this key's public half on each runtime, which is what lets
