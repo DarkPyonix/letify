@@ -94,6 +94,22 @@ def dumps_call_parts(
     return file.getvalue(), buffers
 
 
+def pickle_value_parts(value: Any) -> tuple[bytes, list[pickle.PickleBuffer]]:
+    """Pickle one blob argument with its out-of-band buffers kept apart.
+
+    Uses the same ``_CallPickler`` as ``dumps_call_parts``, so a class or function defined
+    in the caller's own script travels by value through the blob path exactly as it does
+    when it is inlined in the call payload, as spec "Argument addressing" describes. The
+    plain ``pickle.Pickler`` wire.pickle_parts used here before wrote such a class as a
+    name reference, which a worker whose own ``__main__`` is not that script cannot
+    resolve.
+    """
+    buffers: list[pickle.PickleBuffer] = []
+    file = io.BytesIO()
+    _CallPickler(file, protocol=5, buffer_callback=buffers.append).dump(value)
+    return file.getvalue(), buffers
+
+
 class _CallPickler(cloudpickle.Pickler):
     """cloudpickle with the tensor reducer of spec "Frames" and the data collector first."""
 
