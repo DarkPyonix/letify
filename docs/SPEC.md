@@ -756,7 +756,9 @@ Keeping is a block rather than a declaration argument because it describes a str
 
 Nothing is torn down by hand and nothing is torn down on a timer. There is no release call and no shutdown call on the public surface, and everything left goes at process exit.
 
-The lease is the one exception, and it is not a timer on the work: it covers the moment a process is killed outright, which is the one moment nothing can be told to anybody. `SIGKILL`, the out of memory killer and a power cut all run no code at all, so a session that only ends when asked would never be asked.
+Process exit means three things, and letify covers two of them. `atexit` runs the pool's shutdown on an ordinary return from `main` and on an uncaught exception. `SIGTERM` and `SIGHUP`, the signals a shell, a supervisor or a notebook server sends to ask a process to stop, do not run `atexit` callbacks on their own, so the launcher installs a handler for each that shuts the pool down and then invokes whatever handler was already installed, or the signal's default action when none was. The handler is installed once, on the main thread only, because `signal.signal` only works there; a launcher built on a worker thread relies on `atexit` or the lease instead. `SIGINT` is left untouched: in a notebook it is how the kernel delivers an interrupt into the user's running cell, and shutting the pool down there would end a session the user meant to keep after dismissing one `KeyboardInterrupt`.
+
+The lease is the one exception that is not a signal handler, and it is not a timer on the work: it covers the moment a process is killed outright, which is the one moment nothing can be told to anybody. `SIGKILL`, the out of memory killer and a power cut all run no code at all, so a session that only ends when asked would never be asked.
 
 What the lease actually does is exit the worker process, which releases the occupancy. Whether that stops the billing depends on what the provider charges for, and infrastructure cannot choose to switch itself off: something that owns it has to. So the guarantee is per provider and letify states it rather than implying one.
 
