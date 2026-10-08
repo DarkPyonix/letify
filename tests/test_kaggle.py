@@ -17,7 +17,6 @@ from typing import Any
 
 import pytest
 
-from letify import tools
 from letify.cli import main
 from letify.config import login
 
@@ -72,7 +71,8 @@ def accept_cookie(monkeypatch):
 
 #: The API token arguments every successful login test needs now that the token is
 #: mandatory, alongside the cookie.
-TOKEN_ARGS = ["--username", "irack000", "--key", "fake-api-key"]
+API_TOKEN = "KGAT_" + "a" * 32
+TOKEN_ARGS = ["--username", "irack000", "--key", API_TOKEN]
 
 
 def test_a_cookie_and_a_token_are_kept_owner_only_and_never_in_the_config(
@@ -85,20 +85,23 @@ def test_a_cookie_and_a_token_are_kept_owner_only_and_never_in_the_config(
 
     stored = account("kaggle_a") / "cookie"
     assert stored.read_text(encoding="utf-8").strip() == cookie
-    token_path = account("kaggle_a") / "kaggle.json"
-    assert json.loads(token_path.read_text(encoding="utf-8")) == {
-        "username": "irack000",
-        "key": "fake-api-key",
-    }
+    token_path = account("kaggle_a") / "access_token"
+    assert token_path.read_text(encoding="utf-8") == API_TOKEN
+    owner_path = account("kaggle_a") / "username"
+    assert owner_path.read_text(encoding="utf-8") == "irack000"
+    assert not (account("kaggle_a") / "kaggle.json").exists()
     if sys.platform != "win32":
         assert stored.stat().st_mode & 0o777 == 0o600
         assert token_path.stat().st_mode & 0o777 == 0o600
+        assert owner_path.stat().st_mode & 0o777 == 0o600
+        assert account("kaggle_a").stat().st_mode & 0o777 == 0o700
     assert home_config()["kaggle_a"] == {"kind": "kaggle"}
     text = (Path.home() / ".letify" / "config.toml").read_text(encoding="utf-8")
     assert "CLIENT-TOKEN" not in text
-    assert "fake-api-key" not in text
+    assert API_TOKEN not in text
     out = capsys.readouterr()
     assert "ka_sessionid" not in out.out + out.err
+    assert API_TOKEN not in out.out + out.err
     assert accept_cookie == [cookie]
 
 
@@ -175,7 +178,7 @@ def test_with_a_terminal_the_cookie_and_token_are_asked_for(
 
     def hidden(prompt: str) -> str:
         hidden_prompts.append(prompt)
-        return cookie if prompt == login.KAGGLE_COOKIE_PROMPT else "fake-api-key"
+        return cookie if prompt == login.KAGGLE_COOKIE_PROMPT else API_TOKEN
 
     def line(prompt: str) -> str:
         line_prompts.append(prompt)
@@ -185,26 +188,24 @@ def test_with_a_terminal_the_cookie_and_token_are_asked_for(
     monkeypatch.setattr(login, "read_line", line)
     assert main(["login", "kaggle", "kaggle_a"]) == 0
     # The token is asked for first, because it comes from a page rather than a tab.
-    assert hidden_prompts == [login.KAGGLE_KEY_PROMPT, login.KAGGLE_COOKIE_PROMPT]
-    assert line_prompts == [login.KAGGLE_USERNAME_PROMPT]
+    assert hidden_prompts == [login.KAGGLE_TOKEN_PROMPT, login.KAGGLE_COOKIE_PROMPT]
+    assert line_prompts == [login.KAGGLE_OWNER_PROMPT]
     assert (account("kaggle_a") / "cookie").is_file()
-    assert (account("kaggle_a") / "kaggle.json").is_file()
+    assert (account("kaggle_a") / "access_token").is_file()
 
 
-def test_a_key_pasted_with_the_kgat_prefix_is_stored_without_it(
+def test_a_token_pasted_with_the_kgat_prefix_is_stored_verbatim(
     isolated_home, accept_cookie
 ) -> None:
-    """Spec "Kaggle account": kaggle.com shows the key prefixed, the CLI reads the rest."""
-    import json
-
+    """Spec "Kaggle account": kaggle.com shows the token prefixed, the CLI needs it intact."""
     thirty_two = "a1b2c3d4e5f60718293a4b5c6d7e8f90"
     assert main(
         ["login", "kaggle", "kaggle_a", "--cookie", make_cookie(),
-         "--username", "irack000", "--key", login.KAGGLE_KEY_PREFIX + thirty_two,
+         "--username", "irack000", "--key", "KGAT_" + thirty_two,
          "--no-input"]
     ) == 0
-    stored = json.loads((account("kaggle_a") / "kaggle.json").read_text(encoding="utf-8"))
-    assert stored == {"username": "irack000", "key": thirty_two}
+    stored = (account("kaggle_a") / "access_token").read_text(encoding="utf-8")
+    assert stored == "KGAT_" + thirty_two
 
 
 def test_a_cookie_can_be_read_from_a_file(isolated_home, accept_cookie, tmp_path) -> None:
@@ -287,18 +288,15 @@ def test_kaggle_usage_reads_the_weekly_quota_from_the_cli(
     """Spec "Remaining usage, Kaggle": the quota comes from the official CLI's ``quota``
     command, never the cookie, since reading it is not part of the interactive session.
     """
-    fake_kaggle_cli.quota_json = json.dumps(
-        [
-            {"name": "GPU", "totalTimeAllowed": "108000s", "timeUsed": "11700s"},
-            {"name": "TPU", "totalTimeAllowed": "72000s", "timeUsed": "0s"},
-        ]
-    )
     usage = kaggle_provider().usage()
 
     assert usage.unit == "GPU hours"
-    assert usage.used == 11700 / 3600
-    assert usage.limit == 30.0
-    assert usage.remaining == 30.0 - 11700 / 3600
+    assert usage.used == 0.0
+    assert usage.limit == 60.0
+    assert usage.remaining == 60.0
+    assert usage.resets_at is None
+    assert usage.resources == ({"name": "TPU", "unit": "TPU hours", "used": 0.0,
+                                "remaining": 20.0, "limit": 20.0, "resets_at": None},)
     assert "TPU 0 h used, 20 h left of 20" in (usage.note or "")
     quota_calls = [call for call in fake_kaggle_cli.calls if "quota" in call]
     assert len(quota_calls) == 1
@@ -316,8 +314,7 @@ def test_a_failed_quota_cli_call_reports_unknown_rather_than_an_error(
 
 
 def test_an_unrecognized_quota_shape_reports_unknown(fake_kaggle_cli, kaggle_api_token) -> None:
-    """Spec "Remaining usage, Kaggle": the CLI's JSON shape has not been confirmed live, so
-    a shape this parser does not recognize is reported as unread, never guessed at."""
+    """Spec "Remaining usage, Kaggle": unexpected shapes are unread, never guessed at."""
     fake_kaggle_cli.quota_json = json.dumps({"unexpected": "shape"})
     usage = kaggle_provider().usage()
     assert usage.remaining is None
@@ -809,7 +806,7 @@ def test_a_notebook_without_a_token_is_warned_about_not_deleted_via_the_cookie(
 ) -> None:
     """An account declared before the token became required cannot delete its notebook
     through the CLI, and the cookie never substitutes for it."""
-    tools.kaggle_config_path("kaggle_a").unlink()
+    (account("kaggle_a") / "access_token").unlink()
     provider, runtime, _channel = session_channel(fake_kaggle)
     provider.stop(runtime)
     assert fake_kaggle_cli.calls == []
@@ -823,3 +820,132 @@ def test_kaggle_never_opts_out_of_preparing_the_runtime(fake_kaggle) -> None:
     provider = provider_of(Kaggle, "kaggle_a")
     assert provider.prepares_workspace is True
     assert provider.remote_env is True
+
+
+@pytest.mark.parametrize("token", ["a" * 32, "KGAT_", "wrong_token", "KGAT_has space",
+                                  " KGAT_value", "KGAT_value\n"])
+def test_a_malformed_api_token_is_refused_before_cookie_verification(
+    isolated_home, accept_cookie, capsys, token
+) -> None:
+    """Spec "Kaggle": login refuses malformed tokens without reformatting them."""
+    assert main(["login", "kaggle", "kaggle_a", "--cookie", make_cookie(),
+                 "--username", "irack000", "--key", token, "--no-input"]) == 1
+    assert "KGAT_" in capsys.readouterr().err
+    assert not account("kaggle_a").exists()
+    assert not (Path.home() / ".letify" / "config.toml").exists()
+    assert accept_cookie == []
+
+
+def test_every_kaggle_cli_call_receives_only_the_account_token_in_the_environment(
+    fake_kaggle_cli, kaggle_api_token, monkeypatch
+) -> None:
+    """Spec "Kaggle": credentials stay in the environment for quota and deletion."""
+    from letify.config.secrets import write_secret
+    from letify.providers.kaggle import delete_notebook_via_cli, run_cli_quota
+
+    monkeypatch.setenv("KAGGLE_API_TOKEN", "unrelated-parent-token")
+    write_secret("other", "access_token", "KGAT_other")
+    write_secret("other", "username", "other_owner")
+    assert run_cli_quota("kaggle_a") == fake_kaggle_cli.quota_json
+    assert delete_notebook_via_cli("kaggle_a", "notebook63516d2758") is True
+    assert run_cli_quota("other") == fake_kaggle_cli.quota_json
+    assert len(fake_kaggle_cli.calls) == 3
+    assert fake_kaggle_cli.calls[1][-1] == "irack000/notebook63516d2758"
+    for command, environment, token in zip(fake_kaggle_cli.calls,
+                                         fake_kaggle_cli.environments,
+                                         [API_TOKEN, API_TOKEN, "KGAT_other"], strict=True):
+        assert environment["KAGGLE_API_TOKEN"] == token
+        assert "KAGGLE_CONFIG_DIR" not in environment
+        assert all(token not in argument for argument in command)
+
+
+def test_the_fake_cli_refuses_missing_token_environment(fake_kaggle_cli) -> None:
+    """Spec "Kaggle": the fake must enforce the CLI authentication boundary."""
+    assert fake_kaggle_cli.run(["kaggle", "quota"], env={}).returncode != 0
+
+
+def test_quota_uses_reported_hour_values_without_guessing_the_allowance(
+    fake_kaggle_cli, kaggle_api_token
+) -> None:
+    """Spec "Remaining usage": remaining is read directly from the real schema."""
+    fake_kaggle_cli.quota_json = json.dumps([
+        {"resource": "GPU", "used": "3.25h", "remaining": "56.74h", "total": "60.00h",
+         "refreshAt": "2026-10-10T00:00:00"},
+    ])
+    usage = kaggle_provider().usage()
+    assert usage.used == 3.25
+    assert usage.remaining == 56.74
+    assert usage.limit == 60.0
+
+
+@pytest.mark.parametrize("output", ["not JSON", "null", "[]",
+    '[{"name":"GPU","totalTimeAllowed":"108000s","timeUsed":"0s"}]',
+    *[json.dumps([{"resource": "GPU", "used": used, "remaining": "60.00h",
+                   "total": "60.00h", "refreshAt": "2026-10-10T00:00:00"}])
+      for used in ["0s", 0, "NaNh", "infh", "-1h"]],
+    '[{"resource":"GPU","used":"0h","remaining":"60h","total":"60h"}]',
+    '[{"resource":"GPU","used":"0h","remaining":"60h","total":"60h",'
+    '"refreshAt":"bad date"}]',
+])
+def test_unreadable_quota_answers_report_unknown(
+    fake_kaggle_cli, kaggle_api_token, output
+) -> None:
+    """Spec "Remaining usage": unreadable answers do not raise or guess a value."""
+    fake_kaggle_cli.quota_json = output
+    usage = kaggle_provider().usage()
+    assert usage.remaining is None
+    assert "could not be read" in (usage.note or "")
+
+
+def test_the_quota_parser_reads_the_measured_cli_list(fake_kaggle_cli) -> None:
+    """Spec "Remaining usage": parse the measured schema independently of credentials."""
+    from letify.providers.kaggle import _parse_cli_quota
+
+    parsed = _parse_cli_quota(fake_kaggle_cli.quota_json)
+    assert parsed is not None
+    assert parsed["gpu"] == {"used": 0.0, "remaining": 60.0, "total": 60.0}
+    assert parsed["tpu"] == {"used": 0.0, "remaining": 20.0, "total": 20.0}
+
+
+def test_a_token_body_is_not_restricted_to_the_measured_length(
+    isolated_home, accept_cookie
+) -> None:
+    """Spec "Kaggle": prefix and shape validation does not impose an unproven length."""
+    assert main(["login", "kaggle", "kaggle_a", "--cookie", make_cookie(),
+                 "--username", "irack000", "--key", "KGAT_synthetic", "--no-input"]) == 0
+    assert (account("kaggle_a") / "access_token").read_text() == "KGAT_synthetic"
+
+
+def test_login_reuses_the_existing_access_token_without_asking_for_it(
+    isolated_home, accept_cookie, monkeypatch
+) -> None:
+    """Spec "Kaggle": an existing account keeps its token when adding the owner."""
+    from letify.config.secrets import write_secret
+
+    token_path = write_secret("kaggle_a", "access_token", API_TOKEN)
+    original = token_path.read_bytes()
+
+    def refuse_prompt(prompt: str) -> str:
+        pytest.fail(f"Unexpected credential prompt: {prompt}")
+
+    monkeypatch.setattr(login, "read_password", refuse_prompt)
+    assert main(["login", "kaggle", "kaggle_a", "--cookie", make_cookie(),
+                 "--username", "irack000"]) == 0
+    assert token_path.read_bytes() == original
+    assert (account("kaggle_a") / "username").read_text() == "irack000"
+    assert not (account("kaggle_a") / "api_token").exists()
+
+
+def test_a_september_access_token_file_authenticates_quota_without_login(
+    isolated_home, fake_kaggle_cli
+) -> None:
+    """Spec "Kaggle": the existing file supplies the token value, never its path."""
+    from letify.config.secrets import write_secret
+    from letify.providers.kaggle import run_cli_quota
+
+    token_path = write_secret("kaggle_a", "access_token", API_TOKEN)
+    assert token_path.stat().st_size == 37
+    assert run_cli_quota("kaggle_a") == fake_kaggle_cli.quota_json
+    assert fake_kaggle_cli.environments[0]["KAGGLE_API_TOKEN"] == API_TOKEN
+    assert all(API_TOKEN not in argument and str(token_path) not in argument
+               for argument in fake_kaggle_cli.calls[0])

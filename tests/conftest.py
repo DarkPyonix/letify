@@ -1654,18 +1654,14 @@ def fake_kaggle(isolated_home, monkeypatch, tmp_path: Path):
     The fake adapter in ``tests/fake_kaggle_adapter.py`` keeps the real adapter's contract and
     runs the worker in a local interpreter, so the driver programs are the real ones. The
     account also gets an API token, since login requires one: a test of the no-token path
-    removes ``kaggle.json`` itself after this fixture runs.
+    removes ``api_token`` itself after this fixture runs.
     """
-    from letify import tools
     from letify.config.secrets import write_secret
     from letify.providers import kaggle as kaggle_module
 
     write_secret("kaggle_a", "cookie", kaggle_test_cookie())
-    token_path = tools.kaggle_config_path("kaggle_a")
-    token_path.parent.mkdir(parents=True, exist_ok=True)
-    token_path.write_text(
-        json.dumps({"username": "irack000", "key": "fake-api-key"}), encoding="utf-8"
-    )
+    write_secret("kaggle_a", "access_token", "KGAT_" + "a" * 32)
+    write_secret("kaggle_a", "username", "irack000")
     cloud = FakeKaggleCloud()
     monkeypatch.setattr(kaggle_module, "urlopen", cloud.urlopen)
     monkeypatch.setattr(kaggle_module, "JUPYTER_PROXY_HOST", cloud.proxy_host)
@@ -1688,12 +1684,22 @@ class FakeKaggleCLI:
 
     def __init__(self):
         self.calls: list[list[str]] = []
+        self.environments: list[dict[str, str]] = []
         self.fail: set[str] = set()
         #: Standard output a ``quota`` call answers with, as JSON text.
-        self.quota_json = "{}"
+        self.quota_json = json.dumps([
+            {"resource": "GPU", "used": "0.00h", "remaining": "60.00h", "total": "60.00h",
+             "refreshAt": "2026-10-10T00:00:00"},
+            {"resource": "TPU", "used": "0.00h", "remaining": "20.00h", "total": "20.00h",
+             "refreshAt": "2026-10-10T00:00:00"},
+        ])
 
     def run(self, command: list[str], **kwargs: Any) -> FakeCompleted:
         self.calls.append(list(command))
+        environment = dict(kwargs.get("env") or {})
+        self.environments.append(environment)
+        if not environment.get("KAGGLE_API_TOKEN"):
+            return FakeCompleted(returncode=1, stdout="", stderr="Authentication required")
         for marker in self.fail:
             if marker in command:
                 return FakeCompleted(returncode=1, stdout="", stderr="refused")
@@ -1718,9 +1724,7 @@ def fake_kaggle_cli(monkeypatch):
 @pytest.fixture
 def kaggle_api_token(isolated_home):
     """Write a Kaggle API token for alias ``kaggle_a``, as ``letify login kaggle`` would."""
-    from letify import tools
+    from letify.config.secrets import write_secret
 
-    path = tools.kaggle_config_path("kaggle_a")
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps({"username": "irack000", "key": "fake-api-key"}), encoding="utf-8")
-    return path
+    write_secret("kaggle_a", "username", "irack000")
+    return write_secret("kaggle_a", "access_token", "KGAT_" + "a" * 32)

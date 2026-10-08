@@ -13,7 +13,7 @@ Firestore, and ending it. Only the web session principal can do any of that, sin
 internal endpoints that mint the proxy token treat an API key as anonymous and answer
 empty. Everything else, deleting the notebook a run created and reading the weekly quota,
 goes through the official Kaggle CLI instead, authenticated by the API token in
-``kaggle.json``, and never falls back to the cookie: an account declared before the token
+``KAGGLE_API_TOKEN``, and never falls back to the cookie: an account declared before the token
 became required is refused with a ``ConfigError`` at the point that needs it, not served
 from the cookie as a substitute.
 """
@@ -23,6 +23,7 @@ from __future__ import annotations
 import base64
 import binascii
 import json
+import math
 import re
 import time
 import urllib.error
@@ -350,7 +351,7 @@ def new_notebook(alias: str, cookie: str) -> tuple[int, str | None]:
 
     Spec "Kaggle session token chain": a notebook is created fresh for every run and
     deleted when the run ends, so none is kept across runs and there is nothing on disk to
-    go stale. The slug, when Kaggle returns one, is what the official CLI's
+    go stale. The returned slug is confirmed on the live account and is what the CLI's
     ``kernels delete`` addresses the notebook by; a run on an account with no API token
     simply never deletes it through the CLI.
     """
@@ -518,39 +519,27 @@ def cancel_run(cookie: str, run_id: int) -> None:
         pass
 
 
-def read_api_token(alias: str) -> tuple[str, str] | None:
-    """The username and key in the account's ``kaggle.json``, or None when it has none.
-
-    Login requires the token, so this is None only for an account declared before that
-    requirement, or one whose token file was removed by hand; either way the caller reports
-    it with a ``ConfigError`` naming the fix, not a stale cookie-based guess.
-    """
-    path = tools.kaggle_config_path(alias)
-    if not path.is_file():
-        return None
+def read_api_token(alias: str) -> str | None:
+    """Read the account's verbatim API token, or None when the file is unreadable or empty."""
     try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
+        token = (account_directory(alias) / "access_token").read_text(encoding="utf-8")
+    except (OSError, UnicodeError):
         return None
-    if not isinstance(data, dict):
-        return None
-    username, key = data.get("username"), data.get("key")
-    return (str(username), str(key)) if username and key else None
+    return token or None
 
 
-def require_api_token(alias: str) -> tuple[str, str]:
+def require_api_token(alias: str) -> str:
     """The account's API token, or a ``ConfigError`` telling the user to log in again.
 
     Spec "Kaggle account": deleting the notebook a run created and reading the weekly quota
-    go through the official CLI only, with no cookie-based fallback, so an account declared
-    before the token became required cannot do either until it logs in again.
+    go through the official CLI only, with no cookie-based fallback, so an account without
+    the access_token file cannot do either until it logs in again.
     """
     token = read_api_token(alias)
     if token is None:
         raise ConfigError(
             f"{alias} has no Kaggle API token. Log in again with: letify login kaggle "
-            f"{alias} --username <name> --key <key>, the pair from Settings > API on "
-            f"kaggle.com"
+            f"{alias} --username <owner> --key <KGAT_token>, exactly as shown on kaggle.com"
         )
     return token
 
@@ -569,7 +558,12 @@ def delete_notebook_via_cli(alias: str, slug: str | None) -> bool:
     token = read_api_token(alias)
     if token is None:
         return False
-    username, _key = token
+    try:
+        username = (account_directory(alias) / "username").read_text(encoding="utf-8").strip()
+    except (OSError, UnicodeError):
+        return False
+    if not username:
+        return False
     uv = tools.find_uv()
     if uv is None:
         return False
@@ -634,59 +628,40 @@ def run_cli_quota(alias: str) -> str | None:
     return result.stdout if result.returncode == 0 else None
 
 
-def _quota_field(row: dict[str, Any], keys: tuple[str, ...]) -> float | None:
-    for key in keys:
-        if key in row:
-            return _seconds_to_hours(row[key])
-    return None
-
-
-def _quota_row(rows: list[Any], name: str) -> dict[str, float] | None:
-    for row in rows:
-        if not isinstance(row, dict):
-            continue
-        label = str(row.get("name") or row.get("type") or row.get("accelerator") or "").lower()
-        if name not in label:
-            continue
-        total = _quota_field(row, ("totalTimeAllowed", "limit", "total"))
-        used = _quota_field(row, ("timeUsed", "used"))
-        if total is None or used is None:
-            continue
-        return {"total": total, "used": used}
-    return None
-
-
 def _parse_cli_quota(text: str) -> dict[str, dict[str, float]] | None:
-    """Best-effort parse of ``kaggle quota --format json``, or None when the shape is not
-    one this recognizes.
+    """Parse the measured CLI list schema, returning None for unreadable quota output.
 
-    The exact shape of this output has not been confirmed against a live account: the only
-    account available while this was written had an already-invalidated cookie, and the CLI
-    call itself was not tried live either, to avoid hammering an account already stuck.
-    Needs live confirmation. A shape this does not recognize is reported as unread by the
-    caller, never guessed at and never answered from the cookie instead.
+    Hour values are supplied directly. The naive refresh timestamp has no established
+    timezone, so it cannot establish Unix seconds for Usage.resets_at.
     """
     try:
-        data = json.loads(text)
-    except ValueError:
+        rows = json.loads(text)
+        if not isinstance(rows, list):
+            return None
+        result: dict[str, dict[str, float]] = {}
+        for row in rows:
+            if not isinstance(row, dict):
+                return None
+            resource = row.get("resource")
+            if resource not in ("GPU", "TPU"):
+                return None
+            name = resource.lower()
+            if name in result:
+                return None
+            datetime.fromisoformat(row["refreshAt"])
+            hours = {}
+            for field in ("used", "remaining", "total"):
+                value = row[field]
+                if not isinstance(value, str) or not value.endswith("h"):
+                    return None
+                number = float(value[:-1])
+                if not math.isfinite(number) or number < 0:
+                    return None
+                hours[field] = number
+            result[name] = hours
+        return result if "gpu" in result else None
+    except (ValueError, KeyError, TypeError):
         return None
-    rows: list[Any] | None
-    if isinstance(data, list):
-        rows = data
-    elif isinstance(data, dict):
-        rows = [data]
-    else:
-        rows = None
-    if rows is None:
-        return None
-    gpu = _quota_row(rows, "gpu")
-    if gpu is None:
-        return None
-    result: dict[str, dict[str, float]] = {"gpu": gpu}
-    tpu = _quota_row(rows, "tpu")
-    if tpu is not None:
-        result["tpu"] = tpu
-    return result
 
 
 def adapter_command() -> list[str]:
@@ -1107,7 +1082,7 @@ class Kaggle(Provider):
 
         Spec "Remaining usage, Kaggle": this never touches the cookie, which is reserved
         for the interactive session and its Jupyter proxy URL. ``require_api_token`` raises
-        when the account was declared before the token became required.
+        when the account has no readable access_token file.
         """
         require_api_token(self.alias)
         text = run_cli_quota(self.alias)
@@ -1119,10 +1094,7 @@ class Kaggle(Provider):
                 unit=self.usage_unit,
                 source=self.usage_source,
                 remaining=None,
-                note=(
-                    "the Kaggle CLI's quota output could not be read; its JSON shape has "
-                    "not been confirmed against a live account"
-                ),
+                note="the Kaggle CLI's quota output could not be read",
             )
         gpu = parsed["gpu"]
         total, used = gpu["total"], gpu["used"]
@@ -1130,7 +1102,7 @@ class Kaggle(Provider):
         tpu = parsed.get("tpu")
         if tpu is not None:
             notes.append(
-                f"TPU {tpu['used']:g} h used, {max(tpu['total'] - tpu['used'], 0.0):g} h "
+                f"TPU {tpu['used']:g} h used, {tpu['remaining']:g} h "
                 f"left of {tpu['total']:g}"
             )
         return Usage(
@@ -1138,20 +1110,22 @@ class Kaggle(Provider):
             kind=self.kind,
             unit=self.usage_unit,
             source=self.usage_source,
-            remaining=max(total - used, 0.0),
+            remaining=gpu["remaining"],
             limit=total,
             used=used,
             note="; ".join(notes) or None,
+            resources=(
+                ({
+                    "name": "TPU",
+                    "unit": "TPU hours",
+                    "remaining": tpu["remaining"],
+                    "used": tpu["used"],
+                    "limit": tpu["total"],
+                    "resets_at": None,
+                },)
+                if tpu is not None else ()
+            ),
         )
-
-
-def _seconds_to_hours(value: Any) -> float | None:
-    """Read a duration such as ``216000s`` or ``216000`` as hours."""
-    text = str(value or "").strip().removesuffix("s").strip()
-    try:
-        return float(text) / 3600.0
-    except ValueError:
-        return None
 
 
 __all__ = [

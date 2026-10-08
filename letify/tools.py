@@ -165,21 +165,11 @@ def kaggle_cli_command(uv: str) -> list[str]:
     return command(KAGGLE_CLI, uv)
 
 
-def kaggle_config_path(alias: str) -> Path:
-    """``~/.letify/accounts/<alias>/kaggle.json``, the account's API token, when it has one."""
-    return account_directory(alias) / "kaggle.json"
-
-
 def kaggle_cli_environment(alias: str) -> dict[str, str]:
-    """The environment the Kaggle CLI runs in: its own config directory, not the real ``HOME``.
-
-    ``KAGGLE_CONFIG_DIR`` points the CLI at the account directory, where ``kaggle.json`` was
-    written at login, so two accounts on one machine never share a token.
-    """
+    """Pass this account's verbatim token to the CLI through its child environment."""
     env = dict(os.environ)
-    path = kaggle_config_path(alias)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    env["KAGGLE_CONFIG_DIR"] = str(path.parent)
+    token = (account_directory(alias) / "access_token").read_text(encoding="utf-8")
+    env["KAGGLE_API_TOKEN"] = token
     return env
 
 
@@ -214,7 +204,6 @@ __all__ = [
     "find_uv",
     "kaggle_cli_command",
     "kaggle_cli_environment",
-    "kaggle_config_path",
     "missing_uv_message",
     "modal_adapter_command",
     "modal_config_path",
