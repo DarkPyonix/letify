@@ -2640,6 +2640,7 @@ def test_colab_prepares_tailcat_before_the_connection_race(
 ) -> None:
     # Spec "Colab", Runtime tools: installation failure cannot silently lose the race.
     from letify import install
+
     patch_which(tools_module, present=True)
     found = FakeCompleted(stdout='LETIFY-TAILCAT "/remote/tailcat"\n')
     recorder = patch_run(colab_module, result=found)
@@ -2739,3 +2740,54 @@ def test_colab_diagnose_leaves_other_failures_unchanged_when_session_remains(
     diagnosed = provider.diagnose(runtime, failure)
     assert diagnosed is failure
 
+
+# Spec: Transport, Link floor and Colab.
+@pytest.mark.parametrize("provider_class", [Shell, Colab, Tunnel, Elice])
+def test_shell_accounts_share_the_floor_and_keep_account_overrides(provider_class):
+    from letify.transport.pipeline import MIB
+
+    default = provider_of(provider_class, "floor_default").link_floor
+    assert default.min_bps == 10 * MIB
+    assert default.max_rtt_ms == 300
+    custom = provider_of(provider_class, "floor_custom", min_mib_per_s=0.05, max_rtt_ms=500)
+    assert custom.link_floor.min_bps == 0.05 * MIB
+    assert custom.link_floor.max_rtt_ms == 500
+
+
+def test_colab_exec_reply_timeout_names_the_kernel_and_keeps_cli_evidence(
+    isolated_home, patch_which, patch_run
+):
+    patch_which(tools_module, present=True)
+    patch_run(
+        colab_module,
+        result=FakeCompleted(returncode=1, stderr="TimeoutError: Timeout waiting for reply"),
+    )
+    provider = provider_of(Colab, "colab_a", channel="exec")
+    runtime = type("R", (), {"name": "letify-a100-330e87"})()
+    channel = provider.open_channel(runtime)
+    with pytest.raises(letify.RuntimeFailure) as caught:
+        channel.eval("1", timeout=120)
+    assert "letify-a100-330e87" in str(caught.value)
+    assert "notebook kernel" in str(caught.value)
+    assert "busy or not answering" in str(caught.value)
+    assert "colab exec" in str(caught.value)
+    assert caught.value.stderr == "TimeoutError: Timeout waiting for reply"
+    assert "exec -s letify-a100-330e87" in caught.value.command
+
+
+def test_colab_exec_command_timeout_names_its_limit_and_kernel(
+    isolated_home, patch_which, patch_run
+):
+    import subprocess
+
+    patch_which(tools_module, present=True)
+    expired = subprocess.TimeoutExpired("colab exec", 120, stderr="kernel stalled")
+    patch_run(colab_module, error=expired)
+    provider = provider_of(Colab, "colab_a", channel="exec")
+    runtime = type("R", (), {"name": "letify-a100-330e87"})()
+    with pytest.raises(letify.RuntimeFailure) as caught:
+        provider.open_channel(runtime).eval("1", timeout=120)
+    assert "120 s" in str(caught.value)
+    assert "notebook kernel" in str(caught.value)
+    assert caught.value.stderr == "kernel stalled"
+    assert caught.value.__cause__ is expired

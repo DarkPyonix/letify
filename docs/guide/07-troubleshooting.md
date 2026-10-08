@@ -264,7 +264,7 @@ kind = "tunnel"
 mtu = 1280
 ```
 
-letify holds every connection strategy, Tailcat's hole punch included, to a floor: a probe below 5 MiB/s or above 300 ms round trip fails the connection instead of completing it, because a slow link is a failure, not a fallback. See [docs/SPEC.md, Link floor](../SPEC.md#link-floor). If the connection now fails with "below the floor", that is the diagnosis: the path is too slow to use, usually because Tailcat's own direct UDP punch did not succeed and it fell back to a relay. No relay path is offered as an alternative, so fix the underlying reachability instead: open the UDP port the punch needs, or set `address` to a direct SSH path if one exists on the same network. See [docs/NETWORK.md](../NETWORK.md).
+letify holds every connection strategy, Tailcat's hole punch included, to a floor: a probe below 10 MiB/s or above 300 ms round trip fails the connection instead of completing it, because a slow link is a failure, not a fallback. See [docs/SPEC.md, Link floor](../SPEC.md#link-floor). If the connection now fails with "below the floor", that is the diagnosis: the path is too slow to use, usually because Tailcat's own direct UDP punch did not succeed and it fell back to a relay. No relay path is offered as an alternative, so fix the underlying reachability instead: open the UDP port the punch needs, or set `address` to a direct SSH path if one exists on the same network. See [docs/NETWORK.md](../NETWORK.md).
 
 ### Gathered calls are not running in parallel
 

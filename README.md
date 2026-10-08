@@ -167,6 +167,7 @@ Each command writes two files. The account goes to `~/.letify/config.toml`, whic
 [colab_pro_plus]
 kind = "colab"
 account = "you@example.com"
+min_mib_per_s = 0.05
 
 [lab_a100]
 kind = "shell"
@@ -175,6 +176,8 @@ user = "researcher"
 key = "~/.ssh/id_ed25519"
 persistent = true
 ```
+
+The connection pipeline defaults to `10 MiB/s` in each direction and `300 ms` RTT. Colab's measured sustained best is `8.8 MiB/s` up and `10.7 MiB/s` down, so it fails the default floor. The account example explicitly permits a slow link with `min_mib_per_s = 0.05`. Set `min_mib_per_s` and `max_rtt_ms` for your measurements. When all measured links fail the floor, the connection is refused even if an unprobed fallback connected.
 
 The project's `.letify/config.toml` gets only the alias, which is what makes the account usable in this project:
 
