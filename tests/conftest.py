@@ -353,8 +353,15 @@ class RenewalRecorder:
     def __init__(self) -> None:
         self.renewals: list[float] = []
         self.fail_after: int | None = None
+        #: Number of leading attempts that fail with a transient error, such as a renewal
+        #: reply delayed behind a large transfer, before renewals resume.
+        self.transient_for: int = 0
+        self._attempts = 0
 
     def request(self, payload: dict[str, Any], *, timeout: float | None = None) -> float:
+        self._attempts += 1
+        if self._attempts <= self.transient_for:
+            raise letify.RuntimeFailure("recorded-runtime: the call exceeded 60s")
         if self.fail_after is not None and len(self.renewals) >= self.fail_after:
             raise letify.RuntimeLost("the session is gone")
         self.renewals.append(float(payload["grace"]))

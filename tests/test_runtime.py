@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import os
 import shutil
+import signal
 import subprocess
 import sys
 import threading
@@ -326,6 +327,59 @@ def test_a_request_on_a_runtime_whose_channel_is_shut_says_so(let, remote_cpu, l
         runtime.stat()
     with pytest.raises(RuntimeFailure, match="the channel is not open"):
         runtime.call(returns_pid(), (), {})
+
+
+# -- Spec: Sessions, process exit ----------------------------------------------
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="SIGTERM is not a Windows signal")
+def test_sigterm_shuts_the_pool_down_then_chains_to_what_was_there(
+    let, remote_cpu, live
+) -> None:
+    # atexit does not run on a signal, so a process killed with SIGTERM would otherwise
+    # leave its runtime running and billing. The chain matters too: something else may
+    # already be handling SIGTERM, such as a supervisor's own cleanup, and that must
+    # still run.
+    runtime = live(let, remote_cpu)
+    assert runtime.ready is True
+    previous_calls: list[int] = []
+    signal.signal(signal.SIGTERM, lambda signum, frame: previous_calls.append(signum))
+    try:
+        let._register_at_exit()
+        handler = signal.getsignal(signal.SIGTERM)
+        assert handler is not None
+        handler(signal.SIGTERM, None)
+    finally:
+        signal.signal(signal.SIGTERM, signal.SIG_DFL)
+    assert runtime.ready is False
+    assert previous_calls == [signal.SIGTERM]
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="SIGTERM is not a Windows signal")
+def test_registering_signal_handlers_twice_does_not_chain_to_itself(let) -> None:
+    # The same guard that keeps atexit.register from being called twice must cover the
+    # signal handlers too, or a second registration would wrap the first and double up
+    # the pool shutdown, or chain into itself.
+    before = signal.getsignal(signal.SIGTERM)
+    try:
+        let._register_at_exit()
+        once = signal.getsignal(signal.SIGTERM)
+        let._register_at_exit()
+        assert signal.getsignal(signal.SIGTERM) is once
+    finally:
+        signal.signal(signal.SIGTERM, before)
+
+
+def test_sigint_is_left_to_the_interpreter(let) -> None:
+    # SIGINT is how a notebook kernel delivers an interrupt into the user's running cell.
+    # Shutting the pool down there would end a session the user meant to keep after
+    # dismissing one KeyboardInterrupt, so letify never installs a handler for it.
+    before = signal.getsignal(signal.SIGINT)
+    try:
+        let._register_at_exit()
+        assert signal.getsignal(signal.SIGINT) is before
+    finally:
+        signal.signal(signal.SIGINT, before)
 
 
 def test_installation_is_skipped_where_the_machine_already_runs_in_the_environment(let) -> None:
@@ -1273,6 +1327,24 @@ def test_a_lease_stops_renewing_once_the_session_is_gone(renewal_recorder) -> No
     lease.release()
     # Two renewals happened and then the loop stopped, rather than retrying forever.
     assert len(renewal_recorder.renewals) == 2
+
+
+def test_a_lease_survives_a_transient_renewal_failure(renewal_recorder) -> None:
+    # A renewal reply delayed behind a large transfer, or any other round trip that
+    # merely times out, is not the session going away. The loop keeps trying rather
+    # than giving up on the first bad cycle.
+    renewal_recorder.transient_for = 3
+    lease = Lease(renewal_recorder, interval=0.02, grace=90.0)
+    lease.arm()
+    try:
+        deadline = time.monotonic() + 5
+        while len(renewal_recorder.renewals) < 3 and time.monotonic() < deadline:
+            time.sleep(0.01)
+    finally:
+        lease.release()
+    # The thread survived the leading transient failures and renewed once they stopped.
+    assert len(renewal_recorder.renewals) >= 3
+    assert renewal_recorder.renewals[0] == 90.0
 
 
 # -- Spec: Pooling -------------------------------------------------------------
