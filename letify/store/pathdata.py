@@ -41,6 +41,9 @@ WRITE_QUEUE = 4
 #: Files at least this large are hashed through a memory map with blake3's threads.
 LARGE_FILE = 64 << 20
 
+#: Seconds between two polls for completed output files, spec "Writing back".
+POLL_INTERVAL_S = 0.5
+
 #: Uploads at least this large show a progress line.
 PROGRESS_THRESHOLD = 64 << 20
 
@@ -722,12 +725,98 @@ class _Downloaded(_Uploaded):
             self.progress = _Progress(f"{files} files", total, sys.stderr)
 
 
-def write_back(runtime: Runtime, collector: Collector, blobs: str) -> int:
+class WriteBack:
+    """Streams each completed output file back to the client while the call still runs.
+
+    Spec "Writing back", the background write-back. The runtime decides which files are
+    complete, and reports a file only once no process holds it open and its size and
+    modification time are what the poll before saw, so a half-written file is never sent.
+    """
+
+    def __init__(self, runtime: Runtime, collector: Collector, blobs: str) -> None:
+        self.runtime = runtime
+        self.collector = collector
+        self.blobs = blobs
+        self.files = self.bytes = 0
+        self.seconds = 0.0
+        #: The digest this path was last sent with, which keeps the final write-back from
+        #: sending it again and a repeated poll from sending the same version twice.
+        self.sent: dict[Path, str] = {}
+        self._cancelled = threading.Event()
+        self._thread: threading.Thread | None = None
+
+    def start(self) -> None:
+        """Poll the runtime for completed output files on a thread of its own."""
+        if not self.collector.outputs:
+            return
+        self._thread = threading.Thread(
+            target=self._run, name="letify-write-back", daemon=True
+        )
+        self._thread.start()
+
+    def _run(self) -> None:
+        started = time.monotonic()
+        try:
+            while not self._cancelled.wait(POLL_INTERVAL_S):
+                self._poll()
+        except Exception:
+            # The call owns the failure. An output file this path does not manage to send
+            # is sent by the final write-back instead, so nothing is lost here.
+            pass
+        finally:
+            self.seconds = time.monotonic() - started
+
+    def _poll(self) -> None:
+        outputs = {placed.runtime: placed for placed in self.collector.outputs}
+        written = (
+            _worker(
+                self.runtime,
+                {
+                    "op": "data_output_poll",
+                    "dir": self.collector.call_dir,
+                    "blobs": self.blobs,
+                    "outputs": list(outputs),
+                },
+            )
+            or {}
+        )
+        for runtime_path, files in written.items():
+            placed = outputs.get(runtime_path)
+            if placed is None:
+                continue
+            for rel, digest, size in files:
+                if self._cancelled.is_set():
+                    return
+                target = placed.local / rel if rel else placed.local
+                digest = str(digest)
+                if self.sent.get(target) == digest:
+                    continue
+                with _output_lock(placed.local):
+                    _get(self.runtime, self.blobs, digest, target, int(size), _Uploaded(1, 0))
+                    self.collector.cache.record(target, digest)
+                self.sent[target] = digest
+                self.files += 1
+                self.bytes += int(size)
+
+    def cancel(self) -> None:
+        """Stop polling, which the call's end does before the final write-back runs."""
+        self._cancelled.set()
+        thread = self._thread
+        if thread is not None:
+            thread.join(timeout=60)
+            self._thread = None
+
+
+def write_back(
+    runtime: Runtime, collector: Collector, blobs: str, background: WriteBack | None = None
+) -> int:
     """Copy what a returned call created or changed at its output locations to the client.
 
     Answers how many files the runtime listed, each of which is now in its blob cache.
 
-    Spec "Writing back".
+    Spec "Writing back". What ``background`` already sent during the call is not sent
+    again: a listed file whose digest equals the digest that path was delivered with is
+    counted and skipped, so no byte travels twice.
     """
     from .. import install
 
@@ -744,9 +833,15 @@ def write_back(runtime: Runtime, collector: Collector, blobs: str) -> int:
     total = sum(size for _placed, files in plan for _t, _d, size in files)
     meter = _Downloaded(sum(len(files) for _p, files in plan), total)
     sent_files = sent_bytes = kept_files = kept_bytes = 0
+    already = dict(background.sent) if background is not None else {}
     for placed, files in plan:
         with _output_lock(placed.local):
             for target, digest, size in files:
+                if already.get(target) == digest:
+                    # The background write-back delivered this very version during the
+                    # call, so fetching it now would be a duplicate transfer.
+                    meter.advance(size)
+                    continue
                 if _same(cache, target, digest):
                     kept_files += 1
                     kept_bytes += size
@@ -759,11 +854,18 @@ def write_back(runtime: Runtime, collector: Collector, blobs: str) -> int:
                 sent_bytes += size
     meter.finish()
     cache.save()
+    during_files = background.files if background is not None else 0
+    during_bytes = background.bytes if background is not None else 0
+    during_seconds = background.seconds if background is not None else 0.0
     elapsed = time.monotonic() - started
-    rate = sent_bytes / (1 << 20) / elapsed if elapsed > 0 else 0.0
+    total_files = sent_files + during_files
+    total_bytes = sent_bytes + during_bytes
+    span = elapsed + during_seconds
+    rate = total_bytes / (1 << 20) / span if span > 0 else 0.0
     install.log(
-        f"data wrote back {sent_files} files {_mib(sent_bytes)} in {elapsed:.1f} s "
-        f"({rate:.1f} MiB/s), {kept_files} files {_mib(kept_bytes)} already on the client"
+        f"data wrote back {total_files} files {_mib(total_bytes)} in {elapsed:.1f} s "
+        f"({rate:.1f} MiB/s), {during_files} files {_mib(during_bytes)} during the call, "
+        f"{kept_files} files {_mib(kept_bytes)} already on the client"
     )
     return sum(len(files) for _placed, files in plan)
 
@@ -860,6 +962,7 @@ def _stream(runtime: Runtime, payload: dict[str, Any]) -> Any:
 __all__ = [
     "CHUNK",
     "Collector",
+    "WriteBack",
     "DigestCache",
     "Plan",
     "Stream",
