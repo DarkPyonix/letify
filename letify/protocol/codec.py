@@ -62,8 +62,18 @@ def ship_by_value(modules: Sequence[str]) -> None:
         cloudpickle.register_pickle_by_value(module)
 
 
+def _ship_notebook_module(fn: Any) -> None:
+    """Ship the IPython user module without importing IPython or its runtime state."""
+    namespace = getattr(fn, "__globals__", {})
+    shell = getattr(namespace.get("get_ipython"), "__self__", None)
+    module = getattr(shell, "user_module", None)
+    if module is not None and module.__dict__ is namespace:
+        cloudpickle.register_pickle_by_value(module)
+
+
 def dumps_call(fn: Any, args: tuple, kwargs: dict) -> bytes:
     """Serialize a call with cloudpickle, which handles locally defined functions."""
+    _ship_notebook_module(fn)
     return cloudpickle.dumps((fn, args, kwargs), protocol=5)
 
 
@@ -75,6 +85,7 @@ def dumps_call_parts(
     ``data``, when given, is a collector whose ``reduce`` replaces local paths, as spec
     "Project data" describes.
     """
+    _ship_notebook_module(fn)
     buffers: list[pickle.PickleBuffer] = []
     file = io.BytesIO()
     pickler = _CallPickler(file, protocol=5, buffer_callback=buffers.append)
