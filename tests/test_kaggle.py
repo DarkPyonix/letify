@@ -85,7 +85,7 @@ def test_a_cookie_and_a_token_are_kept_owner_only_and_never_in_the_config(
 
     stored = account("kaggle_a") / "cookie"
     assert stored.read_text(encoding="utf-8").strip() == cookie
-    token_path = account("kaggle_a") / "api_token"
+    token_path = account("kaggle_a") / "access_token"
     assert token_path.read_text(encoding="utf-8") == API_TOKEN
     owner_path = account("kaggle_a") / "username"
     assert owner_path.read_text(encoding="utf-8") == "irack000"
@@ -188,10 +188,10 @@ def test_with_a_terminal_the_cookie_and_token_are_asked_for(
     monkeypatch.setattr(login, "read_line", line)
     assert main(["login", "kaggle", "kaggle_a"]) == 0
     # The token is asked for first, because it comes from a page rather than a tab.
-    assert hidden_prompts == [login.KAGGLE_KEY_PROMPT, login.KAGGLE_COOKIE_PROMPT]
-    assert line_prompts == [login.KAGGLE_USERNAME_PROMPT]
+    assert hidden_prompts == [login.KAGGLE_TOKEN_PROMPT, login.KAGGLE_COOKIE_PROMPT]
+    assert line_prompts == [login.KAGGLE_OWNER_PROMPT]
     assert (account("kaggle_a") / "cookie").is_file()
-    assert (account("kaggle_a") / "api_token").is_file()
+    assert (account("kaggle_a") / "access_token").is_file()
 
 
 def test_a_token_pasted_with_the_kgat_prefix_is_stored_verbatim(
@@ -204,7 +204,7 @@ def test_a_token_pasted_with_the_kgat_prefix_is_stored_verbatim(
          "--username", "irack000", "--key", "KGAT_" + thirty_two,
          "--no-input"]
     ) == 0
-    stored = (account("kaggle_a") / "api_token").read_text(encoding="utf-8")
+    stored = (account("kaggle_a") / "access_token").read_text(encoding="utf-8")
     assert stored == "KGAT_" + thirty_two
 
 
@@ -806,7 +806,7 @@ def test_a_notebook_without_a_token_is_warned_about_not_deleted_via_the_cookie(
 ) -> None:
     """An account declared before the token became required cannot delete its notebook
     through the CLI, and the cookie never substitutes for it."""
-    (account("kaggle_a") / "api_token").unlink()
+    (account("kaggle_a") / "access_token").unlink()
     provider, runtime, _channel = session_channel(fake_kaggle)
     provider.stop(runtime)
     assert fake_kaggle_cli.calls == []
@@ -844,7 +844,7 @@ def test_every_kaggle_cli_call_receives_only_the_account_token_in_the_environmen
     from letify.providers.kaggle import delete_notebook_via_cli, run_cli_quota
 
     monkeypatch.setenv("KAGGLE_API_TOKEN", "unrelated-parent-token")
-    write_secret("other", "api_token", "KGAT_other")
+    write_secret("other", "access_token", "KGAT_other")
     write_secret("other", "username", "other_owner")
     assert run_cli_quota("kaggle_a") == fake_kaggle_cli.quota_json
     assert delete_notebook_via_cli("kaggle_a", "notebook63516d2758") is True
@@ -913,4 +913,39 @@ def test_a_token_body_is_not_restricted_to_the_measured_length(
     """Spec "Kaggle": prefix and shape validation does not impose an unproven length."""
     assert main(["login", "kaggle", "kaggle_a", "--cookie", make_cookie(),
                  "--username", "irack000", "--key", "KGAT_synthetic", "--no-input"]) == 0
-    assert (account("kaggle_a") / "api_token").read_text() == "KGAT_synthetic"
+    assert (account("kaggle_a") / "access_token").read_text() == "KGAT_synthetic"
+
+
+def test_login_reuses_the_existing_access_token_without_asking_for_it(
+    isolated_home, accept_cookie, monkeypatch
+) -> None:
+    """Spec "Kaggle": an existing account keeps its token when adding the owner."""
+    from letify.config.secrets import write_secret
+
+    token_path = write_secret("kaggle_a", "access_token", API_TOKEN)
+    original = token_path.read_bytes()
+
+    def refuse_prompt(prompt: str) -> str:
+        pytest.fail(f"Unexpected credential prompt: {prompt}")
+
+    monkeypatch.setattr(login, "read_password", refuse_prompt)
+    assert main(["login", "kaggle", "kaggle_a", "--cookie", make_cookie(),
+                 "--username", "irack000"]) == 0
+    assert token_path.read_bytes() == original
+    assert (account("kaggle_a") / "username").read_text() == "irack000"
+    assert not (account("kaggle_a") / "api_token").exists()
+
+
+def test_a_september_access_token_file_authenticates_quota_without_login(
+    isolated_home, fake_kaggle_cli
+) -> None:
+    """Spec "Kaggle": the existing file supplies the token value, never its path."""
+    from letify.config.secrets import write_secret
+    from letify.providers.kaggle import run_cli_quota
+
+    token_path = write_secret("kaggle_a", "access_token", API_TOKEN)
+    assert token_path.stat().st_size == 37
+    assert run_cli_quota("kaggle_a") == fake_kaggle_cli.quota_json
+    assert fake_kaggle_cli.environments[0]["KAGGLE_API_TOKEN"] == API_TOKEN
+    assert all(API_TOKEN not in argument and str(token_path) not in argument
+               for argument in fake_kaggle_cli.calls[0])

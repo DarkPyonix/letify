@@ -1660,7 +1660,7 @@ def fake_kaggle(isolated_home, monkeypatch, tmp_path: Path):
     from letify.providers import kaggle as kaggle_module
 
     write_secret("kaggle_a", "cookie", kaggle_test_cookie())
-    write_secret("kaggle_a", "api_token", "KGAT_" + "a" * 32)
+    write_secret("kaggle_a", "access_token", "KGAT_" + "a" * 32)
     write_secret("kaggle_a", "username", "irack000")
     cloud = FakeKaggleCloud()
     monkeypatch.setattr(kaggle_module, "urlopen", cloud.urlopen)
@@ -1727,4 +1727,4 @@ def kaggle_api_token(isolated_home):
     from letify.config.secrets import write_secret
 
     write_secret("kaggle_a", "username", "irack000")
-    return write_secret("kaggle_a", "api_token", "KGAT_" + "a" * 32)
+    return write_secret("kaggle_a", "access_token", "KGAT_" + "a" * 32)
