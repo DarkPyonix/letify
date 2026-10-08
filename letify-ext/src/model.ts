@@ -373,5 +373,7 @@ export function activityStatusText(rows: UtilizationRow[], status: Status | null
   const count = sessions.reduce((sum, row) => sum + row.sessions.length, 0);
   const failed = ["utilization", "status", "sessions"].some((key) => errors[key])
     || rows.some((row) => row.unavailable) || sessions.some((row) => row.unavailable);
-  return `${gpuStatusText(gpuSummary(rows, status, busyPercent))}${count ? ` · ${count} session${count === 1 ? "" : "s"}` : ""}${failed ? " $(error) letify error" : ""}`;
+  const summary = gpuSummary(rows, status, busyPercent);
+  const activity = count > 0 && summary.total === 0 && summary.reserved === 0 ? "GPU unknown" : gpuStatusText(summary);
+  return `${activity}${count ? ` · ${count} session${count === 1 ? "" : "s"}` : ""}${failed ? " $(error) letify error" : ""}`;
 }
