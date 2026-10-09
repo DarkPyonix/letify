@@ -751,3 +751,67 @@ def test_the_remote_half_dials_back_and_serves_the_link(patch_popen) -> None:
     thread.join(10)
     listener.close()
     assert seen == [nat.HELLO + token]
+
+
+def test_connect_back_asks_the_remote_again_for_a_second_session() -> None:
+    # Spec "Connect back": one connection carries one SSH session, so a second session has
+    # to be dialed for. Without this a connect_back link could carry nothing in parallel.
+    import socket
+    import threading
+
+    from letify.transport import nat
+    from letify.transport.strategies import ConnectBack
+
+    free = nat.reusable_socket(0)
+    port = free.getsockname()[1]
+    free.close()
+    dialed: list[str] = []
+
+    class Rendezvous(CannedRendezvous):
+        def exchange(self, request, timeout):
+            assert request["kind"] == "connect_back"
+            token = bytes.fromhex(request["token"])
+            dialed.append(request["token"])
+
+            def dial() -> None:
+                sock = socket.create_connection(("127.0.0.1", port), timeout=5)
+                sock.sendall(nat.HELLO + token)
+                self.held = getattr(self, "held", [])
+                self.held.append(sock)
+
+            threading.Thread(target=dial, daemon=True).start()
+            return {"dialing": True}
+
+    target = Target(
+        alias="lab",
+        rendezvous=Rendezvous(),
+        connect_back={"address": "127.0.0.1", "port": port},
+        user="root",
+    )
+    strategy = ConnectBack()
+    link = strategy.attempt(target)
+    assert len(dialed) == 1, dialed
+
+    def use(command: list[str]) -> None:
+        """Connect to the forwarding port, which is what makes the link dial."""
+        forwarded = int(command[command.index("-p") + 1])
+        sock = socket.create_connection(("127.0.0.1", forwarded), timeout=5)
+        sock.close()
+
+    # The first session uses the connection the attempt already took.
+    use(link.ssh_command("uname"))
+    for _ in range(50):
+        if len(dialed) > 1:
+            break
+        time.sleep(0.05)
+    assert len(dialed) == 1, dialed
+
+    # The second has to be dialed for, with a token of its own.
+    use(link.ssh_command("uname"))
+    for _ in range(100):
+        if len(dialed) > 1:
+            break
+        time.sleep(0.05)
+    assert len(dialed) == 2, dialed
+    assert dialed[0] != dialed[1]
+    link.close()
