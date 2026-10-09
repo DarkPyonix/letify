@@ -328,3 +328,24 @@ def test_a_provider_with_no_transfer_channel_keeps_one_stream() -> None:
         provider = Bare()
 
     assert pathdata._streams_for(Runtime(), 256 << 20) == 1
+
+
+def test_the_guard_does_not_go_through_a_provider_lookup() -> None:
+    # A provider's __getattr__ answers accelerator names and raises UnknownInstance for
+    # anything else, which is not an AttributeError, so hasattr on the instance raises it
+    # instead of answering False. Asking the class is what answers the question.
+    from letify.errors import UnknownInstance
+    from letify.store import pathdata
+
+    class Picky:
+        transfer_streams = 4
+        transfer_parallel_mib = 1
+        transfer_parallel_rtt_ms = 0
+
+        def __getattr__(self, name):
+            raise UnknownInstance(f"no instance {name!r}")
+
+    class Runtime:
+        provider = Picky()
+
+    assert pathdata._streams_for(Runtime(), 256 << 20) == 1
