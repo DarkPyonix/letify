@@ -323,30 +323,17 @@ class Colab(Shell):
     def rendezvous(self, runtime: Runtime | None = None) -> Rendezvous | None:
         if runtime is None:
             return None
-        from ..transport.rendezvous import ColabRendezvous
+        from ..transport.rendezvous import ColabRendezvous, prepare_tailcat
 
         name = runtime.name
 
-        def prepare_tailcat() -> str | None:
-            from .. import install
-
-            if not (
-                install.find("tailcat", link_cache=False) or self.config.option("tailcat_binary")
-            ):
-                return None
-            output = self._exec(name, install.remote_tailcat_source(), 180)
-            for line in output.splitlines():
-                if line.startswith("LETIFY-TAILCAT "):
-                    return json.loads(line[len("LETIFY-TAILCAT ") :])
-            raise RuntimeFailure(
-                "tailcat installation gave no verified binary path",
-                stderr=output.strip(),
-            )
+        def run(source: str, timeout: float) -> str:
+            return self._exec(name, source, timeout)
 
         return ColabRendezvous(
-            lambda source, timeout: self._exec(name, source, timeout),
+            run,
             self._public_key(),
-            prepare_tailcat=prepare_tailcat,
+            prepare_tailcat=prepare_tailcat(run, self.config.option("tailcat_binary")),
         )
 
     def fallback(self, runtime: Runtime | None = None) -> Callable[[], Link] | None:

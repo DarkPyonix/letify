@@ -141,6 +141,28 @@ class Shell(Provider):
         return dict(value) if isinstance(value, Mapping) else None
 
     @property
+    def connect_back(self) -> dict[str, Any] | None:
+        """Where the remote can reach this machine, from ``connect_back``.
+
+        Spec "Connect back". ``port`` is required; ``address`` is optional and the STUN
+        answer stands in for it when the port is forwarded here but the name is not known.
+        """
+        value = self.config.option("connect_back")
+        if not isinstance(value, Mapping) or not value.get("port"):
+            return None
+        return dict(value)
+
+    @property
+    def port_mapping(self) -> bool:
+        """Whether to ask the NAT for a forwarding, from ``port_mapping``.
+
+        Spec "Asking the NAT for a mapping": on by default, because a device that does not
+        speak one of the three protocols answers nothing and the attempt costs a second.
+        """
+        value = self.config.option("port_mapping")
+        return True if value is None else bool(value)
+
+    @property
     def link_floor(self) -> LinkFloor:
         """The slowest probe this account accepts, from ``min_mib_per_s`` and ``max_rtt_ms``.
 
@@ -231,17 +253,22 @@ class Shell(Provider):
     def strategies(self) -> list[Strategy]:
         """The ranked strategy list. Reverse SSH joins only when the account sets it."""
         from ..transport.strategies import (
+            ConnectBack,
             DirectSSH,
             ProviderFallback,
+            QuicUDP,
             ReverseSSH,
             TailcatUDP,
             TCPPunch,
         )
 
-        chosen: list[Strategy] = [DirectSSH(), TCPPunch(), TailcatUDP()]
+        chosen: list[Strategy] = [DirectSSH()]
+        if self.connect_back or self.port_mapping:
+            chosen.append(ConnectBack(mapping=self.port_mapping))
+        chosen.extend((TCPPunch(), TailcatUDP(), QuicUDP()))
         if self.reverse_ssh:
             chosen.append(ReverseSSH())
-        chosen.append(ProviderFallback(rank=5 if self.reverse_ssh else 4))
+        chosen.append(ProviderFallback(rank=7 if self.reverse_ssh else 6))
         return chosen
 
     def fallback(self, runtime: Runtime | None = None) -> Callable[[], Link] | None:
@@ -269,6 +296,7 @@ class Shell(Provider):
             remote_python=self.remote_python,
             rendezvous=self.rendezvous(runtime),
             reverse_ssh=self.reverse_ssh,
+            connect_back=self.connect_back,
             fallback=self.fallback(runtime),
             stun=stun,
             tailcat=self.tailcat_binary,
@@ -462,6 +490,42 @@ class Shell(Provider):
             ),
             name=runtime.name,
         )
+
+    def transfer_command(self, runtime: Runtime | None) -> list[str]:
+        """An SSH command for one transfer connection, outside the multiplexed one.
+
+        Spec "Several connections at once": every SSH command letify builds carries
+        ``ControlMaster=auto``, which puts further sessions inside the first connection.
+        A transfer stream has to be its own kernel connection, so it turns that off. A
+        punched link redials for each, which is already one connection per session.
+        """
+        import shlex as _shlex
+
+        from ..protocol.worker import BOOTSTRAP
+
+        link = self.link(runtime)
+        command = link.ssh_command(
+            self.remote_command(f"{self.remote_python} -u -c {_shlex.quote(BOOTSTRAP)}")
+        )
+        kept: list[str] = []
+        index = 0
+        while index < len(command):
+            part = command[index]
+            if part == "-o" and index + 1 < len(command):
+                option = command[index + 1]
+                if option.startswith(("ControlMaster=", "ControlPath=", "ControlPersist=")):
+                    index += 2
+                    continue
+            kept.append(part)
+            index += 1
+        # After the program name, so they are options rather than the remote command.
+        return [kept[0], "-o", "ControlMaster=no", "-o", "ControlPath=none", *kept[1:]]
+
+    def transfer_channel(self, runtime: Runtime | None) -> Channel:
+        """One channel for one transfer stream, on a connection of its own."""
+        from ..runtime.channel import PersistentChannel
+
+        return PersistentChannel(self.transfer_command(runtime), name=f"{self.alias}-transfer")
 
     def device_channel(self, runtime: Runtime) -> Channel:
         """The session's call channel, which hosts the PyTorch device executor."""

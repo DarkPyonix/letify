@@ -84,7 +84,7 @@ def test_a_tcp_punch_needs_a_rendezvous() -> None:
     assert TCPPunch().needs(Target(alias="lab")) == "no rendezvous"
     blocked = CannedRendezvous(unavailable="tailcat is not on PATH")
     assert TCPPunch().needs(Target(alias="lab", rendezvous=blocked)) == "tailcat is not on PATH"
-    assert TCPPunch.rank == 2
+    assert TCPPunch.rank == 3
 
 
 def test_a_colab_account_without_a_key_skips_the_strategies_that_log_in_over_ssh(
@@ -258,7 +258,7 @@ def test_tailcat_needs_the_binary_on_path_and_a_rendezvous(patch_which) -> None:
     patch_which(strategies, present=True)
     assert TailcatUDP().needs(target) is None
     assert TailcatUDP().needs(Target(alias="lab")) == "no rendezvous"
-    assert TailcatUDP.rank == 3
+    assert TailcatUDP.rank == 4
 
 
 def test_ssh_over_tailcat_uses_it_as_the_proxy_command(patch_which, patch_run) -> None:
@@ -305,7 +305,7 @@ def keygen(command: list[str]) -> FakeCompleted:
 def test_reverse_ssh_is_only_raced_when_the_account_sets_it() -> None:
     target = Target(alias="lab", rendezvous=CannedRendezvous())
     assert ReverseSSH().needs(target) == "no reverse_ssh entry"
-    assert ReverseSSH.rank == 4
+    assert ReverseSSH.rank == 6
 
 
 def test_a_reverse_session_key_is_restricted_marked_and_removed_on_close(
@@ -375,8 +375,8 @@ def test_the_remote_half_of_a_reverse_forward_lets_the_server_choose_the_port(
 
 
 def test_the_provider_fallback_is_last_and_moves_behind_reverse_ssh() -> None:
-    assert ProviderFallback().rank == 4
-    assert ProviderFallback(rank=5).rank == 5
+    assert ProviderFallback().rank == 6
+    assert ProviderFallback(rank=7).rank == 7
     assert ProviderFallback().needs(Target(alias="lab")) == "no provider fallback"
     link = OneShotLink("fallback", 4, lambda source, timeout: "out")
     target = Target(alias="lab", fallback=lambda: link)
@@ -572,6 +572,23 @@ def test_the_remote_half_starts_sshd_on_the_splice_port_when_nothing_answers_the
     assert not any("apt-get" in command for command in recorder.commands)
 
 
+def test_the_remote_half_generates_host_keys_before_it_starts_sshd(
+    patch_run, monkeypatch, tmp_path
+) -> None:
+    # Spec "Colab": a Kaggle image ships sshd with no host key, so the install step is
+    # skipped and a server with no host key closes the connection before the banner.
+    binary = tmp_path / "sshd"
+    binary.write_text("")
+    monkeypatch.setattr(nat, "SSHD", str(binary))
+    recorder = patch_run(nat)
+    port = _silent_port()
+    nat._start_sshd(port)
+    keygen = ["ssh-keygen", "-A"]
+    assert keygen in recorder.commands
+    started = [str(binary), "-p", str(port), "-o", "ListenAddress=127.0.0.1"]
+    assert recorder.commands.index(keygen) < recorder.commands.index(started)
+
+
 def test_the_remote_half_starts_no_sshd_when_an_ssh_server_already_answers(
     patch_run, monkeypatch, tmp_path
 ) -> None:
@@ -629,3 +646,189 @@ def test_the_remote_half_keeps_reading_what_tailcat_serve_prints_after_the_addre
     assert not waiter.is_alive(), (
         "tailcat serve never finished, so it blocked writing to a pipe nobody reads"
     )
+
+
+def test_the_punch_asks_the_remote_for_a_window_and_stops_when_it_does(patch_run) -> None:
+    # Spec "the simultaneous open": the strategy names the window in the request and uses
+    # the punch_until the remote answers with, so a slow rendezvous does not leave the two
+    # sides dialing in windows that never overlap.
+    import time
+
+    from letify.transport import nat
+
+    calls: list[dict] = []
+
+    class Rendezvous(CannedRendezvous):
+        def exchange(self, request, timeout):
+            calls.append(request)
+            return {"mapping": ["203.0.113.9", 41111], "punch_until": time.time() - 1.0}
+
+    target = Target(alias="lab", rendezvous=Rendezvous(), stun=("stun.example", 443))
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(nat, "stun_mapping", lambda port, server=None, **kw: ("198.51.100.1", port))
+        with pytest.raises(TimeoutError) as raised:
+            TCPPunch().attempt(target)
+
+    assert calls and calls[0]["window"] == nat.DEFAULT_WINDOW
+    assert "already closed" in str(raised.value)
+
+
+# -- Spec: Transport, Connect back -------------------------------------------------
+
+
+def test_connect_back_needs_an_endpoint_and_a_rendezvous() -> None:
+    from letify.transport.strategies import ConnectBack
+
+    assert ConnectBack.rank == 2
+    # The rendezvous is checked first, because it costs nothing and asking the NAT for a
+    # mapping touches the network.
+    assert ConnectBack().needs(Target(alias="lab", rendezvous=None)) == "no rendezvous"
+    target = Target(alias="lab", connect_back={"address": "h", "port": 20130})
+    assert ConnectBack().needs(target) == "no rendezvous"
+    assert "no connect_back" in ConnectBack().needs(
+        Target(alias="lab", rendezvous=CannedRendezvous())
+    )
+    target = Target(
+        alias="lab", rendezvous=CannedRendezvous(), connect_back={"address": "h", "port": 20130}
+    )
+    assert ConnectBack().needs(target) is None
+
+
+def test_the_remote_dials_the_endpoint_and_the_hello_identifies_it() -> None:
+    # Spec "Connect back": the listener takes the connection that presents the token and
+    # closes anything else, because a reachable port can be dialed by anything.
+    import socket
+    import threading
+
+    from letify.transport import nat
+    from letify.transport.strategies import ConnectBack
+
+    free = nat.reusable_socket(0)
+    port = free.getsockname()[1]
+    free.close()
+
+    class Rendezvous(CannedRendezvous):
+        def exchange(self, request, timeout):
+            assert request["kind"] == "connect_back"
+            assert request["port"] == port
+            token = bytes.fromhex(request["token"])
+
+            def dial() -> None:
+                # A stranger first, then the remote with the hello.
+                stranger = socket.create_connection(("127.0.0.1", port), timeout=5)
+                stranger.sendall(b"not the token at all")
+                real = socket.create_connection(("127.0.0.1", port), timeout=5)
+                real.sendall(nat.HELLO + token)
+                self.held = real
+
+            threading.Thread(target=dial, daemon=True).start()
+            return {"dialing": True}
+
+    rendezvous = Rendezvous()
+    target = Target(
+        alias="lab", rendezvous=rendezvous, connect_back={"address": "127.0.0.1", "port": port}
+    )
+    link = ConnectBack().attempt(target)
+    assert link.strategy == "connect_back"
+    assert link.probe_stream() is not None
+    link.close()
+
+
+def test_the_remote_half_dials_back_and_serves_the_link(patch_popen) -> None:
+    # Spec "Connect back": the remote's half of the request writes the hello and then
+    # serves the link the same way a punch does.
+    import threading
+
+    from letify.transport import nat
+
+    listener = nat.reusable_socket(0)
+    listener.listen(2)
+    port = listener.getsockname()[1]
+    token = bytes.fromhex("ab" * 16)
+    seen: list[bytes] = []
+
+    def accept() -> None:
+        conn, _ = listener.accept()
+        seen.append(nat.recv_exact(conn, len(nat.HELLO) + len(token)))
+        conn.close()
+
+    thread = threading.Thread(target=accept, daemon=True)
+    thread.start()
+    answer, continuation = nat.begin(
+        {
+            "kind": "connect_back",
+            "address": "127.0.0.1",
+            "port": port,
+            "token": token.hex(),
+            "ssh_port": 22,
+        }
+    )
+    assert answer == {"dialing": True}
+    threading.Thread(target=continuation, daemon=True).start()
+    thread.join(10)
+    listener.close()
+    assert seen == [nat.HELLO + token]
+
+
+def test_connect_back_asks_the_remote_again_for_a_second_session() -> None:
+    # Spec "Connect back": one connection carries one SSH session, so a second session has
+    # to be dialed for. Without this a connect_back link could carry nothing in parallel.
+    import socket
+    import threading
+
+    from letify.transport import nat
+    from letify.transport.strategies import ConnectBack
+
+    free = nat.reusable_socket(0)
+    port = free.getsockname()[1]
+    free.close()
+    dialed: list[str] = []
+
+    class Rendezvous(CannedRendezvous):
+        def exchange(self, request, timeout):
+            assert request["kind"] == "connect_back"
+            token = bytes.fromhex(request["token"])
+            dialed.append(request["token"])
+
+            def dial() -> None:
+                sock = socket.create_connection(("127.0.0.1", port), timeout=5)
+                sock.sendall(nat.HELLO + token)
+                self.held = getattr(self, "held", [])
+                self.held.append(sock)
+
+            threading.Thread(target=dial, daemon=True).start()
+            return {"dialing": True}
+
+    target = Target(
+        alias="lab",
+        rendezvous=Rendezvous(),
+        connect_back={"address": "127.0.0.1", "port": port},
+        user="root",
+    )
+    strategy = ConnectBack()
+    link = strategy.attempt(target)
+    assert len(dialed) == 1, dialed
+
+    def use(command: list[str]) -> None:
+        """Connect to the forwarding port, which is what makes the link dial."""
+        forwarded = int(command[command.index("-p") + 1])
+        sock = socket.create_connection(("127.0.0.1", forwarded), timeout=5)
+        sock.close()
+
+    # The first session uses the connection the attempt already took.
+    use(link.ssh_command("uname"))
+    for _ in range(50):
+        if len(dialed) > 1:
+            break
+        time.sleep(0.05)
+    assert len(dialed) == 1, dialed
+
+    # The second has to be dialed for, with a token of its own.
+    use(link.ssh_command("uname"))
+    for _ in range(100):
+        if len(dialed) > 1:
+            break
+        time.sleep(0.05)
+    assert len(dialed) == 2, dialed
+    assert dialed[0] != dialed[1]
+    link.close()

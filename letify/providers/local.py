@@ -143,6 +143,20 @@ class Local(Provider):
 
         return PersistentChannel([str(interpreter), "-u", "-c", BOOTSTRAP], name=runtime.name)
 
+    def transfer_channel(self, runtime: Runtime | None) -> Channel:
+        """Another worker subprocess for one transfer stream.
+
+        Spec "Several connections at once" is about kernel connections, and here there is
+        no network to make one over. A subprocess is the local equivalent, and having it
+        lets the parallel placement be exercised over the real framed path.
+        """
+        from ..protocol.worker import BOOTSTRAP
+        from ..runtime.channel import PersistentChannel
+
+        return PersistentChannel(
+            [str(sys.executable), "-u", "-c", BOOTSTRAP], name=f"{self.alias}-transfer"
+        )
+
     def device_channel(self, runtime: Runtime) -> Channel:
         """The session's call worker subprocess, which hosts the PyTorch device executor."""
         assert runtime.channel is not None

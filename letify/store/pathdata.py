@@ -33,6 +33,33 @@ if TYPE_CHECKING:
 #: The largest piece of a file one ``data_put`` request carries.
 CHUNK = 8 << 20
 
+#: Connections a large blob is split across, and the size above which it is split.
+#: Spec "Several connections at once": one connection over a long path carries a
+#: fraction of what the path will carry.
+STREAMS = 4
+PARALLEL_MIB = 64
+#: Round trip, in milliseconds, below which one stream already carries everything the
+#: link will carry, so splitting is pure cost. Measured: 36.1 MiB/s on one stream and
+#: 33.5 on four over a 0.25 ms link.
+PARALLEL_RTT_MS = 20
+
+
+def ranges(size: int, count: int) -> list[tuple[int, int]]:
+    """Contiguous equal ranges covering ``size``, the last one taking the remainder.
+
+    Empty for an empty file, and never more ranges than there are bytes, so a tiny file
+    is not split into empty pieces. Spec "Several connections at once".
+    """
+    if size <= 0:
+        return []
+    count = max(1, min(count, size))
+    step = size // count
+    split = [(index * step, step) for index in range(count)]
+    offset = split[-1][0]
+    split[-1] = (offset, size - offset)
+    return split
+
+
 #: Pieces the sender keeps unanswered on its stream, spec "Where the bytes come from".
 WINDOW = 8
 
@@ -706,7 +733,13 @@ class Stream:
         bucket = self.plan.bucket
         uploaded = True
         if bucket is None:
-            _put(self.runtime, self._link(), self.blobs, digest, local, size, meter)
+            streams = _streams_for(self.runtime, size)
+            if streams > 1:
+                _put_parallel(
+                    self.runtime, self._link(), self.blobs, digest, local, size, meter, streams
+                )
+            else:
+                _put(self.runtime, self._link(), self.blobs, digest, local, size, meter)
         else:
             # A blob the bucket already holds costs this machine nothing: the runtime pulls
             # it directly, so it counts as already on the bucket rather than as sent.
@@ -766,6 +799,128 @@ class Stream:
                 f"not sent in time, {float(stats.get('seconds', 0.0)):.1f} s total, "
                 f"first {stats.get('first') or 'a file'}"
             )
+
+
+def streams_for(*, streams: int, threshold_mib: int, rtt_ms: float | None, size: int) -> int:
+    """How many connections this blob is worth splitting across.
+
+    Spec "Several connections at once": one below the size threshold, because opening
+    connections to send a few megabytes costs more than it saves; one on a short link,
+    because there a single stream already carries everything the link will carry; and
+    never more streams than there are chunks to send.
+    """
+    if streams <= 1 or size < threshold_mib * (1 << 20):
+        return 1
+    if rtt_ms is None or rtt_ms < PARALLEL_RTT_MS:
+        return 1
+    return max(1, min(streams, (size + CHUNK - 1) // CHUNK))
+
+
+def _streams_for(runtime: Any, size: int) -> int:
+    """``streams_for`` with the account's settings and the link's measured round trip."""
+    provider = getattr(runtime, "provider", None)
+    # On the class, not the instance: a provider's __getattr__ answers accelerator names
+    # and raises UnknownInstance for anything else, which hasattr does not catch.
+    if not hasattr(type(provider), "transfer_channel"):
+        # A provider whose channel is not a connection it can open more of, such as
+        # Modal's sandbox pipes or Kaggle's kernel bridge. Spec "Several connections at
+        # once".
+        return 1
+    rtt = None
+    try:
+        link = provider.link(runtime) if provider is not None else None
+        rtt = getattr(link, "rtt_ms", None)
+    except Exception:
+        rtt = None
+    return streams_for(
+        streams=int(getattr(provider, "transfer_streams", STREAMS) or 1),
+        threshold_mib=int(getattr(provider, "transfer_parallel_mib", PARALLEL_MIB) or 0),
+        rtt_ms=rtt,
+        size=size,
+    )
+
+
+def _put_parallel(
+    runtime: Any,
+    pipeline: Any,
+    blobs: str,
+    digest: str,
+    local: str,
+    size: int,
+    meter: _Uploaded | None,
+    streams: int,
+) -> None:
+    """Send one file over several connections, each carrying one contiguous range.
+
+    Spec "Several connections at once". The call's own stream makes the file and seals it,
+    so a failure there is reported where every other data failure is. The ranges go out on
+    channels of their own, each its own kernel connection.
+    """
+    split = ranges(size, streams)
+    try:
+        pipeline.send({"op": "data_begin", "dir": blobs, "digest": digest, "size": size})
+        pipeline.drain()
+    except RemoteError as exc:
+        raise RuntimeFailure(f"{runtime.name}: data_begin failed: {exc}") from exc
+
+    sent = [0] * len(split)
+    failures: list[BaseException] = []
+    lock = threading.Lock()
+
+    def carry(index: int, offset: int, length: int) -> None:
+        channel = None
+        try:
+            channel = runtime.provider.transfer_channel(runtime)
+            stream = channel.pipeline(window=WINDOW, timeout=3600)
+            with open(local, "rb") as handle:
+                handle.seek(offset)
+                remaining = length
+                at = offset
+                while remaining > 0:
+                    piece = handle.read(min(CHUNK, remaining))
+                    if not piece:
+                        break
+                    stream.send(
+                        {
+                            "op": "data_put_at",
+                            "dir": blobs,
+                            "digest": digest,
+                            "offset": at,
+                            "chunk": pickle.PickleBuffer(piece),
+                        }
+                    )
+                    at += len(piece)
+                    remaining -= len(piece)
+                    with lock:
+                        sent[index] += len(piece)
+                        if meter is not None:
+                            meter.update(sum(sent))
+            stream.drain()
+            stream.close()
+        except BaseException as exc:
+            with lock:
+                failures.append(exc)
+        finally:
+            if channel is not None:
+                channel.close()
+
+    workers = [
+        threading.Thread(target=carry, args=(index, offset, length), daemon=True)
+        for index, (offset, length) in enumerate(split)
+    ]
+    for worker in workers:
+        worker.start()
+    for worker in workers:
+        worker.join()
+    if failures:
+        raise RuntimeFailure(
+            f"{runtime.name}: a transfer stream failed: {failures[0]}"
+        ) from failures[0]
+    try:
+        pipeline.send({"op": "data_seal", "dir": blobs, "digest": digest, "size": size})
+        pipeline.drain()
+    except RemoteError as exc:
+        raise RuntimeFailure(f"{runtime.name}: data_seal failed: {exc}") from exc
 
 
 def _put(

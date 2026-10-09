@@ -223,3 +223,35 @@ def test_the_connection_still_fails_when_the_later_strategy_is_also_below_the_fl
         pipeline([punch, tailcat], grace=0.2, floor=floor).connect()
 
     assert "tcp_punch" in str(raised.value) and "tailcat" in str(raised.value)
+
+
+# -- Spec: Link floor, naming what a healthy round trip with no throughput means ----
+
+
+def test_a_floor_rejection_with_a_healthy_round_trip_names_punch_policing() -> None:
+    # The measured Colab case: the punched link answers 30 round trips at 138 ms and then
+    # carries 0.2 MiB/s, while an ordinary outbound connection from the same machine runs
+    # at 64 MiB/s. Spec "Link floor".
+    floor = LinkFloor(min_bps=10 * MIB, max_rtt_ms=300.0)
+    for up, down in ((8.1, 0.2), (4.0, 0.1), (2.2, 0.1)):
+        reasons = floor.violations(result(up, down, rtt=138.0))
+        assert any("punch" in reason for reason in reasons), (up, down, reasons)
+        assert any("reverse_ssh" in reason for reason in reasons), (up, down, reasons)
+
+
+def test_an_ordinarily_slow_link_is_not_blamed_on_punch_policing() -> None:
+    # Spec "Link floor": a link that is merely slow keeps the plain rejection, whether it
+    # is half the floor or a small fraction of it both ways.
+    floor = LinkFloor(min_bps=10 * MIB, max_rtt_ms=300.0)
+    for up, down in ((5.0, 5.0), (5.8, 5.2), (0.2, 0.2)):
+        reasons = floor.violations(result(up, down, rtt=138.0))
+        assert reasons and not any("punch" in reason for reason in reasons), (up, down, reasons)
+
+
+def test_a_failed_round_trip_is_not_blamed_on_punch_policing() -> None:
+    # Spec "Link floor": the signature is a healthy round trip. A round trip over the
+    # floor is an ordinarily bad path, so the note is left out.
+    floor = LinkFloor(min_bps=10 * MIB, max_rtt_ms=300.0)
+    reasons = floor.violations(result(8.1, 0.2, rtt=900.0))
+
+    assert reasons and not any("punch" in reason for reason in reasons), reasons

@@ -29,6 +29,12 @@ DEFAULT_STUN = ("stun.nextcloud.com", 443)
 HELLO = b"LETIFY-PUNCH1"
 TOKEN_BYTES = 16
 CHUNK = 64 * 1024
+#: Seconds the remote waits for its connect back to complete.
+CONNECT_BACK_TIMEOUT = 20.0
+#: Seconds a punch keeps dialing. Longer than the rendezvous can take, because the agreed
+#: start is fixed before the rendezvous is sent and the remote reaches it while the answer
+#: is still travelling back. Spec "the simultaneous open".
+DEFAULT_WINDOW = 45.0
 ANSWER_MARKER = "LETIFY-ANSWER "
 #: What a non-blocking ``connect_ex`` returns when the dial is under way. Windows answers
 #: with its own would-block code instead of EINPROGRESS.
@@ -154,6 +160,23 @@ def default_route_interface(route_table: Path = Path("/proc/net/route")) -> str 
 # -- the simultaneous open ---------------------------------------------------------
 
 
+def _dials(dials: dict[str, int]) -> str:
+    """What the dials did, as a phrase for the failure. Spec "the simultaneous open"."""
+    if not dials:
+        return (
+            "every dial was still unanswered when the window closed, so the SYN is being "
+            "dropped rather than refused"
+        )
+    counted = ", ".join(f"{count} x {name}" for name, count in sorted(dials.items()))
+    if "ECONNREFUSED" in dials:
+        return (
+            f"every dial was refused ({counted}), so the SYN reached the peer's side and "
+            f"something there answered with a reset instead of accepting the punch. Waiting "
+            f"longer cannot help"
+        )
+    return f"the dials ended with {counted}"
+
+
 def punch(
     port: int,
     peer: tuple[str, int],
@@ -161,7 +184,8 @@ def punch(
     *,
     initiator: bool,
     start_at: float,
-    window: float = 15.0,
+    window: float = DEFAULT_WINDOW,
+    until: float | None = None,
     cancel: threading.Event | None = None,
 ) -> socket.socket:
     """Connect to ``peer`` from ``port`` while listening on it, and agree on one connection.
@@ -169,6 +193,11 @@ def punch(
     The initiator takes the first connection that completes and writes the hello with the
     token. The other side keeps the connection that the hello arrives on. Setting
     ``cancel`` ends the wait for ``start_at`` and the dialing loop with ``Cancelled``.
+
+    ``until`` is the time the other side stops dialing, as it reported it. Both sides then
+    stop together, rather than each spending a window of its own measured from whenever it
+    happened to arrive. Spec "the simultaneous open". Without it the deadline is
+    ``window`` seconds from the agreed start, or from now when that is already past.
     """
     delay = start_at - time.time()
     if delay > 0:
@@ -176,7 +205,12 @@ def punch(
             time.sleep(delay)
         elif cancel.wait(delay):
             raise Cancelled(f"the punch to {peer[0]}:{peer[1]} was cancelled before it began")
-    deadline = max(time.time(), start_at) + window
+    deadline = until if until is not None else max(time.time(), start_at) + window
+    if time.time() >= deadline:
+        raise TimeoutError(
+            f"the punch window with {peer[0]}:{peer[1]} had already closed, "
+            f"so the other side has stopped dialing"
+        )
     listener = reusable_socket(port)
     listener.listen(8)
     listener.setblocking(False)
@@ -184,6 +218,12 @@ def punch(
     retry_at = 0.0
     candidates: list[socket.socket] = []
     expected = HELLO + token
+    #: How each dial ended, counted, so the failure can name the cause. Spec "the
+    #: simultaneous open": a refused dial and an unanswered one have different causes.
+    dials: dict[str, int] = {}
+
+    def record(outcome: str) -> None:
+        dials[outcome] = dials.get(outcome, 0) + 1
 
     def close_all(keep: socket.socket | None) -> None:
         for sock in [listener, connector, *candidates]:
@@ -195,12 +235,17 @@ def punch(
             close_all(None)
             raise Cancelled(f"the punch to {peer[0]}:{peer[1]} was cancelled")
         if connector is None and time.time() >= retry_at:
+            # A dial under way is left alone. The kernel retransmits its SYN, which keeps
+            # the NAT mapping warm, and the socket has to still hold the port pair when the
+            # peer's SYN arrives for a simultaneous open to complete at all.
             connector = reusable_socket(port)
             connector.setblocking(False)
             # A dial refused before any packet leaves, EADDRNOTAVAIL when the peer's SYN
             # has already taken the port pair, leaves a socket that looks writable with no
             # pending error. It is not a connection, so it is dropped and dialed again.
-            if connector.connect_ex(tuple(peer)) not in _DIAL_IN_PROGRESS:
+            code = connector.connect_ex(tuple(peer))
+            if code not in _DIAL_IN_PROGRESS:
+                record(errno.errorcode.get(code, str(code)))
                 connector.close()
                 connector = None
                 retry_at = time.time() + 0.2
@@ -214,9 +259,11 @@ def punch(
             except OSError:
                 pass
         if connector is not None and connector in writable:
-            if connector.getsockopt(socket.SOL_SOCKET, socket.SO_ERROR) == 0:
+            pending = connector.getsockopt(socket.SOL_SOCKET, socket.SO_ERROR)
+            if pending == 0:
                 candidates.append(connector)
             else:
+                record(errno.errorcode.get(pending, str(pending)))
                 connector.close()
                 retry_at = time.time() + 0.2
             connector = None
@@ -242,7 +289,48 @@ def punch(
                     return sock
                 sock.close()
     close_all(None)
-    raise TimeoutError(f"no connection with {peer[0]}:{peer[1]} within {window:g} s")
+    raise TimeoutError(
+        f"no connection with {peer[0]}:{peer[1]} within {window:g} s; {_dials(dials)}"
+    )
+
+
+def accept_hello(
+    listener: socket.socket,
+    token: bytes,
+    *,
+    timeout: float,
+    cancel: threading.Event | None = None,
+) -> socket.socket:
+    """The first connection on ``listener`` that presents the hello for ``token``.
+
+    Spec "Connect back": a port reachable from outside can be dialed by anything, so a
+    connection that does not present the token is closed and the wait goes on. Setting
+    ``cancel`` ends the wait with ``Cancelled``.
+    """
+    expected = HELLO + token
+    deadline = time.time() + timeout
+    listener.setblocking(False)
+    while time.time() < deadline:
+        if cancel is not None and cancel.is_set():
+            raise Cancelled("the wait for the remote to connect back was cancelled")
+        readable, _, _ = select.select([listener], [], [], 0.1)
+        if listener not in readable:
+            continue
+        try:
+            sock, _ = listener.accept()
+        except OSError:
+            continue
+        sock.settimeout(max(0.5, min(5.0, deadline - time.time())))
+        try:
+            seen = recv_exact(sock, len(expected))
+        except (EOFError, OSError):
+            sock.close()
+            continue
+        if seen == expected:
+            sock.setblocking(True)
+            return sock
+        sock.close()
+    raise TimeoutError(f"the remote did not connect back within {timeout:g} s")
 
 
 # -- the probe responder and the splice ----------------------------------------------
@@ -276,10 +364,46 @@ def serve_probe(stream) -> bool:
             return op == b"B"
 
 
+def _hang_up(*sockets: socket.socket) -> None:
+    """Shut both directions down, so the other half of a splice stops too."""
+    for sock in sockets:
+        try:
+            sock.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+
+
 def splice(a: socket.socket, b: socket.socket) -> None:
-    """Copy bytes both ways until either side closes."""
+    """Copy bytes both ways until either side closes.
+
+    Through the kernel with ``os.splice`` where the platform has it, which is Linux. Every
+    byte of a punched session crosses this, and the machine on the other end is often a two
+    core VM, so reading into Python and writing back out costs throughput there. Spec
+    "Transport".
+    """
+
+    def through_kernel(src: socket.socket, dst: socket.socket) -> bool:
+        """Move bytes with a pipe between the two sockets. False when it cannot be done."""
+        read, write = os.pipe()
+        try:
+            while True:
+                moved = os.splice(src.fileno(), write, CHUNK)
+                if not moved:
+                    return True
+                while moved:
+                    moved -= os.splice(read, dst.fileno(), moved)
+        except OSError:
+            return True
+        except (AttributeError, NotImplementedError):
+            return False
+        finally:
+            os.close(read)
+            os.close(write)
 
     def pump(src: socket.socket, dst: socket.socket) -> None:
+        if hasattr(os, "splice") and through_kernel(src, dst):
+            _hang_up(dst, src)
+            return
         try:
             while True:
                 data = src.recv(CHUNK)
@@ -288,11 +412,7 @@ def splice(a: socket.socket, b: socket.socket) -> None:
                 dst.sendall(data)
         except OSError:
             pass
-        for sock in (dst, src):
-            try:
-                sock.shutdown(socket.SHUT_RDWR)
-            except OSError:
-                pass
+        _hang_up(dst, src)
 
     other = threading.Thread(target=pump, args=(b, a), daemon=True)
     other.start()
@@ -347,7 +467,8 @@ def begin(request: dict):
         peer = tuple(request["mapping"])
         ssh = ("127.0.0.1", int(request.get("ssh_port", 22)))
 
-        window = float(request.get("window", 15.0))
+        window = float(request.get("window", DEFAULT_WINDOW))
+        until = max(time.time(), float(request["start_at"])) + window
 
         def punch_and_serve() -> None:
             where = f"{peer[0]}:{peer[1]}"
@@ -359,7 +480,7 @@ def begin(request: dict):
                     token,
                     initiator=False,
                     start_at=float(request["start_at"]),
-                    window=window,
+                    until=until,
                 )
             except TimeoutError:
                 # A punch that does not connect is the normal path to the Tailcat link.
@@ -374,7 +495,53 @@ def begin(request: dict):
                 raise
             serve_link(sock, ssh)
 
-        return {"mapping": list(mapping)}, punch_and_serve
+        return {"mapping": list(mapping), "punch_until": until}, punch_and_serve
+    if kind == "connect_back":
+        # Spec "Connect back": an ordinary outbound connection, then the same hello and
+        # the same splice a punched connection uses.
+        where = (str(request["address"]), int(request["port"]))
+        token = bytes.fromhex(request["token"])
+        ssh = ("127.0.0.1", int(request.get("ssh_port", 22)))
+
+        def dial_and_serve() -> None:
+            try:
+                sock = socket.create_connection(where, timeout=CONNECT_BACK_TIMEOUT)
+            except OSError as error:
+                print(
+                    f"letify agent: connect back to {where[0]}:{where[1]} failed "
+                    f"({error.strerror or error})",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                return
+            sock.sendall(HELLO + token)
+            serve_link(sock, ssh)
+
+        return {"dialing": True}, dial_and_serve
+    if kind == "quic":
+        # Spec "QUIC over a punched UDP pair": the same punched endpoints a TCP punch
+        # exchanges, carrying a QUIC connection instead.
+        holder = reusable_socket(0)
+        port = holder.getsockname()[1]
+        mapping = stun_mapping(port, tuple(request.get("stun") or DEFAULT_STUN))
+        holder.close()
+        peer = (str(request["mapping"][0]), int(request["mapping"][1]))
+        command = [
+            str(request.get("binary", "letify-quic")),
+            "serve",
+            "--bind",
+            str(port),
+            "--peer",
+            f"{peer[0]}:{peer[1]}",
+            "--token",
+            str(request["token"]),
+            "--forward",
+            str(int(request.get("ssh_port", 22))),
+        ]
+        carrier = subprocess.Popen(
+            command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True
+        )
+        return {"mapping": list(mapping)}, _drain_then_wait(carrier)
     if kind == "tailcat":
         process = subprocess.Popen(
             [request.get("binary", "tailcat"), "serve", str(request.get("ssh_port", 22))],
@@ -445,6 +612,26 @@ def _match_then_drain(process, stream, pattern: str) -> str | None:
     return found
 
 
+def _drain_then_wait(process):
+    """Keep reading a helper's output while it runs, then wait for it.
+
+    The same reason as the drain beside the address line of ``tailcat serve``: a pipe
+    holds about 64 KiB and a helper nobody reads blocks on its next write.
+    """
+
+    def hold() -> None:
+        stream = process.stdout
+        if stream is not None:
+            try:
+                for _ in stream:
+                    pass
+            except (OSError, ValueError):
+                pass
+        process.wait()
+
+    return hold
+
+
 def _authorize(public_key: str) -> None:
     path = Path.home() / ".ssh" / "authorized_keys"
     path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -474,6 +661,7 @@ def _start_sshd(port: int = 22) -> None:
 
     The port is named on the command line because a Colab image ships sshd configured for
     127.0.0.1:2222, so starting it with its own configuration leaves the splice port closed.
+    Host keys are generated first because a Kaggle image ships none.
     """
     if _ssh_answers(port):
         return
@@ -485,6 +673,10 @@ def _start_sshd(port: int = 22) -> None:
             env={**os.environ, "DEBIAN_FRONTEND": "noninteractive"},
         )
     subprocess.run(["mkdir", "-p", "/run/sshd"], check=False)
+    # A Kaggle image ships sshd with no host key, so the install above is skipped and the
+    # server closes every connection before the banner. ssh-keygen -A makes only what is
+    # missing, so an image that already has its keys is untouched.
+    subprocess.run(["ssh-keygen", "-A"], check=False)
     subprocess.run([SSHD, "-p", str(port), "-o", "ListenAddress=127.0.0.1"], check=False)
 
 

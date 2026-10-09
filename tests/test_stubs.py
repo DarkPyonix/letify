@@ -222,3 +222,28 @@ def test_the_command_line_writes_the_stub_on_demand(project, capsys) -> None:
 def test_the_shipped_fallback_is_the_plain_providers_view() -> None:
     # A project that never generated a stub keeps exactly today's types.
     assert letify_providers.ProvidersView is letify.launcher.Providers
+
+
+# -- Spec: Generated provider types, layout ----------------------------------------
+
+
+def test_two_blank_lines_come_before_every_class(project) -> None:
+    # Spec "Generated provider types": one blank line runs the classes together, and the
+    # file is read by a person looking up what an alias offers.
+    project('[colab_pro]\nkind = "colab"\n[box]\nkind = "local"\n')
+    text = stubs.render(letify.Launcher())
+
+    lines = text.splitlines()
+    starts = [index for index, line in enumerate(lines) if line.startswith("class ")]
+    assert len(starts) >= 3, text
+    for index in starts:
+        assert lines[index - 1] == "", f"line {index} has no blank line before it:\n{text}"
+        assert lines[index - 2] == "", f"line {index} has one blank line, not two:\n{text}"
+        assert lines[index - 3] != "", f"line {index} has three blank lines:\n{text}"
+
+
+def test_the_generated_stub_has_no_trailing_blank_line(project) -> None:
+    # Spec "Generated provider types": the file ends with one newline, as a Python file does.
+    project('[box]\nkind = "local"\n')
+    text = stubs.render(letify.Launcher())
+    assert text.endswith("\n") and not text.endswith("\n\n"), repr(text[-40:])

@@ -7,6 +7,7 @@ only choices that would take seconds of real transfer are given canned results.
 from __future__ import annotations
 
 import json
+import os
 import socket
 import threading
 import time
@@ -656,3 +657,177 @@ def test_a_cached_floor_rejection_cannot_accept_a_lone_failed_probe(isolated_hom
     with pytest.raises(letify.ProviderUnavailable, match="tailcat: below the floor"):
         pipeline([slow, fallback], cache=cache, floor=LinkFloor.default()).connect()
     assert all(link.closed for link in slow.links)
+
+
+# -- Spec: Transport, the simultaneous open: the window covers the rendezvous -------
+
+
+def test_the_punch_window_is_longer_than_the_rendezvous_can_take() -> None:
+    # Spec "the simultaneous open": the start time is fixed before the rendezvous, so the
+    # remote reaches it while the answer is still travelling back. A window shorter than
+    # the connect timeout can close before the user's side has begun.
+    from letify.transport import strategies
+
+    assert nat.DEFAULT_WINDOW > strategies.CONNECT_TIMEOUT
+
+
+def test_a_punch_whose_window_has_already_closed_fails_at_once() -> None:
+    # Spec "the simultaneous open": the remote reports when it stops, and the user's side
+    # stops then too instead of dialing alone.
+    began = time.perf_counter()
+    with pytest.raises(TimeoutError) as raised:
+        nat.punch(
+            free_port(),
+            ("127.0.0.1", 9),
+            b"t" * 16,
+            initiator=True,
+            start_at=0,
+            until=time.time() - 1.0,
+        )
+    assert time.perf_counter() - began < 2.0
+    assert "window" in str(raised.value)
+
+
+def test_the_remote_half_reports_when_it_stops_punching() -> None:
+    # Spec "the simultaneous open": punch_until travels in the answer so both sides stop
+    # together.
+    answer, _ = nat.begin(
+        {
+            "kind": "tcp_punch",
+            "mapping": ["203.0.113.7", 41000],
+            "token": ("a" * 32),
+            "start_at": time.time() + 1.0,
+            "window": 45.0,
+            "ssh_port": 22,
+        }
+    )
+    assert "punch_until" in answer
+    assert answer["punch_until"] >= time.time() + 45.0 - 1.0
+
+
+def test_a_dial_under_way_is_left_alone_so_the_peer_can_complete_it() -> None:
+    # Spec "the simultaneous open": a half open socket has to still hold the port pair when
+    # the peer's SYN arrives, so a dial under way is never thrown away and redialed. The
+    # kernel retransmits the SYN, which is what keeps the mapping warm.
+    port = free_port()
+    made: list[int] = []
+    real = nat.reusable_socket
+
+    def counting(asked: int = 0, host: str = "0.0.0.0"):
+        made.append(asked)
+        return real(asked, host)
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(nat, "reusable_socket", counting)
+        with pytest.raises(TimeoutError):
+            # 198.51.100.0/24 is reserved for documentation, so the SYN goes unanswered and
+            # the dial stays under way for the whole window.
+            nat.punch(
+                port,
+                ("198.51.100.7", 41000),
+                b"t" * 16,
+                initiator=True,
+                start_at=0,
+                window=2.5,
+            )
+    # The listener and one dial over 2.5 s, not a dial every half second.
+    assert made.count(port) == 2, made
+
+
+# -- Spec: Transport, the simultaneous open: the error names what the dials did -----
+
+
+def test_a_punch_whose_dials_are_refused_says_so() -> None:
+    # Spec "the simultaneous open": measured against a host that resets the punch's SYN,
+    # every dial ended writable with SO_ERROR ECONNREFUSED and the punch still reported
+    # only that it did not connect in time. Port 1 on the loopback answers with a reset
+    # the same way.
+    with pytest.raises(TimeoutError) as raised:
+        nat.punch(
+            free_port(), ("127.0.0.1", 1), b"t" * 16, initiator=True, start_at=0, window=1.5
+        )
+    message = str(raised.value)
+    assert "refused" in message, message
+    assert "ECONNREFUSED" in message, message
+
+
+def test_a_punch_whose_dials_go_unanswered_says_that_instead() -> None:
+    # Spec "the simultaneous open": a dropped SYN is a different cause from a reset one,
+    # so it reads differently. 198.51.100.0/24 is reserved for documentation and answers
+    # nothing.
+    with pytest.raises(TimeoutError) as raised:
+        nat.punch(
+            free_port(),
+            ("198.51.100.7", 41000),
+            b"t" * 16,
+            initiator=True,
+            start_at=0,
+            window=1.5,
+        )
+    message = str(raised.value)
+    assert "unanswered" in message, message
+    assert "ECONNREFUSED" not in message, message
+
+
+# -- Spec: Transport, the splice stays in the kernel --------------------------------
+
+
+def test_the_splice_moves_bytes_both_ways() -> None:
+    # Spec "Transport": whichever copy the platform allows, the bytes arrive.
+    import socket as _socket
+
+    left, right = _socket.socketpair()
+    far, near = _socket.socketpair()
+    thread = threading.Thread(target=nat.splice, args=(right, far), daemon=True)
+    thread.start()
+    left.sendall(b"toward the ssh server")
+    assert nat.recv_exact(near, 21) == b"toward the ssh server"
+    near.sendall(b"and back again")
+    assert nat.recv_exact(left, 14) == b"and back again"
+    left.close()
+    near.close()
+    thread.join(10)
+    assert not thread.is_alive()
+
+
+def test_the_splice_uses_the_kernel_where_the_platform_has_it(monkeypatch) -> None:
+    # Spec "Transport": every byte of a punched session crosses this, often on a two core
+    # VM, so it does not go through Python when the kernel can move it.
+    import socket as _socket
+
+    if not hasattr(os, "splice"):
+        pytest.skip("os.splice is Linux only")
+    used: list[int] = []
+    real = os.splice
+
+    def counting(*args, **kwargs):
+        used.append(1)
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(os, "splice", counting)
+    left, right = _socket.socketpair()
+    far, near = _socket.socketpair()
+    thread = threading.Thread(target=nat.splice, args=(right, far), daemon=True)
+    thread.start()
+    left.sendall(b"x" * 4096)
+    assert nat.recv_exact(near, 4096) == b"x" * 4096
+    left.close()
+    near.close()
+    thread.join(10)
+    assert used, "the splice went through Python"
+
+
+def test_a_platform_without_the_kernel_copy_still_splices(monkeypatch) -> None:
+    # Spec "Transport": Windows and macOS have no os.splice, and the fallback carries them.
+    import socket as _socket
+
+    monkeypatch.delattr(os, "splice", raising=False)
+    left, right = _socket.socketpair()
+    far, near = _socket.socketpair()
+    thread = threading.Thread(target=nat.splice, args=(right, far), daemon=True)
+    thread.start()
+    left.sendall(b"through Python this time")
+    assert nat.recv_exact(near, 24) == b"through Python this time"
+    left.close()
+    near.close()
+    thread.join(10)

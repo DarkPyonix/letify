@@ -11,6 +11,7 @@ from __future__ import annotations
 import os
 import secrets
 import shutil
+import socket
 import subprocess
 import tempfile
 import threading
@@ -21,7 +22,7 @@ from pathlib import Path
 from typing import Any
 
 from ..config.secrets import account_directory
-from . import nat, sshopts
+from . import nat, portmap, quic, sshopts
 from .link import Link, PunchedLink, SSHLink
 
 #: Seconds a single attempt may take before the strategy counts as failed.
@@ -45,6 +46,9 @@ class Target:
     remote_python: str = "python3"
     rendezvous: Any = None
     reverse_ssh: dict[str, Any] | None = None
+    #: Where the remote can reach this machine, for Connect back: ``address`` is
+    #: optional and defaults to what STUN reports, ``port`` is dialed and bound.
+    connect_back: dict[str, Any] | None = None
     fallback: Callable[[], Link] | None = None
     ssh_port: int = 22
     stun: tuple[str, int] = nat.DEFAULT_STUN
@@ -150,11 +154,115 @@ class DirectSSH(Strategy):
         return self.assume(target)
 
 
+class ConnectBack(Strategy):
+    """The remote dials an endpoint of this machine and hands over the connection.
+
+    Spec "Connect back". Nothing is punched: the remote makes an ordinary outbound TCP
+    connection, which is the passive candidate of RFC 6544's three. The listener takes the
+    connection that presents the token, because a port reachable from outside can be
+    dialed by anything.
+    """
+
+    name = "connect_back"
+    rank = 2
+
+    def __init__(self, mapping: bool = False):
+        #: Whether to ask the NAT for a forwarding when the account declares no endpoint.
+        self.mapping = mapping
+        #: The forwarding this strategy was granted, kept so it can be given back.
+        self.granted: portmap.Mapping | None = None
+        self._endpoint: dict[str, Any] | None = None
+
+    def endpoint(self, target: Target) -> dict[str, Any] | None:
+        """Where the remote should dial: the account's entry, or a mapping the NAT grants.
+
+        Spec "Asking the NAT for a mapping". The answer is remembered for the session, so
+        asking happens once per strategy rather than once per attempt.
+        """
+        declared = target.connect_back
+        if declared and declared.get("port"):
+            return dict(declared)
+        if self._endpoint is not None or not self.mapping:
+            return self._endpoint
+        holder = nat.reusable_socket(0)
+        port = holder.getsockname()[1]
+        holder.close()
+        granted = portmap.request(port)
+        if granted is None:
+            return None
+        self.granted = granted
+        self._endpoint = {"address": granted.address, "port": granted.port, "local_port": port}
+        return self._endpoint
+
+    def needs(self, target: Target) -> str | None:
+        unmet = _rendezvous_unmet(target)
+        if unmet:
+            return unmet
+        declared = target.connect_back
+        if (declared and declared.get("port")) or self.mapping:
+            # Asking the NAT costs a round trip, and ``needs`` is called for every
+            # strategy before the race begins, so the asking happens in ``attempt``
+            # where it runs beside the other strategies instead of ahead of them.
+            return None
+        return "no connect_back endpoint"
+
+    def label(self, target: Target | None) -> str:
+        spec = self.endpoint(target) if target is not None else None
+        if not spec:
+            return self.name
+        how = f", {self.granted.protocol}" if self.granted else ""
+        return f"{self.name} ({spec.get('address') or '<stun>'}:{spec.get('port')}{how})"
+
+    def attempt(self, target: Target, cancel: threading.Event | None = None) -> Link:
+        spec = self.endpoint(target) or {}
+        if not spec:
+            raise OSError(
+                "no connect_back endpoint is declared and the NAT offered no mapping, "
+                "so there is nowhere for the remote to dial"
+            )
+
+        def dial(cancel_event: threading.Event | None = None) -> socket.socket:
+            """Ask the remote to dial, and take the connection that presents the token.
+
+            One connection carries one SSH session, so this is called again for each
+            later session. Spec "Connect back".
+            """
+            # A mapping may forward an outside port to a different local one.
+            port = int(spec.get("local_port", spec["port"]))
+            listener = nat.reusable_socket(port)
+            listener.listen(8)
+            token = secrets.token_bytes(nat.TOKEN_BYTES)
+            try:
+                address = spec.get("address")
+                outside = int(spec["port"])
+                if not address:
+                    # The port is forwarded here but its name is not declared, so the
+                    # address STUN reports for it is the one the remote can dial.
+                    address = nat.stun_mapping(port, tuple(target.stun))[0]
+                target.rendezvous.exchange(
+                    {
+                        "kind": "connect_back",
+                        "address": address,
+                        "port": outside,
+                        "token": token.hex(),
+                        "ssh_port": target.ssh_port,
+                    },
+                    CONNECT_TIMEOUT,
+                )
+                return nat.accept_hello(
+                    listener, token, timeout=CONNECT_TIMEOUT, cancel=cancel_event
+                )
+            finally:
+                listener.close()
+
+        return PunchedLink(self.name, self.rank, dial(cancel), target.forwarded_ssh, dial)
+
+
 class TCPPunch(Strategy):
     """TCP hole punching: STUN over TCP 443, then a simultaneous open at an agreed time."""
 
     name = "tcp_punch"
-    rank = 2
+    rank = 3
 
     def needs(self, target: Target) -> str | None:
         return _rendezvous_unmet(target)
@@ -181,17 +289,22 @@ class TCPPunch(Strategy):
                     "mapping": list(mapping),
                     "token": token.hex(),
                     "start_at": start_at,
+                    "window": nat.DEFAULT_WINDOW,
                     "ssh_port": target.ssh_port,
                     "stun": list(target.stun),
                 },
                 CONNECT_TIMEOUT,
             )
+            # The remote reports when it stops dialing, so both sides stop together even
+            # when the rendezvous took most of the window. Spec "the simultaneous open".
+            until = answer.get("punch_until")
             return nat.punch(
                 port,
                 tuple(answer["mapping"]),
                 token,
                 initiator=True,
                 start_at=start_at,
+                until=float(until) if until is not None else None,
                 cancel=cancel,
             )
         finally:
@@ -202,7 +315,7 @@ class TailcatUDP(Strategy):
     """UDP hole punching with Tailcat, then SSH over it."""
 
     name = "tailcat"
-    rank = 3
+    rank = 4
 
     def needs(self, target: Target) -> str | None:
         if shutil.which(target.tailcat) is None:
@@ -213,6 +326,52 @@ class TailcatUDP(Strategy):
     def attempt(self, target: Target, cancel: threading.Event | None = None) -> Link:
         address, port = target.rendezvous.tailcat_endpoint(target.ssh_port, CONNECT_TIMEOUT)
         proxy = f"{target.tailcat} {address} {port}"
+
+        def command(remote_command: str | None = None) -> list[str]:
+            return target.proxied_ssh(proxy, remote_command)
+
+        _verify(command("exit 0"))
+        return SSHLink(self.name, self.rank, command, remote_python=target.remote_python)
+
+
+class QuicUDP(Strategy):
+    """The same UDP punch as Tailcat's, carrying a real QUIC connection, then SSH over it.
+
+    Spec "QUIC over a punched UDP pair": a network that shapes UDP it cannot classify
+    often lets QUIC through, because HTTP/3 is QUIC. The rendezvous exchanges both punched
+    endpoints, so nothing here discovers anything.
+    """
+
+    name = "quic"
+    rank = 5
+
+    def needs(self, target: Target) -> str | None:
+        unmet = _rendezvous_unmet(target)
+        if unmet:
+            return unmet
+        return None if quic.carrier_path() is not None else quic.MISSING
+
+    def attempt(self, target: Target, cancel: threading.Event | None = None) -> Link:
+        carrier = quic.carrier_path()
+        if carrier is None:
+            raise OSError(quic.MISSING)
+        holder = nat.reusable_socket(0)
+        port = holder.getsockname()[1]
+        holder.close()
+        mapping = nat.stun_mapping(port, tuple(target.stun))
+        token = secrets.token_bytes(nat.TOKEN_BYTES).hex()
+        answer = target.rendezvous.exchange(
+            {
+                "kind": "quic",
+                "mapping": list(mapping),
+                "token": token,
+                "ssh_port": target.ssh_port,
+                "stun": list(target.stun),
+            },
+            CONNECT_TIMEOUT,
+        )
+        peer = (str(answer["mapping"][0]), int(answer["mapping"][1]))
+        proxy = quic.connect_command(str(carrier), bind=port, peer=peer, token=token)
 
         def command(remote_command: str | None = None) -> list[str]:
             return target.proxied_ssh(proxy, remote_command)
@@ -256,7 +415,7 @@ class ReverseSSH(Strategy):
     """The remote side forwards its SSH server back to the user's machine with ``ssh -R 0:``."""
 
     name = "reverse_ssh"
-    rank = 4
+    rank = 6
 
     def __init__(self, keys: AuthorizedKeys | None = None):
         self.keys = keys
@@ -337,7 +496,7 @@ class ProviderFallback(Strategy):
     #: The fallback cannot carry the probe, so it does not start the grace period.
     probed = False
 
-    def __init__(self, rank: int = 4):
+    def __init__(self, rank: int = 6):
         self.rank = rank
 
     def needs(self, target: Target) -> str | None:
@@ -351,8 +510,10 @@ class ProviderFallback(Strategy):
 
 __all__ = [
     "AuthorizedKeys",
+    "ConnectBack",
     "DirectSSH",
     "ProviderFallback",
+    "QuicUDP",
     "ReverseSSH",
     "Strategy",
     "TCPPunch",

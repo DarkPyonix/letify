@@ -56,7 +56,18 @@ def _answer(output: str) -> dict[str, Any]:
 
 
 class CommandRendezvous(Rendezvous):
-    """A rendezvous that can run a Python program on the remote machine."""
+    """A rendezvous that can run a Python program on the remote machine.
+
+    Because it can, it can also install tailcat on the machine. That belongs here rather
+    than to one provider: a runtime image that ships no ``tailcat`` fails the strategy with
+    FileNotFoundError when the request carries no path.
+    """
+
+    #: Installs tailcat on the machine and returns its absolute path, or None.
+    _prepare_tailcat: Callable[[], str | None] | None = None
+
+    #: The path the last preparation returned, so it runs once per rendezvous.
+    binary: str | None = None
 
     def extras(self) -> dict[str, Any]:
         """Fields this provider adds to every request."""
@@ -67,7 +78,34 @@ class CommandRendezvous(Rendezvous):
         """Run ``source`` remotely and return what it printed."""
 
     def exchange(self, request: dict[str, Any], timeout: float) -> dict[str, Any]:
+        if request.get("kind") == "tailcat":
+            if self.binary is None and self._prepare_tailcat is not None:
+                self.binary = self._prepare_tailcat()
+            if self.binary is not None:
+                request = {**request, "binary": self.binary}
         return _answer(self.run_python(remote_script({**self.extras(), **request}), timeout))
+
+
+def prepare_tailcat(
+    run: Callable[[str, float], str], binary_option: str | None = None
+) -> Callable[[], str | None]:
+    """Install tailcat on the machine ``run`` reaches and return its verified path.
+
+    Returns None when this machine has no tailcat of its own, because the SSH
+    ``ProxyCommand`` runs one locally and there would be nothing to run it with.
+    """
+    from .. import install
+
+    def prepare() -> str | None:
+        if not (install.find("tailcat", link_cache=False) or binary_option):
+            return None
+        output = run(install.remote_tailcat_source(), 180)
+        for line in output.splitlines():
+            if line.startswith("LETIFY-TAILCAT "):
+                return json.loads(line[len("LETIFY-TAILCAT ") :])
+        raise OSError(f"tailcat installation gave no verified binary path: {output.strip()[-500:]}")
+
+    return prepare
 
 
 class ColabRendezvous(CommandRendezvous):
@@ -94,14 +132,6 @@ class ColabRendezvous(CommandRendezvous):
         if self.public_key:
             extra["authorized_key"] = self.public_key
         return extra
-
-    def exchange(self, request: dict[str, Any], timeout: float) -> dict[str, Any]:
-        if request.get("kind") == "tailcat":
-            if self.binary is None and self._prepare_tailcat is not None:
-                self.binary = self._prepare_tailcat()
-            if self.binary is not None:
-                request = {**request, "binary": self.binary}
-        return super().exchange(request, timeout)
 
     def run_python(self, source: str, timeout: float) -> str:
         return self._run(source, timeout)
