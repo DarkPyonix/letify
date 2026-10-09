@@ -572,6 +572,23 @@ def test_the_remote_half_starts_sshd_on_the_splice_port_when_nothing_answers_the
     assert not any("apt-get" in command for command in recorder.commands)
 
 
+def test_the_remote_half_generates_host_keys_before_it_starts_sshd(
+    patch_run, monkeypatch, tmp_path
+) -> None:
+    # Spec "Colab": a Kaggle image ships sshd with no host key, so the install step is
+    # skipped and a server with no host key closes the connection before the banner.
+    binary = tmp_path / "sshd"
+    binary.write_text("")
+    monkeypatch.setattr(nat, "SSHD", str(binary))
+    recorder = patch_run(nat)
+    port = _silent_port()
+    nat._start_sshd(port)
+    keygen = ["ssh-keygen", "-A"]
+    assert keygen in recorder.commands
+    started = [str(binary), "-p", str(port), "-o", "ListenAddress=127.0.0.1"]
+    assert recorder.commands.index(keygen) < recorder.commands.index(started)
+
+
 def test_the_remote_half_starts_no_sshd_when_an_ssh_server_already_answers(
     patch_run, monkeypatch, tmp_path
 ) -> None:
