@@ -157,3 +157,48 @@ def test_a_program_that_opens_with_a_future_import_still_compiles() -> None:
     scope: dict = {}
     exec(compile(wrapped, "<worker>", "exec"), scope)
     assert "LETIFY-ANSWER" in scope["__letify_value__"]
+
+
+def test_a_kaggle_tailcat_request_carries_the_installed_binary_path(monkeypatch) -> None:
+    """Spec "Kaggle runtimes", An SSH link over the kernel: tailcat is prepared lazily.
+
+    Preparation used to belong to ColabRendezvous alone, so a Kaggle tailcat request
+    carried no binary, the remote side ran a bare ``tailcat``, and the strategy failed
+    with FileNotFoundError on an image that ships no such binary.
+    """
+    from letify import install
+    from letify.transport import nat
+
+    monkeypatch.setattr(install, "find", lambda *a, **k: "/usr/bin/tailcat")
+    binary = "/root/.letify/tools/tailcat/1.0/tailcat"
+    sources: list[str] = []
+
+    class Bridge:
+        def request(self, message, timeout=None):
+            source = message["source"]
+            sources.append(source)
+            if "LETIFY-TAILCAT" in source:
+                return f'LETIFY-TAILCAT "{binary}"', None
+            return nat.ANSWER_MARKER + '{"address": "cat.example"}', None
+
+    rendezvous = kaggle().rendezvous_over(Bridge())
+    assert rendezvous.tailcat_endpoint(2222, 30.0) == ("cat.example", 2222)
+    assert binary in sources[-1]
+
+
+def test_a_kaggle_tailcat_request_omits_the_binary_when_the_user_has_none(monkeypatch) -> None:
+    """Spec: a locally missing tailcat cannot run the ProxyCommand, so nothing is installed."""
+    from letify import install
+    from letify.transport import nat
+
+    monkeypatch.setattr(install, "find", lambda *a, **k: None)
+    sources: list[str] = []
+
+    class Bridge:
+        def request(self, message, timeout=None):
+            sources.append(message["source"])
+            return nat.ANSWER_MARKER + '{"address": "cat.example"}', None
+
+    rendezvous = kaggle().rendezvous_over(Bridge())
+    assert rendezvous.tailcat_endpoint(2222, 30.0) == ("cat.example", 2222)
+    assert not any("LETIFY-TAILCAT" in source for source in sources)

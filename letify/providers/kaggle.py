@@ -1082,7 +1082,7 @@ class Kaggle(Provider):
         Spec "Kaggle runtimes", An SSH link over the kernel. The kernel is how letify
         reaches the machine; it does not have to be how the session is carried.
         """
-        from ..transport.rendezvous import CommandRendezvous
+        from ..transport.rendezvous import CommandRendezvous, prepare_tailcat
 
         bridge = channel
 
@@ -1108,7 +1108,12 @@ class Kaggle(Provider):
                 )
                 return value if isinstance(value, str) else str(value or "")
 
-        return KaggleRendezvous()
+        rendezvous = KaggleRendezvous()
+        # A Kaggle image ships no tailcat, so the request has to carry an installed path.
+        rendezvous._prepare_tailcat = prepare_tailcat(
+            rendezvous.run_python, self.config.option("tailcat_binary")
+        )
+        return rendezvous
 
     def target_over(self, channel: Any) -> Any:
         """What the strategies need, with no address because there is none to dial."""
