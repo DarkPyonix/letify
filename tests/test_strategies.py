@@ -305,7 +305,7 @@ def keygen(command: list[str]) -> FakeCompleted:
 def test_reverse_ssh_is_only_raced_when_the_account_sets_it() -> None:
     target = Target(alias="lab", rendezvous=CannedRendezvous())
     assert ReverseSSH().needs(target) == "no reverse_ssh entry"
-    assert ReverseSSH.rank == 5
+    assert ReverseSSH.rank == 6
 
 
 def test_a_reverse_session_key_is_restricted_marked_and_removed_on_close(
@@ -375,8 +375,8 @@ def test_the_remote_half_of_a_reverse_forward_lets_the_server_choose_the_port(
 
 
 def test_the_provider_fallback_is_last_and_moves_behind_reverse_ssh() -> None:
-    assert ProviderFallback().rank == 5
-    assert ProviderFallback(rank=6).rank == 6
+    assert ProviderFallback().rank == 6
+    assert ProviderFallback(rank=7).rank == 7
     assert ProviderFallback().needs(Target(alias="lab")) == "no provider fallback"
     link = OneShotLink("fallback", 4, lambda source, timeout: "out")
     target = Target(alias="lab", fallback=lambda: link)

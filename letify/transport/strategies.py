@@ -22,7 +22,7 @@ from typing import Any
 
 from ..config.secrets import account_directory
 from ..errors import RuntimeFailure
-from . import nat, portmap, sshopts
+from . import nat, portmap, quic, sshopts
 from .link import Link, PunchedLink, SSHLink
 
 #: Seconds a single attempt may take before the strategy counts as failed.
@@ -335,6 +335,52 @@ class TailcatUDP(Strategy):
         return SSHLink(self.name, self.rank, command, remote_python=target.remote_python)
 
 
+class QuicUDP(Strategy):
+    """The same UDP punch as Tailcat's, carrying a real QUIC connection, then SSH over it.
+
+    Spec "QUIC over a punched UDP pair": a network that shapes UDP it cannot classify
+    often lets QUIC through, because HTTP/3 is QUIC. The rendezvous exchanges both punched
+    endpoints, so nothing here discovers anything.
+    """
+
+    name = "quic"
+    rank = 5
+
+    def needs(self, target: Target) -> str | None:
+        unmet = _rendezvous_unmet(target)
+        if unmet:
+            return unmet
+        return None if quic.carrier_path() is not None else quic.MISSING
+
+    def attempt(self, target: Target, cancel: threading.Event | None = None) -> Link:
+        carrier = quic.carrier_path()
+        if carrier is None:
+            raise OSError(quic.MISSING)
+        holder = nat.reusable_socket(0)
+        port = holder.getsockname()[1]
+        holder.close()
+        mapping = nat.stun_mapping(port, tuple(target.stun))
+        token = secrets.token_bytes(nat.TOKEN_BYTES).hex()
+        answer = target.rendezvous.exchange(
+            {
+                "kind": "quic",
+                "mapping": list(mapping),
+                "token": token,
+                "ssh_port": target.ssh_port,
+                "stun": list(target.stun),
+            },
+            CONNECT_TIMEOUT,
+        )
+        peer = (str(answer["mapping"][0]), int(answer["mapping"][1]))
+        proxy = quic.connect_command(str(carrier), bind=port, peer=peer, token=token)
+
+        def command(remote_command: str | None = None) -> list[str]:
+            return target.proxied_ssh(proxy, remote_command)
+
+        _verify(command("exit 0"))
+        return SSHLink(self.name, self.rank, command, remote_python=target.remote_python)
+
+
 class AuthorizedKeys:
     """The user's ``authorized_keys``, holding one restricted line per live reverse session."""
 
@@ -370,7 +416,7 @@ class ReverseSSH(Strategy):
     """The remote side forwards its SSH server back to the user's machine with ``ssh -R 0:``."""
 
     name = "reverse_ssh"
-    rank = 5
+    rank = 6
 
     def __init__(self, keys: AuthorizedKeys | None = None):
         self.keys = keys
@@ -451,7 +497,7 @@ class ProviderFallback(Strategy):
     #: The fallback cannot carry the probe, so it does not start the grace period.
     probed = False
 
-    def __init__(self, rank: int = 5):
+    def __init__(self, rank: int = 6):
         self.rank = rank
 
     def needs(self, target: Target) -> str | None:
@@ -468,6 +514,7 @@ __all__ = [
     "ConnectBack",
     "DirectSSH",
     "ProviderFallback",
+    "QuicUDP",
     "ReverseSSH",
     "Strategy",
     "TCPPunch",

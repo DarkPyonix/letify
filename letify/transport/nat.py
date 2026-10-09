@@ -486,6 +486,30 @@ def begin(request: dict):
             serve_link(sock, ssh)
 
         return {"dialing": True}, dial_and_serve
+    if kind == "quic":
+        # Spec "QUIC over a punched UDP pair": the same punched endpoints a TCP punch
+        # exchanges, carrying a QUIC connection instead.
+        holder = reusable_socket(0)
+        port = holder.getsockname()[1]
+        mapping = stun_mapping(port, tuple(request.get("stun") or DEFAULT_STUN))
+        holder.close()
+        peer = (str(request["mapping"][0]), int(request["mapping"][1]))
+        command = [
+            str(request.get("binary", "letify-quic")),
+            "serve",
+            "--bind",
+            str(port),
+            "--peer",
+            f"{peer[0]}:{peer[1]}",
+            "--token",
+            str(request["token"]),
+            "--forward",
+            str(int(request.get("ssh_port", 22))),
+        ]
+        carrier = subprocess.Popen(
+            command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True
+        )
+        return {"mapping": list(mapping)}, _drain_then_wait(carrier)
     if kind == "tailcat":
         process = subprocess.Popen(
             [request.get("binary", "tailcat"), "serve", str(request.get("ssh_port", 22))],
@@ -554,6 +578,26 @@ def _match_then_drain(process, stream, pattern: str) -> str | None:
 
     threading.Thread(target=drain, name="letify-drain", daemon=True).start()
     return found
+
+
+def _drain_then_wait(process):
+    """Keep reading a helper's output while it runs, then wait for it.
+
+    The same reason as the drain beside the address line of ``tailcat serve``: a pipe
+    holds about 64 KiB and a helper nobody reads blocks on its next write.
+    """
+
+    def hold() -> None:
+        stream = process.stdout
+        if stream is not None:
+            try:
+                for _ in stream:
+                    pass
+            except (OSError, ValueError):
+                pass
+        process.wait()
+
+    return hold
 
 
 def _authorize(public_key: str) -> None:

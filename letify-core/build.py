@@ -39,6 +39,14 @@ AGENTS = {
     "Darwin": "letify-agent",
 }
 
+#: The QUIC carrier, shipped in the wheel beside the shim. Spec "QUIC over a punched UDP
+#: pair": the remote fetches the same wheel to get its own copy.
+CARRIERS = {
+    "Windows": "letify-quic.exe",
+    "Linux": "letify-quic",
+    "Darwin": "letify-quic",
+}
+
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
@@ -83,6 +91,11 @@ def main(argv: list[str] | None = None) -> int:
     if agent.is_file():
         shutil.copy2(agent, destination / agent.name)
         print(f"letify: agent installed at {destination / agent.name}")
+
+    carrier = built / CARRIERS[system]
+    if carrier.is_file():
+        shutil.copy2(carrier, destination / carrier.name)
+        print(f"letify: QUIC carrier installed at {destination / carrier.name}")
 
     print()
     print("The agent runs on the machine with the GPU:")

@@ -1245,9 +1245,10 @@ The measurements behind the order and the rules below are in [NETWORK.md](NETWOR
 | 2 | Connect back | a rendezvous, and an endpoint of the user's machine the remote can reach |
 | 3 | TCP hole punching | a rendezvous, and NATs on both sides that allow a simultaneous open |
 | 4 | UDP hole punching with Tailcat, then SSH over it | a rendezvous, and UDP in both directions |
-| 5 | Provider fallback | the provider's own path, such as `colab exec` and the Colab file API |
+| 5 | QUIC over a punched UDP pair, then SSH over it | a rendezvous, UDP in both directions, and `letify-quic` on both sides |
+| 6 | Provider fallback | the provider's own path, such as `colab exec` and the Colab file API |
 
-Forward SSH is first because it needs no remote agent and costs one connection attempt, and when it works it is a kernel TCP connection. Connect back is next: the remote dials an endpoint of the user's machine, so the connection is an ordinary TCP connection on both sides, with no simultaneous open to be allowed and no user space tunnel. TCP hole punching comes after it because a punched connection is kernel TCP too but asks both NATs to accept a simultaneous open, which many do not: the requirement is written down as REQ-2 of RFC 5382 because NATs that ignore it are common, and a measured Colab runtime drops the peer's SYN while passing a UDP pinhole in the same minute. Tailcat comes next because its NAT traversal succeeds more often, but it runs in user space and a network that limits UDP limits it too. The provider fallback is last because it is the slowest.
+Forward SSH is first because it needs no remote agent and costs one connection attempt, and when it works it is a kernel TCP connection. Connect back is next: the remote dials an endpoint of the user's machine, so the connection is an ordinary TCP connection on both sides, with no simultaneous open to be allowed and no user space tunnel. TCP hole punching comes after it because a punched connection is kernel TCP too but asks both NATs to accept a simultaneous open, which many do not: the requirement is written down as REQ-2 of RFC 5382 because NATs that ignore it are common, and a measured Colab runtime drops the peer's SYN while passing a UDP pinhole in the same minute. Tailcat comes next because its NAT traversal succeeds more often, but it runs in user space and a network that limits UDP limits it too. QUIC follows it for the same traversal with a different wire: a network that shapes UDP it cannot classify often lets QUIC through, because QUIC is what the web runs on. It is ranked behind Tailcat rather than ahead of it because Tailcat is WireGuard and has been carrying sessions for longer, and rank only decides a tie inside the 25% comparison. The provider fallback is last because it is the slowest.
 
 A strategy whose needs are not met is skipped, not attempted. A `Shell` with no rendezvous has only rank 1. An account with no `address`, such as a Tunnel account that names only `tailcat`, has no rank 1: forward SSH is skipped with the reason `no address`, and no SSH command is built for a guessed or empty address. `letify check` on such an account runs over the strategies that remain.
 
@@ -1425,6 +1426,27 @@ A mapping is released when the link closes, with the same protocol and a lifetim
 The answer is an address and a port, which is exactly what [Connect back](#connect-back) needs, so a successful mapping makes that strategy applicable on a machine whose account declares no endpoint. The asking happens inside the attempt rather than in the applicability check, because the check runs for every strategy before the race begins and a round trip to the gateway there would be added to every connection. Connect back is therefore applicable whenever a rendezvous exists and either an endpoint is declared or asking is allowed, and an attempt with nothing to use fails at once with `no connect_back endpoint is declared and the NAT offered no mapping`. An account sets `port_mapping = false` to stop letify asking, for a network where the request is unwelcome. The result is remembered for the session only: a mapping is not written to the link cache, because the next run may be on another network.
 
 Where asking is turned off and no endpoint is declared, the strategy is skipped with `no connect_back endpoint`, which is a different message from the attempt's, so the user can tell "letify did not try" from "the network does not do this".
+
+### QUIC over a punched UDP pair <!-- id: quic -->
+
+> The same UDP hole punch as Tailcat's, carrying a real QUIC connection, for a network that shapes UDP it cannot classify.
+
+A UDP pinhole opens where a TCP simultaneous open is refused, which is why Tailcat connects on networks the punch cannot reach. What a pinhole does not escape is a device that shapes UDP by what the payload looks like. A measured campus network delivered paced UDP to an unclassified port at 0.25 MiB/s in each direction while carrying inbound TCP at 64 MiB/s, and the same ceiling appeared on a second subnet and a host with no traffic shaping of its own.
+
+QUIC is the one UDP payload such a device is unlikely to shape, because HTTP/3 is QUIC and shaping it breaks the web. So letify can carry the session over a real QUIC v1 connection: version 1 on the wire, a TLS 1.3 handshake, a certificate, and the ALPN `letify/1`.
+
+`letify-quic` is a binary in letify-core, built for each wheel and installed beside the CUDA shim in `letify/remoting/lib/`. It takes the punched endpoints rather than discovering anything, because the rendezvous already exchanges them:
+
+```
+letify-quic serve   --bind <port> --peer <ip:port> --token <hex> --forward <ssh port>
+letify-quic connect --bind <port> --peer <ip:port> --token <hex>
+```
+
+`serve` accepts the connection and splices its first bidirectional stream to the machine's SSH server. `connect` opens the connection and pipes that stream on its own standard input and output, so it is an SSH `ProxyCommand`, exactly as `tailcat <address> <port>` is. Both sides write the token on the stream before anything else and close the connection when it does not match: the certificate is self signed, so the token is what identifies the peer, as it is for a TCP punch.
+
+The remote side needs the same binary. It is not downloaded from a release with a pinned hash, because unlike Tailcat it changes with every letify version and a hash pinned in the source cannot describe the build that is about to be made. Instead the remote fetches the letify wheel for its own platform at the version this client runs, with `pip download letify==<version> --no-deps`, and extracts `letify/remoting/lib/letify-quic` from it. PyPI is the verification, the version matches the client exactly, and no new release asset is needed.
+
+A platform with no `letify-quic` in its wheel skips the strategy with the reason `letify-quic is not in this wheel`, and a remote whose download fails skips it with what the download said.
 
 ### Reverse SSH <!-- id: reverse-ssh -->
 
