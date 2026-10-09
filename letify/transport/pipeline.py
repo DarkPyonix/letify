@@ -39,6 +39,12 @@ MIB = 1024 * 1024
 DEFAULT_MIN_MIB_PER_S = 10.0
 DEFAULT_MAX_RTT_MS = 300.0
 
+#: Share of the floor the collapsed direction stays under for a probe with a healthy
+#: round trip to be read as a punched flow whose bulk packets are dropped.
+POLICED_SHARE = 0.05
+#: How many times the collapsed direction the other one reaches in that reading.
+POLICED_RATIO = 10.0
+
 
 class _BelowFloor(ProviderUnavailable):
     """Every connected strategy measured below the floor.
@@ -75,8 +81,34 @@ class LinkFloor:
                 f"round trip {result.rtt_ms:.1f} ms above the floor {self.max_rtt_ms:.0f} ms"
             )
         if found:
+            if self.policed(result):
+                found.append(
+                    "the round trip is healthy and one direction is tens of times the "
+                    "other, which is what a network that lets a hole punched flow "
+                    "establish and then drops its bulk packets looks like, not a slow "
+                    "path. Both strategies that punch run into it while an ordinary "
+                    "outbound connection from this machine stays fast; reverse_ssh is the "
+                    "strategy that does not punch"
+                )
             found.append("account overrides: min_mib_per_s and max_rtt_ms")
         return found
+
+    def policed(self, result: ProbeResult) -> bool:
+        """Whether the probe looks like a punched flow whose bulk packets are dropped.
+
+        The measured signature is a healthy round trip with one direction tens of times
+        the other: the flow establishes, answers every round trip, and then carries almost
+        nothing one way. A link that is merely slow is slow for the round trip too and is
+        slow both ways, so it keeps the plain rejection. ``POLICED_SHARE`` of the floor
+        bounds the collapsed direction and ``POLICED_RATIO`` the gap between them.
+        """
+        if result.rtt_ms > self.max_rtt_ms:
+            return False
+        slower = min(result.upload_bps, result.download_bps)
+        faster = max(result.upload_bps, result.download_bps)
+        if slower >= POLICED_SHARE * self.min_bps:
+            return False
+        return faster >= POLICED_RATIO * slower
 
 
 @dataclass(frozen=True)
