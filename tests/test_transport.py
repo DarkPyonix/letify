@@ -731,3 +731,38 @@ def test_a_dial_under_way_is_left_alone_so_the_peer_can_complete_it() -> None:
             )
     # The listener and one dial over 2.5 s, not a dial every half second.
     assert made.count(port) == 2, made
+
+
+# -- Spec: Transport, the simultaneous open: the error names what the dials did -----
+
+
+def test_a_punch_whose_dials_are_refused_says_so() -> None:
+    # Spec "the simultaneous open": measured against a host that resets the punch's SYN,
+    # every dial ended writable with SO_ERROR ECONNREFUSED and the punch still reported
+    # only that it did not connect in time. Port 1 on the loopback answers with a reset
+    # the same way.
+    with pytest.raises(TimeoutError) as raised:
+        nat.punch(
+            free_port(), ("127.0.0.1", 1), b"t" * 16, initiator=True, start_at=0, window=1.5
+        )
+    message = str(raised.value)
+    assert "refused" in message, message
+    assert "ECONNREFUSED" in message, message
+
+
+def test_a_punch_whose_dials_go_unanswered_says_that_instead() -> None:
+    # Spec "the simultaneous open": a dropped SYN is a different cause from a reset one,
+    # so it reads differently. 198.51.100.0/24 is reserved for documentation and answers
+    # nothing.
+    with pytest.raises(TimeoutError) as raised:
+        nat.punch(
+            free_port(),
+            ("198.51.100.7", 41000),
+            b"t" * 16,
+            initiator=True,
+            start_at=0,
+            window=1.5,
+        )
+    message = str(raised.value)
+    assert "unanswered" in message, message
+    assert "ECONNREFUSED" not in message, message

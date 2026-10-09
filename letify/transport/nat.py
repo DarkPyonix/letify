@@ -158,6 +158,23 @@ def default_route_interface(route_table: Path = Path("/proc/net/route")) -> str 
 # -- the simultaneous open ---------------------------------------------------------
 
 
+def _dials(dials: dict[str, int]) -> str:
+    """What the dials did, as a phrase for the failure. Spec "the simultaneous open"."""
+    if not dials:
+        return (
+            "every dial was still unanswered when the window closed, so the SYN is being "
+            "dropped rather than refused"
+        )
+    counted = ", ".join(f"{count} x {name}" for name, count in sorted(dials.items()))
+    if "ECONNREFUSED" in dials:
+        return (
+            f"every dial was refused ({counted}), so the SYN reached the peer's side and "
+            f"something there answered with a reset instead of accepting the punch. Waiting "
+            f"longer cannot help"
+        )
+    return f"the dials ended with {counted}"
+
+
 def punch(
     port: int,
     peer: tuple[str, int],
@@ -199,6 +216,12 @@ def punch(
     retry_at = 0.0
     candidates: list[socket.socket] = []
     expected = HELLO + token
+    #: How each dial ended, counted, so the failure can name the cause. Spec "the
+    #: simultaneous open": a refused dial and an unanswered one have different causes.
+    dials: dict[str, int] = {}
+
+    def record(outcome: str) -> None:
+        dials[outcome] = dials.get(outcome, 0) + 1
 
     def close_all(keep: socket.socket | None) -> None:
         for sock in [listener, connector, *candidates]:
@@ -218,7 +241,9 @@ def punch(
             # A dial refused before any packet leaves, EADDRNOTAVAIL when the peer's SYN
             # has already taken the port pair, leaves a socket that looks writable with no
             # pending error. It is not a connection, so it is dropped and dialed again.
-            if connector.connect_ex(tuple(peer)) not in _DIAL_IN_PROGRESS:
+            code = connector.connect_ex(tuple(peer))
+            if code not in _DIAL_IN_PROGRESS:
+                record(errno.errorcode.get(code, str(code)))
                 connector.close()
                 connector = None
                 retry_at = time.time() + 0.2
@@ -232,9 +257,11 @@ def punch(
             except OSError:
                 pass
         if connector is not None and connector in writable:
-            if connector.getsockopt(socket.SOL_SOCKET, socket.SO_ERROR) == 0:
+            pending = connector.getsockopt(socket.SOL_SOCKET, socket.SO_ERROR)
+            if pending == 0:
                 candidates.append(connector)
             else:
+                record(errno.errorcode.get(pending, str(pending)))
                 connector.close()
                 retry_at = time.time() + 0.2
             connector = None
@@ -260,7 +287,9 @@ def punch(
                     return sock
                 sock.close()
     close_all(None)
-    raise TimeoutError(f"no connection with {peer[0]}:{peer[1]} within {window:g} s")
+    raise TimeoutError(
+        f"no connection with {peer[0]}:{peer[1]} within {window:g} s; {_dials(dials)}"
+    )
 
 
 # -- the probe responder and the splice ----------------------------------------------
