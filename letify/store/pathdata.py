@@ -819,6 +819,11 @@ def streams_for(*, streams: int, threshold_mib: int, rtt_ms: float | None, size:
 def _streams_for(runtime: Any, size: int) -> int:
     """``streams_for`` with the account's settings and the link's measured round trip."""
     provider = getattr(runtime, "provider", None)
+    if not hasattr(provider, "transfer_channel"):
+        # A provider whose channel is not a connection it can open more of, such as
+        # Modal's sandbox pipes or Kaggle's kernel bridge. Spec "Several connections at
+        # once".
+        return 1
     rtt = None
     try:
         link = provider.link(runtime) if provider is not None else None
