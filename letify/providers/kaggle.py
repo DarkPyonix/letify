@@ -930,6 +930,27 @@ class KaggleChannel(FramedChannel):
             process.kill()
 
 
+def _capture_stdout(source: str) -> str:
+    """``source`` with its standard output captured into ``__letify_value__``.
+
+    A ``from __future__`` import has to be the first statement of the module, so those
+    lines are hoisted above the wrapper rather than indented under it. Without that the
+    rendezvous program, which begins with one, fails to compile and the punch reports that
+    the remote half gave no answer.
+    """
+    lines = source.splitlines(keepends=True)
+    future = [line for line in lines if line.lstrip().startswith("from __future__")]
+    rest = [line for line in lines if not line.lstrip().startswith("from __future__")]
+    return (
+        "".join(future)
+        + "import contextlib as _c, io as _io\n"
+        + "__letify_buffer__ = _io.StringIO()\n"
+        + "with _c.redirect_stdout(__letify_buffer__):\n"
+        + textwrap.indent("".join(rest), "    ")
+        + "\n__letify_value__ = __letify_buffer__.getvalue()\n"
+    )
+
+
 def _public_key() -> str | None:
     """letify's own public key, so the rendezvous can authorize it on the machine."""
     from pathlib import Path as _Path
@@ -1081,13 +1102,7 @@ class Kaggle(Provider):
                 # source left in __letify_value__, not what it printed: the print goes out
                 # as a STDOUT frame and never reaches the caller. So the source runs with
                 # its standard output captured into that name.
-                captured = (
-                    "import contextlib as _c, io as _io\n"
-                    "__letify_buffer__ = _io.StringIO()\n"
-                    "with _c.redirect_stdout(__letify_buffer__):\n"
-                    + textwrap.indent(source, "    ")
-                    + "\n__letify_value__ = __letify_buffer__.getvalue()\n"
-                )
+                captured = _capture_stdout(source)
                 value, _ = bridge.request(
                     {"op": "eval", "source": captured}, timeout=timeout
                 )
