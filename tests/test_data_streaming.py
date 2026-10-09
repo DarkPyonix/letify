@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import collections
 import re
+import threading
 import time
 from pathlib import Path
 
@@ -752,10 +753,28 @@ def test_a_blob_that_never_arrives_fails_the_open(
 
 
 def test_a_call_that_returns_early_cancels_the_transfer(
-    launcher_from, project, capsys
+    launcher_from, project, capsys, monkeypatch
 ) -> None:
+    # Spec "A call that finishes before the background transfer". Each piece sent after
+    # the call request waits 50 ms, so the cancellation is certain to arrive while the
+    # transfer is still running. Without that the test asserts a timing accident: on a
+    # local channel all 23 MiB can go out in 0.1 s, before the body has even returned,
+    # and nothing is left to cancel. It failed that way in 2 of 4 runs pinned to two
+    # cores, which is what CI runs on.
     let = streaming(launcher_from, data_first_wave_files=1)
     root = dataset(project, 24, size=1 << 20)
+    calling = threading.Event()
+    original_message = wire.Sender.message
+
+    def message(self_, kind, stream, obj):
+        if kind == wire.REQUEST and isinstance(obj, dict):
+            if obj.get("op") == "call":
+                calling.set()
+            elif obj.get("op") == "data_put" and calling.is_set():
+                time.sleep(0.05)
+        return original_message(self_, kind, stream, obj)
+
+    monkeypatch.setattr(wire.Sender, "message", message)
 
     @let.function(device=let.providers.lab.CPU, host=letify.remote)
     def peek(directory: Path) -> str:
