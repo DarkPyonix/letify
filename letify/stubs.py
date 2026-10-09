@@ -113,7 +113,6 @@ def render(launcher: Launcher) -> str:
         "import letify.launcher",
         "import letify.providers",
         "from letify.declare.instance import Instance",
-        "",
     ]
     taken = set(_TAKEN)
     view: list[tuple[str, str]] = []
@@ -133,7 +132,9 @@ def render(launcher: Launcher) -> str:
             name = f"{name}{number}"
         taken.add(name)
 
-        lines.append("")
+        # Two blank lines before a class, as PEP 8 asks for a top level definition. Spec
+        # "Generated provider types".
+        lines.extend(("", ""))
         lines.append(f"class {name}(letify.providers.{type(provider).__name__}):")
         accelerators = _accelerators(provider)
         if accelerators is None:
