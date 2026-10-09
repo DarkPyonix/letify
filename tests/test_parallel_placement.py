@@ -300,3 +300,31 @@ def test_an_account_sets_the_round_trip_threshold() -> None:
 
     assert provider_of(Local, "box").transfer_parallel_rtt_ms == 20
     assert provider_of(Local, "box", transfer_parallel_rtt_ms=5).transfer_parallel_rtt_ms == 5
+
+
+def test_a_provider_with_no_transfer_channel_keeps_one_stream() -> None:
+    # Spec "Several connections at once": a provider whose channel is not a connection it
+    # can open more of, such as Modal's sandbox pipes or Kaggle's kernel bridge, has no
+    # transfer channel, and asking it for one would fail inside the placement.
+    from letify.providers.kaggle import Kaggle
+    from letify.providers.modal import Modal
+    from letify.store import pathdata
+
+    for cls in (Modal, Kaggle):
+        assert not hasattr(cls, "transfer_channel"), cls.__name__
+
+    class Bare:
+        transfer_streams = 4
+        transfer_parallel_mib = 1
+        transfer_parallel_rtt_ms = 20
+
+        def link(self, runtime):
+            class Link:
+                rtt_ms = 138.0
+
+            return Link()
+
+    class Runtime:
+        provider = Bare()
+
+    assert pathdata._streams_for(Runtime(), 256 << 20) == 1
