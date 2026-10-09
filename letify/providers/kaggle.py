@@ -25,6 +25,7 @@ import binascii
 import json
 import math
 import re
+import textwrap
 import time
 import urllib.error
 import urllib.parse
@@ -1076,8 +1077,19 @@ class Kaggle(Provider):
                 return extra
 
             def run_python(self, source: str, timeout: float | None) -> str:
+                # The rendezvous program prints its answer, and ``eval`` returns what the
+                # source left in __letify_value__, not what it printed: the print goes out
+                # as a STDOUT frame and never reaches the caller. So the source runs with
+                # its standard output captured into that name.
+                captured = (
+                    "import contextlib as _c, io as _io\n"
+                    "__letify_buffer__ = _io.StringIO()\n"
+                    "with _c.redirect_stdout(__letify_buffer__):\n"
+                    + textwrap.indent(source, "    ")
+                    + "\n__letify_value__ = __letify_buffer__.getvalue()\n"
+                )
                 value, _ = bridge.request(
-                    {"op": "eval", "source": source}, timeout=timeout
+                    {"op": "eval", "source": captured}, timeout=timeout
                 )
                 return value if isinstance(value, str) else str(value or "")
 
