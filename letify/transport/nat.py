@@ -33,9 +33,6 @@ CHUNK = 64 * 1024
 #: start is fixed before the rendezvous is sent and the remote reaches it while the answer
 #: is still travelling back. Spec "the simultaneous open".
 DEFAULT_WINDOW = 45.0
-#: Seconds before a dial still under way is reissued on a fresh socket. The kernel's own
-#: SYN backoff sends too few SYNs for one to land in the moment the peer's NAT opens.
-DIAL_INTERVAL = 0.5
 ANSWER_MARKER = "LETIFY-ANSWER "
 #: What a non-blocking ``connect_ex`` returns when the dial is under way. Windows answers
 #: with its own would-block code instead of EINPROGRESS.
@@ -200,7 +197,6 @@ def punch(
     listener.setblocking(False)
     connector: socket.socket | None = None
     retry_at = 0.0
-    dialed_at = 0.0
     candidates: list[socket.socket] = []
     expected = HELLO + token
 
@@ -213,15 +209,12 @@ def punch(
         if cancel is not None and cancel.is_set():
             close_all(None)
             raise Cancelled(f"the punch to {peer[0]}:{peer[1]} was cancelled")
-        if connector is not None and time.time() - dialed_at >= DIAL_INTERVAL:
-            # The dial is still under way. A fresh socket sends a fresh SYN, which is what
-            # lands in the moment after the peer's NAT opens.
-            connector.close()
-            connector = None
         if connector is None and time.time() >= retry_at:
+            # A dial under way is left alone. The kernel retransmits its SYN, which keeps
+            # the NAT mapping warm, and the socket has to still hold the port pair when the
+            # peer's SYN arrives for a simultaneous open to complete at all.
             connector = reusable_socket(port)
             connector.setblocking(False)
-            dialed_at = time.time()
             # A dial refused before any packet leaves, EADDRNOTAVAIL when the peer's SYN
             # has already taken the port pair, leaves a socket that looks writable with no
             # pending error. It is not a connection, so it is dropped and dialed again.
