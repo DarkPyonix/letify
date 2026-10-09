@@ -1422,9 +1422,9 @@ The gateway is the default route's next hop, read from `/proc/net/route` on Linu
 
 A mapping is released when the link closes, with the same protocol and a lifetime of zero. A mapping letify did not create is never touched, and a lifetime is never extended beyond the session.
 
-The answer is an address and a port, which is exactly what [Connect back](#connect-back) needs, so a successful mapping makes that strategy applicable on a machine whose account declares no endpoint. An account sets `port_mapping = false` to stop letify asking, for a network where the request is unwelcome. The result is remembered for the session only: a mapping is not written to the link cache, because the next run may be on another network.
+The answer is an address and a port, which is exactly what [Connect back](#connect-back) needs, so a successful mapping makes that strategy applicable on a machine whose account declares no endpoint. The asking happens inside the attempt rather than in the applicability check, because the check runs for every strategy before the race begins and a round trip to the gateway there would be added to every connection. Connect back is therefore applicable whenever a rendezvous exists and either an endpoint is declared or asking is allowed, and an attempt with nothing to use fails at once with `no connect_back endpoint is declared and the NAT offered no mapping`. An account sets `port_mapping = false` to stop letify asking, for a network where the request is unwelcome. The result is remembered for the session only: a mapping is not written to the link cache, because the next run may be on another network.
 
-Where no protocol answers, the strategy is skipped with the reason `no connect_back endpoint and the NAT offered no mapping`, which tells the user the difference between "letify did not try" and "the network does not do this".
+Where asking is turned off and no endpoint is declared, the strategy is skipped with `no connect_back endpoint`, which is a different message from the attempt's, so the user can tell "letify did not try" from "the network does not do this".
 
 ### Reverse SSH <!-- id: reverse-ssh -->
 

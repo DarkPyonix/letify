@@ -198,11 +198,13 @@ class ConnectBack(Strategy):
         unmet = _rendezvous_unmet(target)
         if unmet:
             return unmet
-        if self.endpoint(target) is None:
-            if self.mapping:
-                return "no connect_back endpoint and the NAT offered no mapping"
-            return "no connect_back endpoint"
-        return None
+        declared = target.connect_back
+        if (declared and declared.get("port")) or self.mapping:
+            # Asking the NAT costs a round trip, and ``needs`` is called for every
+            # strategy before the race begins, so the asking happens in ``attempt``
+            # where it runs beside the other strategies instead of ahead of them.
+            return None
+        return "no connect_back endpoint"
 
     def label(self, target: Target | None) -> str:
         spec = self.endpoint(target) if target is not None else None
@@ -214,7 +216,10 @@ class ConnectBack(Strategy):
     def attempt(self, target: Target, cancel: threading.Event | None = None) -> Link:
         spec = self.endpoint(target) or {}
         if not spec:
-            raise OSError("no connect_back endpoint and the NAT offered no mapping")
+            raise OSError(
+                "no connect_back endpoint is declared and the NAT offered no mapping, "
+                "so there is nowhere for the remote to dial"
+            )
         # A mapping may forward an outside port to a different local one.
         port = int(spec.get("local_port", spec["port"]))
         listener = nat.reusable_socket(port)
