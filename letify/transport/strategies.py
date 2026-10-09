@@ -22,7 +22,7 @@ from typing import Any
 
 from ..config.secrets import account_directory
 from ..errors import RuntimeFailure
-from . import nat, sshopts
+from . import nat, portmap, sshopts
 from .link import Link, PunchedLink, SSHLink
 
 #: Seconds a single attempt may take before the strategy counts as failed.
@@ -166,25 +166,63 @@ class ConnectBack(Strategy):
     name = "connect_back"
     rank = 2
 
+    def __init__(self, mapping: bool = False):
+        #: Whether to ask the NAT for a forwarding when the account declares no endpoint.
+        self.mapping = mapping
+        #: The forwarding this strategy was granted, kept so it can be given back.
+        self.granted: portmap.Mapping | None = None
+        self._endpoint: dict[str, Any] | None = None
+
+    def endpoint(self, target: Target) -> dict[str, Any] | None:
+        """Where the remote should dial: the account's entry, or a mapping the NAT grants.
+
+        Spec "Asking the NAT for a mapping". The answer is remembered for the session, so
+        asking happens once per strategy rather than once per attempt.
+        """
+        declared = target.connect_back
+        if declared and declared.get("port"):
+            return dict(declared)
+        if self._endpoint is not None or not self.mapping:
+            return self._endpoint
+        holder = nat.reusable_socket(0)
+        port = holder.getsockname()[1]
+        holder.close()
+        granted = portmap.request(port)
+        if granted is None:
+            return None
+        self.granted = granted
+        self._endpoint = {"address": granted.address, "port": granted.port, "local_port": port}
+        return self._endpoint
+
     def needs(self, target: Target) -> str | None:
-        if not target.connect_back or not target.connect_back.get("port"):
+        unmet = _rendezvous_unmet(target)
+        if unmet:
+            return unmet
+        if self.endpoint(target) is None:
+            if self.mapping:
+                return "no connect_back endpoint and the NAT offered no mapping"
             return "no connect_back endpoint"
-        return _rendezvous_unmet(target)
+        return None
 
     def label(self, target: Target | None) -> str:
-        if target is None or not target.connect_back:
+        spec = self.endpoint(target) if target is not None else None
+        if not spec:
             return self.name
-        spec = target.connect_back
-        return f"{self.name} ({spec.get('address') or '<stun>'}:{spec.get('port')})"
+        how = f", {self.granted.protocol}" if self.granted else ""
+        return f"{self.name} ({spec.get('address') or '<stun>'}:{spec.get('port')}{how})"
 
     def attempt(self, target: Target, cancel: threading.Event | None = None) -> Link:
-        spec = target.connect_back or {}
-        port = int(spec["port"])
+        spec = self.endpoint(target) or {}
+        if not spec:
+            raise OSError("no connect_back endpoint and the NAT offered no mapping")
+        # A mapping may forward an outside port to a different local one.
+        port = int(spec.get("local_port", spec["port"]))
         listener = nat.reusable_socket(port)
         listener.listen(8)
         token = secrets.token_bytes(nat.TOKEN_BYTES)
         try:
             address = spec.get("address")
+            outside = int(spec["port"])
             if not address:
                 # The port is forwarded to this machine but its name is not declared, so
                 # the address STUN reports for it is the one the remote can dial.
@@ -193,7 +231,7 @@ class ConnectBack(Strategy):
                 {
                     "kind": "connect_back",
                     "address": address,
-                    "port": port,
+                    "port": outside,
                     "token": token.hex(),
                     "ssh_port": target.ssh_port,
                 },
