@@ -951,15 +951,25 @@ def _capture_stdout(source: str) -> str:
     )
 
 
-def _public_key() -> str | None:
-    """letify's own public key, so the rendezvous can authorize it on the machine."""
+def _key_path():
+    """Where letify keeps the key pair a Kaggle rendezvous authorizes."""
     from pathlib import Path as _Path
 
-    path = _Path.home() / ".ssh" / "id_letify.pub"
+    return _Path.home() / ".ssh" / "id_letify"
+
+
+def _public_key() -> str | None:
+    """letify's own public key, so the rendezvous can authorize it on the machine."""
     try:
-        return path.read_text(encoding="utf-8").strip() or None
+        return _key_path().with_suffix(".pub").read_text(encoding="utf-8").strip() or None
     except OSError:
         return None
+
+
+def _private_key() -> str | None:
+    """The private half, which the SSH command over a punched link logs in with."""
+    path = _key_path()
+    return str(path) if path.exists() else None
 
 
 class Kaggle(Provider):
@@ -1120,12 +1130,17 @@ class Kaggle(Provider):
         from ..transport import nat
         from ..transport.strategies import Target
 
+        user = self.config.option("user")
         return Target(
             alias=self.alias,
             rendezvous=self.rendezvous_over(channel),
             remote_python=self.remote_python,
             stun=nat.DEFAULT_STUN,
             workspace=self.workspace_root,
+            # The rendezvous authorized this key for root on the VM, so the link has to
+            # offer it and name that user. Without them the VM closes the banner exchange.
+            key=_private_key(),
+            user=user if isinstance(user, str) and user else "root",
         )
 
     def strategies(self) -> list[Any]:
