@@ -491,6 +491,42 @@ class Shell(Provider):
             name=runtime.name,
         )
 
+    def transfer_command(self, runtime: Runtime | None) -> list[str]:
+        """An SSH command for one transfer connection, outside the multiplexed one.
+
+        Spec "Several connections at once": every SSH command letify builds carries
+        ``ControlMaster=auto``, which puts further sessions inside the first connection.
+        A transfer stream has to be its own kernel connection, so it turns that off. A
+        punched link redials for each, which is already one connection per session.
+        """
+        import shlex as _shlex
+
+        from ..protocol.worker import BOOTSTRAP
+
+        link = self.link(runtime)
+        command = link.ssh_command(
+            self.remote_command(f"{self.remote_python} -u -c {_shlex.quote(BOOTSTRAP)}")
+        )
+        kept: list[str] = []
+        index = 0
+        while index < len(command):
+            part = command[index]
+            if part == "-o" and index + 1 < len(command):
+                option = command[index + 1]
+                if option.startswith(("ControlMaster=", "ControlPath=", "ControlPersist=")):
+                    index += 2
+                    continue
+            kept.append(part)
+            index += 1
+        # After the program name, so they are options rather than the remote command.
+        return [kept[0], "-o", "ControlMaster=no", "-o", "ControlPath=none", *kept[1:]]
+
+    def transfer_channel(self, runtime: Runtime | None) -> Channel:
+        """One channel for one transfer stream, on a connection of its own."""
+        from ..runtime.channel import PersistentChannel
+
+        return PersistentChannel(self.transfer_command(runtime), name=f"{self.alias}-transfer")
+
     def device_channel(self, runtime: Runtime) -> Channel:
         """The session's call channel, which hosts the PyTorch device executor."""
         from ..errors import UnsupportedMode

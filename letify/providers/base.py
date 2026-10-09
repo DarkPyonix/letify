@@ -261,6 +261,30 @@ class Provider(abc.ABC):
         return self.default_persistence
 
     @property
+    def transfer_streams(self) -> int:
+        """Connections a large blob is split across, from ``transfer_streams``.
+
+        Spec "Several connections at once": one TCP connection over a long round trip
+        carries a fraction of what the path will carry, and independent connections add
+        up. One keeps the single stream.
+        """
+        from ..store.pathdata import STREAMS
+
+        value = self.config.option("transfer_streams")
+        return max(1, int(value)) if isinstance(value, (int, float)) else STREAMS
+
+    @property
+    def transfer_parallel_mib(self) -> int:
+        """The size above which a blob is split, from ``transfer_parallel_mib``.
+
+        Below it, opening more connections costs more than it saves.
+        """
+        from ..store.pathdata import PARALLEL_MIB
+
+        value = self.config.option("transfer_parallel_mib")
+        return max(0, int(value)) if isinstance(value, (int, float)) else PARALLEL_MIB
+
+    @property
     def persistent(self) -> bool:
         return self.persistence == "persistent"
 
