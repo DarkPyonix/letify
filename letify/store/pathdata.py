@@ -38,6 +38,10 @@ CHUNK = 8 << 20
 #: fraction of what the path will carry.
 STREAMS = 4
 PARALLEL_MIB = 64
+#: Round trip, in milliseconds, below which one stream already carries everything the
+#: link will carry, so splitting is pure cost. Measured: 36.1 MiB/s on one stream and
+#: 33.5 on four over a 0.25 ms link.
+PARALLEL_RTT_MS = 20
 
 
 def ranges(size: int, count: int) -> list[tuple[int, int]]:
@@ -797,19 +801,36 @@ class Stream:
             )
 
 
-def _streams_for(runtime: Any, size: int) -> int:
+def streams_for(*, streams: int, threshold_mib: int, rtt_ms: float | None, size: int) -> int:
     """How many connections this blob is worth splitting across.
 
-    Spec "Several connections at once": one below the account's threshold, because opening
-    connections to send a few megabytes costs more than it saves, and never more streams
-    than there are chunks to send.
+    Spec "Several connections at once": one below the size threshold, because opening
+    connections to send a few megabytes costs more than it saves; one on a short link,
+    because there a single stream already carries everything the link will carry; and
+    never more streams than there are chunks to send.
     """
-    provider = getattr(runtime, "provider", None)
-    streams = int(getattr(provider, "transfer_streams", STREAMS) or 1)
-    threshold = int(getattr(provider, "transfer_parallel_mib", PARALLEL_MIB) or 0)
-    if streams <= 1 or size < threshold * (1 << 20):
+    if streams <= 1 or size < threshold_mib * (1 << 20):
+        return 1
+    if rtt_ms is None or rtt_ms < PARALLEL_RTT_MS:
         return 1
     return max(1, min(streams, (size + CHUNK - 1) // CHUNK))
+
+
+def _streams_for(runtime: Any, size: int) -> int:
+    """``streams_for`` with the account's settings and the link's measured round trip."""
+    provider = getattr(runtime, "provider", None)
+    rtt = None
+    try:
+        link = provider.link(runtime) if provider is not None else None
+        rtt = getattr(link, "rtt_ms", None)
+    except Exception:
+        rtt = None
+    return streams_for(
+        streams=int(getattr(provider, "transfer_streams", STREAMS) or 1),
+        threshold_mib=int(getattr(provider, "transfer_parallel_mib", PARALLEL_MIB) or 0),
+        rtt_ms=rtt,
+        size=size,
+    )
 
 
 def _put_parallel(

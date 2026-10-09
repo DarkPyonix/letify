@@ -911,7 +911,9 @@ The local digest cache is `~/.letify/cache/digests.json`. An entry is keyed by t
 
 A single TCP connection at a long round trip is limited by its window and by how it reacts to loss, not by the path. Measured from a Colab runtime to a machine in Korea at 138 ms, one connection carried 5.5 MiB/s and five independent connections carried 26.0 MiB/s together, which is near what that runtime could push to a nearby endpoint at all. The path was never the limit; the single connection was.
 
-So a blob above `transfer_parallel_mib`, 64 MiB by default, is sent over `transfer_streams` connections, 4 by default. An account sets either, and `transfer_streams = 1` keeps the single stream.
+So a blob above `transfer_parallel_mib`, 64 MiB by default, on a link whose measured round trip is at least `transfer_parallel_rtt_ms`, 20 ms by default, is sent over `transfer_streams` connections, 4 by default. An account sets any of the three, and `transfer_streams = 1` keeps the single stream.
+
+The round trip is a condition because the gain depends on it. A single stream is window limited only when the window takes a long time to fill, so on a short link it already carries everything the link will carry and the extra connections are pure cost. Measured to a lab server over forward SSH at 0.25 ms, 256 MiB went at 36.1 MiB/s on one stream and 33.5 MiB/s on four, about 7% worse, which is the cost of opening the channels and their worker processes. The link reports what the probe measured, and a link with no measurement, such as a provider fallback, is treated as short and keeps one stream.
 
 The connections have to be real ones. Every SSH command letify builds carries `ControlMaster=auto`, which multiplexes further sessions onto the first connection, so opening more channels that way would add streams inside one TCP connection and gain nothing. A transfer channel therefore sets `ControlPath=none` and `ControlMaster=no`, and a punched link redials for each, so each transfer channel is its own kernel connection.
 

@@ -274,6 +274,18 @@ class Provider(abc.ABC):
         return max(1, int(value)) if isinstance(value, (int, float)) else STREAMS
 
     @property
+    def transfer_parallel_rtt_ms(self) -> int:
+        """The round trip above which a blob is split, from ``transfer_parallel_rtt_ms``.
+
+        Below it one stream already carries everything the link will carry, so the extra
+        connections are pure cost. Spec "Several connections at once".
+        """
+        from ..store.pathdata import PARALLEL_RTT_MS
+
+        value = self.config.option("transfer_parallel_rtt_ms")
+        return max(0, int(value)) if isinstance(value, (int, float)) else PARALLEL_RTT_MS
+
+    @property
     def transfer_parallel_mib(self) -> int:
         """The size above which a blob is split, from ``transfer_parallel_mib``.
 

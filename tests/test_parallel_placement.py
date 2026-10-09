@@ -210,6 +210,17 @@ def test_a_large_blob_is_placed_over_several_connections(
     from letify.store import pathdata
 
     monkeypatch.setattr(pathdata, "CHUNK", 1 << 16)
+    # A local channel is never probed, so it has no round trip and would keep one stream,
+    # which is the right answer for a local placement. The condition is pinned on its own
+    # above; here the point is that the pieces assemble over several channels, so the
+    # round trip of a long link is supplied.
+    monkeypatch.setattr(
+        pathdata,
+        "_streams_for",
+        lambda runtime, size: pathdata.streams_for(
+            streams=4, threshold_mib=1, rtt_ms=138.0, size=size
+        ),
+    )
     seen = data_ops(monkeypatch)
     let = persistent(launcher_from, transfer_parallel_mib=1, transfer_streams=4)
     body = os.urandom(3 * MiB)
@@ -241,3 +252,50 @@ def test_a_small_blob_keeps_the_single_stream(project, launcher_from, monkeypatc
     assert read_it(source) == 5000
     assert "data_put" in seen, seen
     assert "data_put_at" not in seen, seen
+
+
+# -- Spec: Several connections at once, the round trip condition ---------------------
+
+
+def test_a_short_link_keeps_one_stream() -> None:
+    # Spec "Several connections at once": measured to a lab server at 0.25 ms, one stream
+    # carried 36.1 MiB/s and four carried 33.5, so splitting there is pure cost.
+    from letify.store.pathdata import streams_for
+
+    assert streams_for(streams=4, threshold_mib=64, rtt_ms=0.25, size=256 * MiB) == 1
+    assert streams_for(streams=4, threshold_mib=64, rtt_ms=None, size=256 * MiB) == 1
+
+
+def test_a_long_link_above_the_threshold_is_split() -> None:
+    from letify.store.pathdata import streams_for
+
+    assert streams_for(streams=4, threshold_mib=64, rtt_ms=138.0, size=256 * MiB) == 4
+    assert streams_for(streams=8, threshold_mib=64, rtt_ms=138.0, size=256 * MiB) == 8
+
+
+def test_a_small_blob_is_not_split_however_long_the_link() -> None:
+    from letify.store.pathdata import streams_for
+
+    assert streams_for(streams=4, threshold_mib=64, rtt_ms=138.0, size=8 * MiB) == 1
+
+
+def test_one_stream_is_honoured_whatever_else_says() -> None:
+    from letify.store.pathdata import streams_for
+
+    assert streams_for(streams=1, threshold_mib=0, rtt_ms=500.0, size=1 << 30) == 1
+
+
+def test_there_are_never_more_streams_than_chunks() -> None:
+    from letify.store import pathdata
+
+    # Two chunks cannot fill eight streams, and an empty range would send nothing.
+    size = 2 * pathdata.CHUNK
+    assert pathdata.streams_for(streams=8, threshold_mib=0, rtt_ms=138.0, size=size) == 2
+
+
+def test_an_account_sets_the_round_trip_threshold() -> None:
+    from conftest import provider_of
+    from letify.providers.local import Local
+
+    assert provider_of(Local, "box").transfer_parallel_rtt_ms == 20
+    assert provider_of(Local, "box", transfer_parallel_rtt_ms=5).transfer_parallel_rtt_ms == 5
