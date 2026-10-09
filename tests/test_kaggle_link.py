@@ -202,3 +202,31 @@ def test_a_kaggle_tailcat_request_omits_the_binary_when_the_user_has_none(monkey
     rendezvous = kaggle().rendezvous_over(Bridge())
     assert rendezvous.tailcat_endpoint(2222, 30.0) == ("cat.example", 2222)
     assert not any("LETIFY-TAILCAT" in source for source in sources)
+
+
+def test_the_kaggle_punch_target_logs_in_as_root_with_the_authorized_key(tmp_path) -> None:
+    """Spec "Kaggle runtimes", An SSH link over the kernel: the link uses the key it authorized.
+
+    Without key and user the SSH command offers no identity and names this machine's own
+    user, so the VM closes the connection during the banner exchange and a link that had
+    already passed its probe is lost.
+    """
+    key = tmp_path / "id_letify"
+    key.write_text("private", encoding="utf-8")
+    key.with_suffix(".pub").write_text("ssh-ed25519 AAAA letify", encoding="utf-8")
+
+    provider = kaggle()
+    import letify.providers.kaggle as module
+
+    original = module._private_key
+    module._private_key = lambda: str(key)
+    try:
+        target = provider.target_over(object())
+    finally:
+        module._private_key = original
+
+    assert target.user == "root"
+    assert target.key == str(key)
+    command = target.forwarded_ssh(40000, "python3 -c pass")
+    assert "root@127.0.0.1" in command
+    assert command[command.index("-i") + 1] == str(key)
