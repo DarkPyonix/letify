@@ -926,13 +926,29 @@ def test_a_remote_worker_is_one_python_reading_framed_requests(patch_run) -> Non
 # -- Spec: Transport, Connection strategies per provider --------------------------
 
 
-def test_a_plain_shell_lists_the_four_default_strategies_in_rank_order() -> None:
+def test_a_plain_shell_lists_the_default_strategies_in_rank_order() -> None:
+    # connect_back is there because port_mapping is on by default: letify asks the NAT for
+    # a forwarding, and the asking happens inside the attempt. Spec "Asking the NAT for a
+    # mapping".
     provider = provider_of(Shell, "lab", address="gpu.example.edu")
     assert [(s.name, s.rank) for s in provider.strategies()] == [
         ("direct_ssh", 1),
-        ("tcp_punch", 2),
-        ("tailcat", 3),
-        ("fallback", 4),
+        ("connect_back", 2),
+        ("tcp_punch", 3),
+        ("tailcat", 4),
+        ("fallback", 5),
+    ]
+
+
+def test_an_account_that_turns_port_mapping_off_does_not_race_connect_back() -> None:
+    # Spec "Asking the NAT for a mapping": port_mapping = false stops letify asking, and
+    # with no declared endpoint there is nothing for connect back to use.
+    provider = provider_of(Shell, "lab", address="gpu.example.edu", port_mapping=False)
+    assert [s.name for s in provider.strategies()] == [
+        "direct_ssh",
+        "tcp_punch",
+        "tailcat",
+        "fallback",
     ]
 
 
@@ -944,7 +960,7 @@ def test_a_shell_with_no_rendezvous_is_reached_by_forward_ssh_alone(patch_run) -
     assert recorder.calls == []
 
 
-def test_reverse_ssh_takes_rank_four_and_moves_the_fallback_to_five() -> None:
+def test_reverse_ssh_takes_rank_five_and_moves_the_fallback_to_six() -> None:
     provider = provider_of(
         Shell,
         "lab",
@@ -952,8 +968,8 @@ def test_reverse_ssh_takes_rank_four_and_moves_the_fallback_to_five() -> None:
         reverse_ssh={"address": "home.example.com", "port": 2222, "user": "me"},
     )
     assert [(s.name, s.rank) for s in provider.strategies()][-2:] == [
-        ("reverse_ssh", 4),
-        ("fallback", 5),
+        ("reverse_ssh", 5),
+        ("fallback", 6),
     ]
 
 
@@ -974,7 +990,12 @@ def test_a_tunnel_with_no_address_and_no_tailcat_says_what_is_missing(isolated_h
 def test_colab_races_without_forward_ssh(isolated_home, patch_which) -> None:
     patch_which(tools_module, present=True)
     provider = provider_of(Colab, "colab_a")
-    assert [s.name for s in provider.strategies()] == ["tcp_punch", "tailcat", "fallback"]
+    assert [s.name for s in provider.strategies()] == [
+        "connect_back",
+        "tcp_punch",
+        "tailcat",
+        "fallback",
+    ]
 
 
 def test_the_colab_rendezvous_is_colab_exec_and_asks_for_an_ssh_server(

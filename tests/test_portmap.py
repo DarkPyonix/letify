@@ -209,12 +209,17 @@ def test_asking_is_skipped_when_the_account_turns_it_off() -> None:
     assert "no connect_back" in ConnectBack(mapping=False).needs(target)
 
 
-def test_a_nat_that_offers_nothing_says_so(monkeypatch) -> None:
+def test_a_nat_that_offers_nothing_fails_the_attempt_not_the_check(monkeypatch) -> None:
+    # Spec "Asking the NAT for a mapping": needs() is called for every strategy before the
+    # race begins, so asking the NAT belongs in attempt(), where it runs beside the other
+    # strategies instead of ahead of them.
     from conftest import CannedRendezvous
 
     from letify.transport.strategies import ConnectBack, Target
 
     monkeypatch.setattr(portmap, "request", lambda port, **kw: None)
     target = Target(alias="lab", rendezvous=CannedRendezvous())
-    unmet = ConnectBack(mapping=True).needs(target)
-    assert unmet is not None and "the NAT offered no mapping" in unmet
+    strategy = ConnectBack(mapping=True)
+    assert strategy.needs(target) is None
+    with pytest.raises(OSError, match="the NAT offered no mapping"):
+        strategy.attempt(target)
