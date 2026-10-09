@@ -1424,7 +1424,9 @@ connect_back = { address = "gpu.example.edu", port = 20130 }
 
 The strategy binds and listens on that port, then sends a `connect_back` rendezvous request naming the endpoint and a 16 byte token. The remote dials the endpoint, writes `LETIFY-PUNCH1` and the token, and then answers the probe and splices to its own SSH server exactly as a punched connection does, so the link type and everything above it are unchanged. The user's side accepts connections until one presents that hello, closes the others, and uses it.
 
-The token is required rather than cosmetic: a port reachable from outside can be connected to by anything, so a connection that does not present it is closed and the listener keeps waiting. The window is the race timeout, and a connection the remote makes after the choice is closed like any other late arrival.
+One connection carries one SSH session, as a punched one does, so a second session asks the remote to dial again: the strategy keeps its listener and sends another `connect_back` request with a new token. That is what lets a placement spread over several connections, [Several connections at once](#parallel-placement), on a link made this way, and without it the link would carry one session and nothing could be parallel on it.
+
+The token is required rather than cosmetic: a port reachable from outside can be connected to by anything, so a connection that does not present it is closed and the listener keeps waiting. Each dial carries its own token, so a connection meant for one session is never taken for another. The window is the race timeout, and a connection the remote makes after the choice is closed like any other late arrival.
 
 This is the passive candidate of RFC 6544's three. Forward SSH is the active one, and the TCP punch is the simultaneous open one. letify tries all three where their needs are met, which is why a network that refuses one can still be reached.
 

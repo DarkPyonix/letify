@@ -11,6 +11,7 @@ from __future__ import annotations
 import os
 import secrets
 import shutil
+import socket
 import subprocess
 import tempfile
 import threading
@@ -21,7 +22,6 @@ from pathlib import Path
 from typing import Any
 
 from ..config.secrets import account_directory
-from ..errors import RuntimeFailure
 from . import nat, portmap, quic, sshopts
 from .link import Link, PunchedLink, SSHLink
 
@@ -220,43 +220,42 @@ class ConnectBack(Strategy):
                 "no connect_back endpoint is declared and the NAT offered no mapping, "
                 "so there is nowhere for the remote to dial"
             )
-        # A mapping may forward an outside port to a different local one.
-        port = int(spec.get("local_port", spec["port"]))
-        listener = nat.reusable_socket(port)
-        listener.listen(8)
-        token = secrets.token_bytes(nat.TOKEN_BYTES)
-        try:
-            address = spec.get("address")
-            outside = int(spec["port"])
-            if not address:
-                # The port is forwarded to this machine but its name is not declared, so
-                # the address STUN reports for it is the one the remote can dial.
-                address = nat.stun_mapping(port, tuple(target.stun))[0]
-            target.rendezvous.exchange(
-                {
-                    "kind": "connect_back",
-                    "address": address,
-                    "port": outside,
-                    "token": token.hex(),
-                    "ssh_port": target.ssh_port,
-                },
-                CONNECT_TIMEOUT,
-            )
-            sock = nat.accept_hello(listener, token, timeout=CONNECT_TIMEOUT, cancel=cancel)
-        finally:
-            listener.close()
-        return PunchedLink(
-            self.name,
-            self.rank,
-            sock,
-            target.forwarded_ssh,
-            lambda: (_ for _ in ()).throw(
-                RuntimeFailure(
-                    f"the connect_back link to {target.alias} carries one SSH session, and "
-                    f"the remote has to be asked again for another"
+
+        def dial(cancel_event: threading.Event | None = None) -> socket.socket:
+            """Ask the remote to dial, and take the connection that presents the token.
+
+            One connection carries one SSH session, so this is called again for each
+            later session. Spec "Connect back".
+            """
+            # A mapping may forward an outside port to a different local one.
+            port = int(spec.get("local_port", spec["port"]))
+            listener = nat.reusable_socket(port)
+            listener.listen(8)
+            token = secrets.token_bytes(nat.TOKEN_BYTES)
+            try:
+                address = spec.get("address")
+                outside = int(spec["port"])
+                if not address:
+                    # The port is forwarded here but its name is not declared, so the
+                    # address STUN reports for it is the one the remote can dial.
+                    address = nat.stun_mapping(port, tuple(target.stun))[0]
+                target.rendezvous.exchange(
+                    {
+                        "kind": "connect_back",
+                        "address": address,
+                        "port": outside,
+                        "token": token.hex(),
+                        "ssh_port": target.ssh_port,
+                    },
+                    CONNECT_TIMEOUT,
                 )
-            ),
-        )
+                return nat.accept_hello(
+                    listener, token, timeout=CONNECT_TIMEOUT, cancel=cancel_event
+                )
+            finally:
+                listener.close()
+
+        return PunchedLink(self.name, self.rank, dial(cancel), target.forwarded_ssh, dial)
 
 
 class TCPPunch(Strategy):
