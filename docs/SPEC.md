@@ -1006,7 +1006,7 @@ A blocking read is the backstop, not the mechanism. When the body opens a file w
 
 #### What the body sees before a file arrives <!-- id: project-data-pending -->
 
-The layout is complete before the call starts and only file contents arrive later. The worker creates every directory of the manifest in the call directory, and places a file at its runtime path only when its blob is complete in the cache, by the hard link or copy of Materializing and the rewritten path. Nothing is placed half written, so a file that exists on the runtime's real file system holds all of its bytes.
+The layout is complete before the call starts and only file contents arrive later. The worker creates every directory of the manifest in the call directory, and places a file at its runtime path only when its blob is complete in the cache, by the hard link or copy of Materializing and the rewritten path. Nothing is placed half written, so a file that exists on the runtime's real file system holds all of its bytes. A path that already holds a different file is replaced rather than unlinked and relinked: the hard link is made at a `.letify-placing.<pid>` name beside it and renamed over the path with `os.replace`. Unlinking first leaves the final name absent for as long as the link takes, and a body that listed the directory and then stats the name it was given fails with `FileNotFoundError` in that window, which is the one thing this section promises cannot happen.
 
 A file that has not arrived is answered from the manifest instead. The worker installs a patch in the process that runs the body, covering paths under the call directory only:
 

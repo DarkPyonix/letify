@@ -949,13 +949,21 @@ def _data_place_now(state, path, entry):
     except OSError:
         pass
     if not linked:
+        # Linked at a name of its own and renamed over the path, never unlinked first.
+        # Unlinking leaves the final name absent for as long as the link takes, and when
+        # the link then fails the file that was there is lost: a body that listed the
+        # directory is left with a name it cannot stat. Spec "What the body sees before a
+        # file arrives". _DATA_PARTIAL names are filtered from every patched listing.
+        staged = "%s%slink%d" % (path, _DATA_PARTIAL, os.getpid())
         try:
-            if os.path.exists(path):
-                os.remove(path)
-            os.link(source, path)
+            os.link(source, staged)
+            os.replace(staged, path)
             linked = True
         except OSError:
-            pass
+            try:
+                os.remove(staged)
+            except OSError:
+                pass
     if not linked:
         # Copied to a name of its own and renamed into place, so a reader never stats a
         # file that is half written. Spec "What the body sees before a file arrives".
