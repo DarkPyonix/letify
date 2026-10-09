@@ -24,24 +24,48 @@ def test_kaggle_races_the_strategies_that_need_no_address() -> None:
     assert names[-1] == "fallback" or "fallback" not in names
 
 
-def test_the_rendezvous_runs_python_through_the_bridge() -> None:
-    # Spec: the bridge runs one standard library program on the machine, which is exactly
-    # what a rendezvous is.
+def test_the_rendezvous_reads_what_the_program_printed() -> None:
+    # Spec: the rendezvous program prints its answer, and eval returns what the source left
+    # in __letify_value__, not what it printed. Measured on a live session: the answer line
+    # went out as a STDOUT frame and the punch reported "the remote half gave no answer".
     from letify.transport.rendezvous import CommandRendezvous
 
-    asked: list[str] = []
+    sent: list[str] = []
 
     class Channel:
+        """A worker's eval, for real: run the source and return __letify_value__."""
+
         def request(self, message, **kwargs):
-            asked.append(message["op"])
             assert message["op"] == "eval"
-            return ("LETIFY-ANSWER {}", None)
+            sent.append(message["source"])
+            scope: dict = {}
+            exec(compile(message["source"], "<worker>", "exec"), scope)
+            return (scope.get("__letify_value__"), None)
 
     provider = kaggle()
     rendezvous = provider.rendezvous_over(Channel())
     assert isinstance(rendezvous, CommandRendezvous)
-    assert rendezvous.run_python("print('x')", 30.0) == "LETIFY-ANSWER {}"
-    assert asked == ["eval"]
+    answer = rendezvous.run_python("print('LETIFY-ANSWER {\"mapping\": [1, 2]}')", 30.0)
+    assert "LETIFY-ANSWER" in answer
+    # The source the worker ran is the program, wrapped so its output is captured.
+    assert "redirect_stdout" in sent[0]
+    assert "print('LETIFY-ANSWER" in sent[0]
+
+
+def test_an_indented_program_survives_the_wrapping() -> None:
+    # Spec: the wrapping indents the program, so one that already has blocks still compiles.
+    sent: list[str] = []
+
+    class Channel:
+        def request(self, message, **kwargs):
+            sent.append(message["source"])
+            scope: dict = {}
+            exec(compile(message["source"], "<worker>", "exec"), scope)
+            return (scope.get("__letify_value__"), None)
+
+    rendezvous = kaggle().rendezvous_over(Channel())
+    program = "def answer():\n    print('LETIFY-ANSWER {}')\n\nanswer()\n"
+    assert "LETIFY-ANSWER" in rendezvous.run_python(program, 30.0)
 
 
 def test_the_target_names_no_address_and_carries_the_rendezvous() -> None:
