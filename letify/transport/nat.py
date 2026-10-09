@@ -661,6 +661,7 @@ def _start_sshd(port: int = 22) -> None:
 
     The port is named on the command line because a Colab image ships sshd configured for
     127.0.0.1:2222, so starting it with its own configuration leaves the splice port closed.
+    Host keys are generated first because a Kaggle image ships none.
     """
     if _ssh_answers(port):
         return
@@ -672,6 +673,10 @@ def _start_sshd(port: int = 22) -> None:
             env={**os.environ, "DEBIAN_FRONTEND": "noninteractive"},
         )
     subprocess.run(["mkdir", "-p", "/run/sshd"], check=False)
+    # A Kaggle image ships sshd with no host key, so the install above is skipped and the
+    # server closes every connection before the banner. ssh-keygen -A makes only what is
+    # missing, so an image that already has its keys is untouched.
+    subprocess.run(["ssh-keygen", "-A"], check=False)
     subprocess.run([SSHD, "-p", str(port), "-o", "ListenAddress=127.0.0.1"], check=False)
 
 
