@@ -138,7 +138,7 @@ dependencies = [
 
 [[package]]
 name = "letify-agent"
-version = "1.2.4"
+version = "2.0.0"
 dependencies = [
  "letify-wire",
  "libloading",
@@ -146,7 +146,7 @@ dependencies = [
 
 [[package]]
 name = "letify-driver"
-version = "1.2.4"
+version = "2.0.0"
 dependencies = [
  "letify-wire",
 ]
@@ -164,7 +164,7 @@ dependencies = [
 
 [[package]]
 name = "letify-wire"
-version = "1.2.4"
+version = "2.0.0"
 
 [[package]]
 name = "libc"
