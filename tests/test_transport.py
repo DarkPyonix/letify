@@ -656,3 +656,76 @@ def test_a_cached_floor_rejection_cannot_accept_a_lone_failed_probe(isolated_hom
     with pytest.raises(letify.ProviderUnavailable, match="tailcat: below the floor"):
         pipeline([slow, fallback], cache=cache, floor=LinkFloor.default()).connect()
     assert all(link.closed for link in slow.links)
+
+
+# -- Spec: Transport, the simultaneous open: the window covers the rendezvous -------
+
+
+def test_the_punch_window_is_longer_than_the_rendezvous_can_take() -> None:
+    # Spec "the simultaneous open": the start time is fixed before the rendezvous, so the
+    # remote reaches it while the answer is still travelling back. A window shorter than
+    # the connect timeout can close before the user's side has begun.
+    from letify.transport import strategies
+
+    assert nat.DEFAULT_WINDOW > strategies.CONNECT_TIMEOUT
+
+
+def test_a_punch_whose_window_has_already_closed_fails_at_once() -> None:
+    # Spec "the simultaneous open": the remote reports when it stops, and the user's side
+    # stops then too instead of dialing alone.
+    began = time.perf_counter()
+    with pytest.raises(TimeoutError) as raised:
+        nat.punch(
+            free_port(),
+            ("127.0.0.1", 9),
+            b"t" * 16,
+            initiator=True,
+            start_at=0,
+            until=time.time() - 1.0,
+        )
+    assert time.perf_counter() - began < 2.0
+    assert "window" in str(raised.value)
+
+
+def test_the_remote_half_reports_when_it_stops_punching() -> None:
+    # Spec "the simultaneous open": punch_until travels in the answer so both sides stop
+    # together.
+    answer, _ = nat.begin(
+        {
+            "kind": "tcp_punch",
+            "mapping": ["203.0.113.7", 41000],
+            "token": ("a" * 32),
+            "start_at": time.time() + 1.0,
+            "window": 45.0,
+            "ssh_port": 22,
+        }
+    )
+    assert "punch_until" in answer
+    assert answer["punch_until"] >= time.time() + 45.0 - 1.0
+
+
+def test_a_dial_under_way_is_replaced_at_a_fixed_cadence() -> None:
+    # Spec "the simultaneous open": the kernel's own SYN backoff sends too few SYNs, so
+    # the dial is reissued on a fresh socket while the window lasts.
+    made: list[int] = []
+    real = nat.reusable_socket
+
+    def counting(port: int = 0, host: str = "0.0.0.0"):
+        made.append(port)
+        return real(port, host)
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(nat, "reusable_socket", counting)
+        with pytest.raises(TimeoutError):
+            # 198.51.100.0/24 is reserved for documentation, so the SYN goes unanswered
+            # and the dial stays under way rather than failing fast.
+            nat.punch(
+                free_port(),
+                ("198.51.100.7", 41000),
+                b"t" * 16,
+                initiator=True,
+                start_at=0,
+                window=2.5,
+            )
+    # One listener plus a dial reissued every 0.5 s over 2.5 s.
+    assert len(made) >= 4, made
