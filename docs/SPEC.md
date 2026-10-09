@@ -1242,11 +1242,12 @@ The measurements behind the order and the rules below are in [NETWORK.md](NETWOR
 | Rank | Strategy | Needs |
 |---|---|---|
 | 1 | Forward SSH to the machine's address | an address the user's machine can reach |
-| 2 | TCP hole punching | a rendezvous, and NATs on both sides that allow a simultaneous open |
-| 3 | UDP hole punching with Tailcat, then SSH over it | a rendezvous, and UDP in both directions |
-| 4 | Provider fallback | the provider's own path, such as `colab exec` and the Colab file API |
+| 2 | Connect back | a rendezvous, and an endpoint of the user's machine the remote can reach |
+| 3 | TCP hole punching | a rendezvous, and NATs on both sides that allow a simultaneous open |
+| 4 | UDP hole punching with Tailcat, then SSH over it | a rendezvous, and UDP in both directions |
+| 5 | Provider fallback | the provider's own path, such as `colab exec` and the Colab file API |
 
-Forward SSH is first because it needs no remote agent and costs one connection attempt, and when it works it is a kernel TCP connection. TCP hole punching comes before UDP because a punched TCP connection is also kernel TCP and is not subject to UDP rate limits. Tailcat comes next because its NAT traversal succeeds more often, but it runs in user space and a network that limits UDP limits it too. The provider fallback is last because it is the slowest.
+Forward SSH is first because it needs no remote agent and costs one connection attempt, and when it works it is a kernel TCP connection. Connect back is next: the remote dials an endpoint of the user's machine, so the connection is an ordinary TCP connection on both sides, with no simultaneous open to be allowed and no user space tunnel. TCP hole punching comes after it because a punched connection is kernel TCP too but asks both NATs to accept a simultaneous open, which many do not: the requirement is written down as REQ-2 of RFC 5382 because NATs that ignore it are common, and a measured Colab runtime drops the peer's SYN while passing a UDP pinhole in the same minute. Tailcat comes next because its NAT traversal succeeds more often, but it runs in user space and a network that limits UDP limits it too. The provider fallback is last because it is the slowest.
 
 A strategy whose needs are not met is skipped, not attempted. A `Shell` with no rendezvous has only rank 1. An account with no `address`, such as a Tunnel account that names only `tailcat`, has no rank 1: forward SSH is skipped with the reason `no address`, and no SSH command is built for a guessed or empty address. `letify check` on such an account runs over the strategies that remain.
 
@@ -1378,6 +1379,30 @@ The remote half of a punch, a Tailcat listener or a reverse forward is one stand
 Tailcat is run as `tailcat serve <port>` on the remote side, which prints `Server listening with new address: <address>`, and as `tailcat <address> <port>` in an SSH `ProxyCommand` on the user's side. It is applicable only when `tailcat` is on the user's PATH.
 
 The remote half reads that address line from the process's own output, and then keeps reading and discarding the rest of it for as long as the process lives. Any remote helper letify starts and reads a line from is drained the same way. A pipe holds about 64 KiB, so a helper whose output nobody reads blocks on its next write once that is full and stops moving bytes. For `tailcat serve` that shows up as a link that connects and then measures far below the link it is carried over, because the stall begins partway through the first transfer. Draining also means the continuation that waits for the process cannot deadlock against a full pipe.
+
+### Connect back <!-- id: connect-back -->
+
+> The remote dials an endpoint of the user's machine and hands over the connection, so neither side has to punch.
+
+A hole punch asks both NATs to do something they may refuse. When the user's machine is reachable at some address and port, nothing has to be punched at all: the remote makes an ordinary outbound TCP connection to it, and that connection carries the session. The remote can always dial out, because that is how the rendezvous reached it.
+
+The endpoint comes from the account:
+
+```toml
+[lab_behind_nat]
+kind = "colab"
+connect_back = { address = "gpu.example.edu", port = 20130 }
+```
+
+`address` may be omitted, and then the address the STUN server reports for this machine is used, which is right when the port is forwarded to it but the name is not known. The port is the one the remote dials; the listener binds the same number locally, because a forward that changes the port cannot be guessed. [Asking the NAT for a mapping](#asking-the-nat-for-a-mapping) can supply both at run time instead.
+
+The strategy binds and listens on that port, then sends a `connect_back` rendezvous request naming the endpoint and a 16 byte token. The remote dials the endpoint, writes `LETIFY-PUNCH1` and the token, and then answers the probe and splices to its own SSH server exactly as a punched connection does, so the link type and everything above it are unchanged. The user's side accepts connections until one presents that hello, closes the others, and uses it.
+
+The token is required rather than cosmetic: a port reachable from outside can be connected to by anything, so a connection that does not present it is closed and the listener keeps waiting. The window is the race timeout, and a connection the remote makes after the choice is closed like any other late arrival.
+
+This is the passive candidate of RFC 6544's three. Forward SSH is the active one, and the TCP punch is the simultaneous open one. letify tries all three where their needs are met, which is why a network that refuses one can still be reached.
+
+Reverse SSH is kept because it asks for something different: it needs an SSH server on the user's machine and installs a key for it, while connect back needs only a port letify can listen on.
 
 ### Reverse SSH <!-- id: reverse-ssh -->
 

@@ -21,6 +21,7 @@ from pathlib import Path
 from typing import Any
 
 from ..config.secrets import account_directory
+from ..errors import RuntimeFailure
 from . import nat, sshopts
 from .link import Link, PunchedLink, SSHLink
 
@@ -45,6 +46,9 @@ class Target:
     remote_python: str = "python3"
     rendezvous: Any = None
     reverse_ssh: dict[str, Any] | None = None
+    #: Where the remote can reach this machine, for Connect back: ``address`` is
+    #: optional and defaults to what STUN reports, ``port`` is dialed and bound.
+    connect_back: dict[str, Any] | None = None
     fallback: Callable[[], Link] | None = None
     ssh_port: int = 22
     stun: tuple[str, int] = nat.DEFAULT_STUN
@@ -150,11 +154,73 @@ class DirectSSH(Strategy):
         return self.assume(target)
 
 
+class ConnectBack(Strategy):
+    """The remote dials an endpoint of this machine and hands over the connection.
+
+    Spec "Connect back". Nothing is punched: the remote makes an ordinary outbound TCP
+    connection, which is the passive candidate of RFC 6544's three. The listener takes the
+    connection that presents the token, because a port reachable from outside can be
+    dialed by anything.
+    """
+
+    name = "connect_back"
+    rank = 2
+
+    def needs(self, target: Target) -> str | None:
+        if not target.connect_back or not target.connect_back.get("port"):
+            return "no connect_back endpoint"
+        return _rendezvous_unmet(target)
+
+    def label(self, target: Target | None) -> str:
+        if target is None or not target.connect_back:
+            return self.name
+        spec = target.connect_back
+        return f"{self.name} ({spec.get('address') or '<stun>'}:{spec.get('port')})"
+
+    def attempt(self, target: Target, cancel: threading.Event | None = None) -> Link:
+        spec = target.connect_back or {}
+        port = int(spec["port"])
+        listener = nat.reusable_socket(port)
+        listener.listen(8)
+        token = secrets.token_bytes(nat.TOKEN_BYTES)
+        try:
+            address = spec.get("address")
+            if not address:
+                # The port is forwarded to this machine but its name is not declared, so
+                # the address STUN reports for it is the one the remote can dial.
+                address = nat.stun_mapping(port, tuple(target.stun))[0]
+            target.rendezvous.exchange(
+                {
+                    "kind": "connect_back",
+                    "address": address,
+                    "port": port,
+                    "token": token.hex(),
+                    "ssh_port": target.ssh_port,
+                },
+                CONNECT_TIMEOUT,
+            )
+            sock = nat.accept_hello(listener, token, timeout=CONNECT_TIMEOUT, cancel=cancel)
+        finally:
+            listener.close()
+        return PunchedLink(
+            self.name,
+            self.rank,
+            sock,
+            target.forwarded_ssh,
+            lambda: (_ for _ in ()).throw(
+                RuntimeFailure(
+                    f"the connect_back link to {target.alias} carries one SSH session, and "
+                    f"the remote has to be asked again for another"
+                )
+            ),
+        )
+
+
 class TCPPunch(Strategy):
     """TCP hole punching: STUN over TCP 443, then a simultaneous open at an agreed time."""
 
     name = "tcp_punch"
-    rank = 2
+    rank = 3
 
     def needs(self, target: Target) -> str | None:
         return _rendezvous_unmet(target)
@@ -207,7 +273,7 @@ class TailcatUDP(Strategy):
     """UDP hole punching with Tailcat, then SSH over it."""
 
     name = "tailcat"
-    rank = 3
+    rank = 4
 
     def needs(self, target: Target) -> str | None:
         if shutil.which(target.tailcat) is None:
@@ -261,7 +327,7 @@ class ReverseSSH(Strategy):
     """The remote side forwards its SSH server back to the user's machine with ``ssh -R 0:``."""
 
     name = "reverse_ssh"
-    rank = 4
+    rank = 5
 
     def __init__(self, keys: AuthorizedKeys | None = None):
         self.keys = keys
@@ -342,7 +408,7 @@ class ProviderFallback(Strategy):
     #: The fallback cannot carry the probe, so it does not start the grace period.
     probed = False
 
-    def __init__(self, rank: int = 4):
+    def __init__(self, rank: int = 5):
         self.rank = rank
 
     def needs(self, target: Target) -> str | None:
@@ -356,6 +422,7 @@ class ProviderFallback(Strategy):
 
 __all__ = [
     "AuthorizedKeys",
+    "ConnectBack",
     "DirectSSH",
     "ProviderFallback",
     "ReverseSSH",

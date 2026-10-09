@@ -141,6 +141,18 @@ class Shell(Provider):
         return dict(value) if isinstance(value, Mapping) else None
 
     @property
+    def connect_back(self) -> dict[str, Any] | None:
+        """Where the remote can reach this machine, from ``connect_back``.
+
+        Spec "Connect back". ``port`` is required; ``address`` is optional and the STUN
+        answer stands in for it when the port is forwarded here but the name is not known.
+        """
+        value = self.config.option("connect_back")
+        if not isinstance(value, Mapping) or not value.get("port"):
+            return None
+        return dict(value)
+
+    @property
     def link_floor(self) -> LinkFloor:
         """The slowest probe this account accepts, from ``min_mib_per_s`` and ``max_rtt_ms``.
 
@@ -231,6 +243,7 @@ class Shell(Provider):
     def strategies(self) -> list[Strategy]:
         """The ranked strategy list. Reverse SSH joins only when the account sets it."""
         from ..transport.strategies import (
+            ConnectBack,
             DirectSSH,
             ProviderFallback,
             ReverseSSH,
@@ -238,10 +251,13 @@ class Shell(Provider):
             TCPPunch,
         )
 
-        chosen: list[Strategy] = [DirectSSH(), TCPPunch(), TailcatUDP()]
+        chosen: list[Strategy] = [DirectSSH()]
+        if self.connect_back:
+            chosen.append(ConnectBack())
+        chosen.extend((TCPPunch(), TailcatUDP()))
         if self.reverse_ssh:
             chosen.append(ReverseSSH())
-        chosen.append(ProviderFallback(rank=5 if self.reverse_ssh else 4))
+        chosen.append(ProviderFallback(rank=6 if self.reverse_ssh else 5))
         return chosen
 
     def fallback(self, runtime: Runtime | None = None) -> Callable[[], Link] | None:
@@ -269,6 +285,7 @@ class Shell(Provider):
             remote_python=self.remote_python,
             rendezvous=self.rendezvous(runtime),
             reverse_ssh=self.reverse_ssh,
+            connect_back=self.connect_back,
             fallback=self.fallback(runtime),
             stun=stun,
             tailcat=self.tailcat_binary,

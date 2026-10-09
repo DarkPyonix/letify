@@ -29,6 +29,8 @@ DEFAULT_STUN = ("stun.nextcloud.com", 443)
 HELLO = b"LETIFY-PUNCH1"
 TOKEN_BYTES = 16
 CHUNK = 64 * 1024
+#: Seconds the remote waits for its connect back to complete.
+CONNECT_BACK_TIMEOUT = 20.0
 #: Seconds a punch keeps dialing. Longer than the rendezvous can take, because the agreed
 #: start is fixed before the rendezvous is sent and the remote reaches it while the answer
 #: is still travelling back. Spec "the simultaneous open".
@@ -292,6 +294,45 @@ def punch(
     )
 
 
+def accept_hello(
+    listener: socket.socket,
+    token: bytes,
+    *,
+    timeout: float,
+    cancel: threading.Event | None = None,
+) -> socket.socket:
+    """The first connection on ``listener`` that presents the hello for ``token``.
+
+    Spec "Connect back": a port reachable from outside can be dialed by anything, so a
+    connection that does not present the token is closed and the wait goes on. Setting
+    ``cancel`` ends the wait with ``Cancelled``.
+    """
+    expected = HELLO + token
+    deadline = time.time() + timeout
+    listener.setblocking(False)
+    while time.time() < deadline:
+        if cancel is not None and cancel.is_set():
+            raise Cancelled("the wait for the remote to connect back was cancelled")
+        readable, _, _ = select.select([listener], [], [], 0.1)
+        if listener not in readable:
+            continue
+        try:
+            sock, _ = listener.accept()
+        except OSError:
+            continue
+        sock.settimeout(max(0.5, min(5.0, deadline - time.time())))
+        try:
+            seen = recv_exact(sock, len(expected))
+        except (EOFError, OSError):
+            sock.close()
+            continue
+        if seen == expected:
+            sock.setblocking(True)
+            return sock
+        sock.close()
+    raise TimeoutError(f"the remote did not connect back within {timeout:g} s")
+
+
 # -- the probe responder and the splice ----------------------------------------------
 
 
@@ -423,6 +464,28 @@ def begin(request: dict):
             serve_link(sock, ssh)
 
         return {"mapping": list(mapping), "punch_until": until}, punch_and_serve
+    if kind == "connect_back":
+        # Spec "Connect back": an ordinary outbound connection, then the same hello and
+        # the same splice a punched connection uses.
+        where = (str(request["address"]), int(request["port"]))
+        token = bytes.fromhex(request["token"])
+        ssh = ("127.0.0.1", int(request.get("ssh_port", 22)))
+
+        def dial_and_serve() -> None:
+            try:
+                sock = socket.create_connection(where, timeout=CONNECT_BACK_TIMEOUT)
+            except OSError as error:
+                print(
+                    f"letify agent: connect back to {where[0]}:{where[1]} failed "
+                    f"({error.strerror or error})",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                return
+            sock.sendall(HELLO + token)
+            serve_link(sock, ssh)
+
+        return {"dialing": True}, dial_and_serve
     if kind == "tailcat":
         process = subprocess.Popen(
             [request.get("binary", "tailcat"), "serve", str(request.get("ssh_port", 22))],
