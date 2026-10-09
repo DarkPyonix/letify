@@ -29,6 +29,13 @@ DEFAULT_STUN = ("stun.nextcloud.com", 443)
 HELLO = b"LETIFY-PUNCH1"
 TOKEN_BYTES = 16
 CHUNK = 64 * 1024
+#: Seconds a punch keeps dialing. Longer than the rendezvous can take, because the agreed
+#: start is fixed before the rendezvous is sent and the remote reaches it while the answer
+#: is still travelling back. Spec "the simultaneous open".
+DEFAULT_WINDOW = 45.0
+#: Seconds before a dial still under way is reissued on a fresh socket. The kernel's own
+#: SYN backoff sends too few SYNs for one to land in the moment the peer's NAT opens.
+DIAL_INTERVAL = 0.5
 ANSWER_MARKER = "LETIFY-ANSWER "
 #: What a non-blocking ``connect_ex`` returns when the dial is under way. Windows answers
 #: with its own would-block code instead of EINPROGRESS.
@@ -161,7 +168,8 @@ def punch(
     *,
     initiator: bool,
     start_at: float,
-    window: float = 15.0,
+    window: float = DEFAULT_WINDOW,
+    until: float | None = None,
     cancel: threading.Event | None = None,
 ) -> socket.socket:
     """Connect to ``peer`` from ``port`` while listening on it, and agree on one connection.
@@ -169,6 +177,11 @@ def punch(
     The initiator takes the first connection that completes and writes the hello with the
     token. The other side keeps the connection that the hello arrives on. Setting
     ``cancel`` ends the wait for ``start_at`` and the dialing loop with ``Cancelled``.
+
+    ``until`` is the time the other side stops dialing, as it reported it. Both sides then
+    stop together, rather than each spending a window of its own measured from whenever it
+    happened to arrive. Spec "the simultaneous open". Without it the deadline is
+    ``window`` seconds from the agreed start, or from now when that is already past.
     """
     delay = start_at - time.time()
     if delay > 0:
@@ -176,12 +189,18 @@ def punch(
             time.sleep(delay)
         elif cancel.wait(delay):
             raise Cancelled(f"the punch to {peer[0]}:{peer[1]} was cancelled before it began")
-    deadline = max(time.time(), start_at) + window
+    deadline = until if until is not None else max(time.time(), start_at) + window
+    if time.time() >= deadline:
+        raise TimeoutError(
+            f"the punch window with {peer[0]}:{peer[1]} had already closed, "
+            f"so the other side has stopped dialing"
+        )
     listener = reusable_socket(port)
     listener.listen(8)
     listener.setblocking(False)
     connector: socket.socket | None = None
     retry_at = 0.0
+    dialed_at = 0.0
     candidates: list[socket.socket] = []
     expected = HELLO + token
 
@@ -194,9 +213,15 @@ def punch(
         if cancel is not None and cancel.is_set():
             close_all(None)
             raise Cancelled(f"the punch to {peer[0]}:{peer[1]} was cancelled")
+        if connector is not None and time.time() - dialed_at >= DIAL_INTERVAL:
+            # The dial is still under way. A fresh socket sends a fresh SYN, which is what
+            # lands in the moment after the peer's NAT opens.
+            connector.close()
+            connector = None
         if connector is None and time.time() >= retry_at:
             connector = reusable_socket(port)
             connector.setblocking(False)
+            dialed_at = time.time()
             # A dial refused before any packet leaves, EADDRNOTAVAIL when the peer's SYN
             # has already taken the port pair, leaves a socket that looks writable with no
             # pending error. It is not a connection, so it is dropped and dialed again.
@@ -347,7 +372,8 @@ def begin(request: dict):
         peer = tuple(request["mapping"])
         ssh = ("127.0.0.1", int(request.get("ssh_port", 22)))
 
-        window = float(request.get("window", 15.0))
+        window = float(request.get("window", DEFAULT_WINDOW))
+        until = max(time.time(), float(request["start_at"])) + window
 
         def punch_and_serve() -> None:
             where = f"{peer[0]}:{peer[1]}"
@@ -359,7 +385,7 @@ def begin(request: dict):
                     token,
                     initiator=False,
                     start_at=float(request["start_at"]),
-                    window=window,
+                    until=until,
                 )
             except TimeoutError:
                 # A punch that does not connect is the normal path to the Tailcat link.
@@ -374,7 +400,7 @@ def begin(request: dict):
                 raise
             serve_link(sock, ssh)
 
-        return {"mapping": list(mapping)}, punch_and_serve
+        return {"mapping": list(mapping), "punch_until": until}, punch_and_serve
     if kind == "tailcat":
         process = subprocess.Popen(
             [request.get("binary", "tailcat"), "serve", str(request.get("ssh_port", 22))],

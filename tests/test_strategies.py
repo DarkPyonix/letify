@@ -629,3 +629,28 @@ def test_the_remote_half_keeps_reading_what_tailcat_serve_prints_after_the_addre
     assert not waiter.is_alive(), (
         "tailcat serve never finished, so it blocked writing to a pipe nobody reads"
     )
+
+
+def test_the_punch_asks_the_remote_for_a_window_and_stops_when_it_does(patch_run) -> None:
+    # Spec "the simultaneous open": the strategy names the window in the request and uses
+    # the punch_until the remote answers with, so a slow rendezvous does not leave the two
+    # sides dialing in windows that never overlap.
+    import time
+
+    from letify.transport import nat
+
+    calls: list[dict] = []
+
+    class Rendezvous(CannedRendezvous):
+        def exchange(self, request, timeout):
+            calls.append(request)
+            return {"mapping": ["203.0.113.9", 41111], "punch_until": time.time() - 1.0}
+
+    target = Target(alias="lab", rendezvous=Rendezvous(), stun=("stun.example", 443))
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(nat, "stun_mapping", lambda port, server=None, **kw: ("198.51.100.1", port))
+        with pytest.raises(TimeoutError) as raised:
+            TCPPunch().attempt(target)
+
+    assert calls and calls[0]["window"] == nat.DEFAULT_WINDOW
+    assert "already closed" in str(raised.value)

@@ -181,17 +181,22 @@ class TCPPunch(Strategy):
                     "mapping": list(mapping),
                     "token": token.hex(),
                     "start_at": start_at,
+                    "window": nat.DEFAULT_WINDOW,
                     "ssh_port": target.ssh_port,
                     "stun": list(target.stun),
                 },
                 CONNECT_TIMEOUT,
             )
+            # The remote reports when it stops dialing, so both sides stop together even
+            # when the rendezvous took most of the window. Spec "the simultaneous open".
+            until = answer.get("punch_until")
             return nat.punch(
                 port,
                 tuple(answer["mapping"]),
                 token,
                 initiator=True,
                 start_at=start_at,
+                until=float(until) if until is not None else None,
                 cancel=cancel,
             )
         finally:
