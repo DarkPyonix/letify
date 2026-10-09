@@ -224,6 +224,46 @@ def test_the_probe_defaults_are_thirty_round_trips_and_two_seconds_each_way() ->
     assert (probe.round_trips, probe.seconds) == (30, 2.0)
 
 
+def test_the_warm_up_is_eight_round_trips_bounded_to_half_a_second_and_two() -> None:
+    # Spec "Choosing a link": long enough for TCP to leave slow start, and no longer.
+    probe = Probe()
+    assert probe.warmup_for(0.0) == 0.5
+    assert probe.warmup_for(10.0) == 0.5
+    assert probe.warmup_for(190.0) == pytest.approx(1.52)
+    assert probe.warmup_for(1000.0) == 2.0
+
+
+def test_the_probe_discards_a_warm_up_transfer_in_each_direction() -> None:
+    """Spec "Choosing a link": the measured transfer is not charged for the ramp.
+
+    The responder is asked to transfer four times, a warm-up and a measurement each way.
+    Only the measured ones decide the numbers, so a stream that is slow until it is warm
+    reports its warm rate.
+    """
+    user, remote = socket.socketpair()
+    threading.Thread(target=nat.serve_probe, args=(remote,), daemon=True).start()
+    probe = Probe(round_trips=2, seconds=0.02)
+    probe.warmup_for = lambda _rtt_ms: 0.02
+    seen: list[bytes] = []
+
+    class Watched:
+        """The stream, recording which transfer ops the probe asked for."""
+
+        def recv(self, size: int) -> bytes:
+            return user.recv(size)
+
+        def sendall(self, data: bytes) -> None:
+            if data[:1] in (b"U", b"D"):
+                seen.append(data[:1])
+            user.sendall(data)
+
+    measured = probe.measure(Watched())
+    user.close()
+    assert seen == [b"U", b"U", b"D", b"D"]
+    assert measured.upload_bps > 0
+    assert measured.download_bps > 0
+
+
 def test_a_responder_asked_to_bridge_stops_answering_the_probe() -> None:
     user, remote = socket.socketpair()
     user.sendall(b"B")
