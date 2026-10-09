@@ -905,6 +905,29 @@ Each file is one blob, named by the blake3 digest of its contents with 16 byte o
 
 The local digest cache is `~/.letify/cache/digests.json`. An entry is keyed by the resolved path and holds size, modification time in nanoseconds, inode and digest. A file whose four stat fields match its entry is not read again. The file is replaced atomically after a call that added or changed an entry. If `~/.cache/letify/digests.json` exists from an earlier install, it is read as a fallback.
 
+#### Several connections at once <!-- id: parallel-placement -->
+
+> A large blob is split across several connections, because one TCP connection over a long path carries a fraction of what the path will carry.
+
+A single TCP connection at a long round trip is limited by its window and by how it reacts to loss, not by the path. Measured from a Colab runtime to a machine in Korea at 138 ms, one connection carried 5.5 MiB/s and five independent connections carried 26.0 MiB/s together, which is near what that runtime could push to a nearby endpoint at all. The path was never the limit; the single connection was.
+
+So a blob above `transfer_parallel_mib`, 64 MiB by default, is sent over `transfer_streams` connections, 4 by default. An account sets either, and `transfer_streams = 1` keeps the single stream.
+
+The connections have to be real ones. Every SSH command letify builds carries `ControlMaster=auto`, which multiplexes further sessions onto the first connection, so opening more channels that way would add streams inside one TCP connection and gain nothing. A transfer channel therefore sets `ControlPath=none` and `ControlMaster=no`, and a punched link redials for each, so each transfer channel is its own kernel connection.
+
+The worker's `data_put` appends to one handle per digest and hashes as it goes, which assumes the pieces arrive in order on one stream. Parallel senders cannot use it, so they use two other requests:
+
+| Request | Does |
+|---|---|
+| `data_put_at` | writes one piece at `offset` into the partial file for `digest`, creating it sparse on the first write, with no hashing |
+| `data_seal` | hashes the finished partial file, refuses it when the digest does not match, and commits it as `data_put` does |
+
+`data_put_at` is safe to send from several connections at once because each piece names where it goes and no two ranges overlap. The hash moves to `data_seal` because a hash over a stream cannot be computed out of order, and it is computed by the worker reading its own file, which also checks that every range arrived.
+
+The ranges are contiguous and equal but for the last, so a sender reads one slice of the local file and nothing is buffered whole. A stream that fails fails the placement: the partial file is removed by the next `data_put_at` at offset zero, and nothing is committed without a matching digest.
+
+The single stream path is unchanged for a blob under the threshold and for an account that sets one stream, because opening four connections to send 8 MiB costs more than it saves.
+
 #### Where the bytes come from <!-- id: project-data-transfer -->
 
 The runtime keeps a file blob cache at `<workspace root>/data/blobs/<first two hex characters>/<digest>`. A cache file is made read-only when it is committed. Before a call the local process asks the worker which digests that cache holds with the expected size, with one `data_have` request. Then:

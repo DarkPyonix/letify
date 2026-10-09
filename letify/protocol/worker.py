@@ -694,6 +694,79 @@ def _op_data_put(request):
     return {"ok": True, "value": None}
 
 
+def _parallel_partial(root, digest):
+    """Where parallel senders write. One name per digest, not per process or thread."""
+    return "%s%s.parallel" % (_data_file(root, digest), _DATA_PARTIAL)
+
+
+def _op_data_begin(request):
+    """Make the file parallel senders will fill, of the size it will end up.
+
+    Spec "Several connections at once". A placement starts here rather than at the write
+    of offset zero, because with several connections offset zero is just another range and
+    may arrive last: truncating on it would throw away what the others had written.
+    """
+    partial = _parallel_partial(request["dir"], request["digest"])
+    os.makedirs(os.path.dirname(partial), exist_ok=True)
+    with open(partial, "wb") as handle:
+        handle.truncate(int(request["size"]))
+    return {"ok": True, "value": None}
+
+
+def _op_data_put_at(request):
+    """Write one piece of a file blob at its offset, for several senders at once.
+
+    No hashing: a hash over a stream cannot be computed out of order, so ``data_seal``
+    does it by reading the finished file.
+    """
+    partial = _parallel_partial(request["dir"], request["digest"])
+    chunk = request.pop("chunk")
+    handle = open(partial, "r+b")
+    try:
+        handle.seek(int(request["offset"]))
+        handle.write(chunk)
+    finally:
+        handle.close()
+    chunk = None
+    return {"ok": True, "value": None}
+
+
+def _op_data_seal(request):
+    """Hash a file assembled by parallel senders, then commit it as ``data_put`` does."""
+    digest = request["digest"]
+    root = request["dir"]
+    partial = _parallel_partial(root, digest)
+    final = _data_file(root, digest)
+    size = request.get("size")
+    try:
+        found = os.path.getsize(partial)
+    except OSError as exc:
+        raise ValueError("no pieces of file blob %s arrived: %s" % (digest, exc))
+    if size is not None and found != int(size):
+        raise ValueError(
+            "file blob %s is short: %d of %d bytes arrived" % (digest, found, int(size))
+        )
+    hasher = _data_hasher()
+    if hasher is not None:
+        with open(partial, "rb") as handle:
+            while True:
+                piece = handle.read(1 << 22)
+                if not piece:
+                    break
+                hasher.update(piece)
+        got = hasher.hexdigest(length=16)
+        if got != digest:
+            os.remove(partial)
+            raise ValueError("file blob %s arrived with digest %s" % (digest, got))
+    try:
+        os.chmod(partial, 0o444)
+    except OSError:
+        pass
+    os.replace(partial, final)
+    _data_arrived(root, digest)
+    return {"ok": True, "value": None}
+
+
 def _op_data_pull(request):
     """Download file blobs from the bucket, eight at a time, then forget the headers."""
     import urllib.request
@@ -1875,6 +1948,9 @@ _OPS = {
     "have": _op_have,
     "data_have": _op_data_have,
     "data_put": _op_data_put,
+    "data_begin": _op_data_begin,
+    "data_put_at": _op_data_put_at,
+    "data_seal": _op_data_seal,
     "data_pull": _op_data_pull,
     "data_evict": _op_data_evict,
     "data_cache": _op_data_cache,
