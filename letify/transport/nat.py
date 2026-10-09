@@ -364,10 +364,46 @@ def serve_probe(stream) -> bool:
             return op == b"B"
 
 
+def _hang_up(*sockets: socket.socket) -> None:
+    """Shut both directions down, so the other half of a splice stops too."""
+    for sock in sockets:
+        try:
+            sock.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+
+
 def splice(a: socket.socket, b: socket.socket) -> None:
-    """Copy bytes both ways until either side closes."""
+    """Copy bytes both ways until either side closes.
+
+    Through the kernel with ``os.splice`` where the platform has it, which is Linux. Every
+    byte of a punched session crosses this, and the machine on the other end is often a two
+    core VM, so reading into Python and writing back out costs throughput there. Spec
+    "Transport".
+    """
+
+    def through_kernel(src: socket.socket, dst: socket.socket) -> bool:
+        """Move bytes with a pipe between the two sockets. False when it cannot be done."""
+        read, write = os.pipe()
+        try:
+            while True:
+                moved = os.splice(src.fileno(), write, CHUNK)
+                if not moved:
+                    return True
+                while moved:
+                    moved -= os.splice(read, dst.fileno(), moved)
+        except OSError:
+            return True
+        except (AttributeError, NotImplementedError):
+            return False
+        finally:
+            os.close(read)
+            os.close(write)
 
     def pump(src: socket.socket, dst: socket.socket) -> None:
+        if hasattr(os, "splice") and through_kernel(src, dst):
+            _hang_up(dst, src)
+            return
         try:
             while True:
                 data = src.recv(CHUNK)
@@ -376,11 +412,7 @@ def splice(a: socket.socket, b: socket.socket) -> None:
                 dst.sendall(data)
         except OSError:
             pass
-        for sock in (dst, src):
-            try:
-                sock.shutdown(socket.SHUT_RDWR)
-            except OSError:
-                pass
+        _hang_up(dst, src)
 
     other = threading.Thread(target=pump, args=(b, a), daemon=True)
     other.start()
