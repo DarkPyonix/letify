@@ -626,6 +626,64 @@ def remote_tailcat_source() -> str:
     )
 
 
+def remote_quic_source(version: str) -> str:
+    """Prepare ``letify-quic`` on the remote from the letify wheel of this version.
+
+    Spec "QUIC over a punched UDP pair": the binary changes with every letify release, so
+    a hash pinned in this source cannot describe the build that is about to be made. The
+    remote therefore fetches the wheel for its own platform at exactly this version, which
+    PyPI verifies, and takes the binary out of it.
+    """
+    import inspect
+
+    return (
+        inspect.getsource(_remote_quic)
+        + f"\nbinary = _remote_quic({version!r})\n"
+        + "import json\nprint('LETIFY-QUIC ' + json.dumps(binary))\n"
+    )
+
+
+def _remote_quic(version):
+    """Take letify-quic out of the letify wheel for this machine, standard library only."""
+    import json
+    import os
+    import subprocess
+    import sys
+    import tempfile
+    import zipfile
+    from pathlib import Path
+
+    inside = "letify/remoting/lib/letify-quic"
+    target = Path(tempfile.gettempdir()) / f"letify-quic-{version}"
+    if target.is_file() and os.access(target, os.X_OK):
+        return str(target)
+    directory = tempfile.mkdtemp(prefix="letify-quic-")
+    done = subprocess.run(
+        [
+            sys.executable, "-m", "pip", "download", f"letify=={version}",
+            "--no-deps", "--only-binary", ":all:", "-d", directory,
+        ],
+        capture_output=True,
+        text=True,
+        timeout=600,
+    )
+    if done.returncode != 0:
+        raise RuntimeError(
+            "could not download the letify wheel for letify-quic: "
+            + (done.stderr or done.stdout).strip()[-400:]
+        )
+    wheels = sorted(Path(directory).glob("letify-*.whl"))
+    if not wheels:
+        raise RuntimeError("pip downloaded no letify wheel")
+    with zipfile.ZipFile(wheels[0]) as archive:
+        if inside not in archive.namelist():
+            raise RuntimeError(f"{wheels[0].name} carries no {inside}")
+        target.write_bytes(archive.read(inside))
+    target.chmod(0o755)
+    json.dumps(str(target))
+    return str(target)
+
+
 def _remote_tailcat(version, release, pins):
     """Install a verified Linux tailcat using only the runtime's standard library."""
     import hashlib

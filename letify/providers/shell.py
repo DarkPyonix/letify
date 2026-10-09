@@ -256,6 +256,7 @@ class Shell(Provider):
             ConnectBack,
             DirectSSH,
             ProviderFallback,
+            QuicUDP,
             ReverseSSH,
             TailcatUDP,
             TCPPunch,
@@ -264,10 +265,10 @@ class Shell(Provider):
         chosen: list[Strategy] = [DirectSSH()]
         if self.connect_back or self.port_mapping:
             chosen.append(ConnectBack(mapping=self.port_mapping))
-        chosen.extend((TCPPunch(), TailcatUDP()))
+        chosen.extend((TCPPunch(), TailcatUDP(), QuicUDP()))
         if self.reverse_ssh:
             chosen.append(ReverseSSH())
-        chosen.append(ProviderFallback(rank=6 if self.reverse_ssh else 5))
+        chosen.append(ProviderFallback(rank=7 if self.reverse_ssh else 6))
         return chosen
 
     def fallback(self, runtime: Runtime | None = None) -> Callable[[], Link] | None:
