@@ -7,6 +7,7 @@ only choices that would take seconds of real transfer are given canned results.
 from __future__ import annotations
 
 import json
+import os
 import socket
 import threading
 import time
@@ -766,3 +767,67 @@ def test_a_punch_whose_dials_go_unanswered_says_that_instead() -> None:
     message = str(raised.value)
     assert "unanswered" in message, message
     assert "ECONNREFUSED" not in message, message
+
+
+# -- Spec: Transport, the splice stays in the kernel --------------------------------
+
+
+def test_the_splice_moves_bytes_both_ways() -> None:
+    # Spec "Transport": whichever copy the platform allows, the bytes arrive.
+    import socket as _socket
+
+    left, right = _socket.socketpair()
+    far, near = _socket.socketpair()
+    thread = threading.Thread(target=nat.splice, args=(right, far), daemon=True)
+    thread.start()
+    left.sendall(b"toward the ssh server")
+    assert nat.recv_exact(near, 21) == b"toward the ssh server"
+    near.sendall(b"and back again")
+    assert nat.recv_exact(left, 14) == b"and back again"
+    left.close()
+    near.close()
+    thread.join(10)
+    assert not thread.is_alive()
+
+
+def test_the_splice_uses_the_kernel_where_the_platform_has_it(monkeypatch) -> None:
+    # Spec "Transport": every byte of a punched session crosses this, often on a two core
+    # VM, so it does not go through Python when the kernel can move it.
+    import socket as _socket
+
+    if not hasattr(os, "splice"):
+        pytest.skip("os.splice is Linux only")
+    used: list[int] = []
+    real = os.splice
+
+    def counting(*args, **kwargs):
+        used.append(1)
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(os, "splice", counting)
+    left, right = _socket.socketpair()
+    far, near = _socket.socketpair()
+    thread = threading.Thread(target=nat.splice, args=(right, far), daemon=True)
+    thread.start()
+    left.sendall(b"x" * 4096)
+    assert nat.recv_exact(near, 4096) == b"x" * 4096
+    left.close()
+    near.close()
+    thread.join(10)
+    assert used, "the splice went through Python"
+
+
+def test_a_platform_without_the_kernel_copy_still_splices(monkeypatch) -> None:
+    # Spec "Transport": Windows and macOS have no os.splice, and the fallback carries them.
+    import socket as _socket
+
+    monkeypatch.delattr(os, "splice", raising=False)
+    left, right = _socket.socketpair()
+    far, near = _socket.socketpair()
+    thread = threading.Thread(target=nat.splice, args=(right, far), daemon=True)
+    thread.start()
+    left.sendall(b"through Python this time")
+    assert nat.recv_exact(near, 24) == b"through Python this time"
+    left.close()
+    near.close()
+    thread.join(10)

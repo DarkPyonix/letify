@@ -1396,7 +1396,7 @@ The remote side's punch window is 45 s, or the request's `window` in seconds whe
 
 Every SSH command letify builds sets `HostKeyAlias=letify-<alias>`, `StrictHostKeyChecking=accept-new` and `UserKnownHostsFile=~/.letify/accounts/<alias>/known_hosts`. Building the command creates that account directory with mode 0700 when it is missing, because `ssh` creates only `~/.ssh` and otherwise cannot record the key: it prints `Failed to add the host to the list of known hosts` on every connection and never pins the key. A host key that differs from the recorded one still fails the connection.
 
-A punched connection first answers the probe, then on request is spliced to the remote machine's SSH server, and SSH runs over a local forwarding port. A second SSH connection over the same link punches again.
+A punched connection first answers the probe, then on request is spliced to the remote machine's SSH server, and SSH runs over a local forwarding port. The splice copies with `os.splice` through a pipe where the platform has it, which is Linux, so the bytes move between the two sockets inside the kernel. Every byte of a punched session crosses it, and the machine on the other end is often a two core VM, so a read into Python and a write back out costs real throughput there. A platform without `os.splice`, or a call it refuses, falls back to the read and write loop. A second SSH connection over the same link punches again.
 
 A local port that letify binds for forwarding is chosen by the operating system, never fixed, because Windows reserves port ranges that vary by machine. The remote end of a reverse forward is chosen the same way, with `ssh -R 0:`.
 
