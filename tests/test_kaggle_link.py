@@ -136,3 +136,24 @@ def test_a_chosen_link_becomes_the_channel(monkeypatch) -> None:
     channel = provider.channel_over(Channel(), name="k-1")
     assert isinstance(channel, Fake)
     assert built and built[0][0] == "ssh"
+
+
+def test_a_program_that_opens_with_a_future_import_still_compiles() -> None:
+    # Spec: a from __future__ import has to be the module's first statement, and the
+    # rendezvous program begins with one. Indenting it under the wrapper made a live punch
+    # fail with "from __future__ imports must occur at the beginning of the file".
+    from letify.providers.kaggle import _capture_stdout
+
+    program = (
+        "from __future__ import annotations\n"
+        "\n"
+        "def answer() -> None:\n"
+        "    print('LETIFY-ANSWER {}')\n"
+        "\n"
+        "answer()\n"
+    )
+    wrapped = _capture_stdout(program)
+    assert wrapped.startswith("from __future__ import annotations")
+    scope: dict = {}
+    exec(compile(wrapped, "<worker>", "exec"), scope)
+    assert "LETIFY-ANSWER" in scope["__letify_value__"]
