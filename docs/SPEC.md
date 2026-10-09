@@ -1355,7 +1355,7 @@ The window has to cover the rendezvous, not just the agreed start. The start tim
 
 The remote side also reports `punch_until`, the time on its own clock at which it stops, and the user's side stops then too rather than dialing alone for a window of its own. A punch that is already over fails at once and names that, instead of spending the window finding out.
 
-A dial that is under way is replaced every 0.5 s. The kernel retransmits a dropped SYN with exponential backoff, so a single socket sends about four SYNs in a window; a punch needs one to land in the moment after the peer's NAT opens, so the dial is reissued on a fresh socket at a fixed cadence instead.
+A dial that is under way is left alone. Reissuing it on a fresh socket would send more SYNs, but it closes the half open socket that holds the port pair, and that socket has to still hold it when the peer's SYN arrives for a simultaneous open to complete. The kernel's own retransmission of the SYN keeps the mapping warm without giving up the port pair. Only a dial the kernel has already refused is repeated.
 
 Every socket in a punch is bound with `SO_REUSEADDR`, and with `SO_REUSEPORT` where the platform has it, so the STUN connection, the listener and the connecting socket share one port. Both sides may complete a connection in each direction. The user's side takes the first connection that completes and writes a hello carrying a 16 byte token the two sides agreed on through the rendezvous. The remote side keeps the connection on which that hello arrives and closes the others.
 

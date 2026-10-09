@@ -704,28 +704,30 @@ def test_the_remote_half_reports_when_it_stops_punching() -> None:
     assert answer["punch_until"] >= time.time() + 45.0 - 1.0
 
 
-def test_a_dial_under_way_is_replaced_at_a_fixed_cadence() -> None:
-    # Spec "the simultaneous open": the kernel's own SYN backoff sends too few SYNs, so
-    # the dial is reissued on a fresh socket while the window lasts.
+def test_a_dial_under_way_is_left_alone_so_the_peer_can_complete_it() -> None:
+    # Spec "the simultaneous open": a half open socket has to still hold the port pair when
+    # the peer's SYN arrives, so a dial under way is never thrown away and redialed. The
+    # kernel retransmits the SYN, which is what keeps the mapping warm.
+    port = free_port()
     made: list[int] = []
     real = nat.reusable_socket
 
-    def counting(port: int = 0, host: str = "0.0.0.0"):
-        made.append(port)
-        return real(port, host)
+    def counting(asked: int = 0, host: str = "0.0.0.0"):
+        made.append(asked)
+        return real(asked, host)
 
     with pytest.MonkeyPatch.context() as patch:
         patch.setattr(nat, "reusable_socket", counting)
         with pytest.raises(TimeoutError):
-            # 198.51.100.0/24 is reserved for documentation, so the SYN goes unanswered
-            # and the dial stays under way rather than failing fast.
+            # 198.51.100.0/24 is reserved for documentation, so the SYN goes unanswered and
+            # the dial stays under way for the whole window.
             nat.punch(
-                free_port(),
+                port,
                 ("198.51.100.7", 41000),
                 b"t" * 16,
                 initiator=True,
                 start_at=0,
                 window=2.5,
             )
-    # One listener plus a dial reissued every 0.5 s over 2.5 s.
-    assert len(made) >= 4, made
+    # The listener and one dial over 2.5 s, not a dial every half second.
+    assert made.count(port) == 2, made
