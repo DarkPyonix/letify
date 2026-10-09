@@ -929,6 +929,17 @@ class KaggleChannel(FramedChannel):
             process.kill()
 
 
+def _public_key() -> str | None:
+    """letify's own public key, so the rendezvous can authorize it on the machine."""
+    from pathlib import Path as _Path
+
+    path = _Path.home() / ".ssh" / "id_letify.pub"
+    try:
+        return path.read_text(encoding="utf-8").strip() or None
+    except OSError:
+        return None
+
+
 class Kaggle(Provider):
     """One Kaggle account."""
 
@@ -1005,6 +1016,8 @@ class Kaggle(Provider):
         #: runs its programs in. The notebook is this runtime's own, created in
         #: ``open_channel`` and deleted in ``stop``.
         self._kernels: dict[str, tuple[Session, str, KaggleChannel, int, int, str | None]] = {}
+        #: The link chosen over the bridge, per runtime, closed with the session.
+        self._links: dict[str, Any] = {}
         #: Monotonic time of the last confirmed-live cookie check, or None before the first.
         self._cookie_checked_at: float | None = None
 
@@ -1039,6 +1052,111 @@ class Kaggle(Provider):
         self._cookie_checked_at = now
         return cookie
 
+    # -- an SSH link over the kernel ----------------------------------------------
+
+    def rendezvous_over(self, channel: Any) -> Any:
+        """The bridge as a rendezvous: it runs one program on the machine and reports.
+
+        Spec "Kaggle runtimes", An SSH link over the kernel. The kernel is how letify
+        reaches the machine; it does not have to be how the session is carried.
+        """
+        from ..transport.rendezvous import CommandRendezvous
+
+        bridge = channel
+
+        class KaggleRendezvous(CommandRendezvous):
+            """``eval`` on the open bridge, which is a standard library program on the VM."""
+
+            def extras(self) -> dict[str, Any]:
+                # The VM has no key of letify's yet, and no SSH server running.
+                extra: dict[str, Any] = {"start_sshd": True}
+                public = _public_key()
+                if public:
+                    extra["authorized_key"] = public
+                return extra
+
+            def run_python(self, source: str, timeout: float | None) -> str:
+                value, _ = bridge.request(
+                    {"op": "eval", "source": source}, timeout=timeout
+                )
+                return value if isinstance(value, str) else str(value or "")
+
+        return KaggleRendezvous()
+
+    def target_over(self, channel: Any) -> Any:
+        """What the strategies need, with no address because there is none to dial."""
+        from ..transport import nat
+        from ..transport.strategies import Target
+
+        return Target(
+            alias=self.alias,
+            rendezvous=self.rendezvous_over(channel),
+            remote_python=self.remote_python,
+            stun=nat.DEFAULT_STUN,
+            workspace=self.workspace_root,
+        )
+
+    def strategies(self) -> list[Any]:
+        """The strategies a session with no address can use, in rank order."""
+        from ..transport.strategies import ProviderFallback, QuicUDP, TailcatUDP, TCPPunch
+
+        return [TCPPunch(), TailcatUDP(), QuicUDP(), ProviderFallback(rank=6)]
+
+    def link_over(self, channel: Any) -> Any:
+        """Race the strategies over the bridge and return the link that wins."""
+        from ..transport.announce import printer
+        from ..transport.pipeline import LinkCache, Pipeline, network_fingerprint
+
+        target = self.target_over(channel)
+        return Pipeline(
+            self.strategies(),
+            target=target,
+            alias=self.alias,
+            cache=LinkCache(self.alias),
+            fingerprint=lambda: network_fingerprint(target.stun),
+            say=printer(self.announce),
+            floor=self.link_floor,
+        ).connect()
+
+    @property
+    def link_floor(self) -> Any:
+        """The slowest probe this account accepts, as a shell account's does."""
+        from ..transport.pipeline import MIB, LinkFloor
+
+        default = LinkFloor.default()
+        min_mib = self.config.option("min_mib_per_s")
+        max_rtt = self.config.option("max_rtt_ms")
+        return LinkFloor(
+            min_bps=float(min_mib) * MIB if isinstance(min_mib, (int, float)) else default.min_bps,
+            max_rtt_ms=float(max_rtt) if isinstance(max_rtt, (int, float)) else default.max_rtt_ms,
+        )
+
+    @property
+    def remote_python(self) -> str:
+        value = self.config.option("remote_python")
+        return str(value) if value else "python3"
+
+    def channel_over(self, bridge: Any, *, name: str) -> Channel:
+        """A worker over the chosen link, or the bridge when nothing was chosen.
+
+        Spec "Kaggle runtimes", An SSH link over the kernel: a network that cannot punch
+        keeps the bridge, which is what every Kaggle session used until now.
+        """
+        import shlex as _shlex
+
+        from ..protocol.worker import BOOTSTRAP
+        from ..runtime.channel import PersistentChannel
+
+        try:
+            link = self.link_over(bridge)
+        except Exception:
+            return bridge
+        self._links[name] = link
+        return PersistentChannel(
+            link.ssh_command(f"{self.remote_python} -u -c {_shlex.quote(BOOTSTRAP)}"),
+            name=name,
+        )
+
     def open_channel(self, runtime: Runtime) -> Channel:
         """Start a session from the cookie and open one worker in one cell of it.
 
@@ -1065,7 +1183,9 @@ class Kaggle(Provider):
             session=session,
         )
         self._kernels[runtime.name] = (session, kernel, channel, run, notebook, slug)
-        return channel
+        # Spec "Kaggle runtimes", An SSH link over the kernel: the bridge is the
+        # rendezvous, and the session rides a link when one is chosen over it.
+        return self.channel_over(channel, name=runtime.name)
 
     def stop(self, runtime: Runtime) -> None:
         """Close the bridge, delete the kernel, cancel the session run, delete the notebook.
@@ -1081,6 +1201,12 @@ class Kaggle(Provider):
         if held is None:
             return
         session, kernel, channel, run, notebook, slug = held
+        link = self._links.pop(runtime.name, None)
+        if link is not None:
+            try:
+                link.close()
+            except Exception:
+                pass
         try:
             channel.close()
         except OSError:
