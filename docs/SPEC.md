@@ -1404,6 +1404,28 @@ This is the passive candidate of RFC 6544's three. Forward SSH is the active one
 
 Reverse SSH is kept because it asks for something different: it needs an SSH server on the user's machine and installs a key for it, while connect back needs only a port letify can listen on.
 
+### Asking the NAT for a mapping <!-- id: asking-the-nat-for-a-mapping -->
+
+> Three standard protocols let a host ask its NAT to forward a port to it. letify asks, and uses the answer as a Connect back endpoint.
+
+A NAT that will not pass a simultaneous open may still hand out a forwarding on request. Three protocols do this and letify tries all of them, because which one a device speaks is not knowable in advance:
+
+| Protocol | Reached at | Shape |
+|---|---|---|
+| PCP, RFC 6887 | the default gateway, UDP 5351 | binary, version 2, `MAP` opcode |
+| NAT-PMP, RFC 6886 | the default gateway, UDP 5351 | binary, version 0, opcode 1 for UDP and 2 for TCP |
+| UPnP IGD | found by SSDP on UDP 239.255.255.250:1900 | SOAP `AddPortMapping` over HTTP |
+
+PCP is asked first because it supersedes NAT-PMP and the two share a port, so a PCP request to a NAT-PMP only device is answered with `UNSUPP_VERSION` rather than silence. NAT-PMP follows, then UPnP, which costs a multicast discovery and two HTTP requests.
+
+The gateway is the default route's next hop, read from `/proc/net/route` on Linux and from the routing table the platform offers elsewhere. A request asks for a lifetime of 3600 seconds and for the external port to equal the internal one, which a device grants when it is free and otherwise answers with the port it chose. Nothing is retried beyond the per-protocol timeout of 1 s, because a device that does not answer in a second on a local link does not speak the protocol.
+
+A mapping is released when the link closes, with the same protocol and a lifetime of zero. A mapping letify did not create is never touched, and a lifetime is never extended beyond the session.
+
+The answer is an address and a port, which is exactly what [Connect back](#connect-back) needs, so a successful mapping makes that strategy applicable on a machine whose account declares no endpoint. An account sets `port_mapping = false` to stop letify asking, for a network where the request is unwelcome. The result is remembered for the session only: a mapping is not written to the link cache, because the next run may be on another network.
+
+Where no protocol answers, the strategy is skipped with the reason `no connect_back endpoint and the NAT offered no mapping`, which tells the user the difference between "letify did not try" and "the network does not do this".
+
 ### Reverse SSH <!-- id: reverse-ssh -->
 
 > An opt-in strategy for a remote machine that can reach the user's machine over SSH. It is not raced by default.

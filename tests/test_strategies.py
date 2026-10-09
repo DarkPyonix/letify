@@ -663,9 +663,14 @@ def test_connect_back_needs_an_endpoint_and_a_rendezvous() -> None:
     from letify.transport.strategies import ConnectBack
 
     assert ConnectBack.rank == 2
-    assert "no connect_back" in ConnectBack().needs(Target(alias="lab", rendezvous=None))
+    # The rendezvous is checked first, because it costs nothing and asking the NAT for a
+    # mapping touches the network.
+    assert ConnectBack().needs(Target(alias="lab", rendezvous=None)) == "no rendezvous"
     target = Target(alias="lab", connect_back={"address": "h", "port": 20130})
     assert ConnectBack().needs(target) == "no rendezvous"
+    assert "no connect_back" in ConnectBack().needs(
+        Target(alias="lab", rendezvous=CannedRendezvous())
+    )
     target = Target(
         alias="lab", rendezvous=CannedRendezvous(), connect_back={"address": "h", "port": 20130}
     )

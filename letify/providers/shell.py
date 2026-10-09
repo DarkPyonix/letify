@@ -153,6 +153,16 @@ class Shell(Provider):
         return dict(value)
 
     @property
+    def port_mapping(self) -> bool:
+        """Whether to ask the NAT for a forwarding, from ``port_mapping``.
+
+        Spec "Asking the NAT for a mapping": on by default, because a device that does not
+        speak one of the three protocols answers nothing and the attempt costs a second.
+        """
+        value = self.config.option("port_mapping")
+        return True if value is None else bool(value)
+
+    @property
     def link_floor(self) -> LinkFloor:
         """The slowest probe this account accepts, from ``min_mib_per_s`` and ``max_rtt_ms``.
 
@@ -252,8 +262,8 @@ class Shell(Provider):
         )
 
         chosen: list[Strategy] = [DirectSSH()]
-        if self.connect_back:
-            chosen.append(ConnectBack())
+        if self.connect_back or self.port_mapping:
+            chosen.append(ConnectBack(mapping=self.port_mapping))
         chosen.extend((TCPPunch(), TailcatUDP()))
         if self.reverse_ssh:
             chosen.append(ReverseSSH())
