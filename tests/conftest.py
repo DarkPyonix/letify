@@ -1693,6 +1693,15 @@ class FakeKaggleCLI:
         self.calls: list[list[str]] = []
         self.environments: list[dict[str, str]] = []
         self.fail: set[str] = set()
+        #: Standard output a ``kernels list --csv`` call answers with. Kaggle names a
+        #: notebook itself, so the titles are its own and the record is what tells
+        #: letify's notebooks from the user's.
+        self.kernels_csv = (
+            "ref,title,author,lastRunTime,totalVotes\n"
+            "irack000/letify-runtime,notebook8843ff70eb,irack000,2026-10-10 05:00:00,0\n"
+            "irack000/my-analysis,My analysis,irack000,2026-10-09 11:00:00,3\n"
+            "irack000/letify-runtime-2,notebook77c1a2,irack000,2026-10-10 06:00:00,0\n"
+        )
         #: Standard output a ``quota`` call answers with, as JSON text.
         self.quota_json = json.dumps([
             {"resource": "GPU", "used": "0.00h", "remaining": "60.00h", "total": "60.00h",
@@ -1712,6 +1721,8 @@ class FakeKaggleCLI:
                 return FakeCompleted(returncode=1, stdout="", stderr="refused")
         if "quota" in command:
             return FakeCompleted(returncode=0, stdout=self.quota_json, stderr="")
+        if "list" in command:
+            return FakeCompleted(returncode=0, stdout=self.kernels_csv, stderr="")
         return FakeCompleted(returncode=0, stdout="{}", stderr="")
 
 

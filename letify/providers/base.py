@@ -361,6 +361,19 @@ class Provider(abc.ABC):
             f"{self.alias} does not offer {name!r}. Available: {', '.join(sorted(table))}"
         )
 
+    #: Whether this provider can be asked what sessions the account already holds. A
+    #: launcher reads it rather than naming provider kinds. Spec "Kaggle", finding the
+    #: notebooks letify owns.
+    discovers_sessions: bool = False
+
+    def sessions(self) -> list[str]:
+        """What the account already holds, for a provider that can be asked.
+
+        Empty for one that cannot, and empty rather than raising when the answer cannot be
+        read: a command asking what exists should not fail because nothing answered.
+        """
+        return []
+
     def expected_cards(self, instance: Any) -> tuple[str, int] | None:
         """The card name fragment and count a session for ``instance`` must have, or None.
 
