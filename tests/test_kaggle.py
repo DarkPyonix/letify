@@ -295,7 +295,7 @@ def kaggle_provider():
     return provider_of(Kaggle, "kaggle_a")
 
 
-@pytest.mark.parametrize("name, devices", [("T4", 2), ("P100", 1)])
+@pytest.mark.parametrize("name, devices", [("T4", 2)])
 def test_a_kaggle_gpu_instance_declares_its_card_count(name, devices) -> None:
     """Spec "Kaggle": the stable GPU names carry their session's card count."""
     instance = getattr(kaggle_provider(), name)
@@ -460,7 +460,7 @@ def test_the_online_check_is_not_repeated_within_the_liveness_ttl(fake_kaggle) -
 def test_declaring_host_local_on_kaggle_fails_at_decoration(let) -> None:
     import letify
 
-    device = kaggle_provider().P100
+    device = kaggle_provider().T4
     with pytest.raises(letify.UnsupportedMode, match="host='remote'"):
 
         @let.function(device=device)
@@ -488,7 +488,6 @@ def test_the_generated_types_mark_kaggle_accelerators_remote_only(isolated_home)
     (isolated_home / ".letify" / "config.toml").write_text('[kg]\nkind = "kaggle"\n')
     text = stubs.render(letify.Launcher(announce=False))
     body = text.split("class Kg(")[1].split("\nclass ")[0]
-    assert "    P100: letify.declare.instance.RemoteOnlyInstance" in body
     assert ": Instance" not in body
 
 
@@ -560,7 +559,6 @@ def session_channel(fake_kaggle, name: str = "letify-t4-1"):
 @pytest.mark.parametrize("name, accelerator", [
     ("TPU_V3_8", "TPU_V3_8"),
     ("T4", "NVIDIA_TESLA_T4"),
-    ("P100", "NVIDIA_TESLA_P100"),
     ("CPU", None),
 ])
 def test_a_kaggle_instance_requests_its_declared_accelerator(
@@ -1124,3 +1122,113 @@ def test_a_stored_token_with_a_newline_authenticates_cli_deletion(
     assert delete_notebook_via_cli("kaggle_a", "notebook63516d2758") is True
     assert fake_kaggle_cli.calls[0][-1] == "irack000/notebook63516d2758"
     assert fake_kaggle_cli.environments[0]["KAGGLE_API_TOKEN"] == API_TOKEN
+
+
+def test_a_kaggle_session_states_the_cards_it_requires() -> None:
+    """Spec "Kaggle": T4 expects two cards whose model contains T4."""
+    from letify.declare.instance import Instance
+
+    provider = kaggle_provider()
+    assert provider.expected_cards(Instance(provider, gpu="T4")) == ("T4", 2)
+    assert provider.expected_cards(Instance(provider, gpu=None)) is None
+
+
+def test_a_card_that_is_not_the_one_asked_for_is_refused(monkeypatch) -> None:
+    """Spec "Kaggle": a request answered with another card does not run.
+
+    Kaggle answered two live P100 requests with two T4s, which is how a declaration
+    stopped saying where the function runs.
+    """
+    from letify.errors import InsufficientDevices
+    from letify.runtime.session import Runtime
+
+    provider = kaggle_provider()
+    session = object.__new__(Runtime)
+    session.name = "letify-t4-1"
+    session.provider = provider
+    session.instance = type("I", (), {"gpu": "T4", "accelerator": "T4"})()
+    monkeypatch.setattr(Runtime, "eval", lambda self, source, timeout=None: ["Tesla P100"])
+    with pytest.raises(InsufficientDevices) as failure:
+        session.check_devices()
+    message = str(failure.value)
+    assert "2 x T4" in message
+    assert "Tesla P100" in message
+    assert "any_accelerator" in message
+
+
+def test_the_cards_that_were_asked_for_pass(monkeypatch) -> None:
+    """Spec "Kaggle": the right name and the right count is what passes."""
+    from letify.runtime.session import Runtime
+
+    provider = kaggle_provider()
+    session = object.__new__(Runtime)
+    session.name = "letify-t4-2"
+    session.provider = provider
+    session.instance = type("I", (), {"gpu": "T4", "accelerator": "T4"})()
+    monkeypatch.setattr(
+        Runtime, "eval", lambda self, source, timeout=None: ["Tesla T4", "Tesla T4"]
+    )
+    session.check_devices()
+
+
+def test_the_notebooks_letify_recorded_are_listed_and_the_user_s_own_are_not(
+    fake_kaggle_cli, kaggle_api_token, config_file
+) -> None:
+    """Spec "Kaggle", finding the notebooks letify owns.
+
+    Kaggle names the notebook itself, confirmed on a live account where one letify created
+    was titled `notebook8843ff70eb`, so the local record is what identifies them. A process
+    that dies before stop leaves its notebook holding weekly quota with nothing pointing at
+    it, and this is how it is found.
+    """
+    from letify.providers.kaggle import record_notebook
+
+    provider = kaggle_provider()
+    assert provider.discovers_sessions is True
+    record_notebook("kaggle_a", "letify-runtime")
+    record_notebook("kaggle_a", "letify-runtime-2")
+    assert provider.sessions() == ["irack000/letify-runtime", "irack000/letify-runtime-2"]
+    listed = [call for call in fake_kaggle_cli.calls if "list" in call]
+    assert listed and "--mine" in listed[0]
+    assert fake_kaggle_cli.environments[0].get("KAGGLE_API_TOKEN")
+
+
+def test_a_notebook_deleted_elsewhere_is_dropped_from_the_record(
+    fake_kaggle_cli, kaggle_api_token, config_file
+) -> None:
+    """Spec: a ref the account no longer has was deleted elsewhere, so it is not reported."""
+    from letify.providers.kaggle import record_notebook, recorded_notebooks
+
+    provider = kaggle_provider()
+    record_notebook("kaggle_a", "letify-runtime")
+    record_notebook("kaggle_a", "gone-already")
+    assert provider.sessions() == ["irack000/letify-runtime"]
+    assert recorded_notebooks("kaggle_a") == ["irack000/letify-runtime"]
+
+
+def test_nothing_is_reported_when_letify_recorded_nothing(
+    fake_kaggle_cli, kaggle_api_token, config_file
+) -> None:
+    """Spec: a notebook created before letify kept this record is not in it."""
+    assert kaggle_provider().sessions() == []
+
+
+def test_listing_notebooks_without_an_api_token_is_empty_rather_than_a_failure(
+    fake_kaggle_cli, isolated_home, config_file
+) -> None:
+    """Spec: reading what exists must not fail a command that is asking what exists."""
+    from letify.providers.kaggle import notebook_record
+
+    path = notebook_record("kaggle_a")
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    path.write_text("irack000/letify-runtime\n", encoding="utf-8")
+    assert kaggle_provider().sessions() == []
+
+
+def test_a_kaggle_account_is_asked_for_its_sessions(launcher_from, fake_kaggle_cli) -> None:
+    """Spec: whether an account can be asked is the provider's answer, not the launcher's."""
+    let = launcher_from('[kaggle_a]\nkind = "kaggle"\n')
+    rows = {row["alias"]: row for row in let.sessions()}
+    row = rows.get("kaggle_a")
+    assert row is not None, rows
+    assert row.get("reason") != "session discovery is not supported"

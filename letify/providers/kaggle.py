@@ -32,6 +32,7 @@ import urllib.parse
 import urllib.request
 from collections.abc import Mapping
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from .. import tools
@@ -67,13 +68,20 @@ if TYPE_CHECKING:
     from ..runtime.session import Runtime
 
 #: GPU session shapes, with memory per card, device count and the internal API name.
-#: P100 remains available through the API although the web UI no longer lists it.
 #: CPU is the empty compute, so it carries no accelerator name.
 GPUS = {
-    "P100": {"vram_gb": 16, "devices": 1, "accelerator": "NVIDIA_TESLA_P100"},
-    "T4": {"vram_gb": 16, "devices": 2, "accelerator": "NVIDIA_TESLA_T4"},
+    "T4": {"vram_gb": 16, "devices": 2, "accelerator": "NVIDIA_TESLA_T4", "model": "T4"},
 }
 TPUS = ("TPU_V3_8",)
+#: Cards Kaggle no longer serves, and what it does instead. Offering one would let a
+#: declaration say P100 and run on something else: spec "Kaggle", the accelerators.
+RETIRED = {
+    "P100": (
+        "Kaggle retired the Tesla P100 on 2026-09-15 and switches a notebook that asks "
+        "for it to two T4s, so the card and the card count would both differ from the "
+        "declaration. Use T4, which is two cards of 16 GB"
+    ),
+}
 
 #: The internal Kaggle service surface the web app uses, authenticated by the session cookie.
 KAGGLE_INTERNAL = "https://www.kaggle.com/api/i/"
@@ -504,6 +512,9 @@ def live_session_url(
     403 on it is the account's own answer, not a stale notebook's.
     """
     kernel, slug = new_notebook(alias, cookie)
+    # Spec "Kaggle", finding the notebooks letify owns: recorded before anything can fail,
+    # so a run that dies next still leaves a trail to its notebook.
+    record_notebook(alias, slug)
     run = start_run(cookie, kernel, accelerator)
     id_token = firebase_id_token(cookie)
     webtier = webtier_session(cookie, id_token, run)
@@ -554,6 +565,116 @@ def read_notebook_owner(alias: str) -> str | None:
     return owner or None
 
 
+def notebook_record(alias: str) -> Path:
+    """Where the refs of the notebooks letify created on this account are kept."""
+    return account_directory(alias) / "notebooks"
+
+
+def recorded_notebooks(alias: str) -> list[str]:
+    """The refs letify believes it created, in the order it created them."""
+    try:
+        text = notebook_record(alias).read_text(encoding="utf-8")
+    except OSError:
+        return []
+    seen: list[str] = []
+    for line in text.splitlines():
+        ref = line.strip()
+        if ref and ref not in seen:
+            seen.append(ref)
+    return seen
+
+
+def record_notebook(alias: str, slug: str | None) -> None:
+    """Note that letify created this notebook, so a later process can still find it.
+
+    Spec "Kaggle", finding the notebooks letify owns: Kaggle names the notebook itself, so
+    the record is the only thing that tells letify's from the user's own. Never raises; a
+    notebook letify cannot record is one it may fail to clean up, not a failed run.
+    """
+    username = read_notebook_owner(alias)
+    if not slug or username is None:
+        return
+    try:
+        path = notebook_record(alias)
+        path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as handle:
+            handle.write(f"{username}/{slug}\n")
+    except OSError:
+        pass
+
+
+def forget_notebook(alias: str, slug: str | None) -> None:
+    """Drop a notebook from the record, once it is gone from the account."""
+    username = read_notebook_owner(alias)
+    if not slug or username is None:
+        return
+    ref = f"{username}/{slug}"
+    kept = [line for line in recorded_notebooks(alias) if line != ref]
+    try:
+        notebook_record(alias).write_text(
+            "".join(f"{line}\n" for line in kept), encoding="utf-8"
+        )
+    except OSError:
+        pass
+
+
+def notebooks_on_account(alias: str) -> list[str] | None:
+    """The refs the account has, through the official CLI, or None when it cannot be asked.
+
+    None and an empty list mean different things: nothing answered, against the account
+    having no notebooks. Never raises.
+    """
+    if read_api_token(alias) is None:
+        return None
+    uv = tools.find_uv()
+    if uv is None:
+        return None
+    import csv
+    import io
+    import subprocess
+
+    try:
+        result = subprocess.run(
+            [*tools.kaggle_cli_command(uv), "kernels", "list", "--mine", "--csv"],
+            env=tools.kaggle_cli_environment(alias),
+            capture_output=True,
+            text=True,
+            timeout=REST_TIMEOUT,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if result.returncode != 0:
+        return None
+    try:
+        rows = list(csv.DictReader(io.StringIO(result.stdout or "")))
+    except csv.Error:
+        return None
+    return [(row.get("ref") or "").strip() for row in rows if (row.get("ref") or "").strip()]
+
+
+def list_notebooks_via_cli(alias: str) -> list[str]:
+    """The recorded notebooks this account still has. Spec "Kaggle", finding them.
+
+    A ref the record names and the account no longer has was deleted elsewhere, so it is
+    dropped from the record rather than reported.
+    """
+    recorded = recorded_notebooks(alias)
+    if not recorded:
+        return []
+    present = notebooks_on_account(alias)
+    if present is None:
+        return []
+    live = [ref for ref in recorded if ref in set(present)]
+    if live != recorded:
+        try:
+            notebook_record(alias).write_text(
+                "".join(f"{ref}\n" for ref in live), encoding="utf-8"
+            )
+        except OSError:
+            pass
+    return live
+
+
 def delete_notebook_via_cli(alias: str, slug: str | None) -> bool:
     """Delete the ephemeral notebook through the official CLI, the only way it is deleted.
 
@@ -596,6 +717,7 @@ def delete_notebook_best_effort(alias: str, kernel_id: int, slug: str | None) ->
     slug or id, never by its cookie, so the user can delete it by hand on kaggle.com.
     """
     if delete_notebook_via_cli(alias, slug):
+        forget_notebook(alias, slug)
         return
     import sys
 
@@ -1024,6 +1146,24 @@ class Kaggle(Provider):
         )
         table.update({name: Instance(self, tpu=name) for name in TPUS})
         return table
+
+    discovers_sessions = True
+
+    def sessions(self) -> list[str]:
+        """The notebooks letify owns on this account, which is where an orphan shows up."""
+        return list_notebooks_via_cli(self.alias)
+
+    def expected_cards(self, instance: Any) -> tuple[str, int] | None:
+        """What a Kaggle session must have, because Kaggle may answer with another card."""
+        gpu = getattr(instance, "gpu", None)
+        spec = GPUS.get(gpu) if gpu else None
+        if spec is None:
+            return None
+        return str(spec["model"]), int(spec["devices"])
+
+    def retired_reason(self, name: str) -> str | None:
+        """Why Kaggle no longer serves a card it once did. Spec "Kaggle", the accelerators."""
+        return RETIRED.get(name.upper())
 
     def store_backend(self) -> str:
         return "filesystem"

@@ -486,7 +486,7 @@ class Launcher:
         for alias in self.config.order:
             try:
                 provider = self.provider(alias)
-                supported = provider.kind == "colab"
+                supported = provider.discovers_sessions
                 rows.append(
                     {
                         "alias": alias,

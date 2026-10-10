@@ -354,9 +354,47 @@ class Provider(abc.ABC):
             return table[name]
         if name.upper() in table:
             return table[name.upper()]
+        retired = self.retired_reason(name)
+        if retired:
+            raise UnknownInstance(f"{self.alias} does not offer {name!r}. {retired}")
         raise UnknownInstance(
             f"{self.alias} does not offer {name!r}. Available: {', '.join(sorted(table))}"
         )
+
+    #: Whether this provider can be asked what sessions the account already holds. A
+    #: launcher reads it rather than naming provider kinds. Spec "Kaggle", finding the
+    #: notebooks letify owns.
+    discovers_sessions: bool = False
+
+    def sessions(self) -> list[str]:
+        """What the account already holds, for a provider that can be asked.
+
+        Empty for one that cannot, and empty rather than raising when the answer cannot be
+        read: a command asking what exists should not fail because nothing answered.
+        """
+        return []
+
+    def expected_cards(self, instance: Any) -> tuple[str, int] | None:
+        """The card name fragment and count a session for ``instance`` must have, or None.
+
+        None means the provider gives what it is asked for, so there is nothing to check.
+        A provider whose service may answer with another card overrides it. Spec "Kaggle",
+        the accelerators.
+        """
+        return None
+
+    @property
+    def any_accelerator(self) -> bool:
+        """Whether a card other than the one asked for is accepted, from ``any_accelerator``."""
+        return self.config.option("any_accelerator") is True
+
+    def retired_reason(self, name: str) -> str | None:
+        """Why an accelerator this provider once offered is gone, or None.
+
+        A name the provider's service answers with a different card belongs here rather
+        than in the inventory, because a declaration states where a function runs.
+        """
+        return None
 
     def device(self, name: str) -> Instance:
         """Look up an accelerator by name."""

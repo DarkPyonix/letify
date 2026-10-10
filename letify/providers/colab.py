@@ -300,6 +300,8 @@ class Colab(Shell):
                 stderr=exc.stderr,
             ) from exc
 
+    discovers_sessions = True
+
     def sessions(self) -> list[str]:
         """Names of the sessions this account currently holds."""
         names = []
