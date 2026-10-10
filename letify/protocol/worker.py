@@ -64,6 +64,21 @@ widen_pipe(_FRAME_FD)
 _SENDER = (TextSender if _LETIFY_TEXT_FRAMES else Sender)(fd_writer(_FRAME_FD))
 
 
+#: Written to a captured descriptor to find out where its reader has got to. A pipe is
+#: read in order, so every byte written before this has been framed once it is reached.
+#: It is never forwarded. Spec "Worker output".
+_DRAIN_TOKEN = b"\x1a\x1aLETIFY-DRAIN-7f3a9c4e\x1a\x1a"
+
+
+def _held_back(data):
+    """How many bytes at the end of ``data`` could be the start of a split token."""
+    most = min(len(_DRAIN_TOKEN) - 1, len(data))
+    for size in range(most, 0, -1):
+        if _DRAIN_TOKEN.startswith(data[len(data) - size:]):
+            return size
+    return 0
+
+
 class _Pump(threading.Thread):
     """Reads one captured descriptor and sends what it reads as output frames."""
 
@@ -71,9 +86,22 @@ class _Pump(threading.Thread):
         threading.Thread.__init__(self, daemon=True)
         self.kind = kind
         self.busy = False
+        self.fd = fd
+        #: Bytes withheld because they may be the start of a token split across two reads.
+        self.tail = b""
+        self.reached = threading.Event()
         self.read_fd, write_fd = os.pipe()
         os.dup2(write_fd, fd)
         os.close(write_fd)
+
+    def send(self, data):
+        if not data:
+            return
+        self.busy = True
+        try:
+            _SENDER.frame(self.kind, 0, data)
+        finally:
+            self.busy = False
 
     def run(self):
         while True:
@@ -83,14 +111,46 @@ class _Pump(threading.Thread):
                 break
             if not data:
                 break
-            self.busy = True
+            data = self.tail + data
+            self.tail = b""
             try:
-                _SENDER.frame(self.kind, 0, data)
+                while True:
+                    at = data.find(_DRAIN_TOKEN)
+                    if at < 0:
+                        break
+                    self.send(data[:at])
+                    data = data[at + len(_DRAIN_TOKEN):]
+                    self.reached.set()
+                keep = _held_back(data)
+                if keep:
+                    self.tail = data[len(data) - keep:]
+                    data = data[: len(data) - keep]
+                self.send(data)
             except OSError:
                 break
-            finally:
-                self.busy = False
         os.close(self.read_fd)
+
+
+def _drain_output(timeout=2.0):
+    """Wait until everything written to the captured descriptors has been framed.
+
+    Spec "Worker output": a call's reply waits for the output its body made, so the
+    caller's own next print comes after it. Waiting on the reading thread's state is not
+    enough, because it has read bytes it has not yet framed; the token goes through the
+    pipe behind those bytes instead. It gives up rather than lose a result.
+    """
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.flush()
+        except Exception:
+            pass
+    for pump in _PUMPS:
+        pump.reached.clear()
+        try:
+            os.write(pump.fd, _DRAIN_TOKEN)
+        except OSError:
+            continue
+        pump.reached.wait(timeout)
 
 
 _PUMPS = [_Pump(1, STDOUT), _Pump(2, STDERR)]
@@ -2066,6 +2126,9 @@ def _run(stream, request, settle):
     request = None
     if settle:
         _settle()
+    if name == "call":
+        # Spec "Worker output": the body's output is framed before its result goes out.
+        _drain_output()
     _reply(stream, outcome)
 
 
