@@ -1112,7 +1112,9 @@ class Kaggle(Provider):
     usage_unit = "GPU hours"
     usage_source = "the weekly accelerator quota the official Kaggle CLI's quota command reads"
 
-    default_workspace = "/kaggle/working/letify"
+    # Spec "Kaggle runtimes": /kaggle/working is the notebook's output directory on its
+    # own 19.5 GB device, while /kaggle is the overlay with about 1 TB free.
+    default_workspace = "/kaggle/letify"
 
     def account_note(self) -> str | None:
         """How the account's cookie is doing, for `letify providers`, with no network call.

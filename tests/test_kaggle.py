@@ -1232,3 +1232,26 @@ def test_a_kaggle_account_is_asked_for_its_sessions(launcher_from, fake_kaggle_c
     row = rows.get("kaggle_a")
     assert row is not None, rows
     assert row.get("reason") != "session discovery is not supported"
+
+
+def test_the_kaggle_workspace_is_not_under_the_output_directory() -> None:
+    """Spec "Kaggle": /kaggle/working is the output directory, on its own 19.5 GB device.
+
+    Measured on a live session: /kaggle/working has 19.5 GB against Kaggle's 20 GB output
+    limit, while /kaggle is the overlay with 1069.9 GB free. A venv and a call's blobs are
+    not the notebook's output, and a 26 GB dataset does not fit on the smaller one.
+    /kaggle/temp, which looks like the obvious scratch path, does not exist on the image.
+    """
+    provider = kaggle_provider()
+    assert provider.workspace_root == "/kaggle/letify"
+    assert "/kaggle/working" not in provider.workspace_root
+
+
+def test_a_kaggle_account_can_still_name_its_own_workspace(config_file) -> None:
+    """Spec: an account that wants another path sets workspace."""
+    from conftest import provider_of
+
+    from letify.providers import Kaggle
+
+    provider = provider_of(Kaggle, "kaggle_a", workspace="/kaggle/working/letify")
+    assert provider.workspace_root == "/kaggle/working/letify"
