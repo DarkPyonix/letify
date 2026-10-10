@@ -299,3 +299,21 @@ def test_a_kaggle_session_on_the_bridge_offers_no_transfer_channel() -> None:
     assert provider.link(Runtime()) is None
     with pytest.raises(UnsupportedMode):
         provider.transfer_channel(Runtime())
+
+
+def test_kaggle_does_not_offer_the_retired_p100() -> None:
+    """Spec "Kaggle": Kaggle retired the P100 on 2026-09-15 and substitutes T4x2.
+
+    Two live accounts asking for P100 both received two T4s. A declaration states where a
+    function runs, so the name is refused rather than silently answered with another card.
+    """
+    from letify.errors import UnknownInstance
+
+    provider = kaggle()
+    assert "P100" not in provider.discover()
+    assert "T4" in provider.discover()
+    with pytest.raises(UnknownInstance) as failure:
+        provider.device("P100")
+    message = str(failure.value)
+    assert "2026-09-15" in message
+    assert "T4" in message

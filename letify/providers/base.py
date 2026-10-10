@@ -354,9 +354,20 @@ class Provider(abc.ABC):
             return table[name]
         if name.upper() in table:
             return table[name.upper()]
+        retired = self.retired_reason(name)
+        if retired:
+            raise UnknownInstance(f"{self.alias} does not offer {name!r}. {retired}")
         raise UnknownInstance(
             f"{self.alias} does not offer {name!r}. Available: {', '.join(sorted(table))}"
         )
+
+    def retired_reason(self, name: str) -> str | None:
+        """Why an accelerator this provider once offered is gone, or None.
+
+        A name the provider's service answers with a different card belongs here rather
+        than in the inventory, because a declaration states where a function runs.
+        """
+        return None
 
     def device(self, name: str) -> Instance:
         """Look up an accelerator by name."""
