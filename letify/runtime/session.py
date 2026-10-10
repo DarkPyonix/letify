@@ -613,6 +613,19 @@ class Runtime:
 
         return (environment_volume(self.provider),)
 
+    def _say(self, message: str) -> None:
+        """One decision line about this runtime, as the transport's lines are written.
+
+        Spec "Environment": the build says it is happening. Silent when the launcher was
+        built with ``announce=False``.
+        """
+        from ..transport.announce import printer
+
+        # On the instance dict, not getattr: a provider's __getattr__ answers accelerator
+        # names and raises UnknownInstance for anything else, which no default catches.
+        announce = self.provider.__dict__.get("announce", True)
+        printer(bool(announce))(f"{self.name}: {message}")
+
     def install_env(self) -> None:
         """Build the project's environment in the session and move the worker onto it.
 
@@ -641,6 +654,7 @@ class Runtime:
             digest = volume.cached_env(self.env, self.platform)
             if not digest:
                 continue
+            self._say(f"restoring the environment, cached as {digest[:12]}")
             archive = f"{where['parent']}/.{digest}.tar.gz"
             volume.materialize(
                 self, digest, path=archive, unpack=True, target=where["parent"], links=True
@@ -658,6 +672,13 @@ class Runtime:
                 self.env, files, root=root, name=self.name, workspace=workspace,
                 archive=bool(archives),
             )
+            # Spec "Environment": the longest step of a first session, and uv's own output
+            # is captured rather than streamed, so it says it is happening.
+            self._say(
+                f"building the environment, {bootstrap.packages_in(files)} packages "
+                f"from {self.env.lock}"
+            )
+            began = time.monotonic()
             try:
                 self.eval(source, timeout=3600)
             except RemoteError as exc:
@@ -665,6 +686,7 @@ class Runtime:
                 raise EnvironmentFailure(
                     message.removeprefix("RuntimeError: "), stderr=exc.remote_traceback
                 ) from exc
+            self._say(f"environment built in {time.monotonic() - began:.1f} s")
             self.env_source = "sync"
         self.python = where["python"]
         self.channel.switch_interpreter(where["python"])

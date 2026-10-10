@@ -1194,6 +1194,14 @@ This applies to every provider except `local`: `shell`, `tunnel`, `colab`, `elic
 
 A failed sync raises `EnvironmentFailure` saying `uv sync failed on <runtime>`, with the command and the last lines of uv's standard error. `EnvironmentFailure` is a `RuntimeFailure`, so the call is retried on a fresh runtime.
 
+The build says it is happening, because it is the longest step of a first session and its output is captured rather than streamed. One line goes to standard error before it starts and one after it ends, as connection decision lines do:
+
+`letify: <runtime>: building the environment, <packages> packages from <lock>`
+
+`letify: <runtime>: environment built in <seconds> s`
+
+The package count is the number of `[[package]]` entries in the lock the local side already read, so it costs nothing to report and tells the reader whether to expect seconds or minutes. A 236 package lock carrying torch took 14 minutes on an Elice ondemand VM, which is normal for that lock and was indistinguishable from a hang. A session that restores an environment archive instead of syncing says so in place of the first line: `letify: <runtime>: restoring the environment, <size> from <store>`.
+
 ### Environment on the sandbox disk <!-- id: modal-env-disk -->
 
 > On `modal` the project directory, its `.venv` and uv's cache live on the sandbox's own disk, not on the workspace volume, because importing a large package from a Modal volume reads thousands of small files over the network.
