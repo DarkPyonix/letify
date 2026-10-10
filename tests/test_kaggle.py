@@ -1122,3 +1122,50 @@ def test_a_stored_token_with_a_newline_authenticates_cli_deletion(
     assert delete_notebook_via_cli("kaggle_a", "notebook63516d2758") is True
     assert fake_kaggle_cli.calls[0][-1] == "irack000/notebook63516d2758"
     assert fake_kaggle_cli.environments[0]["KAGGLE_API_TOKEN"] == API_TOKEN
+
+
+def test_a_kaggle_session_states_the_cards_it_requires() -> None:
+    """Spec "Kaggle": T4 expects two cards whose model contains T4."""
+    from letify.declare.instance import Instance
+
+    provider = kaggle_provider()
+    assert provider.expected_cards(Instance(provider, gpu="T4")) == ("T4", 2)
+    assert provider.expected_cards(Instance(provider, gpu=None)) is None
+
+
+def test_a_card_that_is_not_the_one_asked_for_is_refused(monkeypatch) -> None:
+    """Spec "Kaggle": a request answered with another card does not run.
+
+    Kaggle answered two live P100 requests with two T4s, which is how a declaration
+    stopped saying where the function runs.
+    """
+    from letify.errors import InsufficientDevices
+    from letify.runtime.session import Runtime
+
+    provider = kaggle_provider()
+    session = object.__new__(Runtime)
+    session.name = "letify-t4-1"
+    session.provider = provider
+    session.instance = type("I", (), {"gpu": "T4", "accelerator": "T4"})()
+    monkeypatch.setattr(Runtime, "eval", lambda self, source, timeout=None: ["Tesla P100"])
+    with pytest.raises(InsufficientDevices) as failure:
+        session.check_devices()
+    message = str(failure.value)
+    assert "2 x T4" in message
+    assert "Tesla P100" in message
+    assert "any_accelerator" in message
+
+
+def test_the_cards_that_were_asked_for_pass(monkeypatch) -> None:
+    """Spec "Kaggle": the right name and the right count is what passes."""
+    from letify.runtime.session import Runtime
+
+    provider = kaggle_provider()
+    session = object.__new__(Runtime)
+    session.name = "letify-t4-2"
+    session.provider = provider
+    session.instance = type("I", (), {"gpu": "T4", "accelerator": "T4"})()
+    monkeypatch.setattr(
+        Runtime, "eval", lambda self, source, timeout=None: ["Tesla T4", "Tesla T4"]
+    )
+    session.check_devices()

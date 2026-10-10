@@ -69,7 +69,7 @@ if TYPE_CHECKING:
 #: GPU session shapes, with memory per card, device count and the internal API name.
 #: CPU is the empty compute, so it carries no accelerator name.
 GPUS = {
-    "T4": {"vram_gb": 16, "devices": 2, "accelerator": "NVIDIA_TESLA_T4"},
+    "T4": {"vram_gb": 16, "devices": 2, "accelerator": "NVIDIA_TESLA_T4", "model": "T4"},
 }
 TPUS = ("TPU_V3_8",)
 #: Cards Kaggle no longer serves, and what it does instead. Offering one would let a
@@ -1031,6 +1031,14 @@ class Kaggle(Provider):
         )
         table.update({name: Instance(self, tpu=name) for name in TPUS})
         return table
+
+    def expected_cards(self, instance: Any) -> tuple[str, int] | None:
+        """What a Kaggle session must have, because Kaggle may answer with another card."""
+        gpu = getattr(instance, "gpu", None)
+        spec = GPUS.get(gpu) if gpu else None
+        if spec is None:
+            return None
+        return str(spec["model"]), int(spec["devices"])
 
     def retired_reason(self, name: str) -> str | None:
         """Why Kaggle no longer serves a card it once did. Spec "Kaggle", the accelerators."""

@@ -130,6 +130,24 @@ def project_dir(workspace_root: str, env: Env) -> str:
     return f"{workspace_root.rstrip('/')}/project/{env.key}"
 
 
+#: Reads the cards a runtime has, without nvidia-smi, which a Kaggle image lacks on PATH.
+#: Spec "Kaggle", the accelerators.
+CARD_SOURCE = (
+    "import glob\n"
+    "__letify_cards = []\n"
+    "for _letify_path in sorted(glob.glob('/proc/driver/nvidia/gpus/*/information')):\n"
+    "    try:\n"
+    "        with open(_letify_path) as _letify_handle:\n"
+    "            for _letify_line in _letify_handle:\n"
+    "                if _letify_line.startswith('Model:'):\n"
+    "                    __letify_cards.append(_letify_line.split(':', 1)[1].strip())\n"
+    "                    break\n"
+    "    except OSError:\n"
+    "        pass\n"
+    "__letify_value__ = __letify_cards\n"
+)
+
+
 def packages_in(files: dict[str, bytes]) -> int:
     """How many packages the lock names, for the line the environment build prints.
 
