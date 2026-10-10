@@ -295,7 +295,7 @@ def kaggle_provider():
     return provider_of(Kaggle, "kaggle_a")
 
 
-@pytest.mark.parametrize("name, devices", [("T4", 2), ("P100", 1)])
+@pytest.mark.parametrize("name, devices", [("T4", 2)])
 def test_a_kaggle_gpu_instance_declares_its_card_count(name, devices) -> None:
     """Spec "Kaggle": the stable GPU names carry their session's card count."""
     instance = getattr(kaggle_provider(), name)
@@ -460,7 +460,7 @@ def test_the_online_check_is_not_repeated_within_the_liveness_ttl(fake_kaggle) -
 def test_declaring_host_local_on_kaggle_fails_at_decoration(let) -> None:
     import letify
 
-    device = kaggle_provider().P100
+    device = kaggle_provider().T4
     with pytest.raises(letify.UnsupportedMode, match="host='remote'"):
 
         @let.function(device=device)
@@ -488,7 +488,6 @@ def test_the_generated_types_mark_kaggle_accelerators_remote_only(isolated_home)
     (isolated_home / ".letify" / "config.toml").write_text('[kg]\nkind = "kaggle"\n')
     text = stubs.render(letify.Launcher(announce=False))
     body = text.split("class Kg(")[1].split("\nclass ")[0]
-    assert "    P100: letify.declare.instance.RemoteOnlyInstance" in body
     assert ": Instance" not in body
 
 
@@ -560,7 +559,6 @@ def session_channel(fake_kaggle, name: str = "letify-t4-1"):
 @pytest.mark.parametrize("name, accelerator", [
     ("TPU_V3_8", "TPU_V3_8"),
     ("T4", "NVIDIA_TESLA_T4"),
-    ("P100", "NVIDIA_TESLA_P100"),
     ("CPU", None),
 ])
 def test_a_kaggle_instance_requests_its_declared_accelerator(

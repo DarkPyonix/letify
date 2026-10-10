@@ -67,13 +67,20 @@ if TYPE_CHECKING:
     from ..runtime.session import Runtime
 
 #: GPU session shapes, with memory per card, device count and the internal API name.
-#: P100 remains available through the API although the web UI no longer lists it.
 #: CPU is the empty compute, so it carries no accelerator name.
 GPUS = {
-    "P100": {"vram_gb": 16, "devices": 1, "accelerator": "NVIDIA_TESLA_P100"},
     "T4": {"vram_gb": 16, "devices": 2, "accelerator": "NVIDIA_TESLA_T4"},
 }
 TPUS = ("TPU_V3_8",)
+#: Cards Kaggle no longer serves, and what it does instead. Offering one would let a
+#: declaration say P100 and run on something else: spec "Kaggle", the accelerators.
+RETIRED = {
+    "P100": (
+        "Kaggle retired the Tesla P100 on 2026-09-15 and switches a notebook that asks "
+        "for it to two T4s, so the card and the card count would both differ from the "
+        "declaration. Use T4, which is two cards of 16 GB"
+    ),
+}
 
 #: The internal Kaggle service surface the web app uses, authenticated by the session cookie.
 KAGGLE_INTERNAL = "https://www.kaggle.com/api/i/"
@@ -1024,6 +1031,10 @@ class Kaggle(Provider):
         )
         table.update({name: Instance(self, tpu=name) for name in TPUS})
         return table
+
+    def retired_reason(self, name: str) -> str | None:
+        """Why Kaggle no longer serves a card it once did. Spec "Kaggle", the accelerators."""
+        return RETIRED.get(name.upper())
 
     def store_backend(self) -> str:
         return "filesystem"
