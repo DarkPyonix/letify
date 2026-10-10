@@ -103,6 +103,9 @@ FIRESTORE_DOCUMENT = (
 #: runnable. A freshly created empty notebook cancels its own session because it has nothing
 #: to run, so the session is started with one committed cell.
 NOTEBOOK_TITLE = "letify runtime"
+#: What the kernel bridge carries, measured sending 64 MiB on a live account. The
+#: floor compares a link against this rather than refusing one that beats it.
+BRIDGE_MIB_PER_S = 2.0
 NOTEBOOK_BODY = json.dumps(
     {
         "cells": [
@@ -1112,7 +1115,9 @@ class Kaggle(Provider):
     usage_unit = "GPU hours"
     usage_source = "the weekly accelerator quota the official Kaggle CLI's quota command reads"
 
-    default_workspace = "/kaggle/working/letify"
+    # Spec "Kaggle runtimes": /kaggle/working is the notebook's output directory on its
+    # own 19.5 GB device, while /kaggle is the overlay with about 1 TB free.
+    default_workspace = "/kaggle/letify"
 
     def account_note(self) -> str | None:
         """How the account's cookie is doing, for `letify providers`, with no network call.
@@ -1319,6 +1324,7 @@ class Kaggle(Provider):
         return LinkFloor(
             min_bps=float(min_mib) * MIB if isinstance(min_mib, (int, float)) else default.min_bps,
             max_rtt_ms=float(max_rtt) if isinstance(max_rtt, (int, float)) else default.max_rtt_ms,
+            fallback_bps=self.fallback_mib_per_s * MIB,
         )
 
     @property
@@ -1339,13 +1345,32 @@ class Kaggle(Provider):
 
         try:
             link = self.link_over(bridge, name=name)
-        except Exception:
+        except Exception as exc:
+            # Never silent: a session that quietly changed channel is one nobody can
+            # account for. Spec "A floor rejection never picks something slower".
+            from ..transport.announce import printer
+
+            printer(bool(self.__dict__.get("announce", True)))(
+                f"{self.alias}: the kernel bridge is carrying {name} at about "
+                f"{self.fallback_mib_per_s:.1f} MiB/s, because no link was chosen: {exc}"
+            )
             return bridge
         self._links[name] = link
         return PersistentChannel(
             link.ssh_command(f"{self.remote_python} -u -c {_shlex.quote(BOOTSTRAP)}"),
             name=name,
         )
+
+    @property
+    def fallback_mib_per_s(self) -> float:
+        """The kernel bridge, measured at 2.0 MiB/s sending 64 MiB on a live account.
+
+        Spec "A floor rejection never picks something slower": without this a punched link
+        at down 8.1 MiB/s was refused for being under the 10 MiB/s floor and 26 GB went
+        over the 2 MiB/s bridge instead.
+        """
+        value = self.config.option("fallback_mib_per_s")
+        return max(0.0, float(value)) if isinstance(value, (int, float)) else BRIDGE_MIB_PER_S
 
     @property
     def transfer_connection_cost_s(self) -> float:

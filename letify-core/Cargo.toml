@@ -8,7 +8,7 @@ resolver = "3"
 members = ["letify-wire", "letify-driver", "letify-agent", "letify-quic"]
 
 [workspace.package]
-version = "2.3.0"
+version = "2.4.0"
 edition = "2024"
 license = "MIT"
 repository = "https://github.com/DarkPyonix/letify"
