@@ -218,6 +218,7 @@ def _measured_on(link: Any, measured: ProbeResult | None) -> Any:
     """
     if measured is not None:
         link.rtt_ms = measured.rtt_ms
+        link.upload_bps = measured.upload_bps
     return link
 
 

@@ -274,6 +274,17 @@ class Provider(abc.ABC):
         return max(1, int(value)) if isinstance(value, (int, float)) else STREAMS
 
     @property
+    def transfer_connection_cost_s(self) -> float:
+        """Seconds one more transfer connection takes to open.
+
+        Spec "Several connections at once": zero where the provider dials an address, so
+        the extra connections are free and only the round trip decides. A provider reached
+        by a hole punch overrides it, because each stream punches again.
+        """
+        value = self.config.option("transfer_connection_cost_s")
+        return max(0.0, float(value)) if isinstance(value, (int, float)) else 0.0
+
+    @property
     def transfer_parallel_rtt_ms(self) -> int:
         """The round trip above which a blob is split, from ``transfer_parallel_rtt_ms``.
 
