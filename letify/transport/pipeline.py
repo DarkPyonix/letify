@@ -61,10 +61,38 @@ class LinkFloor:
 
     min_bps: float
     max_rtt_ms: float
+    #: What the provider's own fallback carries, when it is known. A link the floor
+    #: rejected is kept when it beats this. Spec "A floor rejection never picks something
+    #: slower".
+    fallback_bps: float = 0.0
 
     @classmethod
     def default(cls) -> LinkFloor:
         return cls(min_bps=DEFAULT_MIN_MIB_PER_S * MIB, max_rtt_ms=DEFAULT_MAX_RTT_MS)
+
+    def kept_below(self, result: ProbeResult, floored: list[str]) -> str | None:
+        """Why a link the floor rejected is used anyway, or None when it is not.
+
+        Spec "A floor rejection never picks something slower".
+        """
+        if not floored or not self.beats_fallback(result):
+            return None
+        return (
+            f"kept below the floor, because the fallback carries "
+            f"{self.fallback_bps / MIB:.1f} MiB/s"
+        )
+
+    def beats_fallback(self, result: ProbeResult) -> bool:
+        """Whether this probe is faster than the path that would be used instead.
+
+        Spec "A floor rejection never picks something slower": the floor refuses a slow
+        link so a slow link is not used, which is only right when what happens instead is
+        better. A provider with no measurable fallback has nothing to compare against, so
+        the answer is False and the rejection stands.
+        """
+        if not self.fallback_bps:
+            return False
+        return result.upload_bps > self.fallback_bps and result.download_bps > self.fallback_bps
 
     def violations(self, result: ProbeResult) -> list[str]:
         """Each direction, or the round trip, that the probe failed to clear."""
@@ -312,6 +340,10 @@ class Pipeline:
                 return link
             if measured is not None:
                 floored = self.floor.violations(measured)
+                kept = self.floor.kept_below(measured, floored)
+                if kept:
+                    self._say(f"{link.strategy} {kept}")
+                    floored = []
                 if floored:
                     self._say(f"rejected {link.strategy}: below the floor: {', '.join(floored)}")
                     _close(link)
@@ -389,6 +421,10 @@ class Pipeline:
             _close(link)
             return None
         floored = self.floor.violations(measured)
+        kept = self.floor.kept_below(measured, floored)
+        if kept:
+            self._say(f"cached {name} {kept}")
+            floored = []
         if floored:
             self._say(f"cached {name} rejected: below the floor: {', '.join(floored)}")
             reasons.append(f"{name}: below the floor: {', '.join(floored)}")
@@ -573,6 +609,10 @@ class Pipeline:
             else:
                 if measured is not None:
                     floored = self.floor.violations(measured)
+                    kept = self.floor.kept_below(measured, floored)
+                    if kept:
+                        self._say(f"{link.strategy} {kept}")
+                        floored = []
                     if floored:
                         below = f"{link.strategy}: below the floor: {', '.join(floored)}"
                         self._say(f"rejected {below}")
@@ -598,6 +638,10 @@ class Pipeline:
         above_floor: list[tuple[Any, ProbeResult]] = []
         for link, measured in probed:
             floored = self.floor.violations(measured)
+            kept = self.floor.kept_below(measured, floored)
+            if kept:
+                self._say(f"{link.strategy} {kept}")
+                floored = []
             if floored:
                 self._say(f"rejected {link.strategy}: below the floor: {', '.join(floored)}")
                 below = f"{link.strategy}: below the floor: {', '.join(floored)}"
