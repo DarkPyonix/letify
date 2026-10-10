@@ -1307,23 +1307,32 @@ def _data_install_patch():
                 entries.append(_PendingEntry(name, prefix + name, size))
         return _Scandir(entries, found)
 
+    def missing(path, found, real_name, kwargs):
+        """Answer a stat that found nothing, from the manifest or by looking again.
+
+        The real stat runs first, so the data thread can place the file and drop it from
+        the pending map in between, leaving the path in neither: not on disk when it was
+        looked for, not pending when the manifest was asked. Looking again settles it,
+        because placement puts the file on disk before it clears pending, so the second
+        look finds it. A path that is genuinely absent raises as it should. Spec "What the
+        body sees before a file arrives"; the listing states the same rule and takes its
+        snapshot first instead, which a stat cannot afford on a data loader's hot path.
+        """
+        if found is not None:
+            return _data_fake_stat(found[2][1])
+        return real[real_name](path, **kwargs)
+
     def stated(path, **kwargs):
         try:
             return real["stat"](path, **kwargs)
         except FileNotFoundError:
-            found = pending_of(path)
-            if found is None:
-                raise
-            return _data_fake_stat(found[2][1])
+            return missing(path, pending_of(path), "stat", kwargs)
 
     def lstated(path, **kwargs):
         try:
             return real["lstat"](path, **kwargs)
         except FileNotFoundError:
-            found = pending_of(path)
-            if found is None:
-                raise
-            return _data_fake_stat(found[2][1])
+            return missing(path, pending_of(path), "lstat", kwargs)
 
     def disguise(patched, module, name):
         """Give a wrapper the name it replaced, so pickling it finds the name, not the
