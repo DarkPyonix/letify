@@ -130,6 +130,16 @@ def project_dir(workspace_root: str, env: Env) -> str:
     return f"{workspace_root.rstrip('/')}/project/{env.key}"
 
 
+def packages_in(files: dict[str, bytes]) -> int:
+    """How many packages the lock names, for the line the environment build prints.
+
+    The lock is already read, so counting its ``[[package]]`` entries costs nothing and
+    tells the reader whether to expect seconds or minutes. Spec "Environment".
+    """
+    lock = files.get("uv.lock") or b""
+    return lock.count(b"[[package]]")
+
+
 def project_files(env: Env) -> dict[str, bytes]:
     """Read the files a runtime syncs from, refusing what cannot give a matching interpreter.
 

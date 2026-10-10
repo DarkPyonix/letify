@@ -2214,3 +2214,40 @@ def test_a_failed_interpreter_switch_does_not_publish_an_environment_archive(
         provider.start(remote_instance(provider), Env(), name="lab-1", volumes=(volume,))
     assert list(volume.store.backend.list_digests()) == []
     assert volume.cached_env(Env(), sys.platform + "-" + __import__("platform").machine()) is None
+
+
+def test_the_environment_build_says_it_is_building_and_how_long_it_took(
+    uv_project: Path, capsys
+) -> None:
+    """Spec "Environment": the build says it is happening.
+
+    It is the longest step of a first session and uv's own output is captured rather than
+    streamed, so a 236 package lock carrying torch was 14 minutes of silence on a live
+    Elice runtime, indistinguishable from a hang.
+    """
+    provider = provider_of(PreparingLocal, "lab")
+    provider.announce = True
+    env = Env()
+    runtime = provider.start(remote_instance(provider), env, name="lab-1")
+    try:
+        assert runtime.env_source == "sync"
+    finally:
+        runtime.shutdown()
+    err = capsys.readouterr().err
+    building = [line for line in err.splitlines() if "building the environment" in line]
+    built = [line for line in err.splitlines() if "environment built in" in line]
+    assert building, err
+    assert "packages from uv.lock" in building[0]
+    assert built, err
+
+
+def test_the_environment_build_says_nothing_when_the_launcher_is_quiet(
+    uv_project: Path, capsys
+) -> None:
+    """Spec "Environment": silent when the launcher was built with announce=False."""
+    provider = provider_of(PreparingLocal, "lab")
+    provider.announce = False
+    runtime = provider.start(remote_instance(provider), Env(), name="lab-2")
+    runtime.shutdown()
+    err = capsys.readouterr().err
+    assert "building the environment" not in err
