@@ -954,7 +954,8 @@ def _data_place_now(state, path, entry):
         # the link then fails the file that was there is lost: a body that listed the
         # directory is left with a name it cannot stat. Spec "What the body sees before a
         # file arrives". _DATA_PARTIAL names are filtered from every patched listing.
-        staged = "%s%slink%d" % (path, _DATA_PARTIAL, os.getpid())
+        staged = "%s%slink%d.%d" % (
+            path, _DATA_PARTIAL, os.getpid(), threading.get_ident())
         try:
             os.link(source, staged)
             os.replace(staged, path)
@@ -967,7 +968,8 @@ def _data_place_now(state, path, entry):
     if not linked:
         # Copied to a name of its own and renamed into place, so a reader never stats a
         # file that is half written. Spec "What the body sees before a file arrives".
-        partial = "%s%s%d" % (path, _DATA_PARTIAL, os.getpid())
+        partial = "%s%s%d.%d" % (
+            path, _DATA_PARTIAL, os.getpid(), threading.get_ident())
         try:
             shutil.copyfile(source, partial)
             os.replace(partial, path)
@@ -977,7 +979,15 @@ def _data_place_now(state, path, entry):
             except OSError:
                 pass
             return False
-    info = os.stat(path)
+    try:
+        info = os.stat(path)
+    except OSError:
+        # Another thread is placing this same path, so the name is between its link and
+        # its rename. Leaving the path pending and reporting nothing placed is right: the
+        # other thread finishes the placement. Raising here instead ends the whole call,
+        # which is how a race between the opening sweep and the data thread surfaced as
+        # `FileNotFoundError` on a file the body had just listed.
+        return False
     cached = (info.st_size, info.st_mtime_ns) if linked else None
     state["placed"][path] = (digest, info.st_ino, info.st_size, info.st_mtime_ns, cached)
     state["linked"] += linked
