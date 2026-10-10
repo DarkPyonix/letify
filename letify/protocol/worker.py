@@ -2126,11 +2126,17 @@ def _run(stream, request, settle):
     request = None
     if settle:
         _settle()
-    if name == "call":
-        # Spec "Worker output": the body's output is framed before its result goes out.
+    if name in _DRAINS:
+        # Spec "Worker output": what the program wrote is framed before its result goes
+        # out. Every op that runs a program drains; a stat or a lease renewal does not,
+        # because they write nothing and are on the hot path.
         _drain_output()
     _reply(stream, outcome)
 
+
+#: Ops that run a program, so output of theirs may still be unframed when they answer.
+#: Spec "Worker output".
+_DRAINS = frozenset(("call", "exec"))
 
 _DATA_PREFIX = b"LETIFY-DATA "
 
