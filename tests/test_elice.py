@@ -841,7 +841,11 @@ def test_a_refused_spot_launch_ends_nothing(account, fake_eci, capsys) -> None:
         }
     )
     Path("pyproject.toml").write_text("[project]\nname = 'study'\n", encoding="utf-8")
-    Path("uv.lock").write_text("", encoding="utf-8")
+    # Names cloudpickle because a lock naming neither it nor letify is refused before
+    # the launch, and this test is about the launch being refused.
+    Path("uv.lock").write_text(
+        'version = 1\n\n[[package]]\nname = "cloudpickle"\n', encoding="utf-8"
+    )
     provider = account()
     instance = Instance(provider, gpu="A100").priced("spot")._placed("remote")
     with pytest.raises(letify.ProviderUnavailable):

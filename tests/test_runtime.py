@@ -1233,7 +1233,11 @@ def test_a_failed_sync_raises_environment_failure_naming_uv_sync(
     uv_project: Path, tmp_path: Path
 ) -> None:
     # A lock file that names a package no index has makes the real uv fail.
-    (uv_project / "uv.lock").write_text("version = 1\nnot a lock\n", encoding="utf-8")
+    # It still names cloudpickle, because a lock naming neither it nor letify is
+    # refused before the sync, and this test is about the sync's own failure.
+    (uv_project / "uv.lock").write_text(
+        'version = 1\n\n[[package]]\nname = "cloudpickle"\nnot a lock\n', encoding="utf-8"
+    )
     provider = provider_of(PreparingLocal, "lab")
     with pytest.raises(letify.EnvironmentFailure, match="uv sync failed"):
         provider.start(remote_instance(provider), Env(), name="lab-1")
@@ -2251,3 +2255,30 @@ def test_the_environment_build_says_nothing_when_the_launcher_is_quiet(
     runtime.shutdown()
     err = capsys.readouterr().err
     assert "building the environment" not in err
+
+
+def test_a_lock_that_names_neither_letify_nor_cloudpickle_is_refused(tmp_path) -> None:
+    """Spec "Environment": refused locally, because it fails remotely after the session starts.
+
+    A hand written lock for one small function is where this happens: a live Kaggle
+    session failed with `ModuleNotFoundError: No module named 'cloudpickle'` minutes in.
+    """
+    from letify.errors import ConfigError
+    from letify.runtime import bootstrap
+
+    (tmp_path / "pyproject.toml").write_text('[project]\nname = "x"\nversion = "0"\n')
+    (tmp_path / "uv.lock").write_text('version = 1\n\n[[package]]\nname = "idna"\n')
+    with pytest.raises(ConfigError) as failure:
+        bootstrap.project_files(Env(lock=str(tmp_path / "uv.lock")))
+    assert "cloudpickle" in str(failure.value)
+    assert str(tmp_path / "uv.lock") in str(failure.value)
+
+
+def test_a_lock_naming_cloudpickle_alone_is_accepted(tmp_path) -> None:
+    """Spec: cloudpickle is the minimum, because the worker needs it to unpickle the body."""
+    from letify.runtime import bootstrap
+
+    (tmp_path / "pyproject.toml").write_text('[project]\nname = "x"\nversion = "0"\n')
+    (tmp_path / "uv.lock").write_text('version = 1\n\n[[package]]\nname = "cloudpickle"\n')
+    files = bootstrap.project_files(Env(lock=str(tmp_path / "uv.lock")))
+    assert b"cloudpickle" in files["uv.lock"]

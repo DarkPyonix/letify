@@ -158,6 +158,15 @@ def project_files(env: Env) -> dict[str, bytes]:
                 f"pyproject.toml and uv.lock, and {directory.resolve()} has no {name}. "
                 f"Run 'uv lock' in the project first"
             )
+    lock = files.get("uv.lock") or b""
+    if b'name = "letify"' not in lock and b'name = "cloudpickle"' not in lock:
+        raise ConfigError(
+            f"the worker unpickles a declared body with cloudpickle, and a body that uses "
+            f"letify's own names imports letify on the runtime, so "
+            f"{(directory / 'uv.lock').resolve()} has to name letify or at least cloudpickle. "
+            f"It names neither, and the session would fail there with ModuleNotFoundError. "
+            f"Add letify to the project and run 'uv lock' again"
+        )
     local = local_python()
     pinned = files.get(".python-version")
     if pinned is not None:
