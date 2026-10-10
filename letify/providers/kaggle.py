@@ -1207,6 +1207,12 @@ class Kaggle(Provider):
             name=name,
         )
 
+    @property
+    def transfer_connection_cost_s(self) -> float:
+        """A punch, which is what one more stream costs here. Measured at about 10 s."""
+        value = self.config.option("transfer_connection_cost_s")
+        return max(0.0, float(value)) if isinstance(value, (int, float)) else 10.0
+
     def link(self, runtime: Runtime | None = None) -> Any:
         """The link carrying this runtime, or None when the bridge is carrying it.
 

@@ -348,3 +348,38 @@ def test_the_guard_does_not_go_through_a_provider_lookup() -> None:
         provider = Picky()
 
     assert pathdata._streams_for(Runtime(), 256 << 20) == 1
+
+
+def test_streams_that_cost_a_connection_are_opened_only_when_they_pay() -> None:
+    """Spec "Several connections at once": a connection that costs something pays for itself.
+
+    A Kaggle runtime at a 44.7 ms round trip carried 128 MiB at 21.0 MiB/s on one stream
+    and 9.5 MiB/s on four, because three more hole punches cost more than the transfer
+    saved.
+    """
+    from letify.store.pathdata import streams_for
+
+    MIB = 1 << 20
+    near = dict(streams=4, threshold_mib=64, rtt_ms=44.7, size=128 * MIB)
+    # Free connections: the near link still splits, as a forward SSH account does.
+    assert streams_for(**near, rate_bps=56.8 * MIB, cost_s=0.0) == 4
+    # A punch each: 128 MiB at 56.8 MiB/s takes 2.3 s, and one punch alone costs 10 s.
+    assert streams_for(**near, rate_bps=56.8 * MIB, cost_s=10.0) == 1
+    # Far and slow enough that the punch is worth it.
+    assert streams_for(
+        streams=4, threshold_mib=64, rtt_ms=193.0, size=1024 * MIB,
+        rate_bps=12.8 * MIB, cost_s=10.0,
+    ) == 4
+    # No rate to estimate with: the cost cannot be weighed, so one stream.
+    assert streams_for(**near, rate_bps=None, cost_s=10.0) == 1
+
+
+def test_a_provider_reports_what_one_more_connection_costs() -> None:
+    """Spec: 0 for a provider that dials an address, about 10 for one reached by a punch."""
+    from conftest import provider_of
+
+    from letify.providers.kaggle import Kaggle
+    from letify.providers.shell import Shell
+
+    assert float(provider_of(Shell, "dept_gpu").transfer_connection_cost_s) == 0.0
+    assert float(provider_of(Kaggle, "kaggle_a").transfer_connection_cost_s) >= 5.0
