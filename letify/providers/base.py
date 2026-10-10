@@ -374,6 +374,18 @@ class Provider(abc.ABC):
         """
         return []
 
+    def orphans(self) -> list[str]:
+        """What a dead process left behind on this account, for a provider that can tell.
+
+        Spec "Kaggle", stopping what a dead process left behind. Empty for a provider that
+        cannot, so `letify stop --orphans` has nothing to delete there.
+        """
+        return []
+
+    def stop_orphan(self, ref: str) -> bool:
+        """Delete one thing `orphans` reported, and report whether it is gone."""
+        return False
+
     def expected_cards(self, instance: Any) -> tuple[str, int] | None:
         """The card name fragment and count a session for ``instance`` must have, or None.
 

@@ -499,6 +499,40 @@ class Launcher:
                 rows.append({"alias": alias, "sessions": [], "unavailable": str(exc)})
         return rows
 
+    def orphans(self, alias: str | None = None) -> list[dict[str, Any]]:
+        """What a dead process left behind, per account.
+
+        Spec "Kaggle", stopping what a dead process left behind.
+        """
+        rows: list[dict[str, Any]] = []
+        for name in self.config.order:
+            if alias is not None and name != alias:
+                continue
+            try:
+                provider = self.provider(name)
+                rows.append({"alias": name, "kind": provider.kind, "orphans": provider.orphans()})
+            except LetifyError as exc:
+                rows.append({"alias": name, "orphans": [], "unavailable": str(exc)})
+        return rows
+
+    def stop_orphans(self, alias: str | None = None) -> list[dict[str, Any]]:
+        """Delete what ``orphans`` reported, one at a time, reporting each outcome."""
+        done: list[dict[str, Any]] = []
+        for row in self.orphans(alias):
+            if row.get("unavailable"):
+                done.append(row)
+                continue
+            provider = self.provider(row["alias"])
+            for ref in row["orphans"]:
+                try:
+                    gone = provider.stop_orphan(ref)
+                    done.append({"alias": row["alias"], "ref": ref, "stopped": gone})
+                except LetifyError as exc:
+                    done.append(
+                        {"alias": row["alias"], "ref": ref, "stopped": False, "error": str(exc)}
+                    )
+        return done
+
     def status(self) -> dict[str, Any]:
         """What is running right now, and what it is costing.
 

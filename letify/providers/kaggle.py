@@ -24,6 +24,7 @@ import base64
 import binascii
 import json
 import math
+import os
 import re
 import textwrap
 import time
@@ -573,18 +574,66 @@ def notebook_record(alias: str) -> Path:
     return account_directory(alias) / "notebooks"
 
 
-def recorded_notebooks(alias: str) -> list[str]:
-    """The refs letify believes it created, in the order it created them."""
+def recorded_entries(alias: str) -> list[tuple[str, int | None]]:
+    """Each ref letify believes it created and the pid that made it, in order.
+
+    The pid is None for a line an older letify wrote, which had no pid to record.
+    """
     try:
         text = notebook_record(alias).read_text(encoding="utf-8")
     except OSError:
         return []
-    seen: list[str] = []
+    seen: list[tuple[str, int | None]] = []
+    known: set[str] = set()
     for line in text.splitlines():
-        ref = line.strip()
-        if ref and ref not in seen:
-            seen.append(ref)
+        ref, _tab, owner = line.strip().partition("\t")
+        if not ref or ref in known:
+            continue
+        known.add(ref)
+        try:
+            seen.append((ref, int(owner) if owner else None))
+        except ValueError:
+            seen.append((ref, None))
     return seen
+
+
+def recorded_notebooks(alias: str) -> list[str]:
+    """The refs letify believes it created, in the order it created them."""
+    return [ref for ref, _owner in recorded_entries(alias)]
+
+
+def _process_lives(pid: int) -> bool:
+    """Whether a process with this id is still running on this machine."""
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        # Someone else's process, so it is running and not letify's to judge.
+        return True
+    except OSError:
+        return True
+    return True
+
+
+def orphaned_notebooks(alias: str) -> list[str]:
+    """The recorded refs the account still has whose creating process is gone.
+
+    Spec "Kaggle", stopping what a dead process left behind: a notebook a live process is
+    still using is never reported, so nothing deletes a running session's notebook.
+    """
+    entries = recorded_entries(alias)
+    if not entries:
+        return []
+    present = notebooks_on_account(alias)
+    if present is None:
+        return []
+    here = set(present)
+    return [
+        ref
+        for ref, owner in entries
+        if ref in here and (owner is None or not _process_lives(owner))
+    ]
 
 
 def record_notebook(alias: str, slug: str | None) -> None:
@@ -601,7 +650,8 @@ def record_notebook(alias: str, slug: str | None) -> None:
         path = notebook_record(alias)
         path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
         with path.open("a", encoding="utf-8") as handle:
-            handle.write(f"{username}/{slug}\n")
+            # The pid as well, so a live process's notebook is never taken for an orphan.
+            handle.write(f"{username}/{slug}\t{os.getpid()}\n")
     except OSError:
         pass
 
@@ -611,11 +661,18 @@ def forget_notebook(alias: str, slug: str | None) -> None:
     username = read_notebook_owner(alias)
     if not slug or username is None:
         return
-    ref = f"{username}/{slug}"
-    kept = [line for line in recorded_notebooks(alias) if line != ref]
+    forget_ref(alias, f"{username}/{slug}")
+
+
+def forget_ref(alias: str, ref: str) -> None:
+    """Drop one ref from the record, keeping the pid of every other line."""
+    kept = [(line, owner) for line, owner in recorded_entries(alias) if line != ref]
     try:
         notebook_record(alias).write_text(
-            "".join(f"{line}\n" for line in kept), encoding="utf-8"
+            "".join(
+                f"{line}\n" if owner is None else f"{line}\t{owner}\n" for line, owner in kept
+            ),
+            encoding="utf-8",
         )
     except OSError:
         pass
@@ -667,14 +724,11 @@ def list_notebooks_via_cli(alias: str) -> list[str]:
     present = notebooks_on_account(alias)
     if present is None:
         return []
-    live = [ref for ref in recorded if ref in set(present)]
-    if live != recorded:
-        try:
-            notebook_record(alias).write_text(
-                "".join(f"{ref}\n" for ref in live), encoding="utf-8"
-            )
-        except OSError:
-            pass
+    here = set(present)
+    live = [ref for ref in recorded if ref in here]
+    for ref in recorded:
+        if ref not in here:
+            forget_ref(alias, ref)
     return live
 
 
@@ -1157,6 +1211,23 @@ class Kaggle(Provider):
     def sessions(self) -> list[str]:
         """The notebooks letify owns on this account, which is where an orphan shows up."""
         return list_notebooks_via_cli(self.alias)
+
+    def orphans(self) -> list[str]:
+        """Notebooks this account still has whose creating process is gone."""
+        return orphaned_notebooks(self.alias)
+
+    def stop_orphan(self, ref: str) -> bool:
+        """Delete one orphaned notebook, which removes its session with it.
+
+        The run id died with the process that made it, so `cancel_run` cannot reach the
+        run; deleting the notebook is the way in. Spec "Kaggle", stopping what a dead
+        process left behind.
+        """
+        slug = ref.partition("/")[2] or ref
+        if not delete_notebook_via_cli(self.alias, slug):
+            return False
+        forget_ref(self.alias, ref)
+        return True
 
     def expected_cards(self, instance: Any) -> tuple[str, int] | None:
         """What a Kaggle session must have, because Kaggle may answer with another card."""
