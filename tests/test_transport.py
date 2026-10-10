@@ -127,6 +127,9 @@ def test_a_dial_the_kernel_refuses_at_once_is_not_taken_for_a_connection() -> No
     taken_far, _ = peer_listener.accept()
     token = b"d" * 16
     arrived: dict[str, socket.socket] = {}
+    # The handshake completes inside create_connection, so the punch can return before the
+    # thread has published the socket. Without waiting the read below raises KeyError.
+    published = threading.Event()
 
     def peer_completes_its_own_dial() -> None:
         # Over loopback the taken pair is also the peer's own pair seen from its side, so
@@ -134,12 +137,14 @@ def test_a_dial_the_kernel_refuses_at_once_is_not_taken_for_a_connection() -> No
         # refused, and a connection then arrives on its listener.
         time.sleep(0.25)
         arrived["sock"] = socket.create_connection(("127.0.0.1", port))
+        published.set()
 
     threading.Thread(target=peer_completes_its_own_dial, daemon=True).start()
     try:
         chosen = nat.punch(
             port, ("127.0.0.1", peer_port), token, initiator=True, start_at=0, window=5.0
         )
+        assert published.wait(10), "the peer's dial never completed"
         assert nat.recv_exact(arrived["sock"], len(nat.HELLO) + 16) == nat.HELLO + token
         chosen.close()
     finally:
