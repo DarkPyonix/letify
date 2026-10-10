@@ -6,8 +6,10 @@ the strategies of Choosing a link are raced over it.
 
 from __future__ import annotations
 
+import pytest
 from conftest import provider_of
 
+from letify.errors import UnsupportedMode
 from letify.providers.kaggle import Kaggle
 
 
@@ -243,3 +245,57 @@ def test_a_kaggle_runtime_pins_its_host_key_under_its_own_alias() -> None:
     assert target.host_key_alias == "letify-kaggle_a-letify-cpu-abc123"
     command = target.forwarded_ssh(40000)
     assert command[command.index("HostKeyAlias=letify-kaggle_a-letify-cpu-abc123")]
+
+
+def test_a_punched_kaggle_transfer_stream_asks_the_link_for_a_connection(monkeypatch) -> None:
+    """Spec "Several connections at once": each stream gets a connection of its own.
+
+    Multiplexed channels do not add up. Measured on one punched Kaggle link at a 193 ms
+    round trip, four concurrent `ssh cat > /dev/null`, each asking the link for its own
+    command, carried 6.10 MiB/s against 1.57 MiB/s for one, while four channels
+    multiplexed onto the session's command carried 1.14 times one.
+    """
+    built: list[list[str]] = []
+    asked: list[str] = []
+    provider = kaggle()
+
+    class Link:
+        """Each ssh_command lands on a port of its own, as a punched link's does."""
+
+        strategy = "tcp_punch"
+        rtt_ms = 138.0
+
+        def ssh_command(self, remote_command=None):
+            asked.append("session" if not asked else "transfer")
+            return ["ssh", "-p", str(40000 + len(asked)), "root@127.0.0.1",
+                    remote_command or ""]
+
+    class Fake:
+        def __init__(self, command, name=None, **kwargs):
+            built.append(command)
+            self.name = name
+
+    class Runtime:
+        name = "k-1"
+
+    monkeypatch.setattr(provider, "link_over", lambda channel, name=None: Link())
+    monkeypatch.setattr("letify.runtime.channel.PersistentChannel", Fake)
+    provider.channel_over(object(), name="k-1")
+    assert provider.link(Runtime()).rtt_ms == 138.0
+
+    provider.transfer_channel(Runtime())
+    assert len(built) == 2
+    assert built[1] != built[0], "a transfer channel asks the link for a command of its own"
+    assert asked == ["session", "transfer"]
+
+
+def test_a_kaggle_session_on_the_bridge_offers_no_transfer_channel() -> None:
+    """Spec: a session that never punched is carried by the bridge, which has no second channel."""
+    provider = kaggle()
+
+    class Runtime:
+        name = "never-punched"
+
+    assert provider.link(Runtime()) is None
+    with pytest.raises(UnsupportedMode):
+        provider.transfer_channel(Runtime())

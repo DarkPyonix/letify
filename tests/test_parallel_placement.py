@@ -304,14 +304,13 @@ def test_an_account_sets_the_round_trip_threshold() -> None:
 
 def test_a_provider_with_no_transfer_channel_keeps_one_stream() -> None:
     # Spec "Several connections at once": a provider whose channel is not a connection it
-    # can open more of, such as Modal's sandbox pipes or Kaggle's kernel bridge, has no
-    # transfer channel, and asking it for one would fail inside the placement.
-    from letify.providers.kaggle import Kaggle
+    # can open more of, such as Modal's sandbox pipes, has no transfer channel, and asking
+    # it for one would fail inside the placement. Kaggle has one, because a session that
+    # punched is reached over SSH and the link can punch again for each stream.
     from letify.providers.modal import Modal
     from letify.store import pathdata
 
-    for cls in (Modal, Kaggle):
-        assert not hasattr(cls, "transfer_channel"), cls.__name__
+    assert not hasattr(Modal, "transfer_channel")
 
     class Bare:
         transfer_streams = 4
