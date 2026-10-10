@@ -62,7 +62,7 @@ remote: Final = Host.remote
 # The enum class stays importable from letify.declare.instance for letify's own use.
 del Host
 
-__version__ = "2.1.2"
+__version__ = "2.1.3"
 
 
 def fetch(tensor):  # type: ignore[no-untyped-def]
