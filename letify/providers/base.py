@@ -361,6 +361,20 @@ class Provider(abc.ABC):
             f"{self.alias} does not offer {name!r}. Available: {', '.join(sorted(table))}"
         )
 
+    def expected_cards(self, instance: Any) -> tuple[str, int] | None:
+        """The card name fragment and count a session for ``instance`` must have, or None.
+
+        None means the provider gives what it is asked for, so there is nothing to check.
+        A provider whose service may answer with another card overrides it. Spec "Kaggle",
+        the accelerators.
+        """
+        return None
+
+    @property
+    def any_accelerator(self) -> bool:
+        """Whether a card other than the one asked for is accepted, from ``any_accelerator``."""
+        return self.config.option("any_accelerator") is True
+
     def retired_reason(self, name: str) -> str | None:
         """Why an accelerator this provider once offered is gone, or None.
 

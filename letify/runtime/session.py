@@ -130,6 +130,7 @@ class Runtime:
             self.worker_pid = int(self.stat()["pid"])
             self.provider.add_worker_pid(self.worker_pid)
         self.restrict_devices()
+        self.check_devices()
         if self.provider.needs_lease:
             self.lease = Lease(self)
             self.lease.arm()
@@ -690,6 +691,43 @@ class Runtime:
             self.env_source = "sync"
         self.python = where["python"]
         self.channel.switch_interpreter(where["python"])
+
+    def check_devices(self) -> None:
+        """Refuse a session whose cards are not the ones the instance asked for.
+
+        Spec "Kaggle", the accelerators: a provider may answer a request with a different
+        card. Run before the environment is built, so a wrong card costs seconds rather
+        than the minutes a sync takes.
+        """
+        from ..errors import InsufficientDevices
+        from . import bootstrap
+
+        instance = getattr(self, "instance", None)
+        expected = self.provider.expected_cards(instance)
+        if expected is None:
+            return
+        fragment, count = expected
+        try:
+            cards = self.eval(bootstrap.CARD_SOURCE, timeout=120)
+        except Exception:
+            # Reading /proc is not worth failing a session over when it cannot be read.
+            return
+        cards = [str(card) for card in cards or ()]
+        matched = [card for card in cards if fragment.casefold() in card.casefold()]
+        if len(matched) == count and len(cards) == count:
+            return
+        asked = getattr(instance, "accelerator", None) or fragment
+        arrived = ", ".join(cards) if cards else "no GPU at all"
+        message = (
+            f"{self.name}: {self.provider.alias} was asked for {count} x {asked} and the "
+            f"session has {arrived}. A declaration says where a function runs, so the "
+            f"session is not used. Set any_accelerator = true on the account to accept "
+            f"whatever card it is given"
+        )
+        if self.provider.any_accelerator:
+            self._say(f"card mismatch accepted: asked {count} x {asked}, got {arrived}")
+            return
+        raise InsufficientDevices(message)
 
     def check_interpreter(self) -> None:
         """Refuse a worker whose Python major.minor differs from this process."""
