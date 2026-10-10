@@ -384,6 +384,17 @@ class Provider(abc.ABC):
         return None
 
     @property
+    def fallback_mib_per_s(self) -> float:
+        """What this provider's own fallback carries, or 0 when it is not known.
+
+        Spec "A floor rejection never picks something slower": a link the floor rejected
+        is kept when it beats this, because refusing a slow link only makes sense when
+        what happens instead is better.
+        """
+        value = self.config.option("fallback_mib_per_s")
+        return max(0.0, float(value)) if isinstance(value, (int, float)) else 0.0
+
+    @property
     def any_accelerator(self) -> bool:
         """Whether a card other than the one asked for is accepted, from ``any_accelerator``."""
         return self.config.option("any_accelerator") is True

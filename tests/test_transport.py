@@ -901,3 +901,35 @@ def test_a_platform_without_the_kernel_copy_still_splices(monkeypatch) -> None:
     left.close()
     near.close()
     thread.join(10)
+
+
+def test_a_link_below_the_floor_is_kept_when_the_fallback_is_slower(isolated_home, capsys) -> None:
+    """Spec "A floor rejection never picks something slower".
+
+    A live Kaggle session refused a punched link at down 8.1 MiB/s for being under the
+    10 MiB/s floor and then carried 26 GB over the 2 MiB/s kernel bridge instead, which is
+    the opposite of what the floor is for.
+    """
+    floor = LinkFloor(min_bps=10 * MIB, max_rtt_ms=300.0, fallback_bps=2 * MIB)
+    punch = FakeStrategy("tcp_punch", 2, result=result(8.1, 8.1, rtt=190.0))
+    link = pipeline([punch], floor=floor).connect()
+    assert link.strategy == "tcp_punch"
+    err = capsys.readouterr().err
+    assert "kept below the floor" in err
+    assert "2.0 MiB/s" in err
+
+
+def test_a_link_slower_than_the_fallback_is_still_refused(isolated_home) -> None:
+    """Spec: only a link that beats the fallback is kept; a slower one is given up."""
+    floor = LinkFloor(min_bps=10 * MIB, max_rtt_ms=300.0, fallback_bps=2 * MIB)
+    punch = FakeStrategy("tcp_punch", 2, result=result(8.1, 0.5, rtt=190.0))
+    with pytest.raises(letify.ProviderUnavailable):
+        pipeline([punch], floor=floor).connect()
+
+
+def test_a_provider_with_no_known_fallback_keeps_failing_below_the_floor(isolated_home) -> None:
+    """Spec: a provider with no measurable fallback has nothing to compare against."""
+    floor = LinkFloor(min_bps=10 * MIB, max_rtt_ms=300.0)
+    punch = FakeStrategy("tcp_punch", 2, result=result(8.1, 8.1, rtt=190.0))
+    with pytest.raises(letify.ProviderUnavailable):
+        pipeline([punch], floor=floor).connect()

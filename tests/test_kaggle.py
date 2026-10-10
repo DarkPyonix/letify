@@ -1255,3 +1255,42 @@ def test_a_kaggle_account_can_still_name_its_own_workspace(config_file) -> None:
 
     provider = provider_of(Kaggle, "kaggle_a", workspace="/kaggle/working/letify")
     assert provider.workspace_root == "/kaggle/working/letify"
+
+
+def test_the_kaggle_floor_knows_what_the_bridge_carries() -> None:
+    """Spec "A floor rejection never picks something slower": the bridge is 2.0 MiB/s."""
+    from letify.transport.pipeline import MIB
+
+    provider = kaggle_provider()
+    assert provider.fallback_mib_per_s == 2.0
+    assert provider.link_floor.fallback_bps == 2.0 * MIB
+
+
+def test_an_account_can_say_what_its_bridge_carries(config_file) -> None:
+    """Spec: an account overrides it with fallback_mib_per_s."""
+    from conftest import provider_of
+
+    from letify.providers import Kaggle
+
+    provider = provider_of(Kaggle, "kaggle_a", fallback_mib_per_s=5)
+    assert provider.fallback_mib_per_s == 5.0
+
+
+def test_falling_back_to_the_bridge_says_so(monkeypatch, capsys) -> None:
+    """Spec: taking the fallback is never silent.
+
+    A live session spent 25 minutes on the bridge with no line saying which channel it was
+    on, because the fallback was reached through a bare `except Exception: return bridge`.
+    """
+    provider = kaggle_provider()
+    provider.announce = True
+
+    def refuse(channel, name=None):
+        raise RuntimeError("every strategy was below the floor")
+
+    monkeypatch.setattr(provider, "link_over", refuse)
+    bridge = object()
+    assert provider.channel_over(bridge, name="k-1") is bridge
+    err = capsys.readouterr().err
+    assert "the kernel bridge is carrying k-1" in err
+    assert "2.0 MiB/s" in err
