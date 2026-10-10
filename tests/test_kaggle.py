@@ -1169,3 +1169,66 @@ def test_the_cards_that_were_asked_for_pass(monkeypatch) -> None:
         Runtime, "eval", lambda self, source, timeout=None: ["Tesla T4", "Tesla T4"]
     )
     session.check_devices()
+
+
+def test_the_notebooks_letify_recorded_are_listed_and_the_user_s_own_are_not(
+    fake_kaggle_cli, kaggle_api_token, config_file
+) -> None:
+    """Spec "Kaggle", finding the notebooks letify owns.
+
+    Kaggle names the notebook itself, confirmed on a live account where one letify created
+    was titled `notebook8843ff70eb`, so the local record is what identifies them. A process
+    that dies before stop leaves its notebook holding weekly quota with nothing pointing at
+    it, and this is how it is found.
+    """
+    from letify.providers.kaggle import record_notebook
+
+    provider = kaggle_provider()
+    assert provider.discovers_sessions is True
+    record_notebook("kaggle_a", "letify-runtime")
+    record_notebook("kaggle_a", "letify-runtime-2")
+    assert provider.sessions() == ["irack000/letify-runtime", "irack000/letify-runtime-2"]
+    listed = [call for call in fake_kaggle_cli.calls if "list" in call]
+    assert listed and "--mine" in listed[0]
+    assert fake_kaggle_cli.environments[0].get("KAGGLE_API_TOKEN")
+
+
+def test_a_notebook_deleted_elsewhere_is_dropped_from_the_record(
+    fake_kaggle_cli, kaggle_api_token, config_file
+) -> None:
+    """Spec: a ref the account no longer has was deleted elsewhere, so it is not reported."""
+    from letify.providers.kaggle import record_notebook, recorded_notebooks
+
+    provider = kaggle_provider()
+    record_notebook("kaggle_a", "letify-runtime")
+    record_notebook("kaggle_a", "gone-already")
+    assert provider.sessions() == ["irack000/letify-runtime"]
+    assert recorded_notebooks("kaggle_a") == ["irack000/letify-runtime"]
+
+
+def test_nothing_is_reported_when_letify_recorded_nothing(
+    fake_kaggle_cli, kaggle_api_token, config_file
+) -> None:
+    """Spec: a notebook created before letify kept this record is not in it."""
+    assert kaggle_provider().sessions() == []
+
+
+def test_listing_notebooks_without_an_api_token_is_empty_rather_than_a_failure(
+    fake_kaggle_cli, isolated_home, config_file
+) -> None:
+    """Spec: reading what exists must not fail a command that is asking what exists."""
+    from letify.providers.kaggle import notebook_record
+
+    path = notebook_record("kaggle_a")
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    path.write_text("irack000/letify-runtime\n", encoding="utf-8")
+    assert kaggle_provider().sessions() == []
+
+
+def test_a_kaggle_account_is_asked_for_its_sessions(launcher_from, fake_kaggle_cli) -> None:
+    """Spec: whether an account can be asked is the provider's answer, not the launcher's."""
+    let = launcher_from('[kaggle_a]\nkind = "kaggle"\n')
+    rows = {row["alias"]: row for row in let.sessions()}
+    row = rows.get("kaggle_a")
+    assert row is not None, rows
+    assert row.get("reason") != "session discovery is not supported"
