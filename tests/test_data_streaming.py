@@ -14,7 +14,9 @@ suite does not install PyTorch and the wrapper's contract is the class it wraps.
 from __future__ import annotations
 
 import collections
+import os
 import re
+import tempfile
 import threading
 import time
 from pathlib import Path
@@ -1252,9 +1254,114 @@ def test_the_spawn_patch_asks_about_a_file_without_calling_itself() -> None:
     marker = '_PENDING_MODULE = """'
     start = worker.SOURCE.index(marker) + len(marker)
     patch = worker.SOURCE[start : worker.SOURCE.index('"""', start)]
-    assert "real_stat" in patch, "the patch has to save the real os.stat"
+    # The part that runs with os.stat already replaced. _chain runs after it and may ask
+    # about a file, which is safe because missing() no longer goes through os.stat.
+    installed = patch[patch.index("def _install():") : patch.index("def _chain():")]
+    assert "real_stat" in installed, "the patch has to save the real os.stat"
     # The call, not the word: the patch names it in a comment explaining why it is absent.
-    assert "os.path.exists(" not in patch
-    assert "os.path.isfile(" not in patch
+    assert "os.path.exists(" not in installed
+    assert "os.path.isfile(" not in installed
     # And it has to compile, since nothing else in the suite runs it.
     compile(patch, "letify_pending", "exec")
+
+
+def test_the_spawn_patch_converts_a_link_before_it_writes() -> None:
+    """Spec "What the body sees before a file arrives": a child must not write into the cache.
+
+    A placed file is a hard link to the cache blob, so a write through it writes into the
+    cache. The worker converts the link first; the patch a spawned child installs did not,
+    so a live session's HF Trainer children wrote through the link and the blob was removed
+    as changed.
+    """
+    from letify.protocol import worker
+
+    marker = '_PENDING_MODULE = """'
+    start = worker.SOURCE.index(marker) + len(marker)
+    patch = worker.SOURCE[start : worker.SOURCE.index('"""', start)]
+    assert "st_nlink" in patch, "the link count is what tells a cache link from a plain file"
+    assert "copyfile" in patch, "the link has to be copied beside and renamed over"
+    assert "os.replace" in patch
+    # Every way in has to convert, not just builtins.open.
+    assert "def os_opened" in patch
+    compile(patch, "letify_pending", "exec")
+
+
+def test_a_process_the_body_starts_does_not_write_into_the_cache(
+    launcher_from, project, capsys
+) -> None:
+    """Spec "Copy on write": a child's write converts the link, so the blob is untouched.
+
+    A live session's HF Trainer children wrote through the hard link into the cache blob,
+    which then stopped being the file it is the digest of and was removed at the call's
+    end. The child here writes through a spawned interpreter, which is the only process
+    that installs the sitecustomize patch rather than inheriting the worker's.
+    """
+    let = streaming(launcher_from, data_first_wave_mib=1024)
+    root = dataset(project, 1, size=1 << 12)
+    target = root / "000.bin"
+    original = target.read_bytes()
+
+    @let.function(device=let.providers.lab.CPU, host=letify.remote)
+    def child_writes(path: Path) -> dict:
+        import os as _os
+        import subprocess as _sub
+        import sys as _s
+
+        before = _os.stat(path)
+        program = (
+            "import os, sys\n"
+            "path = sys.argv[1]\n"
+            "with open(path, 'wb') as handle:\n"
+            "    handle.write(b'the child wrote this')\n"
+            "print(os.stat(path).st_nlink)\n"
+        )
+        done = _sub.run([_s.executable, "-c", program, str(path)], capture_output=True, text=True)
+        return {
+            "exit": done.returncode,
+            "stderr": done.stderr[-300:],
+            "links_before": before.st_nlink,
+            "links_after": _os.stat(path).st_nlink,
+            "content": open(path, "rb").read(),
+        }
+
+    answer = child_writes(target)
+    assert answer["exit"] == 0, (answer["stderr"], answer)
+    assert answer["content"] == b"the child wrote this"
+    # The child's write landed on a copy, so whatever the cache holds is not the child's.
+    assert answer["links_after"] == 1, answer
+    # And the local file is unchanged, because nothing wrote back over it here.
+    assert target.read_bytes() == original
+
+
+def test_the_patch_a_fresh_process_installs_arrives_through_sitecustomize() -> None:
+    """Spec "What the body sees before a file arrives": a .pth on PYTHONPATH is never run.
+
+    site.py executes a .pth only in a directory it adds through addsitedir, and a
+    PYTHONPATH entry is put on sys.path without that. So the mechanism has to be
+    sitecustomize, which site.py imports from anywhere on the path.
+    """
+    import subprocess
+    import sys as _sys
+
+    from letify.protocol import worker
+
+    assert "sitecustomize" in worker.SOURCE
+    assert "letify_pending.pth" not in worker.SOURCE
+
+    # And the claim itself, so this cannot rot: a .pth on PYTHONPATH does nothing.
+    with tempfile.TemporaryDirectory() as directory:
+        Path(directory, "letify_probe.pth").write_text("import letify_probe\n")
+        Path(directory, "letify_probe.py").write_text(
+            "import sys\nprint('PTH', file=sys.stderr)\n"
+        )
+        Path(directory, "sitecustomize.py").write_text(
+            "import sys\nprint('SITECUSTOMIZE', file=sys.stderr)\n"
+        )
+        done = subprocess.run(
+            [_sys.executable, "-c", "pass"],
+            env={**os.environ, "PYTHONPATH": directory},
+            capture_output=True,
+            text=True,
+        )
+    assert "SITECUSTOMIZE" in done.stderr, done.stderr
+    assert "PTH" not in done.stderr, done.stderr

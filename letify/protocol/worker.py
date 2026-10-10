@@ -953,9 +953,12 @@ def _data_register(data):
             # A call still waiting for bytes needs the patch to answer from the manifest,
             # and a call that placed a link needs it for copy on write. Spec "Copy on write".
             _data_install_patch()
-        if state["pending"]:
-            # Only a call still waiting for bytes needs the manifest on disk and the
-            # wrappers. Inside the lock: the data thread moves a path out of pending and
+        if state["pending"] or state["linked"]:
+            # A call still waiting for bytes needs the manifest on disk for the listings,
+            # and a call that placed a link needs it so a process the body starts can
+            # convert that link before writing through it: the patch a fresh process
+            # installs reads the layout from the manifest and installs nothing without it.
+            # Spec "Copy on write". Inside the lock: the data thread moves a path out of pending and
             # into placed as each blob completes, and the manifest is written from both maps.
             _data_write_manifest(state)
             _data_observe(state)
@@ -1416,7 +1419,7 @@ def _data_write_manifest(state):
     """Write the call's manifest beside its files, for a process started fresh.
 
     Spec "What the body sees before a file arrives": a spawned interpreter installs the
-    same patch from ``letify_pending.pth`` and reads the layout from here, because it has
+    same patch from ``sitecustomize.py`` and reads the layout from here, because it has
     no channel of its own to ask on.
     """
     import json
@@ -1435,10 +1438,11 @@ def _data_write_manifest(state):
     directory = os.path.join(os.path.dirname(state["blobs"]), "pending")
     try:
         os.makedirs(directory, exist_ok=True)
-        with open(os.path.join(directory, "letify_pending.py"), "w") as handle:
+        # sitecustomize, not a .pth: site.py runs a .pth only in a directory it adds
+        # through addsitedir, and a PYTHONPATH entry is not one, so a .pth there never
+        # runs. Spec "What the body sees before a file arrives".
+        with open(os.path.join(directory, "sitecustomize.py"), "w") as handle:
             handle.write(_PENDING_MODULE)
-        with open(os.path.join(directory, "letify_pending.pth"), "w") as handle:
-            handle.write("import letify_pending\n")
     except OSError:
         return
     existing = os.environ.get("PYTHONPATH", "")
@@ -1457,6 +1461,8 @@ import builtins
 import io
 import json
 import os
+import shutil
+import sys
 import time
 
 
@@ -1474,6 +1480,8 @@ def _install():
     real_open, real_io_open = builtins.open, io.open
     real_listdir, real_scandir = os.listdir, os.scandir
     real_stat = os.stat
+    real_os_open = os.open
+    write_flags = os.O_WRONLY | os.O_RDWR | os.O_APPEND | os.O_TRUNC
 
     # Whether the file exists, asked through the real stat. os.path.exists goes through
     # os.stat, and os.stat is what this patch replaces, so asking it here would call the
@@ -1504,13 +1512,58 @@ def _install():
                 raise RuntimeError("letify: %s did not arrive within %.0f s" % (text, wait))
             time.sleep(0.02)
 
+    # A placed file is a hard link to the cache blob, so a write through it writes into
+    # the cache. The worker converts the link first and this has to as well; it cannot read
+    # the worker's placed map, so a link count above one under the call directory is what
+    # it goes on. Spec "What the body sees before a file arrives".
+    def convert(path):
+        try:
+            text = os.path.abspath(os.fspath(path))
+        except TypeError:
+            return
+        if not text.startswith(call_dir):
+            return
+        try:
+            if real_stat(text).st_nlink < 2:
+                return
+        except OSError:
+            return
+        partial = '%s.letify-placing.%d' % (text, os.getpid())
+        try:
+            shutil.copyfile(text, partial)
+            os.replace(partial, text)
+        except OSError:
+            try:
+                os.remove(partial)
+            except OSError:
+                pass
+
+    def writes(mode):
+        return any(letter in mode for letter in ('w', 'a', 'x', '+'))
+
+    def ready(path, writing):
+        wait_for(path)
+        if writing:
+            convert(path)
+
     def opened(file, *args, **kwargs):
-        wait_for(file)
+        mode = kwargs['mode'] if 'mode' in kwargs else (args[0] if args else 'r')
+        ready(file, writes(mode) if isinstance(mode, str) else False)
         return real_open(file, *args, **kwargs)
 
     def io_opened(file, *args, **kwargs):
-        wait_for(file)
+        mode = kwargs['mode'] if 'mode' in kwargs else (args[0] if args else 'r')
+        ready(file, writes(mode) if isinstance(mode, str) else False)
         return real_io_open(file, *args, **kwargs)
+
+    def os_opened(path, *args, **kwargs):
+        flags = kwargs['flags'] if 'flags' in kwargs else (args[0] if args else 0)
+        try:
+            writing = bool(flags & write_flags)
+        except TypeError:
+            writing = False
+        ready(path, writing)
+        return real_os_open(path, *args, **kwargs)
 
     def names(path):
         try:
@@ -1544,12 +1597,37 @@ def _install():
 
     builtins.open = opened
     io.open = io_opened
+    os.open = os_opened
     os.listdir = listed
     os.stat = stated
     os.scandir = real_scandir
 
 
+# letify's directory goes first on PYTHONPATH, so it shadows a sitecustomize the user
+# installed. That one still has to run.
+def _chain():
+    import importlib.util
+
+    here = os.path.dirname(os.path.abspath(__file__))
+    for entry in sys.path:
+        if not entry:
+            continue
+        try:
+            if os.path.abspath(entry) == here:
+                continue
+            candidate = os.path.join(entry, 'sitecustomize.py')
+            if not os.path.isfile(candidate):
+                continue
+            spec = importlib.util.spec_from_file_location('letify_other_sitecustomize', candidate)
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+        except Exception:
+            pass
+        return
+
+
 _install()
+_chain()
 """
 
 
