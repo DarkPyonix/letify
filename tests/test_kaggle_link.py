@@ -131,7 +131,7 @@ def test_a_chosen_link_becomes_the_channel(monkeypatch) -> None:
             built.append(command)
             self.name = name
 
-    monkeypatch.setattr(provider, "link_over", lambda channel: Link())
+    monkeypatch.setattr(provider, "link_over", lambda channel, name=None: Link())
     monkeypatch.setattr("letify.runtime.channel.PersistentChannel", Fake)
     channel = provider.channel_over(Channel(), name="k-1")
     assert isinstance(channel, Fake)
@@ -230,3 +230,16 @@ def test_the_kaggle_punch_target_logs_in_as_root_with_the_authorized_key(tmp_pat
     command = target.forwarded_ssh(40000, "python3 -c pass")
     assert "root@127.0.0.1" in command
     assert command[command.index("-i") + 1] == str(key)
+
+
+def test_a_kaggle_runtime_pins_its_host_key_under_its_own_alias() -> None:
+    """Spec "Kaggle runtimes", An SSH link over the kernel: each run is a new machine.
+
+    One alias for the account fails every session after the first with REMOTE HOST
+    IDENTIFICATION HAS CHANGED, because ssh-keygen -A makes new host keys on each VM.
+    """
+    provider = kaggle()
+    target = provider.target_over(object(), name="letify-cpu-abc123")
+    assert target.host_key_alias == "letify-kaggle_a-letify-cpu-abc123"
+    command = target.forwarded_ssh(40000)
+    assert command[command.index("HostKeyAlias=letify-kaggle_a-letify-cpu-abc123")]

@@ -1125,7 +1125,7 @@ class Kaggle(Provider):
         )
         return rendezvous
 
-    def target_over(self, channel: Any) -> Any:
+    def target_over(self, channel: Any, *, name: str | None = None) -> Any:
         """What the strategies need, with no address because there is none to dial."""
         from ..transport import nat
         from ..transport.strategies import Target
@@ -1133,6 +1133,9 @@ class Kaggle(Provider):
         user = self.config.option("user")
         return Target(
             alias=self.alias,
+            # Every run is a new machine whose ssh-keygen -A makes new host keys, so one
+            # alias for the account would fail every session after the first.
+            host_key_alias=f"letify-{self.alias}-{name}" if name else None,
             rendezvous=self.rendezvous_over(channel),
             remote_python=self.remote_python,
             stun=nat.DEFAULT_STUN,
@@ -1149,12 +1152,12 @@ class Kaggle(Provider):
 
         return [TCPPunch(), TailcatUDP(), QuicUDP(), ProviderFallback(rank=6)]
 
-    def link_over(self, channel: Any) -> Any:
+    def link_over(self, channel: Any, *, name: str | None = None) -> Any:
         """Race the strategies over the bridge and return the link that wins."""
         from ..transport.announce import printer
         from ..transport.pipeline import LinkCache, Pipeline, network_fingerprint
 
-        target = self.target_over(channel)
+        target = self.target_over(channel, name=name)
         return Pipeline(
             self.strategies(),
             target=target,
@@ -1195,7 +1198,7 @@ class Kaggle(Provider):
         from ..runtime.channel import PersistentChannel
 
         try:
-            link = self.link_over(bridge)
+            link = self.link_over(bridge, name=name)
         except Exception:
             return bridge
         self._links[name] = link
