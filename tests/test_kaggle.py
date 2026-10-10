@@ -1310,7 +1310,9 @@ def test_the_record_notes_the_process_that_made_the_notebook(
 
     record_notebook("kaggle_a", "letify-runtime")
     line = notebook_record("kaggle_a").read_text(encoding="utf-8").strip()
-    assert line == f"irack000/letify-runtime\t{os.getpid()}"
+    ref, pid, _created = line.split("\t")
+    assert ref == "irack000/letify-runtime"
+    assert int(pid) == os.getpid()
 
 
 def test_a_notebook_a_live_process_still_uses_is_not_an_orphan(
@@ -1377,3 +1379,75 @@ def test_an_orphan_that_could_not_be_deleted_stays_in_the_record(
     provider = kaggle_provider()
     assert provider.stop_orphan("irack000/letify-runtime") is False
     assert recorded_notebooks("kaggle_a") == ["irack000/letify-runtime"]
+
+
+def test_the_record_notes_when_the_notebook_was_created(kaggle_api_token, config_file) -> None:
+    """Spec "Kaggle", not making sessions faster than Kaggle allows."""
+    import os
+    import time
+
+    from letify.providers.kaggle import notebook_record, record_notebook
+
+    before = time.time()
+    record_notebook("kaggle_a", "letify-runtime")
+    ref, pid, created = (
+        notebook_record("kaggle_a").read_text(encoding="utf-8").strip().split("\t")
+    )
+    assert ref == "irack000/letify-runtime"
+    assert int(pid) == os.getpid()
+    # Recorded to the millisecond, so allow for the rounding.
+    assert before - 0.01 <= float(created) <= time.time() + 0.01
+
+
+def test_how_long_to_wait_before_another_session(config_file, kaggle_api_token) -> None:
+    """Spec: the remainder of min_session_interval_s since the newest recorded creation."""
+    import time
+
+    from letify.providers.kaggle import notebook_record, wait_before_session
+
+    path = notebook_record("kaggle_a")
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    now = time.time()
+    path.write_text(f"irack000/one\t1\t{now - 30:.3f}\n", encoding="utf-8")
+    assert 88 <= wait_before_session("kaggle_a", 120.0) <= 90.1
+    path.write_text(f"irack000/one\t1\t{now - 500:.3f}\n", encoding="utf-8")
+    assert wait_before_session("kaggle_a", 120.0) == 0.0
+    # Nothing recorded, so nothing to wait for.
+    path.write_text("", encoding="utf-8")
+    assert wait_before_session("kaggle_a", 120.0) == 0.0
+    # A record an older letify wrote has no time, so it cannot be waited on.
+    path.write_text("irack000/one\t1\n", encoding="utf-8")
+    assert wait_before_session("kaggle_a", 120.0) == 0.0
+
+
+def test_an_account_sets_how_long_to_leave_between_sessions(config_file) -> None:
+    """Spec: an account sets min_session_interval_s, and 0 turns the wait off."""
+    from conftest import provider_of
+
+    from letify.providers import Kaggle
+
+    assert provider_of(Kaggle, "kaggle_a").min_session_interval_s == 120.0
+    assert provider_of(Kaggle, "kaggle_a", min_session_interval_s=0).min_session_interval_s == 0.0
+    assert provider_of(Kaggle, "kaggle_a", min_session_interval_s=30).min_session_interval_s == 30.0
+
+
+def test_a_refused_run_says_how_long_ago_the_last_session_was_made(
+    kaggle_api_token, config_file
+) -> None:
+    """Spec: a refusal names the gap, so this cause is told from any other.
+
+    A live account refused a run a minute after the previous session, with no message at
+    all from Kaggle.
+    """
+    import time
+
+    from letify.providers.kaggle import notebook_record, refusal_detail
+
+    path = notebook_record("kaggle_a")
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    path.write_text(f"irack000/one\t1\t{time.time() - 61:.3f}\n", encoding="utf-8")
+    detail = refusal_detail("kaggle_a")
+    assert "61" in detail or "60" in detail
+    assert "too soon" in detail
+    path.write_text("", encoding="utf-8")
+    assert refusal_detail("kaggle_a") == ""

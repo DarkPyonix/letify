@@ -1475,12 +1475,22 @@ def _install():
     real_listdir, real_scandir = os.listdir, os.scandir
     real_stat = os.stat
 
+    # Whether the file exists, asked through the real stat. os.path.exists goes through
+    # os.stat, and os.stat is what this patch replaces, so asking it here would call the
+    # patch again and recurse without bottom.
+    def there(text):
+        try:
+            real_stat(text)
+        except OSError:
+            return False
+        return True
+
     def missing(path):
         try:
             text = os.path.abspath(os.fspath(path))
         except TypeError:
             return None
-        if not text.startswith(call_dir) or os.path.exists(text):
+        if not text.startswith(call_dir) or there(text):
             return None
         return text if text in files else None
 
@@ -1489,7 +1499,7 @@ def _install():
         if text is None:
             return
         deadline = time.monotonic() + wait
-        while not os.path.exists(text):
+        while not there(text):
             if time.monotonic() >= deadline:
                 raise RuntimeError("letify: %s did not arrive within %.0f s" % (text, wait))
             time.sleep(0.02)

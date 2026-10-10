@@ -385,7 +385,9 @@ def new_notebook(alias: str, cookie: str) -> tuple[int, str | None]:
     return int(kernel), (str(slug) if slug else None)
 
 
-def start_run(cookie: str, kernel_id: int, accelerator: str | None) -> int:
+def start_run(
+    cookie: str, kernel_id: int, accelerator: str | None, alias: str | None = None
+) -> int:
     """Start an interactive session on the notebook and return its run id.
 
     ``CommitAndRun`` is what the editor's Run does: it commits the notebook body and starts
@@ -420,7 +422,10 @@ def start_run(cookie: str, kernel_id: int, accelerator: str | None) -> int:
     )
     run = reply.get("kernelRunId")
     if run is None:
-        raise RuntimeFailure("Kaggle did not start a session run")
+        # Spec "Kaggle", not making sessions faster than Kaggle allows: the refusal has no
+        # message of its own, so letify names the cause it can see.
+        detail = refusal_detail(alias) if alias else ""
+        raise RuntimeFailure(f"Kaggle did not start a session run.{detail}")
     return int(run)
 
 
@@ -519,7 +524,7 @@ def live_session_url(
     # Spec "Kaggle", finding the notebooks letify owns: recorded before anything can fail,
     # so a run that dies next still leaves a trail to its notebook.
     record_notebook(alias, slug)
-    run = start_run(cookie, kernel, accelerator)
+    run = start_run(cookie, kernel, accelerator, alias)
     id_token = firebase_id_token(cookie)
     webtier = webtier_session(cookie, id_token, run)
     deadline = time.monotonic() + SESSION_START_TIMEOUT
@@ -574,32 +579,84 @@ def notebook_record(alias: str) -> Path:
     return account_directory(alias) / "notebooks"
 
 
-def recorded_entries(alias: str) -> list[tuple[str, int | None]]:
-    """Each ref letify believes it created and the pid that made it, in order.
+#: Seconds to leave between sessions on one account, a guess rather than a measurement.
+#: What is measured is one refusal a minute after the previous session. Spec "Kaggle", not
+#: making sessions faster than Kaggle allows.
+MIN_SESSION_INTERVAL_S = 120.0
 
-    The pid is None for a line an older letify wrote, which had no pid to record.
+
+def recorded_entries(alias: str) -> list[tuple[str, int | None, float | None]]:
+    """Each ref letify created, the pid that made it and when, in order.
+
+    The pid and the time are None for a line an older letify wrote, which recorded
+    neither.
     """
     try:
         text = notebook_record(alias).read_text(encoding="utf-8")
     except OSError:
         return []
-    seen: list[tuple[str, int | None]] = []
+    seen: list[tuple[str, int | None, float | None]] = []
     known: set[str] = set()
     for line in text.splitlines():
-        ref, _tab, owner = line.strip().partition("\t")
+        fields = line.strip().split("\t")
+        ref = fields[0] if fields else ""
         if not ref or ref in known:
             continue
         known.add(ref)
-        try:
-            seen.append((ref, int(owner) if owner else None))
-        except ValueError:
-            seen.append((ref, None))
+        owner: int | None = None
+        created: float | None = None
+        if len(fields) > 1 and fields[1]:
+            try:
+                owner = int(fields[1])
+            except ValueError:
+                owner = None
+        if len(fields) > 2 and fields[2]:
+            try:
+                created = float(fields[2])
+            except ValueError:
+                created = None
+        seen.append((ref, owner, created))
     return seen
+
+
+def newest_creation(alias: str) -> float | None:
+    """When the newest recorded notebook on this account was created, or None."""
+    times = [created for _ref, _owner, created in recorded_entries(alias) if created is not None]
+    return max(times) if times else None
+
+
+def wait_before_session(alias: str, interval: float) -> float:
+    """Seconds still to wait before another session may be created on this account.
+
+    Spec "Kaggle", not making sessions faster than Kaggle allows: Kaggle refuses a run
+    made too soon after the last, and only waiting recovers it.
+    """
+    if interval <= 0:
+        return 0.0
+    newest = newest_creation(alias)
+    if newest is None:
+        return 0.0
+    return max(0.0, interval - (time.time() - newest))
+
+
+def refusal_detail(alias: str) -> str:
+    """What to add to a refusal, naming how long ago the previous session was made.
+
+    This needs no threshold to be useful: it says what happened, so a reader can tell this
+    cause from any other. Empty when nothing is recorded to compare against.
+    """
+    newest = newest_creation(alias)
+    if newest is None:
+        return ""
+    return (
+        f" The previous session on this account was created {time.time() - newest:.0f} s ago, "
+        f"and Kaggle refuses a run made too soon after the last."
+    )
 
 
 def recorded_notebooks(alias: str) -> list[str]:
     """The refs letify believes it created, in the order it created them."""
-    return [ref for ref, _owner in recorded_entries(alias)]
+    return [ref for ref, _owner, _created in recorded_entries(alias)]
 
 
 def _process_lives(pid: int) -> bool:
@@ -631,7 +688,7 @@ def orphaned_notebooks(alias: str) -> list[str]:
     here = set(present)
     return [
         ref
-        for ref, owner in entries
+        for ref, owner, _created in entries
         if ref in here and (owner is None or not _process_lives(owner))
     ]
 
@@ -651,7 +708,7 @@ def record_notebook(alias: str, slug: str | None) -> None:
         path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
         with path.open("a", encoding="utf-8") as handle:
             # The pid as well, so a live process's notebook is never taken for an orphan.
-            handle.write(f"{username}/{slug}\t{os.getpid()}\n")
+            handle.write(f"{username}/{slug}\t{os.getpid()}\t{time.time():.3f}\n")
     except OSError:
         pass
 
@@ -666,16 +723,23 @@ def forget_notebook(alias: str, slug: str | None) -> None:
 
 def forget_ref(alias: str, ref: str) -> None:
     """Drop one ref from the record, keeping the pid of every other line."""
-    kept = [(line, owner) for line, owner in recorded_entries(alias) if line != ref]
+    kept = [row for row in recorded_entries(alias) if row[0] != ref]
     try:
         notebook_record(alias).write_text(
-            "".join(
-                f"{line}\n" if owner is None else f"{line}\t{owner}\n" for line, owner in kept
-            ),
-            encoding="utf-8",
+            "".join(_record_line(*row) for row in kept), encoding="utf-8"
         )
     except OSError:
         pass
+
+
+def _record_line(ref: str, owner: int | None, created: float | None) -> str:
+    """One record line, keeping whichever fields the entry has."""
+    fields = [ref]
+    if owner is not None:
+        fields.append(str(owner))
+        if created is not None:
+            fields.append(f"{created:.3f}")
+    return "\t".join(fields) + "\n"
 
 
 def notebooks_on_account(alias: str) -> list[str] | None:
@@ -1212,6 +1276,23 @@ class Kaggle(Provider):
         """The notebooks letify owns on this account, which is where an orphan shows up."""
         return list_notebooks_via_cli(self.alias)
 
+    def _leave_a_gap(self) -> None:
+        """Wait out the interval since the last session, rather than be refused.
+
+        Spec "Kaggle", not making sessions faster than Kaggle allows: a refusal costs an
+        account that answers nothing for an unknown time, and waiting costs patience.
+        """
+        from ..transport.announce import printer
+
+        waiting = wait_before_session(self.alias, self.min_session_interval_s)
+        if waiting <= 0:
+            return
+        printer(bool(self.__dict__.get("announce", True)))(
+            f"{self.alias}: waiting {waiting:.0f} s before another session, because Kaggle "
+            f"refuses one made too soon after the last"
+        )
+        time.sleep(waiting)
+
     def orphans(self) -> list[str]:
         """Notebooks this account still has whose creating process is gone."""
         return orphaned_notebooks(self.alias)
@@ -1433,6 +1514,14 @@ class Kaggle(Provider):
         )
 
     @property
+    def min_session_interval_s(self) -> float:
+        """Seconds to leave between sessions on this account, from the account or the default."""
+        value = self.config.option("min_session_interval_s")
+        if isinstance(value, (int, float)):
+            return max(0.0, float(value))
+        return MIN_SESSION_INTERVAL_S
+
+    @property
     def fallback_mib_per_s(self) -> float:
         """The kernel bridge, measured at 2.0 MiB/s sending 64 MiB on a live account.
 
@@ -1494,6 +1583,7 @@ class Kaggle(Provider):
                 f"letify login kaggle {self.alias} --username <owner>"
             )
         cookie = self._require_live_cookie()
+        self._leave_a_gap()
         instance = getattr(runtime, "instance", None)
         gpu = getattr(instance, "gpu", None)
         accelerator = GPUS[gpu]["accelerator"] if gpu in GPUS else getattr(instance, "tpu", None)

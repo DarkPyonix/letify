@@ -1237,3 +1237,24 @@ def wrote_back_line(err: str) -> str:
     lines = [line for line in err.splitlines() if line.startswith("letify: data wrote back ")]
     assert lines, err
     return lines[0]
+
+
+def test_the_spawn_patch_asks_about_a_file_without_calling_itself() -> None:
+    """Spec "What the body sees before a file arrives": the patch uses the saved real stat.
+
+    `os.path.exists` goes through `os.stat`, and `os.stat` is what the patch replaces, so
+    asking it from inside the patch calls the patch again. A spawned child recursed until
+    the interpreter stopped.
+    """
+    from letify.protocol import worker
+
+    # The patch lives inside the worker's own source, so it is read from there.
+    marker = '_PENDING_MODULE = """'
+    start = worker.SOURCE.index(marker) + len(marker)
+    patch = worker.SOURCE[start : worker.SOURCE.index('"""', start)]
+    assert "real_stat" in patch, "the patch has to save the real os.stat"
+    # The call, not the word: the patch names it in a comment explaining why it is absent.
+    assert "os.path.exists(" not in patch
+    assert "os.path.isfile(" not in patch
+    # And it has to compile, since nothing else in the suite runs it.
+    compile(patch, "letify_pending", "exec")
