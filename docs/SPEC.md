@@ -1026,6 +1026,8 @@ The body thread reads the pending map only through a snapshot it takes under tha
 
 A listing takes the pending snapshot first and reads the real directory second. The data thread places a file before it removes the path from the pending map, both under the lock, so a file placed between the two steps is in the snapshot if it was still pending, and on disk if it was not. A listing is therefore complete at every moment of the call, not only once streaming settles.
 
+A `stat` cannot take that snapshot first, because it is on a data loader's hot path and every call would pay for it. It reads the real file first instead, and when that finds nothing and the manifest has no pending entry either, it looks at the real file once more rather than reporting the file missing. Those two answers together mean the data thread placed the file and cleared its pending entry between the two reads, so the second look finds it; a path that is genuinely absent raises on the second look as it should. Without it a body that listed the directory and then stats a name in it fails with `FileNotFoundError` on a file that is on disk by the time the error is raised.
+
 #### When a blob does not arrive <!-- id: project-data-streaming-failures -->
 
 - **A blob that never arrives.** A `data_want` unanswered for `data_wait_timeout` seconds on the account, 600 by default, fails that open with `RuntimeFailure` naming the relative path and the digest. The call is not killed, because the body may handle it; the failure is infrastructure, so a retry of the call is allowed.
