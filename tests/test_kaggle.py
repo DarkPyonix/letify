@@ -1294,3 +1294,86 @@ def test_falling_back_to_the_bridge_says_so(monkeypatch, capsys) -> None:
     err = capsys.readouterr().err
     assert "the kernel bridge is carrying k-1" in err
     assert "2.0 MiB/s" in err
+
+
+def test_the_record_notes_the_process_that_made_the_notebook(
+    kaggle_api_token, config_file
+) -> None:
+    """Spec "Kaggle", stopping what a dead process left behind.
+
+    A notebook a live process is still using must never be deleted, so the record notes
+    the pid beside the ref.
+    """
+    import os
+
+    from letify.providers.kaggle import notebook_record, record_notebook
+
+    record_notebook("kaggle_a", "letify-runtime")
+    line = notebook_record("kaggle_a").read_text(encoding="utf-8").strip()
+    assert line == f"irack000/letify-runtime\t{os.getpid()}"
+
+
+def test_a_notebook_a_live_process_still_uses_is_not_an_orphan(
+    fake_kaggle_cli, kaggle_api_token, config_file
+) -> None:
+    """Spec: a ref whose pid is still running on this machine is skipped."""
+    import os
+
+    from letify.providers.kaggle import notebook_record, orphaned_notebooks
+
+    path = notebook_record("kaggle_a")
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    path.write_text(
+        f"irack000/letify-runtime\t{os.getpid()}\n"
+        "irack000/letify-runtime-2\t999999999\n",
+        encoding="utf-8",
+    )
+    assert orphaned_notebooks("kaggle_a") == ["irack000/letify-runtime-2"]
+
+
+def test_a_ref_an_older_letify_recorded_counts_as_an_orphan(
+    fake_kaggle_cli, kaggle_api_token, config_file
+) -> None:
+    """Spec: a ref with no pid cannot be checked, and an older letify is not running."""
+    from letify.providers.kaggle import notebook_record, orphaned_notebooks
+
+    path = notebook_record("kaggle_a")
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    path.write_text("irack000/letify-runtime\n", encoding="utf-8")
+    assert orphaned_notebooks("kaggle_a") == ["irack000/letify-runtime"]
+
+
+def test_stopping_an_orphan_deletes_the_notebook_and_drops_the_record(
+    fake_kaggle_cli, kaggle_api_token, config_file
+) -> None:
+    """Spec "Kaggle", stopping what a dead process left behind.
+
+    The run id died with the process that made it, so cancel_run cannot reach the run and
+    deleting the notebook is the way in.
+    """
+    from letify.providers.kaggle import notebook_record, recorded_notebooks
+
+    path = notebook_record("kaggle_a")
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    path.write_text("irack000/letify-runtime\t999999999\n", encoding="utf-8")
+    provider = kaggle_provider()
+    assert provider.orphans() == ["irack000/letify-runtime"]
+    assert provider.stop_orphan("irack000/letify-runtime") is True
+    assert recorded_notebooks("kaggle_a") == []
+    deleted = [call for call in fake_kaggle_cli.calls if "delete" in call]
+    assert deleted and "irack000/letify-runtime" in deleted[0]
+
+
+def test_an_orphan_that_could_not_be_deleted_stays_in_the_record(
+    fake_kaggle_cli, kaggle_api_token, config_file
+) -> None:
+    """Spec: a ref is dropped only when the delete succeeds, so a failure is tried again."""
+    from letify.providers.kaggle import notebook_record, recorded_notebooks
+
+    fake_kaggle_cli.fail.add("delete")
+    path = notebook_record("kaggle_a")
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    path.write_text("irack000/letify-runtime\t999999999\n", encoding="utf-8")
+    provider = kaggle_provider()
+    assert provider.stop_orphan("irack000/letify-runtime") is False
+    assert recorded_notebooks("kaggle_a") == ["irack000/letify-runtime"]

@@ -171,6 +171,7 @@ def test_every_subcommand_is_reachable_from_the_parser() -> None:
         "sessions",
         "setup",
         "status",
+        "stop",
         "stubs",
         "usage",
         "utilization",
@@ -1531,3 +1532,77 @@ def test_a_modal_login_records_the_workspace_without_a_remote_check(
     assert main(["login", "modal", "modal_lab", "--no-input", "--workspace", "/data"]) == 0
     assert len(calls) == 1
     assert home_config()["modal_lab"]["workspace"] == "/data"
+
+
+def test_stop_without_orphans_stops_nothing(isolated_home, capsys) -> None:
+    """Spec "Kaggle", stopping what a dead process left behind.
+
+    A bare `stop` reads as ending everything, so it ends nothing and says what to pass.
+    """
+    assert main(["stop"]) == 0
+    out = capsys.readouterr().out
+    assert "nothing was stopped" in out
+    assert "--orphans" in out
+
+
+def test_stop_orphans_lists_and_deletes_what_it_found(isolated_home, capsys, monkeypatch) -> None:
+    """Spec: the command lists what it will delete, and -y answers yes."""
+    import letify
+
+    monkeypatch.setattr(
+        letify.Launcher,
+        "orphans",
+        lambda self, alias=None: [{"alias": "k", "kind": "kaggle", "orphans": ["me/one"]}],
+    )
+    stopped: list[str] = []
+
+    def stop_them(self, alias=None):
+        stopped.append("called")
+        return [{"alias": "k", "ref": "me/one", "stopped": True}]
+
+    monkeypatch.setattr(letify.Launcher, "stop_orphans", stop_them)
+    assert main(["stop", "--orphans", "-y"]) == 0
+    out = capsys.readouterr().out
+    assert "me/one" in out
+    assert "stopped" in out
+    assert stopped == ["called"]
+
+
+def test_stop_orphans_asks_first_and_a_no_stops_nothing(
+    isolated_home, capsys, monkeypatch
+) -> None:
+    """Spec: it asks before deleting, and no terminal is a no."""
+    import letify
+
+    monkeypatch.setattr(
+        letify.Launcher,
+        "orphans",
+        lambda self, alias=None: [{"alias": "k", "kind": "kaggle", "orphans": ["me/one"]}],
+    )
+
+    def refuse(self, alias=None):
+        raise AssertionError("nothing may be deleted without an answer")
+
+    monkeypatch.setattr(letify.Launcher, "stop_orphans", refuse)
+    assert main(["stop", "--orphans"]) == 0
+    assert "nothing was stopped" in capsys.readouterr().out
+
+
+def test_stop_orphans_exits_one_when_a_delete_failed(isolated_home, capsys, monkeypatch) -> None:
+    """Spec: the exit status is 1 when any delete failed."""
+    import letify
+
+    monkeypatch.setattr(
+        letify.Launcher,
+        "orphans",
+        lambda self, alias=None: [{"alias": "k", "kind": "kaggle", "orphans": ["me/one"]}],
+    )
+    monkeypatch.setattr(
+        letify.Launcher,
+        "stop_orphans",
+        lambda self, alias=None: [
+            {"alias": "k", "ref": "me/one", "stopped": False, "error": "refused"}
+        ],
+    )
+    assert main(["stop", "--orphans", "-y"]) == 1
+    assert "refused" in capsys.readouterr().out
