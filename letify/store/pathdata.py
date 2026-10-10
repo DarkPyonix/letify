@@ -801,19 +801,38 @@ class Stream:
             )
 
 
-def streams_for(*, streams: int, threshold_mib: int, rtt_ms: float | None, size: int) -> int:
+def streams_for(
+    *,
+    streams: int,
+    threshold_mib: int,
+    rtt_ms: float | None,
+    size: int,
+    rate_bps: float | None = None,
+    cost_s: float = 0.0,
+) -> int:
     """How many connections this blob is worth splitting across.
 
     Spec "Several connections at once": one below the size threshold, because opening
     connections to send a few megabytes costs more than it saves; one on a short link,
-    because there a single stream already carries everything the link will carry; and
-    never more streams than there are chunks to send.
+    because there a single stream already carries everything the link will carry; never
+    more streams than there are chunks to send; and, when a connection costs something to
+    open, only as many as finish the transfer sooner than one would.
     """
     if streams <= 1 or size < threshold_mib * (1 << 20):
         return 1
     if rtt_ms is None or rtt_ms < PARALLEL_RTT_MS:
         return 1
-    return max(1, min(streams, (size + CHUNK - 1) // CHUNK))
+    count = max(1, min(streams, (size + CHUNK - 1) // CHUNK))
+    if cost_s > 0 and count > 1:
+        if not rate_bps or rate_bps <= 0:
+            # Nothing to weigh the cost against, and the cost is real, so do not pay it.
+            return 1
+        alone = size / rate_bps
+        # The connections are opened at the same time, so the cost is paid once.
+        together = size / (rate_bps * count) + cost_s
+        if together >= alone:
+            return 1
+    return count
 
 
 def _streams_for(runtime: Any, size: int) -> int:
@@ -832,9 +851,16 @@ def _streams_for(runtime: Any, size: int) -> int:
         rtt = getattr(link, "rtt_ms", None)
     except Exception:
         rtt = None
+    rate = None
+    try:
+        rate = getattr(link, "upload_bps", None)
+    except Exception:
+        rate = None
     return streams_for(
         streams=int(getattr(provider, "transfer_streams", STREAMS) or 1),
         threshold_mib=int(getattr(provider, "transfer_parallel_mib", PARALLEL_MIB) or 0),
+        rate_bps=rate,
+        cost_s=float(getattr(provider, "transfer_connection_cost_s", 0.0) or 0.0),
         rtt_ms=rtt,
         size=size,
     )

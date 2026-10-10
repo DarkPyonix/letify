@@ -1207,6 +1207,45 @@ class Kaggle(Provider):
             name=name,
         )
 
+    @property
+    def transfer_connection_cost_s(self) -> float:
+        """A punch, which is what one more stream costs here. Measured at about 10 s."""
+        value = self.config.option("transfer_connection_cost_s")
+        return max(0.0, float(value)) if isinstance(value, (int, float)) else 10.0
+
+    def link(self, runtime: Runtime | None = None) -> Any:
+        """The link carrying this runtime, or None when the bridge is carrying it.
+
+        The placement reads ``rtt_ms`` from it to decide how many streams to use.
+        """
+        name = getattr(runtime, "name", None)
+        return self._links.get(name) if name else None
+
+    def transfer_channel(self, runtime: Runtime | None) -> Channel:
+        """One more stream for a placement, on a connection of its own.
+
+        Spec "Several connections at once": the link is asked for its own SSH command,
+        which lands on a local forwarding port of its own and so punches again. Reusing
+        the session's command would multiplex onto the one connection instead, and
+        multiplexed channels do not add up.
+        """
+        import shlex as _shlex
+
+        from ..protocol.worker import BOOTSTRAP
+        from ..runtime.channel import PersistentChannel
+
+        name = getattr(runtime, "name", None)
+        link = self._links.get(name) if name else None
+        if link is None:
+            raise UnsupportedMode(
+                f"{self.alias} is carried by the kernel bridge for {name}, which is one "
+                f"connection and offers no second stream. A punched session does."
+            )
+        return PersistentChannel(
+            link.ssh_command(f"{self.remote_python} -u -c {_shlex.quote(BOOTSTRAP)}"),
+            name=f"{self.alias}-transfer",
+        )
+
     def open_channel(self, runtime: Runtime) -> Channel:
         """Start a session from the cookie and open one worker in one cell of it.
 

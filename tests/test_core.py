@@ -553,3 +553,55 @@ def test_status_reports_the_inventory_against_what_is_reserved(launcher_from) ->
     let = launcher_from('[lab]\nkind = "local"\n[lab.devices]\nCPU = { count = 2 }\n')
     report = let.status()
     assert report["devices"]["lab"]["CPU"] == {"count": 2, "reserved": 0, "indices": []}
+
+
+def test_the_output_of_a_call_comes_before_what_the_caller_prints_next(let, cpu, capsys) -> None:
+    """Spec "Worker output": a call's reply waits for the output the body made.
+
+    The worker frames output on a thread of its own, so the reply could overtake it and
+    the caller's next print would land first, which is what a terminal shows out of order.
+    A live CI run failed the weaker form of this with `assert 'epoch 1 loss 0.5' in ''`.
+    """
+
+    @let.function(device=cpu, host=letify.remote)
+    def noisy() -> int:
+        for index in range(200):
+            print(f"line {index} of the body")
+        return 7
+
+    assert noisy() == 7
+    print("the caller speaks after the call")
+    out = capsys.readouterr().out
+    assert "line 0 of the body" in out
+    assert "line 199 of the body" in out
+    assert out.index("line 199 of the body") < out.index("the caller speaks after the call")
+
+
+def test_output_that_looks_like_the_drain_token_still_arrives(let, cpu, capsys) -> None:
+    """Spec "Worker output": the token is never forwarded, and output is never eaten.
+
+    The reader withholds a tail that could be the start of a split token, so a body whose
+    own output ends in that prefix must still see all of it arrive.
+    """
+    import re
+
+    from letify.protocol import worker
+
+    found = re.search(r'_DRAIN_TOKEN = b"([^"]+)"', worker.SOURCE)
+    assert found, "the worker no longer names a drain token"
+    token = found.group(1).encode().decode("unicode_escape")
+    prefix = token[: len(token) - 1]
+
+    @let.function(device=cpu, host=letify.remote)
+    def speaks(text: str) -> int:
+        import sys
+
+        sys.stdout.write("before|" + text)
+        sys.stdout.flush()
+        sys.stdout.write("|after\n")
+        return len(text)
+
+    assert speaks(prefix) == len(prefix)
+    out = capsys.readouterr().out
+    assert "before|" in out and "|after" in out
+    assert token not in out

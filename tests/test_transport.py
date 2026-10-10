@@ -496,6 +496,31 @@ def test_the_cached_strategy_is_tried_alone_and_kept_at_half_its_throughput(
     assert punch.attempts == 0
 
 
+def test_the_only_applicable_strategy_still_reports_its_round_trip(isolated_home) -> None:
+    """Spec "Several connections at once": the link reports what the probe measured.
+
+    Only the race recorded it, so the two paths that skip the race returned a link with
+    none and a placement then kept a single stream. That turned parallel placement off on
+    the paths most connections actually take.
+    """
+    punch = FakeStrategy("tcp_punch", 2, result=result(20, 20, rtt=138.0))
+    link = pipeline([punch]).connect()
+    assert link.strategy == "tcp_punch"
+    assert link.rtt_ms == 138.0
+
+
+def test_a_link_taken_from_the_cache_reports_its_round_trip(isolated_home) -> None:
+    """Spec "Several connections at once": the cache path records it too."""
+    cache = LinkCache("lab")
+    cache.save("tailcat", result(20, 20), Fingerprint("203.0.113.7", "eth0"))
+    punch = FakeStrategy("tcp_punch", 2, result=result(30, 30))
+    tailcat = FakeStrategy("tailcat", 3, result=result(20, 20, rtt=193.0))
+    link = pipeline([punch, tailcat], cache=cache).connect()
+    assert link.strategy == "tailcat", "the cached strategy was tried alone"
+    assert punch.attempts == 0
+    assert link.rtt_ms == 193.0
+
+
 def test_a_cached_strategy_below_half_its_throughput_runs_the_full_race(isolated_home) -> None:
     cache = LinkCache("lab")
     cache.save("tailcat", result(20, 20), Fingerprint("203.0.113.7", "eth0"))

@@ -34,6 +34,9 @@ class Link:
         self.rank = rank
         #: The round trip the pipeline measured over this link, when it measured one.
         self.rtt_ms: float | None = None
+        #: The probe's upload rate, which the placement weighs a connection's cost
+        #: against. Spec "Several connections at once".
+        self.upload_bps: float | None = None
 
     def probe_stream(self) -> object | None:
         """A stream the probe can run over, or None when this link cannot carry it."""

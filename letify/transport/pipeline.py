@@ -209,6 +209,19 @@ def _below(pairs: Sequence[tuple[str, float, float]], ratio: float, against: str
     ]
 
 
+def _measured_on(link: Any, measured: ProbeResult | None) -> Any:
+    """Record on the link what the probe measured, and return the link.
+
+    Every path out of ``connect`` goes through this, because the placement reads
+    ``rtt_ms`` to decide how many connections to use and a link with none keeps a single
+    stream. Spec "Several connections at once".
+    """
+    if measured is not None:
+        link.rtt_ms = measured.rtt_ms
+        link.upload_bps = measured.upload_bps
+    return link
+
+
 def _close(link: Any) -> None:
     try:
         link.close()
@@ -308,7 +321,7 @@ class Pipeline:
                             [*reasons, f"{link.strategy}: below the floor: {', '.join(floored)}"]
                         ),
                     )
-            return link
+            return _measured_on(link, measured)
 
         network = self.fingerprint() if self.cache is not None else None
         if self.cache is not None and network is not None:
@@ -324,9 +337,9 @@ class Pipeline:
             f"{skipped_note}{held_note}"
         )
         link, measured = self._race(applicable, reasons)
-        if measured is not None:
-            # Kept on the link so status can say how far away the machine is.
-            link.rtt_ms = measured.rtt_ms
+        # Kept on the link so status can say how far away the machine is, and so the
+        # placement knows whether splitting a blob across connections is worth it.
+        _measured_on(link, measured)
         if self.cache is not None and network is not None and measured is not None:
             self.cache.save(link.strategy, measured, network)
             self._say(f"cache rewritten: {link.strategy}")
@@ -394,7 +407,7 @@ class Pipeline:
             _close(link)
             return None
         self._say(f"cached {name} accepted")
-        return link
+        return _measured_on(link, measured)
 
     # -- the race ------------------------------------------------------------
 
