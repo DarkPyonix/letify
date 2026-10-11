@@ -146,9 +146,20 @@ CARD_SOURCE = (
     "        pass\n"
     # /proc can list the right cards on a session whose driver cannot be used, and the
     # first .to('cuda') then raises minutes into the call. Spec "Kaggle".
+    # cuInit is the call CUDA initialization makes, so it answers whether the driver
+    # works rather than standing in for it: a live session had the cards and the control
+    # device and still could not start CUDA. ctypes needs no torch, which the session does
+    # not have yet at this point. Spec "Kaggle".
+    "__letify_cuda = -1\n"
+    "try:\n"
+    "    import ctypes as _letify_ctypes\n"
+    "    __letify_cuda = _letify_ctypes.CDLL('libcuda.so.1').cuInit(0)\n"
+    "except Exception:\n"
+    "    pass\n"
     "__letify_value__ = {\n"
     "    'cards': __letify_cards,\n"
     "    'driver': os.path.exists('/dev/nvidiactl'),\n"
+    "    'cuinit': __letify_cuda,\n"
     "}\n"
 )
 
