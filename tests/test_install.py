@@ -547,6 +547,9 @@ def test_a_download_with_no_size_shows_bytes_and_rate_without_a_percent(monkeypa
             return None
 
     monkeypatch.setattr(install.urllib.request, "urlopen", lambda url, timeout: NoLength())
+    # The subject here is the progress line, and the host is a deliberately invalid one,
+    # so the reachability probe is not what this test is about.
+    monkeypatch.setattr(install, "_reachable", lambda url: None)
     stream = io.StringIO()
     assert (
         install._download("http://example.invalid/x", label="tailcat 0.6.0", stream=stream)
@@ -662,3 +665,42 @@ def test_colab_verifies_the_release_on_the_runtime_before_installing(
         path.write_bytes(b"tampered")
         with pytest.raises(RuntimeError, match=r"tailcat.*SHA-256"):
             exec(source, {})
+
+
+def test_a_download_whose_host_cannot_be_reached_fails_fast_and_names_it(monkeypatch) -> None:
+    """Spec "Automatic install": the connection is made first, with a timeout of its own.
+
+    A campus network blocks release-assets.githubusercontent.com while github.com answers,
+    so `letify setup eci` sat through the read timeout twice and then said only that the
+    download failed.
+    """
+    import socket
+
+    from letify import install
+
+    tried: list[tuple] = []
+
+    def refuse(address, timeout=None):
+        tried.append((address, timeout))
+        raise TimeoutError("timed out")
+
+    monkeypatch.setattr(socket, "create_connection", refuse)
+    with pytest.raises(install.InstallError) as failure:
+        install._download("https://release-assets.githubusercontent.com/a/b.tar.gz")
+    message = str(failure.value)
+    assert "release-assets.githubusercontent.com" in message
+    assert "443" in message
+    assert "eci_binary" in message or "tailcat_binary" in message
+    assert tried and tried[0][0] == ("release-assets.githubusercontent.com", 443)
+    assert tried[0][1] == install.CONNECT_TIMEOUT
+
+
+def test_a_reachable_host_is_downloaded_from_as_before(releases, monkeypatch) -> None:
+    """Spec: the probe only decides whether to try, it does not replace the download.
+
+    The release server is a real one on loopback, so the probe connects to it for real.
+    """
+    archive = tar_gz([("tailcat", b"the binary", "file")])
+    publish_tailcat(monkeypatch, releases, archive)
+    asset = install.asset_for("tailcat")
+    assert install._download(asset.url) == archive

@@ -37,6 +37,10 @@ from .transport.setup import TAILCAT_VERSION
 
 #: Seconds to wait for a release server.
 DOWNLOAD_TIMEOUT = 60.0
+#: Seconds to wait for the connection alone. A host a network blocks has to fail in
+#: seconds, not after the read timeout, and twice that when a release redirects.
+#: Spec "Automatic install".
+CONNECT_TIMEOUT = 10.0
 
 #: Bytes read from a release server at a time, so progress can be reported.
 DOWNLOAD_CHUNK = 64 << 10
@@ -352,8 +356,35 @@ def _isatty(stream) -> bool:
         return False
 
 
+def _reachable(url: str) -> None:
+    """Refuse a download whose host does not answer, before the request is made.
+
+    Spec "Automatic install": the error names the host so a blocked network is told what
+    to open or to configure around, rather than being told the tool is broken.
+    """
+    import socket
+    import urllib.parse
+
+    parsed = urllib.parse.urlsplit(url)
+    host = parsed.hostname
+    if not host:
+        return
+    port = parsed.port or (443 if parsed.scheme == "https" else 80)
+    try:
+        socket.create_connection((host, port), timeout=CONNECT_TIMEOUT).close()
+    except OSError as exc:
+        raise InstallError(
+            f"could not reach {host}:{port} within {CONNECT_TIMEOUT:.0f} s ({exc}), so "
+            f"{url} was not downloaded. The host, not letify, is what is unreachable: a "
+            f"network that allows github.com can still block the host its releases "
+            f"redirect to. Fetch the archive another way and name the binary with the "
+            f"account's tailcat_binary or eci_binary"
+        ) from None
+
+
 def _download(url: str, *, label: str | None = None, stream=None) -> bytes:
     """Fetch ``url``; with ``label``, report progress on ``stream`` (standard error)."""
+    _reachable(url)
     try:
         with urllib.request.urlopen(url, timeout=DOWNLOAD_TIMEOUT) as response:
             if label is None:

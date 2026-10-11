@@ -2257,6 +2257,10 @@ The header ends `busy` while a call runs and `idle` otherwise. `cards` is left o
 
 An account's `tailcat_binary` or `eci_binary`, when set, skips the lookup and is run as written.
 
+**A download that cannot reach its host fails fast and says which host.** The connection is made first with a 10 second timeout of its own, before the request, so a host a network blocks fails in seconds rather than after the 60 second read timeout, and twice that when a release redirects to a second host. The error names the host and the port it could not reach, says the download was refused rather than that the tool is broken, and points at the account's `tailcat_binary` or `eci_binary` for a machine that has to fetch the archive another way. A network that blocks `release-assets.githubusercontent.com` while `github.com` itself answers is what this is for, and it was measured on one.
+
+letify does not reach for another host of its own accord. The host a release redirects to is an implementation detail of the service, not an interface, so a hard coded alternative would fail everyone the day it changes rather than only the blocked network. A blocked network configures the way in once.
+
 **Automatic install.** `tailcat` is installed when a command that needs it finds none: `letify client shell connect` and `letify login tunnel`. It happens with or without a terminal and asks nothing. `eci` is not installed automatically: `letify login elice` asks first, as [Elice machines](#elice-machines) describes, and otherwise only `letify setup eci` installs it. Two lines go to standard error, as connection decision lines do:
 
 - before the download, `letify: installing <tool> <version> from <asset URL> into <version directory>`
