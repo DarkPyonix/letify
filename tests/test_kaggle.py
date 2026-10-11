@@ -1294,3 +1294,160 @@ def test_falling_back_to_the_bridge_says_so(monkeypatch, capsys) -> None:
     err = capsys.readouterr().err
     assert "the kernel bridge is carrying k-1" in err
     assert "2.0 MiB/s" in err
+
+
+def test_the_record_notes_the_process_that_made_the_notebook(
+    kaggle_api_token, config_file
+) -> None:
+    """Spec "Kaggle", stopping what a dead process left behind.
+
+    A notebook a live process is still using must never be deleted, so the record notes
+    the pid beside the ref.
+    """
+    import os
+
+    from letify.providers.kaggle import notebook_record, record_notebook
+
+    record_notebook("kaggle_a", "letify-runtime")
+    line = notebook_record("kaggle_a").read_text(encoding="utf-8").strip()
+    ref, pid, _created = line.split("\t")
+    assert ref == "irack000/letify-runtime"
+    assert int(pid) == os.getpid()
+
+
+def test_a_notebook_a_live_process_still_uses_is_not_an_orphan(
+    fake_kaggle_cli, kaggle_api_token, config_file
+) -> None:
+    """Spec: a ref whose pid is still running on this machine is skipped."""
+    import os
+
+    from letify.providers.kaggle import notebook_record, orphaned_notebooks
+
+    path = notebook_record("kaggle_a")
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    path.write_text(
+        f"irack000/letify-runtime\t{os.getpid()}\n"
+        "irack000/letify-runtime-2\t999999999\n",
+        encoding="utf-8",
+    )
+    assert orphaned_notebooks("kaggle_a") == ["irack000/letify-runtime-2"]
+
+
+def test_a_ref_an_older_letify_recorded_counts_as_an_orphan(
+    fake_kaggle_cli, kaggle_api_token, config_file
+) -> None:
+    """Spec: a ref with no pid cannot be checked, and an older letify is not running."""
+    from letify.providers.kaggle import notebook_record, orphaned_notebooks
+
+    path = notebook_record("kaggle_a")
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    path.write_text("irack000/letify-runtime\n", encoding="utf-8")
+    assert orphaned_notebooks("kaggle_a") == ["irack000/letify-runtime"]
+
+
+def test_stopping_an_orphan_deletes_the_notebook_and_drops_the_record(
+    fake_kaggle_cli, kaggle_api_token, config_file
+) -> None:
+    """Spec "Kaggle", stopping what a dead process left behind.
+
+    The run id died with the process that made it, so cancel_run cannot reach the run and
+    deleting the notebook is the way in.
+    """
+    from letify.providers.kaggle import notebook_record, recorded_notebooks
+
+    path = notebook_record("kaggle_a")
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    path.write_text("irack000/letify-runtime\t999999999\n", encoding="utf-8")
+    provider = kaggle_provider()
+    assert provider.orphans() == ["irack000/letify-runtime"]
+    assert provider.stop_orphan("irack000/letify-runtime") is True
+    assert recorded_notebooks("kaggle_a") == []
+    deleted = [call for call in fake_kaggle_cli.calls if "delete" in call]
+    assert deleted and "irack000/letify-runtime" in deleted[0]
+
+
+def test_an_orphan_that_could_not_be_deleted_stays_in_the_record(
+    fake_kaggle_cli, kaggle_api_token, config_file
+) -> None:
+    """Spec: a ref is dropped only when the delete succeeds, so a failure is tried again."""
+    from letify.providers.kaggle import notebook_record, recorded_notebooks
+
+    fake_kaggle_cli.fail.add("delete")
+    path = notebook_record("kaggle_a")
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    path.write_text("irack000/letify-runtime\t999999999\n", encoding="utf-8")
+    provider = kaggle_provider()
+    assert provider.stop_orphan("irack000/letify-runtime") is False
+    assert recorded_notebooks("kaggle_a") == ["irack000/letify-runtime"]
+
+
+def test_the_record_notes_when_the_notebook_was_created(kaggle_api_token, config_file) -> None:
+    """Spec "Kaggle", not making sessions faster than Kaggle allows."""
+    import os
+    import time
+
+    from letify.providers.kaggle import notebook_record, record_notebook
+
+    before = time.time()
+    record_notebook("kaggle_a", "letify-runtime")
+    ref, pid, created = (
+        notebook_record("kaggle_a").read_text(encoding="utf-8").strip().split("\t")
+    )
+    assert ref == "irack000/letify-runtime"
+    assert int(pid) == os.getpid()
+    # Recorded to the millisecond, so allow for the rounding.
+    assert before - 0.01 <= float(created) <= time.time() + 0.01
+
+
+def test_how_long_to_wait_before_another_session(config_file, kaggle_api_token) -> None:
+    """Spec: the remainder of min_session_interval_s since the newest recorded creation."""
+    import time
+
+    from letify.providers.kaggle import notebook_record, wait_before_session
+
+    path = notebook_record("kaggle_a")
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    now = time.time()
+    path.write_text(f"irack000/one\t1\t{now - 30:.3f}\n", encoding="utf-8")
+    assert 88 <= wait_before_session("kaggle_a", 120.0) <= 90.1
+    path.write_text(f"irack000/one\t1\t{now - 500:.3f}\n", encoding="utf-8")
+    assert wait_before_session("kaggle_a", 120.0) == 0.0
+    # Nothing recorded, so nothing to wait for.
+    path.write_text("", encoding="utf-8")
+    assert wait_before_session("kaggle_a", 120.0) == 0.0
+    # A record an older letify wrote has no time, so it cannot be waited on.
+    path.write_text("irack000/one\t1\n", encoding="utf-8")
+    assert wait_before_session("kaggle_a", 120.0) == 0.0
+
+
+def test_an_account_sets_how_long_to_leave_between_sessions(config_file) -> None:
+    """Spec: an account sets min_session_interval_s, and 0 turns the wait off."""
+    from conftest import provider_of
+
+    from letify.providers import Kaggle
+
+    assert provider_of(Kaggle, "kaggle_a").min_session_interval_s == 120.0
+    assert provider_of(Kaggle, "kaggle_a", min_session_interval_s=0).min_session_interval_s == 0.0
+    assert provider_of(Kaggle, "kaggle_a", min_session_interval_s=30).min_session_interval_s == 30.0
+
+
+def test_a_refused_run_says_how_long_ago_the_last_session_was_made(
+    kaggle_api_token, config_file
+) -> None:
+    """Spec: a refusal names the gap, so this cause is told from any other.
+
+    A live account refused a run a minute after the previous session, with no message at
+    all from Kaggle.
+    """
+    import time
+
+    from letify.providers.kaggle import notebook_record, refusal_detail
+
+    path = notebook_record("kaggle_a")
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    path.write_text(f"irack000/one\t1\t{time.time() - 61:.3f}\n", encoding="utf-8")
+    detail = refusal_detail("kaggle_a")
+    assert "61" in detail or "60" in detail
+    assert "too soon" in detail
+    path.write_text("", encoding="utf-8")
+    assert refusal_detail("kaggle_a") == ""

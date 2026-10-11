@@ -383,3 +383,55 @@ def test_a_provider_reports_what_one_more_connection_costs() -> None:
 
     assert float(provider_of(Shell, "dept_gpu").transfer_connection_cost_s) == 0.0
     assert float(provider_of(Kaggle, "kaggle_a").transfer_connection_cost_s) >= 5.0
+
+
+def test_a_punched_kaggle_shard_is_split_across_streams(monkeypatch) -> None:
+    """Spec "Several connections at once": the plumbing reaches the link's own numbers.
+
+    A live session moved 298 MiB shards on one stream at a 196 ms round trip, where the
+    decision should have been four. This runs `_streams_for` with that session's numbers
+    through a real Kaggle provider, so a break in the plumbing shows rather than the
+    arithmetic, which its own test already covers.
+    """
+    from conftest import provider_of
+
+    from letify.providers import Kaggle
+    from letify.store.pathdata import _streams_for
+
+    MIB = 1 << 20
+    provider = provider_of(Kaggle, "kaggle_a")
+
+    class Link:
+        strategy = "tcp_punch"
+        rtt_ms = 196.2
+        upload_bps = 13.2 * MIB
+
+    class Runtime:
+        name = "letify-t4-cd14ab"
+
+    Runtime.provider = provider
+    provider._links[Runtime.name] = Link()
+    assert _streams_for(Runtime(), 298 * MIB) == 4
+
+
+def test_a_kaggle_shard_keeps_one_stream_when_the_link_was_never_measured(monkeypatch) -> None:
+    """Spec: with no measured rate the cost of a punch cannot be weighed, so one stream."""
+    from conftest import provider_of
+
+    from letify.providers import Kaggle
+    from letify.store.pathdata import _streams_for
+
+    MIB = 1 << 20
+    provider = provider_of(Kaggle, "kaggle_a")
+
+    class Link:
+        strategy = "tcp_punch"
+        rtt_ms = 196.2
+        upload_bps = None
+
+    class Runtime:
+        name = "letify-t4-cd14ab"
+
+    Runtime.provider = provider
+    provider._links[Runtime.name] = Link()
+    assert _streams_for(Runtime(), 298 * MIB) == 1

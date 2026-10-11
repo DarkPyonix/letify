@@ -1673,6 +1673,9 @@ def fake_kaggle(isolated_home, monkeypatch, tmp_path: Path):
     monkeypatch.setattr(kaggle_module, "urlopen", cloud.urlopen)
     monkeypatch.setattr(kaggle_module, "JUPYTER_PROXY_HOST", cloud.proxy_host)
     monkeypatch.setattr(kaggle_module, "SESSION_START_TIMEOUT", 1.0)
+    # The real gap between sessions is two minutes, which a test must not sit through. Its
+    # own tests set it back. Spec "Kaggle", not making sessions faster than Kaggle allows.
+    monkeypatch.setattr(kaggle_module, "MIN_SESSION_INTERVAL_S", 0.0)
     script = Path(__file__).with_name("fake_kaggle_adapter.py")
     monkeypatch.setattr(kaggle_module, "adapter_command", lambda: [sys.executable, str(script)])
     cloud.log = tmp_path / "kaggle-adapter.jsonl"

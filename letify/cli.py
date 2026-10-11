@@ -40,6 +40,16 @@ def build_parser() -> argparse.ArgumentParser:
     sessions_parser.add_argument(
         "--json", action="store_true", help="print the records unformatted"
     )
+    stop = sub.add_parser("stop", help="stop what a dead process left behind")
+    stop.add_argument(
+        "--orphans",
+        action="store_true",
+        help="delete the sessions whose creating process is gone",
+    )
+    stop.add_argument("--alias", help="only this account")
+    stop.add_argument("-y", "--yes", action="store_true", help="do not ask")
+    stop.add_argument("--json", action="store_true", help="print the records unformatted")
+
     sub.add_parser("stubs", help="write the provider types an editor completes")
 
     usage = sub.add_parser("usage", help="show what each account has left")
@@ -523,6 +533,25 @@ def _say(kind: str, message: str) -> None:
     print(f"{render.mark(kind, _out())} {message}")
 
 
+def _detail(row: dict) -> str:
+    """The reason a stop failed, when there is one to add."""
+    return f": {row['error']}" if row.get("error") else ""
+
+
+def _confirmed(question: str) -> bool:
+    """Ask before deleting. Anything but yes is no, and no terminal is no."""
+    import sys as _sys
+
+    if not _sys.stdin.isatty():
+        print(f"{question} not a terminal, so nothing is assumed. Pass -y to delete")
+        return False
+    try:
+        answer = input(f"{question} [y/N] ").strip().lower()
+    except EOFError:
+        return False
+    return answer in ("y", "yes")
+
+
 def _json(value: object) -> int:
     print(json.dumps(value, indent=2))
     return 0
@@ -678,6 +707,39 @@ def _dispatch(args: argparse.Namespace) -> int:
             detail = row.get("unavailable") or row.get("reason") or names or "no active sessions"
             print(f"{row['alias']}  {detail}")
         return 0
+
+    if args.command == "stop":
+        if not args.orphans:
+            # A bare `stop` reads as ending everything, so it ends nothing.
+            print("nothing was stopped. Pass --orphans to delete what a dead process left")
+            return 0
+        rows = let.orphans(args.alias)
+        found = [(row["alias"], ref) for row in rows for ref in row.get("orphans", ())]
+        unavailable = [row for row in rows if row.get("unavailable")]
+        if args.json and not found:
+            return _json(rows)
+        for row in unavailable:
+            print(f"{row['alias']}  {row['unavailable']}")
+        if not found:
+            print("no orphaned sessions")
+            return 0
+        print(f"{len(found)} orphaned session(s) to delete:")
+        for alias, ref in found:
+            print(f"  {alias}  {ref}")
+        if not args.yes and not _confirmed("Delete them?"):
+            print("nothing was stopped")
+            return 0
+        done = let.stop_orphans(args.alias)
+        if args.json:
+            return _json(done)
+        failed = 0
+        for row in done:
+            if row.get("unavailable"):
+                continue
+            mark = "stopped" if row.get("stopped") else f"failed{_detail(row)}"
+            failed += 0 if row.get("stopped") else 1
+            print(f"{row['alias']}  {row['ref']}  {mark}")
+        return 1 if failed else 0
 
     if args.command == "status":
         status = let.status()
