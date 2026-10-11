@@ -133,7 +133,7 @@ def project_dir(workspace_root: str, env: Env) -> str:
 #: Reads the cards a runtime has, without nvidia-smi, which a Kaggle image lacks on PATH.
 #: Spec "Kaggle", the accelerators.
 CARD_SOURCE = (
-    "import glob\n"
+    "import glob, os\n"
     "__letify_cards = []\n"
     "for _letify_path in sorted(glob.glob('/proc/driver/nvidia/gpus/*/information')):\n"
     "    try:\n"
@@ -144,7 +144,12 @@ CARD_SOURCE = (
     "                    break\n"
     "    except OSError:\n"
     "        pass\n"
-    "__letify_value__ = __letify_cards\n"
+    # /proc can list the right cards on a session whose driver cannot be used, and the
+    # first .to('cuda') then raises minutes into the call. Spec "Kaggle".
+    "__letify_value__ = {\n"
+    "    'cards': __letify_cards,\n"
+    "    'driver': os.path.exists('/dev/nvidiactl'),\n"
+    "}\n"
 )
 
 
