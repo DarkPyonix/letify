@@ -1194,6 +1194,10 @@ This covers a write-back that fails, not a client that is killed. A process that
 `mkdir` and the rename cannot clean up after itself, so a resume that reads a directory name still
 has to check for the file it needs.
 
+**A blob is dropped on its content, not its timestamp.** A size that differs from what placement recorded is conclusive, so the blob goes. A size that matches while the mtime differs is not: the content may be identical and only the timestamp new, which is what a file copied back with the same bytes looks like. The worker hashes it and keeps it when the digest still holds. Dropping on the timestamp alone loses a blob every other placed path with that digest still needs, and a session that restored its blobs by copying them back had each copy dropped again on its new mtime, which is how a loop meant to repair the store kept emptying it.
+
+Hashing costs the read, which is why it is only done for the ambiguous case; a size change needs no hash.
+
 **A blob the cache drops is reported.** Removing a file a call may still need is worth a line, so
 the worker prints one on standard error when it drops a blob because the file it is the digest of
 was written through its hard link: `letify: data cache dropped <digest>, written through its link

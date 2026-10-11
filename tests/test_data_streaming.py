@@ -1519,3 +1519,35 @@ def test_the_cache_says_when_it_drops_a_blob_written_through_its_link() -> None:
     assert "data cache dropped" in body
     assert "written through its link" in body
     assert "sys.stderr" in body
+
+
+def test_a_blob_whose_bytes_are_unchanged_survives_a_new_mtime(launcher_from, project) -> None:
+    """Spec "Runtime data cache budget": dropped on content, not on a timestamp.
+
+    A session restoring its blobs by copying them back had each copy dropped again on its
+    new mtime, so a loop meant to repair the store kept emptying it.
+    """
+    let = streaming(launcher_from, data_first_wave_mib=1024)
+    root = dataset(project, 1, size=1 << 12)
+    target = root / "000.bin"
+
+    @let.function(device=let.providers.lab.CPU, host=letify.remote)
+    def touches(path: Path) -> list[int]:
+        import os as _os
+
+        info = _os.stat(path)
+        # The same bytes, a new timestamp: what a copy back looks like.
+        _os.utime(path, (info.st_atime, info.st_mtime + 120))
+        return [info.st_nlink, _os.stat(path).st_size]
+
+    links, size = touches(target)
+    assert links == 2 and size == 1 << 12
+
+    # The blob is still there, so a second call is told the runtime has it.
+    import io
+    from contextlib import redirect_stderr
+
+    captured = io.StringIO()
+    with redirect_stderr(captured):
+        assert touches(target)[1] == 1 << 12
+    assert "data cache dropped" not in captured.getvalue()
