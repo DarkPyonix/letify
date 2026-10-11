@@ -316,6 +316,7 @@ def _reply(stream, outcome):
 
 def _op_call(request):
     data = request.pop("data", None)
+    _letify_replica(request.pop("replica", None))
     modules_dir = request.pop("modules_dir", None)
     if modules_dir:
         modules_dir = os.path.expanduser(modules_dir)
@@ -347,6 +348,25 @@ def _op_call(request):
 
 # Write-back lists of returned calls, by call directory, until data_written takes them.
 _DATA_WRITTEN = {}
+
+
+def _letify_replica(replica):
+    """Tell the letify in this runtime which replica this call is, or that it is none.
+
+    Spec "Replicas": the body reads its rank through letify, which is installed here by
+    the environment, so the numbers are set on the module rather than passed through the
+    user's signature.
+    """
+    try:
+        from letify.declare import replicas as _replicas
+    except Exception:
+        return
+    if replica is None:
+        _replicas._WHO.rank = _replicas._WHO.world_size = _replicas._WHO.rate_bps = None
+        return
+    _replicas._WHO.rank = replica.get("rank")
+    _replicas._WHO.world_size = replica.get("world_size")
+    _replicas._WHO.rate_bps = replica.get("rate_bps")
 
 
 def _data_hash_file(path):

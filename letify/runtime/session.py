@@ -269,6 +269,7 @@ class Runtime:
         timeout: float | None = None,
         data_order: Any = None,
         data_first_wave: int | None = None,
+        replica: dict[str, Any] | None = None,
     ) -> tuple[Any, str]:
         """Run one declared function inside this runtime.
 
@@ -283,7 +284,9 @@ class Runtime:
                 fn, args, kwargs, timeout=timeout, modules=self.env.ship_modules
             )
         args, kwargs = self._externalize(args, kwargs)
-        return self._call_with_data(fn, args, kwargs, timeout, data_order, data_first_wave)
+        return self._call_with_data(
+            fn, args, kwargs, timeout, data_order, data_first_wave, replica
+        )
 
     def _call_with_data(
         self,
@@ -293,6 +296,7 @@ class Runtime:
         timeout: float | None,
         data_order: Any = None,
         data_first_wave: int | None = None,
+        replica: dict[str, Any] | None = None,
     ) -> tuple[Any, str]:
         """Pickle a call, place the first wave of its data, and send the rest beside it.
 
@@ -317,6 +321,10 @@ class Runtime:
                     ship_digests.add(digest)
         head, buffers = protocol.dumps_call_parts(fn, args, kwargs, data=collector)
         request: dict[str, Any] = {"op": "call", "payload": head, "buffers": buffers}
+        if replica is not None:
+            # Spec "Replicas": the body reads its rank on the runtime, not here, so the
+            # numbers travel with the call rather than being set on a client thread.
+            request["replica"] = replica
         blobs = f"{root}/data/blobs"
         stream: pathdata.Stream | None = None
         if self.env.ship_modules:
@@ -708,16 +716,25 @@ class Runtime:
             return
         fragment, count = expected
         try:
-            cards = self.eval(bootstrap.CARD_SOURCE, timeout=120)
+            found = self.eval(bootstrap.CARD_SOURCE, timeout=120)
         except Exception:
             # Reading /proc is not worth failing a session over when it cannot be read.
             return
-        cards = [str(card) for card in cards or ()]
+        found = found if isinstance(found, dict) else {"cards": found, "driver": True}
+        cards = [str(card) for card in found.get("cards") or ()]
+        driver = bool(found.get("driver"))
         matched = [card for card in cards if fragment.casefold() in card.casefold()]
-        if len(matched) == count and len(cards) == count:
+        if len(matched) == count and len(cards) == count and driver:
             return
         asked = getattr(instance, "accelerator", None) or fragment
         arrived = ", ".join(cards) if cards else "no GPU at all"
+        if cards and not driver:
+            # Spec "Kaggle": the cards are right and the driver cannot be used, which the
+            # first .to("cuda") would have reported minutes into the call instead.
+            arrived = (
+                f"{arrived}, and no usable driver: /dev/nvidiactl is not there, so CUDA "
+                f"cannot start"
+            )
         message = (
             f"{self.name}: {self.provider.alias} was asked for {count} x {asked} and the "
             f"session has {arrived}. A declaration says where a function runs, so the "
