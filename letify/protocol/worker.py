@@ -365,6 +365,19 @@ def _data_hash_file(path):
     return hasher.hexdigest(length=16)
 
 
+def _data_same_bytes(path, digest):
+    """Whether the file still hashes to the digest it is the blob of.
+
+    Spec "Runtime data cache budget": only the ambiguous case is hashed, a size that
+    matches with a new timestamp, so the read is paid where a timestamp cannot decide.
+    Never raises; a file that cannot be read is not the file the digest promised.
+    """
+    try:
+        return _data_hash_file(path) == digest
+    except OSError:
+        return False
+
+
 def _data_collect(data, placed):
     """Commit each file a returned call created or changed at an output into the cache."""
     import stat
@@ -431,11 +444,25 @@ def _data_check_cache(data, placed):
             info = os.stat(source)
         except OSError:
             continue
-        if (info.st_size, info.st_mtime_ns) != cached:
-            try:
-                os.remove(source)
-            except OSError:
-                pass
+        if (info.st_size, info.st_mtime_ns) == cached:
+            continue
+        if info.st_size == cached[0] and _data_same_bytes(source, digest):
+            # Spec "Runtime data cache budget": the same bytes with a new timestamp, which
+            # is what a file copied back looks like. The digest still holds, so it stays.
+            continue
+        # Spec "Runtime data cache budget": removing a file a call may still need is worth
+        # a line, or it vanishes and only the next failure mentions it.
+        print(
+            "letify: data cache dropped %s, written through its link (%d bytes at %d, "
+            "placed as %d at %d)"
+            % (digest, info.st_size, info.st_mtime_ns, cached[0], cached[1]),
+            file=sys.stderr,
+            flush=True,
+        )
+        try:
+            os.remove(source)
+        except OSError:
+            pass
 
 
 def _op_data_written(request):
