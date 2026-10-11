@@ -317,3 +317,44 @@ def test_kaggle_does_not_offer_the_retired_p100() -> None:
     message = str(failure.value)
     assert "2026-09-15" in message
     assert "T4" in message
+
+
+def test_the_worker_carries_the_kernel_s_library_path(monkeypatch) -> None:
+    """Spec "Kaggle runtimes": the loader reads LD_LIBRARY_PATH when the process starts.
+
+    A GPU session has its cards, its /dev/nvidia* nodes and a libcuda.so.1 at
+    /usr/local/nvidia/lib64 that ldconfig does not list. The kernel finds it through that
+    variable; a worker started over SSH does not inherit it, which the kernel bridge never
+    suffered and the punched link introduced.
+    """
+    built: list[list[str]] = []
+    provider = kaggle()
+
+    class Bridge:
+        def request(self, message, timeout=None):
+            source = message.get("source", "")
+            if "LD_LIBRARY_PATH" in source:
+                return "/usr/local/nvidia/lib64:/usr/local/cuda/lib64", None
+            return "", None
+
+    class Link:
+        strategy = "tcp_punch"
+        rtt_ms = 120.0
+
+        def ssh_command(self, remote_command=None):
+            return ["ssh", "-p", "40000", "root@127.0.0.1", remote_command or ""]
+
+    class Fake:
+        def __init__(self, command, name=None, **kwargs):
+            built.append(command)
+            self.name = name
+
+    monkeypatch.setattr(provider, "link_over", lambda channel, name=None: Link())
+    monkeypatch.setattr("letify.runtime.channel.PersistentChannel", Fake)
+    provider.channel_over(Bridge(), name="k-1")
+
+    remote = built[0][-1]
+    assert "LD_LIBRARY_PATH=" in remote
+    assert "/usr/local/nvidia/lib64" in remote
+    # Before the interpreter, or the loader has already read the environment.
+    assert remote.index("LD_LIBRARY_PATH=") < remote.index("python3")

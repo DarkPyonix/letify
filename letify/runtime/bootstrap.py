@@ -150,15 +150,21 @@ CARD_SOURCE = (
     # works rather than standing in for it: a live session had the cards and the control
     # device and still could not start CUDA. ctypes needs no torch, which the session does
     # not have yet at this point. Spec "Kaggle".
-    "__letify_cuda = -1\n"
+    # A CUresult is 0 or positive, so a sentinel of -1 would read as one. The load and
+    # the call are reported apart instead. Spec "Kaggle".
+    "__letify_libcuda = False\n"
+    "__letify_cuda = None\n"
     "try:\n"
     "    import ctypes as _letify_ctypes\n"
-    "    __letify_cuda = _letify_ctypes.CDLL('libcuda.so.1').cuInit(0)\n"
+    "    _letify_lib = _letify_ctypes.CDLL('libcuda.so.1')\n"
+    "    __letify_libcuda = True\n"
+    "    __letify_cuda = _letify_lib.cuInit(0)\n"
     "except Exception:\n"
     "    pass\n"
     "__letify_value__ = {\n"
     "    'cards': __letify_cards,\n"
     "    'driver': os.path.exists('/dev/nvidiactl'),\n"
+    "    'libcuda': __letify_libcuda,\n"
     "    'cuinit': __letify_cuda,\n"
     "}\n"
 )

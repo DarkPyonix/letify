@@ -721,11 +721,12 @@ class Runtime:
             # Reading /proc is not worth failing a session over when it cannot be read.
             return
         if not isinstance(found, dict):
-            found = {"cards": found, "driver": True, "cuinit": 0}
+            found = {"cards": found, "driver": True, "libcuda": True, "cuinit": 0}
         cards = [str(card) for card in found.get("cards") or ()]
         driver = bool(found.get("driver"))
-        cuinit = found.get("cuinit", 0)
-        started = cuinit == 0
+        libcuda = bool(found.get("libcuda", True))
+        cuinit = found.get("cuinit")
+        started = libcuda and cuinit == 0
         matched = [card for card in cards if fragment.casefold() in card.casefold()]
         if len(matched) == count and len(cards) == count and driver and started:
             return
@@ -738,11 +739,20 @@ class Runtime:
                 f"{arrived}, and no usable driver: /dev/nvidiactl is not there, so CUDA "
                 f"cannot start"
             )
+        elif cards and not libcuda:
+            # Spec "Kaggle": the userspace driver library is not there at all, which is a
+            # different fault from CUDA refusing to start, and reads as a GPU session on a
+            # CPU image rather than as a CUDA error.
+            arrived = (
+                f"{arrived}, and no libcuda.so.1 to load: the cards are attached and the "
+                f"userspace driver library is missing, so nothing on this session can use "
+                f"them"
+            )
         elif cards and not started:
             arrived = (
-                f"{arrived}, and a driver that does not start: cuInit returned {cuinit}, "
-                f"which is the call CUDA initialization makes, so nothing on this session "
-                f"can use those cards"
+                f"{arrived}, and a driver that does not start: libcuda.so.1 loaded and "
+                f"cuInit returned {cuinit}, which is the call CUDA initialization makes, "
+                f"so nothing on this session can use those cards"
             )
         message = (
             f"{self.name}: {self.provider.alias} was asked for {count} x {asked} and the "
