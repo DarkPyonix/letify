@@ -432,6 +432,15 @@ def _data_check_cache(data, placed):
         except OSError:
             continue
         if (info.st_size, info.st_mtime_ns) != cached:
+            # Spec "Runtime data cache budget": removing a file a call may still need is
+            # worth a line, or it vanishes and only the next failure mentions it.
+            print(
+                "letify: data cache dropped %s, written through its link (%d bytes at %d, "
+                "placed as %d at %d)"
+                % (digest, info.st_size, info.st_mtime_ns, cached[0], cached[1]),
+                file=sys.stderr,
+                flush=True,
+            )
             try:
                 os.remove(source)
             except OSError:
