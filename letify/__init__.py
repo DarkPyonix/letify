@@ -33,7 +33,7 @@ from .declare.cache import session_cache
 from .declare.env import Env
 from .declare.function import Function
 from .declare.instance import AnyInstance, Host, Instance
-from .declare.replicas import rank, world_size
+from .declare.replicas import local_steps, rank, world_size
 from .errors import (
     ConfigError,
     EnvironmentFailure,
@@ -105,6 +105,7 @@ __all__ = [
     "__version__",
     "distributed",
     "local",
+    "local_steps",
     "rank",
     "remote",
     "session_cache",

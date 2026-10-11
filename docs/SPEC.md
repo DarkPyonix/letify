@@ -113,10 +113,7 @@ a step takes. `rate` is the thing the user cannot know and letify already has. A
 reports no rate raises rather than guessing, naming the probe, because a guess here is a guess
 about the whole run's shape.
 
-Worked from measurements already in this document, for 100 MB of parameters and a 0.2 s step: at
-21 MiB/s, which a near Kaggle runtime gives, `local_steps` is 10; at 3.4 MiB/s, which a far one
-gives, it is 57. The number is therefore per runtime rather than per job, which is what letify can
-offer that a fixed hyperparameter cannot.
+Worked from measurements already in this document, for 100 MB of parameters and a 0.2 s step, where a reduction takes 4.54 s at 21 MiB/s and 28.05 s at 3.4 MiB/s against the 0.05 s a quarter of the step allows: `local_steps` is 91 on the near Kaggle runtime and 561 on the far one. The number is therefore per runtime rather than per job, which is what letify can offer that a fixed hyperparameter cannot, and the six fold spread between those two is the size of what a fixed one gets wrong.
 
 ### The assembled loop <!-- id: distributed-loop -->
 
