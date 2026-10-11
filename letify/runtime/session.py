@@ -720,11 +720,14 @@ class Runtime:
         except Exception:
             # Reading /proc is not worth failing a session over when it cannot be read.
             return
-        found = found if isinstance(found, dict) else {"cards": found, "driver": True}
+        if not isinstance(found, dict):
+            found = {"cards": found, "driver": True, "cuinit": 0}
         cards = [str(card) for card in found.get("cards") or ()]
         driver = bool(found.get("driver"))
+        cuinit = found.get("cuinit", 0)
+        started = cuinit == 0
         matched = [card for card in cards if fragment.casefold() in card.casefold()]
-        if len(matched) == count and len(cards) == count and driver:
+        if len(matched) == count and len(cards) == count and driver and started:
             return
         asked = getattr(instance, "accelerator", None) or fragment
         arrived = ", ".join(cards) if cards else "no GPU at all"
@@ -734,6 +737,12 @@ class Runtime:
             arrived = (
                 f"{arrived}, and no usable driver: /dev/nvidiactl is not there, so CUDA "
                 f"cannot start"
+            )
+        elif cards and not started:
+            arrived = (
+                f"{arrived}, and a driver that does not start: cuInit returned {cuinit}, "
+                f"which is the call CUDA initialization makes, so nothing on this session "
+                f"can use those cards"
             )
         message = (
             f"{self.name}: {self.provider.alias} was asked for {count} x {asked} and the "
