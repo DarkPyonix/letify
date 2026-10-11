@@ -54,6 +54,26 @@ Forwarding is viable only if a step that dispatches dozens to thousands of opera
 
 The wait before a remote call's first step is proportional to the bytes that step reads, not to the size of the dataset, because letify derives the read order from the pickled call itself, sends only the first wave of that order before the call, and keeps sending the rest in the background while the call runs.
 
+### N9. Several slow-linked runtimes train faster than one, once synchronization is rare enough
+
+N runtimes that each run the same loop on their own data shard and average parameters
+every `H` local steps beat a single runtime on wall time for the same number of samples,
+for some `H` that depends on the model size, the measured link and the step time. A
+single synchronization moves the parameters once, so the condition is roughly
+`param_bytes / (rate * H) < share * step_seconds`: at `H = 1` it is false by a wide
+margin on every link measured so far, and the claim is about where the boundary is rather
+than whether it exists. The experiment that tests it reports the boundary as a measured
+`(param_bytes, rate, H)` region, not a single number.
+
+### N10. Runtimes reduce between themselves, never through the client
+
+A reduction routed through the client cannot work on a link whose inbound is the weak
+direction, because every round moves `N` times the parameters into it. Two runtimes
+punch to each other with the client as the signalling broker only, so the parameters
+cross cloud to cloud and the client carries the mappings and nothing else. Measured
+inbound on the network this was designed on is capped near 0.25 MiB/s, against 21 MiB/s
+outbound to a near runtime, which is why this is a claim rather than an optimization.
+
 ## How an experiment reports efficiency
 
 This standard sits here rather than in `docs/SPEC.md` because it governs how a claim is tested, not what the system does. The spec records the design; this records what a report has to show before a claim above may be called supported. Every experiment pull request follows it.
@@ -78,7 +98,7 @@ A report that omits one of the four is incomplete, and its claim stays open.
 ## Non-goals
 
 - **Not a scheduler for a shared cluster.** letify targets one researcher's own accounts, not queue management for a group.
-- **Not a training framework.** It runs the user's code. It does not own the training loop, the metrics or the checkpoint format.
+- **Not a training framework.** It runs the user's code. It does not own the metrics, the checkpoint format, or the model and the optimizers, which a declaration passes in. It owns one loop and names it: under `host=distributed` it assembles the local-steps-then-average loop of N9, because the interval that loop turns on is the one quantity only letify measures. That loop is one algorithm rather than an interface, so any other, a control-variate or gossip scheme among them, uses the reductions directly and writes its own loop. Owning a second loop needs this line edited again.
 - **Not a way around a provider's limits.** It does not attempt to bypass session limits, quotas or terms.
 - **No bitwise reproducibility.** Kernel selection by measured timing and batch dependent reduction order make that unachievable in general. The project aims for comparable results under fixed seeds, fixed batch size and fixed padding.
 
