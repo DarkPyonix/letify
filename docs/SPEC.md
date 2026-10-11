@@ -27,7 +27,7 @@ train(lr=1e-4, bs=32)
 
 The decorator takes `device`, `host`, `env`, `timeout` and `retries`. Any other argument is refused by Python as unexpected. `timeout` has no default: a deadline letify invented would end a two hour training run at whatever hour it guessed, which is letify deciding how long the user's own work is allowed to take. It takes no transport, no mode and no width: the three placements below settle where the work runs, and how much can run at once is the provider's inventory rather than a number on the declaration.
 
-### The two placements <!-- id: the-three-placements -->
+### The three placements <!-- id: the-three-placements -->
 
 > `device` says where the accelerator is and `host` says where the host code runs. Both are said in the declaration and nowhere else.
 
@@ -35,9 +35,125 @@ The decorator takes `device`, `host`, `env`, `timeout` and `retries`. Any other 
 
 `host` is the CUDA word for the CPU side, paired with the device the declaration already placed. `"local"`, the default, keeps Python and the libraries in this process and forwards only CUDA calls. `"remote"` ships the declared function to the machine that holds the device.
 
-`host` takes `letify.local` or `letify.remote`, which are the two members of a string enum defined next to `Instance`. The enum class itself is not part of the public surface: two named values say everything a declaration needs, and a class at the top of the package was one more name to learn for the same two choices. Because the members are strings, `host="remote"` is the same value. An unrecognized value raises at declaration time with both options named.
+`host` takes `letify.local`, `letify.remote` or `letify.distributed`, which are the three members of a string enum defined next to `Instance`. The enum class itself is not part of the public surface: two named values say everything a declaration needs, and a class at the top of the package was one more name to learn for the same two choices. Because the members are strings, `host="remote"` is the same value. An unrecognized value raises at declaration time with both options named.
 
 An instance carries no placement of its own. `colab.G4` says which card, and only the declaration's `host` says where the host code runs, so there is one place to read to know where a function runs. How long a session lives is not a declaration argument either: it is the `keep_alive` block around the calls, described under Lifetime.
+
+### Replicas <!-- id: distributed-placement -->
+
+> `host=letify.distributed` runs the same body once per device in a `device` list, each replica knowing which one it is. It does not own the loop.
+
+`device` takes a list only here, and each entry is an `Instance` as any other declaration's is, so
+`[kaggle_a.T4, kaggle_b.T4]` is two replicas on two accounts and `[dept_gpu.Tesla_P100] * 2` is
+refused, because two replicas of one instance would ask that account for twice its devices. A
+single instance under this placement is one replica and is allowed, so a declaration does not have
+to change to run on one runtime.
+
+The body learns which replica it is from `letify.rank()`, 0 upward in the order the `device` list
+names, and `letify.world_size()`, the number of replicas that started. Both raise outside a
+distributed call rather than answering 0 and 1, because a body that reads them under
+`host=letify.remote` has a bug the default would hide. The call returns a list of the replicas'
+return values in rank order.
+
+A replica that cannot start fails the call, as a single remote call's session failure does. A
+replica that dies during the call is an infrastructure failure, so the call fails and may be
+retried, and [Reducing between replicas](#distributed-reduce) says what the reduction does about a
+replica that stops answering mid-round.
+
+This placement does not own the training loop, which [`docs/INTENT.md`](INTENT.md) keeps as a
+non-goal. letify starts the replicas, tells each one its rank, and reduces a tensor when the body
+asks. The loop, the optimizer, how often to synchronize and what to checkpoint stay in the user's
+code.
+
+### Reducing between replicas <!-- id: distributed-reduce -->
+
+> `letify.all_reduce(tensor, op=letify.mean)` replaces the tensor's contents with the reduction of
+> every replica's, and the replicas send to each other rather than through the client.
+
+`all_reduce` takes a CPU tensor or any array that carries its own dtype and shape, so there is no
+dtype argument to get wrong, and it works in place and returns how many replicas were reduced. A
+CUDA tensor is refused, naming `.cpu()`: the copy to host is needed for any transfer and doing it
+silently would hide it from a reader counting costs.
+
+`op` is a callable, not a name. `letify.mean` and `letify.sum` are provided, and any callable
+taking the list of replicas' arrays and returning one array may be passed, which is how a weighted
+or trimmed reduction is written without letify growing options for each. The arithmetic therefore
+lives in the callable, so letify's own package still needs neither numpy nor torch; `letify.mean`
+imports numpy on the runtime where the user's lock already has it, and says so if it does not.
+
+`timeout`, 60 s by default, bounds one round. `min_peers` says how many replicas a round needs:
+`None`, the default, needs all of them, and a number proceeds with that many and reports how many
+were reduced, which is the return value. A replica that misses a round is not an error, because
+Kaggle ends a session at 12 hours, Colab reclaims and Elice preempts, so a replica disappearing is
+the normal case rather than a fault. A round that cannot reach `min_peers` within `timeout` raises,
+and that is an infrastructure failure the call may be retried on.
+
+The replicas reduce between themselves. Each one punches to the others as
+[Choosing a link](#choosing-a-link) describes, with the client passing the mappings between them
+and carrying nothing else: it is the signalling broker, not a hop. This is claim N10, and it is a
+claim because the network letify was designed on has an inbound cap near 0.25 MiB/s against
+21 MiB/s outbound to a near runtime, so a reduction through the client would move `N` times the
+parameters into the weak direction every round. A pair of replicas that cannot punch to each other
+fails the reduction and says so; it does not fall back to the client, for the reason
+[Link floor](#link-floor) gives.
+
+### How often to synchronize <!-- id: distributed-local-steps -->
+
+> `letify.local_steps(param_bytes, step_seconds)` answers how many steps to take between
+> reductions, from the link letify has already measured.
+
+A reduction moves the parameters once, so it is worth it only when it is rare enough against the
+step it interrupts. `local_steps` returns the smallest number of local steps for which
+`param_bytes / (rate * steps)` is at most `share` of `step_seconds`, where `rate` is the measured
+upload of the link the probe recorded and `share` is 0.25 by default. It is at least 1, and 1 means
+the link is fast enough to reduce every step, which is what `DistributedDataParallel` does.
+
+The two arguments are the two things letify cannot know: how large the parameters are and how long
+a step takes. `rate` is the thing the user cannot know and letify already has. A runtime whose link
+reports no rate raises rather than guessing, naming the probe, because a guess here is a guess
+about the whole run's shape.
+
+Worked from measurements already in this document, for 100 MB of parameters and a 0.2 s step, where a reduction takes 4.54 s at 21 MiB/s and 28.05 s at 3.4 MiB/s against the 0.05 s a quarter of the step allows: `local_steps` is 91 on the near Kaggle runtime and 561 on the far one. The number is therefore per runtime rather than per job, which is what letify can offer that a fixed hyperparameter cannot, and the six fold spread between those two is the size of what a fixed one gets wrong.
+
+### The assembled loop <!-- id: distributed-loop -->
+
+> `@let.distributed(...)` runs the local-steps-then-average loop for the user, which is the one
+> loop letify owns. Every other scheme uses the reductions directly.
+
+The declaration takes what letify cannot infer and nothing else:
+
+| Argument | Is |
+|---|---|
+| `device` | the replica list, as [Replicas](#distributed-placement) describes |
+| `model` | a callable the runtime calls to build the model |
+| `data` | a callable taking `(rank, world_size)` and returning this replica's data |
+| `inner` | a callable taking the parameters and returning the optimizer the local steps use |
+| `outer` | the same, for the optimizer the average is applied with |
+| `local_steps` | an integer, or `letify.auto` to ask [How often to synchronize](#distributed-local-steps) |
+| `rounds` | how many times to run `local_steps` steps and then average |
+
+`inner` and `outer` are callables rather than names, so a PyTorch optimizer class is passed
+directly and `functools.partial` carries its hyperparameters. letify holds no list of optimizers
+and so cannot be behind the one a user wants. The decorated function is one step, taking a batch
+and the model and returning the loss, and the loop calls it.
+
+A round runs `local_steps` steps with `inner`, then takes the pseudo-gradient, the parameters
+before the round minus the parameters after it, reduces that across replicas with
+`letify.all_reduce`, and applies it through `outer`. `local_steps=letify.auto` measures the first
+steps of the first round to learn `step_seconds` and then asks `local_steps`, which is the only
+thing this loop does that the user could not do as well in their own: the link's rate is letify's
+to know, and the step time is cheap to measure once the loop is already here.
+
+`local_steps=1` is an all-reduce every step, which is what `DistributedDataParallel` does, and is
+right only on a link fast enough for it. The default asks rather than assuming, because the
+measured range on free runtimes spans 3.4 to 21 MiB/s and the answer differs by a factor of six
+across it.
+
+This is one algorithm, not a framework. The loop returns the per-round losses, and the final
+parameters are the model's on each replica, so a checkpoint is the user's to write from the body as
+in any other call. A scheme this loop cannot express, anything that exchanges more than the
+pseudo-gradient or that weights replicas differently, writes its own loop over
+`letify.all_reduce`, which is the layer this one is built on.
 
 ### Invocation
 
@@ -1062,6 +1178,21 @@ A `stat` cannot take that snapshot first, because it is on a data loader's hot p
 - **A bucket-backed ephemeral provider.** A pull that fails is retried twice with the same downscoped headers, then a third time with headers the local process derives again, and a pull that still fails fails the open with `RuntimeFailure`. A `data_want` for a digest not yet uploaded moves that object to the front of the upload queue, and the worker pulls it when the local process sends its `data_pull`.
 
 #### Ordering with write-back and the cache budget <!-- id: project-data-streaming-order -->
+
+**A write-back that fails leaves no empty directory behind.** A file is written to a
+`.<name>.letify-partial.<pid>.<thread>` beside its target and renamed over it, so a reader never
+sees a half written file, and the target's parent directories are created immediately before that
+rather than as a tree up front. A stream that fails after those directories were created would
+leave them empty, and a resume that picks the newest directory by name then trusts a checkpoint
+that holds nothing: a live session lost about 2,300 steps that way, on four directories whose
+files never arrived because the blobs they streamed from had been pruned. So the write-back
+removes the directories it created itself, innermost first, when its file does not arrive, and
+only while they are still empty. A directory that already existed, or that holds anything, is left
+alone.
+
+This covers a write-back that fails, not a client that is killed. A process that dies between the
+`mkdir` and the rename cannot clean up after itself, so a resume that reads a directory name still
+has to check for the file it needs.
 
 A blob still being written is never evicted. Runtime data cache budget skips a blob whose link count is above 1 and one used within the past 600 seconds; a blob that is pending or in flight for any running call is skipped as well, by the manifests the worker holds, and partial files are skipped as they already are.
 
