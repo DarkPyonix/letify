@@ -172,3 +172,28 @@ def test_a_replica_that_fails_fails_the_call(launcher_from) -> None:
     with pytest.raises(letify.RemoteError) as failure:
         breaks()
     assert "the second replica refused" in str(failure.value)
+
+
+def test_a_replica_does_not_need_torch_on_this_machine(launcher_from, no_module) -> None:
+    """Spec "Replicas": the placement is not local, so nothing asks for PyTorch here.
+
+    The replicas were handed to the provider without the declared placement folded in,
+    so their placement read as the default, local, and `check_mode` asked for PyTorch on
+    the client. It passed on a machine that has torch and failed on CI, which does not.
+    """
+    let = launcher_from('[a]\nkind = "local"\n\n[b]\nkind = "local"\n')
+
+    @let.function(
+        device=[let.providers.a.CPU, let.providers.b.CPU], host=letify.distributed
+    )
+    def who() -> int:
+        import letify as inner
+
+        return inner.rank()
+
+    no_module("torch")
+    assert who() == [0, 1]
+    assert [instance.placement for instance in who.replicas] == [
+        letify.distributed,
+        letify.distributed,
+    ]

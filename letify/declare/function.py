@@ -65,8 +65,11 @@ class Function(Generic[R]):
         self.data_order = data_order
         self.data_first_wave = data_first_wave
         self.is_async = inspect.iscoroutinefunction(fn)
-        #: Spec "Replicas": one Instance per replica, in the order the list named them.
-        self.replicas = _replicas(device, self.host)
+        #: Spec "Replicas": one Instance per replica, in the order the list named them,
+        #: each carrying the declared placement so a provider is not told it is local.
+        self.replicas = tuple(
+            instance._placed(self.host) for instance in _replicas(device, self.host)
+        )
         self.device = self._place(self.replicas[0] if self.replicas else device)
         update_wrapper(self, fn)
 
