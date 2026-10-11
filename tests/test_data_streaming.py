@@ -1365,3 +1365,74 @@ def test_the_patch_a_fresh_process_installs_arrives_through_sitecustomize() -> N
         )
     assert "SITECUSTOMIZE" in done.stderr, done.stderr
     assert "PTH" not in done.stderr, done.stderr
+
+
+def test_the_prune_leaves_a_live_call_its_blobs(launcher_from, project) -> None:
+    """Spec "Runtime data cache budget": a blob in flight for a running call is skipped.
+
+    A call is told which digests the runtime holds and does not send those, so a blob
+    removed between the answer and the use fails the call. A ten minute call outlived the
+    600 s recency window meant to carry it, and a second call beside it pruned 148 blobs
+    at once down to the budget, including ones the first had been told it had. Requests on
+    one channel may overlap, so the prune is sent here while the call is still running,
+    which is the same collision without the timing.
+
+    This passes without the guard as well: every shape that could be built quickly leaves
+    the blob with two links or a fresh use time, which the two older guards already cover.
+    It pins the behaviour the spec states rather than reproducing the failure, and the
+    reproduction is still open.
+    """
+    # Nothing in the first wave, so the call places its files while it runs and the ones
+    # it has not reached yet sit in the cache with a single link, which is the only state
+    # the old guards did not cover.
+    let = streaming(launcher_from, data_first_wave_mib=0)
+    root = dataset(project, 4, size=1 << 18)
+    started = threading.Event()
+
+    @let.function(device=let.providers.lab.CPU, host=letify.remote)
+    def reads(directory: Path, flag: str) -> int:
+        import os
+        import time
+
+        with open(flag, "w") as handle:
+            handle.write("in")
+        for _ in range(400):
+            if not os.path.exists(flag):
+                break
+            time.sleep(0.02)
+        total = 0
+        for entry in sorted(directory.iterdir()):
+            total += len(entry.read_bytes())
+        return total
+
+    flag = project / "running.flag"
+    answer: list = []
+
+    def call() -> None:
+        answer.append(reads(root, str(flag)))
+
+    with let.keep_alive():
+        # One call first, so every blob is in the cache before the call under test starts.
+        assert reads(root, str(project / "warm.flag")) == 4 * (1 << 18)
+        worker = threading.Thread(target=call, daemon=True)
+        worker.start()
+        for _ in range(200):
+            if flag.exists():
+                started.set()
+                break
+            time.sleep(0.02)
+        assert started.is_set(), "the call never reported that it had started"
+        runtime = next(
+            held for bucket in let.pool._runtimes.values() for held in bucket
+        )
+        root = (runtime.workspace or runtime.provider.workspace_root).rstrip("/")
+        # Budget zero, so the prune takes everything it is allowed to take.
+        runtime.request(
+            # recent 0, so only the live call's own guard can save its blobs.
+            {"op": "data_evict", "dir": f"{root}/data/blobs", "budget": 1, "recent": 0},
+            timeout=60,
+        )
+        flag.unlink()
+        worker.join(60)
+
+    assert answer == [4 * (1 << 18)], answer

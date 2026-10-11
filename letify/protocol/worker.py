@@ -675,12 +675,38 @@ def _data_budget(root, total, budget):
     return min(_DATA_DEFAULT_BUDGET, (total + free) // 2)
 
 
+def _digest_of(path):
+    """The digest a blob path holds, which is its shard directory and its name joined."""
+    return os.path.basename(path)
+
+
+def _data_digests_in_flight():
+    """Every digest a running call lists, so the prune does not take one out from under it.
+
+    Spec "Runtime data cache budget". Read under the lock the data thread writes the maps
+    with, so a call registering while this reads cannot change one mid iteration.
+    """
+    wanted = set()
+    with _DATA_READY:
+        for state in list(_DATA_CALLS.values()):
+            wanted.update(state["by_digest"])
+    return wanted
+
+
 def _op_data_evict(request):
-    """Remove least recently used blobs no call links until the cache is within budget."""
+    """Remove least recently used blobs no call links until the cache is within budget.
+
+    Spec "Runtime data cache budget": a digest a running call lists is skipped whatever
+    its link count and age, because the call was told the runtime held it and so did not
+    send it. ``recent`` is the window a blob no call is using is protected for, carried on
+    the request beside the budget.
+    """
     started = time.monotonic()
     root = os.path.expanduser(request["dir"])
     files, total = _data_scan(root)
     budget = _data_budget(root, total, request.get("budget"))
+    recent = float(request.get("recent", _DATA_RECENT_S))
+    wanted = _data_digests_in_flight()
     removed = freed = 0
     if total > budget:
         now = time.time()
@@ -688,7 +714,7 @@ def _op_data_evict(request):
         for used, path, size, links in files:
             if total <= budget:
                 break
-            if links > 1 or now - used < _DATA_RECENT_S:
+            if links > 1 or now - used < recent or _digest_of(path) in wanted:
                 continue
             try:
                 os.remove(path)
