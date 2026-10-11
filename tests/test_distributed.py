@@ -125,3 +125,25 @@ def test_local_steps_refuses_a_link_that_was_never_measured() -> None:
     with pytest.raises(letify.UnsupportedMode) as failure:
         steps_for(param_bytes=1, step_seconds=1.0, rate_bps=None)
     assert "probe" in str(failure.value)
+
+
+def test_calling_a_distributed_declaration_says_it_is_not_finished(launcher_from) -> None:
+    """Spec "Replicas": the placement is declared and the runner is not written yet.
+
+    Accepting the declaration and then running on the first replica alone would be worse
+    than refusing: the user asked for several and would be billed for one, silently.
+    """
+    let = launcher_from('[a]\nkind = "local"\n\n[b]\nkind = "local"\n')
+
+    @let.function(
+        device=[let.providers.a.CPU, let.providers.b.CPU], host=letify.distributed
+    )
+    def body() -> int:
+        return 1
+
+    with pytest.raises(letify.UnsupportedMode) as failure:
+        body()
+    message = str(failure.value)
+    assert "cannot run them yet" in message
+    assert "2 replicas" in message
+    assert "letify.remote" in message
