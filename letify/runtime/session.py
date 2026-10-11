@@ -269,6 +269,7 @@ class Runtime:
         timeout: float | None = None,
         data_order: Any = None,
         data_first_wave: int | None = None,
+        replica: dict[str, Any] | None = None,
     ) -> tuple[Any, str]:
         """Run one declared function inside this runtime.
 
@@ -283,7 +284,9 @@ class Runtime:
                 fn, args, kwargs, timeout=timeout, modules=self.env.ship_modules
             )
         args, kwargs = self._externalize(args, kwargs)
-        return self._call_with_data(fn, args, kwargs, timeout, data_order, data_first_wave)
+        return self._call_with_data(
+            fn, args, kwargs, timeout, data_order, data_first_wave, replica
+        )
 
     def _call_with_data(
         self,
@@ -293,6 +296,7 @@ class Runtime:
         timeout: float | None,
         data_order: Any = None,
         data_first_wave: int | None = None,
+        replica: dict[str, Any] | None = None,
     ) -> tuple[Any, str]:
         """Pickle a call, place the first wave of its data, and send the rest beside it.
 
@@ -317,6 +321,10 @@ class Runtime:
                     ship_digests.add(digest)
         head, buffers = protocol.dumps_call_parts(fn, args, kwargs, data=collector)
         request: dict[str, Any] = {"op": "call", "payload": head, "buffers": buffers}
+        if replica is not None:
+            # Spec "Replicas": the body reads its rank on the runtime, not here, so the
+            # numbers travel with the call rather than being set on a client thread.
+            request["replica"] = replica
         blobs = f"{root}/data/blobs"
         stream: pathdata.Stream | None = None
         if self.env.ship_modules:

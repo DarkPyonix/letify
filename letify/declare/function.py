@@ -139,18 +139,21 @@ class Function(Generic[R]):
     def _run(self, args: tuple, kwargs: dict) -> Any:
         launcher = self.launcher
         if self.host is Host.distributed:
-            # Spec "Replicas": the placement is declared and the runner is not written
-            # yet. Running the first replica alone would bill one runtime for a
-            # declaration that asked for several, without saying so.
-            raise UnsupportedMode(
-                f"host=letify.distributed declares {len(self.replicas)} replicas and "
-                f"letify cannot run them yet, so the call is refused rather than run on "
-                f"one of them. Use host=letify.remote with a single device until it is "
-                f"finished."
-            )
+            return self._run_replicas(args, kwargs)
         instance = launcher.resolve(self.device)
         if instance.placement is Host.local:
             return self._run_here(instance, args, kwargs)
+        return self._run_one(instance, args, kwargs)
+
+    def _run_one(
+        self, instance: Any, args: tuple, kwargs: dict, replica: dict | None = None
+    ) -> Any:
+        """Run the body on one runtime, retrying on an infrastructure failure.
+
+        One replica of a distributed call runs through here too, so a replica gets the
+        same retries and the same reporting as a call that named a single device.
+        """
+        launcher = self.launcher
         last: Exception | None = None
 
         for attempt in range(self.retries + 1):
@@ -166,6 +169,7 @@ class Function(Generic[R]):
                     timeout=self.timeout,
                     data_order=self.data_order,
                     data_first_wave=self.data_first_wave,
+                    replica=_with_rate(replica, runtime),
                 )
             except (RuntimeFailure, ProtocolError) as failure:
                 # The session misbehaved rather than the user's code, so this runtime
@@ -199,6 +203,40 @@ class Function(Generic[R]):
                 return value
 
         raise RuntimeLost(str(last))  # pragma: no cover
+
+    def _run_replicas(self, args: tuple, kwargs: dict) -> list:
+        """Run the body once per replica, and answer with their values in rank order.
+
+        Spec "Replicas": each replica is told which one it is, the call waits for all of
+        them, and a replica that fails fails the call, as a single remote call's failure
+        does. The replicas run at the same time, because running them in turn would make
+        a reduction between them impossible.
+        """
+        import threading
+
+        world = len(self.replicas)
+        values: list = [None] * world
+        failures: list[BaseException] = []
+
+        def run(rank: int, instance: Any) -> None:
+            try:
+                values[rank] = self._run_one(
+                    instance, args, kwargs, {"rank": rank, "world_size": world}
+                )
+            except BaseException as exc:  # reported after every replica has stopped
+                failures.append(exc)
+
+        threads = [
+            threading.Thread(target=run, args=(rank, instance), daemon=True)
+            for rank, instance in enumerate(self.replicas)
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        if failures:
+            raise failures[0]
+        return values
 
     def _run_here(self, instance: Any, args: tuple, kwargs: dict) -> Any:
         """Run the body in this process with its PyTorch operators on the runtime's device.
@@ -259,6 +297,23 @@ def _report_deferred(delta: Any) -> None:
             f"{delta.resolved_early} resolved early",
             file=sys.stderr,
         )
+
+
+def _with_rate(replica: dict | None, runtime: Any) -> dict | None:
+    """The replica's numbers plus the rate its own link measured, for ``local_steps``.
+
+    Spec "How often to synchronize": the rate is the quantity only letify has, and it is
+    this replica's link rather than the job's, so it travels with the call.
+    """
+    if replica is None:
+        return None
+    rate = None
+    try:
+        link = runtime.provider.link(runtime)
+        rate = getattr(link, "upload_bps", None)
+    except Exception:
+        rate = None
+    return {**replica, "rate_bps": rate}
 
 
 def _replicas(device: Any, host: Host) -> tuple[Instance, ...]:

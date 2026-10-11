@@ -127,23 +127,48 @@ def test_local_steps_refuses_a_link_that_was_never_measured() -> None:
     assert "probe" in str(failure.value)
 
 
-def test_calling_a_distributed_declaration_says_it_is_not_finished(launcher_from) -> None:
-    """Spec "Replicas": the placement is declared and the runner is not written yet.
-
-    Accepting the declaration and then running on the first replica alone would be worse
-    than refusing: the user asked for several and would be billed for one, silently.
-    """
+def test_every_replica_runs_the_body_and_knows_which_one_it_is(launcher_from) -> None:
+    """Spec "Replicas": the same body once per device, and the values come back in rank order."""
     let = launcher_from('[a]\nkind = "local"\n\n[b]\nkind = "local"\n')
 
     @let.function(
         device=[let.providers.a.CPU, let.providers.b.CPU], host=letify.distributed
     )
-    def body() -> int:
-        return 1
+    def who() -> tuple[int, int]:
+        import letify as inner
 
-    with pytest.raises(letify.UnsupportedMode) as failure:
-        body()
-    message = str(failure.value)
-    assert "cannot run them yet" in message
-    assert "2 replicas" in message
-    assert "letify.remote" in message
+        return inner.rank(), inner.world_size()
+
+    assert who() == [(0, 2), (1, 2)]
+
+
+def test_one_replica_still_comes_back_as_a_list(launcher_from) -> None:
+    """Spec "Replicas": a single instance is one replica, so the shape does not change."""
+    let = launcher_from('[a]\nkind = "local"\n')
+
+    @let.function(device=let.providers.a.CPU, host=letify.distributed)
+    def who() -> tuple[int, int]:
+        import letify as inner
+
+        return inner.rank(), inner.world_size()
+
+    assert who() == [(0, 1)]
+
+
+def test_a_replica_that_fails_fails_the_call(launcher_from) -> None:
+    """Spec "Replicas": a replica that cannot run fails the call, as one remote call does."""
+    let = launcher_from('[a]\nkind = "local"\n\n[b]\nkind = "local"\n')
+
+    @let.function(
+        device=[let.providers.a.CPU, let.providers.b.CPU], host=letify.distributed
+    )
+    def breaks() -> int:
+        import letify as inner
+
+        if inner.rank() == 1:
+            raise ValueError("the second replica refused")
+        return 0
+
+    with pytest.raises(letify.RemoteError) as failure:
+        breaks()
+    assert "the second replica refused" in str(failure.value)
