@@ -1365,3 +1365,142 @@ def test_the_patch_a_fresh_process_installs_arrives_through_sitecustomize() -> N
         )
     assert "SITECUSTOMIZE" in done.stderr, done.stderr
     assert "PTH" not in done.stderr, done.stderr
+
+
+def test_the_prune_leaves_a_live_call_its_blobs(launcher_from, project) -> None:
+    """Spec "Runtime data cache budget": a blob in flight for a running call is skipped.
+
+    A call is told which digests the runtime holds and does not send those, so a blob
+    removed between the answer and the use fails the call. A ten minute call outlived the
+    600 s recency window meant to carry it, and a second call beside it pruned 148 blobs
+    at once down to the budget, including ones the first had been told it had. Requests on
+    one channel may overlap, so the prune is sent here while the call is still running,
+    which is the same collision without the timing.
+
+    This passes without the guard as well: every shape that could be built quickly leaves
+    the blob with two links or a fresh use time, which the two older guards already cover.
+    It pins the behaviour the spec states rather than reproducing the failure, and the
+    reproduction is still open.
+    """
+    # Nothing in the first wave, so the call places its files while it runs and the ones
+    # it has not reached yet sit in the cache with a single link, which is the only state
+    # the old guards did not cover.
+    let = streaming(launcher_from, data_first_wave_mib=0)
+    root = dataset(project, 4, size=1 << 18)
+    started = threading.Event()
+
+    @let.function(device=let.providers.lab.CPU, host=letify.remote)
+    def reads(directory: Path, flag: str) -> int:
+        import os
+        import time
+
+        with open(flag, "w") as handle:
+            handle.write("in")
+        for _ in range(400):
+            if not os.path.exists(flag):
+                break
+            time.sleep(0.02)
+        total = 0
+        for entry in sorted(directory.iterdir()):
+            total += len(entry.read_bytes())
+        return total
+
+    flag = project / "running.flag"
+    answer: list = []
+
+    def call() -> None:
+        answer.append(reads(root, str(flag)))
+
+    with let.keep_alive():
+        # One call first, so every blob is in the cache before the call under test starts.
+        assert reads(root, str(project / "warm.flag")) == 4 * (1 << 18)
+        worker = threading.Thread(target=call, daemon=True)
+        worker.start()
+        for _ in range(200):
+            if flag.exists():
+                started.set()
+                break
+            time.sleep(0.02)
+        assert started.is_set(), "the call never reported that it had started"
+        runtime = next(
+            held for bucket in let.pool._runtimes.values() for held in bucket
+        )
+        root = (runtime.workspace or runtime.provider.workspace_root).rstrip("/")
+        # Budget zero, so the prune takes everything it is allowed to take.
+        runtime.request(
+            # recent 0, so only the live call's own guard can save its blobs.
+            {"op": "data_evict", "dir": f"{root}/data/blobs", "budget": 1, "recent": 0},
+            timeout=60,
+        )
+        flag.unlink()
+        worker.join(60)
+
+    assert answer == [4 * (1 << 18)], answer
+
+
+def test_a_write_back_that_fails_leaves_no_empty_directory(
+    launcher_from, project, monkeypatch
+) -> None:
+    """Spec "Writing back": a failed stream removes the directories it made.
+
+    A live session's write-back created four checkpoint directories whose files never
+    arrived, because the blobs they streamed from had been pruned, and a resume picked the
+    newest by name and found nothing in it. That cost about 2,300 steps.
+    """
+    let = streaming(launcher_from, data_first_wave_mib=1024)
+    out = project / "outputs"
+    out.mkdir()
+
+    @let.function(device=let.providers.lab.CPU, host=letify.remote)
+    def writes(directory: Path) -> int:
+        import os as _os
+
+        made = _os.path.join(str(directory), "checkpoint-2607")
+        _os.makedirs(made, exist_ok=True)
+        with open(_os.path.join(made, "trainer_state.json"), "wb") as handle:
+            handle.write(b'{"step": 2607}')
+        return 1
+
+    # The stream fails the way a pruned blob makes it fail.
+    from letify.store import pathdata as module
+
+    def refuse(runtime, payload):
+        raise letify.RuntimeFailure("data_stream failed: FileNotFoundError")
+
+    monkeypatch.setattr(module, "_stream", refuse)
+    with pytest.raises(letify.LetifyError):
+        writes(out)
+
+    assert not (out / "checkpoint-2607").exists(), sorted(
+        str(p.relative_to(out)) for p in out.rglob("*")
+    )
+
+
+def test_a_write_back_leaves_a_directory_that_was_already_there(
+    launcher_from, project, monkeypatch
+) -> None:
+    """Spec: a directory that already existed, or that holds anything, is left alone."""
+    let = streaming(launcher_from, data_first_wave_mib=1024)
+    out = project / "outputs"
+    (out / "checkpoint-2607").mkdir(parents=True)
+    (out / "checkpoint-2607" / "kept.txt").write_text("mine", encoding="utf-8")
+
+    @let.function(device=let.providers.lab.CPU, host=letify.remote)
+    def writes(directory: Path) -> int:
+        import os as _os
+
+        made = _os.path.join(str(directory), "checkpoint-2607")
+        with open(_os.path.join(made, "trainer_state.json"), "wb") as handle:
+            handle.write(b'{"step": 2607}')
+        return 1
+
+    from letify.store import pathdata as module
+
+    def refuse(runtime, payload):
+        raise letify.RuntimeFailure("data_stream failed: FileNotFoundError")
+
+    monkeypatch.setattr(module, "_stream", refuse)
+    with pytest.raises(letify.LetifyError):
+        writes(out)
+
+    assert (out / "checkpoint-2607" / "kept.txt").read_text(encoding="utf-8") == "mine"

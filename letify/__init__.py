@@ -33,6 +33,7 @@ from .declare.cache import session_cache
 from .declare.env import Env
 from .declare.function import Function
 from .declare.instance import AnyInstance, Host, Instance
+from .declare.replicas import local_steps, rank, world_size
 from .errors import (
     ConfigError,
     EnvironmentFailure,
@@ -58,11 +59,12 @@ from .store.volume import Volume
 #: ``Final`` so a type checker sees the literal member, which the declaration overloads match on.
 local: Final = Host.local
 remote: Final = Host.remote
+distributed: Final = Host.distributed
 
 # The enum class stays importable from letify.declare.instance for letify's own use.
 del Host
 
-__version__ = "2.4.2"
+__version__ = "2.4.3"
 
 
 def fetch(tensor):  # type: ignore[no-untyped-def]
@@ -101,7 +103,11 @@ __all__ = [
     "UnsupportedMode",
     "Volume",
     "__version__",
+    "distributed",
     "local",
+    "local_steps",
+    "rank",
     "remote",
     "session_cache",
+    "world_size",
 ]

@@ -65,7 +65,9 @@ class Function(Generic[R]):
         self.data_order = data_order
         self.data_first_wave = data_first_wave
         self.is_async = inspect.iscoroutinefunction(fn)
-        self.device = self._place(device)
+        #: Spec "Replicas": one Instance per replica, in the order the list named them.
+        self.replicas = _replicas(device, self.host)
+        self.device = self._place(self.replicas[0] if self.replicas else device)
         update_wrapper(self, fn)
 
     def _place(self, device: Instance | AnyInstance) -> Instance | AnyInstance:
@@ -136,6 +138,16 @@ class Function(Generic[R]):
 
     def _run(self, args: tuple, kwargs: dict) -> Any:
         launcher = self.launcher
+        if self.host is Host.distributed:
+            # Spec "Replicas": the placement is declared and the runner is not written
+            # yet. Running the first replica alone would bill one runtime for a
+            # declaration that asked for several, without saying so.
+            raise UnsupportedMode(
+                f"host=letify.distributed declares {len(self.replicas)} replicas and "
+                f"letify cannot run them yet, so the call is refused rather than run on "
+                f"one of them. Use host=letify.remote with a single device until it is "
+                f"finished."
+            )
         instance = launcher.resolve(self.device)
         if instance.placement is Host.local:
             return self._run_here(instance, args, kwargs)
@@ -249,6 +261,42 @@ def _report_deferred(delta: Any) -> None:
         )
 
 
+def _replicas(device: Any, host: Host) -> tuple[Instance, ...]:
+    """The replicas a declaration names, or empty when it names a single device.
+
+    Spec "Replicas": ``device`` takes a list only under ``host=letify.distributed``, each
+    entry is one replica, and two replicas of one instance are refused because that asks
+    one account for twice the devices it has.
+    """
+    listed = isinstance(device, (list, tuple))
+    if listed and host is not Host.distributed:
+        raise ValueError(
+            f"device is a list of {len(device)} instances, which declares one replica "
+            f"each, so it needs host=letify.distributed. Under host={host.value!r} name "
+            f"one device."
+        )
+    if not listed:
+        return (device,) if host is Host.distributed else ()
+    if not device:
+        raise ValueError(
+            "device is an empty list, so the declaration names no replica. Name at least "
+            "one instance."
+        )
+    seen: list[str] = []
+    for instance in device:
+        alias = getattr(getattr(instance, "provider", None), "alias", None)
+        name = getattr(instance, "accelerator", None)
+        key = f"{alias}.{name}"
+        if key in seen:
+            raise ValueError(
+                f"device names {key} twice, so one account would be asked for twice the "
+                f"devices one replica takes. Name each account once, and use a larger "
+                f"instance such as {name} * 2 for more devices in one replica."
+            )
+        seen.append(key)
+    return tuple(device)
+
+
 def _where(host: Host | str | None) -> Host:
     """Validate the declared host placement, naming both options when it is wrong."""
     if host is None:
@@ -258,8 +306,9 @@ def _where(host: Host | str | None) -> Host:
     except ValueError:
         raise ValueError(
             f"host={host!r} is not a host placement. Use host='local' to keep Python "
-            f"here and forward PyTorch operators, or host='remote' to ship the function to "
-            f"the machine that holds the device."
+            f"here and forward PyTorch operators, host='remote' to ship the function to "
+            f"the machine that holds the device, or host='distributed' to run it once per "
+            f"device in a list."
         ) from None
 
 
