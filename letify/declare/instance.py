@@ -39,6 +39,9 @@ class Host(StrEnum):
 
     local = "local"
     remote = "remote"
+    #: The same body on every device of a ``device`` list, each replica knowing its rank.
+    #: Spec "Replicas".
+    distributed = "distributed"
 
 
 @dataclass(frozen=True, slots=True)
