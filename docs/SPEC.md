@@ -1179,6 +1179,21 @@ A `stat` cannot take that snapshot first, because it is on a data loader's hot p
 
 #### Ordering with write-back and the cache budget <!-- id: project-data-streaming-order -->
 
+**A write-back that fails leaves no empty directory behind.** A file is written to a
+`.<name>.letify-partial.<pid>.<thread>` beside its target and renamed over it, so a reader never
+sees a half written file, and the target's parent directories are created immediately before that
+rather than as a tree up front. A stream that fails after those directories were created would
+leave them empty, and a resume that picks the newest directory by name then trusts a checkpoint
+that holds nothing: a live session lost about 2,300 steps that way, on four directories whose
+files never arrived because the blobs they streamed from had been pruned. So the write-back
+removes the directories it created itself, innermost first, when its file does not arrive, and
+only while they are still empty. A directory that already existed, or that holds anything, is left
+alone.
+
+This covers a write-back that fails, not a client that is killed. A process that dies between the
+`mkdir` and the rename cannot clean up after itself, so a resume that reads a directory name still
+has to check for the file it needs.
+
 A blob still being written is never evicted. Runtime data cache budget skips a blob whose link count is above 1 and one used within the past 600 seconds; a blob that is pending or in flight for any running call is skipped as well, by the manifests the worker holds, and partial files are skipped as they already are.
 
 A write-back waits for nothing that is still arriving. It runs after the transfer is cancelled, and it uses the worker's manifest to decide what to walk: a file that was never placed is unchanged by definition, so it is not fetched, not hashed and not written back. A file placed during the call is compared exactly as Writing back describes.

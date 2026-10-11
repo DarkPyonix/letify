@@ -1183,7 +1183,10 @@ def _get(
     """
     from ..protocol.codec import _hasher
 
-    target.parent.mkdir(parents=True, exist_ok=True)
+    # Spec "Writing back": a stream that fails after these were created would leave them
+    # empty, and a resume that picks the newest directory by name then trusts a checkpoint
+    # holding nothing. Remembered so the failure can take back exactly what it made.
+    made = _made_dirs(target.parent)
     partial = target.with_name(
         f".{target.name}.letify-partial.{os.getpid()}.{threading.get_ident()}"
     )
@@ -1210,6 +1213,7 @@ def _get(
     writer = threading.Thread(target=write_pieces, daemon=True)
     writer.start()
     received = 0
+    landed = False
     try:
         for piece in _stream(runtime, {"op": "data_stream", "dir": blobs, "digest": digest}):
             view = memoryview(piece).cast("B")
@@ -1230,11 +1234,46 @@ def _get(
         if found != digest:
             raise RuntimeFailure(f"{runtime.name}: file blob {digest} arrived with digest {found}")
         os.replace(partial, target)
+        landed = True
     finally:
         if writer.is_alive():
             pieces.put(None)
             writer.join(5)
+        # Before the directories are taken back, or they would not be empty yet.
         partial.unlink(missing_ok=True)
+        if not landed:
+            _unmake_dirs(made)
+
+
+def _made_dirs(directory: Path) -> list[Path]:
+    """Create ``directory`` and return the ones this call had to make, innermost last.
+
+    Spec "Writing back": only what letify made is ever taken back, so a directory the
+    user already had is never touched.
+    """
+    missing: list[Path] = []
+    probe = directory
+    while not probe.exists():
+        missing.append(probe)
+        parent = probe.parent
+        if parent == probe:
+            break
+        probe = parent
+    directory.mkdir(parents=True, exist_ok=True)
+    return list(reversed(missing))
+
+
+def _unmake_dirs(made: list[Path]) -> None:
+    """Remove the directories ``_made_dirs`` created, innermost first, while empty.
+
+    Spec "Writing back". A directory that holds anything is left alone, because something
+    else put it there.
+    """
+    for directory in reversed(made):
+        try:
+            directory.rmdir()
+        except OSError:
+            return
 
 
 def _worker(runtime: Runtime, payload: dict[str, Any]) -> Any:

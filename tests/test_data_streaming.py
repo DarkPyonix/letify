@@ -1436,3 +1436,71 @@ def test_the_prune_leaves_a_live_call_its_blobs(launcher_from, project) -> None:
         worker.join(60)
 
     assert answer == [4 * (1 << 18)], answer
+
+
+def test_a_write_back_that_fails_leaves_no_empty_directory(
+    launcher_from, project, monkeypatch
+) -> None:
+    """Spec "Writing back": a failed stream removes the directories it made.
+
+    A live session's write-back created four checkpoint directories whose files never
+    arrived, because the blobs they streamed from had been pruned, and a resume picked the
+    newest by name and found nothing in it. That cost about 2,300 steps.
+    """
+    let = streaming(launcher_from, data_first_wave_mib=1024)
+    out = project / "outputs"
+    out.mkdir()
+
+    @let.function(device=let.providers.lab.CPU, host=letify.remote)
+    def writes(directory: Path) -> int:
+        import os as _os
+
+        made = _os.path.join(str(directory), "checkpoint-2607")
+        _os.makedirs(made, exist_ok=True)
+        with open(_os.path.join(made, "trainer_state.json"), "wb") as handle:
+            handle.write(b'{"step": 2607}')
+        return 1
+
+    # The stream fails the way a pruned blob makes it fail.
+    from letify.store import pathdata as module
+
+    def refuse(runtime, payload):
+        raise letify.RuntimeFailure("data_stream failed: FileNotFoundError")
+
+    monkeypatch.setattr(module, "_stream", refuse)
+    with pytest.raises(letify.LetifyError):
+        writes(out)
+
+    assert not (out / "checkpoint-2607").exists(), sorted(
+        str(p.relative_to(out)) for p in out.rglob("*")
+    )
+
+
+def test_a_write_back_leaves_a_directory_that_was_already_there(
+    launcher_from, project, monkeypatch
+) -> None:
+    """Spec: a directory that already existed, or that holds anything, is left alone."""
+    let = streaming(launcher_from, data_first_wave_mib=1024)
+    out = project / "outputs"
+    (out / "checkpoint-2607").mkdir(parents=True)
+    (out / "checkpoint-2607" / "kept.txt").write_text("mine", encoding="utf-8")
+
+    @let.function(device=let.providers.lab.CPU, host=letify.remote)
+    def writes(directory: Path) -> int:
+        import os as _os
+
+        made = _os.path.join(str(directory), "checkpoint-2607")
+        with open(_os.path.join(made, "trainer_state.json"), "wb") as handle:
+            handle.write(b'{"step": 2607}')
+        return 1
+
+    from letify.store import pathdata as module
+
+    def refuse(runtime, payload):
+        raise letify.RuntimeFailure("data_stream failed: FileNotFoundError")
+
+    monkeypatch.setattr(module, "_stream", refuse)
+    with pytest.raises(letify.LetifyError):
+        writes(out)
+
+    assert (out / "checkpoint-2607" / "kept.txt").read_text(encoding="utf-8") == "mine"
