@@ -138,6 +138,16 @@ class Function(Generic[R]):
 
     def _run(self, args: tuple, kwargs: dict) -> Any:
         launcher = self.launcher
+        if self.host is Host.distributed:
+            # Spec "Replicas": the placement is declared and the runner is not written
+            # yet. Running the first replica alone would bill one runtime for a
+            # declaration that asked for several, without saying so.
+            raise UnsupportedMode(
+                f"host=letify.distributed declares {len(self.replicas)} replicas and "
+                f"letify cannot run them yet, so the call is refused rather than run on "
+                f"one of them. Use host=letify.remote with a single device until it is "
+                f"finished."
+            )
         instance = launcher.resolve(self.device)
         if instance.placement is Host.local:
             return self._run_here(instance, args, kwargs)
