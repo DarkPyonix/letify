@@ -1496,3 +1496,48 @@ def test_a_session_with_the_cards_and_a_driver_passes() -> None:
         session.check_devices()
     finally:
         Runtime.eval = original
+
+
+def test_a_session_whose_cuinit_fails_is_refused() -> None:
+    """Spec "Kaggle": cuInit is the call CUDA initialization makes.
+
+    A live session listed both T4s and had /dev/nvidiactl, and the first .cuda() still
+    raised "Found no NVIDIA driver on your system" after 30 GB of shards had been sent.
+    """
+    from letify.errors import InsufficientDevices
+    from letify.runtime.session import Runtime
+
+    provider = kaggle_provider()
+    session = object.__new__(Runtime)
+    session.name = "letify-t4-fc7e27"
+    session.provider = provider
+    session.instance = type("I", (), {"gpu": "T4", "accelerator": "T4"})()
+    answer = {"cards": ["Tesla T4", "Tesla T4"], "driver": True, "cuinit": 100}
+    monkey = lambda self, source, timeout=None: answer  # noqa: E731
+    Runtime.eval, original = monkey, Runtime.eval
+    try:
+        with pytest.raises(InsufficientDevices) as failure:
+            session.check_devices()
+    finally:
+        Runtime.eval = original
+    message = str(failure.value)
+    assert "cuInit" in message
+    assert "100" in message
+
+
+def test_a_session_whose_cuinit_succeeds_passes() -> None:
+    """Spec: zero from cuInit is what CUDA starting looks like."""
+    from letify.runtime.session import Runtime
+
+    provider = kaggle_provider()
+    session = object.__new__(Runtime)
+    session.name = "letify-t4-ok"
+    session.provider = provider
+    session.instance = type("I", (), {"gpu": "T4", "accelerator": "T4"})()
+    answer = {"cards": ["Tesla T4", "Tesla T4"], "driver": True, "cuinit": 0}
+    monkey = lambda self, source, timeout=None: answer  # noqa: E731
+    Runtime.eval, original = monkey, Runtime.eval
+    try:
+        session.check_devices()
+    finally:
+        Runtime.eval = original
