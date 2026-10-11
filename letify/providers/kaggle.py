@@ -1508,10 +1508,15 @@ class Kaggle(Provider):
             )
             return bridge
         self._links[name] = link
-        return PersistentChannel(
-            link.ssh_command(f"{self.remote_python} -u -c {_shlex.quote(BOOTSTRAP)}"),
-            name=name,
-        )
+        # Spec "Kaggle runtimes": the kernel finds libcuda through LD_LIBRARY_PATH and a
+        # worker started over SSH does not inherit it, so it is read through the bridge and
+        # set in the command's environment. The loader reads it when the process starts, so
+        # setting it from inside the worker would be too late.
+        remote = f"{self.remote_python} -u -c {_shlex.quote(BOOTSTRAP)}"
+        libraries = self.kernel_library_path(bridge)
+        if libraries:
+            remote = f"env LD_LIBRARY_PATH={_shlex.quote(libraries)} {remote}"
+        return PersistentChannel(link.ssh_command(remote), name=name)
 
     @property
     def min_session_interval_s(self) -> float:
@@ -1537,6 +1542,19 @@ class Kaggle(Provider):
         """A punch, which is what one more stream costs here. Measured at about 10 s."""
         value = self.config.option("transfer_connection_cost_s")
         return max(0.0, float(value)) if isinstance(value, (int, float)) else 10.0
+
+    def kernel_library_path(self, bridge: Any) -> str:
+        """The kernel's own ``LD_LIBRARY_PATH``, asked through the bridge, or empty.
+
+        Spec "Kaggle runtimes". Never raises: a session whose bridge cannot answer is one
+        letify should still try, and the card check refuses it when CUDA cannot start.
+        """
+        source = "import os\n__letify_value__ = os.environ.get('LD_LIBRARY_PATH') or ''\n"
+        try:
+            value, _ = bridge.request({"op": "eval", "source": source}, timeout=60)
+        except Exception:
+            return ""
+        return value.strip() if isinstance(value, str) else ""
 
     def link(self, runtime: Runtime | None = None) -> Any:
         """The link carrying this runtime, or None when the bridge is carrying it.

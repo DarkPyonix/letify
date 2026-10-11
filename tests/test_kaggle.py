@@ -1489,7 +1489,7 @@ def test_a_session_with_the_cards_and_a_driver_passes() -> None:
     session.name = "letify-t4-ok"
     session.provider = provider
     session.instance = type("I", (), {"gpu": "T4", "accelerator": "T4"})()
-    answer = {"cards": ["Tesla T4", "Tesla T4"], "driver": True}
+    answer = {"cards": ["Tesla T4", "Tesla T4"], "driver": True, "cuinit": 0}
     monkey = lambda self, source, timeout=None: answer  # noqa: E731
     Runtime.eval, original = monkey, Runtime.eval
     try:
@@ -1512,7 +1512,9 @@ def test_a_session_whose_cuinit_fails_is_refused() -> None:
     session.name = "letify-t4-fc7e27"
     session.provider = provider
     session.instance = type("I", (), {"gpu": "T4", "accelerator": "T4"})()
-    answer = {"cards": ["Tesla T4", "Tesla T4"], "driver": True, "cuinit": 100}
+    answer = {
+        "cards": ["Tesla T4", "Tesla T4"], "driver": True, "libcuda": True, "cuinit": 100
+    }
     monkey = lambda self, source, timeout=None: answer  # noqa: E731
     Runtime.eval, original = monkey, Runtime.eval
     try:
@@ -1534,10 +1536,43 @@ def test_a_session_whose_cuinit_succeeds_passes() -> None:
     session.name = "letify-t4-ok"
     session.provider = provider
     session.instance = type("I", (), {"gpu": "T4", "accelerator": "T4"})()
-    answer = {"cards": ["Tesla T4", "Tesla T4"], "driver": True, "cuinit": 0}
+    answer = {
+        "cards": ["Tesla T4", "Tesla T4"], "driver": True, "libcuda": True, "cuinit": 0
+    }
     monkey = lambda self, source, timeout=None: answer  # noqa: E731
     Runtime.eval, original = monkey, Runtime.eval
     try:
         session.check_devices()
     finally:
         Runtime.eval = original
+
+
+def test_a_missing_libcuda_is_not_reported_as_a_cuda_error() -> None:
+    """Spec "Kaggle": a CUresult is 0 or positive, so a sentinel would read as one.
+
+    A live refusal said `cuInit returned -1`, which is not a CUresult at all: it was the
+    value for "libcuda.so.1 did not load", a different fault that reads as a GPU session
+    on a CPU image.
+    """
+    from letify.errors import InsufficientDevices
+    from letify.runtime.session import Runtime
+
+    provider = kaggle_provider()
+    session = object.__new__(Runtime)
+    session.name = "letify-t4-d3012a"
+    session.provider = provider
+    session.instance = type("I", (), {"gpu": "T4", "accelerator": "T4"})()
+    answer = {
+        "cards": ["Tesla T4", "Tesla T4"], "driver": True, "libcuda": False, "cuinit": None
+    }
+    monkey = lambda self, source, timeout=None: answer  # noqa: E731
+    Runtime.eval, original = monkey, Runtime.eval
+    try:
+        with pytest.raises(InsufficientDevices) as failure:
+            session.check_devices()
+    finally:
+        Runtime.eval = original
+    message = str(failure.value)
+    assert "no libcuda.so.1 to load" in message
+    assert "cuInit returned" not in message
+    assert "-1" not in message
