@@ -716,16 +716,25 @@ class Runtime:
             return
         fragment, count = expected
         try:
-            cards = self.eval(bootstrap.CARD_SOURCE, timeout=120)
+            found = self.eval(bootstrap.CARD_SOURCE, timeout=120)
         except Exception:
             # Reading /proc is not worth failing a session over when it cannot be read.
             return
-        cards = [str(card) for card in cards or ()]
+        found = found if isinstance(found, dict) else {"cards": found, "driver": True}
+        cards = [str(card) for card in found.get("cards") or ()]
+        driver = bool(found.get("driver"))
         matched = [card for card in cards if fragment.casefold() in card.casefold()]
-        if len(matched) == count and len(cards) == count:
+        if len(matched) == count and len(cards) == count and driver:
             return
         asked = getattr(instance, "accelerator", None) or fragment
         arrived = ", ".join(cards) if cards else "no GPU at all"
+        if cards and not driver:
+            # Spec "Kaggle": the cards are right and the driver cannot be used, which the
+            # first .to("cuda") would have reported minutes into the call instead.
+            arrived = (
+                f"{arrived}, and no usable driver: /dev/nvidiactl is not there, so CUDA "
+                f"cannot start"
+            )
         message = (
             f"{self.name}: {self.provider.alias} was asked for {count} x {asked} and the "
             f"session has {arrived}. A declaration says where a function runs, so the "

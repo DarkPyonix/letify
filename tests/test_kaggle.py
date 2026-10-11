@@ -1451,3 +1451,48 @@ def test_a_refused_run_says_how_long_ago_the_last_session_was_made(
     assert "too soon" in detail
     path.write_text("", encoding="utf-8")
     assert refusal_detail("kaggle_a") == ""
+
+
+def test_a_session_with_the_cards_and_no_driver_is_refused() -> None:
+    """Spec "Kaggle": the cards can be listed on a session whose driver cannot be used.
+
+    A live T4 session passed the card check and then raised "Found no NVIDIA driver on
+    your system" at the first .to("cuda"), minutes into the call.
+    """
+    from letify.errors import InsufficientDevices
+    from letify.runtime.session import Runtime
+
+    provider = kaggle_provider()
+    session = object.__new__(Runtime)
+    session.name = "letify-t4-fc1bf0"
+    session.provider = provider
+    session.instance = type("I", (), {"gpu": "T4", "accelerator": "T4"})()
+    answer = {"cards": ["Tesla T4", "Tesla T4"], "driver": False}
+    monkey = lambda self, source, timeout=None: answer  # noqa: E731
+    Runtime.eval, original = monkey, Runtime.eval
+    try:
+        with pytest.raises(InsufficientDevices) as failure:
+            session.check_devices()
+    finally:
+        Runtime.eval = original
+    message = str(failure.value)
+    assert "driver" in message
+    assert "Tesla T4" in message
+
+
+def test_a_session_with_the_cards_and_a_driver_passes() -> None:
+    """Spec: both halves have to hold, and then the session is used."""
+    from letify.runtime.session import Runtime
+
+    provider = kaggle_provider()
+    session = object.__new__(Runtime)
+    session.name = "letify-t4-ok"
+    session.provider = provider
+    session.instance = type("I", (), {"gpu": "T4", "accelerator": "T4"})()
+    answer = {"cards": ["Tesla T4", "Tesla T4"], "driver": True}
+    monkey = lambda self, source, timeout=None: answer  # noqa: E731
+    Runtime.eval, original = monkey, Runtime.eval
+    try:
+        session.check_devices()
+    finally:
+        Runtime.eval = original
