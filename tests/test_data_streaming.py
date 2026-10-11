@@ -1504,3 +1504,18 @@ def test_a_write_back_leaves_a_directory_that_was_already_there(
         writes(out)
 
     assert (out / "checkpoint-2607" / "kept.txt").read_text(encoding="utf-8") == "mine"
+
+
+def test_the_cache_says_when_it_drops_a_blob_written_through_its_link() -> None:
+    """Spec "Runtime data cache budget": a dropped blob is reported, not silent.
+
+    A live session spent two days unable to tell this removal from the budget prune,
+    because a blob vanished and only the next failure mentioned it.
+    """
+    from letify.protocol import worker
+
+    at = worker.SOURCE.index("def _data_check_cache")
+    body = worker.SOURCE[at : worker.SOURCE.index("\ndef ", at + 10)]
+    assert "data cache dropped" in body
+    assert "written through its link" in body
+    assert "sys.stderr" in body

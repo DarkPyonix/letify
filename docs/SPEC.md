@@ -1194,6 +1194,13 @@ This covers a write-back that fails, not a client that is killed. A process that
 `mkdir` and the rename cannot clean up after itself, so a resume that reads a directory name still
 has to check for the file it needs.
 
+**A blob the cache drops is reported.** Removing a file a call may still need is worth a line, so
+the worker prints one on standard error when it drops a blob because the file it is the digest of
+was written through its hard link: `letify: data cache dropped <digest>, written through its link
+(<size> bytes at <mtime>, placed as <size> at <mtime>)`. The client writes it live as it writes any
+other worker output. Without it a blob could vanish and leave only the failure of whatever asked
+for it next, which cost a live session two days of guessing between this and the budget.
+
 A blob still being written is never evicted. Runtime data cache budget skips a blob whose link count is above 1 and one used within the past 600 seconds; a blob that is pending or in flight for any running call is skipped as well, by the manifests the worker holds, and partial files are skipped as they already are.
 
 A write-back waits for nothing that is still arriving. It runs after the transfer is cancelled, and it uses the worker's manifest to decide what to walk: a file that was never placed is unchanged by definition, so it is not fetched, not hashed and not written back. A file placed during the call is compared exactly as Writing back describes.
