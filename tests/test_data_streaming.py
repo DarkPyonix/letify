@@ -1641,3 +1641,46 @@ def test_a_cancelled_send_leaves_no_partial_in_the_blob_cache(
     root = Path.home() / ".letify" / "runtime" / "data" / "blobs"
     leftovers = [p for p in root.rglob("*") if p.is_file() and ".letify-" in p.name]
     assert leftovers == [], leftovers
+
+
+def test_a_sender_that_stops_fails_the_readers_waiting_on_it(
+    let, cpu, project, capsys, monkeypatch
+) -> None:
+    """Spec "When a blob does not arrive": waiting it out costs the timeout per blob.
+
+    KICT sent 126.9 GB as 132 shards over the first wave budget. The sender raised on the
+    second one, _run swallowed it, and the body's readers waited in silence: 540 s and
+    counting on one shard, with 131 behind it.
+    """
+    from letify.store import pathdata
+
+    first = project / "a.bin"
+    second = project / "b.bin"
+    first.write_bytes(b"a" * (1 << 20))
+    second.write_bytes(b"b" * (1 << 20))
+    monkeypatch.setattr(pathdata, "FIRST_WAVE_MIB", 0.0)
+    monkeypatch.setattr(pathdata, "FIRST_WAVE_FILES", 0)
+
+    real_send = pathdata.Stream._send
+    sent: list[str] = []
+
+    def one_then_raise(self, digest, meter):
+        if sent:
+            raise RuntimeFailure("the transfer stream failed")
+        sent.append(digest)
+        return real_send(self, digest, meter)
+
+    monkeypatch.setattr(pathdata.Stream, "_send", one_then_raise)
+
+    @let.function(device=cpu, host=letify.remote)
+    def read_both(one, two) -> int:
+        return len(one.read_bytes()) + len(two.read_bytes())
+
+    started = time.monotonic()
+    with pytest.raises(RuntimeFailure) as failure:
+        read_both(one=first, two=second)
+    elapsed = time.monotonic() - started
+    assert elapsed < 60, f"waited {elapsed:.0f} s, so it waited out a timeout"
+    assert "was never sent" in str(failure.value), failure.value
+    err = capsys.readouterr().err
+    assert "data sending stopped after" in err, err
