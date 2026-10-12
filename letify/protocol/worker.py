@@ -855,6 +855,40 @@ def _parallel_partial(root, digest):
     return "%s%s.parallel" % (_data_file(root, digest), _DATA_PARTIAL)
 
 
+def _op_data_drop(request):
+    """Remove the partials of a blob nobody is going to finish.
+
+    Spec "Data log line": a sender cancelled when the call ended leaves a partial that no
+    later request completes, because the digest it would be sealed under is written only
+    once every piece has arrived. A single put's partial is invisible to the budget scan,
+    so without this it stays for the life of the runtime.
+    """
+    digest = request["digest"]
+    final = _data_file(request["dir"], digest)
+    open_handle = _DATA_OPEN.pop(digest, None)
+    if open_handle is not None:
+        try:
+            open_handle[0].close()
+        except OSError:
+            pass
+    removed = 0
+    directory = os.path.dirname(final)
+    name = os.path.basename(final)
+    try:
+        entries = os.listdir(directory)
+    except OSError:
+        entries = []
+    for entry in entries:
+        if entry == name or not entry.startswith(name + "."):
+            continue
+        try:
+            os.remove(os.path.join(directory, entry))
+            removed += 1
+        except OSError:
+            pass
+    return {"ok": True, "value": removed}
+
+
 def _op_data_begin(request):
     """Make the file parallel senders will fill, of the size it will end up.
 
@@ -2254,6 +2288,7 @@ _OPS = {
     "data_have": _op_data_have,
     "data_put": _op_data_put,
     "data_begin": _op_data_begin,
+    "data_drop": _op_data_drop,
     "data_put_at": _op_data_put_at,
     "data_seal": _op_data_seal,
     "data_pull": _op_data_pull,

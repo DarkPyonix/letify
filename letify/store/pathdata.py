@@ -612,6 +612,9 @@ class Stream:
         self.runtime = runtime
         self.blobs = blobs
         self.plan = plan
+        #: Digests whose send finished. ``_sent`` holds the ones it began, so a blob the
+        #: sender was carrying when the call ended is in one and not the other.
+        self.done: set[str] = set()
         self.before_files = self.before_bytes = 0
         self.during_files = self.during_bytes = 0
         self.before_seconds = self.during_seconds = 0.0
@@ -714,6 +717,22 @@ class Stream:
         if (thread is None or not thread.is_alive()) and self._pipeline is not None:
             self._pipeline.close()
             self._pipeline = None
+        self._drop_partials()
+
+    def _drop_partials(self) -> None:
+        """Remove the partial of every blob the sender was carrying. Spec "Data log line"."""
+        for digest in self.dropped:
+            try:
+                _worker(self.runtime, {"op": "data_drop", "dir": self.blobs, "digest": digest})
+            except (RuntimeFailure, RemoteError):
+                # The runtime is going away, which removes the partial with it.
+                return
+
+    @property
+    def dropped(self) -> list[str]:
+        """Blobs that were neither already on the runtime nor fully sent."""
+        with self._lock:
+            return [digest for digest in self.plan.missing if digest not in self.done]
 
     # -- the stream ---------------------------------------------------------------
 
@@ -771,6 +790,8 @@ class Stream:
         if not uploaded:
             return
         files, total = self.plan.weight(digest)
+        with self._lock:
+            self.done.add(digest)
         if self._thread is None:
             self.before_files += files
             self.before_bytes += total
@@ -791,19 +812,31 @@ class Stream:
 
         stats = stats or {}
         plan = self.plan
-        sent_files = self.before_files + self.during_files
         sent_bytes = self.before_bytes + self.during_bytes
         seconds = self.before_seconds + self.during_seconds
         rate = sent_bytes / (1 << 20) / seconds if seconds > 0 else 0.0
-        install.log(
+        # Spec "Data log line": counted from what the runtime answered data_have with,
+        # because subtracting what was sent reports a blob that was neither as having
+        # been there all along.
+        missing_weight = [plan.weight(digest) for digest in plan.missing]
+        already_files = plan.detected_files - sum(files for files, _b in missing_weight)
+        already_bytes = plan.detected_bytes - sum(total for _f, total in missing_weight)
+        dropped_weight = [plan.weight(digest) for digest in self.dropped]
+        dropped_files = sum(files for files, _b in dropped_weight)
+        dropped_bytes = sum(total for _f, total in dropped_weight)
+        line = (
             f"data {plan.detected_files} files {_mib(plan.detected_bytes)} detected, "
-            f"{plan.detected_files - sent_files} files "
-            f"{_mib(plan.detected_bytes - sent_bytes)} already on {plan.where}, "
+            f"{already_files} files {_mib(already_bytes)} already on {plan.where}, "
             f"sent {self.before_files} files {_mib(self.before_bytes)} before the call in "
             f"{self.before_seconds:.1f} s, {self.during_files} files "
             f"{_mib(self.during_bytes)} during it in {self.during_seconds:.1f} s "
             f"({rate:.1f} MiB/s), first access waited {float(stats.get('seconds', 0.0)):.1f} s"
         )
+        if dropped_files:
+            line += (
+                f", {dropped_files} files {_mib(dropped_bytes)} dropped when the call ended"
+            )
+        install.log(line)
         if stats.get("files"):
             install.log(
                 f"data waited for {stats['files']} files {_mib(int(stats.get('bytes', 0)))} "

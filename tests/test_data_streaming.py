@@ -1551,3 +1551,93 @@ def test_a_blob_whose_bytes_are_unchanged_survives_a_new_mtime(launcher_from, pr
     with redirect_stderr(captured):
         assert touches(target)[1] == 1 << 12
     assert "data cache dropped" not in captured.getvalue()
+
+
+def test_a_blob_the_sender_was_still_carrying_is_reported_as_dropped(
+    let, cpu, project, capsys, monkeypatch
+) -> None:
+    """Spec "Data log line": subtracting reports it as having been there all along.
+
+    KICT chased this for an afternoon on Kaggle. A 1707 MiB shard was over the first wave
+    budget, so it went to the background sender; the body only stat'ed it, which the
+    observation patch answers from the manifest without waiting; the call returned and the
+    sender was cancelled before the blob was sealed. The line then read "1707 MiB already
+    on the runtime, sent 0", which says the opposite of what happened.
+    """
+    from letify.store import pathdata
+
+    big = project / "big.bin"
+    big.write_bytes(b"z" * (3 << 20))
+
+    # The wave takes nothing, so the one blob goes to the background sender, and the
+    # sender is held until the call has returned and cancelled it.
+    monkeypatch.setattr(pathdata, "FIRST_WAVE_MIB", 0.0)
+    monkeypatch.setattr(pathdata, "FIRST_WAVE_FILES", 0)
+    holding = threading.Event()
+    real_send = pathdata.Stream._send
+
+    def slow(self, digest, meter):
+        holding.wait(timeout=10)
+        return real_send(self, digest, meter)
+
+    monkeypatch.setattr(pathdata.Stream, "_send", slow)
+
+    @let.function(device=cpu, host=letify.remote)
+    def peek(path) -> int:
+        import os
+
+        return os.path.getsize(str(path))
+
+    try:
+        peek(path=big)
+    finally:
+        holding.set()
+    lines = [
+        text
+        for text in capsys.readouterr().err.splitlines()
+        if text.startswith("letify: data ") and not text.startswith("letify: data wrote back ")
+    ]
+    assert lines
+    line = lines[0]
+    assert "0 files 0.0 MiB already on the runtime" in line, line
+    assert "dropped when the call ended" in line, line
+
+
+def test_a_cancelled_send_leaves_no_partial_in_the_blob_cache(
+    let, cpu, project, capsys, monkeypatch
+) -> None:
+    """Spec "Data log line": a full sized partial counts against the budget forever."""
+    from letify.store import pathdata
+
+    big = project / "big2.bin"
+    big.write_bytes(b"y" * (3 << 20))
+    monkeypatch.setattr(pathdata, "FIRST_WAVE_MIB", 0.0)
+    monkeypatch.setattr(pathdata, "FIRST_WAVE_FILES", 0)
+    holding = threading.Event()
+    real_send = pathdata.Stream._send
+
+    def slow(self, digest, meter):
+        holding.wait(timeout=10)
+        return real_send(self, digest, meter)
+
+    monkeypatch.setattr(pathdata.Stream, "_send", slow)
+
+    @let.function(device=cpu, host=letify.remote)
+    def peek(path) -> list[str]:
+        import os
+
+        root = os.path.join(os.path.dirname(os.path.dirname(str(path))), "..", "blobs")
+        root = os.path.normpath(root)
+        found = []
+        for directory, _dirs, names in os.walk(root):
+            found.extend(os.path.join(directory, name) for name in names)
+        return found
+
+    try:
+        peek(path=big)
+    finally:
+        holding.set()
+    time.sleep(1.0)
+    root = Path.home() / ".letify" / "runtime" / "data" / "blobs"
+    leftovers = [p for p in root.rglob("*") if p.is_file() and ".letify-" in p.name]
+    assert leftovers == [], leftovers
