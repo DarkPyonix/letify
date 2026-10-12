@@ -1006,7 +1006,11 @@ class KaggleChannel(FramedChannel):
     text_frames = True
 
     #: Bytes handed to the bridge per write, matching the Modal channel.
-    WRITE_LIMIT = 1 << 20
+    #: Bytes per base64 line. Spec "Kaggle Jupyter Server session": a kernel carries one
+    #: line as one input reply, so the 108 KB worker source went as one reply of 145 KiB.
+    #: 36 KiB is a multiple of three, so every line decodes on its own, and it is the limit
+    #: Channels already states for a Modal sandbox, for the same reason.
+    WRITE_LIMIT = 36 * 1024
 
     def __init__(
         self, command: list[str], env: dict[str, str], *, name: str, session: Session
