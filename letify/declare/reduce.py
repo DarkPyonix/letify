@@ -11,7 +11,7 @@ Spec "Reducing between replicas", claim N10.
 
 from __future__ import annotations
 
-import importlib
+import copy
 import json
 import socket
 import sys
@@ -96,9 +96,6 @@ def all_reduce(
             "so there is nothing to send."
         ) from exc
     raw = view.cast("B").tobytes()
-    fmt = type(tensor).__module__.split(".")[0]
-    dtype = str(getattr(tensor, "dtype", ""))
-    shape = list(getattr(tensor, "shape", ()))
 
     main = sys.modules.get("__main__")
     if main is None or not hasattr(main, "_reduce_join"):
@@ -142,13 +139,7 @@ def all_reduce(
         leader = int(table["leader"])
         count = int(table["count"])
         peers = {int(r): tuple(address) for r, address in table["peers"].items()}
-        header = {
-            "rank": my_rank,
-            "format": fmt,
-            "shape": shape,
-            "dtype": dtype,
-            "nbytes": len(raw),
-        }
+        header = {"rank": my_rank, "nbytes": len(raw)}
 
         if my_rank == leader:
             result = _lead(listener, deadline, my_rank, tensor, header, raw, count, op)
@@ -206,7 +197,7 @@ def _lead(
             conn, _addr = listener.accept()
             conn.settimeout(_remaining(deadline))
             peer_header, payload = _recv_message(conn)
-            collected[int(peer_header["rank"])] = _rebuild(peer_header, payload)
+            collected[int(peer_header["rank"])] = _rebuild(tensor, payload)
             conns.append(conn)
         arrays = [collected[r] for r in sorted(collected)]
         result = op(arrays)
@@ -220,15 +211,15 @@ def _lead(
             conn.close()
 
 
-def _follow(leader_address: tuple, deadline: float, header: dict, raw: bytes) -> Any:
-    """Send this replica's array to the leader, and wait for the reduced result."""
+def _follow(leader_address: tuple, deadline: float, header: dict, raw: bytes) -> bytes:
+    """Send this replica's array to the leader, and wait for the reduced result's bytes."""
     conn = socket.create_connection(leader_address, timeout=_remaining(deadline))
     try:
         conn.settimeout(_remaining(deadline))
         _send_message(conn, header, raw)
         conn.settimeout(_remaining(deadline))
-        result_header, payload = _recv_message(conn)
-        return _rebuild(result_header, payload)
+        _result_header, payload = _recv_message(conn)
+        return payload
     finally:
         conn.close()
 
@@ -268,44 +259,47 @@ def _recv_message(conn: socket.socket) -> tuple[dict, bytes]:
 
 def _encode(array: Any) -> tuple[dict, bytes]:
     """The header and raw bytes of an array this process already holds."""
-    view = memoryview(array).cast("B")
-    raw = view.tobytes()
-    fmt = type(array).__module__.split(".")[0]
-    return (
-        {
-            "rank": -1,
-            "format": fmt,
-            "shape": list(getattr(array, "shape", ())),
-            "dtype": str(getattr(array, "dtype", "")),
-            "nbytes": len(raw),
-        },
-        raw,
-    )
+    try:
+        raw = memoryview(array).cast("B").tobytes()
+    except TypeError as exc:
+        raise UnsupportedMode(
+            f"op returned a {type(array).__name__!r}, which exposes no buffer. A "
+            "reduction returns an array of the same kind it was given."
+        ) from exc
+    return {"rank": -1, "nbytes": len(raw)}, raw
 
 
-def _rebuild(header: dict, payload: bytes) -> Any:
-    """Rebuild a peer's array from its own bytes, by importing its own library here.
+def _rebuild(local: Any, payload: bytes) -> Any:
+    """A peer's array, as a copy of the local one holding the peer's bytes.
 
-    Spec "Reducing between replicas": numpy's ``frombuffer`` for a numpy array, torch's
-    for a tensor. An array naming a library this runtime does not have fails here,
-    naming it.
+    Spec "Reducing between replicas": nothing is imported and no dtype crosses the wire,
+    because the local array already says what kind of thing this is. A peer whose buffer
+    is a different length is refused naming both lengths.
     """
-    module = importlib.import_module(header["format"])
-    attr = header["dtype"].rsplit(".", 1)[-1]
-    dtype = getattr(module, attr, header["dtype"])
-    flat = module.frombuffer(payload, dtype=dtype)
-    return flat.reshape(header["shape"])
+    rebuilt = copy.deepcopy(local)
+    view = memoryview(rebuilt).cast("B")
+    if len(view) != len(payload):
+        raise ReductionFailed(
+            f"a peer sent {len(payload)} bytes where this replica holds {len(view)}, so "
+            f"the replicas disagree on the shape and are not reducing the same thing"
+        )
+    view[:] = payload
+    return rebuilt
 
 
 def _write_back(tensor: Any, result: Any) -> None:
-    """Write the reduced array into ``tensor`` in place."""
+    """Write the reduced value into ``tensor`` in place.
+
+    ``result`` is whatever ``op`` returned on the leader, and the peer's own bytes
+    everywhere else, so both an array and a buffer of the right length land correctly.
+    """
+    if isinstance(result, (bytes, bytearray, memoryview)):
+        memoryview(tensor).cast("B")[:] = result
+        return
     try:
         tensor[...] = result
     except Exception:
-        copy_ = getattr(tensor, "copy_", None)
-        if copy_ is None:
-            raise
-        copy_(result)
+        memoryview(tensor).cast("B")[:] = memoryview(result).cast("B")
 
 
 __all__ = ["all_reduce", "mean", "sum"]

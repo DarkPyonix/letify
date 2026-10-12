@@ -217,34 +217,44 @@ def test_all_reduce_averages_in_place_and_returns_the_count(launcher_from) -> No
         device=[let.providers.a.CPU, let.providers.b.CPU], host=letify.distributed
     )
     def reduce_one() -> tuple[int, list[float]]:
-        import numpy
+        import array
 
         import letify as inner
 
-        values = numpy.array([float(inner.rank()), 10.0], dtype="float32")
-        count = inner.all_reduce(values)
-        return count, values.tolist()
+        def average(arrays):
+            columns = zip(*arrays, strict=True)
+            return array.array("f", [sum(column) / len(arrays) for column in columns])
+
+        values = array.array("f", [float(inner.rank()), 10.0])
+        count = inner.all_reduce(values, op=average)
+        return count, list(values)
 
     assert reduce_one() == [(2, [0.5, 10.0]), (2, [0.5, 10.0])]
 
 
-def test_sum_is_the_other_provided_reduction(launcher_from) -> None:
-    """Spec "Reducing between replicas": ``letify.sum`` adds instead of averaging."""
+def test_the_provided_reductions_average_and_add(launcher_from) -> None:
+    """Spec "Reducing between replicas": letify.mean and letify.sum, where numpy is here.
+
+    They import numpy on the runtime, which letify does not depend on and CI does not
+    install, so this is the one test in the file that needs it. The transport itself is
+    pinned without it.
+    """
+    pytest.importorskip("numpy")
     let = launcher_from('[a]\nkind = "local"\n\n[b]\nkind = "local"\n')
 
-    @let.function(
-        device=[let.providers.a.CPU, let.providers.b.CPU], host=letify.distributed
-    )
-    def total() -> list[float]:
+    @let.function(device=[let.providers.a.CPU, let.providers.b.CPU], host=letify.distributed)
+    def both() -> tuple[list[float], list[float]]:
         import numpy
 
         import letify as inner
 
-        values = numpy.array([float(inner.rank()) + 1.0], dtype="float32")
-        inner.all_reduce(values, op=inner.sum)
-        return values.tolist()
+        averaged = numpy.array([float(inner.rank()), 10.0], dtype="float32")
+        inner.all_reduce(averaged, op=inner.mean)
+        added = numpy.array([float(inner.rank()) + 1.0], dtype="float32")
+        inner.all_reduce(added, op=inner.sum)
+        return averaged.tolist(), added.tolist()
 
-    assert total() == [[3.0], [3.0]]
+    assert both() == [([0.5, 10.0], [3.0]), ([0.5, 10.0], [3.0])]
 
 
 def test_an_arbitrary_callable_is_the_reduction(launcher_from) -> None:
@@ -255,16 +265,16 @@ def test_an_arbitrary_callable_is_the_reduction(launcher_from) -> None:
         device=[let.providers.a.CPU, let.providers.b.CPU], host=letify.distributed
     )
     def weighted() -> list[float]:
-        import numpy
+        import array
 
         import letify as inner
 
         def first_only(arrays):
             return arrays[0]
 
-        values = numpy.array([float(inner.rank())], dtype="float32")
+        values = array.array("f", [float(inner.rank())])
         inner.all_reduce(values, op=first_only)
-        return values.tolist()
+        return list(values)
 
     assert weighted() == [[0.0], [0.0]]
 
@@ -297,14 +307,14 @@ def test_min_peers_proceeds_with_fewer_and_reports_how_many(launcher_from) -> No
         device=[let.providers.a.CPU, let.providers.b.CPU], host=letify.distributed
     )
     def uneven() -> int:
-        import numpy
+        import array
 
         import letify as inner
 
-        values = numpy.array([1.0], dtype="float32")
+        values = array.array("f", [1.0])
         if inner.rank() == 1:
             return 0
-        return inner.all_reduce(values, min_peers=1, timeout=5.0)
+        return inner.all_reduce(values, op=lambda arrays: arrays[0], min_peers=1, timeout=5.0)
 
     assert uneven() == [1, 0]
 
@@ -319,11 +329,11 @@ def test_a_round_that_cannot_reach_min_peers_is_an_infrastructure_failure(
         device=[let.providers.a.CPU, let.providers.b.CPU], host=letify.distributed
     )
     def never_meets() -> str:
-        import numpy
+        import array
 
         import letify as inner
 
-        values = numpy.array([1.0], dtype="float32")
+        values = array.array("f", [1.0])
         if inner.rank() == 1:
             return "left early"
         try:
@@ -345,11 +355,13 @@ def test_the_reduced_bytes_never_cross_the_client(launcher_from) -> None:
         device=[let.providers.a.CPU, let.providers.b.CPU], host=letify.distributed
     )
     def one_round() -> int:
-        import numpy
+        import array
 
         import letify as inner
 
-        return inner.all_reduce(numpy.zeros(4096, dtype="float32"))
+        return inner.all_reduce(
+            array.array("f", [0.0] * 4096), op=lambda arrays: arrays[0]
+        )
 
     before = broker.brokered_bytes()
     assert one_round() == [2, 2]

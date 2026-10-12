@@ -83,11 +83,12 @@ imports numpy on the runtime where the user's lock already has it, and says so i
 
 The list `op` receives holds arrays of the same kind as the one passed in, ordered by rank, and the
 one at the caller's own rank is that very object. A peer's bytes cross the link as the buffer the
-array exposes plus its dtype and shape, and the receiving replica rebuilds them by importing the
-array's own library there: numpy's `frombuffer` for a numpy array, torch's for a tensor. letify
-therefore imports no array library of its own and still hands the callable something a reader of it
-expects. An array that exposes no buffer is refused, naming the type, because there is nothing to
-send.
+array exposes and nothing else, and the receiving replica rebuilds them by copying its own array and
+writing those bytes into the copy. letify therefore imports no array library, names no dtype on the
+wire, and still hands the callable arrays of the kind a reader of it expects. An array that exposes
+no buffer is refused, naming the type, because there is nothing to send, and a peer whose buffer is a
+different length is refused naming both lengths, because replicas that disagree on the shape are not
+reducing the same thing.
 
 Rounds are numbered by the order of the `all_reduce` calls inside the body, so every
 replica that is still running calls it the same number of times. A replica that misses a round is
