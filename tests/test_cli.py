@@ -1664,3 +1664,17 @@ def test_the_cache_listing_says_a_provider_has_no_session_running(
     for row in remote:
         assert row.get("running") is False, row
         assert "files" not in row, row
+
+
+def test_a_bare_stop_says_why_a_live_session_is_not_its_to_end(isolated_home, capsys) -> None:
+    """Spec "Kaggle", stopping what a dead process left behind: it only said what it did.
+
+    KICT read "nothing was stopped" as letify finding nothing, on a session that was idle
+    and billing, and had no way to know that ending the owning process was the way out.
+    """
+    from letify.cli import main
+
+    assert main(["stop", "--alias", "kaggle_a", "-y"]) == 0
+    out = capsys.readouterr().out
+    assert "SIGTERM" in out, out
+    assert "--orphans" in out, out
