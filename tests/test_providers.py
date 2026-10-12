@@ -1457,7 +1457,7 @@ def test_a_sandbox_channel_sends_the_worker_once_and_then_framed_requests(
 ) -> None:
     import base64
 
-    from letify.protocol.worker import SOURCE
+    from letify.protocol.worker import SOURCE, count_line
     from letify.protocol.worker import source as worker_source
 
     provider = provider_of(Modal, "m")
@@ -1471,7 +1471,7 @@ def test_a_sandbox_channel_sends_the_worker_once_and_then_framed_requests(
         written = b"".join(base64.b64decode(r["data"]) for r in fake_modal.requests("write"))
         # The worker source went out exactly once, behind its byte count line, with the flag
         # that makes the sandbox write its frames as base64 lines.
-        assert written.count(b"%d\n" % len(source) + source) == 1
+        assert written.count(count_line(source) + source) == 1
         assert SOURCE.encode() not in written
     finally:
         provider.stop(runtime)

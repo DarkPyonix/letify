@@ -99,9 +99,21 @@ class Pending:
 
 
 #: Passed to ``python -c`` to start the worker: read a length-prefixed source, execute it.
+#: Spec "Channels": the count catches a cut and the digest catches a shift, which keeps the
+#: count intact, so neither failure reaches the compiler as a syntax error.
 BOOTSTRAP = (
-    "import sys;n=int(sys.stdin.buffer.readline());"
-    "exec(compile(sys.stdin.buffer.read(n),'letify-device','exec'))"
+    "import sys,hashlib;"
+    "b=sys.stdin.buffer;"
+    "h=b.readline().split();"
+    "n=int(h[0]);"
+    "s=b.read(n);"
+    "len(s)==n or sys.exit("
+    "'the letify device source arrived short: %d of %d bytes'%(len(s),n));"
+    "d=hashlib.blake2b(s,digest_size=16).hexdigest();"
+    "d==h[1].decode() or sys.exit("
+    "'the letify device source arrived corrupted: %d bytes, digest %s, expected %s'"
+    "%(len(s),d,h[1].decode()));"
+    "exec(compile(s,'letify-device','exec'))"
 )
 
 
@@ -1089,7 +1101,9 @@ def connect(
         target=client._drain_stderr, args=(process.stderr,), name=f"{name}-stderr", daemon=True
     ).start()
     try:
-        transport.raw(b"%d\n" % len(source) + source)
+        from ...protocol.worker import count_line
+
+        transport.raw(count_line(source) + source)
         client.start()
     except (TransportClosed, RuntimeLost) as exc:
         process.kill()

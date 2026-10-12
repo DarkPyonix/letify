@@ -1660,13 +1660,13 @@ def test_the_stub_refuses_a_worker_source_that_arrived_short() -> None:
     """
     import subprocess
 
-    from letify.protocol.worker import BOOTSTRAP, source
+    from letify.protocol.worker import BOOTSTRAP, count_line, source
 
     body = source().encode("utf-8")
     # The count says the whole source; the pipe carries all but the last 284 bytes.
     done = subprocess.run(
         [sys.executable, "-u", "-c", BOOTSTRAP],
-        input=b"%d\n" % len(body) + body[:-284],
+        input=count_line(body) + body[:-284],
         capture_output=True,
         timeout=120,
     )
@@ -1716,3 +1716,46 @@ def test_a_kernel_line_stays_inside_the_limit_a_kernel_carries() -> None:
     assert len(source().encode("utf-8")) > KaggleChannel.WRITE_LIMIT, (
         "the source must cross as several lines, or this pins nothing"
     )
+
+
+def test_the_stub_refuses_a_worker_source_whose_bytes_were_shifted() -> None:
+    """Spec "Channels": the count alone misses a loss and a gain of the same length.
+
+    KICT's Kaggle session reported an unterminated triple-quoted string at generated line
+    3077, which holds `job = _JOBS.get()` in that build and no quote at all, so the source
+    was shifted rather than cut. A shift keeps the byte count intact.
+    """
+    import subprocess
+
+    from letify.protocol.worker import BOOTSTRAP, count_line, source
+
+    body = source().encode("utf-8")
+    # Four bytes lost from the middle and four gained at the end: the same length.
+    shifted = body[:50_000] + body[50_004:] + b"\n" * 4
+    assert len(shifted) == len(body)
+    done = subprocess.run(
+        [sys.executable, "-u", "-c", BOOTSTRAP],
+        input=count_line(body) + shifted,
+        capture_output=True,
+        timeout=120,
+    )
+    assert b"arrived corrupted" in done.stderr, done.stderr[-2000:]
+    assert b"SyntaxError" not in done.stderr
+
+
+def test_a_worker_source_that_arrives_whole_still_runs() -> None:
+    """Spec "Channels": the check costs the good case nothing, so the worker still starts."""
+    import subprocess
+
+    from letify.protocol.worker import BOOTSTRAP, count_line, source
+
+    body = source().encode("utf-8")
+    done = subprocess.run(
+        [sys.executable, "-u", "-c", BOOTSTRAP],
+        input=count_line(body) + body,
+        capture_output=True,
+        timeout=120,
+    )
+    # The worker announces itself and then reads, so closing its input ends it cleanly.
+    assert b"arrived" not in done.stderr, done.stderr[-2000:]
+    assert done.stdout, "the worker said nothing, so it never started"

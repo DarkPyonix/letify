@@ -63,13 +63,9 @@ except (urllib.error.URLError, OSError) as exc:
 # The cell a real bridge executes carries a shim, because a kernel answers input() and not a
 # binary read. Here the same shape is a subprocess whose standard input and output are pipes:
 # the bridge copies lines in and out, exactly as it would copy them to input_request replies
-# and from stream messages.
-STUB = (
-    "import sys;"
-    "b=sys.stdin.buffer;"
-    "n=int(b.readline());"
-    "exec(compile(b.read(n).decode(),'letify-worker','exec'))"
-)
+# and from stream messages. The stub is the real one rather than a copy: a copy of it drifted
+# from the real stub when the count line gained a digest, and the drift read as a dead worker.
+from letify.providers.kaggle_adapter import STUB  # noqa: E402
 
 worker = subprocess.Popen(
     [sys.executable, "-u", "-c", STUB],
