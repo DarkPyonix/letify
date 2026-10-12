@@ -322,8 +322,41 @@ def _setup_tool(args: argparse.Namespace) -> int:
     return 0
 
 
+def _running_runtime(let: Launcher, alias: str):
+    """A session this process already holds on that provider, or None.
+
+    Spec "The cache command": the listing asks only what is already running, because a
+    session it started would bill for the listing.
+    """
+    for runtime in let.pool.live:
+        if getattr(runtime.provider, "alias", None) == alias:
+            return runtime
+    return None
+
+
+def _data_cache_reply(let: Launcher, runtime, clear: bool) -> dict:
+    """One ``data_cache`` request to a session that is already up."""
+    from .store import pathdata
+
+    provider = runtime.provider
+    root = (runtime.workspace or provider.workspace_root).rstrip("/")
+    return runtime.request(
+        {
+            "op": "data_cache",
+            "dir": f"{root}/data/blobs",
+            "budget": pathdata.budget_bytes(provider),
+            "clear": clear,
+        },
+        timeout=600,
+    )
+
+
 def _data_cache_request(let: Launcher, alias: str, clear: bool) -> dict:
-    """Ask a session on the provider's first instance about its file blob cache."""
+    """Ask a session on the provider's first instance about its file blob cache.
+
+    This starts one when none is running, so only a named provider reaches it. Spec "The
+    cache command".
+    """
     from .declare import Env
     from .store import pathdata
 
@@ -462,7 +495,16 @@ def _cache(let: Launcher, args: argparse.Namespace) -> int:
             if not provider.persistent:
                 records.append({"alias": alias, "kept": False})
                 continue
-            result = _data_cache_request(let, alias, False)
+            # Spec "The cache command": a listing bills nothing, so it starts a session
+            # only where starting one is free, and otherwise asks one that is already up.
+            if provider.kind == "local":
+                result = _data_cache_request(let, alias, False)
+            else:
+                runtime = _running_runtime(let, alias)
+                if runtime is None:
+                    records.append({"alias": alias, "kept": True, "running": False})
+                    continue
+                result = _data_cache_reply(let, runtime, False)
         except LetifyError as exc:
             records.append({"alias": alias, "unavailable": str(exc)})
             continue
@@ -470,6 +512,7 @@ def _cache(let: Launcher, args: argparse.Namespace) -> int:
             {
                 "alias": alias,
                 "kept": True,
+                "running": True,
                 "files": result["files"],
                 "bytes": result["bytes"],
                 "budget": result["budget"],
@@ -498,6 +541,8 @@ def _cache(let: Launcher, args: argparse.Namespace) -> int:
             rows.append([row["alias"], f"unavailable: {row['unavailable']}", "", ""])
         elif not row["kept"]:
             rows.append([row["alias"], "not kept between sessions", "", ""])
+        elif not row.get("running"):
+            rows.append([row["alias"], "no session running", "", ""])
         else:
             rows.append(
                 [
