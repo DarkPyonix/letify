@@ -197,3 +197,162 @@ def test_a_replica_does_not_need_torch_on_this_machine(launcher_from, no_module)
         letify.distributed,
         letify.distributed,
     ]
+
+
+# -- all_reduce ---------------------------------------------------------------
+
+
+def test_all_reduce_outside_a_distributed_call_is_refused() -> None:
+    """Spec "Reducing between replicas": there is nothing to reduce with."""
+    with pytest.raises(letify.UnsupportedMode) as failure:
+        letify.all_reduce([1.0, 2.0])
+    assert "distributed" in str(failure.value)
+
+
+def test_all_reduce_averages_in_place_and_returns_the_count(launcher_from) -> None:
+    """Spec "Reducing between replicas": in place, and the return value is how many."""
+    let = launcher_from('[a]\nkind = "local"\n\n[b]\nkind = "local"\n')
+
+    @let.function(
+        device=[let.providers.a.CPU, let.providers.b.CPU], host=letify.distributed
+    )
+    def reduce_one() -> tuple[int, list[float]]:
+        import numpy
+
+        import letify as inner
+
+        values = numpy.array([float(inner.rank()), 10.0], dtype="float32")
+        count = inner.all_reduce(values)
+        return count, values.tolist()
+
+    assert reduce_one() == [(2, [0.5, 10.0]), (2, [0.5, 10.0])]
+
+
+def test_sum_is_the_other_provided_reduction(launcher_from) -> None:
+    """Spec "Reducing between replicas": ``letify.sum`` adds instead of averaging."""
+    let = launcher_from('[a]\nkind = "local"\n\n[b]\nkind = "local"\n')
+
+    @let.function(
+        device=[let.providers.a.CPU, let.providers.b.CPU], host=letify.distributed
+    )
+    def total() -> list[float]:
+        import numpy
+
+        import letify as inner
+
+        values = numpy.array([float(inner.rank()) + 1.0], dtype="float32")
+        inner.all_reduce(values, op=inner.sum)
+        return values.tolist()
+
+    assert total() == [[3.0], [3.0]]
+
+
+def test_an_arbitrary_callable_is_the_reduction(launcher_from) -> None:
+    """Spec "Reducing between replicas": ``op`` is a callable, so no option is needed."""
+    let = launcher_from('[a]\nkind = "local"\n\n[b]\nkind = "local"\n')
+
+    @let.function(
+        device=[let.providers.a.CPU, let.providers.b.CPU], host=letify.distributed
+    )
+    def weighted() -> list[float]:
+        import numpy
+
+        import letify as inner
+
+        def first_only(arrays):
+            return arrays[0]
+
+        values = numpy.array([float(inner.rank())], dtype="float32")
+        inner.all_reduce(values, op=first_only)
+        return values.tolist()
+
+    assert weighted() == [[0.0], [0.0]]
+
+
+def test_a_cuda_tensor_is_refused_and_names_cpu(launcher_from) -> None:
+    """Spec "Reducing between replicas": the copy to host is the user's to write."""
+    let = launcher_from('[a]\nkind = "local"\n')
+
+    @let.function(device=let.providers.a.CPU, host=letify.distributed)
+    def on_the_card() -> str:
+        import letify as inner
+
+        class Pretend:
+            is_cuda = True
+
+        try:
+            inner.all_reduce(Pretend())
+        except inner.UnsupportedMode as failure:
+            return str(failure)
+        return "it was accepted"
+
+    assert ".cpu()" in on_the_card()[0]
+
+
+def test_min_peers_proceeds_with_fewer_and_reports_how_many(launcher_from) -> None:
+    """Spec "Reducing between replicas": a replica missing a round is the normal case."""
+    let = launcher_from('[a]\nkind = "local"\n\n[b]\nkind = "local"\n')
+
+    @let.function(
+        device=[let.providers.a.CPU, let.providers.b.CPU], host=letify.distributed
+    )
+    def uneven() -> int:
+        import numpy
+
+        import letify as inner
+
+        values = numpy.array([1.0], dtype="float32")
+        if inner.rank() == 1:
+            return 0
+        return inner.all_reduce(values, min_peers=1, timeout=5.0)
+
+    assert uneven() == [1, 0]
+
+
+def test_a_round_that_cannot_reach_min_peers_is_an_infrastructure_failure(
+    launcher_from,
+) -> None:
+    """Spec "Reducing between replicas": the call may be retried on it."""
+    let = launcher_from('[a]\nkind = "local"\n\n[b]\nkind = "local"\n')
+
+    @let.function(
+        device=[let.providers.a.CPU, let.providers.b.CPU], host=letify.distributed
+    )
+    def never_meets() -> str:
+        import numpy
+
+        import letify as inner
+
+        values = numpy.array([1.0], dtype="float32")
+        if inner.rank() == 1:
+            return "left early"
+        try:
+            inner.all_reduce(values, timeout=2.0)
+        except inner.RuntimeFailure as failure:
+            return type(failure).__name__
+        return "it returned"
+
+    assert never_meets() == ["ReductionFailed", "left early"]
+
+
+def test_the_reduced_bytes_never_cross_the_client(launcher_from) -> None:
+    """Spec "Reducing between replicas", claim N10: the client brokers and nothing more."""
+    from letify.runtime import broker
+
+    let = launcher_from('[a]\nkind = "local"\n\n[b]\nkind = "local"\n')
+
+    @let.function(
+        device=[let.providers.a.CPU, let.providers.b.CPU], host=letify.distributed
+    )
+    def one_round() -> int:
+        import numpy
+
+        import letify as inner
+
+        return inner.all_reduce(numpy.zeros(4096, dtype="float32"))
+
+    before = broker.brokered_bytes()
+    assert one_round() == [2, 2]
+    # The array is 4096 float32, so 16384 bytes crossed between the replicas. What the
+    # client carried for that round is two joins and two tables.
+    assert broker.brokered_bytes() - before < 2048

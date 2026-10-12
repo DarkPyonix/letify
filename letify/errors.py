@@ -124,6 +124,15 @@ class UnsupportedMode(LetifyError):
     """
 
 
+class ReductionFailed(RuntimeFailure):
+    """An ``all_reduce`` round could not reach ``min_peers`` within its timeout.
+
+    An infrastructure failure, spec "Reducing between replicas" says so: a replica
+    missing a round is the normal case, not a bug in the body, so the call may be
+    retried on it.
+    """
+
+
 class EnvironmentFailure(RuntimeFailure):
     """uv could not be installed on a runtime, or ``uv sync`` failed there. Retryable."""
 

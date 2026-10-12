@@ -1192,6 +1192,40 @@ def _data_want(digests, blocking=False):
         pass
 
 
+#: Guards ``_REDUCE_TABLES``, and wakes an ``all_reduce`` call waiting on an answer.
+_REDUCE_LOCK = threading.Condition()
+
+#: Peer tables and failures the client sent back, keyed by round number, until the
+#: waiting ``all_reduce`` call takes them.
+_REDUCE_TABLES = {}
+
+
+def _reduce_join(message):
+    """Ask the client to broker an all_reduce round. Nothing replies to this request.
+
+    Mirrors ``_data_want``: it is a one-way request on a reserved stream, and the
+    client's answer comes back separately as an ordinary request-reply, op
+    "reduce_peers", below.
+    """
+    try:
+        _SENDER.message(REQUEST, REDUCE_STREAM, message)
+    except OSError:
+        pass
+
+
+def _op_reduce_peers(request):
+    """The client's answer to a join: the peer table for a round, or a failure.
+
+    Spec "Reducing between replicas": the body's ``all_reduce`` is blocked waiting for
+    this, so it is answered by the frame reader at once rather than queued behind the
+    call, which is why it is in ``_LIGHT`` below.
+    """
+    with _REDUCE_LOCK:
+        _REDUCE_TABLES[request["round"]] = request
+        _REDUCE_LOCK.notify_all()
+    return {"ok": True, "value": None}
+
+
 def _data_state_for(path):
     """The running call a path belongs to, or None."""
     for state in _DATA_CALLS.values():
@@ -2218,10 +2252,11 @@ _OPS = {
     "device": _op_device,
     "stat": _op_stat,
     "lease": _op_lease,
+    "reduce_peers": _op_reduce_peers,
 }
 
 #: Answered by the frame reader at once, so they work while a call runs.
-_LIGHT = ("stat", "lease")
+_LIGHT = ("stat", "lease", "reduce_peers")
 
 #: Answered by several replies, the last one marked. These send their own replies.
 _STREAMING = ("data_stream",)

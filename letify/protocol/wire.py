@@ -42,6 +42,11 @@ DEVICE_STREAM = 2
 #: runs" describes. Nothing replies on it, so it never opens a request slot.
 DATA_STREAM = 4
 
+#: The stream the worker joins an all_reduce round on, as spec "Reducing between replicas"
+#: describes. Nothing replies on it either; the client's answer travels as an ordinary
+#: request-reply carrying op "reduce_peers".
+REDUCE_STREAM = 6
+
 #: The largest payload of one ``DATA`` frame, so other streams interleave between chunks.
 CHUNK = 8 << 20
 
@@ -615,6 +620,7 @@ __all__ = [
     "MAGIC",
     "OUT_OF_BAND",
     "PIPE_SIZE",
+    "REDUCE_STREAM",
     "REPLY",
     "REQUEST",
     "SEGMENT",
