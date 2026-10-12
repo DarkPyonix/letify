@@ -81,6 +81,19 @@ or trimmed reduction is written without letify growing options for each. The ari
 lives in the callable, so letify's own package still needs neither numpy nor torch; `letify.mean`
 imports numpy on the runtime where the user's lock already has it, and says so if it does not.
 
+The list `op` receives holds arrays of the same kind as the one passed in, ordered by rank, and the
+one at the caller's own rank is that very object. A peer's bytes cross the link as the buffer the
+array exposes plus its dtype and shape, and the receiving replica rebuilds them by importing the
+array's own library there: numpy's `frombuffer` for a numpy array, torch's for a tensor. letify
+therefore imports no array library of its own and still hands the callable something a reader of it
+expects. An array that exposes no buffer is refused, naming the type, because there is nothing to
+send.
+
+Rounds are numbered by the order of the `all_reduce` calls inside the body, so every
+replica that is still running calls it the same number of times. A replica that misses a round is
+therefore one that has stopped, not one that skipped a round and carried on, and letify does not
+try to resynchronize a body that does the latter.
+
 `timeout`, 60 s by default, bounds one round. `min_peers` says how many replicas a round needs:
 `None`, the default, needs all of them, and a number proceeds with that many and reports how many
 were reduced, which is the return value. A replica that misses a round is not an error, because

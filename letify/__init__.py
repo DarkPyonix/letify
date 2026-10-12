@@ -33,6 +33,7 @@ from .declare.cache import session_cache
 from .declare.env import Env
 from .declare.function import Function
 from .declare.instance import AnyInstance, Host, Instance
+from .declare.reduce import all_reduce, mean, sum
 from .declare.replicas import local_steps, rank, world_size
 from .errors import (
     ConfigError,
@@ -42,6 +43,7 @@ from .errors import (
     LetifyError,
     ProtocolError,
     ProviderUnavailable,
+    ReductionFailed,
     RemoteError,
     RuntimeFailure,
     RuntimeLost,
@@ -93,6 +95,7 @@ __all__ = [
     "ProtocolError",
     "ProviderUnavailable",
     "Providers",
+    "ReductionFailed",
     "RemoteError",
     "RemoteFile",
     "RuntimeFailure",
@@ -103,11 +106,14 @@ __all__ = [
     "UnsupportedMode",
     "Volume",
     "__version__",
+    "all_reduce",
     "distributed",
     "local",
     "local_steps",
+    "mean",
     "rank",
     "remote",
     "session_cache",
+    "sum",
     "world_size",
 ]

@@ -149,12 +149,21 @@ class Function(Generic[R]):
         return self._run_one(instance, args, kwargs)
 
     def _run_one(
-        self, instance: Any, args: tuple, kwargs: dict, replica: dict | None = None
+        self,
+        instance: Any,
+        args: tuple,
+        kwargs: dict,
+        replica: dict | None = None,
+        *,
+        on_channel: Callable[[Any], None] | None = None,
     ) -> Any:
         """Run the body on one runtime, retrying on an infrastructure failure.
 
         One replica of a distributed call runs through here too, so a replica gets the
         same retries and the same reporting as a call that named a single device.
+        ``on_channel``, when given, is called with the runtime's channel as soon as one
+        is acquired, so a distributed call's broker can watch it for an ``all_reduce``
+        join before the call itself is sent.
         """
         launcher = self.launcher
         last: Exception | None = None
@@ -164,6 +173,8 @@ class Function(Generic[R]):
             if runtime.channel is not None:
                 # A persistent channel writes the body's output live, while the call runs.
                 runtime.channel.echo = launcher.stream_logs
+            if on_channel is not None and runtime.channel is not None:
+                on_channel(runtime.channel)
             try:
                 value, logs = runtime.call(
                     self.fn,
@@ -217,14 +228,21 @@ class Function(Generic[R]):
         """
         import threading
 
+        from ..runtime.broker import Broker
+
         world = len(self.replicas)
         values: list = [None] * world
         failures: list[BaseException] = []
+        broker = Broker()
 
         def run(rank: int, instance: Any) -> None:
             try:
                 values[rank] = self._run_one(
-                    instance, args, kwargs, {"rank": rank, "world_size": world}
+                    instance,
+                    args,
+                    kwargs,
+                    {"rank": rank, "world_size": world},
+                    on_channel=lambda channel: broker.watch(rank, channel),
                 )
             except BaseException as exc:  # reported after every replica has stopped
                 failures.append(exc)
@@ -237,6 +255,7 @@ class Function(Generic[R]):
             thread.start()
         for thread in threads:
             thread.join()
+        broker.close()
         if failures:
             raise failures[0]
         return values

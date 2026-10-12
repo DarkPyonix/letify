@@ -278,6 +278,8 @@ class Connection:
         self._device: collections.deque | None = None
         #: ``data_want`` payloads that arrived on ``wire.DATA_STREAM``, for the data sender.
         self._wants: collections.deque = collections.deque()
+        #: ``reduce_join`` payloads that arrived on ``wire.REDUCE_STREAM``, for the broker.
+        self._joins: collections.deque = collections.deque()
 
     # -- reading ---------------------------------------------------------------
 
@@ -310,6 +312,15 @@ class Connection:
             # background sender picks the request up and reorders its queue.
             try:
                 self._wants.append(wire.loads(value[0], value[1]))
+            except Exception:
+                pass
+            with self._turn:
+                self._turn.notify_all()
+        elif kind == wire.REQUEST and stream == wire.REDUCE_STREAM:
+            # The worker joining an all_reduce round. Nothing answers it here: the
+            # broker picks it up and answers separately with a "reduce_peers" request.
+            try:
+                self._joins.append(wire.loads(value[0], value[1]))
             except Exception:
                 pass
             with self._turn:
@@ -418,6 +429,15 @@ class Connection:
         while True:
             try:
                 found.append(self._wants.popleft())
+            except IndexError:
+                return found
+
+    def take_joins(self) -> list[dict[str, Any]]:
+        """Every ``reduce_join`` that has arrived so far, oldest first, and forget them."""
+        found = []
+        while True:
+            try:
+                found.append(self._joins.popleft())
             except IndexError:
                 return found
 
