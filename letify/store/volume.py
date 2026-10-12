@@ -188,15 +188,43 @@ class Volume:
         """
         return self.store.put_tree(root, key=self.env_ref(env, platform)).digest
 
-    def cache_env_from(self, target: Any, env: Env, path: str, platform: str | None = None) -> str:
+    def cache_env_from(
+        self, target: Any, env: Env, path: str, platform: str | None = None,
+        build_s: float | None = None,
+    ) -> str:
         """Pack an environment that was built inside a runtime and store it.
 
         This is how the first session pays the sync and every later one skips it.
+        ``build_s``, when given, is the seconds the build took, recorded beside the
+        archive in a sibling ref so a later session can decide whether restoring is
+        still cheaper than building. Spec "Materializing into a runtime".
         """
         payload, _digest = _session(target).pack_dir(path)
         info = self.store.put_bytes(payload)
         self.store.point(self.env_ref(env, platform), info.digest)
+        if build_s is not None:
+            self.store.point(self.build_ref(env, platform), f"{build_s:.1f} {info.size}")
         return info.digest
+
+    def build_ref(self, env: Env, platform: str | None = None) -> str:
+        """The ref recording the build seconds and archive size beside the env ref."""
+        return f"{self.env_ref(env, platform)}.build"
+
+    def cached_build(self, env: Env, platform: str | None = None) -> tuple[float, int] | None:
+        """``(build seconds, archive bytes)`` recorded beside the cached archive, if any.
+
+        Spec "Materializing into a runtime": one read answers both, so a later session
+        can compare the archive's size over its own measured link against the build it
+        would otherwise pay.
+        """
+        raw = self.store.resolve(self.build_ref(env, platform))
+        if not raw:
+            return None
+        try:
+            seconds_text, bytes_text = raw.split()
+            return float(seconds_text), int(bytes_text)
+        except ValueError:
+            return None
 
     # -- checkpoints ---------------------------------------------------------
 

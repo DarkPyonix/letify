@@ -1014,7 +1014,36 @@ A backend offers a pull by answering with a URL and the request headers that rea
 
 The `gcs` read token is downscoped with a Credential Access Boundary: the local token is exchanged at `https://sts.googleapis.com/v1/token` for one that holds `roles/storage.objectViewer` on the volume's bucket only, with an availability condition restricting it to object names under the volume's prefix. A volume option `sts_endpoint` points the exchange elsewhere. A failed exchange raises `RuntimeFailure` rather than sending the unscoped token.
 
-The environment archive is automatic on an ephemeral provider, including when the declaration names no volumes. Explicit volumes retain precedence. Without explicit volumes, the account's existing `bucket`, `bucket_prefix`, `bucket_endpoint` and `sts_endpoint` select the same GCS backend as project data. Without a bucket, letify uses a filesystem store at `~/.letify/cache/storage/environments/<provider kind>/<account alias>` on the local machine, the `~/.letify/cache/storage/<name>` row of Local machine with the name `environments`, so it falls back to an existing `~/.cache/letify/environments` from an earlier install rather than abandoning the archives already there. A bucket is required only for a direct runtime pull that avoids the local uplink; letify does not create a bucket or require a new setting. The local store survives VM replacement but every restore crosses the client link. The first session that runs `uv sync` for an environment packs its project directory, `.venv` included, into its first explicit or automatic volume under `env/<env key>-<platform>`. `<platform>` is the runtime's `sys.platform` and `platform.machine()` joined by a hyphen, for example `linux-x86_64`, and the env key includes the interpreter's major.minor version. Every later session on the provider with the same key and platform pulls that archive and unpacks it into the project directory's parent instead of syncing. Publishing follows a successful interpreter switch and version check, so a failed environment boot does not publish an archive. A restored interpreter that fails validation causes a sync and replaces the ref. The cache is an optimization, not a promise that packing and transfer beat sync for every archive size.
+The environment archive is automatic on an ephemeral provider, including when the declaration names no volumes. Explicit volumes retain precedence. Without explicit volumes, the account's existing `bucket`, `bucket_prefix`, `bucket_endpoint` and `sts_endpoint` select the same GCS backend as project data. Without a bucket, letify uses a filesystem store at `~/.letify/cache/storage/environments/<provider kind>/<account alias>` on the local machine, the `~/.letify/cache/storage/<name>` row of Local machine with the name `environments`, so it falls back to an existing `~/.cache/letify/environments` from an earlier install rather than abandoning the archives already there. A bucket is required only for a direct runtime pull that avoids the local uplink; letify does not create a bucket or require a new setting. The local store survives VM replacement but every restore crosses the client link. The first session that runs `uv sync` for an environment packs its project directory, `.venv` included, into its first explicit or automatic volume under `env/<env key>-<platform>`. `<platform>` is the runtime's `sys.platform` and `platform.machine()` joined by a hyphen, for example `linux-x86_64`, and the env key includes the interpreter's major.minor version. Every later session on the provider with the same key and platform pulls that archive and unpacks it into the project directory's parent instead of syncing. Publishing follows a successful interpreter switch and version check, so a failed environment boot does not publish an archive. A restored interpreter that fails validation causes a sync and replaces the ref. The cache is an optimization, so letify checks that it is one before paying for it, from numbers it already has rather than from a guess.
+
+After a sync letify knows two things: how long the build took, and the size of the project directory
+it would pack. It packs only when moving that many bytes over the link it just measured would take
+less time than the build did. The archive is smaller than the directory, so the comparison
+overstates the transfer and errs toward building, which is the cheaper of the two to get wrong. The
+ref records the build seconds beside the archive.
+
+A later session restores only when the archive's size over the link measured for that session would
+take less than the recorded build. Otherwise it syncs, and says why:
+`letify: <runtime>: syncing rather than restoring, because 3.0 GB over 13.6 MiB/s is 210 s against a
+34 s build`. A session that has no measured rate for its link restores, because the archive is the
+only thing it can compare against nothing.
+
+An archive with no build recorded beside it is not restored either, and letify says
+`letify: <runtime>: syncing rather than restoring, because the archive carries no build time to
+compare against`. Such an archive was written before letify recorded the build, so it is exactly
+the kind this rule exists to catch, and the session that syncs instead both records the build and
+decides afresh whether the archive is worth keeping. The cost of that is one sync; the cost of
+trusting it is the transfer this rule was measured to avoid.
+
+Skipping the pack is said too, because it is a decision letify made rather than a thing that did not
+happen: `letify: <runtime>: not caching the environment, because 9.4 GB over 13.6 MiB/s is 659 s
+against a 34 s build`.
+
+This rule exists because the cache was measured costing 15 to 18 times what it saved. On a Kaggle T4
+with a 33 package lock carrying torch, 3.3 GB of wheels, `uv sync` took 29 to 34 s, packing the
+environment and pulling the 3.0 GB archive to the client took about 890 s, and pushing it back on a
+later session took 540 s over a 13.6 MiB/s punched link. A provider whose own bandwidth to PyPI is
+better than the client's uplink is the normal case for a notebook provider, not the exception.
 
 A volume's files on a runtime live in its volume directory, `<workspace root>/volumes/<volume name>`. A blob materialized without a named destination is written to `<volume directory>/blobs/<first two hex characters>/<digest>`. The volume option `mount` names another directory for one volume; nothing else sets it. A restored `.venv/bin/python` that does not start is treated as no archive, and the session syncs. Nothing in the public surface names this step.
 

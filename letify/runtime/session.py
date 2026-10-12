@@ -48,6 +48,30 @@ if TYPE_CHECKING:
 BLOB_DISK_LIMIT = 32 * 1024**3
 
 
+def _against_the_build(size: int, rate: float, build_s: float) -> str:
+    """The three numbers both cache decisions weigh, as they are reported.
+
+    Spec "Materializing into a runtime": ``3.0 GB over 13.6 MiB/s is 210 s against a 34 s
+    build``. Each decision prefixes its own clause.
+    """
+    return (
+        f"{size / 1_000_000_000:.1f} GB over {rate / (1024 * 1024):.1f} MiB/s is "
+        f"{size / rate:.0f} s against a {build_s:.0f} s build"
+    )
+
+
+def _sync_rather_than_restore(archive_bytes: int, rate: float, build_s: float) -> str:
+    """The line explaining why a session syncs instead of restoring a cached archive.
+
+    Spec "Materializing into a runtime". This returns the text after the ``<runtime>: ``
+    prefix, which ``Runtime._say`` adds.
+    """
+    return (
+        "syncing rather than restoring, because "
+        f"{_against_the_build(archive_bytes, rate, build_s)}"
+    )
+
+
 @dataclass
 class Runtime:
     """One live session on one provider."""
@@ -81,6 +105,11 @@ class Runtime:
 
     #: How the environment was built: ``"sync"``, ``"archive"``, or None where it was not.
     env_source: str | None = None
+
+    #: Seconds the sync took, when ``env_source`` is ``"sync"``. Spec "Materializing into
+    #: a runtime": weighed against the project directory's size over the measured link to
+    #: decide whether packing an archive is worth it.
+    env_build_s: float | None = None
 
     #: The runtime's ``sys.platform`` and machine, such as ``linux-x86_64``, once probed.
     platform: str | None = None
@@ -151,9 +180,10 @@ class Runtime:
             root = bootstrap.project_dir(
                 self.provider.env_root or self.workspace or self.provider.workspace_root, self.env
             )
-            self._environment_volumes()[0].cache_env_from(
-                self, self.env, root, platform=self.platform
-            )
+            if self._worth_packing(root):
+                self._environment_volumes()[0].cache_env_from(
+                    self, self.env, root, platform=self.platform, build_s=self.env_build_s
+                )
         self.keep_blobs_on_disk()
         for volume in self.volumes:
             self.attach(volume)
@@ -622,6 +652,50 @@ class Runtime:
 
         return (environment_volume(self.provider),)
 
+    def _measured_rate(self) -> float | None:
+        """This session's measured upload rate in bytes per second, or None where none was.
+
+        Follows how ``pathdata._streams_for`` reaches the link from a runtime: a provider
+        with no connection to measure, such as ``Local``, raises reaching for one, and that
+        is read the same as a rate of zero. Spec "Materializing into a runtime".
+        """
+        try:
+            link = self.provider.link(self)
+        except Exception:
+            return None
+        rate = getattr(link, "upload_bps", None)
+        if not rate or rate <= 0:
+            return None
+        return float(rate)
+
+    def _worth_packing(self, root: str) -> bool:
+        """Whether moving the project directory over this session's link beats the build.
+
+        Spec "Materializing into a runtime": the directory is larger than the archive it
+        would become, so this overstates the transfer and errs toward building. A session
+        with no measured rate packs unconditionally, as it always did.
+        """
+        if self.env_build_s is None:
+            return True
+        rate = self._measured_rate()
+        if rate is None:
+            return True
+        from . import bootstrap
+
+        try:
+            size = self.eval(bootstrap.tree_size_source(root), timeout=120)
+        except Exception:
+            return True
+        if not isinstance(size, int) or size <= 0:
+            return True
+        if (size / rate) < self.env_build_s:
+            return True
+        self._say(
+            "not caching the environment, because "
+            f"{_against_the_build(size, rate, self.env_build_s)}"
+        )
+        return False
+
     def _say(self, message: str) -> None:
         """One decision line about this runtime, as the transport's lines are written.
 
@@ -663,6 +737,22 @@ class Runtime:
             digest = volume.cached_env(self.env, self.platform)
             if not digest:
                 continue
+            build = volume.cached_build(self.env, self.platform)
+            if build is None:
+                # Spec "Materializing into a runtime": written before letify recorded the
+                # build, so it is exactly the kind this rule exists to catch.
+                self._say(
+                    "syncing rather than restoring, because the archive carries no "
+                    "build time to compare against"
+                )
+                continue
+            build_s, archive_bytes = build
+            rate = self._measured_rate()
+            if rate is not None and (archive_bytes / rate) >= build_s:
+                # Spec "Materializing into a runtime": the cache is an optimization, so a
+                # link this slow would cost more than the build did.
+                self._say(_sync_rather_than_restore(archive_bytes, rate, build_s))
+                continue
             self._say(f"restoring the environment, cached as {digest[:12]}")
             archive = f"{where['parent']}/.{digest}.tar.gz"
             volume.materialize(
@@ -695,7 +785,8 @@ class Runtime:
                 raise EnvironmentFailure(
                     message.removeprefix("RuntimeError: "), stderr=exc.remote_traceback
                 ) from exc
-            self._say(f"environment built in {time.monotonic() - began:.1f} s")
+            self.env_build_s = time.monotonic() - began
+            self._say(f"environment built in {self.env_build_s:.1f} s")
             self.env_source = "sync"
         self.python = where["python"]
         self.channel.switch_interpreter(where["python"])
