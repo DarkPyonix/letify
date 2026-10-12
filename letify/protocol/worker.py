@@ -40,7 +40,12 @@ BOOTSTRAP = (
     "import sys;"
     "b=sys.stdin.buffer;"
     "n=int(b.readline());"
-    "exec(compile(b.read(n).decode(),'letify-worker','exec'))"
+    "s=b.read(n);"
+    # Spec "Channels": a source cut anywhere compiles as whatever construct the cut landed
+    # inside, or runs and exits without serving, so the count is checked before it is run.
+    "len(s)==n or sys.exit("
+    "'the letify worker source arrived short: %d of %d bytes'%(len(s),n));"
+    "exec(compile(s.decode(),'letify-worker','exec'))"
 )
 
 _BODY = r'''

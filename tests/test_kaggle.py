@@ -1649,3 +1649,70 @@ def test_a_gap_that_never_clears_stops_blocking_the_account(
         time.sleep = monkeypatched
 
     assert sum(slept) <= 40.0, f"waited {sum(slept):.0f} s, over four times the interval"
+
+
+def test_the_stub_refuses_a_worker_source_that_arrived_short() -> None:
+    """Spec "Channels": a cut program fails as a SyntaxError that hides the cause.
+
+    KICT reported a Kaggle session dying with "unterminated triple-quoted string literal"
+    inside the worker source. A truncated source compiles as whatever construct the cut
+    landed inside, so the stub checks the count it was given instead.
+    """
+    import subprocess
+
+    from letify.protocol.worker import BOOTSTRAP, source
+
+    body = source().encode("utf-8")
+    # The count says the whole source; the pipe carries all but the last 284 bytes.
+    done = subprocess.run(
+        [sys.executable, "-u", "-c", BOOTSTRAP],
+        input=b"%d\n" % len(body) + body[:-284],
+        capture_output=True,
+        timeout=120,
+    )
+    assert b"arrived short" in done.stderr, done.stderr[-2000:]
+    assert str(len(body)).encode() in done.stderr
+    assert b"SyntaxError" not in done.stderr
+
+
+def test_the_shim_says_which_line_it_could_not_decode() -> None:
+    """Spec "Kaggle Jupyter Server session": a line cut in transit ended the shim silently.
+
+    It closed the worker's standard input, so the worker compiled whatever had arrived and
+    the only report was the worker's own SyntaxError.
+    """
+    import subprocess
+
+    from letify.providers.kaggle_adapter import SHIM, STUB
+
+    cell = SHIM % {"stub": STUB}
+    done = subprocess.run(
+        [sys.executable, "-u", "-c", cell],
+        # Five base64 characters, which is not a whole group, so decoding raises.
+        input=b"abcde\n",
+        capture_output=True,
+        timeout=120,
+    )
+    assert b"could not decode a line" in done.stderr, done.stderr[-2000:]
+    assert b"of 5 characters" in done.stderr
+
+
+def test_a_kernel_line_stays_inside_the_limit_a_kernel_carries() -> None:
+    """Spec "Kaggle Jupyter Server session": at most 36 KiB per line, so no line is 145 KiB.
+
+    The worker source is about 108 KB, which went as one base64 reply of about 145 KiB.
+    Channels states the same 36 KiB limit for a Modal sandbox, for the same reason.
+    """
+    import base64
+
+    from letify.protocol.worker import source
+    from letify.providers.kaggle import KaggleChannel
+
+    assert KaggleChannel.WRITE_LIMIT <= 36 * 1024
+    # A multiple of three bytes, so every line decodes on its own.
+    assert KaggleChannel.WRITE_LIMIT % 3 == 0
+    # 48 KiB of base64 plus the newline, which is the bound Channels states for Modal.
+    assert len(base64.b64encode(b"x" * KaggleChannel.WRITE_LIMIT)) <= 48 * 1024
+    assert len(source().encode("utf-8")) > KaggleChannel.WRITE_LIMIT, (
+        "the source must cross as several lines, or this pins nothing"
+    )

@@ -34,7 +34,12 @@ STUB = (
     "import sys;"
     "b=sys.stdin.buffer;"
     "n=int(b.readline());"
-    "exec(compile(b.read(n).decode(),'letify-worker','exec'))"
+    "s=b.read(n);"
+    # Spec "Channels": a source cut anywhere compiles as whatever construct the cut landed
+    # inside, or runs and exits without serving, so the count is checked before it is run.
+    "len(s)==n or sys.exit("
+    "'the letify worker source arrived short: %d of %d bytes'%(len(s),n));"
+    "exec(compile(s.decode(),'letify-worker','exec'))"
 )
 
 #: The cell that keeps the worker alive. It reads base64 lines with input(), because that is
@@ -67,7 +72,13 @@ while True:
     try:
         _worker.stdin.write(base64.b64decode(_text))
         _worker.stdin.flush()
-    except (OSError, ValueError):
+    except ValueError:
+        sys.stderr.write(
+            "the letify shim could not decode a line of %%d characters\\n" %% len(_text)
+        )
+        sys.stderr.flush()
+        break
+    except OSError:
         break
 
 try:
