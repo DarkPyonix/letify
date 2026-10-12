@@ -364,6 +364,8 @@ def _op_call(request):
         import shutil
         _data_unregister(state)
         _data_check_cache(data, state["placed"])
+        _DATA_FAILED.pop(data["dir"], None)
+        _DATA_FAILED.pop("", None)
         _DATA_POLL_SEEN.pop(data["dir"], None)
         _DATA_POLL_SENT.pop(data["dir"], None)
         shutil.rmtree(data["dir"], ignore_errors=True)
@@ -1047,6 +1049,9 @@ def _data_register(data):
         "linked": 0,
         "order": {},
         "arrived": 0,
+        # Spec "When a blob does not arrive": set when the local sender stops, so a
+        # reader fails at once with its reason rather than waiting out the timeout.
+        "failed": _DATA_FAILED.get(data["dir"]) or _DATA_FAILED.get(""),
         "wait": float(data.get("wait") or 600.0),
         "observe": bool(data.get("observe", True)),
         "prefetch": int(data.get("prefetch") or 64),
@@ -1238,6 +1243,32 @@ def _data_arrived(blobs, digest):
         _DATA_READY.notify_all()
 
 
+#: Reasons a sender stopped, by call directory, for a call that registers afterwards.
+_DATA_FAILED = {}
+
+
+def _op_data_failed(request):
+    """The local sender stopped, so the blobs it had left will never arrive.
+
+    Spec "When a blob does not arrive": every reader waiting on one of them is woken with
+    the reason, and a reader that arrives later fails on it at once, because waiting out
+    the per blob timeout costs that timeout once for every blob still queued.
+    """
+    reason = request.get("reason") or "the local process stopped sending"
+    where = request.get("dir") or ""
+    with _DATA_READY:
+        # Remembered by directory as well as set on the live call, because the sender can
+        # stop before the call request has been read, and the call then registers after
+        # this and would otherwise inherit nothing. Spec "When a blob does not arrive".
+        _DATA_FAILED[where] = reason
+        for state in _DATA_CALLS.values():
+            if where and state["dir"] != where:
+                continue
+            state["failed"] = reason
+        _DATA_READY.notify_all()
+    return {"ok": True, "value": True}
+
+
 def _data_want(digests, blocking=False):
     """Ask the local process for these blobs, in this order. Nothing replies to it."""
     if not digests:
@@ -1304,6 +1335,10 @@ def _data_wait(path):
         entry = state["pending"].get(path)
         if entry is None:
             return
+        if state["failed"]:
+            raise _DataFailure(
+                "%s was never sent: %s" % (os.path.basename(path), state["failed"])
+            )
         digest, size = entry
         index = state["order"].get(digest)
         if index is not None and index > state["arrived"] + _DATA_MISS_AHEAD:
@@ -1321,6 +1356,11 @@ def _data_wait(path):
     try:
         with _DATA_READY:
             while path in state["pending"] and state["dir"] in _DATA_CALLS:
+                if state["failed"]:
+                    raise _DataFailure(
+                        "%s was never sent: %s"
+                        % (os.path.basename(path), state["failed"])
+                    )
                 left = deadline - time.monotonic()
                 if left <= 0:
                     raise _DataFailure(
@@ -2289,6 +2329,7 @@ _OPS = {
     "data_put": _op_data_put,
     "data_begin": _op_data_begin,
     "data_drop": _op_data_drop,
+    "data_failed": _op_data_failed,
     "data_put_at": _op_data_put_at,
     "data_seal": _op_data_seal,
     "data_pull": _op_data_pull,
@@ -2314,7 +2355,9 @@ _OPS = {
 }
 
 #: Answered by the frame reader at once, so they work while a call runs.
-_LIGHT = ("stat", "lease", "reduce_peers")
+# ``data_failed`` is light because it must not queue behind the call it is about: the call
+# is blocked on a blob the sender will never send, so a queued answer would deadlock.
+_LIGHT = ("stat", "lease", "reduce_peers", "data_failed")
 
 #: Answered by several replies, the last one marked. These send their own replies.
 _STREAMING = ("data_stream",)

@@ -23,7 +23,7 @@ from importlib import import_module
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from ..errors import ConfigError, RemoteError, RuntimeFailure
+from ..errors import ConfigError, ProtocolError, RemoteError, RuntimeFailure
 
 if TYPE_CHECKING:
     from ..providers.base import Provider
@@ -608,10 +608,12 @@ class Stream:
     order after the call starts comes from the runtime rather than from the prediction.
     """
 
-    def __init__(self, runtime: Runtime, blobs: str, plan: Plan) -> None:
+    def __init__(self, runtime: Runtime, blobs: str, plan: Plan, call_dir: str = "") -> None:
         self.runtime = runtime
         self.blobs = blobs
         self.plan = plan
+        #: The call this stream feeds, so a stopped sender fails that call's readers only.
+        self.call_dir = call_dir
         #: Digests whose send finished. ``_sent`` holds the ones it began, so a blob the
         #: sender was carrying when the call ended is in one and not the other.
         self.done: set[str] = set()
@@ -662,12 +664,34 @@ class Stream:
                     break
             # The pieces still in flight are answered before the stream is released.
             self._flush()
-        except Exception:
-            # The call owns the failure: a blob that never arrives fails the read that
-            # waits for it, with the message spec "When a blob does not arrive" names.
-            pass
+        except Exception as exc:
+            # Spec "When a blob does not arrive": the sender stopping leaves every blob
+            # still queued unsendable, so it is said once and the readers waiting on one
+            # are failed with the reason. Waiting it out costs the per blob timeout once
+            # for each, which is how 131 queued shards became a silent hour.
+            if not self._cancelled.is_set():
+                self._stopped(exc)
         finally:
             self.during_seconds = time.monotonic() - started
+
+    def _stopped(self, exc: BaseException) -> None:
+        """Say the sender stopped, and tell the runtime so its readers stop waiting."""
+        from .. import install
+
+        left = self.dropped
+        reason = f"{type(exc).__name__}: {exc}"
+        install.log(
+            f"data sending stopped after {len(self.done)} of "
+            f"{len(self.plan.missing)} files, {len(left)} not sent: {reason}"
+        )
+        try:
+            _worker(
+                self.runtime,
+                {"op": "data_failed", "dir": self.call_dir, "reason": reason},
+            )
+        except (RuntimeFailure, RemoteError, ProtocolError):
+            # The runtime is gone, which fails every reader on its own.
+            pass
 
     def _pump(self) -> bool:
         """Send the next blob of the queue. False once nothing is left to send."""

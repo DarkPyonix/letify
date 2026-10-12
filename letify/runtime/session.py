@@ -419,7 +419,7 @@ class Runtime:
             needed = [d for d in plan.missing if d in ship_digests and d not in wave]
             if needed:
                 wave = needed + wave
-        stream = pathdata.Stream(self, blobs, plan)
+        stream = pathdata.Stream(self, blobs, plan, collector.call_dir)
         if not plan.missing:
             # Nothing to stream: the runtime holds every file, so the call places them all
             # before the body starts. It needs no manifest, no patch and no observation.
