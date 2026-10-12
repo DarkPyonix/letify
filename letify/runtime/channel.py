@@ -654,14 +654,14 @@ class FramedChannel(Channel):
 
     def _send_worker(self) -> None:
         """Hand the worker source to the bootstrap stub: a byte count line, then the source."""
-        from ..protocol.worker import source
+        from ..protocol.worker import count_line, source
 
         connection = self._connection
         assert connection is not None
         data = source(text_frames=self.text_frames).encode("utf-8")
         connection.hello = None
         try:
-            connection.sender.raw(b"%d\n" % len(data) + data)
+            connection.sender.raw(count_line(data) + data)
         except OSError:
             # The worker is already gone. Waiting for its hello reports why.
             pass

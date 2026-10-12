@@ -187,10 +187,10 @@ def test_a_worker_call_whose_body_imports_letify_while_running_names_the_reason(
 
         return inside.session_cache("value", lambda: 1)
 
-    from letify.protocol.worker import SOURCE
+    from letify.protocol.worker import SOURCE, count_line
 
     source = SOURCE.encode()
-    stdin = bytearray(b"%d\n" % len(source) + source)
+    stdin = bytearray(count_line(source) + source)
     sender = wire.Sender(lambda view: stdin.extend(view) or view.nbytes)
     head, buffers = codec.dumps_call_parts(work, (), {})
     sender.message(wire.REQUEST, 1, {"op": "call", "payload": head, "buffers": buffers})

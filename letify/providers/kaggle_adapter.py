@@ -31,14 +31,20 @@ UNREACHABLE = 4
 #: The stub the shim starts the worker with, the one Channels describes: a byte count line,
 #: then that many bytes of source.
 STUB = (
-    "import sys;"
+    "import sys,hashlib;"
     "b=sys.stdin.buffer;"
-    "n=int(b.readline());"
+    "h=b.readline().split();"
+    "n=int(h[0]);"
     "s=b.read(n);"
-    # Spec "Channels": a source cut anywhere compiles as whatever construct the cut landed
-    # inside, or runs and exits without serving, so the count is checked before it is run.
+    # Spec "Channels": a source cut or shifted anywhere compiles as whatever construct the
+    # damage landed inside, or runs and exits without serving. The count catches a cut and
+    # the digest catches a shift, which keeps the count intact.
     "len(s)==n or sys.exit("
     "'the letify worker source arrived short: %d of %d bytes'%(len(s),n));"
+    "d=hashlib.blake2b(s,digest_size=16).hexdigest();"
+    "d==h[1].decode() or sys.exit("
+    "'the letify worker source arrived corrupted: %d bytes, digest %s, expected %s'"
+    "%(len(s),d,h[1].decode()));"
     "exec(compile(s.decode(),'letify-worker','exec'))"
 )
 

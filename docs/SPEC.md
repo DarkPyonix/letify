@@ -656,7 +656,15 @@ A **persistent channel** keeps one worker process alive behind a pipe pair. Mess
 
 A **one-shot channel** can only run a command and collect its output. Every call starts a fresh process, so nothing persists. It exists because some transports offer nothing more, and it refuses the operations that need persistence rather than pretending.
 
-The worker source cannot be sent on standard input as a script, because `python -` reads to end of file before compiling anything and the pipe has to stay open for requests. A small bootstrap stub passed with `-c` reads one line holding a decimal byte count from `sys.stdin.buffer`, reads that many bytes of UTF-8 worker source, executes them, and leaves standard input where it was. From then on both pipes carry frames only. The stub compares what it read against the count and raises `SystemExit` with `the letify worker source arrived short: <read> of <expected> bytes` rather than compiling a truncated program, because a program cut anywhere fails as a `SyntaxError` at whatever construct the cut landed inside, which names the symptom and hides the cause.
+The worker source cannot be sent on standard input as a script, because `python -` reads to end of file before compiling anything and the pipe has to stay open for requests. A small bootstrap stub passed with `-c` reads one line holding a decimal byte count from `sys.stdin.buffer`, reads that many bytes of UTF-8 worker source, executes them, and leaves standard input where it was. From then on both pipes carry frames only. The count line is `<byte count> <digest>`, where the digest is the first 16 bytes of the source's
+blake2b in hexadecimal, from `hashlib` so the stub needs nothing installed. The stub exits rather
+than compiling when either disagrees: `the letify worker source arrived short: <read> of <expected>
+bytes`, or `the letify worker source arrived corrupted: <read> bytes, digest <found>, expected
+<wanted>`. A program cut or shifted anywhere fails as a `SyntaxError` at whatever construct the
+damage landed inside, which names the symptom and hides the cause. The count alone is not enough,
+because a transport that loses one run of bytes and gains another of the same length keeps the count
+intact: a Kaggle session reported an unterminated triple-quoted string at a line that holds no quote
+in the source, which is what a shifted source looks like and what a digest catches.
 
 ### Frames <!-- id: frames -->
 
