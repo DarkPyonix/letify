@@ -1608,7 +1608,7 @@ def test_stop_orphans_exits_one_when_a_delete_failed(isolated_home, capsys, monk
     assert "refused" in capsys.readouterr().out
 
 
-def test_the_cache_listing_starts_no_session(config_file, monkeypatch, capsys) -> None:
+def test_the_cache_listing_starts_no_session(isolated_home, monkeypatch, capsys) -> None:
     """Spec "The cache command": a command that shows what is there starts nothing.
 
     KICT ran `letify cache` and it booted a Modal CPU session, which then failed its own
@@ -1619,6 +1619,10 @@ def test_the_cache_listing_starts_no_session(config_file, monkeypatch, capsys) -
     from letify.cli import main
     from letify.runtime import pool
 
+    (isolated_home / ".letify" / "config.toml").write_text(
+        '[lab]\nkind = "shell"\naddress = "gpu.example.edu"\npersistent = true\n',
+        encoding="utf-8",
+    )
     started: list[str] = []
 
     real = pool.RuntimePool.acquire
@@ -1638,13 +1642,17 @@ def test_the_cache_listing_starts_no_session(config_file, monkeypatch, capsys) -
 
 
 def test_the_cache_listing_says_a_provider_has_no_session_running(
-    config_file, monkeypatch, capsys
+    isolated_home, capsys
 ) -> None:
     """Spec "The cache command": a provider with no session is named, not skipped."""
     import json
 
     from letify.cli import main
 
+    (isolated_home / ".letify" / "config.toml").write_text(
+        '[lab]\nkind = "shell"\naddress = "gpu.example.edu"\npersistent = true\n',
+        encoding="utf-8",
+    )
     assert main(["cache", "--json"]) == 0
     record = json.loads(capsys.readouterr().out)
     remote = [
