@@ -106,9 +106,12 @@ def test_a_path_that_does_not_exist_outside_the_roots_is_left_as_a_plain_path(
     assert not absent.exists()
 
 
-def test_a_path_outside_the_allowed_roots_is_left_as_a_plain_path(
-    let, cpu, project, tmp_path, capsys
-) -> None:
+def test_a_file_outside_the_allowed_roots_is_refused(let, cpu, project, tmp_path) -> None:
+    """Spec "Where the bytes come from": it used to travel as a plain path.
+
+    The body then read a path that is not on the runtime, which failed there as a
+    FileNotFoundError naming neither the cause nor the rule. KICT hit that twice.
+    """
     outside = tmp_path / "elsewhere.txt"
     outside.write_text("not project data", encoding="utf-8")
 
@@ -116,8 +119,9 @@ def test_a_path_outside_the_allowed_roots_is_left_as_a_plain_path(
     def where(path: Path) -> str:
         return str(path)
 
-    assert where(outside) == str(outside)
-    assert data_lines(capsys.readouterr().err) == []
+    with pytest.raises(ValueError) as failure:
+        where(outside)
+    assert "outside the roots letify may send data from" in str(failure.value)
 
 
 def test_a_data_root_named_in_pyproject_is_allowed(let, cpu, project, tmp_path) -> None:
@@ -780,3 +784,40 @@ def test_blobs_a_write_back_adds_keep_the_cache_within_its_budget(
     root = _blobs_root()
     assert sum(p.stat().st_size for p in root.glob("*/*")) <= 20 << 10
     assert len(evictions(capsys.readouterr().err)) == 1
+
+
+def test_a_file_outside_the_allowed_roots_is_refused_rather_than_sent_as_a_path(
+    let, cpu, project, tmp_path
+) -> None:
+    """Spec "Where the bytes come from": passing it on leaves the body reading nothing.
+
+    KICT hit this twice on Kaggle: a shard outside the project root travelled as a plain
+    path and the call died on the runtime with FileNotFoundError naming only the file.
+    """
+    outside = tmp_path / "outside" / "shard.pt"
+    outside.parent.mkdir(parents=True, exist_ok=True)
+    outside.write_bytes(b"x" * 4096)
+
+    @let.function(device=cpu, host="remote")
+    def read(path) -> int:
+        import os
+
+        return os.path.getsize(path)
+
+    with pytest.raises(ValueError) as failure:
+        read(path=outside)
+    message = str(failure.value)
+    assert str(outside) in message
+    assert "data_roots" in message
+    assert "outside the roots letify may send data from" in message
+
+
+def test_a_path_that_does_not_exist_here_still_travels_unchanged(let, cpu, project) -> None:
+    """Spec "Where the bytes come from": that is how a body is told where to write."""
+
+    @let.function(device=cpu, host="remote")
+    def name(path) -> str:
+        return str(path)
+
+    target = Path("/not/on/this/machine/out.pt")
+    assert name(path=target) == str(target)
