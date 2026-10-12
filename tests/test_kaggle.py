@@ -1576,3 +1576,76 @@ def test_a_missing_libcuda_is_not_reported_as_a_cuda_error() -> None:
     assert "no libcuda.so.1 to load" in message
     assert "cuInit returned" not in message
     assert "-1" not in message
+
+
+def test_the_gap_is_read_again_after_waiting(config_file, kaggle_api_token) -> None:
+    """Spec "Kaggle": another process may create a session while this one waits.
+
+    The first attempt waited once on the remainder it read at the start, so a session
+    another process created during the wait left the gap unmet and Kaggle refused the
+    run anyway, one second after the wait ended.
+    """
+    import time
+
+    from conftest import provider_of
+
+    from letify.providers import Kaggle
+    from letify.providers.kaggle import notebook_record
+
+    path = notebook_record("kaggle_a")
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    now = time.time()
+    path.write_text(f"irack000/one\t1\t{now - 9.6:.3f}\n", encoding="utf-8")
+
+    provider = provider_of(Kaggle, "kaggle_a", min_session_interval_s=10)
+    slept: list[float] = []
+
+    def sleep(seconds: float) -> None:
+        # Nothing really sleeps here, so the record stands in for the clock.
+        slept.append(seconds)
+        if len(slept) == 1:
+            # A second process creates one while this one waits, moving the gap forward.
+            path.write_text(f"irack000/two\t2\t{time.time() - 9.6:.3f}\n", encoding="utf-8")
+        else:
+            path.write_text(f"irack000/two\t2\t{time.time() - 500:.3f}\n", encoding="utf-8")
+
+    monkeypatched = time.sleep
+    time.sleep = sleep  # type: ignore[assignment]
+    try:
+        provider._leave_a_gap()
+    finally:
+        time.sleep = monkeypatched
+
+    assert len(slept) == 2, f"waited {len(slept)} time(s), so the gap was not read again"
+
+
+def test_a_gap_that_never_clears_stops_blocking_the_account(
+    config_file, kaggle_api_token
+) -> None:
+    """Spec "Kaggle": a record a dead process left cannot block an account forever."""
+    import time
+
+    from conftest import provider_of
+
+    from letify.providers import Kaggle
+    from letify.providers.kaggle import notebook_record
+
+    path = notebook_record("kaggle_a")
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    provider = provider_of(Kaggle, "kaggle_a", min_session_interval_s=10)
+    slept: list[float] = []
+
+    def sleep(seconds: float) -> None:
+        slept.append(seconds)
+        # Something keeps making sessions, so the remainder never reaches zero.
+        path.write_text(f"irack000/one\t1\t{time.time():.3f}\n", encoding="utf-8")
+
+    path.write_text(f"irack000/one\t1\t{time.time():.3f}\n", encoding="utf-8")
+    monkeypatched = time.sleep
+    time.sleep = sleep  # type: ignore[assignment]
+    try:
+        provider._leave_a_gap()
+    finally:
+        time.sleep = monkeypatched
+
+    assert sum(slept) <= 40.0, f"waited {sum(slept):.0f} s, over four times the interval"

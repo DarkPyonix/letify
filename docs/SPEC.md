@@ -301,6 +301,12 @@ Whether an account can be asked at all is the provider's own answer, `discovers_
 
 So the record notes when each notebook was created, as a third tab separated field after the ref and the pid, and `open_channel` waits out the remainder of `min_session_interval_s` since the newest recorded creation on that account before it creates another. It waits rather than refusing, saying `letify: <alias>: waiting <seconds> s before another session, because Kaggle refuses one made too soon after the last`, because the cost of waiting too long is patience and the cost of waiting too little is an account that refuses every run for an unknown time.
 
+The wait is re-read after it ends rather than computed once, because another process on the same
+account may create a session while this one waits, which moves the newest creation forward. letify
+therefore waits again for the new remainder, up to a total of four times the interval, and then
+creates the session anyway so that a record left by a process that died cannot block an account
+forever.
+
 The default is 120 seconds and it is a guess, not a measurement. What is measured is one refusal: two sessions created at 01:52, the process interrupted at 01:56, another session created at 01:57 and refused at 02:01, so a one minute gap is known to be too short and no upper bound is known. An account sets `min_session_interval_s` to any value, and 0 turns the wait off.
 
 Separately, and without needing a threshold at all, a refusal says how long ago the previous session on that account was created, so a reader can tell this cause from any other: `Kaggle did not start a session run. The previous session on this account was created <seconds> s ago, and Kaggle refuses a run made too soon after the last`. A refusal with no previous session recorded says only the first sentence.

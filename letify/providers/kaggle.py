@@ -1281,17 +1281,33 @@ class Kaggle(Provider):
 
         Spec "Kaggle", not making sessions faster than Kaggle allows: a refusal costs an
         account that answers nothing for an unknown time, and waiting costs patience.
+
+        The remainder is read again after each wait, because another process on this
+        account may create a session while this one waits, which moves the newest
+        creation forward and left the gap unmet. Waiting stops after four times the
+        interval so a record a dead process left cannot block the account forever.
         """
         from ..transport.announce import printer
 
-        waiting = wait_before_session(self.alias, self.min_session_interval_s)
-        if waiting <= 0:
-            return
-        printer(bool(self.__dict__.get("announce", True)))(
-            f"{self.alias}: waiting {waiting:.0f} s before another session, because Kaggle "
-            f"refuses one made too soon after the last"
-        )
-        time.sleep(waiting)
+        interval = self.min_session_interval_s
+        say = printer(bool(self.__dict__.get("announce", True)))
+        spent = 0.0
+        while True:
+            waiting = wait_before_session(self.alias, interval)
+            if waiting <= 0:
+                return
+            if spent + waiting > interval * 4:
+                say(
+                    f"{self.alias}: creating a session without the full gap, because "
+                    f"{spent:.0f} s of waiting did not clear it"
+                )
+                return
+            say(
+                f"{self.alias}: waiting {waiting:.0f} s before another session, because Kaggle "
+                f"refuses one made too soon after the last"
+            )
+            time.sleep(waiting)
+            spent += waiting
 
     def orphans(self) -> list[str]:
         """Notebooks this account still has whose creating process is gone."""
