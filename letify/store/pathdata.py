@@ -18,6 +18,7 @@ import sys
 import threading
 import time
 import tomllib
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from importlib import import_module
 from pathlib import Path
@@ -485,11 +486,16 @@ def _mib(size: int) -> str:
 
 
 class _Uploaded:
-    """Bytes sent so far, drawn as a progress line when the upload is large."""
+    """Bytes sent so far, drawn as a progress line when the upload is large.
+
+    Several senders advance this together once blobs overlap, spec "Several
+    connections at once", so ``base`` is kept under a lock rather than left to the GIL.
+    """
 
     def __init__(self, files: int, total: int) -> None:
         self.base = 0
         self.progress = None
+        self._lock = threading.Lock()
         if total >= PROGRESS_THRESHOLD:
             from ..install import _Progress
 
@@ -497,11 +503,14 @@ class _Uploaded:
 
     def update(self, done: int) -> None:
         if self.progress is not None:
-            self.progress.update(self.base + done)
+            with self._lock:
+                self.progress.update(self.base + done)
 
     def advance(self, size: int) -> None:
-        self.base += size
-        self.update(0)
+        with self._lock:
+            self.base += size
+            if self.progress is not None:
+                self.progress.update(self.base)
 
     def finish(self) -> None:
         if self.progress is not None:
@@ -641,9 +650,31 @@ class Stream:
         started = time.monotonic()
         total = sum(self.plan.weight(digest)[1] for digest in wave)
         meter = _Uploaded(len(wave), total)
-        for digest in wave:
-            self._send(digest, meter)
-            meter.advance(self.plan.sizes.get(digest, 0))
+        senders = self._senders(len(wave))
+        if senders <= 1:
+            for digest in wave:
+                self._send(digest, meter)
+                meter.advance(self.plan.sizes.get(digest, 0))
+        else:
+            # Spec "Several connections at once": the condition for using more than one
+            # connection is the link's round trip alone, not the size threshold, so the
+            # first wave is sent with several senders too whenever the link allows it.
+            remaining = collections.deque(wave)
+            pop_lock = threading.Lock()
+
+            def pop() -> str | None:
+                with pop_lock:
+                    return remaining.popleft() if remaining else None
+
+            def worker(stop: threading.Event) -> None:
+                while not stop.is_set():
+                    digest = pop()
+                    if digest is None:
+                        return
+                    self._send(digest, meter, parallel=True)
+                    meter.advance(self.plan.sizes.get(digest, 0))
+
+            self._send_parallel(senders, worker)
         # Every piece answered, so the wave is placed when the call goes out.
         self._flush()
         meter.finish()
@@ -662,9 +693,26 @@ class Stream:
     def _run(self) -> None:
         started = time.monotonic()
         try:
-            while not self._cancelled.is_set():
-                if not self._pump():
-                    break
+            with self._lock:
+                left = len(self._queue)
+            senders = self._senders(left)
+            if senders <= 1:
+                while not self._cancelled.is_set():
+                    if not self._pump():
+                        break
+            else:
+                # Spec "Several connections at once": several senders over the pool,
+                # each reordering and taking from the same queue the single sender
+                # would have used, rather than one sender on the call's own stream.
+                def worker(stop: threading.Event) -> None:
+                    while not self._cancelled.is_set() and not stop.is_set():
+                        self.reorder()
+                        digest = self._take()
+                        if digest is None:
+                            return
+                        self._send(digest, None, parallel=True)
+
+                self._send_parallel(senders, worker)
             # The pieces still in flight are answered before the stream is released.
             self._flush()
         except Exception as exc:
@@ -773,10 +821,11 @@ class Stream:
 
     def _pool(self) -> _Channels:
         """The call's transfer connections, opened lazily and reused by every blob."""
-        if self._channels is None:
-            limit = int(getattr(self.runtime.provider, "transfer_streams", STREAMS) or 1)
-            self._channels = _Channels(self.runtime, limit)
-        return self._channels
+        with self._lock:
+            if self._channels is None:
+                limit = int(getattr(self.runtime.provider, "transfer_streams", STREAMS) or 1)
+                self._channels = _Channels(self.runtime, limit)
+            return self._channels
 
     def _flush(self) -> None:
         """Read every outstanding reply, so a piece the worker refused fails here."""
@@ -787,9 +836,79 @@ class Stream:
         except RemoteError as exc:
             raise RuntimeFailure(f"{self.runtime.name}: data_put failed: {exc}") from exc
 
+    # -- several senders at once -------------------------------------------------
+
+    def _senders(self, available: int) -> int:
+        """How many blobs this call may have in flight at once, never above ``available``.
+
+        Spec "Several connections at once": the connections carry different blobs at the
+        same time as well as different ranges of one, and the condition for more than one
+        is the link's round trip alone. The size threshold decides whether one blob is
+        split, not whether blobs may overlap.
+        """
+        provider = getattr(self.runtime, "provider", None)
+        if not _has_transfer_channel(provider):
+            return 1
+        rtt = _measured_rtt(provider, self.runtime)
+        if rtt is None or rtt < PARALLEL_RTT_MS:
+            return 1
+        limit = int(getattr(provider, "transfer_streams", STREAMS) or 1)
+        return max(1, min(limit, available))
+
+    def _send_parallel(self, count: int, worker: Callable[[threading.Event], None]) -> None:
+        """Run ``worker(stop)`` on ``count`` threads; the first failure stops the rest.
+
+        One worker failing must not leave the others sending into a dead transfer, so
+        ``stop`` is set as soon as any of them raises, and the first failure is what
+        reaches the caller once every thread has joined.
+        """
+        failures: list[BaseException] = []
+        failures_lock = threading.Lock()
+        stop = threading.Event()
+
+        def guarded() -> None:
+            try:
+                worker(stop)
+            except BaseException as exc:
+                with failures_lock:
+                    failures.append(exc)
+                stop.set()
+
+        threads = [
+            threading.Thread(target=guarded, name=f"letify-data-{index}", daemon=True)
+            for index in range(count)
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        if failures:
+            raise failures[0]
+
+    def _send_alone(self, action: Callable[[Any], None]) -> None:
+        """Run ``action(pipeline)`` on a pooled channel held for the call it makes.
+
+        Used when several senders share the call's pool: ``self._link()`` carries only
+        one sender's ordering at a time, so a blob that needs a pipeline for more than
+        one request borrows a channel of its own for as long as that takes. Spec
+        "Several connections at once".
+        """
+        channel = self._pool().take()
+        ok = False
+        try:
+            pipeline = channel.pipeline(window=WINDOW, timeout=3600)
+            action(pipeline)
+            pipeline.drain()
+            ok = True
+        finally:
+            if ok:
+                self._pool().give(channel)
+            else:
+                self._pool().drop(channel)
+
     # -- one blob ---------------------------------------------------------------
 
-    def _send(self, digest: str, meter: _Uploaded | None) -> None:
+    def _send(self, digest: str, meter: _Uploaded | None, *, parallel: bool = False) -> None:
         with self._lock:
             if digest in self._sent or self._cancelled.is_set():
                 return
@@ -804,7 +923,24 @@ class Stream:
             # finds them open. Spec "Several connections at once".
             warm = self._channels is not None and self._channels.warm
             streams = _streams_for(self.runtime, size, warm=warm)
-            if streams > 1:
+            if streams > 1 and parallel:
+                # self._link() carries only one sender's ordering at a time, so the
+                # data_begin/data_seal pair this blob needs borrows a pooled channel of
+                # its own instead, the same way the ranges already do.
+                self._send_alone(
+                    lambda pipeline: _put_parallel(
+                        self.runtime,
+                        pipeline,
+                        self.blobs,
+                        digest,
+                        local,
+                        size,
+                        meter,
+                        streams,
+                        self._pool(),
+                    )
+                )
+            elif streams > 1:
                 _put_parallel(
                     self.runtime,
                     self._link(),
@@ -815,6 +951,15 @@ class Stream:
                     meter,
                     streams,
                     self._pool(),
+                )
+            elif parallel:
+                # Not split, but two senders cannot share self._link()'s ordering
+                # either, so this blob takes a pooled channel of its own for its
+                # whole send. Spec "Several connections at once".
+                self._send_alone(
+                    lambda pipeline: _put(
+                        self.runtime, pipeline, self.blobs, digest, local, size, meter
+                    )
                 )
             else:
                 _put(self.runtime, self._link(), self.blobs, digest, local, size, meter)
@@ -840,12 +985,12 @@ class Stream:
         files, total = self.plan.weight(digest)
         with self._lock:
             self.done.add(digest)
-        if self._thread is None:
-            self.before_files += files
-            self.before_bytes += total
-        else:
-            self.during_files += files
-            self.during_bytes += total
+            if self._thread is None:
+                self.before_files += files
+                self.before_bytes += total
+            else:
+                self.during_files += files
+                self.during_bytes += total
 
     @property
     def sent(self) -> int:
@@ -927,6 +1072,31 @@ def streams_for(
     return count
 
 
+def _has_transfer_channel(provider: Any) -> bool:
+    """Whether the provider's class can open another transfer connection.
+
+    On the class, not the instance: a provider's ``__getattr__`` answers accelerator
+    names and raises ``UnknownInstance`` for anything else, which ``hasattr`` does not
+    catch. A provider whose channel is not a connection it can open more of, such as
+    Modal's sandbox pipes or Kaggle's kernel bridge, answers False. Spec "Several
+    connections at once".
+    """
+    return hasattr(type(provider), "transfer_channel")
+
+
+def _measured_link(provider: Any, runtime: Any) -> Any:
+    """The provider's link for ``runtime``, or None where asking for it fails."""
+    try:
+        return provider.link(runtime) if provider is not None else None
+    except Exception:
+        return None
+
+
+def _measured_rtt(provider: Any, runtime: Any) -> float | None:
+    """The link's measured round trip in milliseconds, or None with no measurement."""
+    return getattr(_measured_link(provider, runtime), "rtt_ms", None)
+
+
 def _streams_for(runtime: Any, size: int, *, warm: bool = False) -> int:
     """``streams_for`` with the account's settings and the link's measured round trip.
 
@@ -936,24 +1106,11 @@ def _streams_for(runtime: Any, size: int, *, warm: bool = False) -> int:
     cold.
     """
     provider = getattr(runtime, "provider", None)
-    # On the class, not the instance: a provider's __getattr__ answers accelerator names
-    # and raises UnknownInstance for anything else, which hasattr does not catch.
-    if not hasattr(type(provider), "transfer_channel"):
-        # A provider whose channel is not a connection it can open more of, such as
-        # Modal's sandbox pipes or Kaggle's kernel bridge. Spec "Several connections at
-        # once".
+    if not _has_transfer_channel(provider):
         return 1
-    rtt = None
-    try:
-        link = provider.link(runtime) if provider is not None else None
-        rtt = getattr(link, "rtt_ms", None)
-    except Exception:
-        rtt = None
-    rate = None
-    try:
-        rate = getattr(link, "upload_bps", None)
-    except Exception:
-        rate = None
+    link = _measured_link(provider, runtime)
+    rtt = getattr(link, "rtt_ms", None)
+    rate = getattr(link, "upload_bps", None)
     cost_s = 0.0 if warm else float(getattr(provider, "transfer_connection_cost_s", 0.0) or 0.0)
     return streams_for(
         streams=int(getattr(provider, "transfer_streams", STREAMS) or 1),
@@ -1207,6 +1364,7 @@ class _Downloaded(_Uploaded):
     def __init__(self, files: int, total: int) -> None:
         self.base = 0
         self.progress = None
+        self._lock = threading.Lock()
         if total >= PROGRESS_THRESHOLD:
             from ..install import _Progress
 

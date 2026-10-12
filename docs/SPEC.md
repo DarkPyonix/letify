@@ -1129,6 +1129,15 @@ So a blob above `transfer_parallel_mib`, 64 MiB by default, on a link whose meas
 
 The round trip is a condition because the gain depends on it. A single stream is window limited only when the window takes a long time to fill, so on a short link it already carries everything the link will carry and the extra connections are pure cost. Measured to a lab server over forward SSH at 0.25 ms, 256 MiB went at 36.1 MiB/s on one stream and 33.5 MiB/s on four, about 7% worse, which is the cost of opening the channels and their worker processes. The link reports what the probe measured, and a link with no measurement, such as a provider fallback, is treated as short and keeps one stream. A provider whose channel is not a connection it can open more of keeps one stream too: Modal's sandbox reads and writes through its own API, and a Kaggle session that never punched is carried by a kernel bridge, so neither has a second connection to offer. A Kaggle session that did punch is reached over SSH and does: each transfer stream asks the link for its own SSH command, which lands on a local forwarding port of its own and so makes the link punch again.
 
+The connections carry different blobs at the same time as well as different ranges of one, because a
+call whose blobs are each under the split threshold would otherwise send them one after another and
+reach one connection's ceiling however many files it has. Measured on a Kaggle runtime at a 190 ms
+round trip, 20 files of 10 MB each went at 5.0 MiB/s on one connection, which is the 0.9 MiB window
+over that round trip. So the sender runs `transfer_streams` senders over the pool rather than one, and
+the condition for using more than one connection is the link's round trip alone: the size threshold
+decides whether one blob is split, not whether blobs may overlap. A blob the worker asked for by
+`data_want` still goes next, because the queue is reordered before a sender takes from it.
+
 The connections are opened once per call and reused by every blob of it, not opened and closed per
 blob. A call that sends a hundred blobs over a punched link paid a hundred rounds of punching when
 each blob opened its own, which is both the cost the estimate below weighs and a hundred chances for
