@@ -506,3 +506,45 @@ def test_a_warm_pool_costs_nothing_to_weigh() -> None:
     )
     assert cold == 1
     assert warm == 4
+
+
+def test_blobs_under_the_threshold_still_go_over_several_connections(
+    project, launcher_from, monkeypatch
+) -> None:
+    """Spec "Several connections at once": the size threshold splits one blob, not the call.
+
+    KICT's subset was 40 files of 217 MiB in total, each under the threshold, so each went
+    alone on the call's own stream and the whole upload sat at one connection's ceiling.
+    Measured on a Kaggle runtime at a 190 ms round trip, 20 files of 10 MB each went at
+    5.0 MiB/s, which is the 0.9 MiB window over that round trip.
+    """
+    opened = transfer_channels(monkeypatch)
+    let = persistent(launcher_from, transfer_streams=4, transfer_parallel_mib=1000)
+    # A local channel is never probed, so the round trip a long link reports is supplied.
+    monkeypatch.setattr(
+        letify.providers.local.Local,
+        "link",
+        lambda self, runtime=None: _Measured(rtt_ms=138.0, upload_bps=8 << 20),
+        raising=False,
+    )
+    shards = []
+    for index in range(8):
+        shard = project / f"small-{index}.bin"
+        shard.write_bytes(os.urandom(256 * 1024))
+        shards.append(shard)
+
+    @let.function(device=let.providers.lab.CPU, host=letify.remote)
+    def total(paths) -> int:
+        return sum(len(open(p, "rb").read()) for p in paths)
+
+    assert total(paths=shards) == 8 * 256 * 1024
+    assert len(opened) > 1, "every blob went on one connection, so nothing overlapped"
+    assert len(opened) <= 4, f"opened {len(opened)}, over the stream count"
+
+
+class _Measured:
+    """A link whose measured round trip and rate a test sets, as the probe would."""
+
+    def __init__(self, rtt_ms: float, upload_bps: float) -> None:
+        self.rtt_ms = rtt_ms
+        self.upload_bps = upload_bps
