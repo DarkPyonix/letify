@@ -1606,3 +1606,53 @@ def test_stop_orphans_exits_one_when_a_delete_failed(isolated_home, capsys, monk
     )
     assert main(["stop", "--orphans", "-y"]) == 1
     assert "refused" in capsys.readouterr().out
+
+
+def test_the_cache_listing_starts_no_session(config_file, monkeypatch, capsys) -> None:
+    """Spec "The cache command": a command that shows what is there starts nothing.
+
+    KICT ran `letify cache` and it booted a Modal CPU session, which then failed its own
+    uv sync. A configuration naming several persistent providers would bill for all of
+    them to print a listing.
+    """
+    import letify
+    from letify.cli import main
+    from letify.runtime import pool
+
+    started: list[str] = []
+
+    real = pool.RuntimePool.acquire
+
+    def watch(self, instance, env, volumes=(), **kwargs):
+        provider = instance.provider
+        started.append(provider.alias)
+        assert provider.kind == "local", f"the listing started a billed session on {provider.alias}"
+        return real(self, instance, env, volumes, **kwargs)
+
+    monkeypatch.setattr(pool.RuntimePool, "acquire", watch)
+    assert main(["cache", "--json"]) == 0
+    assert all(alias == "local" for alias in started), started
+    out = capsys.readouterr().out
+    assert "providers" in out
+    assert letify  # the import is what makes the launcher reachable in this process
+
+
+def test_the_cache_listing_says_a_provider_has_no_session_running(
+    config_file, monkeypatch, capsys
+) -> None:
+    """Spec "The cache command": a provider with no session is named, not skipped."""
+    import json
+
+    from letify.cli import main
+
+    assert main(["cache", "--json"]) == 0
+    record = json.loads(capsys.readouterr().out)
+    remote = [
+        row
+        for row in record["providers"]
+        if row.get("kept") and row["alias"] != "local"
+    ]
+    assert remote, "no billed persistent provider in the fixture, so this pins nothing"
+    for row in remote:
+        assert row.get("running") is False, row
+        assert "files" not in row, row
