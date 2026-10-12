@@ -275,6 +275,29 @@ def venv_check_source(python: str, archive: str | None = None) -> str:
     return "\n".join(lines) + "\n"
 
 
+def tree_size_source(root: str) -> str:
+    """Source that sums the byte size of every regular file under a directory.
+
+    Walked in Python rather than shelled out to ``du``, so the worker stays portable.
+    Spec "Materializing into a runtime": the packing decision weighs this size, measured
+    after the sync, against the build it just paid for.
+    """
+    return (
+        "import os\n"
+        f"_letify_root = os.path.expanduser({root!r})\n"
+        "_letify_total = 0\n"
+        "for _letify_dirpath, _letify_dirnames, _letify_filenames in os.walk(_letify_root):\n"
+        "    for _letify_name in _letify_filenames:\n"
+        "        try:\n"
+        "            _letify_total += os.lstat(\n"
+        "                os.path.join(_letify_dirpath, _letify_name)\n"
+        "            ).st_size\n"
+        "        except OSError:\n"
+        "            pass\n"
+        "__letify_value__ = _letify_total\n"
+    )
+
+
 def pull_source(
     source: dict[str, object], path: str, *, unpack: bool = False,
     target: str | None = None, links: bool = False,

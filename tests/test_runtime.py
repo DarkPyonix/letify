@@ -432,6 +432,247 @@ def test_a_synced_environment_is_archived_and_the_next_session_restores_it_inste
         second.shutdown()
 
 
+class _FakeLink:
+    """A link whose measured rate a test sets directly.
+
+    ``PreparingLocal`` runs no real probe, so there is nothing to race for a measured
+    rate. ``Runtime._measured_rate`` reaches for ``provider.link(runtime).upload_bps`` the
+    way ``pathdata._streams_for`` does, so a test sets ``link`` on the provider's own
+    ``__dict__`` (``provider.__getattr__`` raises ``UnknownInstance`` for an unknown name
+    rather than ``AttributeError``, which ``monkeypatch.setattr`` cannot see past).
+    """
+
+    def __init__(self, upload_bps: float):
+        self.upload_bps = upload_bps
+        self.rtt_ms = 50.0
+
+
+def test_a_slow_measured_link_makes_a_later_session_sync_rather_than_restore(
+    uv_project: Path, tmp_path: Path, monkeypatch, capsys
+) -> None:
+    # Spec "Materializing into a runtime": a later session restores only when the
+    # archive's size over the link measured for that session would take less than the
+    # recorded build. A link this slow costs more, so the session syncs instead and says
+    # why, in the shape "<size> GB over <rate> MiB/s is <s> s against a <s> s build".
+    provider = provider_of(PreparingLocal, "lab", persistent=False)
+    volume = provider.volume(
+        "cache", backend="filesystem", root=str(tmp_path / "store"), mount=str(tmp_path / "mount")
+    )
+    env = Env()
+    instance = Instance(provider, gpu=None)._placed("remote")
+
+    first = provider.start(instance, env, name="lab-1", volumes=(volume,))
+    try:
+        assert first.env_source == "sync"
+        platform = first.platform
+    finally:
+        first.shutdown()
+    assert volume.cached_build(env, platform) is not None
+
+    shutil.rmtree(remote_projects())
+    monkeypatch.setitem(
+        provider.__dict__, "link", lambda runtime=None: _FakeLink(upload_bps=1024)
+    )
+    second = provider.start(instance, env, name="lab-2", volumes=(volume,))
+    try:
+        assert second.env_source == "sync"
+    finally:
+        second.shutdown()
+    err = capsys.readouterr().err
+    lines = [line for line in err.splitlines() if "syncing rather than restoring" in line]
+    assert lines, err
+    assert "GB over" in lines[0]
+    assert "MiB/s is" in lines[0]
+    assert "s build" in lines[0]
+
+
+def test_an_archive_with_no_recorded_build_is_not_restored(
+    uv_project: Path, tmp_path: Path, capsys
+) -> None:
+    # Spec "Materializing into a runtime": an archive written before letify recorded the
+    # build is the kind this rule exists to catch, so it is not trusted. The session syncs,
+    # which records the build and decides afresh whether the archive is worth keeping.
+    provider = provider_of(PreparingLocal, "lab", persistent=False)
+    volume = provider.volume(
+        "cache", backend="filesystem", root=str(tmp_path / "store"), mount=str(tmp_path / "mount")
+    )
+    env = Env()
+    instance = Instance(provider, gpu=None)._placed("remote")
+
+    first = provider.start(instance, env, name="lab-1", volumes=(volume,))
+    try:
+        platform = first.platform
+    finally:
+        first.shutdown()
+    assert volume.cached_env(env, platform)
+
+    # What an archive from an older letify looks like: the blob and its ref, no build.
+    volume.store.backend.write_ref(volume.build_ref(env, platform), "")
+    shutil.rmtree(remote_projects())
+    second = provider.start(instance, env, name="lab-2", volumes=(volume,))
+    try:
+        assert second.env_source == "sync"
+    finally:
+        second.shutdown()
+    err = capsys.readouterr().err
+    assert "no build time to compare against" in err, err
+
+
+def test_skipping_the_pack_says_so(uv_project: Path, tmp_path: Path, monkeypatch, capsys) -> None:
+    # Spec "Materializing into a runtime": skipping the pack is a decision letify made,
+    # not a thing that did not happen, so it is said rather than left silent.
+    provider = provider_of(PreparingLocal, "lab", persistent=False)
+    volume = provider.volume(
+        "cache", backend="filesystem", root=str(tmp_path / "store"), mount=str(tmp_path / "mount")
+    )
+    env = Env()
+    instance = Instance(provider, gpu=None)._placed("remote")
+    monkeypatch.setitem(provider.__dict__, "link", lambda runtime=None: _FakeLink(upload_bps=1024))
+
+    from letify.runtime.session import Runtime
+
+    real = Runtime.install_env
+
+    def quick_build(self: Runtime) -> None:
+        # A real sync runs; only the time it is judged against is chosen, so the decision
+        # is exercised without waiting for a slow one.
+        real(self)
+        self.env_build_s = 0.001
+
+    monkeypatch.setattr(Runtime, "install_env", quick_build)
+    runtime = provider.start(instance, env, name="lab-1", volumes=(volume,))
+    try:
+        assert volume.cached_env(env, runtime.platform) is None
+    finally:
+        runtime.shutdown()
+    err = capsys.readouterr().err
+    lines = [line for line in err.splitlines() if "not caching the environment" in line]
+    assert lines, err
+    assert "GB over" in lines[0]
+    assert "MiB/s is" in lines[0]
+    assert "s build" in lines[0]
+
+
+def test_a_fast_measured_link_still_restores(
+    uv_project: Path, tmp_path: Path, monkeypatch
+) -> None:
+    # Spec "Materializing into a runtime": a link fast enough that the archive's size over
+    # it costs less than the recorded build still restores, exactly as before this rule.
+    provider = provider_of(PreparingLocal, "lab", persistent=False)
+    volume = provider.volume(
+        "cache", backend="filesystem", root=str(tmp_path / "store"), mount=str(tmp_path / "mount")
+    )
+    env = Env()
+    instance = Instance(provider, gpu=None)._placed("remote")
+
+    first = provider.start(instance, env, name="lab-1", volumes=(volume,))
+    try:
+        assert first.env_source == "sync"
+    finally:
+        first.shutdown()
+
+    shutil.rmtree(remote_projects())
+    fast = 10 * 1024 * 1024 * 1024  # 10 GiB/s
+    monkeypatch.setitem(provider.__dict__, "link", lambda runtime=None: _FakeLink(upload_bps=fast))
+    second = provider.start(instance, env, name="lab-2", volumes=(volume,))
+    try:
+        assert second.env_source == "archive"
+    finally:
+        second.shutdown()
+
+
+def test_a_build_fast_enough_that_packing_costs_more_leaves_no_archive_behind(
+    uv_project: Path, tmp_path: Path, monkeypatch
+) -> None:
+    # Spec "Materializing into a runtime": letify packs only when moving the project
+    # directory's measured size over the link it just measured would take less time than
+    # the build did. A build this fast leaves no archive at all.
+    from letify.runtime.session import Runtime
+
+    provider = provider_of(PreparingLocal, "lab", persistent=False)
+    volume = provider.volume(
+        "cache", backend="filesystem", root=str(tmp_path / "store"), mount=str(tmp_path / "mount")
+    )
+    env = Env()
+    instance = Instance(provider, gpu=None)._placed("remote")
+    monkeypatch.setitem(
+        provider.__dict__, "link", lambda runtime=None: _FakeLink(upload_bps=1024 * 1024)
+    )
+
+    original_install_env = Runtime.install_env
+
+    def fast_build(self: Runtime) -> None:
+        # The test sets the recorded build time directly, right after the real sync, so
+        # the packing decision is exercised without timing an actual uv sync.
+        original_install_env(self)
+        self.env_build_s = 0.0001
+
+    monkeypatch.setattr(Runtime, "install_env", fast_build)
+    runtime = provider.start(instance, env, name="lab-1", volumes=(volume,))
+    try:
+        assert runtime.env_source == "sync"
+        platform = runtime.platform
+    finally:
+        runtime.shutdown()
+    assert volume.cached_env(env, platform) is None
+
+
+def test_a_slow_build_still_packs_an_archive_despite_a_measured_link(
+    uv_project: Path, tmp_path: Path, monkeypatch
+) -> None:
+    # Spec "Materializing into a runtime": a build slow enough that moving the project
+    # directory would still cost less packs an archive, even with a measured link.
+    from letify.runtime.session import Runtime
+
+    provider = provider_of(PreparingLocal, "lab", persistent=False)
+    volume = provider.volume(
+        "cache", backend="filesystem", root=str(tmp_path / "store"), mount=str(tmp_path / "mount")
+    )
+    env = Env()
+    instance = Instance(provider, gpu=None)._placed("remote")
+    monkeypatch.setitem(
+        provider.__dict__, "link", lambda runtime=None: _FakeLink(upload_bps=1024 * 1024)
+    )
+
+    original_install_env = Runtime.install_env
+
+    def slow_build(self: Runtime) -> None:
+        original_install_env(self)
+        self.env_build_s = 10_000.0
+
+    monkeypatch.setattr(Runtime, "install_env", slow_build)
+    runtime = provider.start(instance, env, name="lab-1", volumes=(volume,))
+    try:
+        assert runtime.env_source == "sync"
+        platform = runtime.platform
+    finally:
+        runtime.shutdown()
+    assert volume.cached_env(env, platform) is not None
+
+
+def test_the_recorded_build_seconds_and_archive_size_survive_a_ref_round_trip(
+    tmp_path: Path,
+) -> None:
+    # Spec "Materializing into a runtime": the ref records the build seconds beside the
+    # archive's size in bytes, as plain text on every backend, so one read answers both.
+    provider = provider_of(PreparingLocal, "lab", persistent=False)
+    volume = provider.volume("cache", backend="filesystem", root=str(tmp_path / "store"))
+    env = Env()
+
+    class _FakeSession:
+        def session(self) -> _FakeSession:
+            return self
+
+        def pack_dir(self, path: str) -> tuple[bytes, str]:
+            return b"x" * 42, "unused"
+
+    digest = volume.cache_env_from(
+        _FakeSession(), env, "/project", platform="linux-x86_64", build_s=34.0
+    )
+    assert volume.cached_env(env, "linux-x86_64") == digest
+    assert volume.cached_build(env, "linux-x86_64") == (34.0, 42)
+
+
 def test_a_persistent_provider_syncs_every_session_and_never_archives_the_environment(
     uv_project: Path, tmp_path: Path
 ) -> None:
