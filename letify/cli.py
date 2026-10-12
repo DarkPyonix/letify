@@ -755,8 +755,15 @@ def _dispatch(args: argparse.Namespace) -> int:
 
     if args.command == "stop":
         if not args.orphans:
-            # A bare `stop` reads as ending everything, so it ends nothing.
-            print("nothing was stopped. Pass --orphans to delete what a dead process left")
+            # Spec "Kaggle", stopping what a dead process left behind: a bare stop reads as
+            # ending everything, so it ends nothing, and says why rather than only that.
+            print(
+                "nothing was stopped. A session whose process is still running ends when "
+                "that process ends, because taking it away leaves that process calling a "
+                "runtime that is gone: send SIGTERM to the process that started it, which "
+                "letify handles by closing its sessions. Pass --orphans to delete what a "
+                "dead process left."
+            )
             return 0
         rows = let.orphans(args.alias)
         found = [(row["alias"], ref) for row in rows for ref in row.get("orphans", ())]

@@ -217,7 +217,7 @@ def test_a_large_blob_is_placed_over_several_connections(
     monkeypatch.setattr(
         pathdata,
         "_streams_for",
-        lambda runtime, size: pathdata.streams_for(
+        lambda runtime, size, warm=False: pathdata.streams_for(
             streams=4, threshold_mib=1, rtt_ms=138.0, size=size
         ),
     )
@@ -435,3 +435,74 @@ def test_a_kaggle_shard_keeps_one_stream_when_the_link_was_never_measured(monkey
     Runtime.provider = provider
     provider._links[Runtime.name] = Link()
     assert _streams_for(Runtime(), 298 * MIB) == 1
+
+
+def transfer_channels(monkeypatch) -> list[object]:
+    """Every transfer channel this process opens, in order."""
+    from letify.providers.local import Local
+
+    opened: list[object] = []
+    original = Local.transfer_channel
+
+    def watched(self, runtime):
+        channel = original(self, runtime)
+        opened.append(channel)
+        return channel
+
+    monkeypatch.setattr(Local, "transfer_channel", watched)
+    return opened
+
+
+def test_the_transfer_connections_are_reused_by_every_blob_of_a_call(
+    project, launcher_from, monkeypatch
+) -> None:
+    """Spec "Several connections at once": opened once per call, not once per blob.
+
+    KICT sent 132 shards each over the first wave budget, so each opened and closed its
+    own four connections. On a punched link that is 528 rounds of punching, which is both
+    the cost the estimate weighs and 528 chances for a punch to be refused.
+    """
+    from letify.store import pathdata
+
+    monkeypatch.setattr(pathdata, "CHUNK", 1 << 16)
+    monkeypatch.setattr(
+        pathdata,
+        "_streams_for",
+        lambda runtime, size, warm=False: pathdata.streams_for(
+            streams=4, threshold_mib=1, rtt_ms=138.0, size=size
+        ),
+    )
+    opened = transfer_channels(monkeypatch)
+    let = persistent(launcher_from, transfer_parallel_mib=1, transfer_streams=4)
+    shards = []
+    for index in range(3):
+        shard = project / f"shard-{index}.bin"
+        shard.write_bytes(os.urandom(2 * MiB))
+        shards.append(shard)
+
+    @let.function(device=let.providers.lab.CPU, host=letify.remote)
+    def total(one, two, three) -> int:
+        return sum(len(open(p, "rb").read()) for p in (one, two, three))
+
+    assert total(one=shards[0], two=shards[1], three=shards[2]) == 6 * MiB
+    assert len(opened) <= 4, f"opened {len(opened)} connections for three blobs"
+
+
+def test_a_warm_pool_costs_nothing_to_weigh() -> None:
+    """Spec "Several connections at once": the first blob pays the punch, the rest do not.
+
+    Weighed cold, a 120 MiB blob over a 13.6 MiB/s link against a 10 s punch is not worth
+    splitting. Weighed warm it is, because there is nothing left to pay.
+    """
+    from letify.store.pathdata import streams_for
+
+    size = 120 * MiB
+    rate = 13.6 * MiB
+    cold = streams_for(
+        streams=4, threshold_mib=64, rtt_ms=259.0, size=size, rate_bps=rate, cost_s=10.0
+    )
+    warm = streams_for(
+        streams=4, threshold_mib=64, rtt_ms=259.0, size=size, rate_bps=rate, cost_s=0.0
+    )
+    assert cold == 1
+    assert warm == 4

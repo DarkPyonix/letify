@@ -628,6 +628,9 @@ class Stream:
         self._token: str | None = None
         #: The one stream every piece of this call travels on, opened at the first piece.
         self._pipeline: Any = None
+        #: The transfer connections of this call, opened lazily at the first large blob
+        #: and reused by every one after it. Spec "Several connections at once".
+        self._channels: _Channels | None = None
 
     # -- before the call -------------------------------------------------------
 
@@ -741,6 +744,8 @@ class Stream:
         if (thread is None or not thread.is_alive()) and self._pipeline is not None:
             self._pipeline.close()
             self._pipeline = None
+        if self._channels is not None:
+            self._channels.close()
         self._drop_partials()
 
     def _drop_partials(self) -> None:
@@ -766,6 +771,13 @@ class Stream:
             self._pipeline = self.runtime.pipeline(window=WINDOW, timeout=3600)
         return self._pipeline
 
+    def _pool(self) -> _Channels:
+        """The call's transfer connections, opened lazily and reused by every blob."""
+        if self._channels is None:
+            limit = int(getattr(self.runtime.provider, "transfer_streams", STREAMS) or 1)
+            self._channels = _Channels(self.runtime, limit)
+        return self._channels
+
     def _flush(self) -> None:
         """Read every outstanding reply, so a piece the worker refused fails here."""
         if self._pipeline is None:
@@ -787,10 +799,22 @@ class Stream:
         bucket = self.plan.bucket
         uploaded = True
         if bucket is None:
-            streams = _streams_for(self.runtime, size)
+            # The cost of opening the connections is weighed only while the pool is cold:
+            # the first blob large enough to want them pays the punch, every one after it
+            # finds them open. Spec "Several connections at once".
+            warm = self._channels is not None and self._channels.warm
+            streams = _streams_for(self.runtime, size, warm=warm)
             if streams > 1:
                 _put_parallel(
-                    self.runtime, self._link(), self.blobs, digest, local, size, meter, streams
+                    self.runtime,
+                    self._link(),
+                    self.blobs,
+                    digest,
+                    local,
+                    size,
+                    meter,
+                    streams,
+                    self._pool(),
                 )
             else:
                 _put(self.runtime, self._link(), self.blobs, digest, local, size, meter)
@@ -903,8 +927,14 @@ def streams_for(
     return count
 
 
-def _streams_for(runtime: Any, size: int) -> int:
-    """``streams_for`` with the account's settings and the link's measured round trip."""
+def _streams_for(runtime: Any, size: int, *, warm: bool = False) -> int:
+    """``streams_for`` with the account's settings and the link's measured round trip.
+
+    ``warm`` is True once the call's transfer connections are already open, so there is
+    nothing left to pay for opening them. Spec "Several connections at once": reuse is
+    what makes the cost worth paying, so the estimate charges it only while the pool is
+    cold.
+    """
     provider = getattr(runtime, "provider", None)
     # On the class, not the instance: a provider's __getattr__ answers accelerator names
     # and raises UnknownInstance for anything else, which hasattr does not catch.
@@ -924,14 +954,96 @@ def _streams_for(runtime: Any, size: int) -> int:
         rate = getattr(link, "upload_bps", None)
     except Exception:
         rate = None
+    cost_s = 0.0 if warm else float(getattr(provider, "transfer_connection_cost_s", 0.0) or 0.0)
     return streams_for(
         streams=int(getattr(provider, "transfer_streams", STREAMS) or 1),
         threshold_mib=int(getattr(provider, "transfer_parallel_mib", PARALLEL_MIB) or 0),
         rate_bps=rate,
-        cost_s=float(getattr(provider, "transfer_connection_cost_s", 0.0) or 0.0),
+        cost_s=cost_s,
         rtt_ms=rtt,
         size=size,
     )
+
+
+class _Channels:
+    """The transfer connections of one call, opened once and reused by every blob of it.
+
+    Spec "Several connections at once": the connections are opened once per call and
+    reused by every blob of it, not opened and closed per blob, which is both the cost the
+    estimate weighs and a chance for a punch to be refused each time it happens. Used from
+    several threads at once, one per range of a parallel put.
+    """
+
+    def __init__(self, runtime: Any, limit: int) -> None:
+        self._runtime = runtime
+        self._limit = max(1, int(limit))
+        self._free: list[Any] = []
+        self._opened = 0
+        self._closed = False
+        self._lock = threading.Lock()
+        self._condition = threading.Condition(self._lock)
+
+    @property
+    def warm(self) -> bool:
+        """True once at least one channel of this pool has been opened."""
+        with self._lock:
+            return self._opened > 0
+
+    def take(self) -> Any:
+        """A free channel, a newly opened one, or the next one ``give``n back.
+
+        Raises RuntimeFailure, naming the runtime, if the pool is already closed. Never
+        hangs past a ``close()`` that arrives while this call is waiting.
+        """
+        with self._condition:
+            while True:
+                if self._closed:
+                    raise RuntimeFailure(
+                        f"{self._runtime.name}: the transfer pool is closed"
+                    )
+                if self._free:
+                    return self._free.pop()
+                if self._opened < self._limit:
+                    self._opened += 1
+                    break
+                self._condition.wait()
+        try:
+            return self._runtime.provider.transfer_channel(self._runtime)
+        except BaseException:
+            # The slot was reserved before opening, and must be released on failure so a
+            # waiter is not left blocked on a channel that never came to exist.
+            with self._condition:
+                self._opened -= 1
+                self._condition.notify_all()
+            raise
+
+    def give(self, channel: Any) -> None:
+        """Return a channel to the free list, for the next ``take()`` to reuse."""
+        with self._condition:
+            if self._closed:
+                closed_already = True
+            else:
+                self._free.append(channel)
+                self._condition.notify_all()
+                closed_already = False
+        if closed_already:
+            channel.close()
+
+    def drop(self, channel: Any) -> None:
+        """A channel that failed: close it and free its slot for a replacement."""
+        channel.close()
+        with self._condition:
+            self._opened = max(0, self._opened - 1)
+            self._condition.notify_all()
+
+    def close(self) -> None:
+        """Close every channel this pool opened, and refuse any ``take()`` after it."""
+        with self._condition:
+            self._closed = True
+            free, self._free = self._free, []
+            self._condition.notify_all()
+        for channel in free:
+            channel.close()
 
 
 def _put_parallel(
@@ -943,12 +1055,15 @@ def _put_parallel(
     size: int,
     meter: _Uploaded | None,
     streams: int,
+    channels: _Channels,
 ) -> None:
     """Send one file over several connections, each carrying one contiguous range.
 
     Spec "Several connections at once". The call's own stream makes the file and seals it,
     so a failure there is reported where every other data failure is. The ranges go out on
-    channels of their own, each its own kernel connection.
+    the call's pooled transfer connections, each its own kernel connection, taken from
+    ``channels`` and given back when the range finishes so the next blob of this call
+    reuses it rather than opening its own.
     """
     split = ranges(size, streams)
     try:
@@ -962,9 +1077,14 @@ def _put_parallel(
     lock = threading.Lock()
 
     def carry(index: int, offset: int, length: int) -> None:
-        channel = None
         try:
-            channel = runtime.provider.transfer_channel(runtime)
+            channel = channels.take()
+        except BaseException as exc:
+            with lock:
+                failures.append(exc)
+            return
+        ok = False
+        try:
             stream = channel.pipeline(window=WINDOW, timeout=3600)
             with open(local, "rb") as handle:
                 handle.seek(offset)
@@ -991,12 +1111,19 @@ def _put_parallel(
                             meter.update(sum(sent))
             stream.drain()
             stream.close()
+            ok = True
         except BaseException as exc:
             with lock:
                 failures.append(exc)
         finally:
-            if channel is not None:
-                channel.close()
+            # A range that finished cleanly gives the channel back for the next blob of
+            # this call to reuse. One that failed partway cannot be trusted to still be
+            # at a clean protocol boundary, so it is closed instead and the pool opens a
+            # replacement next time one is needed.
+            if ok:
+                channels.give(channel)
+            else:
+                channels.drop(channel)
 
     workers = [
         threading.Thread(target=carry, args=(index, offset, length), daemon=True)
