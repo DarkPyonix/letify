@@ -370,6 +370,17 @@ class Collector:
         if resolved == project or resolved in project.parents:
             return None
         if not any(_inside(resolved, root) for root in roots):
+            if info is not None:
+                # Spec "Where the bytes come from": a file that exists here and cannot be
+                # sent would travel as a path the body cannot read, which fails on the
+                # runtime naming neither the cause nor this rule, or reads the wrong bytes
+                # where something does sit at that path.
+                raise ValueError(
+                    f"{resolved} is outside the roots letify may send data from. The "
+                    f"project root is {project}. Add its directory to [tool.letify] "
+                    f"data_roots in {project}/pyproject.toml, or move the file inside "
+                    f"the root."
+                )
             return None
         index = len(self.placed)
         placed = Placed(resolved, f"{self.call_dir}/{index}/{resolved.name}", is_dir)

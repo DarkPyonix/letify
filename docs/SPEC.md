@@ -1098,6 +1098,15 @@ A detected path that exists is an input. A detected directory and a detected pat
 
 Any other path is pickled unchanged, so the body receives the local path as it was. Only `os.PathLike` objects are detected. A string that happens to name a local file is left alone, because no rule tells a path from any other string.
 
+One other path is refused rather than pickled unchanged: an `os.PathLike` naming a file or directory that exists on this machine and lies outside every allowed root. Passing it on leaves the body reading a path that is not there, which fails as `FileNotFoundError` on the runtime and names neither the cause nor the rule, and on a runtime where something does sit at that path it reads the wrong bytes instead. So the call raises `ValueError` before it is sent:
+
+```
+<path> is outside the roots letify may send data from. The project root is <root>. Add its
+directory to [tool.letify] data_roots in <root>/pyproject.toml, or move the file inside the root.
+```
+
+A path that exists here and is inside a root is data; a path that does not exist here is a runtime path and still travels unchanged, because that is how a body is told where to write.
+
 A directory is walked without following symbolic links to directories. Regular files and symbolic links to regular files are included. Entries named `.git`, `.venv` and `__pycache__` are skipped.
 
 #### Digests and the digest cache <!-- id: project-data-digests -->
