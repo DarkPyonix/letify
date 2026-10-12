@@ -1299,6 +1299,10 @@ A call that detected data prints one line on standard error:
 
 The line is printed when the call has at least one input file, after the call's outcome is known, because what was sent during the call is not known before then. Sizes are in MiB with one decimal. `<the bucket>` is named when the bytes come from the bucket. `before the call` counts the first wave of The send order and the first wave, `during it` counts what the background sender delivered while the call ran, and the rate covers both. `first access waited` is the wall clock time in which at least one reader was blocked on a blob that had not arrived, and it is `0.0` when the send order was right.
 
+`already on` counts the blobs the runtime answered `data_have` with, not what is left after subtracting what was sent. The two differ whenever a blob was neither already there nor fully sent, and subtracting reports such a blob as having been there all along, which is the opposite of what happened. A blob the background sender was still carrying when the call returned is one of those, so the line ends with `, <files> files <size> dropped when the call ended` whenever there is one, and omits that clause when there is none. A dropped blob is not a failure: the call is over and its bytes are no longer needed, which is why the sender is cancelled. It is reported because a line that accounts for every detected file except the dropped ones cannot be read.
+
+Cancelling the sender removes the partial file of a blob it was writing, in the runtime's blob cache as well as a parallel put's staged ranges. A full sized partial left behind counts against the cache budget and is never completed, because the digest it would be sealed under is only written when every range has arrived.
+
 A call with an output location that returned prints a second line after the write-back:
 
 `letify: data wrote back <files> files <size> in <seconds> s (<rate> MiB/s), <files> files <size> during the call, <files> files <size> already on the client`
