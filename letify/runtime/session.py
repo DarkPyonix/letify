@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import datetime
 import json
+import posixpath
 import sys
 import time
 from collections.abc import Callable, Iterator
@@ -621,6 +622,73 @@ class Runtime:
         value = self.request({"op": "pack_dir", "path": path}, timeout=3600)
         return _payload(value["payload"]), value["digest"]
 
+    def pack_dir_to_file(self, path: str, target: Path) -> tuple[str, int]:
+        """Pack a directory inside the runtime and stream the archive into a local file.
+
+        Spec "Materializing into a runtime". The runtime writes the archive into its blob
+        cache while hashing it, and the client receives it as a stream with the digest
+        checked on arrival, so neither side holds the archive whole. Returns
+        ``(digest, size)``. Needs a persistent channel.
+        """
+        from ..store import pathdata
+
+        staging = f"{posixpath.dirname(path.rstrip('/'))}/.letify-pack"
+        value = self.request(
+            {"op": "pack_blob", "path": path, "dir": staging}, timeout=3600
+        )
+        digest, size, directory = value["digest"], int(value["size"]), value["dir"]
+        meter = pathdata._Downloaded(1, size)
+        try:
+            pathdata._get(self, directory, digest, target, size, meter)
+            meter.finish()
+        finally:
+            self.exec(
+                f"import shutil\nshutil.rmtree({directory!r}, ignore_errors=True)\n",
+                timeout=120,
+            )
+        return digest, size
+
+    def put_path(
+        self,
+        local: Path,
+        path: str,
+        *,
+        digest: str,
+        unpack: bool = False,
+        target: str | None = None,
+        links: bool = False,
+    ) -> protocol.RemoteFile:
+        """Send a local file whose digest is known in pieces, then place it at ``path``.
+
+        Spec "Materializing into a runtime". The file is read one piece at a time, so the
+        client never holds it whole. The runtime verifies the digest as the pieces arrive.
+        """
+        from ..store import pathdata
+
+        size = local.stat().st_size
+        staging = f"{path}.letify-send"
+        meter = pathdata._Uploaded(1, size)
+        pipeline = self.pipeline(window=pathdata.WINDOW, timeout=3600)
+        try:
+            pathdata._put(self, pipeline, staging, digest, str(local), size, meter)
+            pipeline.drain()
+        finally:
+            pipeline.close()
+        meter.finish()
+        value = self.request(
+            {
+                "op": "place_blob",
+                "dir": staging,
+                "digest": digest,
+                "path": path,
+                "unpack": unpack,
+                "target": target,
+                "links": links,
+            },
+            timeout=3600,
+        )
+        return protocol.RemoteFile(path=value["path"], digest=digest, size=value["size"])
+
     # -- environment and volumes ---------------------------------------------
 
     def restrict_devices(self) -> None:
@@ -707,20 +775,26 @@ class Runtime:
             return None
         return size if isinstance(size, int) and size > 0 else None
 
+    def _packs_streaming(self) -> bool:
+        """Whether the archive of the first environment volume streams in both directions."""
+        volumes = self._environment_volumes()
+        return bool(volumes) and self.persistent_channel and volumes[0].store.streams
+
     def _worth_packing(self, root: str) -> bool:
         """Whether moving the project directory over this session's link beats the build.
 
         Spec "Materializing into a runtime": the directory is larger than the archive it
         would become, so this overstates the transfer and errs toward building. With no
-        measured rate it packs only what letify is willing to hold in memory, because the
-        pack moves the archive as one payload the worker and the client each hold whole.
+        measured rate it packs any size when the archive streams, and otherwise only what
+        letify is willing to hold in memory, because that pack moves the archive as one
+        payload the worker and the client each hold whole.
         """
         if self.env_build_s is None:
             return True
         rate = self._measured_rate()
         size = self._tree_size(root)
         if rate is None:
-            if size is None or size <= PACK_WITHOUT_A_RATE:
+            if size is None or size <= PACK_WITHOUT_A_RATE or self._packs_streaming():
                 return True
             self._say(
                 f"not caching the environment, because {size / 1_000_000_000:.1f} GB is over "

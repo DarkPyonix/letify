@@ -47,6 +47,10 @@ class Backend(abc.ABC):
 
     name: str = ""
 
+    #: Whether blobs are files this process can read and place by path. A backend that is
+    #: not, such as an object store, is reached only through ``put`` and ``get``.
+    streams: bool = False
+
     @abc.abstractmethod
     def has(self, digest: str) -> bool: ...
 
@@ -64,6 +68,21 @@ class Backend(abc.ABC):
 
     @abc.abstractmethod
     def write_ref(self, name: str, digest: str) -> None: ...
+
+    def blob_path(self, digest: str) -> Path | None:
+        """The local file holding one blob, or None when the backend keeps no such file."""
+        return None
+
+    def scratch_path(self) -> Path | None:
+        """A fresh path on the same filesystem as the blobs, or None when there is none.
+
+        A file written there is adopted with ``adopt`` by a rename, never copied.
+        """
+        return None
+
+    def adopt(self, path: Path, digest: str) -> None:
+        """Move a finished local file into the store under its digest, without reading it."""
+        raise NotImplementedError(f"the {self.name} backend cannot adopt a file")
 
     def pull_source(self, digest: str) -> dict[str, object] | None:
         """A URL and request headers a runtime can read one blob with, or None.
@@ -103,6 +122,37 @@ class Store:
 
     def get_bytes(self, digest: str) -> bytes:
         return self.backend.get(digest)
+
+    @property
+    def streams(self) -> bool:
+        """Whether a blob can be written and read as a file instead of one bytes object."""
+        return self.backend.streams
+
+    def scratch_path(self) -> Path | None:
+        """A fresh path beside the blobs for a download that ``adopt_file`` will then place."""
+        return self.backend.scratch_path()
+
+    def adopt_file(self, path: str | Path, digest: str) -> BlobInfo:
+        """Place a local file whose digest is already known, without reading it into memory.
+
+        The caller has hashed the file, so the digest is trusted. A backend that keeps
+        files moves it by rename. Any other backend takes the bytes, as ``put_bytes`` does.
+        """
+        source = Path(path)
+        size = source.stat().st_size
+        if not self.backend.streams:
+            payload = source.read_bytes()
+            source.unlink()
+            return self.put_bytes(payload)
+        if self.backend.has(digest):
+            source.unlink()
+        else:
+            self.backend.adopt(source, digest)
+        return BlobInfo(digest, size)
+
+    def blob_path(self, digest: str) -> Path | None:
+        """The local file holding a blob, for a caller that reads it in pieces, or None."""
+        return self.backend.blob_path(digest)
 
     def fetch_file(self, digest: str, target: str | Path) -> Path:
         destination = Path(target)

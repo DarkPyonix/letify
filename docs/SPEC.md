@@ -1076,25 +1076,29 @@ less time than the build did. The archive is smaller than the directory, so the 
 overstates the transfer and errs toward building, which is the cheaper of the two to get wrong. The
 ref records the build seconds beside the archive.
 
-With no measured rate for the link, letify packs only when that directory is at most 1 GiB, and says
-why when it declines. Packing moves the archive as one payload that the worker and the client each
-hold whole, so a tree of several gigabytes is held twice in memory with nothing reporting progress:
-measured on a Modal A10, a 7.2 GB environment sat in that step for over 30 minutes while the session
-billed. Packing unconditionally was right while only an ephemeral provider packed, where the
-alternative was a certain full rebuild; a provider that keeps its workspace root and builds its venv
-elsewhere reaches the same branch, and there the alternative is a sync that may take two minutes.
-Making the pack stream rather than hold the archive whole is the fix that removes this limit, and
-until then the limit is what keeps the step from costing more than it saves.
+With no measured rate for the link, letify packs a directory of any size when the archive streams,
+and says `letify: <runtime>: caching the environment, <size> GB` first. The archive streams when the
+first volume's store keeps blobs as files (the filesystem backend, which the automatic environment
+store uses) and the channel is persistent. Both directions then move the archive in pieces and
+neither side holds it whole:
 
-That fix is three changes, not one, because the content addressed store is bytes in both directions:
-`put_file` reads the file whole, a backend's `put` takes the payload, and `get_bytes` and
-`fetch_file` return it whole. So a restore holds the archive entire on the client too, which is what
-a Kaggle session restoring 3.0 GB in 540 s was doing. Streaming it needs the worker to pack into its
-own blob cache and report the digest, the client to take it down the way a write-back takes an output
-file, which already streams and hashes as the pieces arrive, and the store to accept and serve a blob
-by path rather than by bytes. The filesystem backend that the automatic environment store uses can do
-that with a rename; a bucket needs a resumable upload. Until all three exist, both directions are
-bounded by what one process will hold.
+- Pack: the worker op `pack_blob` writes the same tar.gz as `pack_dir`, with the same member rules,
+  into a staging directory beside the project directory while hashing the bytes it writes. It
+  returns `{"digest", "size", "dir"}`. The client receives the file with the stream a write-back
+  uses, checks the digest as the pieces arrive into a scratch file beside the store, and renames it
+  into the store with `Store.adopt_file`. The staging directory is removed afterwards. The digest
+  is the store's content digest (blake3 truncated to 16 bytes, blake2b without blake3).
+- Restore: a blob of more than one piece (8 MiB) that the store holds as a file is sent with
+  `data_put` pieces into a staging directory beside the destination, then moved into place and
+  unpacked by the worker op `place_blob`. Smaller blobs, and any blob from a store that does not
+  keep files, go as one `put_file` payload.
+
+With no measured rate and a store that does not stream (the GCS backend) or a channel that is not
+persistent, letify packs only when the directory is at most 1 GiB, and says why when it declines,
+because that pack moves the archive as one payload that the worker and the client each hold whole.
+Measured: a 7.2 GB Modal environment sat in that whole-payload pack for over 30 minutes while the
+session billed, and a Kaggle session restoring a 3.0 GB archive held whole took 540 s. A streamed
+transfer ran at 85 to 88 MiB/s. A bucket would need a resumable upload to stream.
 
 A later session restores only when the archive's size over the link measured for that session would
 take less than the recorded build. Otherwise it syncs, and says why:
