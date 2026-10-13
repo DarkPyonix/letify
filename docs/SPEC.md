@@ -777,7 +777,7 @@ The protocol is one JSON object per line. letify sends `{"id": <int>, "op": <nam
 | Op | Fields | Value |
 |---|---|---|
 | `hello` | none | `{"modal": <installed Modal version>}` |
-| `create` | `app`, `args`, `packages`, `gpu`, `timeout`, `idle_timeout`, `volumes`, `ports` | `{"sandbox": <id>}`. Runs `app` as an ephemeral app on first use, builds `debian_slim` with `packages` installed, and starts `args` in a sandbox. Each port in `ports` is exposed with Modal `encrypted_ports` |
+| `create` | `app`, `args`, `packages`, `gpu`, `timeout`, `idle_timeout`, `memory`, `volumes`, `ports` | `{"sandbox": <id>}`. Runs `app` as an ephemeral app on first use, builds `debian_slim` with `packages` installed, and starts `args` in a sandbox. Each port in `ports` is exposed with Modal `encrypted_ports` |
 | `tunnel` | `sandbox`, `port` | `{"host": <text>, "port": <int>, "tls": <bool>}`. The address that reaches `port` inside the sandbox, from `Sandbox.tunnels()`. `tls` is true when the connection has to be made with TLS, which an encrypted port needs |
 | `write` | `sandbox`, `data` | `null`. `data` is base64 of at most 1 MiB. Writes the decoded bytes to the sandbox's standard input and drains it. Modal refuses a write that would buffer more than 2 MiB, so the channel splits a larger frame into `write` requests of 1 MiB, in order |
 | `read_until` | `sandbox`, `prefixes` | `{"lines": [...], "eof": <bool>}`. The sandbox's stdout lines up to and including the first that starts with one of `prefixes`, or every line left when the stream ends |
@@ -811,6 +811,8 @@ A `read_until` blocks until the sandbox prints a line, and the adapter answers o
 Modal also bounds a sandbox that nothing terminates. `create` passes `idle_timeout`, the entry option `idle_timeout`, 600 s by default, after which Modal terminates a sandbox that is idle. That is the bound that stops an abandoned sandbox billing, because an abandoned one is idle by definition once its worker has no one to answer.
 
 It passes `timeout`, the entry option `timeout`, as the sandbox's maximum lifetime, and the default is the longest Modal accepts, 86400 s, measured as accepted. It is not a shorter number letify picked, for the reason The declaration gives for `timeout` having no default: a deadline letify invented would end a two hour training run at whatever hour it guessed. The default was 3600 s, exactly one hour, and it ended two Modal sessions of a real training run at one hour each with nothing saying why, which is that sentence happening. An account that wants a hard cap sets `timeout` itself.
+
+It passes `memory`, the entry option `memory_gib` converted to MiB, as the sandbox's memory request, and passes nothing when the account does not set it, so Modal's default applies. A training process whose RAM grows past what the sandbox gets is killed with SIGKILL, which the channel sees as a worker that stopped without replying; an account whose runs need more sets `memory_gib`, for example `memory_gib = 64`. A value that is not a positive number raises `ConfigError` naming `memory_gib`.
 
 A sandbox that reaches that lifetime takes its worker with it, so the channel sees a worker that stopped without replying. Where the session's age is within a minute of the lifetime letify asked for, the failure says so instead of listing causes: `the Modal sandbox reached the <seconds> s lifetime letify asked for; raise timeout on the account to run longer`.
 
