@@ -2040,7 +2040,7 @@ class FakeColabCli:
         self.unassigned: list[str] = []
 
     def __call__(self, command):
-        if "python" in command and "-c" in command:
+        if "python" in command and "-c" in command and "new" not in command:
             self.unassigned.append(command[-1])
             self.assignments = [a for a in self.assignments if a[1] != command[-1]]
             return FakeCompleted()

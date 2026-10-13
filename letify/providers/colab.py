@@ -131,6 +131,26 @@ UNASSIGN_SCRIPT = (
 )
 
 
+#: Run in the CLI's own Python: ``colab`` with google-auth's request timeout raised to 600 s.
+#: The CLI passes no timeout, so a slow A100 assignment fails at the 120 s default while the
+#: server goes on assigning. google-auth binds the 120 s default into the signature of
+#: ``AuthorizedSession.request`` when it is defined, so setting the module value alone changes
+#: nothing and the method is wrapped as well. Spec "Colab", the Colab CLI paragraph.
+NEW_SCRIPT = (
+    "import sys\n"
+    "import google.auth.transport.requests as requests\n"
+    "requests._DEFAULT_TIMEOUT = 600\n"
+    "_request = requests.AuthorizedSession.request\n"
+    "def _slow_request(self, *args, **kwargs):\n"
+    "    kwargs.setdefault('timeout', requests._DEFAULT_TIMEOUT)\n"
+    "    return _request(self, *args, **kwargs)\n"
+    "requests.AuthorizedSession.request = _slow_request\n"
+    "from colab_cli.cli import main\n"
+    "sys.argv = ['colab', *sys.argv[1:]]\n"
+    "sys.exit(main())\n"
+)
+
+
 def _parse_assignments(listing: str) -> list[tuple[str, str]]:
     """The ``(name, endpoint)`` pairs in ``colab sessions`` output, ``?`` for no local state."""
     found = []
@@ -275,8 +295,21 @@ class Colab(Shell):
 
     # -- the CLI -------------------------------------------------------------
 
-    def _cli(self, *args: str, timeout: float | None = None, stdin: str | None = None) -> str:
-        command = [*self._colab(), *args]
+    def _cli(
+        self,
+        *args: str,
+        timeout: float | None = None,
+        stdin: str | None = None,
+        script: str | None = None,
+    ) -> str:
+        """Run the CLI; with ``script``, run that code in the CLI's Python with ``args`` as argv."""
+        if script is None:
+            command = [*self._colab(), *args]
+        else:
+            uv = tools.find_uv()
+            if uv is None:
+                raise ProviderUnavailable(self.kind, tools.missing_uv_message())
+            command = [*tools.python_command(tools.COLAB, uv), "-c", script, *args]
         result = subprocess.run(
             command,
             input=stdin,
@@ -286,9 +319,10 @@ class Colab(Shell):
             env=self._env(),
         )
         if result.returncode != 0:
+            shown = ["<script>" if part == script else part for part in command]
             raise RuntimeFailure(
-                f"`{' '.join(command)}` exited {result.returncode}",
-                command=" ".join(command),
+                f"`{' '.join(shown)}` exited {result.returncode}",
+                command=" ".join(shown),
                 stderr=(result.stderr or "").strip(),
             )
         return result.stdout
@@ -482,7 +516,7 @@ class Colab(Shell):
                 file=sys.stderr,
             )
         try:
-            self._cli(*args, timeout=900)
+            self._cli(*args, timeout=900, script=NEW_SCRIPT)
         except BaseException:
             # A timed out `colab new` can still leave a server-side assignment behind.
             if before is not None:
