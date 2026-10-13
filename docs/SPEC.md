@@ -121,6 +121,14 @@ address when that connection is refused. The punch is the same `punch` call a st
 replica that would have dialed anyway, the one that is not the leader, is the initiator, so the two
 sides never both take that role whatever their ranks are.
 
+The distributed placement is supported on a pair of runtimes that can reach each other, and nowhere
+else. Two Kaggle runtimes cannot: measured on 2026-10-13, both NATs preserved the port and every TCP
+SYN was dropped for 45 s, and a UDP punch on the same pair sent for 30 s each way without a datagram
+arriving. letify therefore refuses such a pair rather than routing the reduction through the client
+or a relay, which is the decision `docs/INTENT.md` records against claim N10. A declaration naming
+two runtimes that cannot connect fails, and the measurement to make before using a provider pair is
+whether they punch at all.
+
 Punching is between a pair, because one punched connection takes one local port on each side and
 the two sides have to agree which pair that port belongs to. So a round of more than two replicas
 whose members cannot reach each other directly is refused, naming the ranks that could not connect,
