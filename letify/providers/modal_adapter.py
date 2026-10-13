@@ -191,6 +191,15 @@ class Adapter:
             pass
         return None
 
+    def op_poll(self, request: dict[str, Any]) -> Any:
+        """The sandbox's exit code once it ended, or None while it runs."""
+        sandbox_id = str(request["sandbox"])
+        stream = self.sandboxes.get(sandbox_id)
+        # Without a stream it was created by another adapter process, such as a blocked one.
+        sandbox = stream.sandbox if stream else load_modal().Sandbox.from_id(sandbox_id)
+        code = sandbox.poll()
+        return None if code is None else int(code)
+
     # -- billing -----------------------------------------------------------------
 
     def op_billing_summary(self, request: dict[str, Any]) -> Any:

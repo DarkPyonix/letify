@@ -353,6 +353,20 @@ def patch_smi(monkeypatch):
 # -- the lease renewal loop ----------------------------------------------------
 
 
+class RecordedProvider:
+    """A provider that answers the runtime state check with whatever it was told to."""
+
+    def __init__(self) -> None:
+        from letify.providers.base import RuntimeState
+
+        self.state = RuntimeState()
+        self.asked = 0
+
+    def runtime_state(self, runtime: Any) -> Any:
+        self.asked += 1
+        return self.state
+
+
 class RenewalRecorder:
     """Counts lease renewals, standing in for a runtime.
 
@@ -371,6 +385,13 @@ class RenewalRecorder:
         #: reply delayed behind a large transfer, before renewals resume.
         self.transient_for: int = 0
         self._attempts = 0
+        #: What the provider answers when asked whether the runtime still exists.
+        self.provider = RecordedProvider()
+        #: Messages the lease declared the runtime lost with.
+        self.lost: list[str] = []
+
+    def lose(self, message: str) -> None:
+        self.lost.append(message)
 
     def request(self, payload: dict[str, Any], *, timeout: float | None = None) -> float:
         self._attempts += 1
@@ -747,6 +768,10 @@ class FakeModalAdapter:
         except OSError:
             return False
         return stat.rsplit(")", 1)[1].split()[0] != "Z"
+
+    def end_sandbox(self, sandbox: str, exit_code: int) -> None:
+        """Make ``poll`` answer ``exit_code`` for a sandbox, as Modal does once it ended."""
+        (self.state / f"ended-{sandbox}").write_text(str(exit_code), encoding="utf-8")
 
     def fail(self, *ops: str) -> None:
         self._monkeypatch.setenv("FAKE_MODAL_FAIL", ",".join(ops))

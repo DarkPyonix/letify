@@ -30,7 +30,7 @@ import sys
 import threading
 import time
 from collections.abc import Callable, Iterator, Sequence
-from typing import IO, Any
+from typing import IO, Any, NoReturn
 
 from .. import protocol
 from ..errors import ProtocolError, RuntimeFailure, RuntimeLost
@@ -78,6 +78,13 @@ class Channel(abc.ABC):
 
     @abc.abstractmethod
     def close(self) -> None: ...
+
+    def declare_lost(self, message: str) -> None:
+        """Make a call waiting on this channel fail with ``RuntimeLost(message)``.
+
+        The default does nothing, for a channel with no connection that can stay open.
+        """
+        return None
 
     @abc.abstractmethod
     def request(self, payload: dict[str, Any], *, timeout: float | None = None) -> tuple[Any, str]:
@@ -264,6 +271,8 @@ class Connection:
         self.gate = _Gate()
         self.hello: str | None = None
         self.failure: ProtocolError | None = None
+        #: Whether ``failure`` is a runtime declared lost, which raises ``RuntimeLost``.
+        self.lost = False
         self._receiver = wire.Receiver(readinto)
         self._emit = emit
         self._death_detail = death_detail
@@ -356,7 +365,22 @@ class Connection:
                     slot.event.set()
                     self._turn.notify_all()
 
-    def _fail(self, message: str | None) -> None:
+    def lose(self, message: str) -> None:
+        """Fail every waiting request with ``RuntimeLost(message)``, now and from here on."""
+        self._fail(message, lost=True)
+
+    def _raise_failure(self, error: ProtocolError | None) -> NoReturn:
+        """Raise what ended a request: the runtime being lost, or the stream failing."""
+        text = str(error or self.failure)
+        if self.lost:
+            raise RuntimeLost(text)
+        raise ProtocolError(text)
+
+    def _fail(self, message: str | None, *, lost: bool = False) -> None:
+        if self.lost:
+            # A runtime declared lost keeps its reason, rather than the end-of-stream the
+            # declaration provokes by shutting the connection.
+            return
         if message is None:
             detail = self._death_detail()
             message = (
@@ -367,6 +391,7 @@ class Connection:
             )
         with self._turn:
             self.failure = ProtocolError(message)
+            self.lost = lost
             with self._slots_lock:
                 slots = list(self._slots.values())
                 self._slots.clear()
@@ -502,7 +527,7 @@ class Connection:
         if slot.reply is None:
             if watchdog is not None and watchdog.expired:
                 raise RuntimeFailure(f"{self.name}: the call exceeded {timeout}s")
-            raise ProtocolError(str(slot.error or self.failure))
+            self._raise_failure(slot.error)
         head, buffers = slot.reply
         slot.reply = None
         outcome = wire.loads(head, buffers)
@@ -540,7 +565,7 @@ class Connection:
                 if piece is None:
                     if watchdog is not None and watchdog.expired:
                         raise RuntimeFailure(f"{self.name}: the call exceeded {timeout}s")
-                    raise ProtocolError(str(slot.error or self.failure))
+                    self._raise_failure(slot.error)
                 head, buffers = piece
                 outcome = wire.loads(head, buffers)
                 last = not isinstance(outcome, dict) or bool(outcome.get("last"))
@@ -560,7 +585,7 @@ class Connection:
     def _open(self, *, streaming: bool = False) -> _Slot:
         with self._slots_lock:
             if self.failure is not None:
-                raise ProtocolError(str(self.failure))
+                self._raise_failure(None)
             slot = _Slot(self._next_stream, streaming=streaming)
             self._next_stream += 2
             self._slots[slot.stream] = slot
@@ -633,7 +658,7 @@ class Pipeline:
                         raise RuntimeFailure(
                             f"{connection.name}: the call exceeded {self._timeout}s"
                         )
-                    raise ProtocolError(str(slot.error or connection.failure))
+                    connection._raise_failure(slot.error)
                 self._take()
         finally:
             if watchdog is not None:
@@ -712,6 +737,13 @@ class FramedChannel(Channel):
             )
             self._send_worker()
             self._await_ready()
+
+    def declare_lost(self, message: str) -> None:
+        connection = self._connection
+        if connection is not None:
+            connection.lose(message)
+            # A read blocked on a connection that never ends returns once it is killed.
+            self._kill()
 
     @property
     def connection(self) -> Connection:

@@ -45,6 +45,18 @@ if TYPE_CHECKING:
 Persistence = Literal["persistent", "ephemeral"]
 
 
+@dataclasses.dataclass(frozen=True)
+class RuntimeState:
+    """What a provider knows about whether a runtime still exists.
+
+    ``status`` is ``"ended"``, ``"running"`` or ``"unknown"``. ``detail`` is the sentence a
+    waiting call raises ``RuntimeLost`` with when the status is ``"ended"``.
+    """
+
+    status: Literal["ended", "running", "unknown"] = "unknown"
+    detail: str = ""
+
+
 class Provider(abc.ABC):
     """Base class for every provider."""
 
@@ -501,6 +513,15 @@ class Provider(abc.ABC):
         Spec "Failure and retry". The default returns the failure unchanged.
         """
         return failure
+
+    def runtime_state(self, runtime: Runtime) -> RuntimeState:
+        """Ask the provider whether the runtime still exists, without using its channel.
+
+        Spec "Lifetime", the lease. The default cannot tell and answers unknown. A provider
+        that can tell answers ended, with a sentence saying how it ended, or running. The
+        answer must not depend on the channel carrying the call, which may be blocked.
+        """
+        return RuntimeState()
 
     def stop(self, runtime: Runtime) -> None:
         """Release whatever the provider allocated for this runtime."""

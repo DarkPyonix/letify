@@ -251,6 +251,7 @@ class RuntimePool:
         )
         runtime.busy = True
         runtime._pool_key = key
+        runtime._pool = self
         with self._guard:
             self._runtimes.setdefault(key, []).append(runtime)
         return runtime

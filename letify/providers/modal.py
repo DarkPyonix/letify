@@ -45,7 +45,7 @@ from ..errors import (
 )
 from ..protocol import wire
 from ..runtime.channel import Connection, FramedChannel
-from .base import Provider
+from .base import Provider, RuntimeState
 from .usage import Usage
 
 if TYPE_CHECKING:
@@ -104,6 +104,9 @@ WORKER_PACKAGES = ("cloudpickle", "blake3")
 
 #: Seconds ``Modal.stop`` and a channel's shutdown frame wait for a busy adapter.
 STOP_WAIT = 5.0
+
+#: Seconds the second adapter that polls a sandbox may take before it is killed.
+POLL_LIMIT = 30.0
 
 #: Seconds a sandbox may be idle before Modal terminates it, unless the entry sets
 #: ``idle_timeout``.
@@ -488,6 +491,33 @@ class Modal(Provider):
         return SandboxChannel(
             adapter, sandbox, name=runtime.name, data_port=data_port, streams=streams,
             lifetime_s=self.sandbox_timeout_s,
+        )
+
+    def runtime_state(self, runtime: Runtime) -> RuntimeState:
+        """Poll the sandbox from a second adapter process, never the one carrying the call.
+
+        Spec "Lifetime", the lease. The adapter carrying the call may be blocked in a
+        request, so a short-lived one asks. Any failure answers unknown.
+        """
+        sandbox = self._sandboxes.get(runtime.name)
+        if sandbox is None:
+            return RuntimeState()
+        other = Adapter.for_account(self.alias)
+        # A poll that hangs ends the second adapter, which makes the request raise.
+        limit = threading.Timer(POLL_LIMIT, other.abort)
+        limit.daemon = True
+        limit.start()
+        try:
+            code = other.request("poll", sandbox=sandbox)
+        except (LetifyError, ValueError, OSError):
+            return RuntimeState()
+        finally:
+            limit.cancel()
+            other.close()
+        if code is None:
+            return RuntimeState("running")
+        return RuntimeState(
+            "ended", f"the Modal sandbox ended (exit code {code}) while the call was running"
         )
 
     def stop(self, runtime: Runtime) -> None:

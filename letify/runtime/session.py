@@ -149,6 +149,12 @@ class Runtime:
 
     _pool_key: str | None = field(default=None, repr=False)
 
+    #: The pool this runtime was started by, so it can be discarded from the lease thread.
+    _pool: Any = field(default=None, repr=False)
+
+    #: Set once ``shutdown`` has run, so a second discard does nothing.
+    _shut_down: bool = field(default=False, repr=False)
+
     @property
     def key(self) -> str:
         """Pool key. Runtimes with equal keys are interchangeable."""
@@ -237,8 +243,26 @@ class Runtime:
             timeout=120,
         )
 
+    def lose(self, message: str) -> None:
+        """Declare the runtime gone: wake a waiting call with ``RuntimeLost`` and discard it.
+
+        Spec "Lifetime", the lease. Called from the lease thread when the provider says the
+        runtime ended while a request on its channel can no longer be answered.
+        """
+        if self.lease is not None:
+            self.lease.release()
+        if self.channel is not None:
+            self.channel.declare_lost(message)
+        if self._pool is not None:
+            self._pool.discard(self, reason="runtime_ended")
+        else:
+            self.shutdown(reason="runtime_ended")
+
     def shutdown(self, *, reason: str = "explicit_shutdown") -> None:
         """Stop everything that bills for this runtime and explain the decision."""
+        if self._shut_down:
+            return
+        self._shut_down = True
         timestamp = datetime.datetime.now(datetime.UTC).isoformat()
         print(
             f"{timestamp} letify: discarding {self.name} provider={self.provider.alias} "
