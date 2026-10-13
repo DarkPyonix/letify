@@ -102,6 +102,26 @@ STOP_WAIT = 5.0
 #: ``idle_timeout``.
 IDLE_TIMEOUT = 600
 
+#: The sandbox's maximum lifetime, the longest Modal accepts, measured as accepted.
+#: Spec "Modal": not a shorter number letify picked, for the reason The declaration gives
+#: for ``timeout`` having no default. The previous 3600 s ended two sessions of a real
+#: training run at one hour each with nothing saying why.
+SANDBOX_TIMEOUT = 86400
+
+
+def lifetime_detail(*, age_s: float, lifetime_s: int) -> str | None:
+    """What to say when a sandbox died at the lifetime letify asked for, or None.
+
+    Spec "Modal": the channel otherwise reports a worker that stopped without replying and
+    lists causes, none of which is the deadline letify set itself.
+    """
+    if lifetime_s <= 0 or age_s < lifetime_s - 60.0:
+        return None
+    return (
+        f"the Modal sandbox reached the {lifetime_s} s lifetime letify asked for; "
+        f"raise timeout on the account to run longer"
+    )
+
 
 class VolumePathMissing(RuntimeFailure):
     """The adapter answered that a volume path does not exist."""
@@ -377,6 +397,18 @@ class Modal(Provider):
         self._sandboxes: dict[str, str] = {}
         self._adapter: Adapter | None = None
 
+    @property
+    def sandbox_timeout_s(self) -> int:
+        """The sandbox's maximum lifetime, from the account or the longest Modal accepts."""
+        value = self.config.option("timeout", SANDBOX_TIMEOUT)
+        return max(1, int(value))
+
+    @property
+    def sandbox_idle_timeout_s(self) -> int:
+        """Seconds a sandbox may be idle before Modal terminates it. Spec "Modal"."""
+        value = self.config.option("idle_timeout", IDLE_TIMEOUT)
+        return max(1, int(value))
+
     def adapter(self) -> Adapter:
         """The adapter acting as this account, started on its first request."""
         if self._adapter is None or self._adapter.closed:
@@ -440,14 +472,15 @@ class Modal(Provider):
             args=["python3", "-u", "-c", BOOTSTRAP],
             packages=list(WORKER_PACKAGES),
             gpu=self.wire_name(runtime.instance) or None,
-            timeout=int(self.config.option("timeout", 3600)),
-            idle_timeout=int(self.config.option("idle_timeout", IDLE_TIMEOUT)),
+            timeout=self.sandbox_timeout_s,
+            idle_timeout=self.sandbox_idle_timeout_s,
             ports=[] if data_port is None else [data_port],
         )
         sandbox = str(created["sandbox"])
         self._sandboxes[runtime.name] = sandbox
         return SandboxChannel(
-            adapter, sandbox, name=runtime.name, data_port=data_port, streams=streams
+            adapter, sandbox, name=runtime.name, data_port=data_port, streams=streams,
+            lifetime_s=self.sandbox_timeout_s,
         )
 
     def stop(self, runtime: Runtime) -> None:
@@ -598,11 +631,15 @@ class SandboxChannel(FramedChannel):
         name: str,
         data_port: int | None = None,
         streams: int = 1,
+        lifetime_s: int = 0,
     ):
         self.adapter = adapter
         self.sandbox = sandbox
         self.name = name
         self.data_port = data_port
+        #: The sandbox's maximum lifetime, so a death at it is named rather than guessed.
+        self.lifetime_s = lifetime_s
+        self.opened_at = time.monotonic()
         #: TCP connections the data channel carries its frames over.
         self.streams = streams
         self._sockets: list[socket.socket] = []
@@ -628,7 +665,13 @@ class SandboxChannel(FramedChannel):
         self._await_ready()
 
     def _raw_text(self) -> str:
-        return bytes(self._raw[-2000:]).decode("utf-8", "replace")
+        text = bytes(self._raw[-2000:]).decode("utf-8", "replace")
+        # Spec "Modal": a sandbox that reached the lifetime letify asked for takes its
+        # worker with it, and the channel otherwise lists causes, none of them this one.
+        said = lifetime_detail(
+            age_s=time.monotonic() - self.opened_at, lifetime_s=self.lifetime_s
+        )
+        return f"{said}\n{text}" if said else text
 
     def _send_worker(self) -> None:
         # After a reexec the data connection is gone, so the source goes back over stdio.

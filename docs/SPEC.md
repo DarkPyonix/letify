@@ -807,7 +807,11 @@ A `read_until` blocks until the sandbox prints a line, and the adapter answers o
 - `Modal.stop` calls `abort()` when the adapter is out of step or its lock is still held after 5 s. The call timeout watchdog calls it through `SandboxChannel._kill`, so a call past its `timeout` ends its sandbox too.
 - The adapter's `terminate` for an id it did not create finds the sandbox with `modal.Sandbox.from_id` and terminates it. A sandbox that is already gone is not an error.
 
-Modal also bounds a sandbox that nothing terminates. `create` passes `timeout`, the entry option `timeout`, 3600 s by default, as the sandbox's maximum lifetime. It passes `idle_timeout`, the entry option `idle_timeout`, 600 s by default, after which Modal terminates a sandbox that is idle.
+Modal also bounds a sandbox that nothing terminates. `create` passes `idle_timeout`, the entry option `idle_timeout`, 600 s by default, after which Modal terminates a sandbox that is idle. That is the bound that stops an abandoned sandbox billing, because an abandoned one is idle by definition once its worker has no one to answer.
+
+It passes `timeout`, the entry option `timeout`, as the sandbox's maximum lifetime, and the default is the longest Modal accepts, 86400 s, measured as accepted. It is not a shorter number letify picked, for the reason The declaration gives for `timeout` having no default: a deadline letify invented would end a two hour training run at whatever hour it guessed. The default was 3600 s, exactly one hour, and it ended two Modal sessions of a real training run at one hour each with nothing saying why, which is that sentence happening. An account that wants a hard cap sets `timeout` itself.
+
+A sandbox that reaches that lifetime takes its worker with it, so the channel sees a worker that stopped without replying. Where the session's age is within a minute of the lifetime letify asked for, the failure says so instead of listing causes: `the Modal sandbox reached the <seconds> s lifetime letify asked for; raise timeout on the account to run longer`.
 
 ### Modal data channel <!-- id: modal-data-channel -->
 
