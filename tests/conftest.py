@@ -1024,6 +1024,240 @@ def fake_gcs(monkeypatch):
     server.close()
 
 
+class FakeDriveServer:
+    """The parts of the Google Drive v3 API and Google's token endpoint letify uses.
+
+    A real HTTP server on loopback, so the standard library client letify ships is the one
+    under test, from this process and from a worker process alike. Files live in ``files``
+    keyed by id; every request is appended to ``requests``, with its lower cased headers.
+    A request without the quota project header is answered ``403 SERVICE_DISABLED``, as the
+    real API answers it. A resumable session accepts its pieces without a credential, as
+    the real one does, because the session URL authorizes its own upload.
+    """
+
+    def __init__(self, token: str = "drive-token-1", project: str = "drive-project"):
+        import http.server
+        import threading
+
+        self.token = token
+        self.project = project
+        self.files: dict[str, dict[str, Any]] = {}
+        self.sessions: dict[str, dict[str, Any]] = {}
+        self.requests: list[dict[str, Any]] = []
+        self.refresh_grants: list[dict[str, str]] = []
+        self.fail_with: int | None = None
+        self._count = 0
+        owner = self
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def log_message(self, *args: Any) -> None:
+                return None
+
+            def do_GET(self) -> None:
+                owner._handle(self, "GET")
+
+            def do_POST(self) -> None:
+                owner._handle(self, "POST")
+
+            def do_PUT(self) -> None:
+                owner._handle(self, "PUT")
+
+            def do_PATCH(self) -> None:
+                owner._handle(self, "PATCH")
+
+        self._server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self._server.daemon_threads = True
+        self.endpoint = f"http://127.0.0.1:{self._server.server_address[1]}"
+        threading.Thread(target=self._server.serve_forever, daemon=True).start()
+
+    def close(self) -> None:
+        self._server.shutdown()
+        self._server.server_close()
+
+    def login(self, alias: str, scopes: list[str] | None = None) -> Path:
+        """Write the stored Google login of one account, pointing its token endpoint here."""
+        import json
+
+        from letify import paths
+
+        directory = paths.account_directory(alias)
+        directory.mkdir(parents=True, exist_ok=True)
+        stored = {
+            "client_id": "client-1",
+            "client_secret": "secret-1",
+            "refresh_token": "refresh-1",
+            "token_uri": f"{self.endpoint}/token",
+            "scopes": scopes or ["https://www.googleapis.com/auth/drive.file"],
+        }
+        path = directory / "token.json"
+        path.write_text(json.dumps(stored))
+        return path
+
+    def blobs(self) -> dict[str, bytes]:
+        """Content of every file that is not a folder and not a ref, by name."""
+        return {
+            f["name"]: f["content"]
+            for f in self.files.values()
+            if not f["folder"] and not f["name"].startswith("ref ")
+        }
+
+    def refs(self) -> dict[str, str]:
+        return {
+            f["name"][4:]: f["content"].decode()
+            for f in self.files.values()
+            if f["name"].startswith("ref ")
+        }
+
+    def downloads(self) -> list[dict[str, Any]]:
+        return [r for r in self.requests if r["query"].get("alt") == "media"]
+
+    def uploads(self) -> list[dict[str, Any]]:
+        return [r for r in self.requests if r["method"] == "PUT"]
+
+    def _new_id(self) -> str:
+        self._count += 1
+        return f"id{self._count}"
+
+    def _select(self, expression: str) -> list[dict[str, Any]]:
+        import re
+
+        found = [f for f in self.files.values() if not f["trashed"]]
+        for match in re.finditer(r"name = '((?:[^'\\]|\\.)*)'", expression):
+            wanted = re.sub(r"\\(.)", r"\1", match.group(1))
+            found = [f for f in found if f["name"] == wanted]
+        for match in re.finditer(r"'([^']+)' in parents", expression):
+            found = [f for f in found if f["parent"] == match.group(1)]
+        if "mimeType = 'application/vnd.google-apps.folder'" in expression:
+            found = [f for f in found if f["folder"]]
+        return sorted(found, key=lambda f: f["id"])
+
+    def _handle(self, handler: Any, method: str) -> None:
+        import json
+        import urllib.parse
+
+        parsed = urllib.parse.urlsplit(handler.path)
+        query = dict(urllib.parse.parse_qsl(parsed.query))
+        length = int(handler.headers.get("Content-Length") or 0)
+        body = handler.rfile.read(length) if length else b""
+        headers = {k.lower(): v for k, v in handler.headers.items()}
+        self.requests.append(
+            {
+                "method": method,
+                "path": parsed.path,
+                "query": query,
+                "headers": headers,
+                "length": len(body),
+            }
+        )
+
+        def answer(
+            status: int, payload: bytes = b"", extra: dict[str, str] | None = None,
+            kind: str = "application/json",
+        ) -> None:
+            handler.send_response(status)
+            handler.send_header("Content-Type", kind)
+            handler.send_header("Content-Length", str(len(payload)))
+            for key, value in (extra or {}).items():
+                handler.send_header(key, value)
+            handler.end_headers()
+            handler.wfile.write(payload)
+
+        def reply(value: Any, status: int = 200) -> None:
+            answer(status, json.dumps(value).encode())
+
+        if parsed.path == "/token" and method == "POST":
+            self.refresh_grants.append(dict(urllib.parse.parse_qsl(body.decode())))
+            return reply({"access_token": self.token, "expires_in": 3599})
+        if self.fail_with is not None:
+            return answer(self.fail_with, b'{"error": {"message": "injected"}}')
+        if headers.get("x-goog-user-project") != self.project:
+            return answer(403, b'{"error": {"status": "SERVICE_DISABLED"}}')
+
+        session_prefix = "/upload/session/"
+        if parsed.path.startswith(session_prefix) and method == "PUT":
+            session = self.sessions[parsed.path[len(session_prefix) :]]
+            start = int(headers["content-range"].split(" ")[1].split("-")[0])
+            if start != len(session["body"]):
+                return answer(400, b'{"error": {"message": "out of order"}}')
+            session["body"] += body
+            if len(session["body"]) < session["size"]:
+                return answer(308, extra={"Range": f"bytes=0-{len(session['body']) - 1}"})
+            identifier = self._new_id()
+            self.files[identifier] = {
+                **session["meta"], "id": identifier, "content": session["body"],
+                "folder": False, "trashed": False,
+            }
+            return reply({"id": identifier, "name": session["meta"]["name"]})
+
+        if headers.get("authorization") != f"Bearer {self.token}":
+            return answer(401, b'{"error": {"message": "unauthenticated"}}')
+
+        if method == "GET" and parsed.path == "/drive/v3/files":
+            matches = self._select(query.get("q", ""))
+            start = int(query.get("pageToken") or 0)
+            size = int(query.get("pageSize") or 2)
+            page = matches[start : start + size]
+            result: dict[str, Any] = {"files": [{"id": f["id"], "name": f["name"]} for f in page]}
+            if start + size < len(matches):
+                result["nextPageToken"] = str(start + size)
+            return reply(result)
+        if method == "POST" and parsed.path == "/drive/v3/files":
+            meta = json.loads(body)
+            identifier = self._new_id()
+            self.files[identifier] = {
+                "id": identifier, "name": meta["name"], "content": b"", "trashed": False,
+                "parent": (meta.get("parents") or ["root"])[0],
+                "folder": meta.get("mimeType") == "application/vnd.google-apps.folder",
+            }
+            return reply({"id": identifier, "name": meta["name"]})
+        if method == "POST" and parsed.path == "/upload/drive/v3/files":
+            if query.get("uploadType") == "resumable":
+                meta = json.loads(body)
+                meta.setdefault("parent", (meta.get("parents") or ["root"])[0])
+                number = str(len(self.sessions) + 1)
+                self.sessions[number] = {
+                    "meta": meta, "body": b"",
+                    "size": int(headers["x-upload-content-length"]),
+                }
+                return answer(200, extra={"Location": f"{self.endpoint}{session_prefix}{number}"})
+            _, _, rest = body.partition(b"\r\n\r\n")
+            boundary = headers["content-type"].split("boundary=")[1].encode()
+            meta_text, _, tail = rest.partition(b"\r\n--" + boundary + b"\r\n")
+            meta = json.loads(meta_text)
+            content = tail.split(b"\r\n\r\n", 1)[1].rsplit(b"\r\n--" + boundary, 1)[0]
+            identifier = self._new_id()
+            self.files[identifier] = {
+                "id": identifier, "name": meta["name"], "content": content, "trashed": False,
+                "parent": (meta.get("parents") or ["root"])[0], "folder": False,
+            }
+            return reply({"id": identifier, "name": meta["name"]})
+        if method == "PATCH" and parsed.path.startswith("/upload/drive/v3/files/"):
+            identifier = parsed.path.rsplit("/", 1)[-1]
+            self.files[identifier]["content"] = body
+            return reply({"id": identifier})
+        if method == "GET" and parsed.path.startswith("/drive/v3/files/"):
+            found = self.files.get(parsed.path.rsplit("/", 1)[-1])
+            if found is None:
+                return answer(404, b'{"error": {"message": "not found"}}')
+            if query.get("alt") == "media":
+                return answer(200, found["content"], kind="application/octet-stream")
+            return reply({"id": found["id"], "name": found["name"]})
+        return answer(400, b'{"error": {"message": "unexpected request"}}')
+
+
+@pytest.fixture
+def fake_drive(isolated_home):
+    """A Google Drive endpoint on loopback, since a real Drive needs an account.
+
+    The login of the account ``drive-login`` is written under the isolated home, with its
+    token endpoint pointing at the same server.
+    """
+    server = FakeDriveServer()
+    server.login("drive-login")
+    yield server
+    server.close()
+
+
 # -- the Colab runtime proxy's Jupyter file API --------------------------------
 
 

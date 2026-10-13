@@ -53,6 +53,15 @@ BLOB_DISK_LIMIT = 32 * 1024**3
 #: moves the archive as one payload the worker and the client each hold whole.
 PACK_WITHOUT_A_RATE = 1024**3
 
+#: Bytes per second a runtime downloads from Google Drive. The slower of two measurements,
+#: 176.6 MiB/s from a Colab runtime and 182.9 MiB/s from a Kaggle runtime, for one 1 GiB
+#: file. Spec "Materializing into a runtime".
+DRIVE_DOWNLOAD_BPS = 176 * 1024**2
+
+#: Bytes per second a runtime extracts an uncompressed tar onto its disk, measured at
+#: 170 MB/s on a sandbox disk. Spec "Materializing into a runtime".
+EXTRACT_BPS = 170_000_000
+
 
 def _against_the_build(size: int, rate: float, build_s: float) -> str:
     """The three numbers both cache decisions weigh, as they are reported.
@@ -199,9 +208,15 @@ class Runtime:
                     "caching the environment"
                     + (f", {size / 1_000_000_000:.1f} GB" if size else "")
                 )
-                self._environment_volumes()[0].cache_env_from(
-                    self, self.env, root, platform=self.platform, build_s=self.env_build_s
-                )
+                volume = self._environment_volumes()[0]
+                try:
+                    volume.cache_env_from(
+                        self, self.env, root, platform=self.platform, build_s=self.env_build_s
+                    )
+                except Exception as exc:
+                    if not volume.store.backend.moves_on_runtime:
+                        raise
+                    self._not_using_drive(exc, after="not caching the environment")
         self.keep_blobs_on_disk()
         for volume in self.volumes:
             self.attach(volume)
@@ -651,6 +666,46 @@ class Runtime:
             )
         return digest, size
 
+    def pack_dir_to_store(self, path: str, backend: Any) -> tuple[str, int]:
+        """Pack a directory inside the runtime and have the runtime upload the archive.
+
+        Spec "Materializing into a runtime": the archive goes from the runtime's blob cache
+        to the backend without crossing this process. This process creates the upload
+        session, because it holds the credential, and the runtime is sent that session's
+        URL alone. Returns ``(digest, size)``. Needs a persistent channel, and raises
+        rather than routing the archive through this process.
+        """
+        if not self.persistent_channel:
+            raise RuntimeFailure("this channel keeps no worker that could upload the archive")
+        staging = f"{posixpath.dirname(path.rstrip('/'))}/.letify-pack"
+        value = self.request(
+            {"op": "pack_blob", "path": path, "dir": staging, "gzip": False}, timeout=3600
+        )
+        digest, size, directory = value["digest"], int(value["size"]), value["dir"]
+        try:
+            if not backend.has(digest):
+                target = backend.begin_upload(digest, size)
+                if target is None:
+                    raise RuntimeFailure(f"the {backend.name} backend offered no upload")
+                sent = self.request(
+                    {
+                        "op": "push_blob",
+                        "dir": directory,
+                        "digest": digest,
+                        "url": target["url"],
+                        "headers": dict(target.get("headers") or {}),  # type: ignore[call-overload]
+                        "piece": target.get("piece"),
+                    },
+                    timeout=3600,
+                )
+                backend.record_upload(digest, str(sent["id"]))
+        finally:
+            self.exec(
+                f"import shutil\nshutil.rmtree({directory!r}, ignore_errors=True)\n",
+                timeout=120,
+            )
+        return digest, size
+
     def put_path(
         self,
         local: Path,
@@ -813,7 +868,9 @@ class Runtime:
     def _packs_streaming(self) -> bool:
         """Whether the archive of the first environment volume streams in both directions."""
         volumes = self._environment_volumes()
-        return bool(volumes) and self.persistent_channel and volumes[0].store.streams
+        if not volumes or not self.persistent_channel:
+            return False
+        return volumes[0].store.streams or volumes[0].store.backend.moves_on_runtime
 
     def _worth_packing(self, root: str) -> bool:
         """Whether moving the project directory over this session's link beats the build.
@@ -826,6 +883,9 @@ class Runtime:
         """
         if self.env_build_s is None:
             return True
+        volumes = self._environment_volumes()
+        if volumes and volumes[0].store.backend.moves_on_runtime:
+            return self._worth_packing_to_drive(root)
         rate = self._measured_rate()
         size = self._tree_size(root)
         if rate is None:
@@ -846,6 +906,85 @@ class Runtime:
             f"{_against_the_build(size, rate, self.env_build_s)}"
         )
         return False
+
+    def _worth_packing_to_drive(self, root: str) -> bool:
+        """Whether the build took longer than restoring the archive from Drive would.
+
+        Spec "Materializing into a runtime": the archive goes from the runtime to Drive and
+        never over this link, so the gate is the estimated restore, the project directory's
+        size over the Drive download rate plus the same size over the extraction rate.
+        """
+        size = self._tree_size(root)
+        if size is None or self.env_build_s is None:
+            return True
+        restore_s = size / DRIVE_DOWNLOAD_BPS + size / EXTRACT_BPS
+        if self.env_build_s > restore_s:
+            return True
+        self._say(
+            f"not caching the environment, because it built in {self.env_build_s:.0f} s "
+            f"and would take an estimated {restore_s:.0f} s to restore from Drive"
+        )
+        return False
+
+    def _restore_from(self, volume: Volume, where: dict[str, Any]) -> bool:
+        """Restore the environment from one volume's archive. True when the check passed.
+
+        Spec "Materializing into a runtime": a volume with no archive, or one not worth
+        restoring over this session's link, answers False and leaves the sync to build.
+        """
+        from . import bootstrap
+
+        digest = volume.cached_env(self.env, self.platform)
+        if not digest:
+            return False
+        build = volume.cached_build(self.env, self.platform)
+        if build is None:
+            # Spec "Materializing into a runtime": written before letify recorded the
+            # build, so it is exactly the kind this rule exists to catch.
+            self._say(
+                "syncing rather than restoring, because the archive carries no "
+                "build time to compare against"
+            )
+            return False
+        build_s, archive_bytes = build
+        on_drive = volume.store.backend.moves_on_runtime
+        restore_s = volume.cached_restore(self.env, self.platform) if on_drive else None
+        if restore_s is not None and restore_s >= build_s:
+            # Spec "Materializing into a runtime": a restore measured slower than the build
+            # is not worth repeating, so this session builds.
+            self._say(
+                "syncing rather than restoring from Drive, because a restore took "
+                f"{restore_s:.0f} s against a {build_s:.0f} s build"
+            )
+            return False
+        rate = None if on_drive else self._measured_rate()
+        if rate is not None and (archive_bytes / rate) >= build_s:
+            # Spec "Materializing into a runtime": the cache is an optimization, so a
+            # link this slow would cost more than the build did.
+            self._say(_sync_rather_than_restore(archive_bytes, rate, build_s))
+            return False
+        self._say(f"restoring the environment, cached as {digest[:12]}")
+        archive = f"{where['parent']}/.{digest}" + (".tar" if on_drive else ".tar.gz")
+        began = time.monotonic()
+        volume.materialize(
+            self, digest, path=archive, unpack=True, target=where["parent"], links=True
+        )
+        if self.eval(bootstrap.venv_check_source(where["python"], archive), timeout=600):
+            self.env_source = "archive"
+            if on_drive:
+                volume.record_restore(self.env, self.platform, time.monotonic() - began)
+            return True
+        return False
+
+    def _not_using_drive(self, failure: Exception, *, after: str = "syncing") -> None:
+        """Say that a Drive request failed and what the session does instead.
+
+        Spec "Materializing into a runtime": a failed Drive request is not retried into a
+        slower path, and the archive is never routed through this process. A failed
+        restore syncs; a failed pack, which comes after the sync, leaves nothing cached.
+        """
+        reason = " ".join(str(failure).split()) or type(failure).__name__
+        self._say(f"not using the Drive store ({reason[:300]}); {after}")
 
     def _say(self, message: str) -> None:
         """One decision line about this runtime, as the transport's lines are written.
@@ -907,33 +1046,13 @@ class Runtime:
 
         archives = self._environment_volumes()
         for volume in archives:
-            digest = volume.cached_env(self.env, self.platform)
-            if not digest:
-                continue
-            build = volume.cached_build(self.env, self.platform)
-            if build is None:
-                # Spec "Materializing into a runtime": written before letify recorded the
-                # build, so it is exactly the kind this rule exists to catch.
-                self._say(
-                    "syncing rather than restoring, because the archive carries no "
-                    "build time to compare against"
-                )
-                continue
-            build_s, archive_bytes = build
-            rate = self._measured_rate()
-            if rate is not None and (archive_bytes / rate) >= build_s:
-                # Spec "Materializing into a runtime": the cache is an optimization, so a
-                # link this slow would cost more than the build did.
-                self._say(_sync_rather_than_restore(archive_bytes, rate, build_s))
-                continue
-            self._say(f"restoring the environment, cached as {digest[:12]}")
-            archive = f"{where['parent']}/.{digest}.tar.gz"
-            volume.materialize(
-                self, digest, path=archive, unpack=True, target=where["parent"], links=True
-            )
-            if self.eval(bootstrap.venv_check_source(where["python"], archive), timeout=600):
-                self.env_source = "archive"
-                break
+            try:
+                if self._restore_from(volume, where):
+                    break
+            except Exception as exc:
+                if not volume.store.backend.moves_on_runtime:
+                    raise
+                self._not_using_drive(exc)
 
         if self.env_source not in ("archive", "workspace"):
             workspace = self.workspace or self.provider.workspace_root

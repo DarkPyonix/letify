@@ -12,6 +12,7 @@ or the credential lives in the account directory, and the value is resolved when
 from __future__ import annotations
 
 import tomllib
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -91,6 +92,44 @@ def load(path: str | Path | None = None, *, home: bool = True) -> Config:
     return config
 
 
+@dataclass(frozen=True, slots=True)
+class DriveSettings:
+    """The machine's Google Drive store: the login alias, the quota project and the host."""
+
+    login: str
+    project: str
+    endpoint: str | None = None
+
+
+def drive_settings() -> DriveSettings | None:
+    """The Drive store this machine declares at the top level of its configuration, if any.
+
+    Spec "Materializing into a runtime": ``drive_login`` and ``drive_project`` are both
+    needed, and either alone is refused naming the other. ``drive_endpoint`` is optional.
+    """
+    file = config_path()
+    try:
+        settings = _parse(file) if file.is_file() else {}
+    except OSError:
+        settings = {}
+    login = settings.get("drive_login")
+    project = settings.get("drive_project")
+    if not login and not project:
+        return None
+    if not login:
+        raise ConfigError(
+            f"{config_label()} sets drive_project but not drive_login. Set drive_login = "
+            f"'<alias of a Google login>' to keep environment archives in Google Drive."
+        )
+    if not project:
+        raise ConfigError(
+            f"{config_label()} sets drive_login but not drive_project. Set drive_project = "
+            f"'<Google Cloud project id>' with the Drive API enabled."
+        )
+    endpoint = settings.get("drive_endpoint")
+    return DriveSettings(str(login), str(project), str(endpoint) if endpoint else None)
+
+
 def _project_file(path: str | Path | None) -> Path:
     """The project's ``config.toml``, from a ``.letify`` directory, a file, or the default."""
     if path is None:
@@ -157,8 +196,10 @@ __all__ = [
     "GLOBAL_FIELD",
     "RESERVED_ALIASES",
     "Config",
+    "DriveSettings",
     "ProviderConfig",
     "account_directory",
+    "drive_settings",
     "inventory",
     "load",
     "login",
