@@ -86,6 +86,13 @@ LISTEN_WAIT = 60
 #: Seconds the channel allows for connecting through the tunnel and for the hello after it.
 DATA_CONNECT_TIMEOUT = 30
 
+#: Seconds the channel keeps trying to reach a tunnel whose host name does not resolve,
+#: and the pause between attempts. Spec "Modal data channel": the name is new when the
+#: sandbox is, so a resolver asked too early can answer that it does not exist and cache
+#: that answer.
+DATA_OPEN_WINDOW = 30.0
+DATA_OPEN_PAUSE = 3.0
+
 #: TCP connections the data channel opens when ``data_streams`` is not set, and the most
 #: it accepts. Spec "Parallel data streams".
 DATA_STREAMS = 4
@@ -608,6 +615,23 @@ class TlsStream:
             self._wire.release()
 
 
+def _reach(address: tuple[str, int]) -> socket.socket:
+    """Connect to the tunnel, waiting out a host name the resolver does not have yet.
+
+    Spec "Modal data channel": the name is new when the sandbox is, so a resolver asked
+    too early can answer that it does not exist and keep that answer cached. Anything but
+    a resolution failure is raised at once, because waiting does not help it.
+    """
+    deadline = time.monotonic() + DATA_OPEN_WINDOW
+    while True:
+        try:
+            return socket.create_connection(address, timeout=DATA_CONNECT_TIMEOUT)
+        except socket.gaierror:
+            if time.monotonic() >= deadline:
+                raise
+            time.sleep(DATA_OPEN_PAUSE)
+
+
 class SandboxChannel(FramedChannel):
     """Carries the worker's frames over a sandbox's pipes, through the adapter.
 
@@ -637,6 +661,9 @@ class SandboxChannel(FramedChannel):
         self.sandbox = sandbox
         self.name = name
         self.data_port = data_port
+        #: The tunnel host the last open reached for, named in a failure so a reader can
+        #: resolve it themselves. Spec "Modal data channel".
+        self._tunnel_host: str | None = None
         #: The sandbox's maximum lifetime, so a death at it is named rather than guessed.
         self.lifetime_s = lifetime_s
         self.opened_at = time.monotonic()
@@ -688,9 +715,11 @@ class SandboxChannel(FramedChannel):
             self._connection = self._open_data(self.data_port)
         except (LetifyError, OSError, ValueError, KeyError, TypeError) as exc:
             self._close_socket()
+            where = f", host {self._tunnel_host}" if self._tunnel_host else ""
             print(
-                f"letify: {self.name}: the data channel did not open ({exc}); "
-                "frames stay on standard input and output",
+                f"letify: {self.name}: the data channel did not open ({exc}{where}); "
+                "frames stay on standard input and output, which the control path "
+                "shares, so a large transfer there can starve the lease",
                 file=sys.stderr,
                 flush=True,
             )
@@ -707,6 +736,7 @@ class SandboxChannel(FramedChannel):
         stdio.request(listen, timeout=DATA_CONNECT_TIMEOUT + LISTEN_WAIT, kill=self._kill)
         tunnel = self.adapter.request("tunnel", sandbox=self.sandbox, port=port)
         host = str(tunnel["host"])
+        self._tunnel_host = host
         address = (host, int(tunnel["port"]))
         context = None
         if tunnel.get("tls"):
@@ -717,7 +747,7 @@ class SandboxChannel(FramedChannel):
         def open_lane(index: int) -> None:
             # Spec "Parallel data streams": every lane opens at the same time.
             try:
-                raw = socket.create_connection(address, timeout=DATA_CONNECT_TIMEOUT)
+                raw = _reach(address)
             except BaseException as exc:
                 errors.append(exc)
                 return

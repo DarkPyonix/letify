@@ -2941,3 +2941,55 @@ def test_a_sandbox_that_reached_its_lifetime_says_so(config_file) -> None:
     assert "3600" in lifetime_detail(age_s=3599.5, lifetime_s=3600)
     assert "raise timeout" in lifetime_detail(age_s=3601.0, lifetime_s=3600)
     assert lifetime_detail(age_s=120.0, lifetime_s=3600) is None
+
+
+def test_a_tunnel_name_that_is_not_in_dns_yet_is_waited_for(
+    isolated_home, fake_modal, monkeypatch
+) -> None:
+    """Spec "Modal data channel": the host name is new when the sandbox is.
+
+    KICT lost three sessions in a row to a resolver that answered NXDOMAIN for a freshly
+    created tunnel name while github.com resolved every time, and 7.6 GB then went over
+    standard input and output until the lease renewal missed its timeout.
+    """
+    import socket as socketmod
+
+    from letify.providers import modal as modalmod
+
+    attempts: list[float] = []
+    real = socketmod.create_connection
+
+    def refuse_then_open(address, timeout=None, *args, **kwargs):
+        attempts.append(0.0)
+        if len(attempts) < 3:
+            raise socketmod.gaierror(-3, "Temporary failure in name resolution")
+        return real(address, timeout, *args, **kwargs)
+
+    monkeypatch.setattr(modalmod.socket, "create_connection", refuse_then_open)
+    monkeypatch.setattr(modalmod, "DATA_OPEN_PAUSE", 0.01)
+    provider = provider_of(Modal, "m")
+    runtime = modal_runtime(provider)
+    channel = provider.open_channel(runtime)
+    try:
+        channel.start()
+        assert channel.call(sum, ([1, 2, 3],), {})[0] == 6
+        assert len(attempts) >= 3, f"gave up after {len(attempts)} attempt(s)"
+    finally:
+        channel.close()
+        provider.stop(runtime)
+
+
+def test_a_data_channel_failure_names_the_host(isolated_home, fake_modal, capfd) -> None:
+    """Spec "Modal data channel": the host name is named so a reader can resolve it."""
+    fake_modal.fail("tunnel")
+    provider = provider_of(Modal, "m")
+    runtime = modal_runtime(provider)
+    channel = provider.open_channel(runtime)
+    try:
+        channel.start()
+        assert channel.call(sum, ([1, 2, 3],), {})[0] == 6
+        err = capfd.readouterr().err
+        assert "the control path shares" in err, err
+    finally:
+        channel.close()
+        provider.stop(runtime)
