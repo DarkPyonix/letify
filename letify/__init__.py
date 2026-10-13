@@ -27,6 +27,8 @@ the base install and a provider whose package is missing reports itself unavaila
 
 from __future__ import annotations
 
+import os
+from pathlib import Path
 from typing import Final
 
 from .declare.cache import session_cache
@@ -80,6 +82,27 @@ def fetch(tensor):  # type: ignore[no-untyped-def]
     return queue_fetch(tensor)
 
 
+def stash(name: str, path: str | os.PathLike[str]) -> str:
+    """Put a file or directory on the machine's Drive store under ``name``.
+
+    Returns the digest once the upload has finished and the ref is written. A later call on
+    any provider, or the local process, gets it back with ``unstash(name, path)``.
+    """
+    from .store.handoff import stash as stash_handoff
+
+    return stash_handoff(name, path)
+
+
+def unstash(name: str, path: str | os.PathLike[str]) -> Path | None:
+    """Put the handoff ``name`` at ``path``, replacing what was there.
+
+    Returns ``path``, or None when no handoff has that name, in which case nothing changed.
+    """
+    from .store.handoff import unstash as unstash_handoff
+
+    return unstash_handoff(name, path)
+
+
 __all__ = [
     "AnyInstance",
     "Blob",
@@ -108,12 +131,15 @@ __all__ = [
     "__version__",
     "all_reduce",
     "distributed",
+    "fetch",
     "local",
     "local_steps",
     "mean",
     "rank",
     "remote",
     "session_cache",
+    "stash",
     "sum",
+    "unstash",
     "world_size",
 ]

@@ -369,7 +369,7 @@ class Runtime:
         """
         import secrets
 
-        from ..store import pathdata
+        from ..store import handoff, pathdata
 
         assert self.channel is not None
         root = (self.workspace or self.provider.workspace_root).rstrip("/")
@@ -407,9 +407,14 @@ class Runtime:
         back = pathdata.WriteBack(self, collector, blobs) if collector.outputs else None
         if back is not None:
             back.start()
+        # A function body can ask this process for a Drive grant while it runs, as spec
+        # "Named handoffs on the Drive store" describes.
+        grants = handoff.GrantWatcher(self.channel)
+        grants.start()
         try:
             outcome = self.channel.request(request, timeout=timeout)
         finally:
+            grants.close()
             if back is not None:
                 back.cancel()
             added = self._finish_data(stream, call_dir)

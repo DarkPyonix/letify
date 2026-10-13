@@ -1339,6 +1339,38 @@ def _op_reduce_peers(request):
     return {"ok": True, "value": None}
 
 
+#: Guards ``_DRIVE_ANSWERS``, and wakes a ``stash`` or ``unstash`` waiting on an answer.
+_DRIVE_LOCK = threading.Condition()
+
+#: The client's answers to a Drive request, keyed by request id, until the waiting
+#: ``stash`` or ``unstash`` takes them.
+_DRIVE_ANSWERS = {}
+
+
+def _drive_ask(message):
+    """Ask the client for a Drive grant. Nothing replies to this request.
+
+    Mirrors ``_reduce_join``: a one-way request on a reserved stream, answered separately
+    as an ordinary request-reply, op "drive_grant", below.
+    """
+    try:
+        _SENDER.message(REQUEST, DRIVE_STREAM, message)
+    except OSError:
+        pass
+
+
+def _op_drive_grant(request):
+    """The client's answer to a Drive request: a grant, a reply that nothing is there, or a failure.
+
+    The body is blocked waiting for this, so it is answered by the frame reader at once
+    rather than queued behind the call, which is why it is in ``_LIGHT`` below.
+    """
+    with _DRIVE_LOCK:
+        _DRIVE_ANSWERS[request["id"]] = request
+        _DRIVE_LOCK.notify_all()
+    return {"ok": True, "value": None}
+
+
 def _data_state_for(path):
     """The running call a path belongs to, or None."""
     for state in _DATA_CALLS.values():
@@ -2510,12 +2542,13 @@ _OPS = {
     "stat": _op_stat,
     "lease": _op_lease,
     "reduce_peers": _op_reduce_peers,
+    "drive_grant": _op_drive_grant,
 }
 
 #: Answered by the frame reader at once, so they work while a call runs.
 # ``data_failed`` is light because it must not queue behind the call it is about: the call
 # is blocked on a blob the sender will never send, so a queued answer would deadlock.
-_LIGHT = ("stat", "lease", "reduce_peers", "data_failed")
+_LIGHT = ("stat", "lease", "reduce_peers", "drive_grant", "data_failed")
 
 #: Answered by several replies, the last one marked. These send their own replies.
 _STREAMING = ("data_stream",)

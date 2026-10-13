@@ -47,6 +47,11 @@ DATA_STREAM = 4
 #: request-reply carrying op "reduce_peers".
 REDUCE_STREAM = 6
 
+#: The stream a function body asks for a Drive grant on, as spec "Named handoffs on the
+#: Drive store" describes. Nothing replies on it either; the client's answer travels as an
+#: ordinary request-reply carrying op "drive_grant".
+DRIVE_STREAM = 8
+
 #: The largest payload of one ``DATA`` frame, so other streams interleave between chunks.
 CHUNK = 8 << 20
 
@@ -615,6 +620,7 @@ __all__ = [
     "CHUNK",
     "DATA",
     "DEVICE_STREAM",
+    "DRIVE_STREAM",
     "HEADER",
     "HELLO",
     "MAGIC",

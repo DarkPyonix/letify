@@ -502,7 +502,7 @@ class Colab(Shell):
                 return self._exec(name, source, timeout)
 
             files = ColabFiles(self.alias, name, run, workspace=self.workspace_root)
-            return OneShotChannel(run, name=name, files=files)
+            return OneShotChannel(run, name=name, files=files, provider=self.alias)
         return super().open_channel(runtime)
 
 
