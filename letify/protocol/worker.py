@@ -2367,6 +2367,7 @@ def _op_push_blob(request):
 
     url = request.pop("url")
     headers = request.pop("headers", None) or {}
+    cancel = request.pop("cancel", None)
     path = _data_file(os.path.expanduser(request["dir"]), request["digest"])
     size = os.path.getsize(path)
     piece = int(request.get("piece") or (64 << 20))
@@ -2374,6 +2375,8 @@ def _op_push_blob(request):
     with open(path, "rb") as handle:
         offset = 0
         while offset < size:
+            if cancel is not None and cancel.is_set():
+                raise RuntimeError("the upload was abandoned")
             block = handle.read(piece)
             end = offset + len(block)
             span = "bytes %d-%d/%d" % (offset, end - 1, size)
@@ -2393,6 +2396,98 @@ def _op_push_blob(request):
     if remote_id is None:
         raise RuntimeError("the upload session never answered with a file")
     return {"ok": True, "value": {"id": remote_id, "size": size}}
+
+
+#: The one environment pack running beside the session's calls, or None. Spec "Project
+#: data / environment archive": the pack is a background job on the worker.
+_PACK_JOB = {}
+
+
+def _pack_push_run(job, request):
+    """Pack a directory, wait for the upload target, upload it, and remove the staging dir.
+
+    Runs on its own thread, so the worker's main thread keeps answering calls. The state
+    goes packing, packed, uploading, then done or failed. The staging directory is gone
+    before done or failed is reported.
+    """
+    import shutil
+
+    began = time.monotonic()
+    directory = os.path.expanduser(request["dir"])
+    result = None
+    try:
+        packed = _op_pack_blob(
+            {"path": request["path"], "dir": request["dir"], "gzip": False}
+        )["value"]
+        job["digest"], job["size"] = packed["digest"], packed["size"]
+        job["state"] = "packed"
+        job["ready"].wait()
+        target = job["target"]
+        if target is None:
+            raise RuntimeError("the pack was abandoned")
+        job["state"] = "uploading"
+        sent = _op_push_blob(
+            {
+                "dir": packed["dir"],
+                "digest": packed["digest"],
+                "url": target["url"],
+                "headers": target.get("headers") or {},
+                "piece": target.get("piece"),
+                "cancel": job["cancel"],
+            }
+        )["value"]
+        result = {"state": "done", "id": sent["id"], "size": sent["size"]}
+    except BaseException as exc:
+        result = {"state": "failed", "reason": str(exc) or type(exc).__name__}
+    finally:
+        shutil.rmtree(directory, ignore_errors=True)
+    result["seconds"] = time.monotonic() - began
+    job.update(result)
+
+
+def _op_pack_push_start(request):
+    """Start packing a directory on a thread of its own and return at once."""
+    import threading
+
+    current = _PACK_JOB.get("job")
+    if current is not None and current["state"] in ("packing", "packed", "uploading"):
+        return {"ok": False, "error": "a pack is already running", "traceback": ""}
+    job = {
+        "state": "packing",
+        "target": None,
+        "ready": threading.Event(),
+        "cancel": threading.Event(),
+    }
+    _PACK_JOB["job"] = job
+    threading.Thread(target=_pack_push_run, args=(job, request), daemon=True).start()
+    return {"ok": True, "value": None}
+
+
+def _op_pack_push_target(request):
+    """Hand the running pack its upload session, or abandon it when ``url`` is None."""
+    job = _PACK_JOB.get("job")
+    if job is None:
+        return {"ok": False, "error": "no pack is running", "traceback": ""}
+    if request.get("url") is None:
+        job["cancel"].set()
+        job["target"] = None
+    else:
+        job["target"] = {
+            "url": request["url"],
+            "headers": request.get("headers") or {},
+            "piece": request.get("piece"),
+        }
+    job["ready"].set()
+    return {"ok": True, "value": None}
+
+
+def _op_pack_push_state(request):
+    """Report the pack: its state, and the digest, size, file id, seconds or reason it has."""
+    job = _PACK_JOB.get("job")
+    if job is None:
+        return {"ok": True, "value": {"state": "none"}}
+    keys = ("state", "digest", "size", "id", "seconds", "reason")
+    return {"ok": True, "value": {key: job[key] for key in keys if key in job}}
 
 
 def _op_place_blob(request):
@@ -2539,6 +2634,9 @@ _OPS = {
     "pack_dir": _op_pack_dir,
     "pack_blob": _op_pack_blob,
     "push_blob": _op_push_blob,
+    "pack_push_start": _op_pack_push_start,
+    "pack_push_target": _op_pack_push_target,
+    "pack_push_state": _op_pack_push_state,
     "place_blob": _op_place_blob,
     "exec": _op_exec,
     "eval": _op_eval,
@@ -2553,7 +2651,10 @@ _OPS = {
 #: Answered by the frame reader at once, so they work while a call runs.
 # ``data_failed`` is light because it must not queue behind the call it is about: the call
 # is blocked on a blob the sender will never send, so a queued answer would deadlock.
-_LIGHT = ("stat", "lease", "reduce_peers", "drive_grant", "data_failed")
+_LIGHT = (
+    "stat", "lease", "reduce_peers", "drive_grant", "data_failed",
+    "pack_push_state", "pack_push_target",
+)
 
 #: Answered by several replies, the last one marked. These send their own replies.
 _STREAMING = ("data_stream",)

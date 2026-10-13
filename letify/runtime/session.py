@@ -22,6 +22,7 @@ import datetime
 import json
 import posixpath
 import sys
+import threading
 import time
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
@@ -62,6 +63,16 @@ DRIVE_DOWNLOAD_BPS = 176 * 1024**2
 #: 170 MB/s on a sandbox disk. Spec "Materializing into a runtime".
 EXTRACT_BPS = 170_000_000
 
+#: How many times the estimated restore a build must have taken before the environment is
+#: packed to Drive. Spec "Materializing into a runtime": packing has a cost of its own.
+DRIVE_PACK_FACTOR = 2
+
+#: Seconds a closing session waits for a pack still running before it abandons it.
+PACK_CLOSE_WAIT_S = 60.0
+
+#: Seconds between the checks that hand a finished pack its upload session.
+PACK_POLL_S = 2.0
+
 
 def _against_the_build(size: int, rate: float, build_s: float) -> str:
     """The three numbers both cache decisions weigh, as they are reported.
@@ -85,6 +96,15 @@ def _sync_rather_than_restore(archive_bytes: int, rate: float, build_s: float) -
         "syncing rather than restoring, because "
         f"{_against_the_build(archive_bytes, rate, build_s)}"
     )
+
+
+@dataclass
+class _DrivePack:
+    """A pack the worker is running for a Drive store, as this process tracks it."""
+
+    volume: Any
+    began: float = field(default_factory=time.monotonic)
+    target_sent: bool = False
 
 
 @dataclass
@@ -155,6 +175,11 @@ class Runtime:
     #: Set once ``shutdown`` has run, so a second discard does nothing.
     _shut_down: bool = field(default=False, repr=False)
 
+    #: The environment pack running on the worker, or None. Spec "Materializing into a
+    #: runtime": the pack to Drive runs beside the session's calls.
+    _pack: _DrivePack | None = field(default=None, repr=False)
+    _pack_lock: Any = field(default_factory=threading.RLock, repr=False)
+
     @property
     def key(self) -> str:
         """Pool key. Runtimes with equal keys are interchangeable."""
@@ -215,14 +240,12 @@ class Runtime:
                     + (f", {size / 1_000_000_000:.1f} GB" if size else "")
                 )
                 volume = self._environment_volumes()[0]
-                try:
+                if volume.store.backend.moves_on_runtime:
+                    self._start_drive_pack(volume, root)
+                else:
                     volume.cache_env_from(
                         self, self.env, root, platform=self.platform, build_s=self.env_build_s
                     )
-                except Exception as exc:
-                    if not volume.store.backend.moves_on_runtime:
-                        raise
-                    self._not_using_drive(exc, after="not caching the environment")
         self.keep_blobs_on_disk()
         for volume in self.volumes:
             self.attach(volume)
@@ -263,6 +286,7 @@ class Runtime:
         if self._shut_down:
             return
         self._shut_down = True
+        self._close_pack()
         timestamp = datetime.datetime.now(datetime.UTC).isoformat()
         print(
             f"{timestamp} letify: discarding {self.name} provider={self.provider.alias} "
@@ -371,9 +395,13 @@ class Runtime:
                 fn, args, kwargs, timeout=timeout, modules=self.env.ship_modules
             )
         args, kwargs = self._externalize(args, kwargs)
-        return self._call_with_data(
-            fn, args, kwargs, timeout, data_order, data_first_wave, replica
-        )
+        self._poll_pack()
+        try:
+            return self._call_with_data(
+                fn, args, kwargs, timeout, data_order, data_first_wave, replica
+            )
+        finally:
+            self._poll_pack()
 
     def _call_with_data(
         self,
@@ -695,46 +723,6 @@ class Runtime:
             )
         return digest, size
 
-    def pack_dir_to_store(self, path: str, backend: Any) -> tuple[str, int]:
-        """Pack a directory inside the runtime and have the runtime upload the archive.
-
-        Spec "Materializing into a runtime": the archive goes from the runtime's blob cache
-        to the backend without crossing this process. This process creates the upload
-        session, because it holds the credential, and the runtime is sent that session's
-        URL alone. Returns ``(digest, size)``. Needs a persistent channel, and raises
-        rather than routing the archive through this process.
-        """
-        if not self.persistent_channel:
-            raise RuntimeFailure("this channel keeps no worker that could upload the archive")
-        staging = f"{posixpath.dirname(path.rstrip('/'))}/.letify-pack"
-        value = self.request(
-            {"op": "pack_blob", "path": path, "dir": staging, "gzip": False}, timeout=3600
-        )
-        digest, size, directory = value["digest"], int(value["size"]), value["dir"]
-        try:
-            if not backend.has(digest):
-                target = backend.begin_upload(digest, size)
-                if target is None:
-                    raise RuntimeFailure(f"the {backend.name} backend offered no upload")
-                sent = self.request(
-                    {
-                        "op": "push_blob",
-                        "dir": directory,
-                        "digest": digest,
-                        "url": target["url"],
-                        "headers": dict(target.get("headers") or {}),  # type: ignore[call-overload]
-                        "piece": target.get("piece"),
-                    },
-                    timeout=3600,
-                )
-                backend.record_upload(digest, str(sent["id"]))
-        finally:
-            self.exec(
-                f"import shutil\nshutil.rmtree({directory!r}, ignore_errors=True)\n",
-                timeout=120,
-            )
-        return digest, size
-
     def put_path(
         self,
         local: Path,
@@ -937,23 +925,166 @@ class Runtime:
         return False
 
     def _worth_packing_to_drive(self, root: str) -> bool:
-        """Whether the build took longer than restoring the archive from Drive would.
+        """Whether the build took at least twice as long as restoring from Drive would.
 
         Spec "Materializing into a runtime": the archive goes from the runtime to Drive and
         never over this link, so the gate is the estimated restore, the project directory's
-        size over the Drive download rate plus the same size over the extraction rate.
+        size over the Drive download rate plus the same size over the extraction rate. The
+        build must take ``DRIVE_PACK_FACTOR`` times that, because the pack has a cost of its
+        own that the comparison leaves out.
         """
         size = self._tree_size(root)
         if size is None or self.env_build_s is None:
             return True
         restore_s = size / DRIVE_DOWNLOAD_BPS + size / EXTRACT_BPS
-        if self.env_build_s > restore_s:
+        if self.env_build_s >= DRIVE_PACK_FACTOR * restore_s:
             return True
         self._say(
             f"not caching the environment, because it built in {self.env_build_s:.0f} s "
-            f"and would take an estimated {restore_s:.0f} s to restore from Drive"
+            f"and would take an estimated {restore_s:.0f} s to restore from Drive, and a "
+            f"cache pays only when the build takes at least {DRIVE_PACK_FACTOR} times as long"
         )
         return False
+
+    # -- the pack that runs beside the calls ---------------------------------
+
+    def _start_drive_pack(self, volume: Volume, root: str) -> None:
+        """Have the worker pack the environment and upload it on a thread of its own.
+
+        Spec "Materializing into a runtime": this returns at once, so the first call does
+        not wait for the pack. The ref and the build record are written when a poll sees
+        the upload finish. A failure to start leaves nothing cached and says so.
+        """
+        staging = f"{posixpath.dirname(root.rstrip('/'))}/.letify-pack"
+        try:
+            if not self.persistent_channel:
+                raise RuntimeFailure("this channel keeps no worker that could upload the archive")
+            self.request(
+                {"op": "pack_push_start", "path": root, "dir": staging}, timeout=120
+            )
+        except Exception as exc:
+            self._not_using_drive(exc, after="not caching the environment")
+            return
+        self._pack = _DrivePack(volume)
+        threading.Thread(target=self._feed_pack, name="letify-pack", daemon=True).start()
+
+    def _feed_pack(self) -> None:
+        """Hand the pack its upload session soon after the archive is written.
+
+        A call can run for hours, and the upload cannot start until this process has made
+        the session, so this does only that. Reporting stays with the calls and the close.
+        """
+        while True:
+            time.sleep(PACK_POLL_S)
+            job = self._pack
+            if job is None or job.target_sent or self._shut_down:
+                return
+            self._poll_pack(report=False)
+
+    def _poll_pack(self, *, report: bool = True) -> bool:
+        """Ask the worker how the pack is doing and act on the answer.
+
+        A packed archive is given its upload session. A finished upload is recorded, and
+        reported when ``report`` is set. False when the worker could not be asked.
+        """
+        with self._pack_lock:
+            job = self._pack
+            if job is None or self.channel is None:
+                return True
+            try:
+                state = self.request({"op": "pack_push_state"}, timeout=30)
+            except Exception:
+                return False
+            kind = state.get("state")
+            backend = job.volume.store.backend
+            if kind == "packed" and not job.target_sent:
+                job.target_sent = True
+                try:
+                    if backend.has(state["digest"]):
+                        # Another session stored this archive first, so there is nothing to send.
+                        self._send_target(None)
+                        self._pack = None
+                        self._record_pack(job, state["digest"], int(state["size"]))
+                        return True
+                    target = backend.begin_upload(state["digest"], int(state["size"]))
+                    if target is None:
+                        raise RuntimeFailure(f"the {backend.name} backend offered no upload")
+                    self._send_target(target)
+                except Exception as exc:
+                    self._pack = None
+                    try:
+                        self._send_target(None)
+                    except Exception:
+                        pass
+                    self._not_using_drive(exc, after="not caching the environment")
+            elif kind == "done" and report:
+                self._pack = None
+                backend.record_upload(state["digest"], str(state["id"]))
+                self._record_pack(job, state["digest"], int(state["size"]))
+                seconds = float(state["seconds"])
+                size = int(state["size"])
+                self._say(
+                    f"cached the environment, {size / 1_000_000_000:.1f} GB in {seconds:.0f} s "
+                    f"({size / 1024**2 / max(seconds, 0.001):.1f} MiB/s)"
+                )
+            elif kind == "failed" and report:
+                self._pack = None
+                self._not_using_drive(
+                    RuntimeFailure(str(state.get("reason"))), after="not caching the environment"
+                )
+            elif kind == "none":
+                self._pack = None
+            return True
+
+    def _send_target(self, target: dict[str, Any] | None) -> None:
+        """Give the worker the upload session, or None to abandon the pack."""
+        payload: dict[str, Any] = {"op": "pack_push_target", "url": None}
+        if target is not None:
+            payload.update(
+                url=target["url"],
+                headers=dict(target.get("headers") or {}),  # type: ignore[call-overload]
+                piece=target.get("piece"),
+            )
+        self.request(payload, timeout=60)
+
+    def _record_pack(self, job: _DrivePack, digest: str, size: int) -> None:
+        """Write the ref and the build record, which only a finished upload earns."""
+        job.volume.record_env(
+            self.env, self.platform, digest, size, build_s=self.env_build_s
+        )
+
+    def _close_pack(self) -> None:
+        """Wait for a running pack, up to ``PACK_CLOSE_WAIT_S``, then abandon it.
+
+        Spec "Materializing into a runtime": an abandoned pack records nothing, so the
+        next session syncs and may pack again.
+        """
+        job = self._pack
+        if job is None:
+            return
+        deadline = time.monotonic() + PACK_CLOSE_WAIT_S
+        try:
+            while self._pack is not None:
+                if not self._poll_pack():
+                    self._pack = None
+                    return
+                if self._pack is None:
+                    return
+                if time.monotonic() >= deadline:
+                    break
+                time.sleep(0.2)
+            with self._pack_lock:
+                self._pack = None
+                try:
+                    self._send_target(None)
+                except Exception:
+                    pass
+            self._say(
+                "not caching the environment, because the session closed "
+                f"{time.monotonic() - job.began:.0f} s into the pack"
+            )
+        except Exception:
+            self._pack = None
 
     def _restore_from(self, volume: Volume, where: dict[str, Any]) -> bool:
         """Restore the environment from one volume's archive. True when the check passed.

@@ -233,7 +233,7 @@ def test_a_pack_puts_the_archive_in_drive_without_the_client_holding_it(
     assert len(archive) > 0
     assert digest in fake_drive.refs().values()
     # The upload used a session the client created, and the worker was handed its URL.
-    pushes = [p for p in sent if p.get("op") == "push_blob"]
+    pushes = [p for p in sent if p.get("op") == "pack_push_target"]
     assert len(pushes) == 1
     assert pushes[0]["url"].startswith(fake_drive.endpoint + "/upload/session/")
     # The access token never reached the worker for the upload.
@@ -441,3 +441,110 @@ def test_a_record_with_no_restore_seconds_yet_restores(
         assert second.env_source == "archive"
     finally:
         second.shutdown()
+
+
+# -- the pack runs beside the session's calls -----------------------------------
+
+
+def test_the_first_call_runs_while_the_pack_is_still_uploading(
+    isolated_home, uv_project: Path, fake_drive, capsys
+) -> None:
+    import threading
+
+    hold = threading.Event()
+    fake_drive.hold_uploads = hold
+    provider = provider_of(PreparingLocal, "lab", **drive_options(fake_drive))
+    runtime = provider.start(remote_instance(provider), Env(), name="lab-1")
+    try:
+        value, _logs = runtime.call(lambda: 7, (), {})
+        assert value == 7
+        # The upload is held, so the pack has not ended and nothing is recorded yet.
+        assert fake_drive.refs() == {}
+        assert "cached the environment" not in "".join(capsys.readouterr())
+        hold.set()
+    finally:
+        hold.set()
+        runtime.shutdown()
+    assert fake_drive.refs()
+
+
+def test_the_pack_says_it_cached_the_environment_when_the_upload_completes(
+    isolated_home, uv_project: Path, fake_drive, capsys
+) -> None:
+    import re
+
+    provider = provider_of(PreparingLocal, "lab", **drive_options(fake_drive))
+    first_session(provider, Env())
+    shown = capsys.readouterr()
+    text = shown.out + shown.err
+    assert re.search(
+        r"letify: lab-1: cached the environment, [\d.]+ GB in [\d.]+ s \([\d.]+ MiB/s\)", text
+    )
+    (build_name,) = [n for n in fake_drive.refs() if n.endswith(".build")]
+    assert len(fake_drive.refs()[build_name].split()) == 2
+    assert len(fake_drive.blobs()) == 1
+
+
+def test_the_staging_directory_is_removed_when_the_pack_ends(
+    isolated_home, uv_project: Path, fake_drive
+) -> None:
+    from letify.runtime import bootstrap
+
+    provider = provider_of(PreparingLocal, "lab", **drive_options(fake_drive))
+    first_session(provider, Env())
+    assert not list(Path(bootstrap.DEFAULT_WORKSPACE_ROOT).expanduser().rglob(".letify-pack"))
+
+
+def test_a_session_closed_during_the_pack_abandons_it_and_leaves_no_ref(
+    isolated_home, uv_project: Path, fake_drive, capsys, monkeypatch
+) -> None:
+    import threading
+
+    from letify.runtime import session
+
+    monkeypatch.setattr(session, "PACK_CLOSE_WAIT_S", 0.5)
+    hold = threading.Event()
+    fake_drive.hold_uploads = hold
+    provider = provider_of(PreparingLocal, "lab", **drive_options(fake_drive))
+    runtime = provider.start(remote_instance(provider), Env(), name="lab-1")
+    try:
+        runtime.shutdown()
+    finally:
+        hold.set()
+    shown = capsys.readouterr()
+    text = shown.out + shown.err
+    assert "letify: lab-1: not caching the environment, because the session closed " in text
+    assert " s into the pack" in text
+    assert "cached the environment" not in text
+    assert fake_drive.refs() == {}
+
+
+def test_a_failed_upload_is_reported_by_the_session_that_observes_it(
+    isolated_home, uv_project: Path, fake_drive, capsys
+) -> None:
+    fake_drive.fail_with = 500
+    provider = provider_of(PreparingLocal, "lab", **drive_options(fake_drive))
+    first_session(provider, Env())
+    shown = capsys.readouterr()
+    assert "); not caching the environment" in shown.out + shown.err
+    assert fake_drive.refs() == {}
+
+
+def test_the_gate_packs_only_when_the_build_took_twice_the_estimated_restore() -> None:
+    from types import SimpleNamespace
+
+    from letify.runtime import session
+
+    said: list[str] = []
+    restore = 1_000_000_000 / session.DRIVE_DOWNLOAD_BPS + 1_000_000_000 / session.EXTRACT_BPS
+
+    def judged(build_s: float) -> bool:
+        stand_in = SimpleNamespace(
+            _tree_size=lambda root: 1_000_000_000, env_build_s=build_s, _say=said.append
+        )
+        return session.Runtime._worth_packing_to_drive(stand_in, "/root")  # type: ignore[arg-type]
+
+    assert judged(restore * 1.5) is False
+    assert "not caching the environment" in said[-1]
+    assert judged(restore * 2) is True
+    assert judged(restore * 3) is True
