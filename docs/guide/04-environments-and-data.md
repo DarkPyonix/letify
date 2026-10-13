@@ -114,13 +114,18 @@ Chosen by the provider, so your declaration does not mention one.
 
 > 🌏 **For Colab, use a multi-region bucket such as `US`.** You cannot choose where a Colab runtime lands, and a multi-region bucket avoids a cross-region charge on every read. Set a billing alert while you are there.
 
-## Why not Google Drive
+## Google Drive holds environment archives, not data
 
-Drive looks like a disk when mounted, which is the source of the confusion. It is a consumer file service reached one file at a time, and every file access is an HTTP request of tens to hundreds of milliseconds regardless of the file's size.
+Drive is reached one file at a time, and every file access is an HTTP request of tens to hundreds of milliseconds regardless of the file's size. 50,000 images at 100 ms each is over an hour of pure input and output per epoch, with the GPU idle. So letify never puts project data on Drive.
 
-The arithmetic: 50,000 images at 100 ms each is over an hour of pure input and output per epoch, with the GPU idle at 10 to 20% utilization the whole time. The same data as one archive, copied once and unpacked locally, is under a minute.
+One large file is a different case. Measured from Kaggle, Drive downloads at 183 MiB/s and accepts uploads at 72 MiB/s. letify therefore uses Drive for one thing: the packed environment of an ephemeral provider that has no `bucket`. Declare it once for the machine, at the top of `~/.letify/config.toml`:
 
-Drive is a fine warehouse. It is not a working disk. If you already keep data there, pull one archive at session start rather than reading from it during training.
+```toml
+drive_login = "colab_pro"        # the account whose Google login carries the drive.file scope
+drive_project = "letify-511514"  # a Google Cloud project with the Drive API enabled
+```
+
+Either setting alone is refused. A persistent provider ignores both, and an account with `bucket` keeps its bucket. The archive is packed only when the environment took longer to build than it would take to download and unpack, and a later session syncs instead of restoring once a recorded restore has taken longer than the build. Standard Drive API use carries no charge, and the archive counts against your Drive storage.
 
 ## Data your call reads
 
