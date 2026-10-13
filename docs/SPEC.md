@@ -1102,6 +1102,8 @@ Before a blob is written to a destination that is not unpacked, the local proces
 
 A persistent provider builds its environment with `uv sync` in `<workspace root>/project/<env key>` every session, and never packs the project directory into a volume or unpacks an archive from one. A sync over an existing `.venv` checks it and installs nothing, so it is faster than any archive transfer, and the `.venv` is already on the disk the archive would be unpacked to.
 
+That holds only while the project directory is under the workspace root. A provider that keeps its workspace root and still builds the `.venv` elsewhere archives like an ephemeral one, because the directory the sync writes does not survive the session however durable the workspace root is. Modal is that provider: its workspace root is a Modal volume and its `env_root` is the sandbox's own disk, chosen because a cold import from the volume reads thousands of small files over the network. Without this, Modal rebuilt 230 packages on every session, measured at 428 s and 534 s on an A10, and had neither the persistence its workspace root offers nor the archive an ephemeral provider gets. Whether the archive is then worth packing is the measurement Materializing into a runtime already makes.
+
 An ephemeral provider keeps the behaviour of Materializing into a runtime: every file is sent each session, and the environment archive is packed and restored.
 
 Nothing hands a session to the caller. There is no call that returns one, no argument that takes one, and no way to hold the wrong one, because which session serves a call is the pool's answer to work out from the declaration.
