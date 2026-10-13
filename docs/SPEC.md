@@ -1086,6 +1086,16 @@ elsewhere reaches the same branch, and there the alternative is a sync that may 
 Making the pack stream rather than hold the archive whole is the fix that removes this limit, and
 until then the limit is what keeps the step from costing more than it saves.
 
+That fix is three changes, not one, because the content addressed store is bytes in both directions:
+`put_file` reads the file whole, a backend's `put` takes the payload, and `get_bytes` and
+`fetch_file` return it whole. So a restore holds the archive entire on the client too, which is what
+a Kaggle session restoring 3.0 GB in 540 s was doing. Streaming it needs the worker to pack into its
+own blob cache and report the digest, the client to take it down the way a write-back takes an output
+file, which already streams and hashes as the pieces arrive, and the store to accept and serve a blob
+by path rather than by bytes. The filesystem backend that the automatic environment store uses can do
+that with a rename; a bucket needs a resumable upload. Until all three exist, both directions are
+bounded by what one process will hold.
+
 A later session restores only when the archive's size over the link measured for that session would
 take less than the recorded build. Otherwise it syncs, and says why:
 `letify: <runtime>: syncing rather than restoring, because 3.0 GB over 13.6 MiB/s is 210 s against a
