@@ -2523,3 +2523,44 @@ def test_a_lock_naming_cloudpickle_alone_is_accepted(tmp_path) -> None:
     (tmp_path / "uv.lock").write_text('version = 1\n\n[[package]]\nname = "cloudpickle"\n')
     files = bootstrap.project_files(Env(lock=str(tmp_path / "uv.lock")))
     assert b"cloudpickle" in files["uv.lock"]
+
+
+def test_the_managed_python_goes_with_the_venv_when_the_provider_sets_an_env_root() -> None:
+    """Spec "Remote paths letify writes": a workspace root is not always unpackable.
+
+    Modal's workspace root is a Modal volume, which supports no hard link at all: a link
+    inside it fails with EPERM and one to the sandbox disk with EXDEV. So uv downloading a
+    managed interpreter into it failed with "Operation not permitted (os error 1)", naming
+    neither the directory nor the reason. Reproduced on a live Modal T4 sandbox: the same
+    sync with that directory on the sandbox disk succeeds.
+    """
+    from letify.declare.env import Env
+    from letify.runtime import bootstrap
+
+    env = Env()
+    project = "/root/.letify-env/project/abc123"
+    files = {"pyproject.toml": b"[project]\n", "uv.lock": b""}
+    # A persistent provider archives nothing, which is the path that was left on the volume.
+    source = bootstrap.sync_source(
+        env, files, root=project, name="sandbox", workspace="/letify", archive=False
+    )
+    assert f"UV_PYTHON_INSTALL_DIR'] = os.path.expanduser('{project}/.letify-python')" in source
+    # The cache and the tool directory stay on the workspace root, which outlives a sandbox
+    # and was measured to carry them.
+    assert "UV_CACHE_DIR'] = os.path.expanduser('/letify/uv-cache')" in source
+    assert "UV_TOOL_DIR'] = os.path.expanduser('/letify/uv-tool')" in source
+
+
+def test_the_managed_python_stays_on_the_workspace_root_without_an_env_root() -> None:
+    """Spec "Remote paths letify writes": the workspace root is the only writable path
+    some accounts have, so nothing moves where the venv is already under it."""
+    from letify.declare.env import Env
+    from letify.runtime import bootstrap
+
+    env = Env()
+    project = "/workspace/project/abc123"
+    files = {"pyproject.toml": b"[project]\n", "uv.lock": b""}
+    source = bootstrap.sync_source(
+        env, files, root=project, name="lab", workspace="/workspace", archive=False
+    )
+    assert "UV_PYTHON_INSTALL_DIR'] = os.path.expanduser('/workspace/uv-python')" in source
