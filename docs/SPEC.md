@@ -111,6 +111,22 @@ parameters into the weak direction every round. A pair of replicas that cannot p
 fails the reduction and says so; it does not fall back to the client, for the reason
 [Link floor](#link-floor) gives.
 
+A replica joins a round with two addresses for the listener it opened: the one its own interface
+reports, and the one a STUN server says its NAT gives that port. The broker passes both to every
+other joined replica, with a token the pair agrees a connection on and the time both start dialing,
+which is what [TCP hole punching](#tcp-punch) already needs from the client when the client is one
+of the two ends. A replica then tries the address its peer reported for itself first, because two
+replicas on one machine or one network reach each other without a punch, and punches to the mapped
+address when that connection is refused. The punch is the same `punch` call a strategy makes. The
+replica that would have dialed anyway, the one that is not the leader, is the initiator, so the two
+sides never both take that role whatever their ranks are.
+
+Punching is between a pair, because one punched connection takes one local port on each side and
+the two sides have to agree which pair that port belongs to. So a round of more than two replicas
+whose members cannot reach each other directly is refused, naming the ranks that could not connect,
+rather than punching a mesh letify has not measured. Two replicas is the case claim N9's boundary is
+measured on, and more than two over direct addresses already works.
+
 ### How often to synchronize <!-- id: distributed-local-steps -->
 
 > `letify.local_steps(param_bytes, step_seconds)` answers how many steps to take between

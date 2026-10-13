@@ -74,6 +74,28 @@ cross cloud to cloud and the client carries the mappings and nothing else. Measu
 inbound on the network this was designed on is capped near 0.25 MiB/s, against 21 MiB/s
 outbound to a near runtime, which is why this is a claim rather than an optimization.
 
+**TCP hole punching does not reach between two Kaggle runtimes.** Measured on 2026-10-13 between two
+Google Cloud VMs on two Kaggle accounts: both NATs preserved the port, 45117 on each, so the
+signalling and the mappings were right, and every SYN was dropped for the whole 45 second window from
+both sides at once. So the mechanism this claim names works client to runtime, where it was measured,
+and not runtime to runtime on that network. The claim is not refuted, because what it asserts is that
+the reduction must not pass through the client, and that still holds. What is refuted is that a TCP
+punch is the way to arrange it on Kaggle.
+
+**A UDP punch does not reach either.** Measured the same way on the same pair of accounts: both NATs
+preserved the port, 45223 on each, both sides sent datagrams for 30 seconds, and neither received
+one. So neither protocol reaches between two Kaggle runtimes with a mapping learned from a third
+party, and the distributed placement has no runtime to runtime transport on that pair today. A pair
+that cannot connect refuses the reduction, which is what letify does, so the behaviour is right and
+the placement is unusable there rather than slow.
+
+Two paths remain, and which one letify takes is an open decision rather than something to assume.
+Either both runtimes dial outward to a third host that is not the client, which is a relay and has to
+be argued against the constraint that a slow link is a failure, or they exchange parameters through
+object storage in one of their clouds, which letify already reaches with the `bucket` account option
+and the GCS backend. The second needs no inbound anywhere, which is the property the measurements
+above say is missing.
+
 ## How an experiment reports efficiency
 
 This standard sits here rather than in `docs/SPEC.md` because it governs how a claim is tested, not what the system does. The spec records the design; this records what a report has to show before a claim above may be called supported. Every experiment pull request follows it.
@@ -108,7 +130,7 @@ Each of these would change a claim or a default. Answering one is a good first e
 
 1. **How many concurrent sessions does one Colab account allow?** Undocumented, and it moves with tier, credit balance and demand. Until it is measured, a `devices` count in the provider entry is where the answer goes, so a user who has measured their own account is not overruled by a number letify guessed.
 2. **What is the real host synchronization count per step, `k`, for the target workload?** Measurable with `torch.cuda.set_sync_debug_mode("warn")`. This sets whether PyTorch forwarding is worth using for that workload.
-3. **How often does TCP hole punching succeed on the networks researchers actually use?** It succeeded between a Colab VM and a university network in Korea, where both NATs preserved the port. Home routers, office networks and mobile tethering are unmeasured. This decides how often the pipeline falls to UDP or to the provider's own path.
+3. **How often does TCP hole punching succeed on the networks researchers actually use?** It succeeded between a Colab VM and a university network in Korea, where both NATs preserved the port. It failed between two Google Cloud VMs on two Kaggle accounts, where both NATs also preserved the port and every SYN was dropped, so a preserved port is not sufficient. Home routers, office networks and mobile tethering are unmeasured. This decides how often the pipeline falls to UDP or to the provider's own path, and runtime to runtime it decides whether the distributed placement has a transport on a given pair of providers.
 4. **Is NVFP4 reachable in a stock Colab runtime?** Needs the CUDA version, the compute capability and whether the quantization stack installs.
 5. **Is the Elice SSH port stable across a restart?** If it is not, the configuration needs a command that resolves the current port.
 6. **What does Elice spot pricing cost?** The API exposes a pricing id, which suggests preemptible instances are available. This is a direct cost lever.
