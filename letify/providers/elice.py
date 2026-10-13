@@ -43,6 +43,7 @@ from ..errors import (
     SpotPreempted,
     UnsupportedMode,
 )
+from ..paths import accounts_label, tools_label
 from .naming import normalize_gpu
 from .shell import Shell
 from .usage import Usage
@@ -205,7 +206,7 @@ def install_question() -> str:
 
     return (
         "eci, Elice's command line, is not installed. letify can download eci "
-        f"{install.ECI_VERSION} from Elice's GitHub release into ~/.letify/tools; it is "
+        f"{install.ECI_VERSION} from Elice's GitHub release into {tools_label()}; it is "
         "Elice's software, not part of letify. Install it now? [y/N]: "
     )
 
@@ -426,7 +427,7 @@ class Elice(Shell):
             raise ProviderUnavailable(
                 self.kind,
                 f"{self.alias} needs an access token. Run 'letify login elice {self.alias}', "
-                f"which keeps it in ~/.letify/accounts/{self.alias}/, or set access_token_env",
+                f"which keeps it in {accounts_label()}/{self.alias}/, or set access_token_env",
             )
         return token
 

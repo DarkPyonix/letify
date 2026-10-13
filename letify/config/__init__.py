@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Any
 
 from ..errors import ConfigError
+from ..paths import config_label, config_path
 from . import inventory, login, writer
 from .schema import RESERVED_ALIASES, Config, ProviderConfig
 from .secrets import CONFIG_DIRECTORY, account_directory, resolve_secret
@@ -49,7 +50,7 @@ def load(path: str | Path | None = None, *, home: bool = True) -> Config:
     which is what tests do to stay isolated from the developer's own accounts.
     """
     config = Config()
-    home_path = Path.home() / CONFIG_DIRECTORY / CONFIG_FILE
+    home_path = config_path()
     project_path = _project_file(path)
 
     home_entries = _read_entries(home_path, config, require_kind=True) if home else {}
@@ -66,14 +67,14 @@ def load(path: str | Path | None = None, *, home: bool = True) -> Config:
         if WORKSPACE_FIELD in body:
             raise ConfigError(
                 f"{project_path}: {alias!r} sets 'workspace', which belongs in the home file "
-                f"~/.letify/config.toml, because where letify may write is a rule of one "
+                f"{config_label()}, because where letify may write is a rule of one "
                 f"machine rather than of the repository"
             )
         base = home_entries.get(alias, {})
         kind = body.get("kind", base.get("kind"))
         if not isinstance(kind, str):
             raise ConfigError(
-                f"{project_path}: {alias!r} names an account that ~/.letify/config.toml does not "
+                f"{project_path}: {alias!r} names an account that {config_label()} does not "
                 f"have. "
                 f"Run 'letify login <kind> {alias}' to declare it on this machine, or give "
                 f"the table a 'kind' to declare it here."
