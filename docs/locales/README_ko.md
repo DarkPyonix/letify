@@ -155,7 +155,7 @@ letify login colab colab_pro_plus
 letify login shell lab_a100
 ```
 
-명령 하나가 파일 두 개를 씁니다. 계정은 `~/.letify/config.toml`에 들어갑니다. 머신에 속하는 정보이고, 저장소에는 들어가지 않습니다.
+명령 하나가 파일 두 개를 씁니다. 계정은 `~/.letify/config.toml`에 들어갑니다. 머신에 속하는 정보이고, 저장소에는 들어가지 않습니다. letify의 로컬 상태 전체를 `~/.letify` 대신 다른 디렉터리에 두려면 `LETIFY_HOME`을 절대 경로로 설정하세요.
 
 ```toml
 [colab_pro_plus]

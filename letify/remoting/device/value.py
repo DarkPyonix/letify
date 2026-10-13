@@ -14,7 +14,6 @@ import math
 import os
 import tomllib
 from collections.abc import Callable
-from pathlib import Path
 from typing import Any
 
 #: Attributes answered without resolving. Everything else waits for the value first.
@@ -33,7 +32,9 @@ def auto_fetch_enabled(configured: bool | None) -> bool:
 
 def _home_setting() -> bool:
     """``auto_fetch`` at the top level of ``~/.letify/config.toml``, on when absent."""
-    home_file = Path.home() / ".letify" / "config.toml"
+    from ...paths import config_path
+
+    home_file = config_path()
     try:
         settings = tomllib.loads(home_file.read_text(encoding="utf-8"))
     except (OSError, tomllib.TOMLDecodeError):

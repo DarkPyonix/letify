@@ -161,7 +161,7 @@ letify login colab colab_pro_plus
 letify login shell lab_a100
 ```
 
-Each command writes two files. The account goes to `~/.letify/config.toml`, which belongs to your machine and never to the repository:
+Each command writes two files. The account goes to `~/.letify/config.toml`, which belongs to your machine and never to the repository. Set `LETIFY_HOME` to an absolute path to keep all of letify's local state in another directory instead of `~/.letify`:
 
 ```toml
 [colab_pro_plus]

@@ -995,7 +995,9 @@ def forget_secret(alias: str) -> bool:
 
 
 def home_path() -> Path:
-    return Path.home() / CONFIG_DIRECTORY / CONFIG_FILE
+    from ..paths import config_path
+
+    return config_path()
 
 
 def project_path(path: str | Path | None = None) -> Path:

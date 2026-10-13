@@ -42,6 +42,7 @@ from .declare.env import Env
 from .declare.function import Function
 from .declare.instance import AnyInstance, Host, Instance, RemoteOnlyInstance
 from .errors import LetifyError, UnknownInstance, UnknownProvider
+from .paths import config_label
 from .runtime.pool import RuntimePool
 
 if TYPE_CHECKING:
@@ -168,7 +169,7 @@ class Launcher:
             known = ", ".join(self.config.order) or "none"
             raise UnknownProvider(
                 f"no provider is declared under {alias!r}. Declared: {known}. "
-                f"Name it in .letify/config.toml, and declare the account in ~/.letify/config.toml."
+                f"Name it in .letify/config.toml, and declare the account in {config_label()}."
             )
         provider = provider_registry.build(entry)
         # Connection decisions are printed only when the session start line is.
