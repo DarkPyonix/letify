@@ -2016,3 +2016,41 @@ def kaggle_api_token(isolated_home):
     write_secret("kaggle_a", "username", "irack000")
     return write_secret("kaggle_a", "access_token", "KGAT_" + "a" * 32)
 
+
+
+class FakeColabCli:
+    """A Colab CLI that holds assignments, for ``patch_run`` as the ``result`` callable.
+
+    ``sessions`` prints one ``[<name>] <endpoint>`` row per assignment, ``?`` for one with
+    no local state. ``new`` can add an assignment and then fail, as a read timeout does.
+    The unassign script is recognized by its ``python`` executable and removes the endpoint
+    named by its last argument.
+    """
+
+    def __init__(self, assignments=(), new_adds=None, new_fails=False, list_fails_after=None):
+        self.assignments = list(assignments)
+        self.new_adds = new_adds
+        self.new_fails = new_fails
+        self.list_fails_after = list_fails_after
+        self.listings = 0
+        self.unassigned: list[str] = []
+
+    def __call__(self, command):
+        if "python" in command and "-c" in command:
+            self.unassigned.append(command[-1])
+            self.assignments = [a for a in self.assignments if a[1] != command[-1]]
+            return FakeCompleted()
+        if "sessions" in command:
+            self.listings += 1
+            if self.list_fails_after is not None and self.listings > self.list_fails_after:
+                return FakeCompleted(returncode=1, stderr="Read timed out")
+            rows = [f"[{n}] {e} | Hardware: A100 | Variant: GPU\n" for n, e in self.assignments]
+            return FakeCompleted(
+                stdout="".join(rows) or "[colab] No active sessions found on server.\n"
+            )
+        if "new" in command:
+            if self.new_adds:
+                self.assignments.append(("?", self.new_adds))
+            if self.new_fails:
+                return FakeCompleted(returncode=1, stderr="ReadTimeout: Read timed out")
+        return FakeCompleted()

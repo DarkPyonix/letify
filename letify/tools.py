@@ -19,7 +19,7 @@ from __future__ import annotations
 import os
 import shutil
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 from .config.secrets import account_directory
@@ -109,6 +109,15 @@ def command(tool: Tool, uv: str) -> list[str]:
         tool.package,
         tool.executable,
     ]
+
+
+def python_command(tool: Tool, uv: str) -> list[str]:
+    """The argument list that runs the Python of ``tool``'s own uv environment.
+
+    Code run this way can import the tool's package, which is how a call the tool's command
+    line does not offer reaches the tool's client library.
+    """
+    return command(replace(tool, executable="python"), uv)
 
 
 def _ensure_symlink(link_path: Path, target: Path) -> None:
