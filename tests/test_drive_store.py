@@ -43,6 +43,32 @@ def declare_drive(server: Any, **settings: Any) -> None:
     paths.config_path().write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
+#: Tests that pin the gate's own rates and arithmetic, so they see the real constants.
+REAL_GATE = {
+    "test_the_gate_estimates_a_restore_as_size_over_the_download_and_extraction_rates",
+    "test_the_gate_packs_only_when_the_build_took_twice_the_estimated_restore",
+}
+
+
+@pytest.fixture(autouse=True)
+def pack_whatever_the_build_time(
+    request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Make the estimated restore negligible, so a session packs however fast it built.
+
+    A test session builds in one or two seconds, and whether that clears twice the
+    estimated restore of its small tree depends on the machine. A test that needs the
+    pack would otherwise pass or fail by timing. Tests in ``REAL_GATE`` and tests that set
+    the rates themselves see their own values.
+    """
+    if request.node.name in REAL_GATE:
+        return
+    from letify.runtime import session
+
+    monkeypatch.setattr(session, "DRIVE_DOWNLOAD_BPS", 1e18)
+    monkeypatch.setattr(session, "EXTRACT_BPS", 1e18)
+
+
 def drive_options(server: Any, **extra: Any) -> dict[str, Any]:
     """Account options of an ephemeral account, after the machine has declared Drive."""
     declare_drive(server)
