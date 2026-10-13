@@ -1346,6 +1346,11 @@ _DRIVE_LOCK = threading.Condition()
 #: ``stash`` or ``unstash`` takes them.
 _DRIVE_ANSWERS = {}
 
+# A process the body starts inherits this and lacks ``_drive_ask``, which is how
+# ``stash`` and ``unstash`` tell it is a child of the body and refuse. Spec "Named handoffs
+# on the Drive store".
+os.environ["LETIFY_WORKER_PID"] = str(os.getpid())
+
 
 def _drive_ask(message):
     """Ask the client for a Drive grant. Nothing replies to this request.
