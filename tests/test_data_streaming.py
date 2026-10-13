@@ -1757,3 +1757,66 @@ def test_a_blob_that_never_starts_still_times_out_and_says_how_far_it_got(
     message = str(failure.value)
     assert "did not arrive" in message, message
     assert "arrived" in message, message
+
+
+def test_a_blob_sent_beside_the_call_reports_its_bytes(
+    let, cpu, project, capsys, monkeypatch
+) -> None:
+    """Spec "Data log line": a transfer in progress read the same as one never started.
+
+    KICT's 11.3 GB table was moving the whole time and the line said 0.0 MiB/s, because
+    the rate counts only blobs that completed and the background sender was given no
+    meter at all.
+    """
+    from letify.store import pathdata
+
+    big = project / "beside.bin"
+    big.write_bytes(b"q" * (3 << 20))
+    monkeypatch.setattr(pathdata, "FIRST_WAVE_MIB", 0.0)
+    monkeypatch.setattr(pathdata, "FIRST_WAVE_FILES", 0)
+    monkeypatch.setattr(pathdata, "WAIT_TIMEOUT_S", 4.0)
+    def stalled(runtime, pipeline, blobs, digest, local, size, meter):
+        # A third of the blob is reported as handed over and then the send stops, which
+        # is the shape of a blob the sender was carrying when the call ended.
+        meter.update(1 << 20)
+        raise RuntimeFailure("the transfer stream failed")
+
+    monkeypatch.setattr(pathdata, "_put", stalled)
+
+    @let.function(device=cpu, host=letify.remote, retries=0)
+    def peek(path) -> int:
+        return len(path.read_bytes())
+
+    with pytest.raises(RuntimeFailure):
+        peek(path=big)
+    lines = [
+        text
+        for text in capsys.readouterr().err.splitlines()
+        if text.startswith("letify: data ") and "detected," in text
+    ]
+    assert lines
+    assert "dropped when the call ended" in lines[0], lines[0]
+    assert "had arrived" in lines[0], lines[0]
+
+
+def test_a_large_blob_beside_the_call_draws_the_progress_line(
+    let, cpu, project, capsys, monkeypatch
+) -> None:
+    """Spec "Data log line": the background sender draws the same line the wave draws.
+
+    KICT reported no 'uploading' line at all while 11.3 GB moved beside a call, because
+    the background sender was given no meter.
+    """
+    from letify.store import pathdata
+
+    big = project / "wide.bin"
+    big.write_bytes(b"w" * (70 << 20))
+    monkeypatch.setattr(pathdata, "FIRST_WAVE_MIB", 0.0)
+    monkeypatch.setattr(pathdata, "FIRST_WAVE_FILES", 0)
+
+    @let.function(device=cpu, host=letify.remote)
+    def read_it(path) -> int:
+        return len(path.read_bytes())
+
+    assert read_it(path=big) == 70 << 20
+    assert "uploading" in capsys.readouterr().err

@@ -485,6 +485,32 @@ def _mib(size: int) -> str:
     return f"{size / (1 << 20):.1f} MiB"
 
 
+class _Carried:
+    """One blob's progress, recorded on the stream and forwarded to the real meter.
+
+    Spec "Data log line": the bytes of a blob still on the way are reported, and only the
+    blob's own sender knows how far it got.
+    """
+
+    def __init__(self, stream: Any, digest: str, meter: Any) -> None:
+        self._stream = stream
+        self._digest = digest
+        self._meter = meter
+
+    def update(self, done: int) -> None:
+        self._stream.carried[self._digest] = done
+        if self._meter is not None:
+            self._meter.update(done)
+
+    def advance(self, size: int) -> None:
+        if self._meter is not None:
+            self._meter.advance(size)
+
+    def finish(self) -> None:
+        if self._meter is not None:
+            self._meter.finish()
+
+
 class _Uploaded:
     """Bytes sent so far, drawn as a progress line when the upload is large.
 
@@ -626,6 +652,10 @@ class Stream:
         #: Digests whose send finished. ``_sent`` holds the ones it began, so a blob the
         #: sender was carrying when the call ended is in one and not the other.
         self.done: set[str] = set()
+        #: Bytes of each blob handed to the runtime, including one still on the way.
+        self.carried: dict[str, int] = {}
+        #: The meter for blobs sent beside the call, spec "Data log line".
+        self._meter: _Uploaded | None = None
         self.before_files = self.before_bytes = 0
         self.during_files = self.during_bytes = 0
         self.before_seconds = self.during_seconds = 0.0
@@ -750,8 +780,21 @@ class Stream:
         digest = self._take()
         if digest is None:
             return False
-        self._send(digest, None)
+        self._send(digest, self._beside())
         return True
+
+    def _beside(self) -> _Uploaded:
+        """The meter for blobs sent beside the call, made at the first one.
+
+        Spec "Data log line": without one, a blob sent beside the call reported nothing,
+        so a transfer in progress and one that never started looked the same.
+        """
+        with self._lock:
+            if self._meter is None:
+                left = [d for d in self.plan.missing if d not in self.done]
+                total = sum(self.plan.weight(digest)[1] for digest in left)
+                self._meter = _Uploaded(len(left), total)
+            return self._meter
 
     def _take(self) -> str | None:
         with self._lock:
@@ -916,6 +959,7 @@ class Stream:
         size = self.plan.sizes.get(digest, 0)
         local = self.plan.files[digest]
         bucket = self.plan.bucket
+        meter = _Carried(self, digest, meter)
         uploaded = True
         if bucket is None:
             # The cost of opening the connections is weighed only while the pool is cold:
@@ -1014,9 +1058,13 @@ class Stream:
         missing_weight = [plan.weight(digest) for digest in plan.missing]
         already_files = plan.detected_files - sum(files for files, _b in missing_weight)
         already_bytes = plan.detected_bytes - sum(total for _f, total in missing_weight)
-        dropped_weight = [plan.weight(digest) for digest in self.dropped]
+        dropped = self.dropped
+        dropped_weight = [plan.weight(digest) for digest in dropped]
         dropped_files = sum(files for files, _b in dropped_weight)
         dropped_bytes = sum(total for _f, total in dropped_weight)
+        # Spec "Data log line": the rate counts only blobs that completed, so a large one
+        # in flight reads as 0.0 MiB/s however fast it is moving.
+        arrived = sum(self.carried.get(digest, 0) for digest in dropped)
         line = (
             f"data {plan.detected_files} files {_mib(plan.detected_bytes)} detected, "
             f"{already_files} files {_mib(already_bytes)} already on {plan.where}, "
@@ -1029,6 +1077,8 @@ class Stream:
             line += (
                 f", {dropped_files} files {_mib(dropped_bytes)} dropped when the call ended"
             )
+            if arrived:
+                line += f", {_mib(arrived)} of them had arrived"
         install.log(line)
         if stats.get("files"):
             install.log(
