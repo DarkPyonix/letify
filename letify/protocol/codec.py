@@ -130,6 +130,10 @@ class _CallPickler(cloudpickle.Pickler):
         return super().reducer_override(obj)
 
 
+#: Prefix of a digest computed with blake2b because blake3 was missing. A blake3 digest has none.
+BLAKE2B_PREFIX = "b2-"
+
+
 def _hasher() -> Any:
     """A fresh incremental hasher: blake3 on every core, or blake2b where blake3 is missing."""
     try:
@@ -146,10 +150,28 @@ def new_hasher() -> Any:
     return _hasher()
 
 
+def hasher_for(digest: str) -> Any | None:
+    """A fresh hasher of the algorithm ``digest`` names, or None where it cannot be computed.
+
+    Spec "Argument addressing": a digest names its own algorithm, so a side checking one
+    follows the side that computed it. None means blake3 is missing here and the digest is
+    blake3, so the check cannot be made.
+    """
+    if digest.startswith(BLAKE2B_PREFIX):
+        import hashlib
+
+        return hashlib.blake2b(digest_size=16)
+    try:
+        import blake3
+    except ImportError:
+        return None
+    return blake3.blake3(max_threads=blake3.blake3.AUTO)
+
+
 def finish_digest(hasher: Any) -> str:
-    """The content address a hasher from ``new_hasher`` has accumulated."""
+    """The content address a hasher from ``new_hasher`` or ``hasher_for`` has accumulated."""
     if hasher.name == "blake2b":
-        return str(hasher.hexdigest())
+        return BLAKE2B_PREFIX + str(hasher.hexdigest())
     return str(hasher.hexdigest(length=16))
 
 
@@ -158,14 +180,13 @@ def digest_parts(parts: Iterable[Any]) -> str:
 
     blake3 is preferred because it hashes at several gigabytes per second, which
     keeps hashing orders of magnitude away from being the bottleneck on any real
-    network link. blake2b from the standard library is the fallback.
+    network link. blake2b from the standard library is the fallback, and its digests
+    carry ``BLAKE2B_PREFIX``.
     """
     hasher = _hasher()
     for part in parts:
         hasher.update(part)
-    if hasher.name == "blake2b":
-        return hasher.hexdigest()
-    return hasher.hexdigest(length=16)
+    return finish_digest(hasher)
 
 
 def digest_of(payload: bytes) -> str:
@@ -297,6 +318,7 @@ __all__ = [
     "dumps_call",
     "dumps_call_parts",
     "finish_digest",
+    "hasher_for",
     "new_hasher",
     "parse",
     "split_output",

@@ -924,6 +924,8 @@ A top-level argument whose serialized size is 64 KiB or more is replaced by a `B
 
 A `bytes` argument is hashed as it is. Any other argument is pickled with protocol 5 and a `buffer_callback` through `codec.pickle_value_parts`, cloudpickle underneath rather than the standard library's `pickle.Pickler`, and the digest is taken over the pickle and then each out-of-band buffer in order, with no joined copy. The digest is blake3 with 16 byte output, or blake2b from the standard library where blake3 is missing.
 
+A digest names its own algorithm. A blake3 digest is the 32 hexadecimal characters of the 16 byte output, unchanged, so every digest already stored in a cache, a volume or Drive stays valid. A digest computed with blake2b because blake3 is missing is `b2-` followed by the 32 hexadecimal characters of the 16 byte blake2b output. Whoever checks a digest picks the algorithm from the digest, through `codec.hasher_for`, so a worker without blake3 and a client with it agree on every blob, archive, write-back file and handoff, and no handshake is needed. A side that cannot compute the algorithm of a digest it was given, a worker without blake3 handed a blake3 digest, does not check it and trusts the sender, and a name it computes itself uses its own algorithm. A placed file is compared by the algorithm of its recorded digest, so a worker without blake3 does not report an unchanged file as an output.
+
 cloudpickle rather than plain `pickle` because a `pickle.Pickler` writes a class or function defined in the caller's own run script as a name reference, `__main__.<name>`, and the worker's own `__main__` is not that script, so unpickling such a blob fails with `AttributeError: Can't get attribute '<name>' on <module '__main__' ...>`. cloudpickle ships such an object by value instead, the same as it already does for the call itself in `codec.dumps_call_parts`, so an argument too large to inline behaves the same as one that is not. The cost of cloudpickle's extra dispatch over plain `pickle` is in the noise: it only intercepts function, class and module objects, not the bulk of a large value, so a 256 MiB buffer or a multi-megabyte list of plain values serializes within a few percent of the same time either way, measured on this machine. There is accordingly no branch between the two picklers.
 
 The digest of an immutable argument is cached on the `Runtime` for the life of the session, so a repeated argument is not hashed again. Immutable means a `bytes` object, or an object that supports weak references and exposes a read-only buffer, such as a NumPy array with `writeable` set to `False`. A `bytes` entry holds a reference to its object so its id cannot be reused, and at most 16 such entries are kept, least recently used first out. Any other argument is pickled and hashed on every call, because it may have changed.
@@ -1088,7 +1090,7 @@ neither side holds it whole:
   returns `{"digest", "size", "dir"}`. The client receives the file with the stream a write-back
   uses, checks the digest as the pieces arrive into a scratch file beside the store, and renames it
   into the store with `Store.adopt_file`. The staging directory is removed afterwards. The digest
-  is the store's content digest (blake3 truncated to 16 bytes, blake2b without blake3).
+  is the store's content digest (blake3 truncated to 16 bytes, or `b2-` and blake2b where the worker has no blake3), and the client checks it with the algorithm the digest names.
 - Restore: a blob of more than one piece (8 MiB) that the store holds as a file is sent with
   `data_put` pieces into a staging directory beside the destination, then moved into place and
   unpacked by the worker op `place_blob`. Smaller blobs, and any blob from a store that does not
@@ -1113,6 +1115,8 @@ compare against`. Such an archive was written before letify recorded the build, 
 the kind this rule exists to catch, and the session that syncs instead both records the build and
 decides afresh whether the archive is worth keeping. The cost of that is one sync; the cost of
 trusting it is the transfer this rule was measured to avoid.
+
+A failure to cache the environment through the client's own store at boot, the pack, the stream back or the store write, never fails the session: it says `letify: <runtime>: not caching the environment (<reason>)` and the session goes on, the same as a failed pack on the workspace root.
 
 Packing is said, because it is a step that can take minutes and had nothing reporting it:
 `letify: <runtime>: caching the environment, 2.1 GB`. Skipping it is said too, because it is a

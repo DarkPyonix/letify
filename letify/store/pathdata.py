@@ -139,9 +139,9 @@ def hash_file(path: Path, size: int) -> str:
         else:
             while chunk := handle.read(1 << 20):
                 hasher.update(chunk)
-    if hasher.name == "blake2b":
-        return hasher.hexdigest()
-    return hasher.hexdigest(length=16)
+    from ..protocol.codec import finish_digest
+
+    return finish_digest(hasher)
 
 
 class DigestCache:
@@ -1608,7 +1608,7 @@ def _get(
     Spec "Writing back". One writing thread takes the pieces, so receiving the next one
     overlaps writing and hashing the one before it and the link does not idle.
     """
-    from ..protocol.codec import _hasher
+    from ..protocol.codec import finish_digest, hasher_for
 
     # Spec "Writing back": a stream that fails after these were created would leave them
     # empty, and a resume that picks the newest directory by name then trusts a checkpoint
@@ -1617,7 +1617,8 @@ def _get(
     partial = target.with_name(
         f".{target.name}.letify-partial.{os.getpid()}.{threading.get_ident()}"
     )
-    hasher = _hasher()
+    # The algorithm the digest names, which is the worker's when its venv has no blake3.
+    hasher = hasher_for(digest)
     pieces: queue.Queue = queue.Queue(maxsize=WRITE_QUEUE)
     failure: list[BaseException] = []
 
@@ -1630,7 +1631,8 @@ def _get(
                     if piece is None:
                         return
                     handle.write(piece)
-                    hasher.update(piece)
+                    if hasher is not None:
+                        hasher.update(piece)
         except BaseException as exc:  # pragma: no cover - a local disk failure
             failure.append(exc)
             # Drained, so the receiving thread is never left waiting on a full queue.
@@ -1657,7 +1659,7 @@ def _get(
             raise RuntimeFailure(
                 f"{runtime.name}: file blob {digest} arrived with {received} bytes, not {size}"
             )
-        found = hasher.hexdigest() if hasher.name == "blake2b" else hasher.hexdigest(length=16)
+        found = finish_digest(hasher) if hasher is not None else digest
         if found != digest:
             raise RuntimeFailure(f"{runtime.name}: file blob {digest} arrived with digest {found}")
         os.replace(partial, target)

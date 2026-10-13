@@ -248,7 +248,13 @@ def unstash(name: str, path: str | os.PathLike[str]) -> Path | None:
 
 
 def _verify(name: str, archive: Path, digest: str) -> None:
-    found = digest_of_file(archive)
+    hasher = codec.hasher_for(digest)
+    if hasher is None:
+        return
+    with open(archive, "rb") as handle:
+        while chunk := handle.read(1 << 20):
+            hasher.update(chunk)
+    found = codec.finish_digest(hasher)
     if found != digest:
         raise RuntimeFailure(
             f"handoff {name!r}: the blob downloaded from Drive has digest {found}, "

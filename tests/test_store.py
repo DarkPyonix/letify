@@ -875,3 +875,57 @@ def test_a_one_shot_runtime_pulls_an_archive_without_relaying_it_through_the_cli
     blobs = [r for r in fake_gcs.downloads() if "/blobs/" in unquote(r["path"])]
     assert [r["authorization"] for r in blobs] == ["Bearer down-token-1"]
     let.pool.shutdown()
+
+
+# -- Spec: Argument addressing, a digest names its own algorithm -----------------
+
+
+def test_an_environment_packed_by_a_worker_without_blake3_is_checked_with_blake2b(
+    tmp_path: Path,
+) -> None:
+    # The worker hashes the archive with blake2b because its venv has no blake3. The
+    # client has blake3, so a client that checked with its own algorithm called the same
+    # bytes corrupted: "file blob ... arrived with digest ...".
+    from conftest import NoBlake3Local, provider_of
+
+    from letify.declare.env import Env
+    from letify.declare.instance import Instance
+
+    provider = provider_of(NoBlake3Local, "nob3")
+    volume = provider.volume("cache", backend="filesystem", root=str(tmp_path / "store"))
+    runtime = provider.start(
+        Instance(provider, gpu=None)._placed("remote"), Env(lock=str(tmp_path / "x.lock")),
+        name="nob3-1",
+    )
+    try:
+        installed = tmp_path / "site"
+        installed.mkdir()
+        (installed / "marker.txt").write_text("installed", encoding="utf-8")
+        digest = volume.cache_env_from(runtime, Env(lock=str(tmp_path / "x.lock")), str(installed))
+    finally:
+        runtime.shutdown()
+    assert digest.startswith("b2-")
+    assert volume.store.backend.has(digest)
+
+
+def test_a_digest_is_checked_with_the_algorithm_it_names() -> None:
+    from letify.protocol import codec
+
+    hasher = codec.hasher_for("b2-" + "0" * 32)
+    hasher.update(b"x")
+    assert codec.finish_digest(hasher).startswith("b2-")
+    other = codec.hasher_for("0" * 32)
+    other.update(b"x")
+    assert not codec.finish_digest(other).startswith("b2-")
+    assert codec.digest_of(b"x") == codec.finish_digest(other)
+
+
+def test_blake2b_is_named_by_a_prefix_when_blake3_is_missing(no_module) -> None:
+    from letify.protocol import codec
+
+    no_module("blake3")
+    digest = codec.digest_of(b"same contents")
+    assert digest.startswith("b2-")
+    assert len(digest) == 35
+    assert codec.hasher_for("0" * 32) is None
+    assert codec.hasher_for(digest).name == "blake2b"
