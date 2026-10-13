@@ -2593,3 +2593,57 @@ def test_a_persistent_provider_that_builds_its_venv_elsewhere_still_archives(
     finally:
         runtime.shutdown()
     assert volume.cached_env(env, platform), "nothing was archived, so the next session resyncs"
+
+
+def test_a_large_environment_is_not_packed_when_the_link_was_never_measured(
+    uv_project: Path, tmp_path: Path, monkeypatch, capsys
+) -> None:
+    """Spec "Materializing into a runtime": the pack holds the archive whole, twice.
+
+    2.6.3 made a provider that keeps its workspace root archive like an ephemeral one, and
+    that branch packed unconditionally with no measured rate. On a Modal A10 a 7.2 GB
+    environment sat in the pack for over 30 minutes, silently, while the session billed.
+    """
+    from letify.runtime import session as sessionmod
+
+    provider = provider_of(PreparingLocal, "lab", persistent=False)
+    volume = provider.volume(
+        "cache", backend="filesystem", root=str(tmp_path / "store"), mount=str(tmp_path / "mount")
+    )
+    env = Env()
+    instance = Instance(provider, gpu=None)._placed("remote")
+    # No measured rate, as a Modal sandbox has none, and a tree over the limit.
+    monkeypatch.setattr(sessionmod.Runtime, "_measured_rate", lambda self: None)
+    monkeypatch.setattr(
+        sessionmod.Runtime, "_tree_size", lambda self, root: 8 * 1024**3
+    )
+    runtime = provider.start(instance, env, name="lab-1", volumes=(volume,))
+    try:
+        platform = runtime.platform
+    finally:
+        runtime.shutdown()
+    assert volume.cached_env(env, platform) is None
+    err = capsys.readouterr().err
+    assert "over the 1.0 GiB letify will hold in memory" in err, err
+
+
+def test_a_small_environment_is_still_packed_and_says_so(
+    uv_project: Path, tmp_path: Path, monkeypatch, capsys
+) -> None:
+    """Spec "Materializing into a runtime": the pack can take minutes, so it is said."""
+    from letify.runtime import session as sessionmod
+
+    provider = provider_of(PreparingLocal, "lab", persistent=False)
+    volume = provider.volume(
+        "cache", backend="filesystem", root=str(tmp_path / "store"), mount=str(tmp_path / "mount")
+    )
+    env = Env()
+    instance = Instance(provider, gpu=None)._placed("remote")
+    monkeypatch.setattr(sessionmod.Runtime, "_measured_rate", lambda self: None)
+    runtime = provider.start(instance, env, name="lab-1", volumes=(volume,))
+    try:
+        platform = runtime.platform
+    finally:
+        runtime.shutdown()
+    assert volume.cached_env(env, platform)
+    assert "caching the environment" in capsys.readouterr().err

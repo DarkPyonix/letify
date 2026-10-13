@@ -1063,6 +1063,16 @@ less time than the build did. The archive is smaller than the directory, so the 
 overstates the transfer and errs toward building, which is the cheaper of the two to get wrong. The
 ref records the build seconds beside the archive.
 
+With no measured rate for the link, letify packs only when that directory is at most 1 GiB, and says
+why when it declines. Packing moves the archive as one payload that the worker and the client each
+hold whole, so a tree of several gigabytes is held twice in memory with nothing reporting progress:
+measured on a Modal A10, a 7.2 GB environment sat in that step for over 30 minutes while the session
+billed. Packing unconditionally was right while only an ephemeral provider packed, where the
+alternative was a certain full rebuild; a provider that keeps its workspace root and builds its venv
+elsewhere reaches the same branch, and there the alternative is a sync that may take two minutes.
+Making the pack stream rather than hold the archive whole is the fix that removes this limit, and
+until then the limit is what keeps the step from costing more than it saves.
+
 A later session restores only when the archive's size over the link measured for that session would
 take less than the recorded build. Otherwise it syncs, and says why:
 `letify: <runtime>: syncing rather than restoring, because 3.0 GB over 13.6 MiB/s is 210 s against a
@@ -1076,7 +1086,9 @@ the kind this rule exists to catch, and the session that syncs instead both reco
 decides afresh whether the archive is worth keeping. The cost of that is one sync; the cost of
 trusting it is the transfer this rule was measured to avoid.
 
-Skipping the pack is said too, because it is a decision letify made rather than a thing that did not
+Packing is said, because it is a step that can take minutes and had nothing reporting it:
+`letify: <runtime>: caching the environment, 2.1 GB`. Skipping it is said too, because it is a
+decision letify made rather than a thing that did not
 happen: `letify: <runtime>: not caching the environment, because 9.4 GB over 13.6 MiB/s is 659 s
 against a 34 s build`.
 
