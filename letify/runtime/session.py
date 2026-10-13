@@ -86,6 +86,13 @@ def _against_the_build(size: int, rate: float, build_s: float) -> str:
     )
 
 
+def _reason_of(error: BaseException) -> str:
+    """One line naming an error's type and first message line, for a status message."""
+    lines = str(error).strip().splitlines()
+    reason = f"{type(error).__name__}: {lines[0]}" if lines else type(error).__name__
+    return reason[:197] + "..." if len(reason) > 200 else reason
+
+
 def _sync_rather_than_restore(archive_bytes: int, rate: float, build_s: float) -> str:
     """The line explaining why a session syncs instead of restoring a cached archive.
 
@@ -243,9 +250,14 @@ class Runtime:
                 if volume.store.backend.moves_on_runtime:
                     self._start_drive_pack(volume, root)
                 else:
-                    volume.cache_env_from(
-                        self, self.env, root, platform=self.platform, build_s=self.env_build_s
-                    )
+                    try:
+                        volume.cache_env_from(
+                            self, self.env, root, platform=self.platform, build_s=self.env_build_s
+                        )
+                    except Exception as error:
+                        # The environment is built and checked, so a failed cache must not
+                        # fail the session. Spec "Materializing into a runtime".
+                        self._say(f"not caching the environment ({_reason_of(error)})")
         self.keep_blobs_on_disk()
         for volume in self.volumes:
             self.attach(volume)
@@ -831,11 +843,7 @@ class Runtime:
             self.eval(source, timeout=3600)
         except Exception as error:
             # The environment is built and checked, so a failed cache must not fail the call.
-            lines = str(error).strip().splitlines()
-            reason = f"{type(error).__name__}: {lines[0]}" if lines else type(error).__name__
-            if len(reason) > 200:
-                reason = reason[:197] + "..."
-            self._say(f"not caching the environment on the workspace root ({reason})")
+            self._say(f"not caching the environment on the workspace root ({_reason_of(error)})")
 
     def _environment_volumes(self) -> tuple[Volume, ...]:
         """Explicit archive volumes, or the automatic cache where the project does not survive.

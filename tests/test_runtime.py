@@ -2982,3 +2982,37 @@ def test_a_small_environment_is_still_packed_and_says_so(
         runtime.shutdown()
     assert volume.cached_env(env, platform)
     assert "caching the environment" in capsys.readouterr().err
+
+
+def test_a_failure_to_cache_the_environment_through_the_client_store_does_not_fail_the_session(
+    uv_project: Path, tmp_path: Path, monkeypatch, capsys
+) -> None:
+    # Spec "Materializing into a runtime": a failed cache at boot is said and the
+    # session goes on, the same as a failed pack on the workspace root.
+    from letify.runtime.session import Runtime
+    from letify.store.volume import Volume
+
+    provider = provider_of(PreparingLocal, "lab", persistent=False)
+    volume = provider.volume(
+        "cache", backend="filesystem", root=str(tmp_path / "store"), mount=str(tmp_path / "mount")
+    )
+    env = Env()
+    instance = Instance(provider, gpu=None)._placed("remote")
+    real = Runtime.install_env
+
+    def slow_build(self: Runtime) -> None:
+        real(self)
+        self.env_build_s = 10_000.0
+
+    def refuse(*args: object, **kwargs: object) -> str:
+        raise RuntimeFailure("lab-1: file blob 9870 arrived with digest d0aa")
+
+    monkeypatch.setattr(Runtime, "install_env", slow_build)
+    monkeypatch.setattr(Volume, "cache_env_from", refuse)
+    runtime = provider.start(instance, env, name="lab-1", volumes=(volume,))
+    try:
+        assert runtime.ready
+    finally:
+        runtime.shutdown()
+    err = capsys.readouterr().err
+    assert "not caching the environment (RuntimeFailure: lab-1: file blob 9870" in err, err

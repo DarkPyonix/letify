@@ -247,11 +247,9 @@ def _release_output():
 
 
 def _digest(payload):
-    try:
-        import blake3
-        return blake3.blake3(payload).hexdigest(length=16)
-    except ImportError:
-        return hashlib.blake2b(payload, digest_size=16).hexdigest()
+    hasher = _data_new_hasher()
+    hasher.update(payload)
+    return _data_finish(hasher)
 
 
 def _resolve(value):
@@ -394,20 +392,22 @@ def _letify_replica(replica):
     _replicas._WHO.rate_bps = replica.get("rate_bps")
 
 
-def _data_hash_file(path):
-    """The file digest of a file on the runtime: blake3 when present, else blake2b."""
-    hasher = _data_hasher()
+def _data_hash_file(path, like=None):
+    """The file digest of a file on the runtime: blake3 when present, else blake2b.
+
+    With ``like``, a digest the file may already be named by, the algorithm that digest
+    names is used when it can be, so the result is comparable with it.
+    """
+    hasher = _data_hasher(like) if like is not None else None
     if hasher is None:
-        hasher = hashlib.blake2b(digest_size=16)
+        hasher = _data_new_hasher()
     with open(path, "rb") as handle:
         while True:
             piece = handle.read(1 << 22)
             if not piece:
                 break
             hasher.update(piece)
-    if hasher.name == "blake2b":
-        return hasher.hexdigest()
-    return hasher.hexdigest(length=16)
+    return _data_finish(hasher)
 
 
 def _data_same_bytes(path, digest):
@@ -418,7 +418,7 @@ def _data_same_bytes(path, digest):
     Never raises; a file that cannot be read is not the file the digest promised.
     """
     try:
-        return _data_hash_file(path) == digest
+        return _data_hash_file(path, digest) == digest
     except OSError:
         return False
 
@@ -453,7 +453,7 @@ def _data_collect(data, placed):
             # The placed record ends with the cache stamp, which is not part of the comparison.
             if known is not None and known[1:4] == (info.st_ino, info.st_size, info.st_mtime_ns):
                 continue
-            digest = _data_hash_file(full)
+            digest = _data_hash_file(full, known[0] if known is not None else None)
             if known is not None and known[0] == digest:
                 continue
             final = _data_file(data["blobs"], digest)
@@ -667,7 +667,14 @@ def _data_file(root, digest):
     return os.path.join(root, digest[:2], digest)
 
 
-def _data_hasher():
+def _data_hasher(digest):
+    """A hasher of the algorithm ``digest`` names, or None where it cannot be computed here.
+
+    A digest with the ``b2-`` prefix is blake2b and one without is blake3, so a runtime
+    without blake3 cannot check a blake3 digest and trusts the sender.
+    """
+    if digest.startswith("b2-"):
+        return hashlib.blake2b(digest_size=16)
     try:
         import blake3
     except ImportError:
@@ -675,10 +682,23 @@ def _data_hasher():
     return blake3.blake3(max_threads=blake3.blake3.AUTO)
 
 
+def _data_new_hasher():
+    """The hasher this runtime names new content with: blake3 when present, else blake2b."""
+    hasher = _data_hasher("")
+    return hasher if hasher is not None else hashlib.blake2b(digest_size=16)
+
+
+def _data_finish(hasher):
+    """The digest a hasher has accumulated, with the prefix a blake2b digest carries."""
+    if hasher.name == "blake2b":
+        return "b2-" + hasher.hexdigest()
+    return hasher.hexdigest(length=16)
+
+
 def _data_commit(partial, final, digest, hasher):
     """Rename a received file into the cache once its digest matches, read-only."""
     if hasher is not None:
-        found = hasher.hexdigest(length=16)
+        found = _data_finish(hasher)
         if found != digest:
             os.remove(partial)
             raise ValueError("file blob %s arrived with digest %s" % (digest, found))
@@ -838,7 +858,7 @@ def _op_data_put(request):
         stale = _DATA_OPEN.pop(digest, None)
         if stale is not None:
             stale[0].close()
-        _DATA_OPEN[digest] = (open(partial, "wb"), _data_hasher())
+        _DATA_OPEN[digest] = (open(partial, "wb"), _data_hasher(digest))
     handle, hasher = _DATA_OPEN[digest]
     handle.write(chunk)
     if hasher is not None:
@@ -938,7 +958,7 @@ def _op_data_seal(request):
         raise ValueError(
             "file blob %s is short: %d of %d bytes arrived" % (digest, found, int(size))
         )
-    hasher = _data_hasher()
+    hasher = _data_hasher(digest)
     if hasher is not None:
         with open(partial, "rb") as handle:
             while True:
@@ -946,7 +966,7 @@ def _op_data_seal(request):
                 if not piece:
                     break
                 hasher.update(piece)
-        got = hasher.hexdigest(length=16)
+        got = _data_finish(hasher)
         if got != digest:
             os.remove(partial)
             raise ValueError("file blob %s arrived with digest %s" % (digest, got))
@@ -979,7 +999,7 @@ def _op_data_pull(request):
             partial = "%s.partial.%d.%d" % (final, os.getpid(), threading.get_ident())
             try:
                 os.makedirs(os.path.dirname(final), exist_ok=True)
-                hasher = _data_hasher()
+                hasher = _data_hasher(digest)
                 wanted = urllib.request.Request(url, headers=headers)
                 with urllib.request.urlopen(wanted, timeout=3600) as response, \
                         open(partial, "wb") as out:
@@ -2334,16 +2354,14 @@ def _op_pack_blob(request):
     directory = os.path.expanduser(request["dir"])
     os.makedirs(directory, exist_ok=True)
     partial = os.path.join(directory, ".pack.%d.partial" % os.getpid())
-    hasher = _data_hasher()
-    if hasher is None:
-        hasher = hashlib.blake2b(digest_size=16)
+    hasher = _data_new_hasher()
     try:
         with open(partial, "wb") as handle:
             hashed = _HashedFile(handle, hasher)
             mode = "w:gz" if request.get("gzip", True) else "w"
             with tarfile.open(fileobj=hashed, mode=mode) as archive:
                 archive.add(root, arcname=os.path.basename(root.rstrip("/")), recursive=True)
-        digest = hasher.hexdigest() if hasher.name == "blake2b" else hasher.hexdigest(length=16)
+        digest = _data_finish(hasher)
         final = _data_file(directory, digest)
         os.makedirs(os.path.dirname(final), exist_ok=True)
         os.replace(partial, final)

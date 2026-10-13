@@ -60,8 +60,10 @@ def test_content_addressing_falls_back_to_the_standard_library(no_module) -> Non
     # blake3 is preferred for speed, but it is a wheel, so blake2b has to carry the same
     # guarantee when it is absent.
     no_module("blake3")
+    # Its digests carry the b2- prefix, so a side with blake3 does not mistake them for its own.
     digest = codec.digest_of(b"same contents")
-    assert len(digest) == 32
+    assert digest.startswith("b2-")
+    assert len(digest) == 35
     assert digest == codec.digest_of(b"same contents")
 
 

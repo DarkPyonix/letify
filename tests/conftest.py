@@ -124,6 +124,23 @@ class PreparingLocal(Local):
     remote_env = True
 
 
+class NoBlake3Local(Local):
+    """A local provider whose worker cannot import blake3, like a runtime venv without letify.
+
+    The worker is the real one behind the real framed protocol. Hiding the module before
+    the bootstrap runs makes it hash with blake2b, which the client then has to follow.
+    """
+
+    def open_channel(self, runtime: Any) -> Any:
+        from letify.protocol.worker import BOOTSTRAP
+        from letify.runtime.channel import PersistentChannel
+
+        hide = "import sys; sys.modules['blake3'] = None\n"
+        return PersistentChannel(
+            [sys.executable, "-u", "-c", hide + BOOTSTRAP], name=runtime.name
+        )
+
+
 @pytest.fixture
 def uv_project(tmp_path: Path, monkeypatch) -> Path:
     """A tiny uv project that depends on this checkout of letify, locked with the real uv.
