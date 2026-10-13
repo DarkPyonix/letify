@@ -847,7 +847,20 @@ While the channel waits for `HELLO` each read waits at most 30 s, and a lane rea
 
 Socket buffers are left to the kernel. `SO_SNDBUF` and `SO_RCVBUF` are never set, because setting them turns off the kernel's buffer tuning and the value is capped at `net.core.wmem_max`, 212 KiB by default.
 
-When any step fails, a `tunnel` failure, a connection that does not open, or no `HELLO` within 30 s, the channel prints one line on stderr, `letify: <runtime>: the data channel did not open (<reason>); frames stay on standard input and output`, and keeps using standard input and output. The worker returns to reading standard input when a byte arrives there or its `wait` ends without an authenticated connection, so a request the channel sends over standard input after a failure is answered without waiting for `wait`.
+The tunnel's host name is new when the sandbox is, so a resolver that is asked for it too early can
+answer that it does not exist and keep that answer cached. Resolution is therefore retried for
+`DATA_OPEN_WINDOW`, 30 s, every 3 s, before the channel gives up. Measured on a host where
+`github.com` always resolved and a freshly created tunnel name did not, three sessions in a row fell
+back, and 7.6 GB then went over standard input and output, where one piece held the control path long
+enough for the lease renewal to miss its 60 s timeout and the worker pipe closed. Mornings on the
+same host reached 45 to 90 MiB/s on the same path, so the fallback was the whole difference.
+
+When the window ends without a connection, or a `tunnel` request fails, or no `HELLO` arrives within
+30 s, the channel prints one line on stderr, `letify: <runtime>: the data channel did not open
+(<reason>, host <name>); frames stay on standard input and output, which the control path shares, so
+a large transfer there can starve the lease`, and keeps using standard input and output. The host name
+is named so a reader can resolve it themselves. The channel tries again on the next call rather than
+staying that way, because the name may simply have been too new. The worker returns to reading standard input when a byte arrives there or its `wait` ends without an authenticated connection, so a request the channel sends over standard input after a failure is answered without waiting for `wait`.
 
 A `reexec` request goes over the data connection. The worker replies there and replaces its process, which closes the connection. The channel then sends the worker source over standard input, waits for `HELLO` there, and opens the data channel again.
 
