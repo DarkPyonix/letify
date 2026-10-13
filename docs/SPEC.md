@@ -1137,7 +1137,7 @@ The follow-up design stores each model shard as one content addressed blob and p
 
 ### Volumes on a persistent runtime <!-- id: persistent-volumes -->
 
-> On a persistent provider the volume directory under the workspace root is the runtime's copy of the volume. A file is sent only when that copy does not already hold its digest, and no environment archive is packed or restored.
+> On a persistent provider the volume directory under the workspace root is the runtime's copy of the volume. A file is sent only when that copy does not already hold its digest, and no environment archive is packed or restored, except on the workspace root as below.
 
 A persistent runtime keeps `<workspace root>/volumes/<volume name>` between sessions, so a later session already holds what an earlier one received. The volume directory holds a manifest, `.letify-manifest.json`, mapping each materialized destination path to the digest, size in bytes and modification time in nanoseconds it had when it was written.
 
@@ -1145,7 +1145,27 @@ Before a blob is written to a destination that is not unpacked, the local proces
 
 A persistent provider builds its environment with `uv sync` in `<workspace root>/project/<env key>` every session, and never packs the project directory into a volume or unpacks an archive from one. A sync over an existing `.venv` checks it and installs nothing, so it is faster than any archive transfer, and the `.venv` is already on the disk the archive would be unpacked to.
 
-That holds only while the project directory is under the workspace root. A provider that keeps its workspace root and still builds the `.venv` elsewhere archives like an ephemeral one, because the directory the sync writes does not survive the session however durable the workspace root is. Modal is that provider: its workspace root is a Modal volume and its `env_root` is the sandbox's own disk, chosen because a cold import from the volume reads thousands of small files over the network. Without this, Modal rebuilt 230 packages on every session, measured at 428 s and 534 s on an A10, and had neither the persistence its workspace root offers nor the archive an ephemeral provider gets. Whether the archive is then worth packing is the measurement Materializing into a runtime already makes.
+That holds only while the project directory is under the workspace root. A provider that keeps its workspace root and builds the `.venv` elsewhere keeps the environment archive on that workspace root, not in a store and never through the client. Modal is that provider: its workspace root is a Modal volume that outlives every sandbox, and its `env_root` is the sandbox's own disk, chosen because a cold import from the volume reads thousands of small files over the network.
+
+The archive is `<workspace root>/env-archives/<env key>-<platform>.tar`, uncompressed. Measured on a Modal T4 with a 5.5 GB project directory of 33 packages including torch:
+
+| Step | Time |
+|---|---|
+| `uv sync` build | 216 s |
+| pack through the client's filesystem store | about 700 s |
+| restore through the client's filesystem store | 727 s |
+| `tar -cf` to the volume, uncompressed | 70.8 s |
+| `tar -xf` from the volume, uncompressed | 31.9 s |
+| `tar.gz` to the volume | 240.1 s, gzip is CPU bound |
+| `tar.gz` from the volume | 39.8 s, 3.0 GB |
+
+The client's inbound link is the weak one, so the store path is slower than the build in both directions. Compression costs more than it saves on the volume, so the archive is not compressed.
+
+After a successful sync and interpreter check, the runtime says `caching the environment on the workspace root, <size>`, runs tar from the project directory's parent into a temporary name beside the destination, and renames it into place, so a concurrent session never reads a half written archive. Nothing is sent to the client, and no measured rate gates the pack, because the transfer stays inside the provider.
+
+At the start of `install_env`, when that archive exists on the runtime, the runtime says `restoring the environment from the workspace root`, extracts it into the project directory's parent, and validates the interpreter with the same check an archive restore uses. The restore refuses a member whose path escapes the destination and allows the absolute symlinks a `.venv` needs. A directory an earlier session left under the same name is removed first. When validation fails, the runtime removes the extracted tree, syncs, and replaces the archive. `Runtime.env_source` is `"workspace"` after this restore. This path is taken before and instead of the store path, and such a provider never uses the client store or the bucket store for its environment.
+
+A session sees the archive only once the volume shows it, which is not at once on Modal: a session started right after the one that packed rebuilt and packed again, and a session started a few minutes later restored and its whole call took 44.2 s, against 106.6 s and 183.8 s for the two that built. The rebuild that follows such a miss is not wasted work so much as repeated work, and it leaves the same archive behind.
 
 An ephemeral provider keeps the behaviour of Materializing into a runtime: every file is sent each session, and the environment archive is packed and restored.
 

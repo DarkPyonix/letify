@@ -109,7 +109,8 @@ class Runtime:
     #: How long this session lives, from the declaration that started it.
     lease: Lease | None = field(default=None, repr=False)
 
-    #: How the environment was built: ``"sync"``, ``"archive"``, or None where it was not.
+    #: How the environment was built: ``"sync"``, ``"archive"`` (restored from a store),
+    #: ``"workspace"`` (restored from the workspace root), or None where it was not.
     env_source: str | None = None
 
     #: Seconds the sync took, when ``env_source`` is ``"sync"``. Spec "Materializing into
@@ -182,7 +183,9 @@ class Runtime:
             raise
         # The same rule as _environment_volumes: a project directory that does not
         # survive the session is worth archiving whatever the provider calls itself.
-        if self.env_source == "sync" and not (
+        if self.env_source == "sync" and self._archives_on_workspace():
+            self._pack_on_workspace()
+        elif self.env_source == "sync" and not (
             self.provider.persistent and self._project_survives()
         ):
             from . import bootstrap
@@ -724,6 +727,35 @@ class Runtime:
 
         self.workspace = self.eval(bootstrap.workspace_source(root), timeout=120)
 
+    def _archives_on_workspace(self) -> bool:
+        """Whether the environment archive lives on the runtime's own workspace root.
+
+        Spec "Volumes on a persistent runtime": true for a provider whose workspace root
+        persists and whose project directory lies outside it.
+        """
+        return bool(
+            self.provider.remote_env and self.provider.persistent and not self._project_survives()
+        )
+
+    def _workspace_archive(self) -> str:
+        """The archive path on the workspace root for this environment and platform."""
+        workspace = (self.workspace or self.provider.workspace_root).rstrip("/")
+        return f"{workspace}/env-archives/{self.env.key}-{self.platform}.tar"
+
+    def _pack_on_workspace(self) -> None:
+        """Tar the project directory onto the workspace root; nothing goes to the client."""
+        from . import bootstrap
+
+        root = bootstrap.project_dir(
+            self.provider.env_root or self.workspace or self.provider.workspace_root, self.env
+        )
+        size = self._tree_size(root)
+        self._say(
+            "caching the environment on the workspace root"
+            + (f", {size / 1_000_000_000:.1f} GB" if size else "")
+        )
+        self.eval(bootstrap.workspace_pack_source(root, self._workspace_archive()), timeout=3600)
+
     def _environment_volumes(self) -> tuple[Volume, ...]:
         """Explicit archive volumes, or the automatic cache where the project does not survive.
 
@@ -734,6 +766,9 @@ class Runtime:
         the session however durable the root is.
         """
         if self.provider.persistent and self._project_survives():
+            return ()
+        if self._archives_on_workspace():
+            # Spec "Volumes on a persistent runtime": the archive is on the workspace root.
             return ()
         if self.volumes:
             return self.volumes
@@ -846,8 +881,30 @@ class Runtime:
         where = self.eval(bootstrap.probe_source(self.env, root), timeout=120)
         self.platform = where["platform"]
 
-        # Spec "Volumes on a persistent runtime": the .venv is already on the runtime's
-        # disk, so an archive is neither restored nor packed there.
+        # Spec "Volumes on a persistent runtime": a provider whose workspace root persists
+        # and whose project directory does not keeps the archive on the workspace root, and
+        # one whose project directory survives needs no archive at all.
+        on_workspace = self._archives_on_workspace()
+        found = f"os.path.isfile(os.path.expanduser({self._workspace_archive()!r}))"
+        archive_here = on_workspace and self.eval(
+            f"import os\n__letify_value__ = {found}\n", timeout=120
+        )
+        if archive_here:
+            self._say("restoring the environment from the workspace root")
+            self.eval(
+                bootstrap.workspace_restore_source(self._workspace_archive(), where["parent"]),
+                timeout=3600,
+            )
+            if self.eval(bootstrap.venv_check_source(where["python"]), timeout=600):
+                self.env_source = "workspace"
+            else:
+                self._say("the restored environment failed its interpreter check, syncing")
+                self.eval(
+                    "import os, shutil\n"
+                    f"shutil.rmtree(os.path.expanduser({root!r}), ignore_errors=True)\n",
+                    timeout=600,
+                )
+
         archives = self._environment_volumes()
         for volume in archives:
             digest = volume.cached_env(self.env, self.platform)
@@ -878,14 +935,14 @@ class Runtime:
                 self.env_source = "archive"
                 break
 
-        if self.env_source != "archive":
+        if self.env_source not in ("archive", "workspace"):
             workspace = self.workspace or self.provider.workspace_root
             # Spec "Remote paths letify writes": uv's cache, its managed Pythons, its tool
             # installs and its own binary stay under the workspace root regardless of an
             # env root or whether the provider is persistent or ephemeral.
             source = bootstrap.sync_source(
                 self.env, files, root=root, name=self.name, workspace=workspace,
-                archive=bool(archives),
+                archive=bool(archives) or on_workspace,
             )
             # Spec "Environment": the longest step of a first session, and uv's own output
             # is captured rather than streamed, so it says it is happening.
