@@ -2706,6 +2706,81 @@ def test_a_persistent_provider_that_builds_its_venv_elsewhere_archives_on_its_wo
     assert "caching the environment on the workspace root" in err, err
 
 
+def test_the_workspace_pack_names_its_temporary_file_without_the_process_id(
+    tmp_path: Path, monkeypatch
+) -> None:
+    # Spec "Volumes on a persistent runtime": every Modal sandbox runs its worker under the
+    # same small pid, so the temporary name carries 16 random hex digits instead.
+    import re
+    import subprocess
+
+    project = tmp_path / "proj"
+    project.mkdir()
+    (project / "a.txt").write_text("a")
+    archive = tmp_path / "vol" / "env.tar"
+    seen: list[str] = []
+    real = subprocess.run
+
+    def record(cmd, *args, **kwargs):
+        seen.append(cmd[2])
+        return real(cmd, *args, **kwargs)
+
+    monkeypatch.setattr(subprocess, "run", record)
+    source = bootstrap.workspace_pack_source(str(project), str(archive))
+    for _ in range(2):
+        exec(source, {})
+    assert len(seen) == 2 and seen[0] != seen[1]
+    for name in seen:
+        assert re.fullmatch(re.escape(str(archive)) + r"\.[0-9a-f]{16}\.partial", name), name
+    assert archive.is_file()
+    assert not list(archive.parent.glob("*.partial"))
+
+
+def test_a_pack_that_fails_removes_its_temporary_file(tmp_path: Path) -> None:
+    # Spec "Volumes on a persistent runtime": a failed pack leaves no partial behind.
+    project = tmp_path / "proj"
+    project.mkdir()
+    archive = tmp_path / "vol" / "env.tar"
+    source = bootstrap.workspace_pack_source(str(project), str(archive)).replace(
+        "['tar', '-cf', _partial,", "['sh', '-c', 'echo x > \"$0\"; exit 2', _partial,"
+    )
+    with pytest.raises(subprocess.CalledProcessError):
+        exec(source, {})
+    assert not list(archive.parent.glob("*.partial")), "a temporary archive was left behind"
+    assert not archive.exists()
+
+
+def test_a_failed_workspace_pack_does_not_fail_the_session(
+    uv_project: Path, tmp_path: Path, monkeypatch, capsys
+) -> None:
+    # Spec "Volumes on a persistent runtime": the environment is already built, so a failed
+    # cache is said and the session goes on.
+    provider, volume = _elsewhere_provider(tmp_path)
+    env = Env()
+    real = bootstrap.workspace_pack_source
+
+    def failing(root: str, archive: str) -> str:
+        return real(root, archive).replace(
+            "['tar', '-cf', _partial,", "['sh', '-c', 'echo x > \"$0\"; exit 2', _partial,"
+        )
+
+    monkeypatch.setattr(bootstrap, "workspace_pack_source", failing)
+    instance = Instance(provider, gpu=None)._placed("remote")
+    runtime = provider.start(instance, env, name="lab-1", volumes=(volume,))
+    try:
+        assert runtime.env_source == "sync"
+        assert runtime.eval("__letify_value__ = 6 * 7") == 42
+        archive = _workspace_archive(env, runtime.platform)
+    finally:
+        runtime.shutdown()
+    err = capsys.readouterr().err
+    assert (
+        "not caching the environment on the workspace root (RemoteError: CalledProcessError" in err
+    ), err
+    assert not archive.exists()
+    assert not list(archive.parent.glob("*.partial"))
+
+
 def test_a_second_session_restores_the_environment_from_the_workspace_root(
     uv_project: Path, tmp_path: Path, monkeypatch, capsys
 ) -> None:

@@ -826,7 +826,16 @@ class Runtime:
             "caching the environment on the workspace root"
             + (f", {size / 1_000_000_000:.1f} GB" if size else "")
         )
-        self.eval(bootstrap.workspace_pack_source(root, self._workspace_archive()), timeout=3600)
+        source = bootstrap.workspace_pack_source(root, self._workspace_archive())
+        try:
+            self.eval(source, timeout=3600)
+        except Exception as error:
+            # The environment is built and checked, so a failed cache must not fail the call.
+            lines = str(error).strip().splitlines()
+            reason = f"{type(error).__name__}: {lines[0]}" if lines else type(error).__name__
+            if len(reason) > 200:
+                reason = reason[:197] + "..."
+            self._say(f"not caching the environment on the workspace root ({reason})")
 
     def _environment_volumes(self) -> tuple[Volume, ...]:
         """Explicit archive volumes, or the automatic cache where the project does not survive.

@@ -281,13 +281,15 @@ def workspace_pack_source(root: str, archive: str) -> str:
     Spec "Volumes on a persistent runtime": runs ``tar`` from the directory's parent into a
     temporary name and renames it into place, so a concurrent session never reads a half
     written archive. Uncompressed, because gzip costs more than it saves on a local volume.
+    The temporary name carries random hex, not the process id, because every Modal sandbox
+    runs its worker under the same pid. A failed pack removes its temporary file.
     """
     return (
-        "import os, subprocess\n"
+        "import os, secrets, subprocess\n"
         f"_root = os.path.expanduser({root!r}).rstrip('/')\n"
         f"_archive = os.path.expanduser({archive!r})\n"
         "os.makedirs(os.path.dirname(_archive), exist_ok=True)\n"
-        "_partial = _archive + '.' + str(os.getpid()) + '.partial'\n"
+        "_partial = _archive + '.' + secrets.token_hex(8) + '.partial'\n"
         "try:\n"
         "    subprocess.run(['tar', '-cf', _partial, '-C', os.path.dirname(_root),\n"
         "                    os.path.basename(_root)], check=True, capture_output=True)\n"
