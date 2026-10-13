@@ -24,7 +24,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from .. import protocol
-from .cas import BlobInfo, Store
+from .cas import Store
 
 if TYPE_CHECKING:
     from ..declare.env import Env
@@ -236,21 +236,28 @@ class Volume:
         """
         runtime = _session(target)
         scratch = self.store.scratch_path() if self.store.streams else None
-        if self.store.backend.moves_on_runtime:
-            # The runtime uploads the archive itself, so it never crosses this process.
-            digest, size = runtime.pack_dir_to_store(path, self.store.backend)
-            info = BlobInfo(digest, size)
-        elif scratch is not None and runtime.persistent_channel:
+        if scratch is not None and runtime.persistent_channel:
             # Streamed: the archive lands in a file beside the store and is renamed in.
             digest, _size = runtime.pack_dir_to_file(path, scratch)
             info = self.store.adopt_file(scratch, digest)
         else:
             payload, _digest = runtime.pack_dir(path)
             info = self.store.put_bytes(payload)
-        self.store.point(self.env_ref(env, platform), info.digest)
-        if build_s is not None:
-            self.store.point(self.build_ref(env, platform), f"{build_s:.1f} {info.size}")
+        self.record_env(env, platform, info.digest, info.size, build_s=build_s)
         return info.digest
+
+    def record_env(
+        self, env: Env, platform: str | None, digest: str, size: int, *,
+        build_s: float | None = None,
+    ) -> None:
+        """Point the env ref at a stored archive and write the build record beside it.
+
+        A Drive archive is uploaded by the runtime in the background, so its ref is written
+        by the session that saw the upload finish, not by the pack that started it.
+        """
+        self.store.point(self.env_ref(env, platform), digest)
+        if build_s is not None:
+            self.store.point(self.build_ref(env, platform), f"{build_s:.1f} {size}")
 
     def build_ref(self, env: Env, platform: str | None = None) -> str:
         """The ref recording the build seconds and archive size beside the env ref."""

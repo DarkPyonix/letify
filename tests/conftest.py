@@ -1071,6 +1071,8 @@ class FakeDriveServer:
         self.requests: list[dict[str, Any]] = []
         self.refresh_grants: list[dict[str, str]] = []
         self.fail_with: int | None = None
+        #: When set, a piece of a resumable upload waits for this event before it is taken.
+        self.hold_uploads: threading.Event | None = None
         self._count = 0
         owner = self
 
@@ -1203,6 +1205,8 @@ class FakeDriveServer:
 
         session_prefix = "/upload/session/"
         if parsed.path.startswith(session_prefix) and method == "PUT":
+            if self.hold_uploads is not None:
+                self.hold_uploads.wait(timeout=20)
             session = self.sessions[parsed.path[len(session_prefix) :]]
             start = int(headers["content-range"].split(" ")[1].split("-")[0])
             if start != len(session["body"]):
