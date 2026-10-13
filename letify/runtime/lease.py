@@ -17,6 +17,7 @@ import threading
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
+    from ..providers.base import RuntimeState
     from .session import Runtime
 
 #: How often this process pushes the deadline forward.
@@ -56,6 +57,15 @@ class Lease:
             if not self._renew():
                 return
 
+    def _ask_provider(self) -> RuntimeState:
+        """What the provider says about the runtime. Any failure to ask answers unknown."""
+        from ..providers.base import RuntimeState
+
+        try:
+            return self.runtime.provider.runtime_state(self.runtime)
+        except Exception:
+            return RuntimeState()
+
     def _renew(self) -> bool:
         from ..errors import LetifyError, RuntimeLost
 
@@ -65,6 +75,13 @@ class Lease:
             # The session is gone. The pool notices on its next call.
             return False
         except LetifyError as exc:
+            state = self._ask_provider()
+            if state.status == "ended":
+                # The runtime is gone and a call waiting on it would wait for a reply that
+                # cannot come, so it is told why and the renewer stops.
+                self._stop.set()
+                self.runtime.lose(state.detail)
+                return False
             # A round trip that merely timed out, such as a renewal reply delayed behind
             # a large transfer, is not the session going away. Giving up here would let
             # one slow cycle stop the renewer for good, so this logs and tries again on

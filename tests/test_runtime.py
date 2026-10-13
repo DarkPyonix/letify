@@ -1639,6 +1639,92 @@ def test_a_lease_survives_a_transient_renewal_failure(renewal_recorder) -> None:
     assert renewal_recorder.renewals[0] == 90.0
 
 
+def test_a_lease_timeout_on_a_runtime_its_provider_says_ended_loses_the_runtime(
+    renewal_recorder,
+) -> None:
+    # Spec "Lifetime", the lease: an ended runtime turns the failure into RuntimeLost.
+    from letify.providers.base import RuntimeState
+
+    renewal_recorder.transient_for = 99
+    renewal_recorder.provider.state = RuntimeState(
+        "ended", "the Modal sandbox ended (exit code 3) while the call was running"
+    )
+    lease = Lease(renewal_recorder, interval=0.02, grace=90.0)
+    assert lease._renew() is False
+    assert renewal_recorder.lost == [
+        "the Modal sandbox ended (exit code 3) while the call was running"
+    ]
+
+
+def test_a_lease_timeout_with_the_runtime_state_unknown_keeps_retrying(renewal_recorder) -> None:
+    renewal_recorder.transient_for = 3
+    lease = Lease(renewal_recorder, interval=0.02, grace=90.0)
+    lease.arm()
+    try:
+        deadline = time.monotonic() + 5
+        while len(renewal_recorder.renewals) < 2 and time.monotonic() < deadline:
+            time.sleep(0.01)
+    finally:
+        lease.release()
+    assert renewal_recorder.provider.asked >= 1
+    assert renewal_recorder.lost == []
+    assert len(renewal_recorder.renewals) >= 2
+
+
+def test_a_lease_timeout_on_a_running_runtime_keeps_retrying(renewal_recorder) -> None:
+    from letify.providers.base import RuntimeState
+
+    renewal_recorder.provider.state = RuntimeState("running")
+    renewal_recorder.transient_for = 1
+    lease = Lease(renewal_recorder, interval=0.02, grace=90.0)
+    assert lease._renew() is True
+    assert renewal_recorder.lost == []
+
+
+def test_a_runtime_lost_by_its_lease_ends_the_waiting_call_with_that_message(channel) -> None:
+    # The data connection of an ended sandbox can stay open with no end-of-stream, so the
+    # reader blocks. Declaring the channel lost has to wake it with the stated reason.
+    from letify.errors import RuntimeLost
+
+    channel.start()
+    outcome: list[BaseException] = []
+
+    def call() -> None:
+        try:
+            channel.call(time.sleep, (600,), {})
+        except BaseException as exc:
+            outcome.append(exc)
+
+    thread = threading.Thread(target=call, daemon=True)
+    thread.start()
+    time.sleep(1)
+    channel.declare_lost("the sandbox ended (exit code 7) while the call was running")
+    thread.join(timeout=30)
+    assert not thread.is_alive()
+    [error] = outcome
+    assert isinstance(error, RuntimeLost)
+    assert "the sandbox ended (exit code 7) while the call was running" in str(error)
+
+
+def test_a_runtime_lost_by_its_lease_is_discarded_once_with_reason_runtime_ended(
+    let, remote_cpu, live
+) -> None:
+    runtime = live(let, remote_cpu)
+    reasons: list[str] = []
+    real = runtime.shutdown
+
+    def record(*, reason: str = "explicit_shutdown") -> None:
+        reasons.append(reason)
+        real(reason=reason)
+
+    runtime.shutdown = record  # type: ignore[method-assign]
+    pool = let.pool
+    runtime._pool = pool
+    runtime.lose("the sandbox ended (exit code 1) while the call was running")
+    assert reasons == ["runtime_ended"]
+    assert runtime not in pool.live
+
+
 # -- Spec: Pooling -------------------------------------------------------------
 
 

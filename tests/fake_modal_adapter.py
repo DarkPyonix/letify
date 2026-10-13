@@ -142,6 +142,11 @@ def handle(request: dict, sandboxes: dict[str, Sandbox]) -> object:
         except ProcessLookupError:
             pass
         return None
+    if op == "poll":
+        if request["sandbox"] not in known_sandboxes():
+            raise KeyError(f"no sandbox {request['sandbox']!r}")
+        ended = STATE / f"ended-{request['sandbox']}"
+        return int(ended.read_text(encoding="utf-8")) if ended.is_file() else None
     if op == "volume_put":
         target = volume_file(request["volume"], request["path"])
         target.parent.mkdir(parents=True, exist_ok=True)
@@ -178,7 +183,7 @@ def main() -> None:
     for line in sys.stdin:
         request = json.loads(line)
         with (STATE / "requests.jsonl").open("a", encoding="utf-8") as log:
-            log.write(json.dumps(request) + "\n")
+            log.write(json.dumps({**request, "pid": os.getpid()}) + "\n")
         op = request.get("op")
         if op in EXIT:
             sys.stderr.write(f"the fake adapter crashed on {op}\n")

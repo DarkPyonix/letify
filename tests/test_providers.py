@@ -1255,10 +1255,16 @@ class _Sandbox:
     stdout = ()
     def terminate(self):
         _log("terminate")
+    def poll(self):
+        _log("poll")
+        return int(os.environ["STUB_MODAL_EXIT"]) if "STUB_MODAL_EXIT" in os.environ else None
     def tunnels(self, timeout=50):
         return {8765: _Tunnel()}
 
 class Sandbox:
+    @staticmethod
+    def from_id(sandbox_id):
+        return _Sandbox()
     @staticmethod
     def create(*args, app=None, **kwargs):
         _log("create", app.name, list(kwargs.get("encrypted_ports") or []))
@@ -2208,6 +2214,73 @@ def test_a_request_on_an_adapter_out_of_step_fails_without_waiting(
         provider.adapter().request("hello")
     assert time.monotonic() - started < 5
     provider.stop(runtime)
+
+
+def test_the_modal_adapter_poll_answers_the_exit_code_or_null(tmp_path: Path) -> None:
+    # Spec "Modal adapter", op poll: null while the sandbox runs, its exit code once it ended.
+    import os
+    import sys
+
+    site = tmp_path / "site" / "modal"
+    site.mkdir(parents=True)
+    (site / "__init__.py").write_text(STUB_MODAL, encoding="utf-8")
+    script = Path(modal_module.__file__).with_name("modal_adapter.py")
+    base = {
+        **os.environ,
+        "PYTHONPATH": str(tmp_path / "site"),
+        "STUB_MODAL_LOG": str(tmp_path / "modal.log"),
+    }
+    answers = []
+    for exit_code in (None, "137"):
+        env = dict(base)
+        env.pop("STUB_MODAL_EXIT", None)
+        if exit_code is not None:
+            env["STUB_MODAL_EXIT"] = exit_code
+        adapter = Adapter([sys.executable, "-P", str(script)], env=env, name="m")
+        try:
+            answers.append(adapter.request("poll", sandbox="sb-elsewhere"))
+        finally:
+            adapter.close()
+    assert answers == [None, 137]
+
+
+def test_modal_asks_a_second_adapter_whether_a_sandbox_ended(isolated_home, fake_modal) -> None:
+    provider = provider_of(Modal, "m")
+    runtime = modal_runtime(provider)
+    provider.open_channel(runtime)
+    try:
+        blocked = provider.adapter()
+        # The adapter carrying the call may be stuck in a request, so it must not be asked.
+        with blocked._lock:
+            running = provider.runtime_state(runtime)
+            fake_modal.end_sandbox("sb-1", 9)
+            ended = provider.runtime_state(runtime)
+        [create] = fake_modal.requests("create")
+        polls = fake_modal.requests("poll")
+        assert running.status == "running"
+        assert ended.status == "ended"
+        assert ended.detail == "the Modal sandbox ended (exit code 9) while the call was running"
+        assert len(polls) == 2
+        assert all(poll["pid"] != create["pid"] for poll in polls)
+    finally:
+        provider.stop(runtime)
+
+
+def test_a_failing_modal_poll_answers_unknown(isolated_home, fake_modal) -> None:
+    provider = provider_of(Modal, "m")
+    runtime = modal_runtime(provider)
+    provider.open_channel(runtime)
+    try:
+        fake_modal.fail("poll")
+        assert provider.runtime_state(runtime).status == "unknown"
+    finally:
+        provider.stop(runtime)
+
+
+def test_a_provider_that_cannot_tell_answers_unknown() -> None:
+    from letify.providers.local import Local
+
+    assert provider_of(Local, "x").runtime_state(object()).status == "unknown"
 
 
 def test_a_modal_sandbox_is_created_with_a_lifetime_and_an_idle_limit(
