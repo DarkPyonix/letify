@@ -140,7 +140,9 @@ def _executable(tool: str) -> str:
 
 
 def tools_home() -> Path:
-    return Path.home() / ".letify" / "tools"
+    from .paths import tools_directory
+
+    return tools_directory()
 
 
 def cache_path(tool: str) -> Path:
@@ -165,7 +167,9 @@ def auto_install_enabled() -> bool:
     value = os.environ.get("LETIFY_AUTO_INSTALL")
     if value is not None:
         return value.strip().lower() not in ("0", "false", "no")
-    home_file = Path.home() / ".letify" / "config.toml"
+    from .paths import config_path
+
+    home_file = config_path()
     try:
         settings = tomllib.loads(home_file.read_text(encoding="utf-8"))
     except (OSError, tomllib.TOMLDecodeError):

@@ -28,7 +28,9 @@ ACCOUNTS_DIRECTORY = "accounts"
 
 def account_directory(alias: str) -> Path:
     """``~/.letify/accounts/<alias>/``, whether or not it exists yet."""
-    return Path.home() / CONFIG_DIRECTORY / ACCOUNTS_DIRECTORY / alias
+    from ..paths import account_directory as declared
+
+    return declared(alias)
 
 
 def resolve_secret(

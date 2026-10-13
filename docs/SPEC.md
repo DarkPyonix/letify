@@ -1989,25 +1989,27 @@ The worker's working directory is the root, so a relative path in user code reso
 
 ### Declared filesystem paths <!-- id: declared-paths -->
 
-> letify writes exclusively to declared directories: locally under ~/.letify, and on runtimes within the designated workspace root, with explicit documented exceptions for system SSH and daemon runtime directories.
+> letify writes exclusively to declared directories: locally under `~/.letify` or the directory `LETIFY_HOME` names, and on runtimes within the designated workspace root, with explicit documented exceptions for system SSH and daemon runtime directories.
 
 Every path letify creates or writes is declared here. The system temporary directory (/tmp, /var/tmp, or tempfile.gettempdir()) is never used, locally or on a runtime.
 
 #### Local machine
 
-Local filesystem modifications are consolidated under the single root `~/.letify`. The declared local paths are:
+Local filesystem modifications are consolidated under the single root `~/.letify`. The declared local paths are listed below, written relative to `~/.letify`:
+
+`LETIFY_HOME`, when set and non-empty, replaces `~/.letify` as the root of every local path in the table below, and `~` in it is expanded. A relative value raises `ConfigError` naming the value and saying it must be absolute, because a root that moves with the working directory would split one machine's state across directories. Unset or empty means `~/.letify`. `LETIFY_CONFIG` moves only the config file and wins over `LETIFY_HOME` for that file. The fallbacks that read `~/.cache/letify/...` apply only when `LETIFY_HOME` is unset, because a moved root is a separate letify state and does not read the default one's caches. With both `LETIFY_HOME` and `XDG_RUNTIME_DIR` set, the SSH control directory is `$XDG_RUNTIME_DIR/letify-<h>`, where `<h>` is the first 8 hex characters of the SHA-256 of the resolved root, so two roots on one machine never share multiplexed connections and the socket path stays short. The Local provider workspace follows the root. Messages that tell a person which file to edit name the path in use.
 
 | Path | Purpose | Movable by |
 |---|---|---|
-| `~/.letify/config.toml` | Machine configuration declaring accounts and global providers | `LETIFY_CONFIG` environment variable or project `.letify/config.toml` |
-| `~/.letify/accounts/<alias>/` | Account credentials and secrets (mode 0700 directory, mode 0600 files). Holds secret files only: `token.json`, `modal.toml`, `eci.yaml`, `cookie`, `access_token`, `username`, `notebook_id`, `known_hosts`, `link.json`, `password`. Never contains CLI cache directories or python packages | not movable |
-| `~/.letify/tools/<tool>/<version>/` | Installed standalone binaries (`tailcat`, `eci`). Older versions under `~/.letify/tools/<tool>/` are automatically pruned on install | not movable |
-| `~/.letify/cache/digests.json` | Local project file digest cache. Falls back to reading `~/.cache/letify/digests.json` if it exists from an earlier install | not movable |
-| `~/.letify/cache/storage/<name>` | Filesystem storage backend root for store `<name>`. Falls back to reading `~/.cache/letify/<name>` if it exists | not movable |
-| `~/.letify/cache/tools/<alias>/` | Redirected `HOME` and `USERPROFILE` for provider CLIs (`colab`, `kaggle`). Mode 0700. Keeps CLI temporary files, packages, and `.config/` out of the credential directory. The CLI finds its token via a symbolic link pointing to `~/.letify/accounts/<alias>/token.json` (or copy fallback on systems without symlink support) | not movable |
-| `~/.letify/tmp/` | Temporary directory for ephemeral keys during reverse SSH negotiation and adapter stderr files. Mode 0700 | not movable |
-| `~/.letify/ssh/` | OpenSSH multiplexing control sockets (`ControlPath`). Mode 0700 | `XDG_RUNTIME_DIR` (moved to `$XDG_RUNTIME_DIR/letify`) |
-| `~/.letify/runtime/` | Local provider workspace root for calls and local volumes. Holds `data/blobs`, `data/calls`, `tmp`. Falls back to reading `~/.letify-runtime` if it exists | not movable |
+| `~/.letify/config.toml` | Machine configuration declaring accounts and global providers | `LETIFY_CONFIG` environment variable (the file only), `LETIFY_HOME`, or project `.letify/config.toml` |
+| `~/.letify/accounts/<alias>/` | Account credentials and secrets (mode 0700 directory, mode 0600 files). Holds secret files only: `token.json`, `modal.toml`, `eci.yaml`, `cookie`, `access_token`, `username`, `notebook_id`, `known_hosts`, `link.json`, `password`. Never contains CLI cache directories or python packages | `LETIFY_HOME` |
+| `~/.letify/tools/<tool>/<version>/` | Installed standalone binaries (`tailcat`, `eci`). Older versions under `~/.letify/tools/<tool>/` are automatically pruned on install | `LETIFY_HOME` |
+| `~/.letify/cache/digests.json` | Local project file digest cache. Falls back to reading `~/.cache/letify/digests.json` if it exists from an earlier install | `LETIFY_HOME` |
+| `~/.letify/cache/storage/<name>` | Filesystem storage backend root for store `<name>`. Falls back to reading `~/.cache/letify/<name>` if it exists | `LETIFY_HOME` |
+| `~/.letify/cache/tools/<alias>/` | Redirected `HOME` and `USERPROFILE` for provider CLIs (`colab`, `kaggle`). Mode 0700. Keeps CLI temporary files, packages, and `.config/` out of the credential directory. The CLI finds its token via a symbolic link pointing to `~/.letify/accounts/<alias>/token.json` (or copy fallback on systems without symlink support) | `LETIFY_HOME` |
+| `~/.letify/tmp/` | Temporary directory for ephemeral keys during reverse SSH negotiation and adapter stderr files. Mode 0700 | `LETIFY_HOME` |
+| `~/.letify/ssh/` | OpenSSH multiplexing control sockets (`ControlPath`). Mode 0700 | `XDG_RUNTIME_DIR` (moved to `$XDG_RUNTIME_DIR/letify`), `LETIFY_HOME` (with `XDG_RUNTIME_DIR`: `$XDG_RUNTIME_DIR/letify-<h>`; without it: `$LETIFY_HOME/ssh`) |
+| `~/.letify/runtime/` | Local provider workspace root for calls and local volumes. Holds `data/blobs`, `data/calls`, `tmp`. Falls back to reading `~/.letify-runtime` if it exists | `LETIFY_HOME` |
 
 **Documented local exceptions:**
 

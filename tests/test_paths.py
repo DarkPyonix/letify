@@ -337,3 +337,182 @@ def test_an_existing_environment_store_outside_the_root_is_still_read(monkeypatc
     provider = Local(ProviderConfig("lab", "local", {}, 0))
 
     assert environment_volume(provider)._store.backend.root == legacy / "local" / "lab"
+
+
+# -- LETIFY_HOME ------------------------------------------------------------------------
+# Spec "Declared filesystem paths", "Local machine": the root moves with LETIFY_HOME.
+
+
+def test_every_declared_directory_moves_under_letify_home(isolated_home, monkeypatch, tmp_path):
+    from letify import paths
+
+    moved = tmp_path / "moved"
+    monkeypatch.setenv("LETIFY_HOME", str(moved))
+    monkeypatch.delenv("LETIFY_CONFIG", raising=False)
+    monkeypatch.delenv("XDG_RUNTIME_DIR", raising=False)
+
+    assert paths.letify_root() == moved
+    assert paths.config_path() == moved / "config.toml"
+    assert paths.accounts_directory() == moved / "accounts"
+    assert paths.account_directory("a") == moved / "accounts" / "a"
+    assert account_directory("a") == moved / "accounts" / "a"
+    assert paths.tools_directory() == moved / "tools"
+    assert paths.cache_directory() == moved / "cache"
+    assert paths.digest_cache_path() == moved / "cache" / "digests.json"
+    assert paths.storage_cache_directory("s") == moved / "cache" / "storage" / "s"
+    assert paths.tool_cache_home("a") == moved / "cache" / "tools" / "a"
+    assert paths.local_tmp_directory() == moved / "tmp"
+    assert paths.ssh_control_directory() == moved / "ssh"
+    assert paths.local_runtime_directory() == moved / "runtime"
+
+
+def test_an_unset_or_empty_letify_home_means_the_default_root(isolated_home, monkeypatch):
+    from letify import paths
+
+    monkeypatch.delenv("LETIFY_HOME", raising=False)
+    assert paths.letify_root() == Path.home() / ".letify"
+    monkeypatch.setenv("LETIFY_HOME", "")
+    assert paths.letify_root() == Path.home() / ".letify"
+    assert paths.local_runtime_root() == "~/.letify/runtime"
+
+
+def test_a_tilde_in_letify_home_is_expanded(isolated_home, monkeypatch):
+    from letify import paths
+
+    monkeypatch.setenv("LETIFY_HOME", "~/elsewhere")
+    assert paths.letify_root() == Path.home() / "elsewhere"
+
+
+def test_a_relative_letify_home_is_refused_naming_it(isolated_home, monkeypatch):
+    import pytest
+
+    from letify import paths
+    from letify.errors import ConfigError
+
+    monkeypatch.setenv("LETIFY_HOME", "state/letify")
+    with pytest.raises(ConfigError) as caught:
+        paths.letify_root()
+    assert "state/letify" in str(caught.value)
+    assert "absolute" in str(caught.value)
+
+
+def test_letify_config_still_wins_for_the_config_file_only(isolated_home, monkeypatch, tmp_path):
+    from letify import paths
+
+    monkeypatch.setenv("LETIFY_HOME", str(tmp_path / "moved"))
+    monkeypatch.setenv("LETIFY_CONFIG", str(tmp_path / "other.toml"))
+    assert paths.config_path() == tmp_path / "other.toml"
+    assert paths.accounts_directory() == tmp_path / "moved" / "accounts"
+
+
+def test_a_moved_root_does_not_read_the_default_roots_caches(isolated_home, monkeypatch, tmp_path):
+    from letify import paths
+
+    old = Path.home() / ".cache" / "letify"
+    (old / "digests.json").parent.mkdir(parents=True, exist_ok=True)
+    (old / "digests.json").write_text("{}", encoding="utf-8")
+    (old / "my_store").mkdir()
+
+    monkeypatch.delenv("LETIFY_HOME", raising=False)
+    assert paths.digest_cache_path() == old / "digests.json"
+    assert paths.storage_cache_directory("my_store") == old / "my_store"
+
+    moved = tmp_path / "moved"
+    monkeypatch.setenv("LETIFY_HOME", str(moved))
+    assert paths.digest_cache_path() == moved / "cache" / "digests.json"
+    assert paths.storage_cache_directory("my_store") == moved / "cache" / "storage" / "my_store"
+
+
+def test_the_ssh_directory_is_hashed_per_root_when_xdg_runtime_dir_is_set(
+    isolated_home, monkeypatch, tmp_path
+):
+    import hashlib
+
+    from letify import paths
+
+    runtime = tmp_path / "run"
+    monkeypatch.setenv("XDG_RUNTIME_DIR", str(runtime))
+
+    monkeypatch.delenv("LETIFY_HOME", raising=False)
+    assert paths.ssh_control_directory() == runtime / "letify"
+
+    first, second = tmp_path / "one", tmp_path / "two"
+    monkeypatch.setenv("LETIFY_HOME", str(first))
+    one = paths.ssh_control_directory()
+    digest = hashlib.sha256(str(first.resolve()).encode("utf-8")).hexdigest()[:8]
+    assert one == runtime / f"letify-{digest}"
+    monkeypatch.setenv("LETIFY_HOME", str(second))
+    assert paths.ssh_control_directory() != one
+
+
+def test_the_ssh_directory_stays_under_the_root_without_xdg_runtime_dir(
+    isolated_home, monkeypatch, tmp_path
+):
+    from letify import paths
+
+    monkeypatch.delenv("XDG_RUNTIME_DIR", raising=False)
+    monkeypatch.setenv("LETIFY_HOME", str(tmp_path / "moved"))
+    assert paths.ssh_control_directory() == tmp_path / "moved" / "ssh"
+
+
+def test_the_local_provider_workspace_follows_letify_home(isolated_home, monkeypatch, tmp_path):
+    monkeypatch.setenv("LETIFY_HOME", str(tmp_path / "moved"))
+    assert local_runtime_root() == str(tmp_path / "moved" / "runtime")
+    assert local_runtime_directory() == tmp_path / "moved" / "runtime"
+
+
+def test_the_install_cache_and_home_settings_follow_letify_home(
+    isolated_home, monkeypatch, tmp_path
+):
+    moved = tmp_path / "moved"
+    moved.mkdir()
+    (moved / "config.toml").write_text("auto_install = false\n", encoding="utf-8")
+    monkeypatch.setenv("LETIFY_HOME", str(moved))
+    monkeypatch.delenv("LETIFY_AUTO_INSTALL", raising=False)
+    monkeypatch.delenv("LETIFY_CONFIG", raising=False)
+
+    assert install.tools_home() == moved / "tools"
+    assert install.cache_path("eci").is_relative_to(moved / "tools")
+    assert install.auto_install_enabled() is False
+
+
+def test_the_device_auto_fetch_setting_is_read_from_the_moved_root(
+    isolated_home, monkeypatch, tmp_path
+):
+    from letify.remoting.device.value import auto_fetch_enabled
+
+    moved = tmp_path / "moved"
+    moved.mkdir()
+    (moved / "config.toml").write_text("auto_fetch = false\n", encoding="utf-8")
+    monkeypatch.setenv("LETIFY_HOME", str(moved))
+    monkeypatch.delenv("LETIFY_AUTO_FETCH", raising=False)
+    monkeypatch.delenv("LETIFY_CONFIG", raising=False)
+    assert auto_fetch_enabled(None) is False
+
+
+def test_the_machine_configuration_is_read_from_the_moved_root(
+    isolated_home, monkeypatch, tmp_path
+):
+    from letify.config import load
+
+    moved = tmp_path / "moved"
+    moved.mkdir()
+    (moved / "config.toml").write_text(
+        '[colab_x]\nkind = "colab"\nglobal = true\n', encoding="utf-8"
+    )
+    monkeypatch.setenv("LETIFY_HOME", str(moved))
+    monkeypatch.delenv("LETIFY_CONFIG", raising=False)
+    assert "colab_x" in load().providers
+
+
+def test_messages_name_the_machine_file_in_use(isolated_home, monkeypatch, tmp_path):
+    import pytest
+
+    from letify.errors import UnknownProvider
+    from letify.launcher import Launcher
+
+    moved = tmp_path / "moved"
+    monkeypatch.setenv("LETIFY_HOME", str(moved))
+    with pytest.raises(UnknownProvider) as caught:
+        Launcher().provider("nowhere")
+    assert str(moved / "config.toml") in str(caught.value)
