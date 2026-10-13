@@ -47,6 +47,11 @@ if TYPE_CHECKING:
 #: The total size of argument blob files kept under a persistent workspace root, 32 GiB.
 BLOB_DISK_LIMIT = 32 * 1024**3
 
+#: The largest project directory letify packs into an environment archive when it has no
+#: measured rate to judge the transfer by. Spec "Materializing into a runtime": the pack
+#: moves the archive as one payload the worker and the client each hold whole.
+PACK_WITHOUT_A_RATE = 1024**3
+
 
 def _against_the_build(size: int, rate: float, build_s: float) -> str:
     """The three numbers both cache decisions weigh, as they are reported.
@@ -185,6 +190,11 @@ class Runtime:
                 self.provider.env_root or self.workspace or self.provider.workspace_root, self.env
             )
             if self._worth_packing(root):
+                size = self._tree_size(root)
+                self._say(
+                    "caching the environment"
+                    + (f", {size / 1_000_000_000:.1f} GB" if size else "")
+                )
                 self._environment_volumes()[0].cache_env_from(
                     self, self.env, root, platform=self.platform, build_s=self.env_build_s
                 )
@@ -687,25 +697,38 @@ class Runtime:
             return None
         return float(rate)
 
-    def _worth_packing(self, root: str) -> bool:
-        """Whether moving the project directory over this session's link beats the build.
-
-        Spec "Materializing into a runtime": the directory is larger than the archive it
-        would become, so this overstates the transfer and errs toward building. A session
-        with no measured rate packs unconditionally, as it always did.
-        """
-        if self.env_build_s is None:
-            return True
-        rate = self._measured_rate()
-        if rate is None:
-            return True
+    def _tree_size(self, root: str) -> int | None:
+        """The byte size of the project directory on the runtime, or None when unknown."""
         from . import bootstrap
 
         try:
             size = self.eval(bootstrap.tree_size_source(root), timeout=120)
         except Exception:
+            return None
+        return size if isinstance(size, int) and size > 0 else None
+
+    def _worth_packing(self, root: str) -> bool:
+        """Whether moving the project directory over this session's link beats the build.
+
+        Spec "Materializing into a runtime": the directory is larger than the archive it
+        would become, so this overstates the transfer and errs toward building. With no
+        measured rate it packs only what letify is willing to hold in memory, because the
+        pack moves the archive as one payload the worker and the client each hold whole.
+        """
+        if self.env_build_s is None:
             return True
-        if not isinstance(size, int) or size <= 0:
+        rate = self._measured_rate()
+        size = self._tree_size(root)
+        if rate is None:
+            if size is None or size <= PACK_WITHOUT_A_RATE:
+                return True
+            self._say(
+                f"not caching the environment, because {size / 1_000_000_000:.1f} GB is over "
+                f"the {PACK_WITHOUT_A_RATE / 1024**3:.1f} GiB letify will hold in memory and "
+                f"this link was never measured"
+            )
+            return False
+        if size is None:
             return True
         if (size / rate) < self.env_build_s:
             return True
