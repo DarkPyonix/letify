@@ -15,6 +15,7 @@ import os
 import re
 import secrets
 import select
+import shlex
 import socket
 import struct
 import subprocess
@@ -560,10 +561,23 @@ def begin(request: dict):
         descriptor = os.open(key, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
         with os.fdopen(descriptor, "w") as handle:
             handle.write(request["private_key"])
+        # With a jump host the same identity and host-key policy must reach both hops, and
+        # -J does not carry command-line options to the jump connection, so the hop is an
+        # explicit ProxyCommand that repeats them.
+        jump = request.get("jump")
+        hop: list[str] = []
+        if jump:
+            proxy = (
+                "ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new"
+                f" -i {shlex.quote(str(key))}"
+                f" -W %h:%p -p {int(jump.get('port', 22))}"
+                f" {shlex.quote(str(jump['user']) + '@' + str(jump['address']))}"
+            )
+            hop = ["-o", f"ProxyCommand={proxy}"]
         process = subprocess.Popen(
             [
                 "ssh", "-N", "-o", "BatchMode=yes", "-o", "ExitOnForwardFailure=yes",
-                "-o", "StrictHostKeyChecking=accept-new",
+                "-o", "StrictHostKeyChecking=accept-new", *hop,
                 "-R", f"0:127.0.0.1:{int(request.get('ssh_port', 22))}",
                 "-p", str(request["port"]), "-i", str(key),
                 f"{request['user']}@{request['address']}",
