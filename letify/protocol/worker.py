@@ -2200,7 +2200,7 @@ def _unpack(path, target, links=False):
     interpreter by absolute path.
     """
     os.makedirs(target, exist_ok=True)
-    with tarfile.open(path, "r:gz") as archive:
+    with tarfile.open(path, "r:*") as archive:
         try:
             archive.extractall(target, filter="tar" if links else "data")
         except TypeError:
@@ -2290,6 +2290,8 @@ def _op_pack_blob(request):
     Same archive and member rules as ``pack_dir``, but the archive never exists as one
     bytes object: it is written to a partial file in pieces, and the caller reads it back
     with ``data_stream``. The reply names the directory it used, with ``~`` expanded.
+    The archive is gzip unless the request sets ``gzip`` to false, which writes a plain
+    tar for a store that moves the archive at a disk's speed.
     """
     root = os.path.expanduser(request["path"])
     directory = os.path.expanduser(request["dir"])
@@ -2301,7 +2303,8 @@ def _op_pack_blob(request):
     try:
         with open(partial, "wb") as handle:
             hashed = _HashedFile(handle, hasher)
-            with tarfile.open(fileobj=hashed, mode="w:gz") as archive:
+            mode = "w:gz" if request.get("gzip", True) else "w"
+            with tarfile.open(fileobj=hashed, mode=mode) as archive:
                 archive.add(root, arcname=os.path.basename(root.rstrip("/")), recursive=True)
         digest = hasher.hexdigest() if hasher.name == "blake2b" else hasher.hexdigest(length=16)
         final = _data_file(directory, digest)
@@ -2311,6 +2314,48 @@ def _op_pack_blob(request):
         if os.path.exists(partial):
             os.remove(partial)
     return {"ok": True, "value": {"digest": digest, "size": hashed.size, "dir": directory}}
+
+
+def _op_push_blob(request):
+    """Upload a blob from the blob cache to a resumable upload session, in pieces.
+
+    The session URL authorizes its own upload, so the request carries no access token.
+    Every piece but the last is a multiple of 256 KiB, as Drive requires, and is answered
+    308 until the last, which is answered with the new file's metadata. The reply names
+    the file id.
+    """
+    import json
+    import urllib.error
+    import urllib.request
+
+    url = request.pop("url")
+    headers = request.pop("headers", None) or {}
+    path = _data_file(os.path.expanduser(request["dir"]), request["digest"])
+    size = os.path.getsize(path)
+    piece = int(request.get("piece") or (64 << 20))
+    remote_id = None
+    with open(path, "rb") as handle:
+        offset = 0
+        while offset < size:
+            block = handle.read(piece)
+            end = offset + len(block)
+            span = "bytes %d-%d/%d" % (offset, end - 1, size)
+            send = urllib.request.Request(url, data=block, method="PUT", headers=headers)
+            send.add_header("Content-Length", str(len(block)))
+            send.add_header("Content-Range", span)
+            try:
+                with urllib.request.urlopen(send, timeout=3600) as response:
+                    remote_id = json.loads(response.read())["id"]
+            except urllib.error.HTTPError as exc:
+                if exc.code != 308:
+                    raise RuntimeError(
+                        "the upload returned %d: %s"
+                        % (exc.code, exc.read()[:300].decode(errors="replace"))
+                    )
+            offset = end
+    if remote_id is None:
+        raise RuntimeError("the upload session never answered with a file")
+    return {"ok": True, "value": {"id": remote_id, "size": size}}
 
 
 def _op_place_blob(request):
@@ -2456,6 +2501,7 @@ _OPS = {
     "get_file": _op_get_file,
     "pack_dir": _op_pack_dir,
     "pack_blob": _op_pack_blob,
+    "push_blob": _op_push_blob,
     "place_blob": _op_place_blob,
     "exec": _op_exec,
     "eval": _op_eval,

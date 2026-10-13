@@ -93,6 +93,22 @@ class Backend(abc.ABC):
         """
         return None
 
+    #: Whether the runtime moves archives to and from this backend itself, so that an
+    #: archive never crosses this process. Such a backend offers ``pull_source`` and
+    #: ``begin_upload``.
+    moves_on_runtime: bool = False
+
+    def begin_upload(self, digest: str, size: int) -> dict[str, object] | None:
+        """A URL, request headers and piece size a runtime uploads one blob with, or None.
+
+        The answer authorizes that one upload and carries no access token.
+        """
+        return None
+
+    def record_upload(self, digest: str, remote_id: str) -> None:
+        """Remember what the backend named a blob the runtime uploaded."""
+        return None
+
     def missing(self, digests: list[str]) -> list[str]:
         """Which of these digests the store does not hold.
 

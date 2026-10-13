@@ -382,7 +382,7 @@ def pull_source(
         f"if {unpack!r}:\n"
         f"    _target = {target or str(Path(path).parent)!r}\n"
         "    os.makedirs(_target, exist_ok=True)\n"
-        "    with tarfile.open(_path, 'r:gz') as _archive:\n"
+        "    with tarfile.open(_path, 'r:*') as _archive:\n"
         "        _root = os.path.realpath(_target)\n"
         "        for _member in _archive.getmembers():\n"
         "            _destination = os.path.realpath(os.path.join(_root, _member.name))\n"

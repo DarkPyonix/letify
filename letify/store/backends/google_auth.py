@@ -95,6 +95,10 @@ class TokenSource:
                 f"needs an RSA signature the standard library cannot make; run "
                 f"'gcloud auth activate-service-account' so gcloud can mint the token",
             )
+        return self._refresh(info, str(path))
+
+    def _refresh(self, info: dict[str, object], label: str) -> tuple[str, float]:
+        """Exchange the refresh token in ``info`` for an access token and its lifetime."""
         form = urllib.parse.urlencode(
             {
                 "grant_type": "refresh_token",
@@ -112,10 +116,10 @@ class TokenSource:
         except urllib.error.HTTPError as exc:
             detail = exc.read()[:500].decode(errors="replace")
             raise RuntimeFailure(
-                f"refreshing the Google login in {path} returned {exc.code}: {detail}"
+                f"refreshing the Google login in {label} returned {exc.code}: {detail}"
             ) from exc
         except (urllib.error.URLError, OSError) as exc:
-            raise RuntimeFailure(f"refreshing the Google login in {path} failed: {exc}") from exc
+            raise RuntimeFailure(f"refreshing the Google login in {label} failed: {exc}") from exc
         return str(reply["access_token"]), float(reply.get("expires_in", ASSUMED_LIFETIME_S))
 
     def _from_gcloud(self, gcloud: str) -> tuple[str, float]:

@@ -24,13 +24,14 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from .. import protocol
-from .cas import Store
+from .cas import BlobInfo, Store
 
 if TYPE_CHECKING:
     from ..declare.env import Env
     from ..protocol.handle import RemoteFile
     from ..providers.base import Provider
     from ..runtime.session import Runtime
+    from .backends.drive import DriveBackend
 
 #: The file in a volume directory that records what a persistent runtime already holds.
 MANIFEST = ".letify-manifest.json"
@@ -98,11 +99,38 @@ def environment_volume(provider: Provider) -> Volume:
     from .backends.filesystem import FilesystemBackend
     from .pathdata import data_bucket
 
-    backend = data_bucket(provider)
+    backend = data_bucket(provider) or environment_drive(provider)
     if backend is None:
         root = storage_cache_directory("environments") / provider.kind / provider.alias
         backend = FilesystemBackend(root)
     return Volume(provider, "environments", _store=Store(backend))
+
+
+def environment_drive(provider: Provider) -> DriveBackend | None:
+    """The machine's Drive store, for an ephemeral provider whose account sets no bucket.
+
+    Spec "Materializing into a runtime": Drive is declared once per machine with
+    ``drive_login`` and ``drive_project``, and either alone is refused naming the other. A
+    persistent provider ignores it, as it ignores ``bucket``. Only the environment archive
+    goes to Drive, never project data.
+    """
+    if provider.persistent:
+        return None
+    from ..config import drive_settings
+
+    settings = drive_settings()
+    if settings is None:
+        return None
+    cached = getattr(provider, "_letify_drive", None)
+    if cached is not None:
+        return cached  # type: ignore[no-any-return]
+    from .backends.drive import DRIVE_ENDPOINT, DriveBackend
+
+    drive = DriveBackend(
+        settings.login, settings.project, endpoint=settings.endpoint or DRIVE_ENDPOINT
+    )
+    provider._letify_drive = drive  # type: ignore[attr-defined]
+    return drive
 
 
 def _piece_size() -> int:
@@ -208,7 +236,11 @@ class Volume:
         """
         runtime = _session(target)
         scratch = self.store.scratch_path() if self.store.streams else None
-        if scratch is not None and runtime.persistent_channel:
+        if self.store.backend.moves_on_runtime:
+            # The runtime uploads the archive itself, so it never crosses this process.
+            digest, size = runtime.pack_dir_to_store(path, self.store.backend)
+            info = BlobInfo(digest, size)
+        elif scratch is not None and runtime.persistent_channel:
             # Streamed: the archive lands in a file beside the store and is renamed in.
             digest, _size = runtime.pack_dir_to_file(path, scratch)
             info = self.store.adopt_file(scratch, digest)
@@ -231,13 +263,40 @@ class Volume:
         can compare the archive's size over its own measured link against the build it
         would otherwise pay.
         """
+        record = self._build_record(env, platform)
+        return None if record is None else (record[0], record[1])
+
+    def cached_restore(self, env: Env, platform: str | None = None) -> float | None:
+        """Seconds a session measured restoring this archive, once one has, else None.
+
+        Spec "Materializing into a runtime": the third field of the record beside the
+        archive, written back by the first session that restores from it.
+        """
+        record = self._build_record(env, platform)
+        return None if record is None else record[2]
+
+    def record_restore(
+        self, env: Env, platform: str | None, restore_s: float
+    ) -> None:
+        """Write the measured restore seconds into the record beside the archive."""
+        record = self._build_record(env, platform)
+        if record is None:
+            return
+        build_s, size, _ = record
+        self.store.point(self.build_ref(env, platform), f"{build_s:.1f} {size} {restore_s:.1f}")
+
+    def _build_record(
+        self, env: Env, platform: str | None
+    ) -> tuple[float, int, float | None] | None:
+        """``(build seconds, archive bytes, restore seconds or None)``, or None when absent."""
         raw = self.store.resolve(self.build_ref(env, platform))
         if not raw:
             return None
+        fields = raw.split()
         try:
-            seconds_text, bytes_text = raw.split()
-            return float(seconds_text), int(bytes_text)
-        except ValueError:
+            restore = float(fields[2]) if len(fields) > 2 else None
+            return float(fields[0]), int(fields[1]), restore
+        except (ValueError, IndexError):
             return None
 
     # -- checkpoints ---------------------------------------------------------
