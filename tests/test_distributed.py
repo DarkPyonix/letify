@@ -368,3 +368,78 @@ def test_the_reduced_bytes_never_cross_the_client(launcher_from) -> None:
     # The array is 4096 float32, so 16384 bytes crossed between the replicas. What the
     # client carried for that round is two joins and two tables.
     assert broker.brokered_bytes() - before < 2048
+
+
+def test_a_join_carries_both_the_local_and_the_mapped_address(launcher_from, monkeypatch) -> None:
+    """Spec "Reducing between replicas": the broker passes both to every joined replica."""
+    from letify.declare import reduce as reducing
+
+    monkeypatch.setattr(reducing, "_mapped_address", lambda port: ("203.0.113.7", 41234))
+    let = launcher_from('[a]\nkind = "local"\n\n[b]\nkind = "local"\n')
+
+    @let.function(device=[let.providers.a.CPU, let.providers.b.CPU], host=letify.distributed)
+    def round_once() -> dict:
+        import array
+
+        import letify as inner
+
+        seen = {}
+        values = array.array("f", [float(inner.rank())])
+        inner.all_reduce(values, op=lambda arrays: arrays[0], _watch=seen)
+        return seen
+
+    tables = round_once()
+    for table in tables:
+        peers = table["peers"]
+        assert peers, table
+        for entry in peers.values():
+            assert "address" in entry and "mapped" in entry, entry
+        assert table["token"]
+        assert table["start_at"] > 0
+
+
+def test_a_round_of_three_that_cannot_reach_each_other_is_refused() -> None:
+    """Spec "Reducing between replicas": a punched mesh is not something letify measured."""
+    from letify.declare.reduce import _pair_for_punching
+
+    assert _pair_for_punching(count=2, ranks=[0, 1]) == (0, 1)
+    with pytest.raises(letify.ReductionFailed) as failure:
+        _pair_for_punching(count=3, ranks=[0, 1, 2])
+    assert "0, 1, 2" in str(failure.value) or "three" in str(failure.value)
+
+
+def test_the_listener_and_its_mapping_are_made_once_per_replica(
+    launcher_from, monkeypatch
+) -> None:
+    """Spec "Reducing between replicas": a loop reducing every H steps pays this per round.
+
+    The first version opened a listener and asked STUN for its mapping on every round, so
+    a body that reduces a hundred times made a hundred STUN round trips and punched a
+    hundred times.
+    """
+    let = launcher_from('[a]\nkind = "local"\n\n[b]\nkind = "local"\n')
+
+    @let.function(device=[let.providers.a.CPU, let.providers.b.CPU], host=letify.distributed)
+    def three_rounds() -> tuple[int, int]:
+        import array
+
+        import letify as inner
+        from letify.declare import reduce as reducing
+
+        asked = []
+        real = reducing._mapped_address
+        reducing._mapped_address = lambda port: asked.append(port) or real(port)
+        try:
+            ports = set()
+            for _ in range(3):
+                values = array.array("f", [1.0])
+                inner.all_reduce(values, op=lambda arrays: arrays[0])
+                ports.add(reducing._listener(2)[1])
+        finally:
+            reducing._mapped_address = real
+        return len(asked), len(ports)
+
+    for asked, ports in three_rounds():
+        # The first round opens the listener, so one ask across three rounds, not three.
+        assert asked <= 1, f"asked STUN {asked} times for three rounds"
+        assert ports == 1, f"used {ports} ports for three rounds"

@@ -68,6 +68,7 @@ def all_reduce(
     op: Callable[[list], Any] | None = None,
     timeout: float = DEFAULT_TIMEOUT,
     min_peers: int | None = None,
+    _watch: dict | None = None,
 ) -> int:
     """Replace ``tensor``'s contents with the reduction of every replica's, in place.
 
@@ -111,19 +112,16 @@ def all_reduce(
         round_id = _ROUND
 
     deadline = time.monotonic() + timeout
-    listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    listener, port, mapped = _listener(world)
+    host = _local_address()
     try:
-        listener.bind(("0.0.0.0", 0))
-        listener.listen(world)
-        port = listener.getsockname()[1]
-        host = _local_address()
-
         main._reduce_join(
             {
                 "op": "reduce_join",
                 "round": round_id,
                 "rank": my_rank,
                 "address": [host, port],
+                "mapped": list(mapped) if mapped is not None else None,
                 "timeout": timeout,
                 "min_peers": needed,
             }
@@ -138,20 +136,56 @@ def all_reduce(
 
         leader = int(table["leader"])
         count = int(table["count"])
-        peers = {int(r): tuple(address) for r, address in table["peers"].items()}
-        header = {"rank": my_rank, "nbytes": len(raw)}
+        token = str(table.get("token", ""))
+        start_at = float(table.get("start_at", time.time()))
+        peers = {
+            int(r): {
+                "address": tuple(entry["address"]),
+                "mapped": tuple(entry["mapped"]) if entry.get("mapped") else None,
+            }
+            for r, entry in table["peers"].items()
+        }
+        header = {"rank": my_rank, "round": round_id, "nbytes": len(raw)}
+
+        if _watch is not None:
+            _watch["peers"] = table.get("peers")
+            _watch["token"] = token
+            _watch["start_at"] = start_at
 
         if my_rank == leader:
-            result = _lead(listener, deadline, my_rank, tensor, header, raw, count, op)
+            result = _lead(
+                listener, deadline, my_rank, tensor, header, raw, count, op, peers, token,
+                start_at, port, round_id,
+            )
         else:
-            result = _follow(peers[leader], deadline, header, raw)
+            result = _follow(leader, peers, deadline, header, raw, token, start_at, port, count)
     except OSError as exc:
         raise ReductionFailed(f"all_reduce round {round_id} failed: {exc}") from exc
-    finally:
-        listener.close()
 
     _write_back(tensor, result)
     return count
+
+
+#: The replica's listener, its port and its STUN mapping, opened once and kept.
+#: Spec "Reducing between replicas": a loop that reduces every H steps would otherwise
+#: pay a STUN round trip and a fresh punch on every round.
+_LISTENER: list = []
+_LISTENER_LOCK = threading.Lock()
+
+
+def _listener(world: int) -> tuple[Any, int, tuple[str, int] | None]:
+    """This replica's listening socket, its port and its mapped address, made once."""
+    with _LISTENER_LOCK:
+        if not _LISTENER:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            if hasattr(socket, "SO_REUSEPORT"):
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+            sock.bind(("0.0.0.0", 0))
+            sock.listen(max(1, world))
+            port = sock.getsockname()[1]
+            _LISTENER.append((sock, port, _mapped_address(port)))
+        return _LISTENER[0]
 
 
 def _local_address() -> str:
@@ -161,6 +195,40 @@ def _local_address() -> str:
         return socket.gethostbyname(socket.gethostname())
     except OSError:
         return "127.0.0.1"
+
+
+def _mapped_address(port: int) -> tuple[str, int] | None:
+    """The STUN mapping of the listener's own ``port``, or None when it cannot be had.
+
+    Spec "Reducing between replicas": a replica joins a round with two addresses, its
+    own and this one. Never raises: a replica with no mapping still joins, with
+    ``mapped`` absent, and is still reachable on its own address.
+    """
+    try:
+        from ..transport import nat
+    except ImportError:
+        return None
+    try:
+        return nat.stun_mapping(port)
+    except Exception:
+        return None
+
+
+def _pair_for_punching(*, count: int, ranks: list[int]) -> tuple[int, int]:
+    """The two ranks a punch is between, or a refusal naming every rank in the round.
+
+    Spec "Reducing between replicas": one punched connection takes one local port on
+    each side, so punching a round of more than two replicas is refused rather than
+    attempted as a mesh letify has not measured.
+    """
+    ordered = sorted(ranks)
+    if count == 2 and len(ordered) == 2:
+        return ordered[0], ordered[1]
+    named = ", ".join(str(r) for r in ordered)
+    raise ReductionFailed(
+        f"a round of {count} replicas over ranks {named} cannot punch to reach each "
+        "other directly: punching is between a pair, not a mesh of more than two"
+    )
 
 
 def _await_table(main: Any, round_id: int, deadline: float) -> dict:
@@ -187,18 +255,62 @@ def _lead(
     raw: bytes,
     count: int,
     op: Callable[[list], Any],
+    peers: dict[int, dict],
+    token: str,
+    start_at: float,
+    port: int,
+    round_id: int,
 ) -> Any:
-    """Accept every other joined peer, reduce, and send the result back to each."""
+    """Accept every other joined peer, punching for one that never connects, then reduce
+    and send the result back to each.
+
+    Spec "Reducing between replicas": the leader accepts on its own listener first,
+    because two replicas on one machine or one network reach each other without a
+    punch, and punches with ``initiator=False`` only for a peer that never arrives.
+    """
     collected: dict[int, Any] = {my_rank: tensor}
     conns: list[socket.socket] = []
     try:
+        window_deadline = min(deadline, start_at + _window())
         while len(collected) < count:
-            listener.settimeout(_remaining(deadline))
-            conn, _addr = listener.accept()
+            remaining_window = window_deadline - time.monotonic()
+            if remaining_window <= 0:
+                break
+            listener.settimeout(max(0.01, min(remaining_window, _remaining(deadline))))
+            try:
+                conn, _addr = listener.accept()
+            except TimeoutError:
+                break
             conn.settimeout(_remaining(deadline))
             peer_header, payload = _recv_message(conn)
+            if int(peer_header.get("round", round_id)) != round_id:
+                # The listener outlives a round, so a connection a previous one left
+                # behind can be accepted here. Spec "Reducing between replicas".
+                conn.close()
+                continue
             collected[int(peer_header["rank"])] = _rebuild(tensor, payload)
             conns.append(conn)
+
+        missing = sorted(r for r in peers if r not in collected)
+        if missing:
+            _pair_for_punching(count=count, ranks=sorted(peers))
+            from ..transport import nat
+
+            for peer_rank in missing:
+                mapped = peers[peer_rank]["mapped"]
+                if mapped is None:
+                    raise ReductionFailed(
+                        f"replica {peer_rank} never connected directly and reported no "
+                        "mapped address to punch to"
+                    )
+                conn = nat.punch(
+                    port, mapped, bytes.fromhex(token), initiator=False, start_at=start_at
+                )
+                conn.settimeout(_remaining(deadline))
+                peer_header, payload = _recv_message(conn)
+                collected[int(peer_header["rank"])] = _rebuild(tensor, payload)
+                conns.append(conn)
+
         arrays = [collected[r] for r in sorted(collected)]
         result = op(arrays)
         result_header, result_raw = _encode(result)
@@ -211,9 +323,34 @@ def _lead(
             conn.close()
 
 
-def _follow(leader_address: tuple, deadline: float, header: dict, raw: bytes) -> bytes:
-    """Send this replica's array to the leader, and wait for the reduced result's bytes."""
-    conn = socket.create_connection(leader_address, timeout=_remaining(deadline))
+def _follow(
+    leader_rank: int,
+    peers: dict[int, dict],
+    deadline: float,
+    header: dict,
+    raw: bytes,
+    token: str,
+    start_at: float,
+    port: int,
+    count: int,
+) -> bytes:
+    """Send this replica's array to the leader, and wait for the reduced result's bytes.
+
+    Spec "Reducing between replicas": the address the leader reported for itself is
+    tried first, and the mapped address is punched to with ``initiator=True`` only when
+    that direct connection fails.
+    """
+    peer = peers[leader_rank]
+    try:
+        conn = socket.create_connection(peer["address"], timeout=_remaining(deadline))
+    except OSError:
+        _pair_for_punching(count=count, ranks=sorted(peers))
+        mapped = peer["mapped"]
+        if mapped is None:
+            raise
+        from ..transport import nat
+
+        conn = nat.punch(port, mapped, bytes.fromhex(token), initiator=True, start_at=start_at)
     try:
         conn.settimeout(_remaining(deadline))
         _send_message(conn, header, raw)
@@ -222,6 +359,15 @@ def _follow(leader_address: tuple, deadline: float, header: dict, raw: bytes) ->
         return payload
     finally:
         conn.close()
+
+
+def _window() -> float:
+    """The punch window, from ``letify.transport.nat`` when it can be imported."""
+    try:
+        from ..transport import nat
+    except ImportError:
+        return 45.0
+    return nat.DEFAULT_WINDOW
 
 
 def _remaining(deadline: float) -> float:

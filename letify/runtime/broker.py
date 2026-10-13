@@ -10,6 +10,7 @@ claim N10.
 from __future__ import annotations
 
 import json
+import secrets
 import threading
 import time
 from typing import Any
@@ -23,6 +24,10 @@ _TOTAL_BYTES = 0
 
 #: Seconds between polls of a replica's joins, and between sweeps for an expired round.
 _POLL_S = 0.02
+
+#: Seconds ahead of now a round's agreed start moment is set, so every replica's
+#: answer arrives before dialing is meant to begin.
+_START_AHEAD_S = 1.0
 
 
 def _account(payload: dict) -> None:
@@ -134,10 +139,26 @@ class Broker:
             self._fail(round_id, joins)
 
     def _answer(self, round_id: int, joins: dict[int, dict]) -> None:
-        """Send every joined replica the peer table, naming the lowest rank leader."""
+        """Send every joined replica the peer table, naming the lowest rank leader.
+
+        Spec "Reducing between replicas": each entry carries both addresses a replica
+        joined with, and the table carries one token and one start moment, the same
+        for every replica of this round, so a pair can agree a punch without the client
+        relaying anything more than this.
+        """
         leader = min(joins)
-        peers = {str(r): list(join["address"]) for r, join in joins.items()}
-        payload = {"round": round_id, "peers": peers, "leader": leader, "count": len(joins)}
+        peers = {
+            str(r): {"address": list(join["address"]), "mapped": join.get("mapped")}
+            for r, join in joins.items()
+        }
+        payload = {
+            "round": round_id,
+            "peers": peers,
+            "leader": leader,
+            "count": len(joins),
+            "token": secrets.token_hex(16),
+            "start_at": time.time() + _START_AHEAD_S,
+        }
         self._send_to(joins, payload)
 
     def _fail(self, round_id: int, joins: dict[int, dict]) -> None:
