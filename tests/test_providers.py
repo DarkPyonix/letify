@@ -2218,7 +2218,9 @@ def test_a_modal_sandbox_is_created_with_a_lifetime_and_an_idle_limit(
     provider.open_channel(runtime)
     try:
         [created] = fake_modal.requests("create")
-        assert created["timeout"] == 3600
+        # Spec "Modal": the lifetime is the longest Modal accepts, not an hour letify
+        # picked, because a deadline letify invented ends the user's work at its guess.
+        assert created["timeout"] == 86400
         assert created["idle_timeout"] == 600
     finally:
         provider.stop(runtime)
@@ -2910,3 +2912,32 @@ def test_colab_punch_rendezvous_completes_during_tailcat_installation(
         release.set()
         installing.join(2)
     assert endpoints == [("fake", 22)]
+
+
+def test_a_modal_sandbox_is_not_given_an_hour_long_deadline(config_file) -> None:
+    """Spec "Modal": a deadline letify invented would end a two hour run at its guess.
+
+    The default was 3600 s, exactly one hour, and it ended two Modal sessions of a real
+    training run at one hour each with nothing saying why. The declaration's own `timeout`
+    has no default for this reason, and the sandbox's lifetime is the same question.
+    """
+    from conftest import provider_of
+
+    from letify.providers import Modal
+
+    provider = provider_of(Modal, "lab")
+    assert provider.sandbox_timeout_s == 86400, "letify picked a deadline again"
+    # An idle sandbox is what has to be bounded, and that bound is unchanged.
+    assert provider.sandbox_idle_timeout_s == 600
+    # An account that wants a cap still sets one.
+    assert provider_of(Modal, "lab", timeout=7200).sandbox_timeout_s == 7200
+
+
+def test_a_sandbox_that_reached_its_lifetime_says_so(config_file) -> None:
+    """Spec "Modal": the channel otherwise lists causes, none of them this one."""
+    from letify.providers.modal import lifetime_detail
+
+    assert lifetime_detail(age_s=3599.5, lifetime_s=3600) is not None
+    assert "3600" in lifetime_detail(age_s=3599.5, lifetime_s=3600)
+    assert "raise timeout" in lifetime_detail(age_s=3601.0, lifetime_s=3600)
+    assert lifetime_detail(age_s=120.0, lifetime_s=3600) is None
