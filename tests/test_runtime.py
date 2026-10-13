@@ -2564,3 +2564,32 @@ def test_the_managed_python_stays_on_the_workspace_root_without_an_env_root() ->
         env, files, root=project, name="lab", workspace="/workspace", archive=False
     )
     assert "UV_PYTHON_INSTALL_DIR'] = os.path.expanduser('/workspace/uv-python')" in source
+
+
+def test_a_persistent_provider_that_builds_its_venv_elsewhere_still_archives(
+    uv_project: Path, tmp_path: Path
+) -> None:
+    """Spec "Volumes on a persistent runtime": the project directory has to survive.
+
+    Modal keeps its workspace root, a Modal volume, and builds the .venv on the sandbox's
+    own disk because a cold import from the volume reads thousands of small files over the
+    network. Keying the archive off the provider's persistence gave it neither: it rebuilt
+    230 packages on every session, measured at 428 s and 534 s on an A10.
+    """
+    provider = provider_of(PreparingLocal, "lab")
+    assert provider.persistent
+    volume = provider.volume(
+        "cache", backend="filesystem", root=str(tmp_path / "store"), mount=str(tmp_path / "mount")
+    )
+    env = Env()
+    instance = Instance(provider, gpu=None)._placed("remote")
+
+    # A venv built off the workspace root does not survive, however durable the root is.
+    object.__setattr__(provider, "env_root", str(tmp_path / "elsewhere"))
+    runtime = provider.start(instance, env, name="lab-1", volumes=(volume,))
+    try:
+        assert runtime.env_source == "sync"
+        platform = runtime.platform
+    finally:
+        runtime.shutdown()
+    assert volume.cached_env(env, platform), "nothing was archived, so the next session resyncs"

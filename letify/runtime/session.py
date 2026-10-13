@@ -174,7 +174,11 @@ class Runtime:
             # Not retried, so nothing else would end this session.
             self.shutdown(reason="interpreter_mismatch")
             raise
-        if self.env_source == "sync" and not self.provider.persistent:
+        # The same rule as _environment_volumes: a project directory that does not
+        # survive the session is worth archiving whatever the provider calls itself.
+        if self.env_source == "sync" and not (
+            self.provider.persistent and self._project_survives()
+        ):
             from . import bootstrap
 
             root = bootstrap.project_dir(
@@ -643,14 +647,29 @@ class Runtime:
         self.workspace = self.eval(bootstrap.workspace_source(root), timeout=120)
 
     def _environment_volumes(self) -> tuple[Volume, ...]:
-        """Explicit archive volumes, or the automatic cache for an ephemeral provider."""
-        if self.provider.persistent:
+        """Explicit archive volumes, or the automatic cache where the project does not survive.
+
+        Spec "Volumes on a persistent runtime": a persistent provider needs no archive
+        because its project directory is on a disk that lasts, which holds only while that
+        directory is under the workspace root. One that keeps its workspace and builds the
+        .venv elsewhere archives like an ephemeral one, because the sync's output dies with
+        the session however durable the root is.
+        """
+        if self.provider.persistent and self._project_survives():
             return ()
         if self.volumes:
             return self.volumes
         from ..store.volume import environment_volume
 
         return (environment_volume(self.provider),)
+
+    def _project_survives(self) -> bool:
+        """Whether the directory the sync writes lives on the disk the workspace root is on."""
+        root = (self.provider.env_root or "").rstrip("/")
+        if not root:
+            return True
+        workspace = (self.workspace or self.provider.workspace_root or "").rstrip("/")
+        return bool(workspace) and (root == workspace or root.startswith(workspace + "/"))
 
     def _measured_rate(self) -> float | None:
         """This session's measured upload rate in bytes per second, or None where none was.
