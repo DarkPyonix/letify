@@ -357,7 +357,9 @@ def sync_source(
     It raises ``RuntimeError`` with ``uv could not be installed on <name>`` or ``uv sync
     failed on <name>`` so the local side can name the step that failed.
     """
-    root = root or project_dir(DEFAULT_WORKSPACE_ROOT, env)
+    # Derived from the workspace root when it is given, so the two cannot disagree: the
+    # managed Python's directory is chosen by whether the project lies inside it.
+    root = root or project_dir(workspace or DEFAULT_WORKSPACE_ROOT, env)
     workspace = workspace or DEFAULT_WORKSPACE_ROOT
     encoded = {key: base64.b64encode(value).decode() for key, value in files.items()}
     sync_args = sync_command(env)[1:]
@@ -400,8 +402,15 @@ def sync_source(
     ]
     declared = dict(env.variables)
     directories = uv_env(workspace)
-    if archive:
-        # Keep an interpreter uv downloads inside the tree sent to the next VM.
+    inside = root.rstrip("/") == workspace.rstrip("/") or root.startswith(
+        workspace.rstrip("/") + "/"
+    )
+    if archive or not inside:
+        # Keep an interpreter uv downloads inside the tree sent to the next VM, and, when
+        # the project directory is off the workspace root, beside the .venv it serves: a
+        # workspace root is not always a filesystem an interpreter can be unpacked on.
+        # Spec "Remote paths letify writes": Modal's is a volume that carries no hard
+        # link, so unpacking one there fails with Operation not permitted.
         directories["UV_PYTHON_INSTALL_DIR"] = f"{root.rstrip('/')}/.letify-python"
     for key, value in directories.items():
         if key not in declared:
