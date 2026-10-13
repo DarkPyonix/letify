@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import os
 import secrets
+import shlex
 import shutil
 import socket
 import subprocess
@@ -30,6 +31,7 @@ CONNECT_TIMEOUT = 30.0
 #: The comment every reverse SSH session key carries in authorized_keys.
 SESSION_MARKER = "letify-session"
 RESTRICTION = 'restrict,port-forwarding,command="/bin/false"'
+JUMP_RESTRICTION = 'restrict,port-forwarding,permitopen="{target}",command="/bin/false"'
 
 
 @dataclass
@@ -411,6 +413,70 @@ class AuthorizedKeys:
         self._write([existing for existing in self._lines() if existing != line])
 
 
+class JumpAuthorizedKeys:
+    """The jump host's ``authorized_keys``, edited over SSH from the user's machine.
+
+    Spec "Reverse SSH through a jump host". It owns the login and the shell command that
+    edits the file there. It does not generate keys and never sends the jump key anywhere.
+    """
+
+    def __init__(self, spec: dict[str, Any]):
+        self.address = str(spec["address"])
+        self.port = int(spec.get("port", 22))
+        self.user = str(spec["user"])
+        self.key = os.path.expanduser(str(spec["key"])) if spec.get("key") else None
+
+    @property
+    def login(self) -> str:
+        return f"{self.user}@{self.address}:{self.port}"
+
+    def _edit(self, filter_program: str, environment: dict[str, str], append: str | None) -> None:
+        exports = " ".join(f"{name}={shlex.quote(value)}" for name, value in environment.items())
+        script = (
+            "set -e; umask 077; mkdir -p ~/.ssh; chmod 700 ~/.ssh; "
+            'f=~/.ssh/authorized_keys; touch "$f"; chmod 600 "$f"; '
+            "tmp=$(mktemp ~/.ssh/.letify.XXXXXX); trap 'rm -f \"$tmp\"' EXIT; "
+            f'{exports} awk {shlex.quote(filter_program)} "$f" > "$tmp"; '
+        )
+        if append is not None:
+            script += f"printf '%s\\n' {shlex.quote(append)} >> \"$tmp\"; "
+        script += 'chmod 600 "$tmp"; mv "$tmp" "$f"'
+        command = ["ssh"]
+        if self.key:
+            command += ["-i", self.key]
+        command += ["-p", str(self.port), "-o", "BatchMode=yes", f"{self.user}@{self.address}"]
+        command.append(script)
+        try:
+            result = subprocess.run(command, capture_output=True, text=True, timeout=60)
+        except (OSError, subprocess.TimeoutExpired) as error:
+            self._refused(str(error) or type(error).__name__)
+        if result.returncode != 0:
+            reason = (result.stderr or "").strip().splitlines()
+            self._refused(reason[-1] if reason else f"ssh exited with {result.returncode}")
+
+    def _refused(self, reason: str) -> None:
+        raise OSError(f"reverse_ssh: the jump host {self.login} refused letify ({reason})")
+
+    def purge(self, alias: str) -> None:
+        """Remove every session line for ``alias``, as ``AuthorizedKeys.purge`` does."""
+        self._edit(
+            'NF >= 2 && $(NF-1) == ENVIRON["M"] && $NF == ENVIRON["A"] { next } { print }',
+            {"M": SESSION_MARKER, "A": alias},
+            None,
+        )
+
+    def install(self, alias: str, public_key: str, target: str) -> str:
+        """Append the session line, limited to opening a connection to ``target``."""
+        kind, body = public_key.split()[:2]
+        restriction = JUMP_RESTRICTION.format(target=target)
+        line = f"{restriction} {kind} {body} {SESSION_MARKER} {alias}"
+        self._edit("{ print }", {}, line)
+        return line
+
+    def remove(self, line: str) -> None:
+        self._edit('$0 != ENVIRON["L"] { print }', {"L": line}, None)
+
+
 class ReverseSSH(Strategy):
     """The remote side forwards its SSH server back to the user's machine with ``ssh -R 0:``."""
 
@@ -428,6 +494,10 @@ class ReverseSSH(Strategy):
     def attempt(self, target: Target, cancel: threading.Event | None = None) -> Link:
         keys = self.keys or AuthorizedKeys()
         keys.purge(target.alias)
+        spec = target.reverse_ssh or {}
+        jump = JumpAuthorizedKeys(spec["jump"]) if spec.get("jump") else None
+        if jump is not None:
+            jump.purge(target.alias)
         from ..paths import local_tmp_directory
 
         tmp_dir = local_tmp_directory()
@@ -454,26 +524,41 @@ class ReverseSSH(Strategy):
         if result.returncode != 0:
             shutil.rmtree(directory, ignore_errors=True)
             raise OSError(f"ssh-keygen failed: {result.stderr.strip()}")
-        line = keys.install(target.alias, private.with_suffix(".pub").read_text())
+        public = private.with_suffix(".pub").read_text()
+        line = keys.install(target.alias, public)
+        jump_line: str | None = None
 
         def cleanup() -> None:
-            keys.remove(line)
-            shutil.rmtree(directory, ignore_errors=True)
+            try:
+                if jump is not None and jump_line is not None:
+                    jump.remove(jump_line)
+            finally:
+                keys.remove(line)
+                shutil.rmtree(directory, ignore_errors=True)
 
-        spec = target.reverse_ssh or {}
         try:
+            if jump is not None:
+                target_address = f"{spec['address']}:{int(spec.get('port', 22))}"
+                jump_line = jump.install(target.alias, public, target_address)
+            request: dict[str, Any] = {
+                "kind": "reverse_ssh",
+                "address": spec["address"],
+                "port": int(spec.get("port", 22)),
+                "user": spec["user"],
+                "private_key": private.read_text(),
+                "key_directory": (
+                    f"{target.workspace.rstrip('/')}/tmp/letify-{secrets.token_hex(8)}"
+                ),
+                "ssh_port": target.ssh_port,
+            }
+            if jump is not None:
+                request["jump"] = {
+                    "address": jump.address,
+                    "port": jump.port,
+                    "user": jump.user,
+                }
             answer = target.rendezvous.exchange(
-                {
-                    "kind": "reverse_ssh",
-                    "address": spec["address"],
-                    "port": int(spec.get("port", 22)),
-                    "user": spec["user"],
-                    "private_key": private.read_text(),
-                    "key_directory": (
-                        f"{target.workspace.rstrip('/')}/tmp/letify-{secrets.token_hex(8)}"
-                    ),
-                    "ssh_port": target.ssh_port,
-                },
+                request,
                 CONNECT_TIMEOUT,
             )
             port = int(answer["port"])
@@ -512,6 +597,7 @@ __all__ = [
     "AuthorizedKeys",
     "ConnectBack",
     "DirectSSH",
+    "JumpAuthorizedKeys",
     "ProviderFallback",
     "QuicUDP",
     "ReverseSSH",

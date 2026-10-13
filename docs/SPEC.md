@@ -1910,6 +1910,21 @@ It is opt-in because it needs the user's machine to accept inbound SSH and needs
 
 The key is per session. letify generates a new ed25519 key pair for each session and appends the public key to the user's `~/.ssh/authorized_keys` with `restrict,port-forwarding,command="/bin/false"` and the comment `letify-session <alias>`. The private key reaches the remote side through the rendezvous. Closing the link removes the line. Before a new session's key is added, every line carrying the `letify-session` marker for that alias is removed, so a crashed session never leaves a key behind.
 
+#### Reverse SSH through a jump host <!-- id: reverse-ssh-jump -->
+
+> `reverse_ssh` takes an optional `jump`, for a user's machine whose SSH server the internet reaches only through another server.
+
+```toml
+[colab_pro_plus]
+reverse_ssh = { address = "168.188.127.175", port = 30008, user = "work", jump = { address = "jump.example.org", port = 20070, user = "root", key = "~/.ssh/id_jump" } }
+```
+
+With `jump`, `address` and `port` are the user's SSH server as the jump host reaches it, and the remote side connects to `<user>@<address>:<port>` through `-o ProxyCommand="ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new -i <session key> -W %h:%p -p <jump port> <jump user>@<jump address>"` and forwards its port back with `-R` as before. It is a ProxyCommand rather than `-J`, because the options given for the main hop on the command line do not reach a `-J` hop.
+
+The per-session key authorizes both hops. Besides the user's own `~/.ssh/authorized_keys`, letify appends the session's public key to the jump host's `~/.ssh/authorized_keys` with `restrict,port-forwarding,permitopen="<address>:<port>",command="/bin/false"` and the comment `letify-session <alias>`, so the key opens a connection to the user's SSH server and nothing else. letify reaches the jump host from the user's machine with `ssh -i <jump key> -p <jump port> <jump user>@<jump address>`, `BatchMode=yes`, and edits the file there with a shell command; `key` is optional and defaults to the SSH client's own keys. Closing the link removes that line, and before a new session's key is added every line carrying the `letify-session` marker for that alias is removed from the jump host too, as on the user's machine. The jump key never leaves the user's machine.
+
+A jump host that letify cannot log in to, or whose `authorized_keys` it cannot edit, fails the strategy with `reverse_ssh: the jump host <user>@<address>:<port> refused letify (<reason>)`, before anything is sent to the remote side.
+
 ### Colab <!-- id: colab-transport -->
 
 > Colab is a `Shell` whose rendezvous is `colab exec`. It has no forward SSH, and its fallback is `colab exec` with the Colab file API.

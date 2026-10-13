@@ -352,6 +352,131 @@ def test_a_reverse_session_key_is_restricted_marked_and_removed_on_close(
     assert "AAAAmine" in authorized.read_text()
 
 
+JUMP = {"address": "jump.example.org", "port": 20070, "user": "root", "key": "~/.ssh/id_jump"}
+
+
+def jump_target(rendezvous, **jump):
+    return Target(
+        alias="lab",
+        rendezvous=rendezvous,
+        user="researcher",
+        reverse_ssh={
+            "address": "10.0.0.5",
+            "port": 30008,
+            "user": "me",
+            "jump": {**JUMP, **jump},
+        },
+    )
+
+
+def jump_calls(recorder):
+    return [c for c in recorder.commands if c[0] == "ssh"]
+
+
+def dispatch(jump_result=None):
+    def run(command):
+        if command[0] == "ssh-keygen":
+            return keygen(command)
+        return jump_result or FakeCompleted()
+
+    return run
+
+
+JUMP_LINE = (
+    'restrict,port-forwarding,permitopen="10.0.0.5:30008",command="/bin/false" '
+    "ssh-ed25519 AAAAsession letify-session lab"
+)
+
+
+def test_a_jump_line_is_installed_with_the_exact_restriction_and_removed_on_close(
+    isolated_home, patch_run
+) -> None:
+    recorder = patch_run(strategies, result=dispatch())
+    link = ReverseSSH().attempt(jump_target(CannedRendezvous({"port": 40022})))
+    install = jump_calls(recorder)[-1]
+    assert install[:7] == [
+        "ssh",
+        "-i",
+        os.path.expanduser("~/.ssh/id_jump"),
+        "-p",
+        "20070",
+        "-o",
+        "BatchMode=yes",
+    ]
+    assert install[-2] == "root@jump.example.org"
+    assert JUMP_LINE in install[-1]
+    link.close()
+    removal = jump_calls(recorder)[-1]
+    assert removal[-2] == "root@jump.example.org"
+    assert JUMP_LINE in removal[-1]
+    assert len(jump_calls(recorder)) == 3
+
+
+def test_a_jump_key_is_optional_and_then_left_to_the_ssh_client(isolated_home, patch_run) -> None:
+    recorder = patch_run(strategies, result=dispatch())
+    target = jump_target(CannedRendezvous({"port": 40022}))
+    del target.reverse_ssh["jump"]["key"]
+    ReverseSSH().attempt(target)
+    assert "-i" not in jump_calls(recorder)[0]
+
+
+def test_stale_jump_lines_are_purged_before_the_session_line_is_added(
+    isolated_home, patch_run
+) -> None:
+    recorder = patch_run(strategies, result=dispatch())
+    ReverseSSH().attempt(jump_target(CannedRendezvous({"port": 40022})))
+    purge, install = jump_calls(recorder)[:2]
+    assert "letify-session" in purge[-1] and "lab" in purge[-1]
+    assert JUMP_LINE not in purge[-1]
+    assert JUMP_LINE in install[-1]
+
+
+def test_a_refused_jump_raises_and_sends_nothing_to_the_rendezvous(
+    isolated_home, patch_run
+) -> None:
+    patch_run(
+        strategies, result=dispatch(FakeCompleted(returncode=255, stderr="Permission denied\n"))
+    )
+    rendezvous = CannedRendezvous({"port": 40022})
+    with pytest.raises(OSError) as raised:
+        ReverseSSH().attempt(jump_target(rendezvous))
+    assert str(raised.value) == (
+        "reverse_ssh: the jump host root@jump.example.org:20070 refused letify (Permission denied)"
+    )
+    assert rendezvous.requests == []
+
+
+def test_the_rendezvous_names_the_jump_host_and_never_its_key(isolated_home, patch_run) -> None:
+    patch_run(strategies, result=dispatch())
+    rendezvous = CannedRendezvous({"port": 40022})
+    ReverseSSH().attempt(jump_target(rendezvous))
+    request = rendezvous.requests[0]
+    assert request["jump"] == {"address": "jump.example.org", "port": 20070, "user": "root"}
+    assert "id_jump" not in json.dumps(request)
+
+
+def test_the_remote_half_reaches_the_server_through_the_jump_host(patch_popen, tmp_path) -> None:
+    started = patch_popen(nat, ["Allocated port 40022 for remote forward to 127.0.0.1:22\n"])
+    nat.begin(
+        {
+            "kind": "reverse_ssh",
+            "address": "10.0.0.5",
+            "port": 30008,
+            "user": "me",
+            "private_key": "PRIVATE KEY\n",
+            "key_directory": str(tmp_path),
+            "jump": {"address": "jump.example.org", "port": 20070, "user": "root"},
+        }
+    )
+    command = started[0].command
+    option = next(c for c in command if c.startswith("ProxyCommand="))
+    assert "-W %h:%p" in option
+    assert "-p 20070" in option and "root@jump.example.org" in option
+    assert str(tmp_path / "letify_reverse") in option
+    assert "StrictHostKeyChecking=accept-new" in option
+    assert command[-1] == "me@10.0.0.5" and command[command.index("-p") + 1] == "30008"
+
+
 def test_the_remote_half_of_a_reverse_forward_lets_the_server_choose_the_port(
     patch_popen, tmp_path
 ) -> None:
