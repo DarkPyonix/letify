@@ -20,7 +20,7 @@ from importlib import import_module
 from pathlib import Path
 
 import pytest
-from conftest import FakeCompleted, FakeResponse, provider_of
+from conftest import FakeColabCli, FakeCompleted, FakeResponse, provider_of
 
 import letify
 from letify import providers
@@ -3066,3 +3066,73 @@ def test_a_data_channel_failure_names_the_host(isolated_home, fake_modal, capfd)
     finally:
         channel.close()
         provider.stop(runtime)
+
+
+# -- Spec: Colab, an assignment with no session ---------------------------------
+
+
+def _colab_with(patch_which, patch_run, cli):
+    patch_which(tools_module, present=True)
+    patch_run(colab_module, result=cli)
+    return provider_of(Colab, "colab_a")
+
+
+def test_a_failed_colab_new_that_left_an_assignment_unassigns_it_and_reraises(
+    isolated_home, patch_which, patch_run, capsys
+) -> None:
+    cli = FakeColabCli(new_adds="gpu-a100-new", new_fails=True)
+    provider = _colab_with(patch_which, patch_run, cli)
+    with pytest.raises(letify.RuntimeFailure, match=r"ReadTimeout|exited 1"):
+        provider.create_session(provider.A100, "letify-a100-1")
+    assert cli.unassigned == ["gpu-a100-new"]
+    assert "gpu-a100-new" in capsys.readouterr().err
+
+
+def test_an_assignment_that_existed_before_a_failed_colab_new_is_left_alone(
+    isolated_home, patch_which, patch_run
+) -> None:
+    cli = FakeColabCli(assignments=[("?", "gpu-old")], new_fails=True)
+    provider = _colab_with(patch_which, patch_run, cli)
+    with pytest.raises(letify.RuntimeFailure):
+        provider.create_session(provider.A100, "letify-a100-1")
+    assert cli.unassigned == []
+
+
+def test_a_failed_colab_new_does_not_unassign_a_session_with_a_name(
+    isolated_home, patch_which, patch_run
+) -> None:
+    cli = FakeColabCli(new_fails=True)
+    cli.assignments.append(("letify-other", "gpu-named"))
+    provider = _colab_with(patch_which, patch_run, cli)
+    with pytest.raises(letify.RuntimeFailure):
+        provider.create_session(provider.A100, "letify-a100-1")
+    assert cli.unassigned == []
+
+
+def test_a_failed_endpoint_check_is_reported_and_the_original_error_is_raised(
+    isolated_home, patch_which, patch_run, capsys
+) -> None:
+    cli = FakeColabCli(new_fails=True, list_fails_after=1)
+    provider = _colab_with(patch_which, patch_run, cli)
+    with pytest.raises(letify.RuntimeFailure, match=r"colab_a|new"):
+        provider.create_session(provider.A100, "letify-a100-1")
+    assert "endpoint check" in capsys.readouterr().err
+    assert cli.unassigned == []
+
+
+def test_colab_orphans_are_the_endpoints_with_no_local_session(
+    isolated_home, patch_which, patch_run
+) -> None:
+    cli = FakeColabCli(assignments=[("?", "gpu-a"), ("letify-x", "gpu-b"), ("?", "gpu-c")])
+    provider = _colab_with(patch_which, patch_run, cli)
+    assert provider.orphans() == ["gpu-a", "gpu-c"]
+
+
+def test_stopping_a_colab_orphan_unassigns_its_endpoint(
+    isolated_home, patch_which, patch_run
+) -> None:
+    cli = FakeColabCli(assignments=[("?", "gpu-a")])
+    provider = _colab_with(patch_which, patch_run, cli)
+    assert provider.stop_orphan("gpu-a") is True
+    assert cli.unassigned == ["gpu-a"]
+    assert provider.orphans() == []

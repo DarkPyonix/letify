@@ -121,6 +121,28 @@ def _access_token(stored: dict[str, Any]) -> str:
         return str(json.loads(response.read())["access_token"])
 
 
+#: Run in the CLI's own Python: release the server-side assignment at the endpoint in argv.
+#: ``colab stop`` cannot do this, because it needs the local session state an assignment
+#: made by a failed ``colab new`` never got. Spec "Colab", an assignment with no session.
+UNASSIGN_SCRIPT = (
+    "import sys\n"
+    "from colab_cli.common import state\n"
+    "state.client.unassign(sys.argv[1])\n"
+)
+
+
+def _parse_assignments(listing: str) -> list[tuple[str, str]]:
+    """The ``(name, endpoint)`` pairs in ``colab sessions`` output, ``?`` for no local state."""
+    found = []
+    for line in listing.splitlines():
+        head = line.strip().split("|")[0].split()
+        if len(head) >= 2 and head[0].startswith("[") and head[0].endswith("]"):
+            name = head[0][1:-1]
+            if name.lower() != "colab":
+                found.append((name, head[1]))
+    return found
+
+
 class Colab(Shell):
     """A Colab runtime for one Google account."""
 
@@ -316,6 +338,68 @@ class Colab(Shell):
                 names.append(word)
         return names
 
+    def _assignments(self) -> list[tuple[str, str]]:
+        """Every assignment the account holds, as ``(name, endpoint)``; ``?`` has no local state."""
+        return _parse_assignments(self._cli("sessions", timeout=120))
+
+    def _unassign(self, endpoint: str) -> None:
+        """Release one assignment by endpoint, through the CLI's own client library."""
+        uv = tools.find_uv()
+        if uv is None:
+            raise ProviderUnavailable(self.kind, tools.missing_uv_message())
+        command = [*tools.python_command(tools.COLAB, uv), "-c", UNASSIGN_SCRIPT, endpoint]
+        result = subprocess.run(
+            command, capture_output=True, text=True, timeout=180, env=self._env()
+        )
+        if result.returncode != 0:
+            raise RuntimeFailure(
+                f"unassigning {endpoint} exited {result.returncode}",
+                command=" ".join(command[:-3]),
+                stderr=(result.stderr or "").strip(),
+            )
+
+    def orphans(self) -> list[str]:
+        """Endpoints of assignments the account holds that no local session names."""
+        return [endpoint for name, endpoint in self._assignments() if name == "?"]
+
+    def stop_orphan(self, ref: str) -> bool:
+        """Unassign one endpoint `orphans` reported, and report whether it is gone."""
+        try:
+            self._unassign(ref)
+        except (RuntimeFailure, ProviderUnavailable, subprocess.TimeoutExpired):
+            return False
+        return True
+
+    def _release_leftovers(self, before: set[str]) -> None:
+        """Unassign each `?` assignment that appeared since ``before``, best effort."""
+        try:
+            leftovers = [
+                endpoint
+                for name, endpoint in self._assignments()
+                if name == "?" and endpoint not in before
+            ]
+        except (RuntimeFailure, ProviderUnavailable, subprocess.TimeoutExpired) as exc:
+            print(
+                f"letify: {self.alias}: the endpoint check after the failed 'colab new' "
+                f"could not list assignments ({exc}); an assignment may still be billing, "
+                "see 'letify stop --orphans'",
+                file=sys.stderr,
+            )
+            return
+        for endpoint in leftovers:
+            if self.stop_orphan(endpoint):
+                print(
+                    f"letify: {self.alias}: released {endpoint}, assigned by the failed "
+                    "'colab new'",
+                    file=sys.stderr,
+                )
+            else:
+                print(
+                    f"letify: {self.alias}: could not release {endpoint}, assigned by the "
+                    "failed 'colab new'; run 'letify stop --orphans'",
+                    file=sys.stderr,
+                )
+
     # -- the pipeline ----------------------------------------------------------
 
     def strategies(self) -> list[Strategy]:
@@ -388,7 +472,22 @@ class Colab(Shell):
             args += ["--gpu", ALIASES.get(instance.gpu, instance.gpu)]
         elif instance.tpu:
             args += ["--tpu", instance.tpu]
-        self._cli(*args, timeout=900)
+        try:
+            before = {endpoint for _, endpoint in self._assignments()}
+        except (RuntimeFailure, subprocess.TimeoutExpired) as exc:
+            before = None
+            print(
+                f"letify: {self.alias}: the endpoint check before 'colab new' could not "
+                f"list assignments ({exc}); a failed creation will not be cleaned up",
+                file=sys.stderr,
+            )
+        try:
+            self._cli(*args, timeout=900)
+        except BaseException:
+            # A timed out `colab new` can still leave a server-side assignment behind.
+            if before is not None:
+                self._release_leftovers(before)
+            raise
         try:
             self._start_keep_alive(name)
         except BaseException:
