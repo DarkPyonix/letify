@@ -258,6 +258,7 @@ class Connection:
         emit: Callable[[str, bytes], None],
         *,
         death_detail: Callable[[], str] = lambda: "",
+        death_cause: Callable[[], str | None] = lambda: None,
         poll_fd: int | None = None,
     ):
         self.name = name
@@ -276,6 +277,8 @@ class Connection:
         self._receiver = wire.Receiver(readinto)
         self._emit = emit
         self._death_detail = death_detail
+        #: Names what ended the worker when the provider can tell, replacing the usual causes.
+        self._death_cause = death_cause
         #: Guards ``_reading`` and wakes waiters when a reply, a hello or a failure arrives.
         self._turn = threading.Condition()
         self._reading = False
@@ -383,10 +386,16 @@ class Connection:
             return
         if message is None:
             detail = self._death_detail()
+            cause = self._death_cause()
+            causes = (
+                f": {cause}."
+                if cause
+                else ". The usual causes are an out of memory kill, a preempted session, "
+                "or a crash below Python."
+            )
             message = (
                 f"{self.name}: the worker stopped without replying, so the process died "
-                f"before it finished. The usual causes are an out of memory kill, a "
-                f"preempted session, or a crash below Python.\n--- last remote output ---\n"
+                f"before it finished{causes}\n--- last remote output ---\n"
                 f"{self._tail.text()[-2000:]}{detail[-2000:]}"
             )
         with self._turn:

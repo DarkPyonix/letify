@@ -31,7 +31,7 @@ import tempfile
 import threading
 import time
 import weakref
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from typing import IO, TYPE_CHECKING, Any
 
 from ..config import ProviderConfig
@@ -131,6 +131,22 @@ def lifetime_detail(*, age_s: float, lifetime_s: int) -> str | None:
         f"the Modal sandbox reached the {lifetime_s} s lifetime letify asked for; "
         f"raise timeout on the account to run longer"
     )
+
+
+def exit_cause(found: tuple[bool, int | None] | None) -> str | None:
+    """What a poll of a sandbox whose worker stopped says, or None when it is unknown.
+
+    Spec "Modal": the exit code tells an out of memory kill from a preemption.
+    """
+    if found is None:
+        return None
+    ended, code = found
+    if not ended:
+        return "the Modal sandbox is still running, so the worker process died inside it"
+    text = f"the Modal sandbox exited with code {code}"
+    if code == 137:
+        text += ", which is SIGKILL, most often the container running out of memory"
+    return text
 
 
 class VolumePathMissing(RuntimeFailure):
@@ -491,7 +507,27 @@ class Modal(Provider):
         return SandboxChannel(
             adapter, sandbox, name=runtime.name, data_port=data_port, streams=streams,
             lifetime_s=self.sandbox_timeout_s,
+            probe=lambda: self.poll_sandbox(sandbox),
         )
+
+    def poll_sandbox(self, sandbox: str) -> tuple[bool, int | None] | None:
+        """Poll a sandbox once from a second adapter: ``(ended, exit code)``, or None if unknown.
+
+        A short-lived adapter asks, because the one carrying the call may be blocked.
+        """
+        other = Adapter.for_account(self.alias)
+        # A poll that hangs ends the second adapter, which makes the request raise.
+        limit = threading.Timer(POLL_LIMIT, other.abort)
+        limit.daemon = True
+        limit.start()
+        try:
+            code = other.request("poll", sandbox=sandbox)
+        except (LetifyError, ValueError, OSError):
+            return None
+        finally:
+            limit.cancel()
+            other.close()
+        return (code is not None, code)
 
     def runtime_state(self, runtime: Runtime) -> RuntimeState:
         """Poll the sandbox from a second adapter process, never the one carrying the call.
@@ -502,19 +538,11 @@ class Modal(Provider):
         sandbox = self._sandboxes.get(runtime.name)
         if sandbox is None:
             return RuntimeState()
-        other = Adapter.for_account(self.alias)
-        # A poll that hangs ends the second adapter, which makes the request raise.
-        limit = threading.Timer(POLL_LIMIT, other.abort)
-        limit.daemon = True
-        limit.start()
-        try:
-            code = other.request("poll", sandbox=sandbox)
-        except (LetifyError, ValueError, OSError):
+        found = self.poll_sandbox(sandbox)
+        if found is None:
             return RuntimeState()
-        finally:
-            limit.cancel()
-            other.close()
-        if code is None:
+        ended, code = found
+        if not ended:
             return RuntimeState("running")
         return RuntimeState(
             "ended", f"the Modal sandbox ended (exit code {code}) while the call was running"
@@ -686,8 +714,11 @@ class SandboxChannel(FramedChannel):
         data_port: int | None = None,
         streams: int = 1,
         lifetime_s: int = 0,
+        probe: Callable[[], tuple[bool, int | None] | None] | None = None,
     ):
         self.adapter = adapter
+        #: Polls the sandbox from a second adapter, see ``Modal.poll_sandbox``.
+        self.probe = probe
         self.sandbox = sandbox
         self.name = name
         self.data_port = data_port
@@ -716,6 +747,7 @@ class SandboxChannel(FramedChannel):
             wire.chunks_readinto(self._read_chunks),
             self._emit,
             death_detail=self._raw_text,
+            death_cause=self._exit_cause,
         )
         self._connection = self._stdio
         self._send_worker()
@@ -729,6 +761,17 @@ class SandboxChannel(FramedChannel):
             age_s=time.monotonic() - self.opened_at, lifetime_s=self.lifetime_s
         )
         return f"{said}\n{text}" if said else text
+
+    def _exit_cause(self) -> str | None:
+        """What one poll of the sandbox found, or None to keep the usual causes.
+
+        Spec "Modal": a lifetime death is already named by ``_raw_text``, so it is not polled.
+        """
+        if self.probe is None or lifetime_detail(
+            age_s=time.monotonic() - self.opened_at, lifetime_s=self.lifetime_s
+        ):
+            return None
+        return exit_cause(self.probe())
 
     def _send_worker(self) -> None:
         # After a reexec the data connection is gone, so the source goes back over stdio.
@@ -821,7 +864,12 @@ class SandboxChannel(FramedChannel):
                 )
                 carrier.timeout = DATA_CONNECT_TIMEOUT
             connection = Connection(
-                self.name, carrier.send, carrier.recv_into, self._emit, death_detail=self._raw_text
+                self.name,
+                carrier.send,
+                carrier.recv_into,
+                self._emit,
+                death_detail=self._raw_text,
+                death_cause=self._exit_cause,
             )
             # The connect timeout still applies, so a missing hello fails here.
             connection.wait_hello()

@@ -814,6 +814,8 @@ It passes `timeout`, the entry option `timeout`, as the sandbox's maximum lifeti
 
 A sandbox that reaches that lifetime takes its worker with it, so the channel sees a worker that stopped without replying. Where the session's age is within a minute of the lifetime letify asked for, the failure says so instead of listing causes: `the Modal sandbox reached the <seconds> s lifetime letify asked for; raise timeout on the account to run longer`.
 
+Otherwise a Modal worker that stopped without replying is followed by one `poll` of its sandbox from a second adapter process, waiting at most 30 s for the exit code, and the failure names what the poll found instead of listing causes: `the Modal sandbox exited with code <n>` for a sandbox that ended, with `, which is SIGKILL, most often the container running out of memory` added for 137, and `the Modal sandbox is still running, so the worker process died inside it` for one still running. A poll that fails or times out leaves the message as it was. The message is what tells an out-of-memory kill from a preemption, which a training run that died twice in one day could not.
+
 ### Modal data channel <!-- id: modal-data-channel -->
 
 > Once the worker has said hello over the sandbox's standard input and output, the channel moves its frames to a TCP connection through a Modal encrypted port. Standard input and output stay the control path and the fallback.

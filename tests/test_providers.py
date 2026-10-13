@@ -3205,3 +3205,73 @@ def test_stopping_a_colab_orphan_unassigns_its_endpoint(
     assert provider.stop_orphan("gpu-a") is True
     assert cli.unassigned == ["gpu-a"]
     assert provider.orphans() == []
+
+
+# -- Modal: a worker that stopped names what the sandbox did (spec "Modal") -----------
+
+
+def _died_modal_call(fake_modal, provider, *, ended: int | None) -> str:
+    """Kill the worker behind a Modal channel, make a call, and return the failure text."""
+    import os
+    import signal
+    import time
+
+    from letify.errors import ProtocolError
+
+    runtime = modal_runtime(provider)
+    channel = provider.open_channel(runtime)
+    channel.start()
+    [pid] = fake_modal.sandbox_pids()
+    if ended is not None:
+        fake_modal.end_sandbox("sb-1", ended)
+    os.kill(pid, signal.SIGKILL)
+    try:
+        with pytest.raises(ProtocolError) as caught:
+            channel.call(time.sleep, (600,), {}, timeout=20)
+    finally:
+        channel.close()
+        provider.stop(runtime)
+    return str(caught.value)
+
+
+def test_a_worker_killed_with_exit_137_names_the_out_of_memory_kill(
+    isolated_home, fake_modal
+) -> None:
+    text = _died_modal_call(fake_modal, provider_of(Modal, "m"), ended=137)
+    assert "the Modal sandbox exited with code 137, which is SIGKILL" in text
+    assert "most often the container running out of memory" in text
+    assert "The usual causes" not in text
+
+
+def test_a_worker_whose_sandbox_exited_with_1_names_the_code_only(
+    isolated_home, fake_modal
+) -> None:
+    text = _died_modal_call(fake_modal, provider_of(Modal, "m"), ended=1)
+    assert "the Modal sandbox exited with code 1" in text
+    assert "SIGKILL" not in text
+    assert "The usual causes" not in text
+
+
+def test_a_worker_that_died_inside_a_running_sandbox_says_so(isolated_home, fake_modal) -> None:
+    text = _died_modal_call(fake_modal, provider_of(Modal, "m"), ended=None)
+    assert "the Modal sandbox is still running, so the worker process died inside it" in text
+    assert "The usual causes" not in text
+
+
+def test_a_failed_poll_leaves_the_worker_death_message_as_it_was(
+    isolated_home, fake_modal
+) -> None:
+    fake_modal.fail("poll")
+    text = _died_modal_call(fake_modal, provider_of(Modal, "m"), ended=137)
+    assert "The usual causes are an out of memory kill" in text
+    assert "the Modal sandbox exited" not in text
+
+
+def test_a_sandbox_at_its_lifetime_keeps_the_lifetime_message_without_a_poll(
+    isolated_home, fake_modal
+) -> None:
+    provider = provider_of(Modal, "m", timeout=1)
+    text = _died_modal_call(fake_modal, provider, ended=137)
+    assert "lifetime letify asked for" in text
+    assert "exited with code" not in text
+    assert fake_modal.requests("poll") == []
