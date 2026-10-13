@@ -1269,6 +1269,31 @@ def _op_data_failed(request):
     return {"ok": True, "value": True}
 
 
+def _data_received(blobs, digest):
+    """Bytes of this blob that are on the runtime's disk, however they are arriving.
+
+    Spec "When a blob does not arrive": the wait counts time without progress, and this is
+    what progress means. Reads the partial a single put writes and the one a parallel put
+    fills, so neither shape looks stalled while it grows.
+    """
+    total = 0
+    final = _data_file(blobs, digest)
+    directory = os.path.dirname(final)
+    name = os.path.basename(final)
+    try:
+        entries = os.listdir(directory)
+    except OSError:
+        return 0
+    for entry in entries:
+        if entry != name and not entry.startswith(name + "."):
+            continue
+        try:
+            total = max(total, os.stat(os.path.join(directory, entry)).st_size)
+        except OSError:
+            continue
+    return total
+
+
 def _data_want(digests, blocking=False):
     """Ask the local process for these blobs, in this order. Nothing replies to it."""
     if not digests:
@@ -1353,6 +1378,7 @@ def _data_wait(path):
             state["first"] = os.path.basename(path)
         deadline = started + state["wait"]
     _data_want([digest], True)
+    received = _data_received(state["blobs"], digest)
     try:
         with _DATA_READY:
             while path in state["pending"] and state["dir"] in _DATA_CALLS:
@@ -1361,11 +1387,20 @@ def _data_wait(path):
                         "%s was never sent: %s"
                         % (os.path.basename(path), state["failed"])
                     )
+                # Spec "When a blob does not arrive": the wait counts time without
+                # progress, because a blob needing longer than the timeout at the link's
+                # rate would otherwise fail however healthy its transfer was.
+                landed = _data_received(state["blobs"], digest)
+                if landed > received:
+                    received = landed
+                    deadline = time.monotonic() + state["wait"]
                 left = deadline - time.monotonic()
                 if left <= 0:
                     raise _DataFailure(
-                        "the file blob %s of %s did not arrive within %.0f s"
-                        % (digest, os.path.basename(path), state["wait"])
+                        "the file blob %s of %s did not arrive within %.0f s, "
+                        "%.1f MiB of %.1f MiB arrived"
+                        % (digest, os.path.basename(path), state["wait"],
+                           received / 1048576.0, size / 1048576.0)
                     )
                 _DATA_READY.wait(min(left, 0.5))
     finally:

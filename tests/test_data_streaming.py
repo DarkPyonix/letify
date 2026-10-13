@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import collections
 import os
+import pickle
 import re
 import tempfile
 import threading
@@ -1684,3 +1685,75 @@ def test_a_sender_that_stops_fails_the_readers_waiting_on_it(
     assert "was never sent" in str(failure.value), failure.value
     err = capsys.readouterr().err
     assert "data sending stopped after" in err, err
+
+
+def test_a_blob_still_arriving_does_not_time_out(let, cpu, project, monkeypatch) -> None:
+    """Spec "When a blob does not arrive": the timeout counts time without progress.
+
+    KICT's 11.3 GB table failed after 600 s on a Modal path measured at 45.3 MiB/s for a
+    blob on its own. 11.3 GB needs 19.3 MiB/s to land inside 600 s, so a healthy transfer
+    of a blob that large always failed, and the line said 0.0 MiB/s because the rate counts
+    only the blobs that completed.
+    """
+    from letify.store import pathdata
+
+    big = project / "slow.bin"
+    big.write_bytes(b"s" * (6 << 20))
+    monkeypatch.setattr(pathdata, "FIRST_WAVE_MIB", 0.0)
+    monkeypatch.setattr(pathdata, "FIRST_WAVE_FILES", 0)
+    monkeypatch.setattr(pathdata, "CHUNK", 1 << 20)
+    # Each piece lands well inside the wait, and the whole blob takes longer than it.
+    monkeypatch.setattr(pathdata, "WAIT_TIMEOUT_S", 4.0)
+    def piecewise(runtime, pipeline, blobs, digest, local, size, meter):
+        with open(local, "rb") as handle:
+            offset = 0
+            while offset < size:
+                piece = handle.read(1 << 20)
+                if not piece:
+                    break
+                pipeline.send(
+                    {
+                        "op": "data_put",
+                        "dir": blobs,
+                        "digest": digest,
+                        "offset": offset,
+                        "chunk": pickle.PickleBuffer(piece),
+                        "last": offset + len(piece) >= size,
+                    }
+                )
+                offset += len(piece)
+                time.sleep(3.0)
+
+    monkeypatch.setattr(pathdata, "_put", piecewise)
+
+    # retries=0, because a retry finds the blob already there and hides the timeout.
+    @let.function(device=cpu, host=letify.remote, retries=0)
+    def read_it(path) -> int:
+        return len(path.read_bytes())
+
+    assert read_it(path=big) == 6 << 20
+
+
+def test_a_blob_that_never_starts_still_times_out_and_says_how_far_it_got(
+    let, cpu, project, monkeypatch
+) -> None:
+    """Spec "When a blob does not arrive": the timeout still catches a blob that stalls."""
+    from letify.store import pathdata
+
+    big = project / "stalled.bin"
+    big.write_bytes(b"t" * (2 << 20))
+    monkeypatch.setattr(pathdata, "FIRST_WAVE_MIB", 0.0)
+    monkeypatch.setattr(pathdata, "FIRST_WAVE_FILES", 0)
+    monkeypatch.setattr(pathdata, "WAIT_TIMEOUT_S", 4.0)
+    # Nothing is ever sent, so nothing ever grows.
+    monkeypatch.setattr(pathdata.Stream, "_send", lambda self, digest, meter: None)
+
+    @let.function(device=cpu, host=letify.remote)
+    def read_it(path) -> int:
+        return len(path.read_bytes())
+
+    with pytest.raises(RuntimeFailure) as failure:
+        read_it(path=big)
+    message = str(failure.value)
+    assert "did not arrive" in message, message
+    assert "arrived" in message, message
