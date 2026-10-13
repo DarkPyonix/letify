@@ -419,6 +419,21 @@ class Modal(Provider):
         value = self.config.option("idle_timeout", IDLE_TIMEOUT)
         return max(1, int(value))
 
+    @property
+    def sandbox_memory_mib(self) -> int | None:
+        """The sandbox's memory request in MiB from ``memory_gib``, or None for Modal's own.
+
+        Spec "Modal": a training process past what the sandbox gets is killed with SIGKILL.
+        """
+        value = self.config.option("memory_gib")
+        if value is None:
+            return None
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or value <= 0:
+            raise ConfigError(
+                f"{self.alias}: memory_gib has to be a positive number of GiB, not {value!r}"
+            )
+        return int(value * 1024)
+
     def adapter(self) -> Adapter:
         """The adapter acting as this account, started on its first request."""
         if self._adapter is None or self._adapter.closed:
@@ -484,6 +499,7 @@ class Modal(Provider):
             gpu=self.wire_name(runtime.instance) or None,
             timeout=self.sandbox_timeout_s,
             idle_timeout=self.sandbox_idle_timeout_s,
+            memory=self.sandbox_memory_mib,
             ports=[] if data_port is None else [data_port],
         )
         sandbox = str(created["sandbox"])

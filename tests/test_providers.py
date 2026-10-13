@@ -2368,6 +2368,39 @@ def test_a_modal_sandbox_is_created_with_a_lifetime_and_an_idle_limit(
         provider.stop(runtime)
 
 
+def test_a_modal_sandbox_requests_the_memory_the_account_sets(isolated_home, fake_modal) -> None:
+    # Spec "Modal": memory_gib becomes the sandbox's memory request in MiB.
+    provider = provider_of(Modal, "m", memory_gib=64)
+    runtime = modal_runtime(provider)
+    provider.open_channel(runtime)
+    try:
+        [created] = fake_modal.requests("create")
+        assert created["memory"] == 64 * 1024
+    finally:
+        provider.stop(runtime)
+
+
+def test_a_modal_sandbox_requests_no_memory_when_the_account_sets_none(
+    isolated_home, fake_modal
+) -> None:
+    provider = provider_of(Modal, "m")
+    runtime = modal_runtime(provider)
+    provider.open_channel(runtime)
+    try:
+        [created] = fake_modal.requests("create")
+        assert created.get("memory") is None
+    finally:
+        provider.stop(runtime)
+
+
+@pytest.mark.parametrize("value", [0, -2, "lots", True])
+def test_a_memory_gib_that_is_not_a_positive_number_is_refused(config_file, value) -> None:
+    from letify.errors import ConfigError
+
+    with pytest.raises(ConfigError, match="memory_gib"):
+        _ = provider_of(Modal, "lab", memory_gib=value).sandbox_memory_mib
+
+
 # -- Modal data channel ----------------------------------------------------------
 
 

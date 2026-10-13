@@ -109,6 +109,7 @@ class Adapter:
             gpu=request.get("gpu") or None,
             timeout=int(request["timeout"]),
             idle_timeout=int(request["idle_timeout"]) if request.get("idle_timeout") else None,
+            memory=int(request["memory"]) if request.get("memory") else None,
             volumes={
                 str(path): modal.Volume.from_name(str(name), create_if_missing=True)
                 for path, name in (request.get("volumes") or {}).items()
