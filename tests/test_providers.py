@@ -398,6 +398,9 @@ COLAB_CLI = [
 ]
 
 
+COLAB_PYTHON = [*COLAB_CLI[:-1], "python"]
+
+
 def test_a_missing_uv_says_how_to_get_it(isolated_home, patch_which) -> None:
     # The Colab CLI runs through uv, so uv is the one thing that has to be installed.
     patch_which(tools_module, present=False)
@@ -414,7 +417,9 @@ def test_creating_a_colab_session_names_the_accelerator_the_cli_accepts(
     recorder = patch_run(colab_module)
     provider = provider_of(Colab, "colab_a")
     provider.create_session(provider.RTX_PRO_6000, "letify-g4-1")
-    assert recorder.command == [*COLAB_CLI, "new", "-s", "letify-g4-1", "--gpu", "G4"]
+    assert recorder.command == [
+        *COLAB_PYTHON, "-c", colab_module.NEW_SCRIPT, "new", "-s", "letify-g4-1", "--gpu", "G4"
+    ]
 
 
 def test_creating_a_colab_session_for_a_tpu_asks_for_a_tpu(
@@ -424,7 +429,9 @@ def test_creating_a_colab_session_for_a_tpu_asks_for_a_tpu(
     recorder = patch_run(colab_module)
     provider = provider_of(Colab, "colab_a")
     provider.create_session(provider.v5e1, "letify-v5e1-1")
-    assert recorder.command == [*COLAB_CLI, "new", "-s", "letify-v5e1-1", "--tpu", "v5e1"]
+    assert recorder.command == [
+        *COLAB_PYTHON, "-c", colab_module.NEW_SCRIPT, "new", "-s", "letify-v5e1-1", "--tpu", "v5e1"
+    ]
 
 
 def test_colab_offers_a_cpu_instance_under_the_name_local_uses(isolated_home) -> None:
@@ -441,7 +448,69 @@ def test_creating_a_colab_session_for_the_cpu_asks_for_no_accelerator(
     recorder = patch_run(colab_module)
     provider = provider_of(Colab, "colab_a")
     provider.create_session(provider.cpu, "letify-cpu-1")
-    assert recorder.command == [*COLAB_CLI, "new", "-s", "letify-cpu-1"]
+    assert recorder.command == [
+        *COLAB_PYTHON, "-c", colab_module.NEW_SCRIPT, "new", "-s", "letify-cpu-1"
+    ]
+
+
+def test_colab_new_raises_the_request_timeout_to_600_s_and_keeps_the_900_s_limit(
+    isolated_home, patch_which, patch_run
+) -> None:
+    # Spec "Colab": google-auth's 120 s default is too short for an A100 assignment.
+    patch_which(tools_module, present=True)
+    recorder = patch_run(colab_module)
+    provider = provider_of(Colab, "colab_a")
+    provider.create_session(provider.A100, "letify-a100-1")
+    call = next(c for c in recorder.calls if "new" in c["command"])
+    assert "_DEFAULT_TIMEOUT = 600" in colab_module.NEW_SCRIPT
+    assert "colab_cli.cli" in colab_module.NEW_SCRIPT
+    assert call["timeout"] == 900
+    assert call["command"][-5:] == ["new", "-s", "letify-a100-1", "--gpu", "A100"]
+
+
+def test_the_new_script_sets_the_timeout_before_calling_the_cli_and_exits_with_its_code() -> None:
+    # Run the script with a stub colab_cli, to see the order and the exit code.
+    import subprocess as sp
+    import tempfile
+    from pathlib import Path
+
+    with tempfile.TemporaryDirectory() as root:
+        stub = Path(root, "stub")
+        (stub / "colab_cli").mkdir(parents=True)
+        (stub / "colab_cli" / "__init__.py").write_text("")
+        (stub / "colab_cli" / "cli.py").write_text(
+            "import sys\n"
+            "import google.auth.transport.requests as r\n"
+            "def main():\n"
+            "    print(r._DEFAULT_TIMEOUT, r.AuthorizedSession().request('GET', 'u'), sys.argv)\n"
+            "    raise SystemExit(3)\n"
+        )
+        google = Path(root, "stub", "google", "auth", "transport")
+        google.mkdir(parents=True)
+        for d in (google.parent.parent, google.parent, google):
+            (d / "__init__.py").write_text("")
+        (google / "requests.py").write_text(
+            "_DEFAULT_TIMEOUT = 120\n"
+            "class AuthorizedSession:\n"
+            "    def request(self, method, url, timeout=_DEFAULT_TIMEOUT):\n"
+            "        return timeout\n"
+        )
+        done = sp.run(
+            [sys.executable, "-c", colab_module.NEW_SCRIPT, "new", "-s", "x"],
+            capture_output=True, text=True, env={"PYTHONPATH": str(stub)},
+        )
+    assert done.returncode == 3, done.stderr
+    assert done.stdout.strip() == "600 600 ['colab', 'new', '-s', 'x']"
+
+
+def test_a_failed_colab_new_raises_with_the_command_and_stderr(
+    isolated_home, patch_which, patch_run
+) -> None:
+    provider = _colab_with(patch_which, patch_run, FakeColabCli(new_fails=True))
+    with pytest.raises(letify.RuntimeFailure) as caught:
+        provider.create_session(provider.A100, "letify-a100-1")
+    assert "ReadTimeout" in caught.value.stderr
+    assert "new -s letify-a100-1 --gpu A100" in caught.value.command
 
 
 def test_a_failing_cli_command_names_the_command_and_the_end_of_its_stderr(
