@@ -1543,6 +1543,29 @@ The access token is looked up in this order, the first that answers wins:
 
 A token is reused until 60 s before it expires. A service account key file is refused with its reason, because exchanging one needs an RSA signature the standard library cannot make; `gcloud auth activate-service-account` followed by rule 3 covers that case. When no rule answers, the backend raises `ProviderUnavailable` for `gcs` saying that no Google login was found and naming `gcloud auth application-default login` and `GOOGLE_OAUTH_ACCESS_TOKEN`.
 
+### Named handoffs on the Drive store <!-- id: drive-handoff -->
+
+> `letify.stash(name, path)` puts a file or directory on the machine's Drive store under a name, and `letify.unstash(name, path)` puts it back, in a later call on any provider or in the local process.
+
+A handoff is what a volume cannot be: a value written on one provider and read on another, such as a checkpoint written on Kaggle and resumed on `dept_gpu`. A volume belongs to one provider and stays attached to it, so letify keeps the two apart. `stash` and `unstash` take no provider and no volume.
+
+`stash(name, path)` packs `path`, a file or a directory, into an uncompressed tar whose members are relative to `path`'s parent, so the tar holds the one entry `path`'s base name. Its digest, letify's content hash as the blob store uses it, names the blob in the `letify` folder, and the ref `ref stash/<name>` holds that digest. It returns the digest once the upload has finished and the ref is written. Stashing a name again moves the ref, and the blob the ref named before is deleted unless another `stash/` ref still names it. An upload of the same digest that Drive already holds sends nothing. The tar keeps each member's modification time, so a file rewritten with the same bytes gives a new digest.
+
+`unstash(name, path)` reads the ref, downloads the blob, checks its digest, and unpacks it so that the tar's one entry lands at `path`, replacing what `path` held. It returns `path` as a `pathlib.Path`. When no ref `stash/<name>` exists it returns `None` and changes nothing, so `if letify.unstash("ckpt", ckpt_dir) is None:` starts from scratch. A digest that does not match raises `RuntimeFailure` and leaves `path` untouched.
+
+A name is 1 to 128 characters of letters, digits, `.`, `_` and `-`, and does not start with `.`; anything else raises `ValueError` naming the rule. Names are shared by every project on the machine's Drive store, so a project that wants its own space puts its name in the handoff name.
+
+The name `unstash` is not `fetch`, because `letify.fetch(tensor)` already reads a tensor back in `host=local`.
+
+Both run in two places with the same result:
+
+- **In the local process**, the client moves the bytes itself with the `DriveBackend` of Google Drive is a store, not a volume.
+- **Inside a shipped function**, the worker moves the bytes between the runtime and Drive and they never cross the client's link. The worker asks the local process for a grant with a one-way request on a reserved stream, as `all_reduce` asks for a peer table, and the local process answers with the light op `drive_grant`: for `stash`, the existing digest or a resumable upload session URL for the archive's size, which the local process creates as Google Drive is a store, not a volume describes; for `unstash`, the blob's media URL with the short-lived request headers, or a reply that the name has no ref. After a `stash` upload the worker reports the Drive file id and the local process writes the ref and deletes the replaced blob. The worker holds no refresh token and writes no header to disk.
+
+A body run on a one-shot channel, which has no stream back to the local process, cannot ask for a grant, so `stash` and `unstash` there raise `UnsupportedMode` naming the provider rather than reading the runtime's own configuration.
+
+When the machine declares no Drive store, both raise `ConfigError` naming `drive_login` and `drive_project`. letify never falls back to another store or to the local disk. A Drive request that fails raises `RuntimeFailure` naming the Drive status and the name, and the function body decides whether to carry on.
+
 ## Environment
 
 > An `Env` is a declaration keyed by the project's uv files, not a built image. Every remote runtime builds it with `uv sync` into a project `.venv` and runs the worker with that `.venv`'s Python.

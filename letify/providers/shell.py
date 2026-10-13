@@ -483,6 +483,7 @@ class Shell(Provider):
                 link.runner,  # type: ignore[attr-defined]
                 name=runtime.name,
                 files=getattr(link, "files", None),
+                provider=self.alias,
             )
         return PersistentChannel(
             link.ssh_command(

@@ -1065,6 +1065,9 @@ class FakeDriveServer:
             def do_PATCH(self) -> None:
                 owner._handle(self, "PATCH")
 
+            def do_DELETE(self) -> None:
+                owner._handle(self, "DELETE")
+
         self._server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
         self._server.daemon_threads = True
         self.endpoint = f"http://127.0.0.1:{self._server.server_address[1]}"
@@ -1235,6 +1238,10 @@ class FakeDriveServer:
             identifier = parsed.path.rsplit("/", 1)[-1]
             self.files[identifier]["content"] = body
             return reply({"id": identifier})
+        if method == "DELETE" and parsed.path.startswith("/drive/v3/files/"):
+            if self.files.pop(parsed.path.rsplit("/", 1)[-1], None) is None:
+                return answer(404, b'{"error": {"message": "not found"}}')
+            return answer(204)
         if method == "GET" and parsed.path.startswith("/drive/v3/files/"):
             found = self.files.get(parsed.path.rsplit("/", 1)[-1])
             if found is None:

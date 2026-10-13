@@ -190,6 +190,15 @@ cache.fetch_checkpoint("run-1", target)
 cache.resume(runtime, "run-1", path)   # put the newest one inside a session
 ```
 
+### Handoffs
+
+```python
+letify.stash("ckpt", ckpt_dir)         # put a file or directory on the machine's Drive store
+letify.unstash("ckpt", ckpt_dir)       # put it back, or None when no handoff has that name
+```
+
+Both work in the local process and inside a shipped function, on any provider. They need `drive_login` and `drive_project` in the machine configuration and raise `ConfigError` without them. On a one-shot channel, which has no stream back to the local process, they raise `UnsupportedMode` naming the provider. `letify.fetch(tensor)` is a different call and still reads a tensor back.
+
 ### Types
 
 | Name | Is |
@@ -200,6 +209,7 @@ cache.resume(runtime, "run-1", path)   # put the newest one inside a session
 | `Env` | an environment declaration |
 | `Volume` | a content addressed store on a provider |
 | `session_cache` | a value built once per session, keyed by name |
+| `stash`, `unstash` | a named file or directory handed between providers through Drive |
 | `Blob`, `RemoteFile` | references to something that lives in a session |
 | `Function` | what the decorator returns |
 

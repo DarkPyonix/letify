@@ -18,6 +18,8 @@ than one request per digest.
 from __future__ import annotations
 
 import json
+import os
+import shutil
 import threading
 import urllib.error
 import urllib.parse
@@ -48,6 +50,59 @@ _SCOPES = (
 )
 
 _FOLDER_TYPE = "application/vnd.google-apps.folder"
+
+
+def upload_pieces(
+    path: str | os.PathLike[str], url: str, headers: dict[str, str], piece: int
+) -> str:
+    """Send one file to a resumable session URL in pieces and return the new file's id.
+
+    Every piece but the last is a multiple of 256 KiB, as Drive requires, and is answered
+    308 until the last, which is answered with the new file's metadata. This is plain
+    standard library code that both this process and a worker can run, so a handoff made
+    inside a shipped function uploads from the runtime and the bytes never cross the client.
+    """
+    size = os.path.getsize(path)
+    remote_id: str | None = None
+    with open(path, "rb") as handle:
+        offset = 0
+        while offset < size:
+            block = handle.read(piece)
+            end = offset + len(block)
+            send = urllib.request.Request(url, data=block, method="PUT", headers=headers)
+            send.add_header("Content-Length", str(len(block)))
+            send.add_header("Content-Range", f"bytes {offset}-{end - 1}/{size}")
+            try:
+                with urllib.request.urlopen(send, timeout=3600) as response:
+                    remote_id = str(json.loads(response.read())["id"])
+            except urllib.error.HTTPError as exc:
+                if exc.code != 308:
+                    detail = exc.read()[:300].decode(errors="replace")
+                    raise RuntimeFailure(f"Drive upload returned {exc.code}: {detail}") from exc
+            except (urllib.error.URLError, OSError) as exc:
+                raise RuntimeFailure(f"Drive upload failed: {exc}") from exc
+            offset = end
+    if remote_id is None:
+        raise RuntimeFailure("Drive upload: the session never answered with a file")
+    return remote_id
+
+
+def download_to(url: str, headers: dict[str, str], destination: str | os.PathLike[str]) -> int:
+    """Stream one Drive file into ``destination`` and return its size in bytes."""
+    request = urllib.request.Request(url, headers=headers)
+    try:
+        with urllib.request.urlopen(request, timeout=3600) as response, open(
+            destination, "wb"
+        ) as out:
+            shutil.copyfileobj(response, out, 1 << 20)
+    except urllib.error.HTTPError as exc:
+        detail = exc.read()[:300].decode(errors="replace")
+        raise RuntimeFailure(f"Drive download returned {exc.code}: {detail}") from exc
+    except (urllib.error.URLError, OSError) as exc:
+        raise RuntimeFailure(f"Drive download failed: {exc}") from exc
+    finally:
+        request = None  # type: ignore[assignment]
+    return os.path.getsize(destination)
 
 
 class AccountTokenSource(TokenSource):
@@ -272,6 +327,50 @@ class DriveBackend(Backend):
         """Remember the file id of a blob the runtime uploaded."""
         self._ids[digest] = remote_id
 
+    # -- named handoffs ----------------------------------------------------------
+
+    def put_file(self, digest: str, path: str | os.PathLike[str]) -> None:
+        """Upload one local file as the blob ``digest``, in pieces, without reading it whole."""
+        target = self.begin_upload(digest, os.path.getsize(path))
+        assert target is not None
+        headers = dict(target.get("headers") or {})  # type: ignore[call-overload]
+        remote_id = upload_pieces(path, str(target["url"]), headers, int(target["piece"]))  # type: ignore[call-overload]
+        self.record_upload(digest, remote_id)
+
+    def get_file(self, digest: str, destination: str | os.PathLike[str]) -> int:
+        """Download the blob ``digest`` into a local file and return its size."""
+        source = self.pull_source(digest)
+        assert source is not None
+        return download_to(
+            str(source["url"]), dict(source.get("headers") or {}), destination  # type: ignore[call-overload]
+        )
+
+    def delete_blob(self, digest: str) -> None:
+        """Delete the blob ``digest``. A blob that is already gone is not an error."""
+        file_id = self._file_id(digest)
+        if file_id is None:
+            return
+        url = f"{self.endpoint}/drive/v3/files/{urllib.parse.quote(file_id)}"
+        self._call("DELETE", url, what=f"deleting {digest}")
+        self._ids.pop(digest, None)
+
+    def refs_with_prefix(self, prefix: str) -> dict[str, str]:
+        """Every ref whose name starts with ``prefix``, as name to digest, in one listing."""
+        found: dict[str, str] = {}
+        wanted = REF_PREFIX + prefix
+        for entry in self._list(
+            f"{_quoted(self.folder())} in parents and trashed = false", "id,name"
+        ):
+            name = str(entry["name"])
+            if not name.startswith(wanted):
+                continue
+            payload = self._call(
+                "GET", self._media_url(str(entry["id"])), what=f"reading ref {name[4:]}"
+            )
+            if payload is not None:
+                found[name[len(REF_PREFIX) :]] = payload.decode().strip()
+        return found
+
     # -- the backend -----------------------------------------------------------
 
     def has(self, digest: str) -> bool:
@@ -325,4 +424,11 @@ class DriveBackend(Backend):
         )
 
 
-__all__ = ["DRIVE_ENDPOINT", "FOLDER_NAME", "AccountTokenSource", "DriveBackend"]
+__all__ = [
+    "DRIVE_ENDPOINT",
+    "FOLDER_NAME",
+    "AccountTokenSource",
+    "DriveBackend",
+    "download_to",
+    "upload_pieces",
+]

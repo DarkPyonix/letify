@@ -30,6 +30,7 @@ _NO_LETIFY = (
     "the project with 'uv add letify' so uv.lock carries it into the runtime."
 )
 _MODULES = {modules_code}
+os.environ["LETIFY_ONE_SHOT"] = {provider!r}
 _WORKSPACE = {workspace_root!r}
 if _MODULES:
     _modules_dir = os.path.join(os.path.expanduser(_WORKSPACE), "modules")
@@ -112,6 +113,7 @@ def build(
     *,
     modules: Sequence[str] = (),
     workspace_root: str = "~/.letify-runtime",
+    provider: str = "this provider",
 ) -> str:
     """Return the script that runs one call and prints its outcome."""
     payload = base64.b64encode(dumps_call(fn, args, kwargs)).decode()
@@ -135,6 +137,7 @@ def build(
         version=PROTOCOL_VERSION,
         modules_code=repr(modules_dict),
         workspace_root=workspace_root,
+        provider=provider,
     )
 
 

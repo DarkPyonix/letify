@@ -280,6 +280,8 @@ class Connection:
         self._wants: collections.deque = collections.deque()
         #: ``reduce_join`` payloads that arrived on ``wire.REDUCE_STREAM``, for the broker.
         self._joins: collections.deque = collections.deque()
+        #: ``drive_ask`` payloads that arrived on ``wire.DRIVE_STREAM``, for the grant watcher.
+        self._grants: collections.deque = collections.deque()
 
     # -- reading ---------------------------------------------------------------
 
@@ -321,6 +323,15 @@ class Connection:
             # broker picks it up and answers separately with a "reduce_peers" request.
             try:
                 self._joins.append(wire.loads(value[0], value[1]))
+            except Exception:
+                pass
+            with self._turn:
+                self._turn.notify_all()
+        elif kind == wire.REQUEST and stream == wire.DRIVE_STREAM:
+            # A function body asking for a Drive grant. Nothing answers it here: the grant
+            # watcher picks it up and answers separately with a "drive_grant" request.
+            try:
+                self._grants.append(wire.loads(value[0], value[1]))
             except Exception:
                 pass
             with self._turn:
@@ -438,6 +449,15 @@ class Connection:
         while True:
             try:
                 found.append(self._joins.popleft())
+            except IndexError:
+                return found
+
+    def take_grants(self) -> list[dict[str, Any]]:
+        """Every ``drive_ask`` that has arrived so far, oldest first, and forget them."""
+        found = []
+        while True:
+            try:
+                found.append(self._grants.popleft())
             except IndexError:
                 return found
 
@@ -869,9 +889,14 @@ class OneShotChannel(Channel):
 
     persistent = False
 
-    def __init__(self, runner: Any, *, name: str = "runtime", files: Any = None):
+    def __init__(
+        self, runner: Any, *, name: str = "runtime", files: Any = None, provider: str = ""
+    ):
         self.runner = runner
         self.name = name
+        #: The provider's alias, which a body on this channel is told when it asks for a stream
+        #: back to this process that a one-shot channel cannot give.
+        self.provider = provider or name
         #: A provider's own file transfer, which serves ``put_file``, ``get_file`` and
         #: ``pack_dir`` where a program per call cannot carry the bytes.
         self.files = files
@@ -933,7 +958,7 @@ class OneShotChannel(Channel):
     ) -> tuple[Any, str]:
         from ..protocol import driver
 
-        source = driver.build(fn, args, kwargs, modules=modules)
+        source = driver.build(fn, args, kwargs, modules=modules, provider=self.provider)
         stdout = self._run(source, timeout)
         logs, value = protocol.parse(stdout, runtime_key=self.name)
         return value, logs

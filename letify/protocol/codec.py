@@ -141,6 +141,18 @@ def _hasher() -> Any:
     return blake3.blake3(max_threads=blake3.blake3.AUTO)
 
 
+def new_hasher() -> Any:
+    """A fresh incremental hasher, the one ``digest_parts`` uses."""
+    return _hasher()
+
+
+def finish_digest(hasher: Any) -> str:
+    """The content address a hasher from ``new_hasher`` has accumulated."""
+    if hasher.name == "blake2b":
+        return str(hasher.hexdigest())
+    return str(hasher.hexdigest(length=16))
+
+
 def digest_parts(parts: Iterable[Any]) -> str:
     """Content address of the concatenation of ``parts``, hashed without joining them.
 
@@ -284,6 +296,8 @@ __all__ = [
     "digest_parts",
     "dumps_call",
     "dumps_call_parts",
+    "finish_digest",
+    "new_hasher",
     "parse",
     "split_output",
     "unwrap",
