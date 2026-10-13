@@ -21,6 +21,7 @@ import tempfile
 import threading
 import time
 from pathlib import Path
+from typing import ClassVar
 
 import pytest
 
@@ -1820,3 +1821,116 @@ def test_a_large_blob_beside_the_call_draws_the_progress_line(
 
     assert read_it(path=big) == 70 << 20
     assert "uploading" in capsys.readouterr().err
+
+
+def test_the_wrote_back_rate_counts_the_seconds_spent_carrying(
+    launcher_from, project, capsys
+) -> None:
+    """Spec "Data log line": not how long the background write-back was alive.
+
+    It polls for the whole call, so dividing by its lifetime turned 1212.4 MiB carried in
+    19.5 s, about 62 MiB/s, into a reported 2.4 MiB/s on KICT's Modal run.
+    """
+    let = streaming(launcher_from)
+    root = project / "rate"
+    root.mkdir()
+
+    @let.function(device=let.providers.lab.CPU, host=letify.remote)
+    def train(directory: Path, held: float) -> str:
+        import time as clock
+
+        (directory / "checkpoint.bin").write_bytes(b"\x05" * (8 << 20))
+        clock.sleep(held)
+        return "done"
+
+    assert train(root, HELD_S) == "done"
+    line = wrote_back_line(capsys.readouterr().err)
+    size = re.search(r"wrote back \d+ files ([\d.]+) MiB", line)
+    rate = re.search(r"\(([\d.]+) MiB/s\)", line)
+    assert size and rate, line
+    # 8 MiB over a local channel takes a fraction of a second; the call held for HELD_S.
+    implied = float(size.group(1)) / max(float(rate.group(1)), 1e-9)
+    assert implied < HELD_S / 2, f"the rate implies {implied:.1f} s of carrying: {line}"
+
+
+def test_a_file_the_background_is_still_carrying_is_not_counted_twice(
+    launcher_from, project, capsys, monkeypatch
+) -> None:
+    """Spec "Writing back": the final write-back starts only once the background stopped.
+
+    KICT's line read "1 files 402.2 MiB during the call, 1 files 402.2 MiB already on the
+    client": the final write-back began while the background path was still carrying that
+    file, found it complete on the local disk, and counted it a second time. The wait
+    for the background used to give up after 60 s, so the test takes the wait away.
+    """
+    from letify.store import pathdata
+
+    # What a wait that gave up looks like: the stop is asked for and nothing waits for it.
+    monkeypatch.setattr(pathdata.WriteBack, "cancel", lambda self: self._cancelled.set())
+    real_get = pathdata._get
+
+    def slow_in_the_background(runtime, blobs, digest, target, size, meter):
+        if threading.current_thread().name == "letify-write-back":
+            time.sleep(3.0)
+        return real_get(runtime, blobs, digest, target, size, meter)
+
+    monkeypatch.setattr(pathdata, "_get", slow_in_the_background)
+    let = streaming(launcher_from)
+    root = project / "twice"
+    root.mkdir()
+
+    @let.function(device=let.providers.lab.CPU, host=letify.remote)
+    def train(directory: Path) -> str:
+        import time as clock
+
+        (directory / "checkpoint.bin").write_bytes(b"\x06" * (1 << 20))
+        # Long enough for a poll to find the file complete, short enough that the call
+        # returns while the background is still carrying it.
+        clock.sleep(1.5)
+        return "done"
+
+    assert train(root) == "done"
+    line = wrote_back_line(capsys.readouterr().err)
+    during = re.search(r"(\d+) files [\d.]+ MiB during the call", line)
+    kept = re.search(r"(\d+) files [\d.]+ MiB already on the client", line)
+    assert during and kept, line
+    assert not (int(during.group(1)) == 1 and int(kept.group(1)) == 1), line
+
+
+def test_skipped_files_do_not_enter_the_progress_line(project, monkeypatch) -> None:
+    """Spec "Writing back": a skip added its size at once and drew 31830.2 MiB/s."""
+    from letify.store import pathdata
+
+    totals: list[int] = []
+    real = pathdata._Downloaded
+
+    class Watched(real):  # type: ignore[misc, valid-type]
+        def __init__(self, files: int, total: int) -> None:
+            totals.append(total)
+            super().__init__(files, total)
+
+    monkeypatch.setattr(pathdata, "_Downloaded", Watched)
+    kept = project / "kept.bin"
+    kept.write_bytes(b"k" * 1000)
+
+    class Runtime:
+        name = "rt"
+
+        def request(self, payload, timeout=None):
+            raise AssertionError(f"nothing should be fetched: {payload.get('op')}")
+
+    class Placed:
+        local = project
+        runtime = "/rt/out"
+
+    class Collector:
+        call_dir = "/rt/call"
+        outputs: ClassVar[list] = [Placed]
+        cache = pathdata.DigestCache(project / "digests.json")
+
+    digest = Collector.cache.digest(kept)
+    monkeypatch.setattr(
+        pathdata, "_worker", lambda runtime, payload: {"/rt/out": [["kept.bin", digest, 1000]]}
+    )
+    pathdata.write_back(Runtime(), Collector(), "/rt/blobs")
+    assert totals == [0], totals

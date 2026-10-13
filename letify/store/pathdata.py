@@ -1435,6 +1435,9 @@ class WriteBack:
         self.blobs = blobs
         self.files = self.bytes = 0
         self.seconds = 0.0
+        #: Seconds spent inside transfers, which the wrote back rate divides by. Spec
+        #: "Data log line": ``seconds`` is how long this ran, which is the whole call.
+        self.carrying_seconds = 0.0
         #: The digest this path was last sent with, which keeps the final write-back from
         #: sending it again and a repeated poll from sending the same version twice.
         self.sent: dict[Path, str] = {}
@@ -1488,11 +1491,16 @@ class WriteBack:
                 if self.sent.get(target) == digest:
                     continue
                 with _output_lock(placed.local):
+                    began = time.monotonic()
                     _get(self.runtime, self.blobs, digest, target, int(size), _Uploaded(1, 0))
                     self.collector.cache.record(target, digest)
-                self.sent[target] = digest
-                self.files += 1
-                self.bytes += int(size)
+                    # Recorded before the lock is released, so the final write-back, which
+                    # decides under the same lock, never sees the file on disk unrecorded.
+                    # Spec "Writing back".
+                    self.carrying_seconds += time.monotonic() - began
+                    self.sent[target] = digest
+                    self.files += 1
+                    self.bytes += int(size)
 
     def cancel(self) -> None:
         """Stop polling, which the call's end does before the final write-back runs."""
@@ -1526,22 +1534,38 @@ def write_back(
             target = placed.local / rel if rel else placed.local
             files.append((target, str(digest), int(size)))
         plan.append((placed, files))
-    total = sum(size for _placed, files in plan for _t, _d, size in files)
-    meter = _Downloaded(sum(len(files) for _p, files in plan), total)
     sent_files = sent_bytes = kept_files = kept_bytes = 0
-    already = dict(background.sent) if background is not None else {}
+
+    def delivered(target: Path, digest: str) -> bool:
+        """Whether the background write-back already brought this very version.
+
+        Read under the output lock, never from a copy taken earlier: the background path
+        may still be finishing a file when the call returns, and it records the file
+        under the same lock. Spec "Writing back".
+        """
+        return background is not None and background.sent.get(target) == digest
+
+    # Decided before anything is fetched, so the progress line covers only the bytes this
+    # write-back carries. Spec "Writing back": a skip added its size at once.
+    fetch: list[tuple[Placed, list[tuple[Path, str, int]]]] = []
     for placed, files in plan:
+        wanted = []
         with _output_lock(placed.local):
             for target, digest, size in files:
-                if already.get(target) == digest:
-                    # The background write-back delivered this very version during the
-                    # call, so fetching it now would be a duplicate transfer.
-                    meter.advance(size)
+                if delivered(target, digest):
                     continue
                 if _same(cache, target, digest):
                     kept_files += 1
                     kept_bytes += size
-                    meter.advance(size)
+                    continue
+                wanted.append((target, digest, size))
+        fetch.append((placed, wanted))
+    total = sum(size for _placed, files in fetch for _t, _d, size in files)
+    meter = _Downloaded(sum(len(files) for _p, files in fetch), total)
+    for placed, files in fetch:
+        with _output_lock(placed.local):
+            for target, digest, size in files:
+                if delivered(target, digest):
                     continue
                 _get(runtime, blobs, digest, target, size, meter)
                 cache.record(target, digest)
@@ -1552,7 +1576,7 @@ def write_back(
     cache.save()
     during_files = background.files if background is not None else 0
     during_bytes = background.bytes if background is not None else 0
-    during_seconds = background.seconds if background is not None else 0.0
+    during_seconds = background.carrying_seconds if background is not None else 0.0
     elapsed = time.monotonic() - started
     total_files = sent_files + during_files
     total_bytes = sent_bytes + during_bytes
