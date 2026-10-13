@@ -690,11 +690,40 @@ def test_the_remote_half_starts_sshd_on_the_splice_port_when_nothing_answers_the
     binary = tmp_path / "sshd"
     binary.write_text("")
     monkeypatch.setattr(nat, "SSHD", str(binary))
+    monkeypatch.setattr(nat, "LETIFY_SSHD_CONFIG", str(tmp_path / "sshd_config.letify"))
     recorder = patch_run(nat)
     port = _silent_port()
     nat._start_sshd(port)
-    assert [str(binary), "-p", str(port), "-o", "ListenAddress=127.0.0.1"] in recorder.commands
+    assert _sshd_started(binary, port) in recorder.commands
     assert not any("apt-get" in command for command in recorder.commands)
+
+
+def _sshd_started(binary, port: int) -> list[str]:
+    """The command the remote half starts sshd with. Spec "Colab", the rendezvous."""
+    return [
+        str(binary), "-f", nat.LETIFY_SSHD_CONFIG, "-p", str(port), "-o", "ListenAddress=127.0.0.1"
+    ]
+
+
+def test_the_remote_sshd_takes_parallel_handshakes_whatever_the_image_sets(tmp_path) -> None:
+    # Spec "Colab": a Colab image sets MaxStartups 1, which a command-line -o does not
+    # override, so parallel transfer streams over reverse_ssh were closed before the banner.
+    source = tmp_path / "sshd_config"
+    source.write_text("Port 2222\nMaxStartups 1\n  maxstartups 3:30:10\nPermitRootLogin yes\n")
+    target = tmp_path / "sshd_config.letify"
+    nat._write_sshd_config(str(source), str(target))
+    lines = target.read_text().splitlines()
+    assert "Port 2222" in lines and "PermitRootLogin yes" in lines
+    assert [line for line in lines if "maxstartups" in line.lower()] == [
+        f"MaxStartups {nat.SSHD_MAX_STARTUPS}"
+    ]
+    assert lines[0] == f"MaxStartups {nat.SSHD_MAX_STARTUPS}"
+
+
+def test_the_remote_sshd_config_is_written_when_the_image_has_none(tmp_path) -> None:
+    target = tmp_path / "sshd_config.letify"
+    nat._write_sshd_config(str(tmp_path / "missing"), str(target))
+    assert target.read_text().splitlines() == [f"MaxStartups {nat.SSHD_MAX_STARTUPS}"]
 
 
 def test_the_remote_half_generates_host_keys_before_it_starts_sshd(
@@ -705,12 +734,13 @@ def test_the_remote_half_generates_host_keys_before_it_starts_sshd(
     binary = tmp_path / "sshd"
     binary.write_text("")
     monkeypatch.setattr(nat, "SSHD", str(binary))
+    monkeypatch.setattr(nat, "LETIFY_SSHD_CONFIG", str(tmp_path / "sshd_config.letify"))
     recorder = patch_run(nat)
     port = _silent_port()
     nat._start_sshd(port)
     keygen = ["ssh-keygen", "-A"]
     assert keygen in recorder.commands
-    started = [str(binary), "-p", str(port), "-o", "ListenAddress=127.0.0.1"]
+    started = _sshd_started(binary, port)
     assert recorder.commands.index(keygen) < recorder.commands.index(started)
 
 

@@ -659,6 +659,31 @@ def _authorize(public_key: str) -> None:
 #: The SSH server binary the remote half starts on a machine that has none on the port.
 SSHD = "/usr/sbin/sshd"
 
+#: The image's own server configuration, which the started server's is copied from.
+SSHD_CONFIG = "/etc/ssh/sshd_config"
+
+#: The configuration the remote half starts the server with.
+LETIFY_SSHD_CONFIG = "/etc/ssh/sshd_config.letify"
+
+#: Unauthenticated connections the server takes at once. Spec "Colab": a Colab image sets 1,
+#: and the transfer streams of one session arrive together.
+SSHD_MAX_STARTUPS = "64:30:128"
+
+
+def _write_sshd_config(source: str, target: str) -> None:
+    """Copy ``source`` to ``target`` with its MaxStartups replaced by ``SSHD_MAX_STARTUPS``.
+
+    A command-line ``-o MaxStartups`` does not override the file's value, so the file the
+    server reads has to carry it.
+    """
+    try:
+        lines = Path(source).read_text().splitlines()
+    except OSError:
+        lines = []
+    kept = [line for line in lines if not line.strip().lower().startswith("maxstartups")]
+    # First, ahead of any Match block, so it applies to the whole server.
+    Path(target).write_text("\n".join([f"MaxStartups {SSHD_MAX_STARTUPS}", *kept]) + "\n")
+
 
 def _ssh_answers(port: int, timeout: float = 3.0) -> bool:
     """Whether a line starting with ``SSH-`` arrives from ``127.0.0.1:<port>``."""
@@ -691,7 +716,11 @@ def _start_sshd(port: int = 22) -> None:
     # server closes every connection before the banner. ssh-keygen -A makes only what is
     # missing, so an image that already has its keys is untouched.
     subprocess.run(["ssh-keygen", "-A"], check=False)
-    subprocess.run([SSHD, "-p", str(port), "-o", "ListenAddress=127.0.0.1"], check=False)
+    _write_sshd_config(SSHD_CONFIG, LETIFY_SSHD_CONFIG)
+    subprocess.run(
+        [SSHD, "-f", LETIFY_SSHD_CONFIG, "-p", str(port), "-o", "ListenAddress=127.0.0.1"],
+        check=False,
+    )
 
 
 def run_detached(request_json: str, source: str) -> None:  # pragma: no cover - remote entry
