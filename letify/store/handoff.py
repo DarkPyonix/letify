@@ -35,6 +35,10 @@ from ..protocol import codec
 #: so a body can tell it runs on a channel with no stream back to the local process.
 ONE_SHOT_MARKER = "LETIFY_ONE_SHOT"
 
+#: The environment variable the worker sets to its process id, so a child process of the
+#: body, which inherits it but lacks the worker's grant hook, can say why it cannot ask.
+WORKER_MARKER = "LETIFY_WORKER_PID"
+
 #: The prefix of a handoff's ref, so handoffs share the folder with other refs.
 REF_SPACE = "stash/"
 
@@ -198,7 +202,7 @@ def stash(name: str, path: str | os.PathLike[str]) -> str:
     source = Path(path)
     if not source.exists():
         raise FileNotFoundError(f"cannot stash {str(source)!r}: it does not exist")
-    main = _worker_main()
+    main = _worker_main(name)
     if main is not None:
         return _stash_in_worker(main, name, source)
     backend = drive_backend()
@@ -222,7 +226,7 @@ def unstash(name: str, path: str | os.PathLike[str]) -> Path | None:
     """
     check_name(name)
     target = Path(path)
-    main = _worker_main()
+    main = _worker_main(name)
     if main is not None:
         return _unstash_in_worker(main, name, target)
     backend = drive_backend()
@@ -255,7 +259,7 @@ def _verify(name: str, archive: Path, digest: str) -> None:
 # -- inside a shipped function ---------------------------------------------------------
 
 
-def _worker_main() -> Any:
+def _worker_main(name: str) -> Any:
     """The worker's ``__main__`` module when this runs inside a shipped function, else None.
 
     The same test ``all_reduce`` makes: only the worker defines the hook that sends a request
@@ -264,6 +268,13 @@ def _worker_main() -> Any:
     main = sys.modules.get("__main__")
     if main is not None and hasattr(main, "_drive_ask"):
         return main
+    worker_pid = os.environ.get(WORKER_MARKER)
+    if worker_pid is not None and worker_pid != str(os.getpid()):
+        raise UnsupportedMode(
+            f"handoff {name!r}: stash and unstash must be called from the process letify "
+            f"runs the body in, not from a child process it started (this is a child of "
+            f"worker process {worker_pid}). Call it in the body and pass the path to the child."
+        )
     one_shot = os.environ.get(ONE_SHOT_MARKER)
     if one_shot is not None:
         raise UnsupportedMode(

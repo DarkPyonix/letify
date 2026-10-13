@@ -425,3 +425,77 @@ def test_stash_and_unstash_on_a_one_shot_channel_raise_unsupported_mode_naming_t
     assert len(value) == 2
     assert all("colab_a" in message for message in value)
     assert fake_drive.requests == []
+
+
+# -- a child process of the body -------------------------------------------------------
+
+
+def test_stash_and_unstash_in_a_child_process_of_the_body_say_to_call_from_the_main_process(
+    fake_drive, launcher_from, tmp_path, worker_sees_this_checkout
+) -> None:
+    """Spec: a child the body starts has no grant hook, so it raises instead of reading config."""
+    declare_drive(fake_drive)
+    let = launcher_from(LOCAL)
+    source = tmp_path / "f.txt"
+    source.write_text("x")
+
+    @let.function(device=let.providers.a.CPU, host=letify.remote)
+    def from_children(path: str) -> dict:
+        import multiprocessing
+        import os
+        import subprocess
+        import sys
+        from pathlib import Path
+
+        import letify as inner
+
+        code = (
+            "import sys, letify\n"
+            "for call in (lambda: letify.stash('kid', sys.argv[1]),"
+            " lambda: letify.unstash('kid', sys.argv[1] + '.out')):\n"
+            "    try:\n"
+            "        call()\n"
+            "    except letify.UnsupportedMode as exc:\n"
+            "        print('UM:' + str(exc))\n"
+        )
+        run = subprocess.run(
+            [sys.executable, "-c", code, path], capture_output=True, text=True, check=True
+        )
+        helper = Path(path).parent / "spawned_helper.py"
+        helper.write_text(
+            "import letify\n"
+            "def unstash_it(queue, path):\n"
+            "    try:\n"
+            "        letify.unstash('spawned', path)\n"
+            "    except letify.UnsupportedMode as exc:\n"
+            "        queue.put(str(exc))\n"
+            "    else:\n"
+            "        queue.put('no error')\n"
+        )
+        sys.path.insert(0, str(helper.parent))
+        old = os.environ.get("PYTHONPATH", "")
+        os.environ["PYTHONPATH"] = str(helper.parent) + os.pathsep + old
+        import spawned_helper
+
+        context = multiprocessing.get_context("spawn")
+        queue = context.Queue()
+        process = context.Process(target=spawned_helper.unstash_it, args=(queue, path + ".spawn"))
+        process.start()
+        spawned = queue.get(timeout=120)
+        process.join()
+        return {
+            "subprocess": [x for x in run.stdout.splitlines() if x.startswith("UM:")],
+            "spawn": spawned,
+            "main_is_not_refused": inner.UnsupportedMode.__name__,
+        }
+
+    with let.keep_alive():
+        answer = from_children(str(source))
+    assert len(answer["subprocess"]) == 2
+    for message in answer["subprocess"] + [answer["spawn"]]:
+        assert "process letify runs the body in" in message
+        assert "child process" in message
+    assert "'kid'" in answer["subprocess"][0] and "'kid'" in answer["subprocess"][1]
+    assert "'spawned'" in answer["spawn"]
+    assert fake_drive.requests == []
+

@@ -1565,6 +1565,8 @@ Both run in two places with the same result:
 
 A body run on a one-shot channel, which has no stream back to the local process, cannot ask for a grant, so `stash` and `unstash` there raise `UnsupportedMode` naming the provider rather than reading the runtime's own configuration.
 
+The worker sets the environment variable `LETIFY_WORKER_PID` to its process id, so a process the body starts, such as one per GPU, inherits it without the grant hook. `stash` and `unstash` called there raise `UnsupportedMode` naming the handoff, saying the call must be made from the process letify runs the body in and not from a child process it started, and neither reads the configuration nor touches Drive.
+
 When the machine declares no Drive store, both raise `ConfigError` naming `drive_login` and `drive_project`. letify never falls back to another store or to the local disk. A Drive request that fails raises `RuntimeFailure` naming the Drive status and the name, and the function body decides whether to carry on.
 
 ## Environment
