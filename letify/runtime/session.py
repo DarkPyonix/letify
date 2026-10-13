@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import datetime
 import json
+import posixpath
 import sys
 import time
 from collections.abc import Callable, Iterator
@@ -108,7 +109,8 @@ class Runtime:
     #: How long this session lives, from the declaration that started it.
     lease: Lease | None = field(default=None, repr=False)
 
-    #: How the environment was built: ``"sync"``, ``"archive"``, or None where it was not.
+    #: How the environment was built: ``"sync"``, ``"archive"`` (restored from a store),
+    #: ``"workspace"`` (restored from the workspace root), or None where it was not.
     env_source: str | None = None
 
     #: Seconds the sync took, when ``env_source`` is ``"sync"``. Spec "Materializing into
@@ -181,7 +183,9 @@ class Runtime:
             raise
         # The same rule as _environment_volumes: a project directory that does not
         # survive the session is worth archiving whatever the provider calls itself.
-        if self.env_source == "sync" and not (
+        if self.env_source == "sync" and self._archives_on_workspace():
+            self._pack_on_workspace()
+        elif self.env_source == "sync" and not (
             self.provider.persistent and self._project_survives()
         ):
             from . import bootstrap
@@ -621,6 +625,73 @@ class Runtime:
         value = self.request({"op": "pack_dir", "path": path}, timeout=3600)
         return _payload(value["payload"]), value["digest"]
 
+    def pack_dir_to_file(self, path: str, target: Path) -> tuple[str, int]:
+        """Pack a directory inside the runtime and stream the archive into a local file.
+
+        Spec "Materializing into a runtime". The runtime writes the archive into its blob
+        cache while hashing it, and the client receives it as a stream with the digest
+        checked on arrival, so neither side holds the archive whole. Returns
+        ``(digest, size)``. Needs a persistent channel.
+        """
+        from ..store import pathdata
+
+        staging = f"{posixpath.dirname(path.rstrip('/'))}/.letify-pack"
+        value = self.request(
+            {"op": "pack_blob", "path": path, "dir": staging}, timeout=3600
+        )
+        digest, size, directory = value["digest"], int(value["size"]), value["dir"]
+        meter = pathdata._Downloaded(1, size)
+        try:
+            pathdata._get(self, directory, digest, target, size, meter)
+            meter.finish()
+        finally:
+            self.exec(
+                f"import shutil\nshutil.rmtree({directory!r}, ignore_errors=True)\n",
+                timeout=120,
+            )
+        return digest, size
+
+    def put_path(
+        self,
+        local: Path,
+        path: str,
+        *,
+        digest: str,
+        unpack: bool = False,
+        target: str | None = None,
+        links: bool = False,
+    ) -> protocol.RemoteFile:
+        """Send a local file whose digest is known in pieces, then place it at ``path``.
+
+        Spec "Materializing into a runtime". The file is read one piece at a time, so the
+        client never holds it whole. The runtime verifies the digest as the pieces arrive.
+        """
+        from ..store import pathdata
+
+        size = local.stat().st_size
+        staging = f"{path}.letify-send"
+        meter = pathdata._Uploaded(1, size)
+        pipeline = self.pipeline(window=pathdata.WINDOW, timeout=3600)
+        try:
+            pathdata._put(self, pipeline, staging, digest, str(local), size, meter)
+            pipeline.drain()
+        finally:
+            pipeline.close()
+        meter.finish()
+        value = self.request(
+            {
+                "op": "place_blob",
+                "dir": staging,
+                "digest": digest,
+                "path": path,
+                "unpack": unpack,
+                "target": target,
+                "links": links,
+            },
+            timeout=3600,
+        )
+        return protocol.RemoteFile(path=value["path"], digest=digest, size=value["size"])
+
     # -- environment and volumes ---------------------------------------------
 
     def restrict_devices(self) -> None:
@@ -656,6 +727,35 @@ class Runtime:
 
         self.workspace = self.eval(bootstrap.workspace_source(root), timeout=120)
 
+    def _archives_on_workspace(self) -> bool:
+        """Whether the environment archive lives on the runtime's own workspace root.
+
+        Spec "Volumes on a persistent runtime": true for a provider whose workspace root
+        persists and whose project directory lies outside it.
+        """
+        return bool(
+            self.provider.remote_env and self.provider.persistent and not self._project_survives()
+        )
+
+    def _workspace_archive(self) -> str:
+        """The archive path on the workspace root for this environment and platform."""
+        workspace = (self.workspace or self.provider.workspace_root).rstrip("/")
+        return f"{workspace}/env-archives/{self.env.key}-{self.platform}.tar"
+
+    def _pack_on_workspace(self) -> None:
+        """Tar the project directory onto the workspace root; nothing goes to the client."""
+        from . import bootstrap
+
+        root = bootstrap.project_dir(
+            self.provider.env_root or self.workspace or self.provider.workspace_root, self.env
+        )
+        size = self._tree_size(root)
+        self._say(
+            "caching the environment on the workspace root"
+            + (f", {size / 1_000_000_000:.1f} GB" if size else "")
+        )
+        self.eval(bootstrap.workspace_pack_source(root, self._workspace_archive()), timeout=3600)
+
     def _environment_volumes(self) -> tuple[Volume, ...]:
         """Explicit archive volumes, or the automatic cache where the project does not survive.
 
@@ -666,6 +766,9 @@ class Runtime:
         the session however durable the root is.
         """
         if self.provider.persistent and self._project_survives():
+            return ()
+        if self._archives_on_workspace():
+            # Spec "Volumes on a persistent runtime": the archive is on the workspace root.
             return ()
         if self.volumes:
             return self.volumes
@@ -707,20 +810,26 @@ class Runtime:
             return None
         return size if isinstance(size, int) and size > 0 else None
 
+    def _packs_streaming(self) -> bool:
+        """Whether the archive of the first environment volume streams in both directions."""
+        volumes = self._environment_volumes()
+        return bool(volumes) and self.persistent_channel and volumes[0].store.streams
+
     def _worth_packing(self, root: str) -> bool:
         """Whether moving the project directory over this session's link beats the build.
 
         Spec "Materializing into a runtime": the directory is larger than the archive it
         would become, so this overstates the transfer and errs toward building. With no
-        measured rate it packs only what letify is willing to hold in memory, because the
-        pack moves the archive as one payload the worker and the client each hold whole.
+        measured rate it packs any size when the archive streams, and otherwise only what
+        letify is willing to hold in memory, because that pack moves the archive as one
+        payload the worker and the client each hold whole.
         """
         if self.env_build_s is None:
             return True
         rate = self._measured_rate()
         size = self._tree_size(root)
         if rate is None:
-            if size is None or size <= PACK_WITHOUT_A_RATE:
+            if size is None or size <= PACK_WITHOUT_A_RATE or self._packs_streaming():
                 return True
             self._say(
                 f"not caching the environment, because {size / 1_000_000_000:.1f} GB is over "
@@ -772,8 +881,30 @@ class Runtime:
         where = self.eval(bootstrap.probe_source(self.env, root), timeout=120)
         self.platform = where["platform"]
 
-        # Spec "Volumes on a persistent runtime": the .venv is already on the runtime's
-        # disk, so an archive is neither restored nor packed there.
+        # Spec "Volumes on a persistent runtime": a provider whose workspace root persists
+        # and whose project directory does not keeps the archive on the workspace root, and
+        # one whose project directory survives needs no archive at all.
+        on_workspace = self._archives_on_workspace()
+        found = f"os.path.isfile(os.path.expanduser({self._workspace_archive()!r}))"
+        archive_here = on_workspace and self.eval(
+            f"import os\n__letify_value__ = {found}\n", timeout=120
+        )
+        if archive_here:
+            self._say("restoring the environment from the workspace root")
+            self.eval(
+                bootstrap.workspace_restore_source(self._workspace_archive(), where["parent"]),
+                timeout=3600,
+            )
+            if self.eval(bootstrap.venv_check_source(where["python"]), timeout=600):
+                self.env_source = "workspace"
+            else:
+                self._say("the restored environment failed its interpreter check, syncing")
+                self.eval(
+                    "import os, shutil\n"
+                    f"shutil.rmtree(os.path.expanduser({root!r}), ignore_errors=True)\n",
+                    timeout=600,
+                )
+
         archives = self._environment_volumes()
         for volume in archives:
             digest = volume.cached_env(self.env, self.platform)
@@ -804,14 +935,14 @@ class Runtime:
                 self.env_source = "archive"
                 break
 
-        if self.env_source != "archive":
+        if self.env_source not in ("archive", "workspace"):
             workspace = self.workspace or self.provider.workspace_root
             # Spec "Remote paths letify writes": uv's cache, its managed Pythons, its tool
             # installs and its own binary stay under the workspace root regardless of an
             # env root or whether the provider is persistent or ephemeral.
             source = bootstrap.sync_source(
                 self.env, files, root=root, name=self.name, workspace=workspace,
-                archive=bool(archives),
+                archive=bool(archives) or on_workspace,
             )
             # Spec "Environment": the longest step of a first session, and uv's own output
             # is captured rather than streamed, so it says it is happening.

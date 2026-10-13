@@ -105,6 +105,13 @@ def environment_volume(provider: Provider) -> Volume:
     return Volume(provider, "environments", _store=Store(backend))
 
 
+def _piece_size() -> int:
+    """Bytes of one piece the streaming send uses, below which one message is as good."""
+    from .pathdata import CHUNK
+
+    return CHUNK
+
+
 def _session(target: Any) -> Runtime:
     """The live session behind a declaration, or a session given directly.
 
@@ -199,8 +206,15 @@ class Volume:
         archive in a sibling ref so a later session can decide whether restoring is
         still cheaper than building. Spec "Materializing into a runtime".
         """
-        payload, _digest = _session(target).pack_dir(path)
-        info = self.store.put_bytes(payload)
+        runtime = _session(target)
+        scratch = self.store.scratch_path() if self.store.streams else None
+        if scratch is not None and runtime.persistent_channel:
+            # Streamed: the archive lands in a file beside the store and is renamed in.
+            digest, _size = runtime.pack_dir_to_file(path, scratch)
+            info = self.store.adopt_file(scratch, digest)
+        else:
+            payload, _digest = runtime.pack_dir(path)
+            info = self.store.put_bytes(payload)
         self.store.point(self.env_ref(env, platform), info.digest)
         if build_s is not None:
             self.store.point(self.build_ref(env, platform), f"{build_s:.1f} {info.size}")
@@ -308,6 +322,16 @@ class Volume:
         if source is not None:
             return runtime.pull(
                 source, destination, digest=digest, unpack=unpack, target=into, links=links
+            )
+        local = self.store.blob_path(digest)
+        if (
+            local is not None
+            and runtime.persistent_channel
+            and local.stat().st_size > _piece_size()
+        ):
+            # Streamed: a blob of more than one piece is read and sent a piece at a time.
+            return runtime.put_path(
+                local, destination, digest=digest, unpack=unpack, target=into, links=links
             )
         payload = self.store.get_bytes(digest)
         return runtime.put_bytes(payload, destination, unpack=unpack, target=into, links=links)

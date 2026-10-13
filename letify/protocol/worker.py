@@ -2263,6 +2263,81 @@ def _op_pack_dir(request):
     }
 
 
+class _HashedFile:
+    """A write-only file that hashes every byte it passes on, so no second read is needed."""
+
+    def __init__(self, handle, hasher):
+        self._handle = handle
+        self._hasher = hasher
+        self.size = 0
+
+    def write(self, data):
+        self._handle.write(data)
+        self._hasher.update(data)
+        self.size += len(data)
+        return len(data)
+
+    def flush(self):
+        self._handle.flush()
+
+    def tell(self):
+        return self.size
+
+
+def _op_pack_blob(request):
+    """Pack a directory into the blob cache as one committed file, hashing as it writes.
+
+    Same archive and member rules as ``pack_dir``, but the archive never exists as one
+    bytes object: it is written to a partial file in pieces, and the caller reads it back
+    with ``data_stream``. The reply names the directory it used, with ``~`` expanded.
+    """
+    root = os.path.expanduser(request["path"])
+    directory = os.path.expanduser(request["dir"])
+    os.makedirs(directory, exist_ok=True)
+    partial = os.path.join(directory, ".pack.%d.partial" % os.getpid())
+    hasher = _data_hasher()
+    if hasher is None:
+        hasher = hashlib.blake2b(digest_size=16)
+    try:
+        with open(partial, "wb") as handle:
+            hashed = _HashedFile(handle, hasher)
+            with tarfile.open(fileobj=hashed, mode="w:gz") as archive:
+                archive.add(root, arcname=os.path.basename(root.rstrip("/")), recursive=True)
+        digest = hasher.hexdigest() if hasher.name == "blake2b" else hasher.hexdigest(length=16)
+        final = _data_file(directory, digest)
+        os.makedirs(os.path.dirname(final), exist_ok=True)
+        os.replace(partial, final)
+    finally:
+        if os.path.exists(partial):
+            os.remove(partial)
+    return {"ok": True, "value": {"digest": digest, "size": hashed.size, "dir": directory}}
+
+
+def _op_place_blob(request):
+    """Move a received file blob to its destination path, and unpack it when asked.
+
+    The sender wrote the blob into a staging directory with ``data_put``. The staging
+    directory is removed once the file has moved.
+    """
+    import shutil
+
+    staging = request["dir"]
+    source = _data_file(staging, request["digest"])
+    path = request["path"]
+    directory = os.path.dirname(path)
+    if directory:
+        os.makedirs(directory, exist_ok=True)
+    os.replace(source, path)
+    try:
+        os.chmod(path, 0o644)
+    except OSError:
+        pass
+    shutil.rmtree(staging, ignore_errors=True)
+    if request.get("unpack"):
+        _unpack(path, request.get("target") or os.path.dirname(path), request.get("links"))
+    return {"ok": True, "value": {"path": path, "size": os.path.getsize(path)}}
+
+
 def _op_exec(request):
     """Run plain source inside the worker, sharing its globals."""
     exec(compile(request["source"], "<letify>", "exec"), globals())
@@ -2380,6 +2455,8 @@ _OPS = {
     "pull": _op_pull,
     "get_file": _op_get_file,
     "pack_dir": _op_pack_dir,
+    "pack_blob": _op_pack_blob,
+    "place_blob": _op_place_blob,
     "exec": _op_exec,
     "eval": _op_eval,
     "release": _op_release,

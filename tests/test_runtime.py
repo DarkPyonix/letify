@@ -15,6 +15,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import tarfile
 import threading
 import time
 from pathlib import Path
@@ -665,6 +666,8 @@ def test_the_recorded_build_seconds_and_archive_size_survive_a_ref_round_trip(
 
         def pack_dir(self, path: str) -> tuple[bytes, str]:
             return b"x" * 42, "unused"
+
+        persistent_channel = False
 
     digest = volume.cache_env_from(
         _FakeSession(), env, "/project", platform="linux-x86_64", build_s=34.0
@@ -2566,43 +2569,138 @@ def test_the_managed_python_stays_on_the_workspace_root_without_an_env_root() ->
     assert "UV_PYTHON_INSTALL_DIR'] = os.path.expanduser('/workspace/uv-python')" in source
 
 
-def test_a_persistent_provider_that_builds_its_venv_elsewhere_still_archives(
-    uv_project: Path, tmp_path: Path
-) -> None:
-    """Spec "Volumes on a persistent runtime": the project directory has to survive.
-
-    Modal keeps its workspace root, a Modal volume, and builds the .venv on the sandbox's
-    own disk because a cold import from the volume reads thousands of small files over the
-    network. Keying the archive off the provider's persistence gave it neither: it rebuilt
-    230 packages on every session, measured at 428 s and 534 s on an A10.
-    """
+def _elsewhere_provider(tmp_path: Path):
+    """A persistent provider whose .venv is built off its workspace root, as Modal's is."""
     provider = provider_of(PreparingLocal, "lab")
     assert provider.persistent
     volume = provider.volume(
         "cache", backend="filesystem", root=str(tmp_path / "store"), mount=str(tmp_path / "mount")
     )
+    object.__setattr__(provider, "env_root", str(tmp_path / "elsewhere"))
+    return provider, volume
+
+
+def _workspace_archive(env: Env, platform: str) -> Path:
+    root = Path(bootstrap.DEFAULT_WORKSPACE_ROOT)
+    return root / "env-archives" / f"{env.key}-{platform}.tar"
+
+
+def test_a_persistent_provider_that_builds_its_venv_elsewhere_archives_on_its_workspace_root(
+    uv_project: Path, tmp_path: Path, capsys
+) -> None:
+    """Spec "Volumes on a persistent runtime": the archive stays on the workspace root.
+
+    This test used to expect the archive in the client's store. The expectation changed
+    because the spec did: measured on a Modal T4 with a 5.5 GB project directory, packing
+    through the client took about 700 s and restoring 727 s against a 216 s build, because
+    the client's inbound link is the weak one. Tar to the volume the workspace root lives
+    on took 70.8 s. The original reason to archive at all, that a venv built off the
+    workspace root does not survive the sandbox, is unchanged.
+    """
+    provider, volume = _elsewhere_provider(tmp_path)
     env = Env()
     instance = Instance(provider, gpu=None)._placed("remote")
-
-    # A venv built off the workspace root does not survive, however durable the root is.
-    object.__setattr__(provider, "env_root", str(tmp_path / "elsewhere"))
     runtime = provider.start(instance, env, name="lab-1", volumes=(volume,))
     try:
         assert runtime.env_source == "sync"
         platform = runtime.platform
     finally:
         runtime.shutdown()
-    assert volume.cached_env(env, platform), "nothing was archived, so the next session resyncs"
+    archive = _workspace_archive(env, platform)
+    assert archive.is_file(), "nothing was archived on the workspace root"
+    assert not archive.with_name(archive.name + ".partial").exists()
+    assert not list(archive.parent.glob("*.partial")), "a temporary archive was left behind"
+    # Uncompressed: a plain tar, not a gzip stream.
+    with open(archive, "rb") as handle:
+        assert handle.read(2) != b"\x1f\x8b"
+    with tarfile.open(archive) as opened:
+        assert any(name.endswith("/.venv/bin/python") for name in opened.getnames())
+    assert volume.cached_env(env, platform) is None, "the client's store was used"
+    err = capsys.readouterr().err
+    assert "caching the environment on the workspace root" in err, err
 
 
-def test_a_large_environment_is_not_packed_when_the_link_was_never_measured(
+def test_a_second_session_restores_the_environment_from_the_workspace_root(
     uv_project: Path, tmp_path: Path, monkeypatch, capsys
 ) -> None:
-    """Spec "Materializing into a runtime": the pack holds the archive whole, twice.
+    # Spec "Volumes on a persistent runtime": the archive on the workspace root is
+    # restored at the start of install_env, so uv sync does not run.
+    provider, volume = _elsewhere_provider(tmp_path)
+    env = Env()
+    instance = Instance(provider, gpu=None)._placed("remote")
+    first = provider.start(instance, env, name="lab-1", volumes=(volume,))
+    try:
+        assert first.env_source == "sync"
+    finally:
+        first.shutdown()
+    shutil.rmtree(tmp_path / "elsewhere")  # the sandbox's own disk is gone
 
-    2.6.3 made a provider that keeps its workspace root archive like an ephemeral one, and
-    that branch packed unconditionally with no measured rate. On a Modal A10 a 7.2 GB
-    environment sat in the pack for over 30 minutes, silently, while the session billed.
+    def refuse(*args, **kwargs):
+        raise AssertionError("uv sync ran although the workspace root held the archive")
+
+    monkeypatch.setattr(bootstrap, "sync_source", refuse)
+    second = provider.start(instance, env, name="lab-2", volumes=(volume,))
+    try:
+        assert second.env_source == "workspace"
+        executable, _version, _letify = second.call(reports_interpreter(), (), {})[0]
+        venv_bin = tmp_path / "elsewhere" / "project" / env.key / ".venv" / "bin"
+        assert Path(executable).parent == venv_bin
+    finally:
+        second.shutdown()
+    err = capsys.readouterr().err
+    assert "restoring the environment from the workspace root" in err, err
+    assert volume.cached_env(env, second.platform) is None
+
+
+def test_a_workspace_archive_that_fails_validation_is_replaced_by_a_sync(
+    uv_project: Path, tmp_path: Path
+) -> None:
+    # Spec "Volumes on a persistent runtime": a restore that fails the interpreter check
+    # is removed, the environment is synced, and the archive is written again.
+    provider, volume = _elsewhere_provider(tmp_path)
+    env = Env()
+    instance = Instance(provider, gpu=None)._placed("remote")
+    first = provider.start(instance, env, name="lab-1", volumes=(volume,))
+    try:
+        platform = first.platform
+    finally:
+        first.shutdown()
+    archive = _workspace_archive(env, platform)
+    # An archive whose .venv has no working interpreter.
+    broken = tmp_path / "broken"
+    (broken / "project" / env.key / ".venv" / "bin").mkdir(parents=True)
+    (broken / "project" / env.key / ".venv" / "bin" / "python").write_text("not a program")
+    archive.unlink()
+    with tarfile.open(archive, "w") as packed:
+        packed.add(broken / "project", arcname="project")
+    shutil.rmtree(tmp_path / "elsewhere")
+    stale = archive.stat().st_size
+
+    second = provider.start(instance, env, name="lab-2", volumes=(volume,))
+    try:
+        assert second.env_source == "sync"
+        executable, _version, _letify = second.call(reports_interpreter(), (), {})[0]
+        venv_bin = tmp_path / "elsewhere" / "project" / env.key / ".venv" / "bin"
+        assert Path(executable).parent == venv_bin
+    finally:
+        second.shutdown()
+    assert archive.stat().st_size != stale, "the broken archive was not replaced"
+    third = provider.start(instance, env, name="lab-3", volumes=(volume,))
+    try:
+        assert third.env_source == "workspace"
+    finally:
+        third.shutdown()
+
+
+def test_a_large_environment_is_packed_when_the_link_was_never_measured(
+    uv_project: Path, tmp_path: Path, monkeypatch, capsys
+) -> None:
+    """Spec "Materializing into a runtime": the pack streams, so no size limit applies.
+
+    This test used to expect a refusal above 1 GiB, because the pack held the archive whole
+    on the runtime and on the client. On a Modal A10 a 7.2 GB environment sat in that pack
+    for over 30 minutes. The expectation changed only because the spec did: a store that
+    streams has no limit, and the announcement of the size stays.
     """
     from letify.runtime import session as sessionmod
 
@@ -2612,7 +2710,7 @@ def test_a_large_environment_is_not_packed_when_the_link_was_never_measured(
     )
     env = Env()
     instance = Instance(provider, gpu=None)._placed("remote")
-    # No measured rate, as a Modal sandbox has none, and a tree over the limit.
+    # No measured rate, as a Modal sandbox has none, and a tree over 1 GiB.
     monkeypatch.setattr(sessionmod.Runtime, "_measured_rate", lambda self: None)
     monkeypatch.setattr(
         sessionmod.Runtime, "_tree_size", lambda self, root: 8 * 1024**3
@@ -2622,9 +2720,85 @@ def test_a_large_environment_is_not_packed_when_the_link_was_never_measured(
         platform = runtime.platform
     finally:
         runtime.shutdown()
-    assert volume.cached_env(env, platform) is None
+    assert volume.cached_env(env, platform), "nothing was packed"
     err = capsys.readouterr().err
-    assert "over the 1.0 GiB letify will hold in memory" in err, err
+    assert "caching the environment, 8.6 GB" in err, err
+    assert "not caching the environment" not in err, err
+
+
+def test_packing_an_environment_never_holds_the_archive_whole_on_the_client(
+    uv_project: Path, tmp_path: Path, monkeypatch
+) -> None:
+    """Spec "Materializing into a runtime": the archive streams into the store.
+
+    ``Runtime.pack_dir`` and ``Store.put_bytes`` each hold the whole archive in one bytes
+    object, so neither may run while an environment is cached on a store that streams.
+    """
+    from letify.runtime.session import Runtime
+    from letify.store.cas import Store
+
+    def refuse(*_args, **_kwargs):
+        raise AssertionError("the archive was held whole in one bytes object")
+
+    monkeypatch.setattr(Runtime, "pack_dir", refuse)
+    monkeypatch.setattr(Store, "put_bytes", refuse)
+    provider = provider_of(PreparingLocal, "lab", persistent=False)
+    volume = provider.volume(
+        "cache", backend="filesystem", root=str(tmp_path / "store"), mount=str(tmp_path / "mount")
+    )
+    env = Env()
+    instance = Instance(provider, gpu=None)._placed("remote")
+    runtime = provider.start(instance, env, name="lab-1", volumes=(volume,))
+    try:
+        platform = runtime.platform
+    finally:
+        runtime.shutdown()
+    digest = volume.cached_env(env, platform)
+    assert digest
+    blob = volume.store.blob_path(digest)
+    assert blob is not None and blob.read_bytes()[:2] == b"\x1f\x8b"
+    from letify.protocol import digest_of
+
+    assert digest_of(blob.read_bytes()) == digest
+
+
+def test_restoring_a_blob_from_a_store_that_streams_does_not_read_it_whole(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Spec "Materializing into a runtime": the restore sends the stored file in pieces."""
+    import os
+
+    from letify.store.cas import Store
+
+    provider = provider_of(Local, "lab")
+    volume = provider.volume(
+        "cache", backend="filesystem", root=str(tmp_path / "store"), mount=str(tmp_path / "mount")
+    )
+    source = tmp_path / "tree"
+    source.mkdir()
+    # Random bytes do not compress, so the archive is larger than one piece of 8 MiB.
+    (source / "weights.bin").write_bytes(os.urandom(9 << 20))
+    (source / "note.txt").write_text("hello")
+    digest = volume.store.put_tree(source).digest
+
+    def refuse(*_args, **_kwargs):
+        raise AssertionError("the blob was read whole")
+
+    monkeypatch.setattr(Store, "get_bytes", refuse)
+    instance = Instance(provider, gpu=None)._placed("remote")
+    runtime = provider.start(instance, Env(lock=str(tmp_path / "absent.lock")), name="lab-1",
+                             volumes=(volume,))
+    try:
+        into = tmp_path / "restored"
+        volume.materialize(
+            runtime, digest, path=str(tmp_path / "held" / "archive.tgz"), unpack=True,
+            target=str(into),
+        )
+        assert (into / "tree" / "note.txt").read_text() == "hello"
+        assert (into / "tree" / "weights.bin").stat().st_size == 9 << 20
+        assert (tmp_path / "held" / "archive.tgz").stat().st_size > 9 << 20
+    finally:
+        runtime.shutdown()
 
 
 def test_a_small_environment_is_still_packed_and_says_so(

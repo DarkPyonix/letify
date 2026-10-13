@@ -1076,25 +1076,29 @@ less time than the build did. The archive is smaller than the directory, so the 
 overstates the transfer and errs toward building, which is the cheaper of the two to get wrong. The
 ref records the build seconds beside the archive.
 
-With no measured rate for the link, letify packs only when that directory is at most 1 GiB, and says
-why when it declines. Packing moves the archive as one payload that the worker and the client each
-hold whole, so a tree of several gigabytes is held twice in memory with nothing reporting progress:
-measured on a Modal A10, a 7.2 GB environment sat in that step for over 30 minutes while the session
-billed. Packing unconditionally was right while only an ephemeral provider packed, where the
-alternative was a certain full rebuild; a provider that keeps its workspace root and builds its venv
-elsewhere reaches the same branch, and there the alternative is a sync that may take two minutes.
-Making the pack stream rather than hold the archive whole is the fix that removes this limit, and
-until then the limit is what keeps the step from costing more than it saves.
+With no measured rate for the link, letify packs a directory of any size when the archive streams,
+and says `letify: <runtime>: caching the environment, <size> GB` first. The archive streams when the
+first volume's store keeps blobs as files (the filesystem backend, which the automatic environment
+store uses) and the channel is persistent. Both directions then move the archive in pieces and
+neither side holds it whole:
 
-That fix is three changes, not one, because the content addressed store is bytes in both directions:
-`put_file` reads the file whole, a backend's `put` takes the payload, and `get_bytes` and
-`fetch_file` return it whole. So a restore holds the archive entire on the client too, which is what
-a Kaggle session restoring 3.0 GB in 540 s was doing. Streaming it needs the worker to pack into its
-own blob cache and report the digest, the client to take it down the way a write-back takes an output
-file, which already streams and hashes as the pieces arrive, and the store to accept and serve a blob
-by path rather than by bytes. The filesystem backend that the automatic environment store uses can do
-that with a rename; a bucket needs a resumable upload. Until all three exist, both directions are
-bounded by what one process will hold.
+- Pack: the worker op `pack_blob` writes the same tar.gz as `pack_dir`, with the same member rules,
+  into a staging directory beside the project directory while hashing the bytes it writes. It
+  returns `{"digest", "size", "dir"}`. The client receives the file with the stream a write-back
+  uses, checks the digest as the pieces arrive into a scratch file beside the store, and renames it
+  into the store with `Store.adopt_file`. The staging directory is removed afterwards. The digest
+  is the store's content digest (blake3 truncated to 16 bytes, blake2b without blake3).
+- Restore: a blob of more than one piece (8 MiB) that the store holds as a file is sent with
+  `data_put` pieces into a staging directory beside the destination, then moved into place and
+  unpacked by the worker op `place_blob`. Smaller blobs, and any blob from a store that does not
+  keep files, go as one `put_file` payload.
+
+With no measured rate and a store that does not stream (the GCS backend) or a channel that is not
+persistent, letify packs only when the directory is at most 1 GiB, and says why when it declines,
+because that pack moves the archive as one payload that the worker and the client each hold whole.
+Measured: a 7.2 GB Modal environment sat in that whole-payload pack for over 30 minutes while the
+session billed, and a Kaggle session restoring a 3.0 GB archive held whole took 540 s. A streamed
+transfer ran at 85 to 88 MiB/s. A bucket would need a resumable upload to stream.
 
 A later session restores only when the archive's size over the link measured for that session would
 take less than the recorded build. Otherwise it syncs, and says why:
@@ -1133,7 +1137,7 @@ The follow-up design stores each model shard as one content addressed blob and p
 
 ### Volumes on a persistent runtime <!-- id: persistent-volumes -->
 
-> On a persistent provider the volume directory under the workspace root is the runtime's copy of the volume. A file is sent only when that copy does not already hold its digest, and no environment archive is packed or restored.
+> On a persistent provider the volume directory under the workspace root is the runtime's copy of the volume. A file is sent only when that copy does not already hold its digest, and no environment archive is packed or restored, except on the workspace root as below.
 
 A persistent runtime keeps `<workspace root>/volumes/<volume name>` between sessions, so a later session already holds what an earlier one received. The volume directory holds a manifest, `.letify-manifest.json`, mapping each materialized destination path to the digest, size in bytes and modification time in nanoseconds it had when it was written.
 
@@ -1141,7 +1145,27 @@ Before a blob is written to a destination that is not unpacked, the local proces
 
 A persistent provider builds its environment with `uv sync` in `<workspace root>/project/<env key>` every session, and never packs the project directory into a volume or unpacks an archive from one. A sync over an existing `.venv` checks it and installs nothing, so it is faster than any archive transfer, and the `.venv` is already on the disk the archive would be unpacked to.
 
-That holds only while the project directory is under the workspace root. A provider that keeps its workspace root and still builds the `.venv` elsewhere archives like an ephemeral one, because the directory the sync writes does not survive the session however durable the workspace root is. Modal is that provider: its workspace root is a Modal volume and its `env_root` is the sandbox's own disk, chosen because a cold import from the volume reads thousands of small files over the network. Without this, Modal rebuilt 230 packages on every session, measured at 428 s and 534 s on an A10, and had neither the persistence its workspace root offers nor the archive an ephemeral provider gets. Whether the archive is then worth packing is the measurement Materializing into a runtime already makes.
+That holds only while the project directory is under the workspace root. A provider that keeps its workspace root and builds the `.venv` elsewhere keeps the environment archive on that workspace root, not in a store and never through the client. Modal is that provider: its workspace root is a Modal volume that outlives every sandbox, and its `env_root` is the sandbox's own disk, chosen because a cold import from the volume reads thousands of small files over the network.
+
+The archive is `<workspace root>/env-archives/<env key>-<platform>.tar`, uncompressed. Measured on a Modal T4 with a 5.5 GB project directory of 33 packages including torch:
+
+| Step | Time |
+|---|---|
+| `uv sync` build | 216 s |
+| pack through the client's filesystem store | about 700 s |
+| restore through the client's filesystem store | 727 s |
+| `tar -cf` to the volume, uncompressed | 70.8 s |
+| `tar -xf` from the volume, uncompressed | 31.9 s |
+| `tar.gz` to the volume | 240.1 s, gzip is CPU bound |
+| `tar.gz` from the volume | 39.8 s, 3.0 GB |
+
+The client's inbound link is the weak one, so the store path is slower than the build in both directions. Compression costs more than it saves on the volume, so the archive is not compressed.
+
+After a successful sync and interpreter check, the runtime says `caching the environment on the workspace root, <size>`, runs tar from the project directory's parent into a temporary name beside the destination, and renames it into place, so a concurrent session never reads a half written archive. Nothing is sent to the client, and no measured rate gates the pack, because the transfer stays inside the provider.
+
+At the start of `install_env`, when that archive exists on the runtime, the runtime says `restoring the environment from the workspace root`, extracts it into the project directory's parent, and validates the interpreter with the same check an archive restore uses. The restore refuses a member whose path escapes the destination and allows the absolute symlinks a `.venv` needs. A directory an earlier session left under the same name is removed first. When validation fails, the runtime removes the extracted tree, syncs, and replaces the archive. `Runtime.env_source` is `"workspace"` after this restore. This path is taken before and instead of the store path, and such a provider never uses the client store or the bucket store for its environment.
+
+A session sees the archive only once the volume shows it, which is not at once on Modal: a session started right after the one that packed rebuilt and packed again, and a session started a few minutes later restored and its whole call took 44.2 s, against 106.6 s and 183.8 s for the two that built. The rebuild that follows such a miss is not wasted work so much as repeated work, and it leaves the same archive behind.
 
 An ephemeral provider keeps the behaviour of Materializing into a runtime: every file is sent each session, and the environment archive is packed and restored.
 

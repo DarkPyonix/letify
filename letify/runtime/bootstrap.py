@@ -275,6 +275,69 @@ def venv_check_source(python: str, archive: str | None = None) -> str:
     return "\n".join(lines) + "\n"
 
 
+def workspace_pack_source(root: str, archive: str) -> str:
+    """Source that packs a project directory into an uncompressed tar beside its destination.
+
+    Spec "Volumes on a persistent runtime": runs ``tar`` from the directory's parent into a
+    temporary name and renames it into place, so a concurrent session never reads a half
+    written archive. Uncompressed, because gzip costs more than it saves on a local volume.
+    """
+    return (
+        "import os, subprocess\n"
+        f"_root = os.path.expanduser({root!r}).rstrip('/')\n"
+        f"_archive = os.path.expanduser({archive!r})\n"
+        "os.makedirs(os.path.dirname(_archive), exist_ok=True)\n"
+        "_partial = _archive + '.' + str(os.getpid()) + '.partial'\n"
+        "try:\n"
+        "    subprocess.run(['tar', '-cf', _partial, '-C', os.path.dirname(_root),\n"
+        "                    os.path.basename(_root)], check=True, capture_output=True)\n"
+        "    os.replace(_partial, _archive)\n"
+        "finally:\n"
+        "    if os.path.exists(_partial):\n"
+        "        os.remove(_partial)\n"
+        "__letify_value__ = os.path.getsize(_archive)\n"
+    )
+
+
+def workspace_restore_source(archive: str, target: str) -> str:
+    """Source that extracts a workspace archive into ``target``, or answers False without one.
+
+    Spec "Volumes on a persistent runtime": a member whose path escapes ``target`` is
+    refused, and the absolute symlinks a ``.venv`` needs are allowed, as the worker's
+    environment unpacking does with ``links=True``.
+    """
+    return (
+        "import os, shutil, tarfile\n"
+        f"_archive = os.path.expanduser({archive!r})\n"
+        f"_target = os.path.expanduser({target!r})\n"
+        "if not os.path.isfile(_archive):\n"
+        "    __letify_value__ = False\n"
+        "else:\n"
+        "    os.makedirs(_target, exist_ok=True)\n"
+        "    _real = os.path.abspath(_target)\n"
+        "    with tarfile.open(_archive, 'r:') as _packed:\n"
+        "        for _member in _packed.getmembers():\n"
+        "            # Lexical, because a tree from an earlier session already holds symlinks\n"
+        "            # that realpath would follow out of the destination.\n"
+        "            _where = os.path.normpath(os.path.join(_real, _member.name))\n"
+        "            if os.path.commonpath([_real, _where]) != _real:\n"
+        "                raise ValueError('archive member would escape the destination')\n"
+        "        # A tree left by an earlier session holds symlinks that extraction would\n"
+        "        # follow, so the top level names the archive holds are replaced whole.\n"
+        "        for _top in {_m.name.split('/')[0] for _m in _packed.getmembers()}:\n"
+        "            _old = os.path.join(_real, _top)\n"
+        "            if os.path.islink(_old) or os.path.isfile(_old):\n"
+        "                os.remove(_old)\n"
+        "            elif os.path.isdir(_old):\n"
+        "                shutil.rmtree(_old)\n"
+        "        try:\n"
+        "            _packed.extractall(_target, filter='tar')\n"
+        "        except TypeError:\n"
+        "            _packed.extractall(_target)\n"
+        "    __letify_value__ = True\n"
+    )
+
+
 def tree_size_source(root: str) -> str:
     """Source that sums the byte size of every regular file under a directory.
 
@@ -455,4 +518,6 @@ __all__ = [
     "uv_bin_dir",
     "uv_env",
     "venv_check_source",
+    "workspace_pack_source",
+    "workspace_restore_source",
 ]

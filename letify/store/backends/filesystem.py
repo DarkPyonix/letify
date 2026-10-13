@@ -7,17 +7,23 @@ remote runtime pulls from when data is already here.
 
 from __future__ import annotations
 
+import os
+import uuid
 from collections.abc import Iterator
 from pathlib import Path
 
 from ..cas import Backend
 from .layout import BLOB_PREFIX, blob_key, ref_key
 
+#: Where a download is written before it is renamed into the blobs.
+INCOMING = "incoming"
+
 
 class FilesystemBackend(Backend):
     """Blobs and refs as files under one root."""
 
     name = "filesystem"
+    streams = True
 
     def __init__(self, root: str | Path):
         self.root = Path(root).expanduser()
@@ -39,6 +45,21 @@ class FilesystemBackend(Backend):
 
     def get(self, digest: str) -> bytes:
         return self._path(blob_key(digest)).read_bytes()
+
+    def blob_path(self, digest: str) -> Path | None:
+        path = self._path(blob_key(digest))
+        return path if path.is_file() else None
+
+    def scratch_path(self) -> Path:
+        directory = self.root / INCOMING
+        directory.mkdir(parents=True, exist_ok=True)
+        return directory / f"{uuid.uuid4().hex}.partial"
+
+    def adopt(self, path: Path, digest: str) -> None:
+        target = self._path(blob_key(digest))
+        target.parent.mkdir(parents=True, exist_ok=True)
+        # A rename on one filesystem, so a reader never sees a partial blob.
+        os.replace(path, target)
 
     def list_digests(self, prefix: str = "") -> Iterator[str]:
         base = self.root / BLOB_PREFIX
