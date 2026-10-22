@@ -185,3 +185,50 @@ def test_the_carrier_carries_a_stream_between_two_of_itself(tmp_path) -> None:
     finally:
         server.kill()
         listener.close()
+
+
+class RecordingRendezvous:
+    """A command rendezvous whose remote is a list of canned outputs, one per program run."""
+
+    @staticmethod
+    def build(outputs: list[str]):
+        from letify.transport.rendezvous import CommandRendezvous
+
+        class Recording(CommandRendezvous):
+            def __init__(self) -> None:
+                self.sources: list[str] = []
+                self.outputs = list(outputs)
+
+            def unavailable(self) -> str | None:
+                return None
+
+            def run_python(self, source: str, timeout: float) -> str:
+                self.sources.append(source)
+                return self.outputs.pop(0)
+
+        return Recording()
+
+
+def test_a_command_rendezvous_prepares_the_quic_carrier_once_and_names_it(monkeypatch) -> None:
+    # Spec "QUIC over a punched UDP pair": a runtime image ships no letify-quic, so the
+    # rendezvous takes it out of the letify wheel on the remote before the first QUIC
+    # request, and every QUIC request then carries the path.
+    import letify
+
+    answer = nat.ANSWER_MARKER + '{"mapping": ["203.0.113.9", 41000]}'
+    rendezvous = RecordingRendezvous.build(
+        ['LETIFY-QUIC "/tmp/letify-quic-9.9.9"', answer, answer]
+    )
+    monkeypatch.setattr(letify, "__version__", "9.9.9")
+    request = {"kind": "quic", "mapping": ["198.51.100.1", 41000], "token": "ab" * 16}
+    rendezvous.exchange(dict(request), 30.0)
+    rendezvous.exchange(dict(request), 30.0)
+    assert "_remote_quic('9.9.9')" in rendezvous.sources[0]
+    assert all("_remote_quic" not in source for source in rendezvous.sources[1:])
+    assert all('"binary": "/tmp/letify-quic-9.9.9"' in source for source in rendezvous.sources[1:])
+
+
+def test_a_quic_carrier_the_remote_could_not_prepare_fails_the_request() -> None:
+    rendezvous = RecordingRendezvous.build(["could not download the letify wheel"])
+    with pytest.raises(OSError, match="letify-quic"):
+        rendezvous.exchange({"kind": "quic", "mapping": ["198.51.100.1", 41000]}, 30.0)
