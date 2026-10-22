@@ -90,10 +90,14 @@ class CommandRendezvous(Rendezvous):
             if self.binary is not None:
                 request = {**request, "binary": self.binary}
         elif request.get("kind") == "quic":
-            if self.quic_binary is None:
-                self.quic_binary = self._prepare_quic()
-            request = {**request, "binary": self.quic_binary}
+            request = {**request, "binary": self.prepare_quic()}
         return _answer(self.run_python(remote_script({**self.extras(), **request}), timeout))
+
+    def prepare_quic(self) -> str:
+        """The path of ``letify-quic`` on the machine, prepared on the first call."""
+        if self.quic_binary is None:
+            self.quic_binary = self._prepare_quic()
+        return self.quic_binary
 
     def _prepare_quic(self) -> str:
         """Take ``letify-quic`` out of the letify wheel of this version on the machine.

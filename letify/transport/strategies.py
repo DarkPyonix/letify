@@ -357,10 +357,16 @@ class QuicUDP(Strategy):
         carrier = quic.carrier_path()
         if carrier is None:
             raise OSError(quic.MISSING)
-        holder = nat.reusable_socket(0)
+        # The remote carrier is made ready first: a UDP mapping goes stale if a slow
+        # download sits between asking for it and the carrier binding its port.
+        prepare = getattr(target.rendezvous, "prepare_quic", None)
+        if prepare is not None:
+            prepare()
+        holder = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        holder.bind(("0.0.0.0", 0))
         port = holder.getsockname()[1]
         holder.close()
-        mapping = nat.stun_mapping(port, tuple(target.stun))
+        mapping = nat.udp_stun_mapping(port, tuple(target.stun))
         token = secrets.token_bytes(nat.TOKEN_BYTES).hex()
         answer = target.rendezvous.exchange(
             {
