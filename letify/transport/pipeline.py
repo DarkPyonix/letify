@@ -547,8 +547,15 @@ class Pipeline:
                         self._say(f"switching from {first} to {chosen.strategy}")
                     return chosen, measured
 
-            if len(seen) == len(applicable) or time.monotonic() >= deadline:
+            if len(seen) == len(applicable):
                 break
+            if time.monotonic() >= deadline:
+                # A probe of a slow link can outlast the timeout. A strategy that settled while
+                # it ran already has its outcome, so it is still offered before the race ends.
+                with condition:
+                    unseen = any(index not in seen for index in outcomes)
+                if not unseen:
+                    break
             # Nothing acceptable yet, so the strategies still connecting get the rest of
             # the timeout rather than the grace period that a rejected link started.
             with condition:

@@ -933,3 +933,52 @@ def test_a_provider_with_no_known_fallback_keeps_failing_below_the_floor(isolate
     punch = FakeStrategy("tcp_punch", 2, result=result(8.1, 8.1, rtt=190.0))
     with pytest.raises(letify.ProviderUnavailable):
         pipeline([punch], floor=floor).connect()
+
+
+# Spec: Transport, Link floor.
+def test_a_strategy_that_connects_after_a_floor_rejection_is_still_considered(isolated_home):
+    """The Colab Pro+ case: Tailcat connected first and measured below the floor, and the TCP
+    punch connected while that probe ran. The punch must be probed and chosen, not reported as
+    not connected in time."""
+    fallback = FakeStrategy("fallback", 6, probed=False)
+    connect_back = FakeStrategy("connect_back", 1, error="no connect_back endpoint")
+    quic = FakeStrategy("quic", 5, error="no letify-quic")
+    slow = FakeStrategy("tailcat", 3, result=result(0.5, 0.2, rtt=129.1), delay=0.3)
+    punch = FakeStrategy("tcp_punch", 2, result=result(40, 40, rtt=30.0), delay=0.7)
+    chosen = pipeline([connect_back, punch, slow, quic, fallback], floor=LinkFloor.default()).connect()
+    assert chosen.strategy == "tcp_punch"
+    assert slow.links[0].closed
+
+
+class SlowProbe(FakeProbe):
+    """A probe that takes as long on one strategy as a real probe takes on a slow link."""
+
+    def __init__(self, slow: str, seconds: float) -> None:
+        super().__init__()
+        self.slow = slow
+        self.seconds = seconds
+
+    def measure(self, stream):
+        if stream.strategy == self.slow:
+            time.sleep(self.seconds)
+        return super().measure(stream)
+
+
+# Spec: Transport, Link floor.
+def test_a_connected_strategy_is_considered_even_when_a_slow_probe_used_up_the_timeout(isolated_home):
+    """A probe of a slow link can outlast the race timeout. A strategy that connected while
+    it ran has an outcome already, so it is probed and chosen rather than reported as not
+    connected in time."""
+    slow = FakeStrategy("tailcat", 3, result=result(0.5, 0.2, rtt=129.1), delay=0.3)
+    punch = FakeStrategy("tcp_punch", 2, result=result(40, 40, rtt=30.0), delay=0.7)
+    race = Pipeline(
+        [punch, slow],
+        target=None,
+        alias="lab",
+        probe=SlowProbe("tailcat", 1.5),
+        fingerprint=fingerprint(),
+        grace=0.2,
+        timeout=1.0,
+        floor=LinkFloor.default(),
+    )
+    assert race.connect().strategy == "tcp_punch"
