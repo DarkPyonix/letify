@@ -362,27 +362,31 @@ class QuicUDP(Strategy):
         prepare = getattr(target.rendezvous, "prepare_quic", None)
         if prepare is not None:
             prepare()
-        holder = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        holder.bind(("0.0.0.0", 0))
-        port = holder.getsockname()[1]
-        holder.close()
-        mapping = nat.udp_stun_mapping(port, tuple(target.stun))
-        token = secrets.token_bytes(nat.TOKEN_BYTES).hex()
-        answer = target.rendezvous.exchange(
-            {
-                "kind": "quic",
-                "mapping": list(mapping),
-                "token": token,
-                "ssh_port": target.ssh_port,
-                "stun": list(target.stun),
-            },
-            CONNECT_TIMEOUT,
-        )
-        peer = (str(answer["mapping"][0]), int(answer["mapping"][1]))
-        proxy = quic.connect_command(str(carrier), bind=port, peer=peer, token=token)
 
+        def dial() -> str:
+            holder = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            holder.bind(("0.0.0.0", 0))
+            port = holder.getsockname()[1]
+            holder.close()
+            mapping = nat.udp_stun_mapping(port, tuple(target.stun))
+            token = secrets.token_bytes(nat.TOKEN_BYTES).hex()
+            answer = target.rendezvous.exchange(
+                {
+                    "kind": "quic",
+                    "mapping": list(mapping),
+                    "token": token,
+                    "ssh_port": target.ssh_port,
+                    "stun": list(target.stun),
+                },
+                CONNECT_TIMEOUT,
+            )
+            peer = (str(answer["mapping"][0]), int(answer["mapping"][1]))
+            return quic.connect_command(str(carrier), bind=port, peer=peer, token=token)
+
+        # The remote carrier accepts one connection, so every SSH command gets its own
+        # pair, the way a punched TCP link punches again.
         def command(remote_command: str | None = None) -> list[str]:
-            return target.proxied_ssh(proxy, remote_command)
+            return target.proxied_ssh(dial(), remote_command)
 
         _verify(command("exit 0"))
         return SSHLink(self.name, self.rank, command, remote_python=target.remote_python)

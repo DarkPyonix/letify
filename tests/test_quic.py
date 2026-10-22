@@ -72,7 +72,7 @@ def test_the_strategy_exchanges_both_endpoints_and_proxies_ssh(
     proxy = next(part for part in command if part.startswith("ProxyCommand="))
     assert "letify-quic" in proxy and "connect" in proxy
     assert "--peer 203.0.113.9:44444" in proxy
-    assert f"--token {request['token']}" in proxy
+    assert f"--token {rendezvous.requests[-1]['token']}" in proxy
     assert recorder.command[-1] == "exit 0"
 
 
@@ -335,3 +335,29 @@ def test_the_strategy_prepares_the_remote_carrier_before_asking_for_its_mapping(
     rendezvous.prepare_quic = lambda: order.append("prepare")
     QuicUDP().attempt(Target(alias="lab", rendezvous=rendezvous, user="root"))
     assert order == ["prepare", "stun"]
+
+
+def test_every_ssh_command_after_the_first_gets_its_own_quic_pair(
+    monkeypatch, tmp_path, patch_run
+) -> None:
+    # The remote carrier accepts one connection and splices it, so a second SSH session
+    # through the same ProxyCommand finds nobody listening. Each later command asks the
+    # rendezvous for a new pair, as a punched TCP link punches again.
+    bundled = tmp_path / "letify-quic"
+    bundled.write_text("", encoding="utf-8")
+    bundled.chmod(0o755)
+    monkeypatch.setattr(quic, "LIB_DIR", tmp_path)
+    monkeypatch.setattr(
+        nat, "udp_stun_mapping", lambda port, server=None, **kw: ("198.51.100.1", port)
+    )
+    patch_run(__import__("letify.transport.strategies", fromlist=["x"]))
+    rendezvous = CannedRendezvous({"mapping": ["203.0.113.9", 44444]})
+    link = QuicUDP().attempt(Target(alias="lab", rendezvous=rendezvous, user="root"))
+    assert len(rendezvous.requests) == 1
+    first = link.ssh_command("uname")
+    second = link.ssh_command("uname")
+    assert len(rendezvous.requests) == 3
+    tokens = [request["token"] for request in rendezvous.requests]
+    assert len(set(tokens)) == 3
+    proxies = [next(part for part in command if part.startswith("ProxyCommand=")) for command in (first, second)]
+    assert tokens[1] in proxies[0] and tokens[2] in proxies[1]
