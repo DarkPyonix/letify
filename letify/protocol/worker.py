@@ -1380,8 +1380,14 @@ def _drive_ask(message):
     """
     try:
         _SENDER.message(REQUEST, DRIVE_STREAM, message)
-    except OSError:
-        pass
+    except OSError as exc:
+        # The stash or unstash then waits out its grant timeout; this line names why.
+        print(
+            f"letify: drive request {message.get('kind')} {message.get('name')} "
+            f"was not sent: {exc}",
+            file=sys.stderr,
+            flush=True,
+        )
 
 
 def _op_drive_grant(request):
