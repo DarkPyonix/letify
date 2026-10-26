@@ -23,6 +23,7 @@ from __future__ import annotations
 import abc
 import collections
 import contextlib
+import contextvars
 import os
 import select
 import subprocess
@@ -36,6 +37,13 @@ from typing import IO, Any, NoReturn
 from .. import protocol
 from ..errors import ProtocolError, RuntimeFailure, RuntimeLost
 from ..protocol import wire
+
+#: Set for the length of a call by the thread that sends it. When it holds a function and the
+#: thread is the main one, the first KeyboardInterrupt during the wait for the reply calls it
+#: and the wait goes on. Spec "Controlling a running call", Ctrl-C in the owning process.
+INTERRUPT_HOOK: contextvars.ContextVar[Callable[[], None] | None] = contextvars.ContextVar(
+    "letify_interrupt_hook", default=None
+)
 
 #: Marks the line a one-shot ``eval`` prints its value on.
 EVAL_MARKER = "__LETIFY_EVAL__"
@@ -435,6 +443,50 @@ class Connection:
                 self._reading = False
                 self._turn.notify_all()
 
+    def _wait_interruptibly(self, slot: _Slot, on_interrupt: Callable[[], None]) -> None:
+        """Wait for ``slot``'s reply so that a first KeyboardInterrupt is forwarded, not fatal.
+
+        Spec "Controlling a running call". A KeyboardInterrupt raised inside the frame
+        reader could land between two reads and leave the stream cut inside a frame, so the
+        main thread never reads here. It waits on a thread that does, which a
+        KeyboardInterrupt interrupts harmlessly. The first one calls ``on_interrupt`` and the
+        wait goes on. The second stops waiting and propagates.
+        """
+        if threading.current_thread() is not threading.main_thread():
+            self._wait(slot.event.is_set)
+            return
+        failures: list[BaseException] = []
+
+        def read() -> None:
+            try:
+                self._wait(slot.event.is_set)
+            except BaseException as exc:
+                failures.append(exc)
+
+        reader = threading.Thread(target=read, name="letify-call-reader", daemon=True)
+        reader.start()
+        interrupted = False
+        while True:
+            try:
+                reader.join(0.2)
+                if not reader.is_alive():
+                    break
+            except KeyboardInterrupt:
+                if interrupted:
+                    self._forget(slot)
+                    raise
+                interrupted = True
+                token = INTERRUPT_HOOK.set(None)
+                try:
+                    on_interrupt()
+                except KeyboardInterrupt:
+                    self._forget(slot)
+                    raise
+                finally:
+                    INTERRUPT_HOOK.reset(token)
+        if failures:
+            raise failures[0]
+
     def wait_hello(self) -> str:
         self._wait(lambda: self.hello is not None)
         if self.hello is None:
@@ -517,6 +569,7 @@ class Connection:
         shared: bool = True,
     ) -> tuple[Any, str]:
         watchdog = _Watchdog(kill, timeout) if timeout is not None else None
+        on_interrupt = INTERRUPT_HOOK.get()
         try:
             with self.gate.shared() if shared else contextlib.nullcontext():
                 slot = self._open()
@@ -530,7 +583,10 @@ class Connection:
                 except BaseException:
                     self._forget(slot)
                     raise
-            self._wait(slot.event.is_set)
+            if on_interrupt is None:
+                self._wait(slot.event.is_set)
+            else:
+                self._wait_interruptibly(slot, on_interrupt)
         finally:
             if watchdog is not None:
                 watchdog.cancel()

@@ -37,6 +37,7 @@ from ..errors import (
     RemoteError,
     RuntimeFailure,
 )
+from . import control
 from .lease import Lease
 
 if TYPE_CHECKING:
@@ -401,16 +402,23 @@ class Runtime:
         """
         if self.channel is None:
             raise RuntimeFailure(f"{self.name}: the channel is not open")
+        name = getattr(fn, "__qualname__", None) or repr(fn)
         if not self.persistent_channel:
             self.last_used = time.monotonic()
-            return self.channel.call(
-                fn, args, kwargs, timeout=timeout, modules=self.env.ship_modules
-            )
+            # Spec "Controlling a running call": a one-shot call is listed too, so a command
+            # against it can say why it is refused.
+            run = control.begin(self, name)
+            try:
+                return self.channel.call(
+                    fn, args, kwargs, timeout=timeout, modules=self.env.ship_modules
+                )
+            finally:
+                run.end()
         args, kwargs = self._externalize(args, kwargs)
         self._poll_pack()
         try:
             return self._call_with_data(
-                fn, args, kwargs, timeout, data_order, data_first_wave, replica
+                fn, args, kwargs, timeout, data_order, data_first_wave, replica, name
             )
         finally:
             self._poll_pack()
@@ -424,6 +432,7 @@ class Runtime:
         data_order: Any = None,
         data_first_wave: int | None = None,
         replica: dict[str, Any] | None = None,
+        name: str = "",
     ) -> tuple[Any, str]:
         """Pickle a call, place the first wave of its data, and send the rest beside it.
 
@@ -475,9 +484,13 @@ class Runtime:
         # "Named handoffs on the Drive store" describes.
         grants = handoff.GrantWatcher(self.channel)
         grants.start()
+        # The record exists before the call is sent and goes when it returns or raises.
+        run = control.begin(self, name)
         try:
-            outcome = self.channel.request(request, timeout=timeout)
+            with run.interruptible():
+                outcome = self.channel.request(request, timeout=timeout)
         finally:
+            run.end()
             grants.close()
             if back is not None:
                 back.cancel()
