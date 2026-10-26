@@ -16,6 +16,7 @@ import subprocess
 import sys
 import threading
 import time
+from pathlib import Path
 
 import pytest
 from conftest import CannedRendezvous, FakeCompleted, LoopbackRendezvous
@@ -987,3 +988,66 @@ def test_connect_back_asks_the_remote_again_for_a_second_session() -> None:
     assert len(dialed) == 2, dialed
     assert dialed[0] != dialed[1]
     link.close()
+
+
+@pytest.fixture(autouse=True)
+def _sshd_lock_in_tmp(monkeypatch, tmp_path) -> None:
+    monkeypatch.setattr(nat, "SSHD_LOCK", str(tmp_path / "letify-sshd.lock"), raising=False)
+
+
+def test_the_remote_sshd_config_is_moved_into_place_whole(monkeypatch, tmp_path) -> None:
+    # Spec "Colab": the file is written beside the target and os.replace moves it, so a
+    # server reading it sees the old file or the whole new one.
+    source = tmp_path / "sshd_config"
+    source.write_text("Port 2222\n")
+    target = tmp_path / "sshd_config.letify"
+    target.write_text("old\n")
+    moves = []
+    real_replace = os.replace
+
+    def replace(src, dst):
+        moves.append((Path(src), Path(dst), Path(src).read_text(), target.read_text()))
+        real_replace(src, dst)
+
+    monkeypatch.setattr(os, "replace", replace)
+    nat._write_sshd_config(str(source), str(target))
+    assert len(moves) == 1
+    src, dst, written, seen_at_target = moves[0]
+    assert dst == target and src.parent == target.parent and src != target
+    assert written.splitlines() == [f"MaxStartups {nat.SSHD_MAX_STARTUPS}", "Port 2222"]
+    assert seen_at_target == "old\n"
+    assert sorted(p.name for p in tmp_path.iterdir() if "letify" in p.name) == [
+        "sshd_config.letify"
+    ]
+
+
+def test_two_concurrent_sshd_starts_start_the_server_once(monkeypatch, tmp_path) -> None:
+    # Spec "Colab": the check, write and start run under a lock and the check is repeated
+    # once it is held, so the caller that waited finds the first caller's server.
+    binary = tmp_path / "sshd"
+    binary.write_text("")
+    monkeypatch.setattr(nat, "SSHD", str(binary))
+    monkeypatch.setattr(nat, "LETIFY_SSHD_CONFIG", str(tmp_path / "sshd_config.letify"))
+    monkeypatch.setattr(nat, "SSHD_CONFIG", str(tmp_path / "missing"))
+    started = []
+    barrier = threading.Barrier(2)
+
+    def run(command, **kwargs):
+        if command[0] == str(binary):
+            time.sleep(0.2)
+            started.append(command)
+        return subprocess.CompletedProcess(command, 0)
+
+    monkeypatch.setattr(nat.subprocess, "run", run)
+    monkeypatch.setattr(nat, "_ssh_answers", lambda port, timeout=3.0: bool(started))
+
+    def call() -> None:
+        barrier.wait()
+        nat._start_sshd(2200)
+
+    threads = [threading.Thread(target=call) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    assert len(started) == 1

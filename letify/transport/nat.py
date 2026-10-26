@@ -10,6 +10,7 @@ remote side.
 from __future__ import annotations
 
 import errno
+import fcntl
 import json
 import os
 import re
@@ -669,6 +670,10 @@ LETIFY_SSHD_CONFIG = "/etc/ssh/sshd_config.letify"
 #: and the transfer streams of one session arrive together.
 SSHD_MAX_STARTUPS = "64:30:128"
 
+#: The lock that serialises concurrent server starts. Spec "Colab": two strategies
+#: rendezvous at once, and each would otherwise write the file and bind the port.
+SSHD_LOCK = "/run/letify-sshd.lock"
+
 
 def _write_sshd_config(source: str, target: str) -> None:
     """Copy ``source`` to ``target`` with its MaxStartups replaced by ``SSHD_MAX_STARTUPS``.
@@ -682,7 +687,16 @@ def _write_sshd_config(source: str, target: str) -> None:
         lines = []
     kept = [line for line in lines if not line.strip().lower().startswith("maxstartups")]
     # First, ahead of any Match block, so it applies to the whole server.
-    Path(target).write_text("\n".join([f"MaxStartups {SSHD_MAX_STARTUPS}", *kept]) + "\n")
+    text = "\n".join([f"MaxStartups {SSHD_MAX_STARTUPS}", *kept]) + "\n"
+    # Written beside the target and moved over it, so a server that reads the file while a
+    # second caller rewrites it sees the old file or the whole new one.
+    temporary = f"{target}.{os.getpid()}.{threading.get_ident()}.tmp"
+    try:
+        Path(temporary).write_text(text)
+        os.replace(temporary, target)
+    except BaseException:
+        Path(temporary).unlink(missing_ok=True)
+        raise
 
 
 def _ssh_answers(port: int, timeout: float = 3.0) -> bool:
@@ -704,23 +718,29 @@ def _start_sshd(port: int = 22) -> None:
     """
     if _ssh_answers(port):
         return
-    if not Path(SSHD).exists():  # pragma: no cover - installs a system package on the VM
-        subprocess.run(["apt-get", "update", "-qq"], check=False)
+    Path(SSHD_LOCK).parent.mkdir(parents=True, exist_ok=True)
+    with open(SSHD_LOCK, "w") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        # A caller that waited for the lock finds the server the first caller started.
+        if _ssh_answers(port):
+            return
+        if not Path(SSHD).exists():  # pragma: no cover - installs a system package on the VM
+            subprocess.run(["apt-get", "update", "-qq"], check=False)
+            subprocess.run(
+                ["apt-get", "install", "-y", "-qq", "openssh-server"],
+                check=True,
+                env={**os.environ, "DEBIAN_FRONTEND": "noninteractive"},
+            )
+        subprocess.run(["mkdir", "-p", "/run/sshd"], check=False)
+        # A Kaggle image ships sshd with no host key, so the install above is skipped and the
+        # server closes every connection before the banner. ssh-keygen -A makes only what is
+        # missing, so an image that already has its keys is untouched.
+        subprocess.run(["ssh-keygen", "-A"], check=False)
+        _write_sshd_config(SSHD_CONFIG, LETIFY_SSHD_CONFIG)
         subprocess.run(
-            ["apt-get", "install", "-y", "-qq", "openssh-server"],
-            check=True,
-            env={**os.environ, "DEBIAN_FRONTEND": "noninteractive"},
+            [SSHD, "-f", LETIFY_SSHD_CONFIG, "-p", str(port), "-o", "ListenAddress=127.0.0.1"],
+            check=False,
         )
-    subprocess.run(["mkdir", "-p", "/run/sshd"], check=False)
-    # A Kaggle image ships sshd with no host key, so the install above is skipped and the
-    # server closes every connection before the banner. ssh-keygen -A makes only what is
-    # missing, so an image that already has its keys is untouched.
-    subprocess.run(["ssh-keygen", "-A"], check=False)
-    _write_sshd_config(SSHD_CONFIG, LETIFY_SSHD_CONFIG)
-    subprocess.run(
-        [SSHD, "-f", LETIFY_SSHD_CONFIG, "-p", str(port), "-o", "ListenAddress=127.0.0.1"],
-        check=False,
-    )
 
 
 def run_detached(request_json: str, source: str) -> None:  # pragma: no cover - remote entry
