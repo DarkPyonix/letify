@@ -1034,6 +1034,45 @@ Each runtime also reports `price_type`, as [Price type](#elice-price-type) descr
 
 `status()` describes this process only. A session started by a different process is not in it, since the pool lives in the process that owns it. What a machine itself is doing is a different question, answered by `letify utilization`.
 
+## Controlling a running call <!-- id: run-control -->
+
+> A running call can be interrupted, inspected and changed from outside, the way a local process can, without the declaration growing a handle.
+
+A call on a remote runtime is a program running somewhere else. On a laptop the person who started a training loop can press Ctrl-C, attach a debugger or read a variable; letify gives the same reach to a call, so a run that turns out to save no checkpoint can still be saved. None of this adds a value to user code: a call is addressed from the command line by a run id, the way a local process is addressed by its pid, and the session lifetime in [Lifetime](#lifetime) is unchanged.
+
+### Run ids and the registry
+
+Every call on a runtime gets a run id, 12 lowercase hex characters, when it is sent. The owning process writes `~/.letify/runs/<run id>.json` before the call is sent and removes it when the call returns or raises. The record holds `run`, `function` (the qualified name), `runtime`, `provider` (the account alias), `started_at` (Unix seconds), `pid` (the owning process) and `socket`, the owner's control socket. The directory is created with mode 0700 and each file with mode 0600.
+
+Each owning process listens on one Unix socket, `~/.letify/runs/<pid>.sock`, created on the first call and removed at exit. A command reaches a run by reading its record and connecting to that socket; the owner forwards the request to the runtime over the call's own channel. A record whose `pid` no longer exists is stale: it is removed when read and the run is reported as not found. On Windows there is no control socket, and the commands below say so.
+
+The request travels as one JSON object per line on the socket and the answer as one JSON object per line, so a tool that is not letify can drive it.
+
+### Commands
+
+Every command takes `--json`, which prints one JSON object instead of text. The exit status is 0 on success, 2 for a usage error, 3 when the run is not found, and 1 for any other failure.
+
+- `letify runs` lists the live runs of this machine: run id, function, runtime, provider, age and owner pid.
+- `letify interrupt <run>` raises `KeyboardInterrupt` in the call's body on the runtime, in the thread that runs it, as Ctrl-C does in a local process. The body's `except` and `finally` blocks run, so the call ends the way an interrupted local function ends: its outputs are written back as for any call that raises, and the caller sees the exception. A body that catches it keeps running.
+- `letify exec <run> CODE` or `letify exec <run> -f FILE` runs Python source inside the worker process, on a thread of its own, while the body keeps running. The source sees these names:
+  - `frame`, the innermost frame of the body's thread whose code is not in the standard library, site-packages or letify, so it is the user's own loop;
+  - `frames`, every such frame from the outermost to the innermost;
+  - `L`, `frame.f_locals`, and `G`, `frame.f_globals`.
+
+  When the source is a single expression the answer carries the `repr` of its value. The answer always carries what the source printed on stdout and stderr, and a traceback when it raised. `--timeout S`, 60 by default, bounds the wait for the answer, not the thread. The body is not paused, so the source sees the body's objects as they are while it runs. Mutating an object, such as `L["config"].save_every = 100`, reaches the running loop on every Python. Assigning a name, such as `L["save_every"] = 100`, reaches the running frame only on Python 3.13 and later, where `f_locals` writes through; on an earlier Python the answer says that the assignment was not applied. A file written by the source lives on the runtime: calling `letify.stash(name, path)` in the source moves it to the Drive store, as from the body, so a checkpoint can be rescued from a runtime that may not survive.
+
+A command against a run on a provider whose worker has no persistent channel, the one-shot channels, fails with `UnsupportedMode` naming the provider.
+
+### Ctrl-C in the owning process
+
+The first `KeyboardInterrupt` that reaches a thread waiting for a call's reply sends the same interrupt as `letify interrupt` and keeps waiting, so the body's handlers run and the outputs come back before the call raises. The waiting thread prints `letify: interrupting <run>; press Ctrl-C again to stop waiting`. A second `KeyboardInterrupt` during that wait stops waiting at once and propagates, as before this section existed. No signal handler is installed for this, so a notebook kernel's interrupt behaves the same way.
+
+### Exit hooks
+
+`letify.on_exit(fn)`, called inside a body, registers `fn` to run when the worker is about to end while that body is still running, for a reason other than the body returning or raising. The reasons are the worker receiving `SIGTERM` (a preempted session, a provider stopping it), the lease deadline passing, and the channel closing while a call runs. Hooks run in the reverse order of registration, each at most once, on the body's process, with 120 s in total; a hook that raises is reported on stderr and the next one runs. Hooks registered by a call are dropped when that call ends. `SIGKILL`, the out of memory killer and a power cut run no code at all, so no hook runs for them; checkpoints are what covers those.
+
+Outside a body, `letify.on_exit` raises `UnsupportedMode`, because a local process has `atexit` already.
+
 ## Storage
 
 > A volume is a content addressed blob store on whichever backend a provider has. Each provider holds one volume per project, filled automatically from what a call uses, so a declaration never names one.
