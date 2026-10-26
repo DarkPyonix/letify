@@ -1,12 +1,8 @@
-"""Build letify-core and the agent, and put them where letify looks.
+"""Build letify-quic and put it where letify looks.
 
-The library has to be installed under the name of the one it replaces, because being found before the real
-driver is the entire mechanism. Cargo cannot emit those names directly, so this copies the
-artifact into place under the right one.
-
-    Linux and WSL2   libcuda.so.1   reached with LD_PRELOAD
-    Windows          nvcuda.dll     reached by putting its directory first in the
-                                    loader's search order
+The wheels carry the QUIC carrier binary in ``letify/remoting/lib/``. The spec's "QUIC over a
+punched UDP pair" describes what it does, and ``letify/transport/quic.py`` finds it there.
+This script builds the workspace and copies the binary into place.
 
 Run it from the repository root or from here:
 
@@ -26,21 +22,8 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parent
 
-#: What the library must be called on each platform, and what cargo produces.
-ARTIFACTS = {
-    "Windows": ("letify_driver.dll", "nvcuda.dll"),
-    "Linux": ("libletify_driver.so", "libcuda.so.1"),
-    "Darwin": ("libletify_driver.dylib", "libletify_driver.dylib"),
-}
-
-AGENTS = {
-    "Windows": "letify-agent.exe",
-    "Linux": "letify-agent",
-    "Darwin": "letify-agent",
-}
-
-#: The QUIC carrier, shipped in the wheel beside the shim. Spec "QUIC over a punched UDP
-#: pair": the remote fetches the same wheel to get its own copy.
+#: The QUIC carrier each platform's wheel ships. Spec "QUIC over a punched UDP pair": the
+#: remote fetches the same wheel to get its own copy.
 CARRIERS = {
     "Windows": "letify-quic.exe",
     "Linux": "letify-quic",
@@ -52,19 +35,19 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--debug", action="store_true", help="build without optimizations")
     parser.add_argument(
-        "--target-dir", default=None, help="where letify should find letify-core"
+        "--target-dir", default=None, help="where letify should find letify-quic"
     )
     args = parser.parse_args(argv)
 
     system = platform.system()
-    if system not in ARTIFACTS:
-        print(f"letify: {system} is not a supported platform for the shim", file=sys.stderr)
+    if system not in CARRIERS:
+        print(f"letify: {system} is not a supported platform for letify-quic", file=sys.stderr)
         return 1
 
     if shutil.which("cargo") is None:
         print(
             "letify: cargo is not on PATH. Install Rust from https://rustup.rs to build "
-            "letify-core, or use host='remote' and skip it entirely.",
+            "letify-quic, or skip it: the QUIC strategy is then left out.",
             file=sys.stderr,
         )
         return 1
@@ -79,29 +62,12 @@ def main(argv: list[str] | None = None) -> int:
     destination = Path(args.target_dir) if args.target_dir else ROOT / "letify" / "remoting" / "lib"
     destination.mkdir(parents=True, exist_ok=True)
 
-    source_name, install_name = ARTIFACTS[system]
-    source = built / source_name
-    if not source.is_file():
-        print(f"letify: cargo did not produce {source}", file=sys.stderr)
-        return 1
-    shutil.copy2(source, destination / install_name)
-    print(f"letify: letify-core installed at {destination / install_name}")
-
-    agent = built / AGENTS[system]
-    if agent.is_file():
-        shutil.copy2(agent, destination / agent.name)
-        print(f"letify: agent installed at {destination / agent.name}")
-
     carrier = built / CARRIERS[system]
-    if carrier.is_file():
-        shutil.copy2(carrier, destination / carrier.name)
-        print(f"letify: QUIC carrier installed at {destination / carrier.name}")
-
-    print()
-    print("The agent runs on the machine with the GPU:")
-    print(f"    {agent.name} 0.0.0.0:7654")
-    print()
-    print("letify starts it for you when a declaration asks for host='local'.")
+    if not carrier.is_file():
+        print(f"letify: cargo did not produce {carrier}", file=sys.stderr)
+        return 1
+    shutil.copy2(carrier, destination / carrier.name)
+    print(f"letify: QUIC carrier installed at {destination / carrier.name}")
     return 0
 
 
