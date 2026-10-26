@@ -1895,7 +1895,7 @@ A UDP pinhole opens where a TCP simultaneous open is refused, which is why Tailc
 
 QUIC is the one UDP payload such a device is unlikely to shape, because HTTP/3 is QUIC and shaping it breaks the web. So letify can carry the session over a real QUIC v1 connection: version 1 on the wire, a TLS 1.3 handshake, a certificate, and the ALPN `letify/1`.
 
-`letify-quic` is a binary in letify-core, built for each wheel and installed beside the CUDA shim in `letify/remoting/lib/`. It takes the punched endpoints rather than discovering anything, because the rendezvous already exchanges them:
+`letify-quic` is a binary in letify-core, built for each wheel and installed in `letify/remoting/lib/`. It takes the punched endpoints rather than discovering anything, because the rendezvous already exchanges them:
 
 ```
 letify-quic serve   --bind <port> --peer <ip:port> --token <hex> --forward <ssh port>
@@ -2585,11 +2585,13 @@ A lost worker process or link raises `RuntimeLost`, and the session is discarded
 
 `_make_wrapper_subclass`, `TorchFunctionMode` and `torch.utils._pytree` are each present in 2.1. An older PyTorch raises `UnsupportedMode` naming the version found and the version needed.
 
-### The driver stand-in is retired <!-- id: letify-core -->
+### The driver stand-in is removed <!-- id: letify-core -->
 
-> `host="local"` does not load letify-core. Standing in for the CUDA driver was replaced by operator forwarding.
+> `host="local"` does not load letify-core. Standing in for the CUDA driver was replaced by operator forwarding, and the driver stand-in was removed from the tree.
 
-Measured on 2026-09-14 against a Tesla P100 server with torch 2.5.1 cu121: libcudart 12.1 resolves 425 driver symbols by name and the stand-in `libcuda.so.1` exports 20, so CUDA initialization fails with `cudaErrorInsufficientDriver`. The private `cuGetExportTable` blocks adding symbols one by one, and PyTorch kernels arrive through fatbinary registration that `cuModuleLoadData` does not see. Operator forwarding depends on PyTorch's public extension points instead of the driver's private ones. The Rust crates in `letify-core/` and `letify.remoting.probe` remain in the tree and the wheels, and nothing on the `host="local"` path calls them.
+Measured on 2026-09-14 against a Tesla P100 server with torch 2.5.1 cu121: libcudart 12.1 resolves 425 driver symbols by name and the stand-in `libcuda.so.1` exports 20, so CUDA initialization fails with `cudaErrorInsufficientDriver`. The private `cuGetExportTable` blocks adding symbols one by one, and PyTorch kernels arrive through fatbinary registration that `cuModuleLoadData` does not see. Operator forwarding depends on PyTorch's public extension points instead of the driver's private ones.
+
+The crates `letify-wire`, `letify-driver` and `letify-agent` and the module `letify.remoting.probe` are not in the tree. The code is at the git tag `archive/cuda-driver-forwarding`. A stand-in at the CUDA runtime API layer, which libcudart does not need driver symbols for, is proposed in [pull request 74](https://github.com/DarkPyonix/letify/pull/74). `letify-core/` holds the crates `letify` and `letify-quic`.
 
 ## Command line
 
@@ -2615,7 +2617,7 @@ A heading, an alias at the top of a block and a table's column names are bold. S
 
 A `LetifyError` that reaches the command line prints `✗ <message>` on standard error and exits with 1. An argument error is argparse's own and exits with 2.
 
-`--json` prints the records with no styling on `providers`, `devices`, `status`, `usage`, `utilization`, `probe` and `efficiency`.
+`--json` prints the records with no styling on `providers`, `devices`, `status`, `usage`, `utilization` and `efficiency`.
 
 Connection decision lines stay on standard error as `letify: <message>`, with the content set by Transport. When standard error is a terminal with colour, the `letify:` prefix is dim and nothing else changes.
 
@@ -2627,7 +2629,6 @@ Connection decision lines stay on standard error as `letify: <message>`, with th
 | `devices` | A table `PROVIDER  ACCELERATORS`, the accelerators joined by `, `. `--json` is the mapping from alias to accelerator names |
 | `status` | The header `<name>  <live> live, <busy> busy`, one block per live runtime, then a table `PROVIDER  ACCELERATOR  RESERVED  INDICES` with reserved as `<reserved>/<count>`. With no runtime the blocks are replaced by `no live session in this process`. `--json` is `Launcher.status()` |
 | `usage`, `utilization` | As Remaining usage and GPU utilization describe |
-| `probe` | A mark and `forwarding usable`, `forwarding usable but costly` or `forwarding not usable`, then aligned `platform`, `core`, `agent` and `round trip` fields and the reason, dim. `--json` is the capability record |
 | `efficiency` | `<p>% of a direct run`. `--json` is `{"efficiency": <fraction>}` |
 | `check` | `✓ <alias> answers`, then the machine's output indented by 2 spaces |
 | `login` | `✓ <alias> declared in <home>`, or `! <alias> was already declared in <home>, so nothing was asked for`, then `✓ <alias> referenced in <project>, which is safe to commit` |
@@ -2754,7 +2755,7 @@ Provider tools run out of process and never in the user's `.venv`. Colab runs th
 
 uv must be installed. letify finds it from the `UV` environment variable, then from `PATH`. If neither has it, letify raises an error that says uv is required.
 
-The Python code is pure and links no Python extension. letify-core binaries are built in CI and placed in `letify/remoting/lib/`, so each release has one wheel per desktop platform, tagged `py3-none-<platform>`:
+The Python code is pure and links no Python extension. The `letify-quic` binary of letify-core is built in CI and placed in `letify/remoting/lib/`, so each release has one wheel per desktop platform, tagged `py3-none-<platform>`:
 
 | Platform | Wheel platform tag |
 |---|---|
@@ -2765,7 +2766,7 @@ The Python code is pure and links no Python extension. letify-core binaries are 
 | macOS arm64 | `macosx_11_0_arm64` |
 | macOS x86_64 | `macosx_10_12_x86_64` |
 
-Linux wheels are built inside the `manylinux_2_28` containers, so the binaries need glibc 2.28 or newer. That covers RHEL 8, Debian 10 and Ubuntu 18.10 onward. The sdist carries no binaries, and an install from it has no letify-core.
+Linux wheels are built inside the `manylinux_2_28` containers, so the binaries need glibc 2.28 or newer. That covers RHEL 8, Debian 10 and Ubuntu 18.10 onward. The sdist carries no binaries, and an install from it has no `letify-quic`, so the QUIC strategy is skipped.
 
 ### Versioning and releases <!-- id: versioning -->
 
@@ -2776,7 +2777,7 @@ Linux wheels are built inside the `manylinux_2_28` containers, so the binaries n
 | File | Field |
 |---|---|
 | `letify/__init__.py` | `__version__` |
-| `letify-core/Cargo.toml` | `[workspace.package].version`, and the `letify`, `letify-wire`, `letify-driver`, `letify-agent` and `letify-quic` entries in `Cargo.lock` |
+| `letify-core/Cargo.toml` | `[workspace.package].version`, and the `letify` and `letify-quic` entries in `Cargo.lock` |
 | `letify-ext/package.json` | `version`, and `version` and `packages[""].version` in `package-lock.json`, when `letify-ext/` exists |
 | Git tag | `v<version>` |
 

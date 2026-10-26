@@ -48,7 +48,6 @@ from letify.store.backends.filesystem import FilesystemBackend
 from letify.transport import strategies as strategies_module
 from letify.transport.rendezvous import ShellCommandRendezvous, TailcatRendezvous
 
-probe_module = import_module("letify.remoting.probe")
 usage_module = import_module("letify.providers.usage")
 
 

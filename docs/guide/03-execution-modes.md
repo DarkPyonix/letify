@@ -86,7 +86,7 @@ torch.cuda.set_sync_debug_mode("warn")
 This does not depend on where the GPU is, so it can be measured on any CUDA device, including a Colab runtime. Under `host="local"`, `letify.remoting.device.current_client().stats` counts it for you: `round_trips` is `k` and `ops` is `n`. With `k` measured and the round trip measured, the formula gives you a real answer instead of an estimate.
 
 ```bash
-letify probe gpu.lab.example.edu     # round trip, and whether forwarding is possible
+ping -c 5 gpu.lab.example.edu        # round trip
 ```
 
 ## Tuning `k` down

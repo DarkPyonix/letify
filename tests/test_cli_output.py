@@ -190,20 +190,6 @@ def test_a_runtime_block_leaves_out_what_is_not_known() -> None:
     )
 
 
-def test_probe_prints_a_verdict_with_aligned_fields_and_json_on_request(
-    isolated_home, capsys
-) -> None:
-    assert main(["probe"]) == 0
-    out = capsys.readouterr().out
-    first = out.splitlines()[0]
-    assert first[:2] in {"✓ ", "✗ ", "! "}
-    assert "forwarding" in first
-    assert any(line.startswith("platform ") for line in out.splitlines())
-    assert main(["probe", "--json"]) == 0
-    report = json.loads(capsys.readouterr().out)
-    assert report["platform"] and "usable" in report
-
-
 def test_efficiency_prints_json_on_request(capsys) -> None:
     assert main(["efficiency", "0.5", "3", "150", "--json"]) == 0
     assert json.loads(capsys.readouterr().out)["efficiency"] == pytest.approx(0.526, abs=1e-3)

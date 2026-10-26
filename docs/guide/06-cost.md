@@ -148,7 +148,7 @@ Colab figures assume the 600 credit pack at 49.99 USD, which is about 0.083 USD 
 ## Checking before you spend
 
 ```bash
-letify probe gpu.lab.example.edu     # round trip, and whether forwarding is viable
+ping -c 5 gpu.lab.example.edu        # round trip, which sets what forwarding costs
 letify check lab_a100                # does the machine answer at all?
 letify login shell lab_a100          # declare the machine before spending on it
 letify usage                         # what is left on each account

@@ -114,7 +114,7 @@ This repository uses [ResearchTree](https://darkpyonix.github.io/researchtree/) 
 
 ## Code layout
 
-The Python package is pure Python and links no Python extension. The package lives in `letify/` at the repository root. letify-core, the Rust workspace in `letify-core/`, is built in CI and shipped as plain binaries in `letify/remoting/lib/` inside platform wheels.
+The Python package is pure Python and links no Python extension. The package lives in `letify/` at the repository root. letify-core, the Rust workspace in `letify-core/`, is built in CI, and its `letify-quic` binary is shipped in `letify/remoting/lib/` inside platform wheels.
 
 ```
 letify/
@@ -129,7 +129,7 @@ letify/
   runtime/          Channel, session, pool, lease, bootstrap and telemetry
   store/            Content addressed blob store, volumes and backends
   providers/        Provider base class and one module per provider
-  remoting/         CUDA API forwarding, used only where a low-latency path exists
+  remoting/         PyTorch operator forwarding for host="local" (remoting/device/) and the efficiency arithmetic; also holds the letify-quic binary in lib/
   _vendor/          Vendored third party code
 letify-ext/         VS Code extension (TypeScript) showing quota and GPU activity from the CLI's --json output
 ```

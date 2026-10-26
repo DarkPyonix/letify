@@ -83,7 +83,7 @@ def test_the_extension_is_optional(tmp_path: Path) -> None:
 
 
 @pytest.mark.parametrize(
-    "crate", ["letify", "letify-wire", "letify-driver", "letify-agent", "letify-quic"]
+    "crate", ["letify", "letify-quic"]
 )
 def test_a_crate_entry_in_the_lockfile_that_disagrees_is_reported(
     tmp_path: Path, crate: str

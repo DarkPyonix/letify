@@ -1,28 +1,22 @@
-"""CUDA call forwarding: the capability probe and the arithmetic behind it.
+"""PyTorch forwarding for ``host="local"`` and the arithmetic that prices it.
 
-letify-core that does the interception is a Rust component under ``letify-core/``, because
-intercepting the CUDA driver cannot be done from Python. This package is the part that
-stays pure Python: it finds letify-core, measures the round trip, and refuses clearly when
-forwarding cannot run.
+``remoting/device/`` is the forwarding itself. What is defined here is the efficiency
+formula, which needs neither PyTorch nor a connection. It does not own the letify-quic
+binary in ``lib/``, which ``letify.transport.quic`` finds.
 """
 
 from __future__ import annotations
 
-from .capability import LATENCY_BUDGET_MS, Capability
-from .loader import Injection, core_directory, inject, preload_command
-from .probe import CORE_NAMES, core_path, efficiency, ping, probe, require
 
-__all__ = [
-    "CORE_NAMES",
-    "LATENCY_BUDGET_MS",
-    "Capability",
-    "Injection",
-    "core_directory",
-    "core_path",
-    "efficiency",
-    "inject",
-    "ping",
-    "preload_command",
-    "probe",
-    "require",
-]
+def efficiency(step_seconds: float, syncs: int, round_trip_ms: float) -> float:
+    """Expected fraction of a direct run, ``T / (T + k * RTT)``.
+
+    ``step_seconds`` is the GPU time per step, ``syncs`` the host synchronizations per
+    step and ``round_trip_ms`` the round trip to the runtime. ``syncs`` is measured with
+    ``torch.cuda.set_sync_debug_mode("warn")``, which does not depend on where the GPU is.
+    """
+    overhead = syncs * round_trip_ms / 1000.0
+    return step_seconds / (step_seconds + overhead)
+
+
+__all__ = ["efficiency"]

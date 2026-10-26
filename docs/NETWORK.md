@@ -217,26 +217,6 @@ Both sides bound one TCP port, learned the mapping from `stun.nextcloud.com:443`
 
 `colab console` is not a usable channel: it is a terminal inside tmux, and a single input line of 4000 characters or more arrives truncated or mixed with terminal control sequences. The Colab runtime proxy reaches only port 8080 on the VM; other port prefixes return 404.
 
-### letify-core copy throughput
-
-A copy to the device through letify-core, with the payload streamed from the caller's buffer into the agent's staging buffer, moves about 2000 MiB/s over loopback TCP. The same payload through an encoded frame, the path before streaming, moves about 520 MiB/s. Both carry one 256 MiB `CopyToDevice` request between a `BufWriter` and a `BufReader` with `TCP_NODELAY`, on an AMD EPYC 7763, and report the median of five runs.
-
-| Path | Three invocations |
-|---|---|
-| Encoded frame, before the change | 545, 544, 507 MiB/s |
-| Encoded frame, after the change | 515, 514, 519 MiB/s |
-| Streamed into staging | 2043, 1961, 1873 MiB/s |
-
-A copy to the host, with the payload streamed from the agent's staging buffer into the caller's buffer, moves about 3250 MiB/s over loopback TCP. The same payload through an encoded frame and a copy into the caller's buffer, the path before streaming, moves about 520 MiB/s. Both carry one 256 MiB `Payload` reply over the same socket pair and machine and report the median of five runs. The copy on the device is not included.
-
-| Path | Three invocations |
-|---|---|
-| Encoded frame, before the change | 522, 514, 519 MiB/s |
-| Encoded frame, after the change | 528, 527, 540 MiB/s |
-| Streamed into the destination | 3234, 3261, 3244 MiB/s |
-
-Loopback removes the network, so these numbers bound what the copy path itself costs. On a real link the link rate decides throughput whenever it is below them. To reproduce, run `cargo test --release -p letify-wire --test throughput -- --ignored --nocapture --test-threads=1` in `letify-core/`.
-
 ## PyTorch forwarding on dept_gpu
 
 > Reading the loss once every 50 steps, `host="local"` takes a median 3.45 ms per step against 1.70 ms directly on the server: about twice the direct time, and one round trip per 45 steps. Measured on 2026-09-14.
@@ -315,7 +295,7 @@ Three checks settle most of what is provider specific.
 
 ```bash
 # Round trip to the machine, which sets the efficiency formula.
-letify probe gpu.lab.example.edu
+ping -c 5 gpu.lab.example.edu
 
 # Whether a layer 3 tunnel is possible at all.
 ls -l /dev/net/tun

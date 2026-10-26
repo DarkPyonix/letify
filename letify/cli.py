@@ -183,10 +183,6 @@ def build_parser() -> argparse.ArgumentParser:
     cache.add_argument("alias", nargs="?", help="provider alias or local cache target to clear")
     cache.add_argument("--json", action="store_true", help="print the records unformatted")
 
-    probe = sub.add_parser("probe", help="measure whether host='local' is worth using")
-    probe.add_argument("host", nargs="?", help="host name to measure the round trip to")
-    probe.add_argument("--json", action="store_true", help="print the record unformatted")
-
     efficiency = sub.add_parser(
         "efficiency", help="expected fraction of a direct run, from measured terms"
     )
@@ -835,39 +831,6 @@ def _dispatch(args: argparse.Namespace) -> int:
         _say("ok", f"{args.alias} answers")
         for line in str(answer).splitlines():
             print(f"  {line}")
-        return 0
-
-    if args.command == "probe":
-        from .remoting import probe as run_probe
-
-        capability = run_probe(args.host)
-        record = {
-            "platform": capability.platform,
-            "core": capability.core,
-            "agent": capability.agent,
-            "round_trip_ms": capability.round_trip_ms,
-            "usable": capability.usable,
-            "costly": capability.costly,
-            "reason": capability.explain(),
-        }
-        if args.json:
-            return _json(record)
-        if capability.usable and capability.costly:
-            _say("warn", "forwarding usable but costly")
-        elif capability.usable:
-            _say("ok", "forwarding usable")
-        else:
-            _say("fail", "forwarding not usable")
-        rtt = capability.round_trip_ms
-        pairs = [
-            ("platform", str(capability.platform)),
-            ("core", str(capability.core)),
-            ("agent", str(capability.agent)),
-            ("round trip", f"{rtt:.1f} ms" if rtt is not None else "not measured"),
-        ]
-        style = _out()
-        sys.stdout.write(render.fields(pairs, style))
-        print(style.dim(str(record["reason"])))
         return 0
 
     return 1

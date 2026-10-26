@@ -24,7 +24,7 @@ Read this table first. Most confusion about letify is one of these words meaning
 | **persistence** | Whether a provider's storage outlives a session: `persistent` or `ephemeral`. |
 | **RemoteTensor** | Under `host="local"`, the local stand-in for a tensor on the runtime's GPU: a meta tensor for shape and dtype plus a handle. Reports its device as `cuda:0`. |
 | **device worker** | The process on the runtime that runs PyTorch operators on real tensors keyed by handle, one per session. |
-| **letify-core** | A Rust workspace from an earlier `host="local"` design that stood in for the CUDA driver. Retired from that path; nothing on it calls letify-core. |
+| **letify-core** | The Rust workspace in `letify-core/`: the `letify` crate and the `letify-quic` binary. The CUDA driver stand-in it once held is removed. |
 
 ## The shape of the thing
 
@@ -58,7 +58,7 @@ One directory per concern, so the file you need is the one named after the thing
 | `runtime/` | The channel, the session, the pool, the lease, bootstrap source |
 | `providers/` | The base class, name normalization, and one module per provider |
 | `store/` | The content addressed store, volumes, and `backends/` |
-| `remoting/` | PyTorch forwarding in `remoting/device/`, and the round trip probe and efficiency arithmetic |
+| `remoting/` | PyTorch forwarding in `remoting/device/`, and the efficiency arithmetic |
 | `launcher.py` | `Launcher` itself, which ties the rest together |
 | `errors.py` | The exception hierarchy, which everything imports |
 | `cli.py` | The command line |
@@ -180,7 +180,7 @@ Three protocol rules exist for performance rather than tidiness. Large arguments
 
 ## remoting
 
-PyTorch forwarding, in `remoting/device/`, and the round trip arithmetic beside it.
+PyTorch forwarding, in `remoting/device/`, and the efficiency arithmetic beside it.
 
 | Module | Owns |
 |---|---|
@@ -197,4 +197,4 @@ It refuses rather than degrading when PyTorch is absent or too old. It does not 
 
 ## letify-core
 
-A Rust workspace that stood in for the CUDA driver in an earlier design of `host="local"`. It is retired from that path because libcudart needs driver symbols the stand-in cannot provide; the spec's "The driver stand-in is retired" gives the measurement. The crates remain in `letify-core/` and nothing in the Python package calls them on the `host="local"` path.
+The Rust workspace in `letify-core/`. It holds the crate `letify`, published to crates.io, and the binary `letify-quic`, which the wheels carry in `letify/remoting/lib/` and `letify/transport/quic.py` runs. The driver stand-in it once held is removed; the spec's "The driver stand-in is removed" gives the measurement and where the code is.
