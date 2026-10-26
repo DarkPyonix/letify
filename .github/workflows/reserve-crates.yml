@@ -1,0 +1,77 @@
+# Reserve a letify-* crate name on crates.io before its first real release.
+#
+# Pushing the tag reserve/<crate>, for example reserve/letify-link, publishes version 0.0.0 of
+# that crate: a library with no code whose README says which letify release ships it. The real
+# crate later publishes at letify's own version, as every crate in letify-core does, so 0.0.0
+# stays below every real release.
+#
+# Only names starting with letify- are accepted, and a name crates.io already has is skipped,
+# so pushing the tag again changes nothing. The crate letify itself is not reserved here: it
+# publishes at the release version from publish-crates.yml.
+#
+# The upload runs in the GitHub environment crates-io with the secret CARGO_REGISTRY_TOKEN, as
+# publish-crates.yml does.
+name: reserve-crates
+
+on:
+  push:
+    tags: ["reserve/*"]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: reserve-crates-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  reserve:
+    runs-on: ubuntu-latest
+    environment: crates-io
+    steps:
+      - name: Install Rust
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+      - name: Publish 0.0.0 unless the name is taken
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+          CRATE: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          name="${CRATE#reserve/}"
+          if [[ ! "$name" =~ ^letify-[a-z0-9]+(-[a-z0-9]+)*$ ]]; then
+            echo "reserve/$name: only names of the form letify-<word> are reserved here" >&2
+            exit 1
+          fi
+          code="$(curl -s -o /dev/null -w '%{http_code}' -A 'letify-reserve (github.com/DarkPyonix/letify)' "https://crates.io/api/v1/crates/$name")"
+          if [[ "$code" == "200" ]]; then
+            echo "$name is already on crates.io; nothing to reserve"
+            exit 0
+          fi
+          if [[ -z "$CARGO_REGISTRY_TOKEN" ]]; then
+            echo "CARGO_REGISTRY_TOKEN is empty. Add it to the crates-io environment." >&2
+            exit 1
+          fi
+          dir="$RUNNER_TEMP/$name"
+          mkdir -p "$dir/src"
+          cat > "$dir/Cargo.toml" <<TOML
+          [package]
+          name = "$name"
+          version = "0.0.0"
+          edition = "2024"
+          license = "MIT"
+          description = "Reserved for the letify project. The first release ships with letify 3.0."
+          repository = "https://github.com/DarkPyonix/letify"
+          readme = "README.md"
+          TOML
+          cat > "$dir/README.md" <<MD
+          # $name
+
+          This name is reserved for the letify project, https://github.com/DarkPyonix/letify.
+          Version 0.0.0 holds no code. The first release ships with letify 3.0 and carries
+          letify's version, as every letify crate does.
+          MD
+          echo '#![doc = include_str!("../README.md")]' > "$dir/src/lib.rs"
+          cd "$dir"
+          cargo publish --allow-dirty
