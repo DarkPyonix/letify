@@ -157,7 +157,7 @@ def udp_stun_mapping(
                         return parse_stun_response(data, transaction)
                     except ValueError:
                         continue
-            except socket.timeout:
+            except TimeoutError:
                 continue
         raise TimeoutError(f"no UDP STUN reply from {server[0]}:{server[1]}")
     finally:

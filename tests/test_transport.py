@@ -945,7 +945,8 @@ def test_a_strategy_that_connects_after_a_floor_rejection_is_still_considered(is
     quic = FakeStrategy("quic", 5, error="no letify-quic")
     slow = FakeStrategy("tailcat", 3, result=result(0.5, 0.2, rtt=129.1), delay=0.3)
     punch = FakeStrategy("tcp_punch", 2, result=result(40, 40, rtt=30.0), delay=0.7)
-    chosen = pipeline([connect_back, punch, slow, quic, fallback], floor=LinkFloor.default()).connect()
+    strategies = [connect_back, punch, slow, quic, fallback]
+    chosen = pipeline(strategies, floor=LinkFloor.default()).connect()
     assert chosen.strategy == "tcp_punch"
     assert slow.links[0].closed
 
@@ -965,7 +966,9 @@ class SlowProbe(FakeProbe):
 
 
 # Spec: Transport, Link floor.
-def test_a_connected_strategy_is_considered_even_when_a_slow_probe_used_up_the_timeout(isolated_home):
+def test_a_connected_strategy_is_considered_even_when_a_slow_probe_used_up_the_timeout(
+    isolated_home,
+):
     """A probe of a slow link can outlast the race timeout. A strategy that connected while
     it ran has an outcome already, so it is probed and chosen rather than reported as not
     connected in time."""

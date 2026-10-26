@@ -109,7 +109,8 @@ class CommandRendezvous(Rendezvous):
 
         from .. import install
 
-        output = self.run_python(install.remote_quic_source(letify.__version__), QUIC_PREPARE_TIMEOUT)
+        source = install.remote_quic_source(letify.__version__)
+        output = self.run_python(source, QUIC_PREPARE_TIMEOUT)
         for line in output.splitlines():
             if line.startswith("LETIFY-QUIC "):
                 return json.loads(line[len("LETIFY-QUIC ") :])

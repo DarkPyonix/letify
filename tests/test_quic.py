@@ -302,7 +302,9 @@ def test_the_remote_half_punches_toward_the_peer_before_the_carrier_listens(
     monkeypatch.setattr(
         nat, "udp_stun_mapping", lambda port, server=None, **kw: ("203.0.113.9", port)
     )
-    monkeypatch.setattr(nat, "punch_udp", lambda port, peer, **kw: order.append(("punch", port, peer)))
+    monkeypatch.setattr(
+        nat, "punch_udp", lambda port, peer, **kw: order.append(("punch", port, peer))
+    )
     started = patch_popen(nat, [])
     answer, _ = nat.begin(
         {
@@ -328,7 +330,9 @@ def test_the_strategy_prepares_the_remote_carrier_before_asking_for_its_mapping(
     bundled.chmod(0o755)
     monkeypatch.setattr(quic, "LIB_DIR", tmp_path)
     monkeypatch.setattr(
-        nat, "udp_stun_mapping", lambda port, server=None, **kw: order.append("stun") or ("198.51.100.1", port)
+        nat,
+        "udp_stun_mapping",
+        lambda port, server=None, **kw: order.append("stun") or ("198.51.100.1", port),
     )
     patch_run(__import__("letify.transport.strategies", fromlist=["x"]))
     rendezvous = CannedRendezvous({"mapping": ["203.0.113.9", 44444]})
@@ -359,5 +363,8 @@ def test_every_ssh_command_after_the_first_gets_its_own_quic_pair(
     assert len(rendezvous.requests) == 3
     tokens = [request["token"] for request in rendezvous.requests]
     assert len(set(tokens)) == 3
-    proxies = [next(part for part in command if part.startswith("ProxyCommand=")) for command in (first, second)]
+    proxies = [
+        next(part for part in command if part.startswith("ProxyCommand="))
+        for command in (first, second)
+    ]
     assert tokens[1] in proxies[0] and tokens[2] in proxies[1]

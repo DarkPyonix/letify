@@ -932,7 +932,8 @@ class PersistentChannel(FramedChannel):
         code = exit_text(self._process.returncode) if self._process else None
         reason = f", with {code}" if code else ""
         return RuntimeFailure(
-            f"{self.name}: the worker exited before it was ready{reason}\n--- last remote output ---\n"
+            f"{self.name}: the worker exited before it was ready{reason}\n"
+            "--- last remote output ---\n"
             f"{stderr[-2000:]}{self._ssh_log_section()}",
             command=" ".join(self.command),
             stderr=stderr,
@@ -973,7 +974,8 @@ class PersistentChannel(FramedChannel):
         if process is None or connection is None:
             raise RuntimeLost(f"{self.name}: the channel is closed")
         if process.poll() is not None:
-            raise RuntimeLost(f"{self.name}: the worker exited with {exit_text(process.returncode)}")
+            code = exit_text(process.returncode)
+            raise RuntimeLost(f"{self.name}: the worker exited with {code}")
         return connection.request(payload, timeout=timeout, kill=self._kill)
 
 

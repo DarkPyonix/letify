@@ -737,7 +737,9 @@ def test_stash_and_unstash_in_a_child_process_of_the_body_say_to_call_from_the_m
 
 
 
-def test_every_drive_grant_is_reported_and_a_failed_answer_names_its_error(monkeypatch, capsys) -> None:
+def test_every_drive_grant_is_reported_and_a_failed_answer_names_its_error(
+    monkeypatch, capsys
+) -> None:
     import time
 
     from letify.store import handoff
@@ -794,7 +796,9 @@ def test_a_drive_request_the_worker_cannot_send_is_named_on_its_stderr(capsys) -
     assert "letify: drive request unstash run-checkpoint was not sent: broken pipe" in err
 
 
-def test_a_grant_still_running_when_the_call_ends_is_named_with_its_age(monkeypatch, capsys) -> None:
+def test_a_grant_still_running_when_the_call_ends_is_named_with_its_age(
+    monkeypatch, capsys
+) -> None:
     import threading
     import time
 
