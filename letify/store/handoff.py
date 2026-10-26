@@ -177,13 +177,37 @@ def commit(backend: Any, name: str, digest: str) -> None:
     The previous blob stays when another ``stash/`` ref still names it. A ref that already
     holds ``digest`` is not written again.
     """
+    release(backend, point(backend, name, digest))
+
+
+def point(backend: Any, name: str, digest: str) -> str | None:
+    """Point ``stash/<name>`` at ``digest``, and return the digest it named before, if any other."""
     ref = REF_SPACE + name
     previous = backend.read_ref(ref)
     if previous == digest:
-        return
+        return None
     backend.write_ref(ref, digest)
-    if previous and previous not in backend.refs_with_prefix(REF_SPACE).values():
+    return previous
+
+
+def release(backend: Any, previous: str | None) -> None:
+    """Delete the blob ``previous`` unless a ``stash/`` ref still names it."""
+    if previous and not backend.ref_names(REF_SPACE, previous):
         backend.delete_blob(previous)
+
+
+def _release_later(backend: Any, name: str, previous: str | None) -> None:
+    """Run [`release`] on a thread, so a grant is answered without waiting for the deletion."""
+    if not previous:
+        return
+
+    def run() -> None:
+        try:
+            release(backend, previous)
+        except Exception as exc:
+            say(f"drive handoff {name}: the replaced blob {previous} was not deleted: {exc}")
+
+    threading.Thread(target=run, name="letify-drive-release", daemon=True).start()
 
 
 def _named(name: str, exc: Exception) -> RuntimeFailure:
@@ -382,13 +406,13 @@ def grant(message: dict[str, Any]) -> dict[str, Any]:
             if kind == "stash":
                 digest, size = str(message["digest"]), int(message["size"])
                 if backend.has(digest):
-                    commit(backend, name, digest)
+                    _release_later(backend, name, point(backend, name, digest))
                     return {"done": True}
                 return {"upload": backend.begin_upload(digest, size)}
             if kind == "stashed":
                 digest = str(message["digest"])
                 backend.record_upload(digest, str(message["file_id"]))
-                commit(backend, name, digest)
+                _release_later(backend, name, point(backend, name, digest))
                 return {"done": True}
             if kind == "unstash":
                 digest = backend.read_ref(REF_SPACE + name)
