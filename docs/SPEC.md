@@ -1076,7 +1076,7 @@ A call has exactly one owner at a time, and the session still ends with the call
 5. **The call ends at the new owner.** `letify takeover` prints the body's output as it arrives. When the call returns it prints the `repr` of the value, or with `--result PATH` writes the value with pickle to `PATH`, and exits 0. When the body raises it prints the traceback and exits 1. With `--json` the last line is one object with `run`, `ok`, `value_repr` or `error`, and `result_path`. The call's outputs are written back under the record's `project`, not the current directory. The session is then ended.
 6. **The same from Python.** `letify.takeover(run)` does the same in the calling process and returns the value or raises the body's exception, as a call does. It holds no handle: it returns once the call has ended and the session is gone. A darkpyonix kernel uses this to adopt a run started elsewhere.
 
-A provider whose runtime cannot be reached by a second process refuses with `UnsupportedMode` naming it. The `Local` provider is one: its worker is a child of the owning process and dies with it.
+A provider whose runtime cannot be reached by a second process refuses with `UnsupportedMode` naming it. On the `Local` provider the runtime is this machine, so the new owner connects to the socket directly, but the worker is a child of the owning process and dies with it: a `Local` run can be taken over only from an owner that is still alive.
 
 ### Ctrl-C in the owning process
 
