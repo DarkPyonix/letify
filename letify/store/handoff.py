@@ -30,6 +30,7 @@ from typing import Any
 
 from ..errors import ConfigError, LetifyError, RuntimeFailure, UnsupportedMode
 from ..protocol import codec
+from ..transport.announce import say
 
 #: The environment variable the one-shot driver script sets, holding the provider's name,
 #: so a body can tell it runs on a channel with no stream back to the local process.
@@ -176,13 +177,37 @@ def commit(backend: Any, name: str, digest: str) -> None:
     The previous blob stays when another ``stash/`` ref still names it. A ref that already
     holds ``digest`` is not written again.
     """
+    release(backend, point(backend, name, digest))
+
+
+def point(backend: Any, name: str, digest: str) -> str | None:
+    """Point ``stash/<name>`` at ``digest``, and return the digest it named before, if any other."""
     ref = REF_SPACE + name
     previous = backend.read_ref(ref)
     if previous == digest:
-        return
+        return None
     backend.write_ref(ref, digest)
-    if previous and previous not in backend.refs_with_prefix(REF_SPACE).values():
+    return previous
+
+
+def release(backend: Any, previous: str | None) -> None:
+    """Delete the blob ``previous`` unless a ``stash/`` ref still names it."""
+    if previous and not backend.ref_holds(REF_SPACE, previous):
         backend.delete_blob(previous)
+
+
+def _release_later(backend: Any, name: str, previous: str | None) -> None:
+    """Run [`release`] on a thread, so a grant is answered without waiting for the deletion."""
+    if not previous:
+        return
+
+    def run() -> None:
+        try:
+            release(backend, previous)
+        except Exception as exc:
+            say(f"drive handoff {name}: the replaced blob {previous} was not deleted: {exc}")
+
+    threading.Thread(target=run, name="letify-drive-release", daemon=True).start()
 
 
 def _named(name: str, exc: Exception) -> RuntimeFailure:
@@ -381,13 +406,13 @@ def grant(message: dict[str, Any]) -> dict[str, Any]:
             if kind == "stash":
                 digest, size = str(message["digest"]), int(message["size"])
                 if backend.has(digest):
-                    commit(backend, name, digest)
+                    _release_later(backend, name, point(backend, name, digest))
                     return {"done": True}
                 return {"upload": backend.begin_upload(digest, size)}
             if kind == "stashed":
                 digest = str(message["digest"])
                 backend.record_upload(digest, str(message["file_id"]))
-                commit(backend, name, digest)
+                _release_later(backend, name, point(backend, name, digest))
                 return {"done": True}
             if kind == "unstash":
                 digest = backend.read_ref(REF_SPACE + name)
@@ -414,9 +439,14 @@ class GrantWatcher:
     ``drive_grant`` request. It carries URLs and short-lived headers, never the bytes.
     """
 
-    def __init__(self, channel: Any, poll_s: float = 0.02) -> None:
+    def __init__(
+        self, channel: Any, poll_s: float = 0.02, join_timeout_s: float = 30.0
+    ) -> None:
         self._channel = channel
         self._poll_s = poll_s
+        self._join_timeout_s = join_timeout_s
+        #: The grant being made now, as (ask, monotonic start), or None between grants.
+        self._in_flight: tuple[dict[str, Any], float] | None = None
         self._stop = threading.Event()
         self._thread = threading.Thread(target=self._run, name="letify-drive", daemon=True)
 
@@ -425,21 +455,38 @@ class GrantWatcher:
 
     def close(self) -> None:
         self._stop.set()
-        self._thread.join(timeout=30)
+        self._thread.join(timeout=self._join_timeout_s)
+        busy = self._in_flight
+        if self._thread.is_alive() and busy is not None:
+            ask, started = busy
+            say(f"drive grant {ask.get('kind')} {ask.get('name')}: still running after "
+                f"{time.monotonic() - started:.1f} s when the call ended; "
+                f"its result will not be reported")
+
+    def _answer(self, ask: dict[str, Any], started: float) -> None:
+        reply = grant(ask)
+        label = f"drive grant {ask.get('kind')} {ask.get('name')}"
+        try:
+            self._channel.request({"op": "drive_grant", "id": ask.get("id"), **reply}, timeout=300)
+        except Exception as exc:
+            # Either nobody waits any more, or the worker waits out its grant timeout;
+            # the line tells the two apart from the worker's own error.
+            say(f"{label}: the answer was not delivered after "
+                f"{time.monotonic() - started:.1f} s: {type(exc).__name__}: {exc}")
+        else:
+            say(f"{label}: answered in {time.monotonic() - started:.1f} s")
 
     def _run(self) -> None:
         while not self._stop.is_set():
             connection = getattr(self._channel, "connection", None)
             asks = connection.take_grants() if connection is not None else []
             for ask in asks:
-                reply = grant(ask)
+                started = time.monotonic()
+                self._in_flight = (ask, started)
                 try:
-                    self._channel.request(
-                        {"op": "drive_grant", "id": ask.get("id"), **reply}, timeout=300
-                    )
-                except Exception:
-                    # The worker is gone or its call already failed; nobody is waiting.
-                    pass
+                    self._answer(ask, started)
+                finally:
+                    self._in_flight = None
             self._stop.wait(self._poll_s)
 
 

@@ -17,6 +17,7 @@ than one request per digest.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import shutil
@@ -354,22 +355,31 @@ class DriveBackend(Backend):
         self._call("DELETE", url, what=f"deleting {digest}")
         self._ids.pop(digest, None)
 
-    def refs_with_prefix(self, prefix: str) -> dict[str, str]:
-        """Every ref whose name starts with ``prefix``, as name to digest, in one listing."""
-        found: dict[str, str] = {}
+    def ref_holds(self, prefix: str, digest: str) -> bool:
+        """Whether a ref whose name starts with ``prefix`` holds ``digest``, from one listing.
+
+        A ref holds the digest and nothing else, so the listing's ``md5Checksum`` of each ref
+        names its content and no ref is downloaded. An entry listed without a checksum is read.
+        """
         wanted = REF_PREFIX + prefix
+        checksum = hashlib.md5(digest.encode()).hexdigest()
         for entry in self._list(
-            f"{_quoted(self.folder())} in parents and trashed = false", "id,name"
+            f"{_quoted(self.folder())} in parents and trashed = false", "id,name,md5Checksum"
         ):
             name = str(entry["name"])
             if not name.startswith(wanted):
                 continue
+            listed = entry.get("md5Checksum")
+            if listed is not None:
+                if listed == checksum:
+                    return True
+                continue
             payload = self._call(
                 "GET", self._media_url(str(entry["id"])), what=f"reading ref {name[4:]}"
             )
-            if payload is not None:
-                found[name[len(REF_PREFIX) :]] = payload.decode().strip()
-        return found
+            if payload is not None and payload.decode().strip() == digest:
+                return True
+        return False
 
     # -- the backend -----------------------------------------------------------
 

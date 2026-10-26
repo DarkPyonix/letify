@@ -18,6 +18,9 @@ from typing import Any
 
 from . import nat
 
+#: Seconds the remote gets to download the letify wheel and take ``letify-quic`` out of it.
+QUIC_PREPARE_TIMEOUT = 600.0
+
 
 def remote_script(request: dict[str, Any]) -> str:
     """The standard library module plus one call that answers ``request`` and stays running."""
@@ -69,6 +72,9 @@ class CommandRendezvous(Rendezvous):
     #: The path the last preparation returned, so it runs once per rendezvous.
     binary: str | None = None
 
+    #: The path of ``letify-quic`` on the machine, taken out of the letify wheel once.
+    quic_binary: str | None = None
+
     def extras(self) -> dict[str, Any]:
         """Fields this provider adds to every request."""
         return {}
@@ -83,7 +89,31 @@ class CommandRendezvous(Rendezvous):
                 self.binary = self._prepare_tailcat()
             if self.binary is not None:
                 request = {**request, "binary": self.binary}
+        elif request.get("kind") == "quic":
+            request = {**request, "binary": self.prepare_quic()}
         return _answer(self.run_python(remote_script({**self.extras(), **request}), timeout))
+
+    def prepare_quic(self) -> str:
+        """The path of ``letify-quic`` on the machine, prepared on the first call."""
+        if self.quic_binary is None:
+            self.quic_binary = self._prepare_quic()
+        return self.quic_binary
+
+    def _prepare_quic(self) -> str:
+        """Take ``letify-quic`` out of the letify wheel of this version on the machine.
+
+        Spec "QUIC over a punched UDP pair": a runtime image ships no carrier, and the
+        remote half otherwise looks it up on PATH and fails with FileNotFoundError.
+        """
+        import letify
+
+        from .. import install
+
+        output = self.run_python(install.remote_quic_source(letify.__version__), QUIC_PREPARE_TIMEOUT)
+        for line in output.splitlines():
+            if line.startswith("LETIFY-QUIC "):
+                return json.loads(line[len("LETIFY-QUIC ") :])
+        raise OSError(f"letify-quic preparation gave no binary path: {output.strip()[-500:]}")
 
 
 def prepare_tailcat(

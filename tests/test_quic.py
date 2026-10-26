@@ -56,7 +56,7 @@ def test_the_strategy_exchanges_both_endpoints_and_proxies_ssh(
     bundled.chmod(0o755)
     monkeypatch.setattr(quic, "LIB_DIR", tmp_path)
     monkeypatch.setattr(
-        nat, "stun_mapping", lambda port, server=None, **kw: ("198.51.100.1", port)
+        nat, "udp_stun_mapping", lambda port, server=None, **kw: ("198.51.100.1", port)
     )
     recorder = patch_run(__import__("letify.transport.strategies", fromlist=["x"]))
     rendezvous = CannedRendezvous({"mapping": ["203.0.113.9", 44444]})
@@ -72,7 +72,7 @@ def test_the_strategy_exchanges_both_endpoints_and_proxies_ssh(
     proxy = next(part for part in command if part.startswith("ProxyCommand="))
     assert "letify-quic" in proxy and "connect" in proxy
     assert "--peer 203.0.113.9:44444" in proxy
-    assert f"--token {request['token']}" in proxy
+    assert f"--token {rendezvous.requests[-1]['token']}" in proxy
     assert recorder.command[-1] == "exit 0"
 
 
@@ -83,8 +83,9 @@ def test_the_remote_half_reports_its_mapping_and_starts_the_carrier(
     patch_popen, monkeypatch
 ) -> None:
     monkeypatch.setattr(
-        nat, "stun_mapping", lambda port, server=None, **kw: ("203.0.113.9", port)
+        nat, "udp_stun_mapping", lambda port, server=None, **kw: ("203.0.113.9", port)
     )
+    monkeypatch.setattr(nat, "punch_udp", lambda port, peer, **kw: None)
     started = patch_popen(nat, [])
     answer, _ = nat.begin(
         {
@@ -185,3 +186,178 @@ def test_the_carrier_carries_a_stream_between_two_of_itself(tmp_path) -> None:
     finally:
         server.kill()
         listener.close()
+
+
+class RecordingRendezvous:
+    """A command rendezvous whose remote is a list of canned outputs, one per program run."""
+
+    @staticmethod
+    def build(outputs: list[str]):
+        from letify.transport.rendezvous import CommandRendezvous
+
+        class Recording(CommandRendezvous):
+            def __init__(self) -> None:
+                self.sources: list[str] = []
+                self.outputs = list(outputs)
+
+            def unavailable(self) -> str | None:
+                return None
+
+            def run_python(self, source: str, timeout: float) -> str:
+                self.sources.append(source)
+                return self.outputs.pop(0)
+
+        return Recording()
+
+
+def test_a_command_rendezvous_prepares_the_quic_carrier_once_and_names_it(monkeypatch) -> None:
+    # Spec "QUIC over a punched UDP pair": a runtime image ships no letify-quic, so the
+    # rendezvous takes it out of the letify wheel on the remote before the first QUIC
+    # request, and every QUIC request then carries the path.
+    import letify
+
+    answer = nat.ANSWER_MARKER + '{"mapping": ["203.0.113.9", 41000]}'
+    rendezvous = RecordingRendezvous.build(
+        ['LETIFY-QUIC "/tmp/letify-quic-9.9.9"', answer, answer]
+    )
+    monkeypatch.setattr(letify, "__version__", "9.9.9")
+    request = {"kind": "quic", "mapping": ["198.51.100.1", 41000], "token": "ab" * 16}
+    rendezvous.exchange(dict(request), 30.0)
+    rendezvous.exchange(dict(request), 30.0)
+    assert "_remote_quic('9.9.9')" in rendezvous.sources[0]
+    assert all("_remote_quic" not in source for source in rendezvous.sources[1:])
+    assert all('"binary": "/tmp/letify-quic-9.9.9"' in source for source in rendezvous.sources[1:])
+
+
+def test_a_quic_carrier_the_remote_could_not_prepare_fails_the_request() -> None:
+    rendezvous = RecordingRendezvous.build(["could not download the letify wheel"])
+    with pytest.raises(OSError, match="letify-quic"):
+        rendezvous.exchange({"kind": "quic", "mapping": ["198.51.100.1", 41000]}, 30.0)
+
+
+# -- Spec: QUIC over a punched UDP pair, the UDP endpoints ------------------------
+
+
+def _stun_reply(request: bytes, address: tuple[str, int]) -> bytes:
+    import socket
+    import struct
+
+    cookie = struct.unpack("!I", request[4:8])[0]
+    port = address[1] ^ (cookie >> 16)
+    host = struct.unpack("!I", socket.inet_aton(address[0]))[0] ^ cookie
+    value = struct.pack("!BBHI", 0, 1, port, host)
+    attribute = struct.pack("!HH", 0x0020, len(value)) + value
+    return struct.pack("!HHI", 0x0101, len(attribute), cookie) + request[8:20] + attribute
+
+
+def test_the_udp_mapping_is_asked_over_udp_from_the_port_itself() -> None:
+    # A NAT maps UDP and TCP separately, so the port QUIC binds is asked about over UDP.
+    import socket
+    import threading
+
+    server = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    server.bind(("127.0.0.1", 0))
+    seen = []
+
+    def answer() -> None:
+        request, source = server.recvfrom(2048)
+        seen.append(source)
+        server.sendto(_stun_reply(request, ("203.0.113.7", 50505)), source)
+
+    thread = threading.Thread(target=answer, daemon=True)
+    thread.start()
+    holder = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    holder.bind(("127.0.0.1", 0))
+    port = holder.getsockname()[1]
+    holder.close()
+    mapping = nat.udp_stun_mapping(port, server.getsockname(), timeout=2.0)
+    thread.join(2)
+    server.close()
+    assert mapping == ("203.0.113.7", 50505)
+    assert seen[0][1] == port
+
+
+def test_a_udp_punch_sends_from_the_port_to_the_peer() -> None:
+    import socket
+
+    peer = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    peer.bind(("127.0.0.1", 0))
+    peer.settimeout(2.0)
+    holder = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    holder.bind(("127.0.0.1", 0))
+    port = holder.getsockname()[1]
+    holder.close()
+    nat.punch_udp(port, peer.getsockname(), count=3, interval=0.0)
+    sources = {peer.recvfrom(64)[1][1] for _ in range(3)}
+    peer.close()
+    assert sources == {port}
+
+
+def test_the_remote_half_punches_toward_the_peer_before_the_carrier_listens(
+    patch_popen, monkeypatch
+) -> None:
+    # The carrier only listens, so without packets toward the peer a NAT in front of the
+    # remote drops the client's first QUIC packets.
+    order = []
+    monkeypatch.setattr(
+        nat, "udp_stun_mapping", lambda port, server=None, **kw: ("203.0.113.9", port)
+    )
+    monkeypatch.setattr(nat, "punch_udp", lambda port, peer, **kw: order.append(("punch", port, peer)))
+    started = patch_popen(nat, [])
+    answer, _ = nat.begin(
+        {
+            "kind": "quic",
+            "mapping": ["198.51.100.1", 41000],
+            "token": "ab" * 16,
+            "ssh_port": 22,
+            "binary": "/tmp/letify-quic",
+        }
+    )
+    bound = int(started[0].command[started[0].command.index("--bind") + 1])
+    assert order == [("punch", bound, ("198.51.100.1", 41000))]
+    assert answer["mapping"] == ["203.0.113.9", bound]
+
+
+def test_the_strategy_prepares_the_remote_carrier_before_asking_for_its_mapping(
+    monkeypatch, tmp_path, patch_run
+) -> None:
+    # A mapping asked for before a slow wheel download may expire before the carrier binds.
+    order = []
+    bundled = tmp_path / "letify-quic"
+    bundled.write_text("", encoding="utf-8")
+    bundled.chmod(0o755)
+    monkeypatch.setattr(quic, "LIB_DIR", tmp_path)
+    monkeypatch.setattr(
+        nat, "udp_stun_mapping", lambda port, server=None, **kw: order.append("stun") or ("198.51.100.1", port)
+    )
+    patch_run(__import__("letify.transport.strategies", fromlist=["x"]))
+    rendezvous = CannedRendezvous({"mapping": ["203.0.113.9", 44444]})
+    rendezvous.prepare_quic = lambda: order.append("prepare")
+    QuicUDP().attempt(Target(alias="lab", rendezvous=rendezvous, user="root"))
+    assert order == ["prepare", "stun"]
+
+
+def test_every_ssh_command_after_the_first_gets_its_own_quic_pair(
+    monkeypatch, tmp_path, patch_run
+) -> None:
+    # The remote carrier accepts one connection and splices it, so a second SSH session
+    # through the same ProxyCommand finds nobody listening. Each later command asks the
+    # rendezvous for a new pair, as a punched TCP link punches again.
+    bundled = tmp_path / "letify-quic"
+    bundled.write_text("", encoding="utf-8")
+    bundled.chmod(0o755)
+    monkeypatch.setattr(quic, "LIB_DIR", tmp_path)
+    monkeypatch.setattr(
+        nat, "udp_stun_mapping", lambda port, server=None, **kw: ("198.51.100.1", port)
+    )
+    patch_run(__import__("letify.transport.strategies", fromlist=["x"]))
+    rendezvous = CannedRendezvous({"mapping": ["203.0.113.9", 44444]})
+    link = QuicUDP().attempt(Target(alias="lab", rendezvous=rendezvous, user="root"))
+    assert len(rendezvous.requests) == 1
+    first = link.ssh_command("uname")
+    second = link.ssh_command("uname")
+    assert len(rendezvous.requests) == 3
+    tokens = [request["token"] for request in rendezvous.requests]
+    assert len(set(tokens)) == 3
+    proxies = [next(part for part in command if part.startswith("ProxyCommand=")) for command in (first, second)]
+    assert tokens[1] in proxies[0] and tokens[2] in proxies[1]

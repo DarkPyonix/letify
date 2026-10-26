@@ -142,6 +142,24 @@ def test_a_replaced_blob_stays_when_another_stash_ref_names_it(fake_drive, tmp_p
     assert blob_names(fake_drive) == sorted([first, second])
 
 
+def test_restashing_a_name_downloads_no_other_ref(fake_drive, tmp_path) -> None:
+    """Spec: whether another ref names the replaced blob comes from one listing."""
+    declare_drive(fake_drive)
+    source = tmp_path / "state.txt"
+    for index in range(5):
+        source.write_text(f"other {index}")
+        letify.stash(f"other-{index}", source)
+    source.write_text("one")
+    first = letify.stash("state", source)
+    fake_drive.requests.clear()
+    source.write_text("two")
+    second = letify.stash("state", source)
+    # Only the ref being moved is read; the five others are judged from the listing.
+    assert len(fake_drive.downloads()) == 1
+    assert first not in fake_drive.blobs()
+    assert fake_drive.refs()["stash/state"] == second
+
+
 def test_stashing_the_same_digest_sends_nothing(fake_drive, tmp_path) -> None:
     declare_drive(fake_drive)
     source = make_tree(tmp_path / "ckpt")
@@ -340,6 +358,41 @@ def test_a_function_restashing_a_name_replaces_the_blob_through_the_client(
     assert blob_names(fake_drive) == [second]
 
 
+def test_a_function_restashing_a_name_returns_before_the_replaced_blob_is_deleted(
+    fake_drive, launcher_from, tmp_path, worker_sees_this_checkout
+) -> None:
+    """Spec: the grant answers once the ref is written, and the deletion follows."""
+    import threading
+    import time
+
+    declare_drive(fake_drive)
+    let = launcher_from(LOCAL)
+    source = tmp_path / "state.txt"
+
+    @let.function(device=let.providers.a.CPU, host=letify.remote)
+    def stash_text(path: str, text: str) -> str:
+        from pathlib import Path
+
+        import letify as inner
+
+        Path(path).write_text(text)
+        return inner.stash("state", path)
+
+    with let.keep_alive():
+        first = stash_text(str(source), "one")
+        fake_drive.hold_deletes = threading.Event()
+        try:
+            second = stash_text(str(source), "two")
+            assert fake_drive.refs() == {"stash/state": second}
+            assert first in fake_drive.blobs()
+        finally:
+            fake_drive.hold_deletes.set()
+        deadline = time.monotonic() + 10
+        while first in fake_drive.blobs() and time.monotonic() < deadline:
+            time.sleep(0.05)
+    assert blob_names(fake_drive) == [second]
+
+
 def test_a_function_on_a_machine_with_no_drive_fails_naming_both_settings(
     isolated_home, launcher_from, tmp_path, worker_sees_this_checkout
 ) -> None:
@@ -499,3 +552,98 @@ def test_stash_and_unstash_in_a_child_process_of_the_body_say_to_call_from_the_m
     assert "'spawned'" in answer["spawn"]
     assert fake_drive.requests == []
 
+
+
+def test_every_drive_grant_is_reported_and_a_failed_answer_names_its_error(monkeypatch, capsys) -> None:
+    import time
+
+    from letify.store import handoff
+
+    asked = [
+        {"id": 1, "kind": "stash", "name": "run-checkpoint"},
+        {"id": 2, "kind": "stash", "name": "run-manifest"},
+    ]
+
+    class Connection:
+        def take_grants(self):
+            found, asked[:] = list(asked), []
+            return found
+
+    class Channel:
+        connection = Connection()
+
+        def request(self, message, timeout):
+            if message["id"] == 2:
+                raise TimeoutError("no reply within 300 s")
+
+    monkeypatch.setattr(handoff, "grant", lambda ask: {"done": True})
+    watcher = handoff.GrantWatcher(Channel(), poll_s=0.01)
+    watcher.start()
+    deadline = time.time() + 5
+    while asked and time.time() < deadline:
+        time.sleep(0.01)
+    time.sleep(0.05)
+    watcher.close()
+    err = capsys.readouterr().err
+    assert "drive grant stash run-checkpoint: answered in" in err
+    assert "drive grant stash run-manifest: the answer was not delivered after" in err
+    assert "no reply within 300 s" in err
+
+
+def test_a_drive_request_the_worker_cannot_send_is_named_on_its_stderr(capsys) -> None:
+    import ast
+    import sys
+
+    from letify.protocol import worker
+
+    # The worker is a program shipped as text, so the function is taken from its source.
+    tree = ast.parse(worker.SOURCE)
+    node = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "_drive_ask")
+
+    class Sender:
+        def message(self, *args):
+            raise OSError("broken pipe")
+
+    namespace = {"_SENDER": Sender(), "REQUEST": 1, "DRIVE_STREAM": 5, "sys": sys}
+    exec(compile(ast.Module([node], []), "worker_drive_ask", "exec"), namespace)
+    namespace["_drive_ask"]({"kind": "unstash", "name": "run-checkpoint"})
+    err = capsys.readouterr().err
+    assert "letify: drive request unstash run-checkpoint was not sent: broken pipe" in err
+
+
+def test_a_grant_still_running_when_the_call_ends_is_named_with_its_age(monkeypatch, capsys) -> None:
+    import threading
+    import time
+
+    from letify.store import handoff
+
+    asked = [{"id": 1, "kind": "stash", "name": "run-checkpoint"}]
+    entered, release = threading.Event(), threading.Event()
+
+    class Connection:
+        def take_grants(self):
+            found, asked[:] = list(asked), []
+            return found
+
+    class Channel:
+        connection = Connection()
+
+        def request(self, message, timeout):
+            return None
+
+    def slow_grant(ask):
+        entered.set()
+        release.wait(10)
+        return {"done": True}
+
+    monkeypatch.setattr(handoff, "grant", slow_grant)
+    watcher = handoff.GrantWatcher(Channel(), poll_s=0.01, join_timeout_s=0.2)
+    watcher.start()
+    assert entered.wait(5)
+    time.sleep(0.05)
+    watcher.close()
+    err = capsys.readouterr().err
+    release.set()
+    assert "drive grant stash run-checkpoint: still running after " in err
+    assert "s when the call ended; its result will not be reported" in err
+    assert "answered in" not in err

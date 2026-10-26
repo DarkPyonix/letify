@@ -27,7 +27,7 @@ from . import nat, portmap, quic, sshopts
 from .link import Link, PunchedLink, SSHLink
 
 #: Seconds a single attempt may take before the strategy counts as failed.
-CONNECT_TIMEOUT = 30.0
+CONNECT_TIMEOUT = 120.0
 #: The comment every reverse SSH session key carries in authorized_keys.
 SESSION_MARKER = "letify-session"
 RESTRICTION = 'restrict,port-forwarding,command="/bin/false"'
@@ -357,26 +357,36 @@ class QuicUDP(Strategy):
         carrier = quic.carrier_path()
         if carrier is None:
             raise OSError(quic.MISSING)
-        holder = nat.reusable_socket(0)
-        port = holder.getsockname()[1]
-        holder.close()
-        mapping = nat.stun_mapping(port, tuple(target.stun))
-        token = secrets.token_bytes(nat.TOKEN_BYTES).hex()
-        answer = target.rendezvous.exchange(
-            {
-                "kind": "quic",
-                "mapping": list(mapping),
-                "token": token,
-                "ssh_port": target.ssh_port,
-                "stun": list(target.stun),
-            },
-            CONNECT_TIMEOUT,
-        )
-        peer = (str(answer["mapping"][0]), int(answer["mapping"][1]))
-        proxy = quic.connect_command(str(carrier), bind=port, peer=peer, token=token)
+        # The remote carrier is made ready first: a UDP mapping goes stale if a slow
+        # download sits between asking for it and the carrier binding its port.
+        prepare = getattr(target.rendezvous, "prepare_quic", None)
+        if prepare is not None:
+            prepare()
 
+        def dial() -> str:
+            holder = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            holder.bind(("0.0.0.0", 0))
+            port = holder.getsockname()[1]
+            holder.close()
+            mapping = nat.udp_stun_mapping(port, tuple(target.stun))
+            token = secrets.token_bytes(nat.TOKEN_BYTES).hex()
+            answer = target.rendezvous.exchange(
+                {
+                    "kind": "quic",
+                    "mapping": list(mapping),
+                    "token": token,
+                    "ssh_port": target.ssh_port,
+                    "stun": list(target.stun),
+                },
+                CONNECT_TIMEOUT,
+            )
+            peer = (str(answer["mapping"][0]), int(answer["mapping"][1]))
+            return quic.connect_command(str(carrier), bind=port, peer=peer, token=token)
+
+        # The remote carrier accepts one connection, so every SSH command gets its own
+        # pair, the way a punched TCP link punches again.
         def command(remote_command: str | None = None) -> list[str]:
-            return target.proxied_ssh(proxy, remote_command)
+            return target.proxied_ssh(dial(), remote_command)
 
         _verify(command("exit 0"))
         return SSHLink(self.name, self.rank, command, remote_python=target.remote_python)

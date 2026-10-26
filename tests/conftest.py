@@ -1090,6 +1090,8 @@ class FakeDriveServer:
         self.fail_with: int | None = None
         #: When set, a piece of a resumable upload waits for this event before it is taken.
         self.hold_uploads: threading.Event | None = None
+        #: When set, a DELETE waits for this event before it is answered.
+        self.hold_deletes: threading.Event | None = None
         self._count = 0
         owner = self
 
@@ -1179,6 +1181,7 @@ class FakeDriveServer:
         return sorted(found, key=lambda f: f["id"])
 
     def _handle(self, handler: Any, method: str) -> None:
+        import hashlib
         import json
         import urllib.parse
 
@@ -1246,7 +1249,13 @@ class FakeDriveServer:
             start = int(query.get("pageToken") or 0)
             size = int(query.get("pageSize") or 2)
             page = matches[start : start + size]
-            result: dict[str, Any] = {"files": [{"id": f["id"], "name": f["name"]} for f in page]}
+            listed = []
+            for f in page:
+                entry = {"id": f["id"], "name": f["name"]}
+                if "md5Checksum" in query.get("fields", "") and not f["folder"]:
+                    entry["md5Checksum"] = hashlib.md5(f["content"]).hexdigest()
+                listed.append(entry)
+            result: dict[str, Any] = {"files": listed}
             if start + size < len(matches):
                 result["nextPageToken"] = str(start + size)
             return reply(result)
@@ -1285,6 +1294,8 @@ class FakeDriveServer:
             self.files[identifier]["content"] = body
             return reply({"id": identifier})
         if method == "DELETE" and parsed.path.startswith("/drive/v3/files/"):
+            if self.hold_deletes is not None:
+                self.hold_deletes.wait(timeout=20)
             if self.files.pop(parsed.path.rsplit("/", 1)[-1], None) is None:
                 return answer(404, b'{"error": {"message": "not found"}}')
             return answer(204)
