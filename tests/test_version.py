@@ -80,3 +80,28 @@ def test_the_extension_is_optional(tmp_path: Path) -> None:
     root = _tree(tmp_path, extension=False)
     version.set_version(root, "1.0.0")
     assert not any(name.startswith("letify-ext") for name in version.read_versions(root))
+
+
+@pytest.mark.parametrize(
+    "crate", ["letify", "letify-wire", "letify-driver", "letify-agent", "letify-quic"]
+)
+def test_a_crate_entry_in_the_lockfile_that_disagrees_is_reported(
+    tmp_path: Path, crate: str
+) -> None:
+    root = _tree(tmp_path, extension=False)
+    version.set_version(root, "1.0.0")
+    lock = root / "letify-core" / "Cargo.lock"
+    entry = f'name = "{crate}"\nversion = "1.0.0"'
+    assert entry in lock.read_text()
+    lock.write_text(lock.read_text().replace(entry, f'name = "{crate}"\nversion = "0.9.0"'))
+    errors = version.check(root)
+    assert len(errors) == 1 and "Cargo.lock" in errors[0]
+
+
+def test_set_writes_the_version_into_every_crate_entry_of_the_lockfile(tmp_path: Path) -> None:
+    root = _tree(tmp_path, extension=False)
+    version.set_version(root, "3.1.4")
+    lock = (root / "letify-core" / "Cargo.lock").read_text()
+    for crate in version.CRATES:
+        assert f'name = "{crate}"\nversion = "3.1.4"' in lock
+    assert {"letify", "letify-quic"} <= set(version.CRATES)

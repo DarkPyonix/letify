@@ -1,0 +1,89 @@
+# Publish the crate letify to crates.io when a version tag is pushed.
+#
+# This runs beside publish.yml on the same tag v<version>. Order inside this file:
+#   1. verify: the tag agrees with every version file, the tagged commit is on develop, the
+#      workspace builds and its tests pass, and `cargo publish --dry-run` packages and builds
+#      the crate alone.
+#   2. publish-crate: the upload, only after verify succeeds.
+# The upload is last because crates.io never replaces a version. A published number can be
+# yanked but is taken forever, so every check that can fail runs before it.
+#
+# GitHub Release creation stays in publish.yml. Other crates in letify-core set publish = false.
+#
+# One-time setup: add the crates.io API token as the secret CARGO_REGISTRY_TOKEN in the GitHub
+# environment crates-io. See docs/guide/08-releasing.md.
+name: publish-crates
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: publish-crates-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: astral-sh/setup-uv@v6
+      - name: Install Rust
+        # rustup reads letify-core/rust-toolchain.toml when cargo runs there.
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+      - name: Check the tag and every file carry one version
+        run: uv run --no-project python scripts/version.py check --tag "$GITHUB_REF_NAME"
+      - name: Check the tagged commit is on develop
+        # letify tags develop, not main, so develop is the branch a release must come from.
+        run: |
+          git fetch origin develop
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/develop; then
+            echo "Tagged commit $GITHUB_SHA is not an ancestor of origin/develop."
+            echo "Merge the release commit into develop before tagging."
+            exit 1
+          fi
+      - name: Build the workspace
+        # All five crates are pure Rust with no system packages needed on ubuntu-latest.
+        working-directory: letify-core
+        run: cargo build --workspace --locked
+      - name: Test the workspace
+        working-directory: letify-core
+        run: cargo test --workspace --locked
+      - name: Package and build the crate without uploading
+        working-directory: letify-core
+        run: cargo publish -p letify --dry-run --locked
+
+  publish-crate:
+    needs: verify
+    runs-on: ubuntu-latest
+    environment: crates-io
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+      - name: Publish letify to crates.io
+        working-directory: letify-core
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          status=$(curl -s -o /dev/null -w '%{http_code}' -A "letify-release (https://github.com/DarkPyonix/letify)" "https://crates.io/api/v1/crates/letify/${version}")
+          if [ "$status" = "200" ]; then
+            echo "letify ${version} is already on crates.io, nothing to publish."
+            exit 0
+          fi
+          if [ -z "$CARGO_REGISTRY_TOKEN" ]; then
+            echo "CARGO_REGISTRY_TOKEN is empty."
+            echo "Add a crates.io API token as the secret CARGO_REGISTRY_TOKEN in the crates-io environment."
+            exit 1
+          fi
+          cargo publish -p letify --locked

@@ -2776,13 +2776,15 @@ Linux wheels are built inside the `manylinux_2_28` containers, so the binaries n
 | File | Field |
 |---|---|
 | `letify/__init__.py` | `__version__` |
-| `letify-core/Cargo.toml` | `[workspace.package].version`, and the `letify-wire`, `letify-driver` and `letify-agent` entries in `Cargo.lock` |
+| `letify-core/Cargo.toml` | `[workspace.package].version`, and the `letify`, `letify-wire`, `letify-driver`, `letify-agent` and `letify-quic` entries in `Cargo.lock` |
 | `letify-ext/package.json` | `version`, and `version` and `packages[""].version` in `package-lock.json`, when `letify-ext/` exists |
 | Git tag | `v<version>` |
 
 `python scripts/version.py set <version>` writes all of them and `python scripts/version.py check [--tag v<version>]` exits 1 naming each file that disagrees. The `ci` workflow runs the check on every push and pull request, and the `publish` workflow runs it with the pushed tag before building anything.
 
 Pushing a tag `v*` runs `.github/workflows/publish.yml`. It builds the sdist, the six platform wheels above and, when `letify-ext/` exists, the extension's `letify-ext-<version>.vsix` after its unit tests pass. It then creates the GitHub Release for the tag with every one of those files attached, and uploads the sdist and wheels to PyPI. The extension is not published to the VS Code Marketplace.
+
+The same tag also runs `.github/workflows/publish-crates.yml`, which publishes the crate `letify` to crates.io at the same version. `letify` is the Rust face of the project: a library crate in `letify-core/letify` that re-exports the letify components meant for use outside letify, the first being the connection library `letify-link` once it exists. Every other crate in `letify-core/` sets `publish = false`, because each is a binary shipped inside the wheels and tied to the Python package of the same version. The workflow checks before it uploads anything: the tag agrees with every version file, the tagged commit is on `develop`, the workspace builds and its tests pass, and `cargo publish -p letify --dry-run` packages and builds the crate on its own. The upload comes last, because crates.io never replaces a version: a published number can be yanked but is taken forever. It runs in the GitHub environment `crates-io` with the repository secret `CARGO_REGISTRY_TOKEN`, a crates.io API token scoped to publishing `letify` and the future `letify-*` crates. A tag pushed before that secret exists fails at the upload and publishes nothing.
 
 ## Known gaps
 
