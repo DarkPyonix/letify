@@ -12,12 +12,14 @@ from __future__ import annotations
 import _thread
 import json
 import os
+import shutil
 import signal
 import stat
 import sys
+import tempfile
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import Any
 
@@ -40,7 +42,20 @@ def worker_sees_this_checkout(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 @pytest.fixture
-def let(isolated_home, launcher_from, worker_sees_this_checkout) -> letify.Launcher:
+def short_dir(monkeypatch: pytest.MonkeyPatch) -> Iterator[Path]:
+    """A directory with a short path, because a Unix socket path holds about 100 bytes.
+
+    A test's own temporary directory is longer than that when the suite runs in parallel.
+    It is the runtime directory the control socket falls back to.
+    """
+    directory = Path(tempfile.mkdtemp(prefix="lt-"))
+    monkeypatch.setenv("XDG_RUNTIME_DIR", str(directory))
+    yield directory
+    shutil.rmtree(directory, ignore_errors=True)
+
+
+@pytest.fixture
+def let(isolated_home, launcher_from, worker_sees_this_checkout, short_dir) -> letify.Launcher:
     return launcher_from(LOCAL)
 
 
@@ -85,9 +100,7 @@ def the_run() -> str:
 # -- run ids and the registry ---------------------------------------------------
 
 
-def test_a_running_call_is_listed_by_runs_and_gone_after_it_ends(
-    let, tmp_path, capsys
-) -> None:
+def test_a_running_call_is_listed_by_runs_and_gone_after_it_ends(let, tmp_path, capsys) -> None:
     stop = str(tmp_path / "stop")
 
     @let.function(device=let.providers.a.CPU, host=letify.remote)
@@ -118,7 +131,7 @@ def test_a_running_call_is_listed_by_runs_and_gone_after_it_ends(
     assert stat.S_IMODE(runs_dir.stat().st_mode) == 0o700
     assert stat.S_IMODE(record.stat().st_mode) == 0o600
     assert Path(row["socket"]).exists()
-    assert row["socket"] == str(runs_dir / f"{os.getpid()}.sock")
+    assert row["socket"] == str(control.socket_path(os.getpid()))
 
     assert main(["runs"]) == 0
     assert run in capsys.readouterr().out
@@ -132,7 +145,7 @@ def test_a_running_call_is_listed_by_runs_and_gone_after_it_ends(
     assert json.loads(capsys.readouterr().out) == []
 
 
-def test_a_record_whose_owner_is_gone_is_removed_when_read(isolated_home) -> None:
+def test_a_record_whose_owner_is_gone_is_removed_when_read(isolated_home, short_dir) -> None:
     runs_dir = control.runs_directory()
     runs_dir.mkdir(parents=True, mode=0o700)
     record = runs_dir / "abcdef012345.json"
@@ -156,22 +169,19 @@ def test_a_record_whose_owner_is_gone_is_removed_when_read(isolated_home) -> Non
 
 
 def test_a_long_home_puts_the_control_socket_in_the_ssh_control_directory(
-    monkeypatch, tmp_path
+    monkeypatch, tmp_path, short_dir
 ) -> None:
     deep = tmp_path / ("d" * 60) / ("e" * 60)
     deep.mkdir(parents=True)
-    short = tmp_path / "x"
-    short.mkdir()
     monkeypatch.setenv("LETIFY_HOME", str(deep))
-    monkeypatch.setenv("XDG_RUNTIME_DIR", str(short))
     chosen = control.socket_path(4321)
     assert chosen.parent == paths.ssh_control_directory()
     assert chosen.name == "run-4321.sock"
     assert len(os.fsencode(chosen)) <= 100
 
     monkeypatch.delenv("LETIFY_HOME")
-    monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
-    assert control.socket_path(4321) == tmp_path / ".letify" / "runs" / "4321.sock"
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: short_dir))
+    assert control.socket_path(4321) == short_dir / ".letify" / "runs" / "4321.sock"
 
 
 def test_unknown_run_ids_exit_with_status_three(isolated_home, capsys) -> None:
@@ -189,7 +199,9 @@ def test_exec_needs_source_from_the_argument_or_a_file(isolated_home) -> None:
     assert stopped.value.code == 2
 
 
-def test_a_run_on_a_one_shot_channel_is_refused_naming_the_provider(isolated_home, capsys) -> None:
+def test_a_run_on_a_one_shot_channel_is_refused_naming_the_provider(
+    isolated_home, short_dir, capsys
+) -> None:
     class Provider:
         alias = "kaggle_a"
 
@@ -389,9 +401,7 @@ def test_exec_assigning_a_name_reaches_the_frame_on_python_3_13(let, tmp_path) -
 
 
 @pytest.mark.skipif(sys.version_info >= (3, 13), reason="f_locals writes through from 3.13")
-def test_exec_assigning_a_name_is_reported_as_not_applied_before_python_3_13(
-    let, tmp_path
-) -> None:
+def test_exec_assigning_a_name_is_reported_as_not_applied_before_python_3_13(let, tmp_path) -> None:
     ready, stop = str(tmp_path / "ready"), str(tmp_path / "stop")
     call = Running(spin_with_counter(let), ready, stop)
     run = the_run()
@@ -440,9 +450,7 @@ def test_exec_output_is_captured_without_swallowing_the_bodys_own_prints(
     assert "exec-out" not in seen.out and "exec-err" not in seen.err
 
 
-def test_exec_reports_the_traceback_of_source_that_raises(
-    let, tmp_path, capsys
-) -> None:
+def test_exec_reports_the_traceback_of_source_that_raises(let, tmp_path, capsys) -> None:
     ready, stop = str(tmp_path / "ready"), str(tmp_path / "stop")
     call = Running(spin_with_counter(let), ready, stop)
     run = the_run()
@@ -457,9 +465,7 @@ def test_exec_reports_the_traceback_of_source_that_raises(
     call.join()
 
 
-def test_exec_runs_a_file_and_json_carries_the_whole_answer(
-    let, tmp_path, capsys
-) -> None:
+def test_exec_runs_a_file_and_json_carries_the_whole_answer(let, tmp_path, capsys) -> None:
     ready, stop = str(tmp_path / "ready"), str(tmp_path / "stop")
     call = Running(spin_with_counter(let), ready, stop)
     run = the_run()
@@ -587,7 +593,7 @@ def test_the_message_names_the_run_and_the_second_ctrl_c_stops_waiting(
 
 
 def hooked_body(let):
-    @let.function(device=let.providers.a.CPU, host=letify.remote)
+    @let.function(device=let.providers.a.CPU, host=letify.remote, retries=0)
     def hooked(ready_file: str, marker: str) -> None:
         import time
 
@@ -646,12 +652,10 @@ def test_hooks_run_when_the_channel_closes_during_a_call(let, tmp_path) -> None:
     call.join()
 
 
-def test_a_hook_that_raises_is_reported_and_the_next_one_still_runs(
-    let, tmp_path, capfd
-) -> None:
+def test_a_hook_that_raises_is_reported_and_the_next_one_still_runs(let, tmp_path, capfd) -> None:
     ready, marker = str(tmp_path / "ready"), tmp_path / "marker"
 
-    @let.function(device=let.providers.a.CPU, host=letify.remote)
+    @let.function(device=let.providers.a.CPU, host=letify.remote, retries=0)
     def hooked(ready_file: str, marker_file: str) -> None:
         import time
 
