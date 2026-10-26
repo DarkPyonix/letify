@@ -779,6 +779,27 @@ class FramedChannel(Channel):
         return connection.pipeline(window=window, timeout=timeout, kill=self._kill)
 
 
+def exit_text(code: int | None) -> str | None:
+    """Name a subprocess exit code with its short meaning, or None while it still runs.
+
+    The text reads ``code <n>`` plus a meaning, to follow ``the worker exited with``.
+
+    Spec "Modal": a negative code is a signal, reported as the shell's 128 plus N.
+    """
+    if code is None:
+        return None
+    if code < 0:
+        code = 128 - code
+    text = f"code {code}"
+    if code == 255:
+        text += ": ssh could not reach or lost the machine"
+    elif code > 128:
+        text += f": killed by signal {code - 128}"
+        if code == 137:
+            text += ", which is SIGKILL, most often out of memory"
+    return text
+
+
 class PersistentChannel(FramedChannel):
     """One worker process, kept alive behind a pipe pair.
 
@@ -835,6 +856,7 @@ class PersistentChannel(FramedChannel):
                 process.stdout.readinto,  # type: ignore[attr-defined]
                 self._emit,
                 death_detail=self._stderr_text,
+                death_cause=self._exit_cause,
                 poll_fd=process.stdout.fileno(),
             )
             self._send_worker()
@@ -843,6 +865,18 @@ class PersistentChannel(FramedChannel):
     def _kill(self) -> None:
         if self._process is not None:
             self._process.kill()
+
+    def _exit_cause(self) -> str | None:
+        """What the exit code of the worker process says, once the process has exited."""
+        process = self._process
+        if process is None:
+            return None
+        try:
+            process.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            return None
+        code = exit_text(process.returncode)
+        return f"the worker exited with {code}" if code else None
 
     def _stderr_text(self) -> str:
         """The process's own standard error, complete once the process has exited."""
@@ -859,10 +893,14 @@ class PersistentChannel(FramedChannel):
     def _startup_failure(self, expired: bool, cause: Exception) -> Exception:
         if expired:
             return super()._startup_failure(expired, cause)
+        stderr = self._stderr_text().strip()
+        code = exit_text(self._process.returncode) if self._process else None
+        reason = f", with {code}" if code else ""
         return RuntimeFailure(
-            f"{self.name}: the worker exited before it was ready",
+            f"{self.name}: the worker exited before it was ready{reason}\n--- last remote output ---\n"
+            f"{stderr[-2000:]}",
             command=" ".join(self.command),
-            stderr=self._stderr_text().strip(),
+            stderr=stderr,
         )
 
     def close(self) -> None:
@@ -899,7 +937,7 @@ class PersistentChannel(FramedChannel):
         if process is None or connection is None:
             raise RuntimeLost(f"{self.name}: the channel is closed")
         if process.poll() is not None:
-            raise RuntimeLost(f"{self.name}: the worker exited with code {process.returncode}")
+            raise RuntimeLost(f"{self.name}: the worker exited with {exit_text(process.returncode)}")
         return connection.request(payload, timeout=timeout, kill=self._kill)
 
 

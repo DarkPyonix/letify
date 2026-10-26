@@ -146,6 +146,49 @@ def test_a_worker_that_exits_before_it_is_ready_fails_at_start() -> None:
         opened.start()
 
 
+_READ_SOURCE = "import sys; n = int(sys.stdin.readline().split()[0]); sys.stdin.read(n); "
+
+
+@pytest.mark.parametrize(
+    ("tail", "expected"),
+    [
+        ("sys.exit(255)", ["code 255", "ssh could not reach or lost the machine"]),
+        (
+            "os.kill(os.getpid(), signal.SIGKILL)",
+            ["code 137", "killed by signal 9", "SIGKILL", "out of memory"],
+        ),
+        ("sys.exit(1)", ["with code 1"]),
+    ],
+)
+def test_a_worker_that_dies_before_hello_names_its_exit_code_and_stderr(tail, expected) -> None:
+    # Spec "Modal": a subprocess channel names the exit code, so a lost ssh connection is
+    # told from a kill and from a Python crash.
+    stub = (
+        _READ_SOURCE
+        + "import os, signal; sys.stderr.write('boom line\\n'); sys.stderr.flush(); "
+        + tail
+    )
+    opened = PersistentChannel([sys.executable, "-u", "-c", stub], name="early-exit")
+    with pytest.raises(RuntimeFailure) as caught:
+        opened.start()
+    text = str(caught.value)
+    for part in expected:
+        assert part in text
+    assert "boom line" in text
+
+
+def test_a_worker_that_dies_mid_call_names_its_exit_code(channel) -> None:
+    channel.start()
+    channel._process.kill()
+    channel._process.wait(timeout=30)
+    with pytest.raises(letify.RuntimeLost, match="killed by signal 9"):
+        channel.call(returns_pid(), (), {})
+    process, channel._process = channel._process, None
+    for pipe in (process.stdin, process.stdout, process.stderr):
+        if pipe is not None:
+            pipe.close()
+
+
 def test_a_worker_that_is_already_gone_is_reported_lost(channel) -> None:
     channel.start()
     channel._process.kill()
