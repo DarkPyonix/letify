@@ -15,6 +15,7 @@ the local disk: a machine with no Drive raises ``ConfigError``.
 from __future__ import annotations
 
 import contextlib
+import http.client
 import itertools
 import os
 import re
@@ -26,7 +27,7 @@ import threading
 import time
 from collections.abc import Iterator
 from pathlib import Path
-from typing import Any
+from typing import Any, overload
 
 from ..errors import ConfigError, LetifyError, RuntimeFailure, UnsupportedMode
 from ..protocol import codec
@@ -218,17 +219,26 @@ def stash(name: str, path: str | os.PathLike[str]) -> str:
     return digest
 
 
-def unstash(name: str, path: str | os.PathLike[str]) -> Path | None:
+@overload
+def unstash(name: str) -> dict[str, bytes] | None: ...
+@overload
+def unstash(name: str, path: str | os.PathLike[str]) -> Path | None: ...
+def unstash(
+    name: str, path: str | os.PathLike[str] | None = None
+) -> Path | dict[str, bytes] | None:
     """Put the handoff ``name`` at ``path``, replacing what was there.
 
     Returns ``path``, or None when no handoff has that name, in which case nothing changed.
-    Spec "Named handoffs on the Drive store".
+    With no ``path`` nothing is written to disk: the result is a dict from the path of each
+    regular file in the handoff, as stored, to its bytes, or None when no handoff has that
+    name. Spec "Named handoffs on the Drive store".
     """
     check_name(name)
-    target = Path(path)
     main = _worker_main(name)
     if main is not None:
-        return _unstash_in_worker(main, name, target)
+        if path is None:
+            return _unstash_memory_in_worker(main, name)
+        return _unstash_in_worker(main, name, Path(path))
     backend = drive_backend()
     try:
         digest = backend.read_ref(REF_SPACE + name)
@@ -236,6 +246,15 @@ def unstash(name: str, path: str | os.PathLike[str]) -> Path | None:
         raise _named(name, exc) from exc
     if digest is None:
         return None
+    if path is None:
+        try:
+            source = backend.pull_source(digest)
+        except RuntimeFailure as exc:
+            raise _named(name, exc) from exc
+        return _members_from(
+            name, digest, str(source["url"]), dict(source.get("headers") or {})  # type: ignore[call-overload]
+        )
+    target = Path(path)
     with _scratch(target.absolute()) as scratch:
         archive = scratch / "unstash.tar"
         try:
@@ -245,6 +264,153 @@ def unstash(name: str, path: str | os.PathLike[str]) -> Path | None:
         _verify(name, archive, digest)
         unpack(archive, target, scratch)
     return target
+
+
+# -- reading a handoff into memory ----------------------------------------------------
+
+_BLOCK = 512
+_REGULAR = (tarfile.REGTYPE, tarfile.AREGTYPE, tarfile.CONTTYPE)
+
+
+def _truncated() -> RuntimeFailure:
+    return RuntimeFailure("a handoff archive ended before its last member was complete")
+
+
+def _take(stream: Any, size: int, hasher: Any) -> bytes:
+    """Exactly ``size`` bytes, hashed, from one ``read(size)`` call unless a read comes short.
+
+    A single call lets the buffered reader allocate the result once. Only a short read, which
+    a chunked response can give, joins pieces.
+    """
+    data = stream.read(size)
+    if len(data) != size:
+        pieces = [data]
+        have = len(data)
+        while have < size:
+            more = stream.read(size - have)
+            if not more:
+                raise _truncated()
+            pieces.append(more)
+            have += len(more)
+        data = b"".join(pieces)
+    if hasher is not None:
+        hasher.update(data)
+    return data
+
+
+def _skip(stream: Any, size: int, hasher: Any) -> None:
+    """Read and hash ``size`` bytes without keeping them."""
+    while size > 0:
+        _take(stream, min(size, 1 << 20), hasher)
+        size -= min(size, 1 << 20)
+
+
+def _pax_fields(data: bytes) -> dict[str, str]:
+    """The ``key=value`` records of a pax extended header."""
+    fields: dict[str, str] = {}
+    position = 0
+    while position < len(data):
+        space = data.find(b" ", position)
+        if space < 0:
+            break
+        length = int(data[position:space])
+        record = data[space + 1 : position + length - 1]
+        key, _, value = record.partition(b"=")
+        fields[key.decode("utf-8")] = value.decode("utf-8", "surrogateescape")
+        position += length
+    return fields
+
+
+def read_archive(stream: Any, hasher: Any) -> dict[str, bytes]:
+    """Read a tar from ``stream`` in one pass into a dict of regular files, hashing every byte.
+
+    Headers are parsed as they arrive, so a member's bytes are never held twice. GNU long
+    name records and pax records are applied to the member that follows. The stream is read
+    to its end so the hash covers the whole blob. Digest checking is the caller's.
+    """
+    members: dict[str, bytes] = {}
+    name: str | None = None
+    size_override: int | None = None
+    while True:
+        header = stream.read(_BLOCK)
+        if len(header) < _BLOCK:
+            more = header
+            while len(more) < _BLOCK:
+                piece = stream.read(_BLOCK - len(more))
+                if not piece:
+                    break
+                more += piece
+            header = more
+            if len(header) < _BLOCK:
+                if hasher is not None:
+                    hasher.update(header)
+                if header.strip(b"\0"):
+                    raise _truncated()
+                return members
+        if hasher is not None:
+            hasher.update(header)
+        if header == b"\0" * _BLOCK:
+            while chunk := stream.read(1 << 20):
+                if hasher is not None:
+                    hasher.update(chunk)
+            return members
+        try:
+            info = tarfile.TarInfo.frombuf(header, "utf-8", "surrogateescape")
+        except tarfile.TarError as exc:
+            raise RuntimeFailure(f"a handoff archive has an unreadable header: {exc}") from exc
+        size = info.size
+        padding = -size % _BLOCK
+        if info.type in (tarfile.GNUTYPE_LONGNAME, tarfile.GNUTYPE_LONGLINK):
+            text = _take(stream, size, hasher).split(b"\0", 1)[0].decode("utf-8", "surrogateescape")
+            _skip(stream, padding, hasher)
+            if info.type == tarfile.GNUTYPE_LONGNAME:
+                name = text
+            continue
+        if info.type == tarfile.XHDTYPE:
+            fields = _pax_fields(_take(stream, size, hasher))
+            _skip(stream, padding, hasher)
+            name = fields.get("path", name)
+            if "size" in fields:
+                size_override = int(fields["size"])
+            continue
+        if info.type in (tarfile.XGLTYPE, tarfile.SOLARIS_XHDTYPE):
+            _skip(stream, size + padding, hasher)
+            continue
+        if info.type in _REGULAR:
+            if size_override is not None:
+                size = size_override
+                padding = -size % _BLOCK
+            members[name if name is not None else info.name] = _take(stream, size, hasher)
+            _skip(stream, padding, hasher)
+        else:
+            _skip(stream, size + padding, hasher)
+        name = None
+        size_override = None
+
+
+def _members_from(name: str, digest: str, url: str, headers: dict[str, str]) -> dict[str, bytes]:
+    """Download the blob at ``url`` straight into a dict of its files, then check the digest."""
+    from .backends.drive import open_stream
+
+    hasher = codec.hasher_for(digest)
+    try:
+        response = open_stream(url, headers)
+        try:
+            members = read_archive(response, hasher)
+        finally:
+            response.close()
+    except (OSError, http.client.HTTPException) as exc:
+        raise RuntimeFailure(f"handoff {name!r}: Drive download failed: {exc}") from exc
+    except RuntimeFailure as exc:
+        raise _named(name, exc) from exc
+    if hasher is not None:
+        found = codec.finish_digest(hasher)
+        if found != digest:
+            raise RuntimeFailure(
+                f"handoff {name!r}: the blob downloaded from Drive has digest {found}, "
+                f"and the ref names {digest}"
+            )
+    return members
 
 
 def _verify(name: str, archive: Path, digest: str) -> None:
@@ -340,6 +506,18 @@ def _stash_in_worker(main: Any, name: str, source: Path) -> str:
             target = None
         _ask(main, {"kind": "stashed", "name": name, "digest": digest, "file_id": file_id})
     return digest
+
+
+def _unstash_memory_in_worker(main: Any, name: str) -> dict[str, bytes] | None:
+    answer = _ask(main, {"kind": "unstash", "name": name})
+    if answer.get("missing"):
+        return None
+    try:
+        return _members_from(
+            name, str(answer["digest"]), str(answer["url"]), dict(answer.get("headers") or {})
+        )
+    finally:
+        answer = None  # type: ignore[assignment]
 
 
 def _unstash_in_worker(main: Any, name: str, target: Path) -> Path | None:
