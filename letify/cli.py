@@ -12,6 +12,7 @@ import json
 import os
 import shutil
 import sys
+import time
 from pathlib import Path
 
 from . import __version__, render
@@ -194,6 +195,28 @@ def build_parser() -> argparse.ArgumentParser:
     efficiency.add_argument("syncs", type=int, help="host synchronizations per step")
     efficiency.add_argument("round_trip_ms", type=float, help="network round trip")
     efficiency.add_argument("--json", action="store_true", help="print the record unformatted")
+
+    runs_parser = sub.add_parser("runs", help="list the calls running from this machine")
+    runs_parser.add_argument("--json", action="store_true", help="print the records unformatted")
+    interrupt_parser = sub.add_parser(
+        "interrupt", help="raise KeyboardInterrupt in a running call's body"
+    )
+    interrupt_parser.add_argument("run", help="a run id, as letify runs lists it")
+    interrupt_parser.add_argument(
+        "--json", action="store_true", help="print the record unformatted"
+    )
+    exec_parser = sub.add_parser("exec", help="run Python source inside a running call's worker")
+    exec_parser.add_argument("run", help="a run id, as letify runs lists it")
+    exec_parser.add_argument("code", nargs="?", help="the source to run")
+    exec_parser.add_argument("-f", "--file", help="read the source from this file instead")
+    exec_parser.add_argument(
+        "--timeout",
+        type=float,
+        default=60.0,
+        metavar="S",
+        help="seconds to wait for the answer; the source keeps running after that",
+    )
+    exec_parser.add_argument("--json", action="store_true", help="print the record unformatted")
 
     setup_parser = sub.add_parser(
         "setup", help="install tailcat or eci from its publisher ahead of time"
@@ -597,6 +620,110 @@ def _confirmed(question: str) -> bool:
     return answer in ("y", "yes")
 
 
+def _run_control(args: argparse.Namespace) -> int:
+    """``letify runs``, ``interrupt`` and ``exec``: spec "Controlling a running call".
+
+    Exit status 0 on success, 2 for a usage error, 3 when the run is not found and 1 for
+    any other failure.
+    """
+    from .errors import RunNotFound, UnsupportedMode
+    from .runtime import control
+
+    def refuse(message: str, status: int, kind: str = "Error") -> int:
+        if args.json:
+            _json({"ok": False, "type": kind, "error": message})
+        else:
+            _fail(message)
+        return status
+
+    if args.command == "runs":
+        if not control.available():
+            return refuse("run control is not available on Windows", 1, "UnsupportedMode")
+        rows = control.list_runs()
+        if args.json:
+            return _json(rows)
+        if not rows:
+            print("no calls are running")
+            return 0
+        now = time.time()
+        table = [("RUN", "FUNCTION", "RUNTIME", "PROVIDER", "AGE", "PID")] + [
+            (
+                str(row["run"]),
+                str(row.get("function", "")),
+                str(row.get("runtime", "")),
+                str(row.get("provider", "")),
+                _age(now - float(row.get("started_at", now))),
+                str(row.get("pid", "")),
+            )
+            for row in rows
+        ]
+        widths = [max(len(line[column]) for line in table) for column in range(6)]
+        for line in table:
+            cells = (cell.ljust(width) for cell, width in zip(line, widths, strict=True))
+            print("  ".join(cells).rstrip())
+        return 0
+
+    command: dict[str, object] = {"cmd": args.command}
+    wait = 90.0
+    if args.command == "exec":
+        if (args.code is None) == (args.file is None):
+            return refuse("give the source as CODE or with -f FILE, not both and not neither", 2)
+        if args.timeout <= 0:
+            return refuse("--timeout must be positive", 2)
+        try:
+            source = args.code if args.code is not None else Path(args.file).read_text("utf-8")
+        except (OSError, UnicodeDecodeError) as exc:
+            return refuse(f"cannot read {args.file}: {exc}", 1)
+        command.update({"source": source, "timeout": args.timeout})
+        wait = args.timeout + 30
+    try:
+        answer = control.ask(args.run, command, wait=wait)
+    except RunNotFound as exc:
+        return refuse(str(exc), 3, "RunNotFound")
+    except UnsupportedMode as exc:
+        return refuse(str(exc), 1, "UnsupportedMode")
+    failed = not answer.get("ok")
+    if args.command == "exec" and answer.get("error"):
+        failed = True
+    if args.json:
+        _json(answer)
+        return 1 if failed else 0
+    if not answer.get("ok"):
+        kind = answer.get("type") or "Error"
+        reason = answer.get("error") or answer.get("reason") or "failed"
+        _fail(f"{kind}: {reason}" if kind != "Error" else str(reason))
+        return 1
+    if args.command == "interrupt":
+        if not answer.get("interrupted"):
+            _fail(f"{args.run} was not interrupted: {answer.get('reason', 'unknown reason')}")
+            return 1
+        _say("ok", f"{args.run} interrupted")
+        return 0
+    sys.stdout.write(str(answer.get("stdout") or ""))
+    sys.stderr.write(str(answer.get("stderr") or ""))
+    if answer.get("error"):
+        sys.stderr.write(str(answer["error"]))
+        return 1
+    if answer.get("has_value"):
+        print(answer["value"])
+    assigned = answer.get("assigned") or []
+    if assigned and not answer.get("applied"):
+        _fail(
+            "this Python does not write assignments to f_locals back into the running "
+            f"frame, so {', '.join(map(str, assigned))} was not applied"
+        )
+    return 0
+
+
+def _age(seconds: float) -> str:
+    seconds = max(0, int(seconds))
+    if seconds < 60:
+        return f"{seconds}s"
+    if seconds < 3600:
+        return f"{seconds // 60}m{seconds % 60:02d}s"
+    return f"{seconds // 3600}h{seconds % 3600 // 60:02d}m"
+
+
 def _json(value: object) -> int:
     print(json.dumps(value, indent=2))
     return 0
@@ -623,6 +750,10 @@ def _dispatch(args: argparse.Namespace) -> int:
 
     if args.command == "setup":
         return _setup_tool(args)
+
+    if args.command in ("runs", "interrupt", "exec"):
+        # Talks to the process that owns the run, so no Launcher is built.
+        return _run_control(args)
 
     if args.command == "client":
         # Runs on the remote machine, which has no accounts, so no Launcher is built.

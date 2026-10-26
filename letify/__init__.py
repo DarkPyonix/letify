@@ -33,6 +33,7 @@ from typing import Final, overload
 
 from .declare.cache import session_cache
 from .declare.env import Env
+from .declare.exit import on_exit
 from .declare.function import Function
 from .declare.instance import AnyInstance, Host, Instance
 from .declare.reduce import all_reduce, mean, sum
@@ -151,6 +152,7 @@ __all__ = [
     "local",
     "local_steps",
     "mean",
+    "on_exit",
     "rank",
     "remote",
     "session_cache",
