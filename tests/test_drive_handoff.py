@@ -588,3 +588,25 @@ def test_every_drive_grant_is_reported_and_a_failed_answer_names_its_error(monke
     assert "drive grant stash run-checkpoint: answered in" in err
     assert "drive grant stash run-manifest: the answer was not delivered after" in err
     assert "no reply within 300 s" in err
+
+
+def test_a_drive_request_the_worker_cannot_send_is_named_on_its_stderr(capsys) -> None:
+    import ast
+    import sys
+
+    from letify.protocol import worker
+
+    # The worker is a program shipped as text, so the function is taken from its source.
+    tree = ast.parse(worker.SOURCE)
+    node = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "_drive_ask")
+
+    class Sender:
+        def message(self, *args):
+            raise OSError("broken pipe")
+
+    namespace = {"_SENDER": Sender(), "REQUEST": 1, "DRIVE_STREAM": 5, "sys": sys}
+    exec(compile(ast.Module([node], []), "worker_drive_ask", "exec"), namespace)
+    namespace["_drive_ask"]({"kind": "unstash", "name": "run-checkpoint"})
+    err = capsys.readouterr().err
+    assert "letify: drive request unstash run-checkpoint was not sent: broken pipe" in err
+
