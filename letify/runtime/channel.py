@@ -27,6 +27,7 @@ import os
 import select
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from collections.abc import Callable, Iterator, Sequence
@@ -819,6 +820,8 @@ class PersistentChannel(FramedChannel):
         self._start_lock = threading.Lock()
         self._stderr = _Tail()
         self._stderr_reader: threading.Thread | None = None
+        #: Where ``ssh -E`` appends the log of the client and its forked master.
+        self._ssh_log: str | None = None
 
     # -- lifecycle -----------------------------------------------------------
 
@@ -826,9 +829,10 @@ class PersistentChannel(FramedChannel):
         with self._start_lock:
             if self._process is not None:
                 return
+            command = self._with_ssh_log()
             try:
                 process = subprocess.Popen(
-                    self.command,
+                    command,
                     stdin=subprocess.PIPE,
                     stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE,
@@ -836,6 +840,7 @@ class PersistentChannel(FramedChannel):
                     env=self.env,
                 )
             except OSError as exc:
+                self._drop_ssh_log()
                 raise RuntimeFailure(
                     f"{self.name}: could not start the worker: {exc}",
                     command=" ".join(self.command),
@@ -855,7 +860,7 @@ class PersistentChannel(FramedChannel):
                 wire.fd_writer(process.stdin.fileno()),
                 process.stdout.readinto,  # type: ignore[attr-defined]
                 self._emit,
-                death_detail=self._stderr_text,
+                death_detail=lambda: self._stderr_text() + self._ssh_log_section(),
                 death_cause=self._exit_cause,
                 poll_fd=process.stdout.fileno(),
             )
@@ -865,6 +870,36 @@ class PersistentChannel(FramedChannel):
     def _kill(self) -> None:
         if self._process is not None:
             self._process.kill()
+
+    def _with_ssh_log(self) -> list[str]:
+        """The command, with ``-E <file>`` after the program when that program is ssh.
+
+        Spec "Modal": ControlPersist forks a master whose standard error is /dev/null, so
+        the transport's own errors reach only this file.
+        """
+        self._drop_ssh_log()
+        if os.path.basename(self.command[0]) not in ("ssh", "ssh.exe"):
+            return self.command
+        handle, self._ssh_log = tempfile.mkstemp(prefix="letify-ssh-", suffix=".log")
+        os.close(handle)
+        return [self.command[0], "-E", self._ssh_log, *self.command[1:]]
+
+    def _drop_ssh_log(self) -> None:
+        log, self._ssh_log = self._ssh_log, None
+        if log is not None:
+            with contextlib.suppress(OSError):
+                os.unlink(log)
+
+    def _ssh_log_section(self) -> str:
+        """The last 2000 characters of the ssh log under a heading, or empty when it is empty."""
+        if self._ssh_log is None:
+            return ""
+        try:
+            with open(self._ssh_log, "rb") as handle:
+                text = handle.read().decode("utf-8", "replace").strip()
+        except OSError:
+            return ""
+        return f"\n--- ssh log ---\n{text[-2000:]}" if text else ""
 
     def _exit_cause(self) -> str | None:
         """What the exit code of the worker process says, once the process has exited."""
@@ -898,7 +933,7 @@ class PersistentChannel(FramedChannel):
         reason = f", with {code}" if code else ""
         return RuntimeFailure(
             f"{self.name}: the worker exited before it was ready{reason}\n--- last remote output ---\n"
-            f"{stderr[-2000:]}",
+            f"{stderr[-2000:]}{self._ssh_log_section()}",
             command=" ".join(self.command),
             stderr=stderr,
         )
@@ -923,6 +958,7 @@ class PersistentChannel(FramedChannel):
         finally:
             if self._stderr_reader is not None:
                 self._stderr_reader.join(1)
+            self._drop_ssh_log()
 
     @property
     def alive(self) -> bool:

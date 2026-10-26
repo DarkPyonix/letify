@@ -189,6 +189,55 @@ def test_a_worker_that_dies_mid_call_names_its_exit_code(channel) -> None:
             pipe.close()
 
 
+def _fake_ssh(tmp_path, body: str) -> str:
+    path = tmp_path / "ssh"
+    path.write_text(f"#!{sys.executable}\n{body}")
+    path.chmod(0o755)
+    return str(path)
+
+
+_FAKE_SSH_FAILS = (
+    "import sys\n"
+    "log = sys.argv[sys.argv.index('-E') + 1]\n"
+    "open(log, 'a').write('client_loop: send disconnect: Broken pipe\\n')\n"
+    "sys.stderr.write('Permanently added host\\n')\n"
+    "sys.exit(255)\n"
+)
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="the fake ssh is a script")
+def test_an_ssh_worker_that_dies_before_hello_shows_the_ssh_log(tmp_path) -> None:
+    # Spec "Modal": ssh -E carries the transport errors a ControlPersist master hides.
+    command = [_fake_ssh(tmp_path, _FAKE_SSH_FAILS), "-o", "A=b", "host", "python"]
+    opened = PersistentChannel(command, name="colab")
+    with pytest.raises(RuntimeFailure) as caught:
+        opened.start()
+    text = str(caught.value)
+    assert "--- ssh log ---" in text
+    assert "Broken pipe" in text
+    assert "Permanently added host" in text
+    assert "code 255" in text
+    log = opened._ssh_log
+    assert log is not None and os.path.exists(log)
+    opened.close()
+    assert not os.path.exists(log)
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="the fake ssh is a script")
+def test_ssh_gets_its_log_option_right_after_the_program(tmp_path) -> None:
+    opened = PersistentChannel([_fake_ssh(tmp_path, ""), "-o", "A=b", "host"], name="colab")
+    command = opened._with_ssh_log()
+    assert command[1] == "-E" and command[2] == opened._ssh_log
+    assert command[3:] == ["-o", "A=b", "host"]
+    opened._drop_ssh_log()
+
+
+def test_a_command_that_is_not_ssh_is_started_unchanged() -> None:
+    opened = PersistentChannel([sys.executable, "-u", "-c", "pass"], name="local")
+    assert opened._with_ssh_log() == opened.command
+    assert opened._ssh_log is None
+
+
 def test_a_worker_that_is_already_gone_is_reported_lost(channel) -> None:
     channel.start()
     channel._process.kill()
