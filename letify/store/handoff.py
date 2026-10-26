@@ -192,7 +192,7 @@ def point(backend: Any, name: str, digest: str) -> str | None:
 
 def release(backend: Any, previous: str | None) -> None:
     """Delete the blob ``previous`` unless a ``stash/`` ref still names it."""
-    if previous and not backend.ref_names(REF_SPACE, previous):
+    if previous and not backend.ref_holds(REF_SPACE, previous):
         backend.delete_blob(previous)
 
 

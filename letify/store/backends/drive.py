@@ -355,7 +355,7 @@ class DriveBackend(Backend):
         self._call("DELETE", url, what=f"deleting {digest}")
         self._ids.pop(digest, None)
 
-    def ref_names(self, prefix: str, digest: str) -> bool:
+    def ref_holds(self, prefix: str, digest: str) -> bool:
         """Whether a ref whose name starts with ``prefix`` holds ``digest``, from one listing.
 
         A ref holds the digest and nothing else, so the listing's ``md5Checksum`` of each ref
