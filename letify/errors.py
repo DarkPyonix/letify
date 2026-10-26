@@ -124,6 +124,14 @@ class UnsupportedMode(LetifyError):
     """
 
 
+class RunNotFound(LetifyError):
+    """No live run has the id a run control command named.
+
+    Spec "Controlling a running call": ``letify interrupt`` and ``letify exec`` exit with
+    status 3 for it. A record whose owning process is gone counts as not found.
+    """
+
+
 class ReductionFailed(RuntimeFailure):
     """An ``all_reduce`` round could not reach ``min_peers`` within its timeout.
 

@@ -28,6 +28,7 @@ DECLARED_LOCAL_PATHS = frozenset(
         "tmp",
         "ssh",
         "runtime",
+        "runs",
     }
 )
 
