@@ -132,6 +132,35 @@ Confirm the final candidate on the bigger card.
 
 > ⚠️ This does not apply when you need a specific capability. NVFP4 needs Blackwell tensor cores, which on Colab means `G4` and nothing else. There is no cheaper substitute.
 
+## Reaching into a running call
+
+A call is a program running somewhere else, and you can still do to it what you would do to a local process. Every call gets a 12 character run id while it runs. `letify runs` lists the live calls of the machine:
+
+```bash
+letify runs
+letify interrupt 3f9a0c61d2b4                   # raise KeyboardInterrupt in the body, as Ctrl-C does
+letify exec 3f9a0c61d2b4 "L['step']"            # read a local variable of the running loop
+letify exec 3f9a0c61d2b4 "L['config'].save_every = 100"
+letify exec 3f9a0c61d2b4 -f rescue.py --timeout 300
+```
+
+`interrupt` runs the body's `except` and `finally` blocks, so a loop that saves in a `finally` saves. Pressing Ctrl-C in the process that made the call does the same once, then waits for the outputs. A second Ctrl-C stops waiting.
+
+`exec` runs your source on a thread of the worker while the body keeps running. It sees `frame`, `frames`, `L` (the locals of `frame`) and `G` (its globals), where `frame` is the innermost frame of your own code. A single expression answers with its `repr`. Changing an object, as in `L["config"].save_every = 100`, reaches the loop on every Python. Assigning a name, as in `L["step"] = 0`, reaches it only on Python 3.13 and later, and the answer says so on an earlier one. A file the source writes is on the runtime, so `import letify; letify.stash("ckpt", "model.pt")` in the source moves it to the Drive store before the runtime goes away.
+
+To save state when the runtime is taken away, register a hook inside the body:
+
+```python
+@let.function(device=colab.G4, host=letify.remote)
+def train():
+    letify.on_exit(lambda: letify.stash("ckpt", "model.pt"))
+    ...
+```
+
+The hook runs when the worker receives `SIGTERM`, when its lease runs out, or when the channel closes during the call. It does not run for `SIGKILL` or the out of memory killer, so keep writing checkpoints as well. Hooks run newest first and share 120 seconds.
+
+None of this works on a provider whose worker has only a one-shot channel, and the commands say which provider. There is no control socket on Windows. See the spec section "Controlling a running call".
+
 ## Practical patterns
 
 **Run the configurations, collect a table.**

@@ -190,6 +190,14 @@ cache.fetch_checkpoint("run-1", target)
 cache.resume(runtime, "run-1", path)   # put the newest one inside a session
 ```
 
+### Exit hooks
+
+```python
+letify.on_exit(fn)                    # inside a body: run fn if the worker ends before the body does
+```
+
+The hook runs on `SIGTERM`, when the lease deadline passes and when the channel closes during the call, newest first, within 120 s in total. Outside a body it raises `UnsupportedMode`. `letify runs`, `interrupt` and `exec` reach a running call from the command line; see [Controlling a running call](docs/SPEC.md#run-control).
+
 ### Handoffs
 
 ```python
@@ -237,6 +245,9 @@ letify devices                # accelerators each provider offers
 letify status                 # live sessions and what they are costing
 letify usage [alias]          # what is left on each account
 letify utilization [alias]    # how busy each instance's accelerator is
+letify runs                   # calls running from this machine, with their run ids
+letify interrupt <run>        # raise KeyboardInterrupt in a running call's body
+letify exec <run> CODE        # run source beside a running call (-f FILE, --timeout S)
 letify check <alias>          # confirm a machine answers
 letify probe <host>           # whether host="local" is worth using
 letify efficiency 0.5 3 150   # expected share of a direct run
