@@ -68,7 +68,7 @@ distributed: Final = Host.distributed
 # The enum class stays importable from letify.declare.instance for letify's own use.
 del Host
 
-__version__ = "2.8.6"
+__version__ = "2.8.7"
 
 
 def fetch(tensor):  # type: ignore[no-untyped-def]
