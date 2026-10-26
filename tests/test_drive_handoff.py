@@ -499,3 +499,39 @@ def test_stash_and_unstash_in_a_child_process_of_the_body_say_to_call_from_the_m
     assert "'spawned'" in answer["spawn"]
     assert fake_drive.requests == []
 
+
+
+def test_every_drive_grant_is_reported_and_a_failed_answer_names_its_error(monkeypatch, capsys) -> None:
+    import time
+
+    from letify.store import handoff
+
+    asked = [
+        {"id": 1, "kind": "stash", "name": "run-checkpoint"},
+        {"id": 2, "kind": "stash", "name": "run-manifest"},
+    ]
+
+    class Connection:
+        def take_grants(self):
+            found, asked[:] = list(asked), []
+            return found
+
+    class Channel:
+        connection = Connection()
+
+        def request(self, message, timeout):
+            if message["id"] == 2:
+                raise TimeoutError("no reply within 300 s")
+
+    monkeypatch.setattr(handoff, "grant", lambda ask: {"done": True})
+    watcher = handoff.GrantWatcher(Channel(), poll_s=0.01)
+    watcher.start()
+    deadline = time.time() + 5
+    while asked and time.time() < deadline:
+        time.sleep(0.01)
+    time.sleep(0.05)
+    watcher.close()
+    err = capsys.readouterr().err
+    assert "drive grant stash run-checkpoint: answered in" in err
+    assert "drive grant stash run-manifest: the answer was not delivered after" in err
+    assert "no reply within 300 s" in err

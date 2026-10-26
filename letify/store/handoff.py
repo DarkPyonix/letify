@@ -30,6 +30,7 @@ from typing import Any
 
 from ..errors import ConfigError, LetifyError, RuntimeFailure, UnsupportedMode
 from ..protocol import codec
+from ..transport.announce import say
 
 #: The environment variable the one-shot driver script sets, holding the provider's name,
 #: so a body can tell it runs on a channel with no stream back to the local process.
@@ -432,14 +433,20 @@ class GrantWatcher:
             connection = getattr(self._channel, "connection", None)
             asks = connection.take_grants() if connection is not None else []
             for ask in asks:
+                started = time.monotonic()
                 reply = grant(ask)
+                label = f"drive grant {ask.get('kind')} {ask.get('name')}"
                 try:
                     self._channel.request(
                         {"op": "drive_grant", "id": ask.get("id"), **reply}, timeout=300
                     )
-                except Exception:
-                    # The worker is gone or its call already failed; nobody is waiting.
-                    pass
+                except Exception as exc:
+                    # Either nobody waits any more, or the worker waits out its grant timeout;
+                    # the line tells the two apart from the worker's own error.
+                    say(f"{label}: the answer was not delivered after "
+                        f"{time.monotonic() - started:.1f} s: {type(exc).__name__}: {exc}")
+                else:
+                    say(f"{label}: answered in {time.monotonic() - started:.1f} s")
             self._stop.wait(self._poll_s)
 
 
