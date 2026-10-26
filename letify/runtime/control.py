@@ -252,12 +252,18 @@ class _Server:
         """Stop listening. The records are left alone, which belong to their runs."""
         atexit.unregister(self.close)
         with contextlib.suppress(OSError):
+            # Wakes the accept thread, which a close alone leaves blocked on Linux.
+            self.socket.shutdown(socket.SHUT_RDWR)
+        with contextlib.suppress(OSError):
             self.socket.close()
         if self.pid == os.getpid():
             with contextlib.suppress(OSError):
                 self.path.unlink()
 
     def close(self) -> None:
+        with contextlib.suppress(OSError):
+            # Wakes the accept thread, which a close alone leaves blocked on Linux.
+            self.socket.shutdown(socket.SHUT_RDWR)
         with contextlib.suppress(OSError):
             self.socket.close()
         with contextlib.suppress(OSError):

@@ -456,20 +456,24 @@ class Connection:
             self._wait(slot.event.is_set)
             return
         failures: list[BaseException] = []
+        # Waited on instead of joining the thread: after a KeyboardInterrupt inside
+        # ``Thread.join`` Python 3.12 can report a thread that still runs as finished.
+        finished = threading.Event()
 
         def read() -> None:
             try:
                 self._wait(slot.event.is_set)
             except BaseException as exc:
                 failures.append(exc)
+            finally:
+                finished.set()
 
         reader = threading.Thread(target=read, name="letify-call-reader", daemon=True)
         reader.start()
         interrupted = False
         while True:
             try:
-                reader.join(0.2)
-                if not reader.is_alive():
+                if finished.wait(0.2):
                     break
             except KeyboardInterrupt:
                 if interrupted:
