@@ -1,0 +1,14 @@
+[package]
+name = "letify"
+description = "The Rust face of letify, a declarative tool for running Python and PyTorch work on remote GPUs."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+readme = "README.md"
+homepage = "https://github.com/DarkPyonix/letify"
+documentation = "https://docs.rs/letify"
+keywords = ["infrastructure", "gpu", "remote", "nat-traversal", "declarative"]
+categories = ["development-tools", "network-programming"]
+
+[dependencies]
