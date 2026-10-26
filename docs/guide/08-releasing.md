@@ -24,7 +24,7 @@ The `ci` workflow runs `check` on every push and pull request.
    git commit -am "Chore: Set the version to 1.2.0"
    ```
 
-2. Bring the commit to `main` as usual, then tag that commit and push the tag:
+2. Tag that commit on `develop` and push the tag. The crates.io workflow refuses a tag whose commit is not in `develop`'s history:
 
    ```
    git tag v1.2.0
