@@ -485,7 +485,6 @@ class FakeEliceServer:
         return self.requests[-1]
 
     def _handle(self, handler: Any, method: str) -> None:
-        import hashlib
         import json
         import urllib.parse
 
@@ -990,7 +989,6 @@ class FakeGCSServer:
         return authorization in (f"Bearer {self.token}", f"Bearer down-{self.token}")
 
     def _handle(self, handler: Any, method: str) -> None:
-        import hashlib
         import json
         import urllib.parse
 
@@ -1364,7 +1362,6 @@ class FakeJupyterServer:
         self._server.server_close()
 
     def _handle(self, handler: Any, method: str) -> None:
-        import hashlib
         import json
         import urllib.parse
 
