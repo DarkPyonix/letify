@@ -2591,6 +2591,22 @@ A lost worker process or link raises `RuntimeLost`, and the session is discarded
 
 Measured on 2026-09-14 against a Tesla P100 server with torch 2.5.1 cu121: libcudart 12.1 resolves 425 driver symbols by name and the stand-in `libcuda.so.1` exports 20, so CUDA initialization fails with `cudaErrorInsufficientDriver`. The private `cuGetExportTable` blocks adding symbols one by one, and PyTorch kernels arrive through fatbinary registration that `cuModuleLoadData` does not see. Operator forwarding depends on PyTorch's public extension points instead of the driver's private ones. The Rust crates in `letify-core/` and `letify.remoting.probe` remain in the tree and the wheels, and nothing on the `host="local"` path calls them.
 
+### CUDA runtime API forwarding <!-- id: cuda-runtime-forwarding -->
+
+> `host="local"` serves any framework that reaches the GPU through the CUDA runtime, by standing in for `libcudart` rather than for the driver.
+
+This section is a hypothesis on its own branch and reaches `develop` only if the experiment adopts it. It answers three needs that operator forwarding cannot: a framework other than PyTorch (JAX, TensorFlow), a CUDA extension or Triton kernel compiled in the local process, and a GPU shared at low latency by several processes on one LAN, such as a darkpyonix kernel or Ember.
+
+The stand-in is a `libcudart.so.12` that the local process loads ahead of the real one. It forwards each runtime API call over the framed protocol to an agent on the runtime that calls the real `libcudart`. Kernel images arrive through `__cudaRegisterFatBinary` and `__cudaRegisterFunction`, which a runtime stand-in receives directly, so each fatbinary is sent once and registered on the agent, and a launch names the registered function. This is the step the driver stand-in could not see.
+
+Launches, copies and memsets are queued without waiting, as operator forwarding batches operators, and a synchronizing call (`cudaStreamSynchronize`, `cudaDeviceSynchronize`, a device to host copy, an event query) is the only round trip, so N7 holds here too.
+
+cuBLAS, cuDNN and NCCL reach the driver through the private `cuGetExportTable` and do not go through `libcudart` for their own kernels. They are forwarded as libraries: the stand-in also provides `libcublas`, `libcublasLt` and `libcudnn` whose calls are forwarded whole to the agent's real libraries, with device pointers passed as the agent's addresses. A library that is not forwarded this way is refused when it loads, naming it, rather than failing at its first call.
+
+The experiment decides whether this holds. It is adopted when, on dept_gpu (LAN, below 1 ms round trip): a JAX and a TensorFlow training step run unchanged with `host="local"`; a Triton kernel compiled locally runs on the runtime; and the PyTorch benchmark step is within 1.2x of operator forwarding. It is rejected if cuBLAS or cuDNN forwarding needs symbols that are not exported, or if the step is more than 2x operator forwarding.
+
+The code this starts from is the archived driver stand-in at tag `archive/cuda-driver-forwarding`: `letify-wire` (the protocol), `letify-driver` and `letify-agent`.
+
 ## Command line
 
 > Every command prints for a person by default and for a program with `--json`, through one renderer, `letify/render.py`.
