@@ -191,6 +191,7 @@ def _forked_child():
         sys.stdin = open(os.devnull)
     except OSError:
         pass
+    _forget_run_control()
     if sys.platform.startswith("linux"):
         try:
             import ctypes
@@ -2078,6 +2079,9 @@ def _call(request):
     request.clear()
     args = _resolve(args)
     kwargs = _resolve(kwargs)
+    # Spec "Controlling a running call": from here until the body ends, an interrupt may be
+    # delivered and exit hooks may be registered.
+    _run_enter()
     try:
         value = fn(*args, **kwargs)
         if hasattr(value, "__await__"):
@@ -2091,6 +2095,8 @@ def _call(request):
         if (exc.name or "").split(".")[0] == "letify":
             raise ModuleNotFoundError(_NO_LETIFY, name=exc.name) from exc
         raise
+    finally:
+        _run_leave()
     return {"ok": True, "value": value}
 
 
@@ -2623,14 +2629,378 @@ def _op_lease(request):
 
     def watch():
         while True:
-            time.sleep(15)
+            # Wakes at the deadline rather than on a fixed beat, so a short grace is honoured.
+            time.sleep(max(0.05, min(15.0, state.get("deadline", 0) - time.time() + 0.05)))
             if time.time() > state.get("deadline", 0):
-                os._exit(0)
+                _exit_with_hooks(0)
 
     if not state.get("armed"):
         state["armed"] = True
         threading.Thread(target=watch, daemon=True).start()
     return {"ok": True, "value": state["deadline"]}
+
+
+# -- controlling a running call --------------------------------------------------------
+# Spec "Controlling a running call": an interrupt, source run beside the body, and exit hooks.
+
+#: What is running. ``body`` is true from just before the declared function is called until
+#: it returns or raises. ``hooks`` are the callables ``letify.on_exit`` registered, dropped
+#: when the call ends. ``op_signal`` marks a SIGINT sent by the ``interrupt`` op, and
+#: ``raised`` is when a KeyboardInterrupt was last raised by the handler.
+_RUN = {"body": False, "hooks": [], "op_signal": False, "raised": 0.0, "ignored": False}
+_RUN_LOCK = threading.Lock()
+
+#: Held while hooks run, so a second reason to end waits for the first one's hooks.
+_HOOKS_LOCK = threading.Lock()
+
+#: Seconds all exit hooks together may take.
+_HOOKS_SECONDS = 120.0
+
+
+def _run_enter():
+    with _RUN_LOCK:
+        _RUN["hooks"] = []
+        _RUN["body"] = True
+
+
+def _run_leave():
+    with _RUN_LOCK:
+        _RUN["body"] = False
+        _RUN["hooks"] = []
+
+
+def _exit_register(fn):
+    """Add an exit hook for the running body. False when no body is running."""
+    with _RUN_LOCK:
+        if not _RUN["body"]:
+            return False
+        _RUN["hooks"].append(fn)
+        return True
+
+
+def _run_exit_hooks(reason):
+    """Run the registered hooks, newest first and each once, within 120 s in total.
+
+    A hook that raises is reported on standard error and the next one runs. The hooks run
+    on a thread of their own, so a body blocked in C code cannot hold them up.
+    """
+    with _HOOKS_LOCK:
+        with _RUN_LOCK:
+            hooks = list(reversed(_RUN["hooks"]))
+            _RUN["hooks"] = []
+        if not hooks:
+            return
+
+        def go():
+            for hook in hooks:
+                try:
+                    hook()
+                except BaseException:
+                    print("letify: an exit hook raised (%s):" % reason, file=sys.stderr)
+                    traceback.print_exc()
+
+        thread = threading.Thread(target=go, daemon=True)
+        thread.start()
+        thread.join(_HOOKS_SECONDS)
+        if thread.is_alive():
+            print("letify: exit hooks did not finish within %d s" % _HOOKS_SECONDS,
+                  file=sys.stderr)
+        _drain_output()
+
+
+def _exit_with_hooks(code, reason="the lease ended"):
+    _run_exit_hooks(reason)
+    os._exit(code)
+
+
+def _on_sigint(signum, frame):
+    """Raise KeyboardInterrupt, as the default handler does, except for a stale interrupt.
+
+    A SIGINT the ``interrupt`` op sent can reach the main thread after the body returned,
+    and it is dropped then. One that arrives within a second of the last raised interrupt
+    is dropped too, because on a Local runtime the terminal's Ctrl-C and the owner's
+    interrupt both arrive for one key press.
+    """
+    now = time.monotonic()
+    if _RUN["op_signal"]:
+        _RUN["op_signal"] = False
+        if not _RUN["body"] or now - _RUN["raised"] < 1.0:
+            return
+    elif _RUN["ignored"]:
+        return
+    _RUN["raised"] = now
+    raise KeyboardInterrupt
+
+
+def _on_sigterm(signum, frame):
+    # Everything happens on the thread reading the wakeup descriptor, because this runs on
+    # the main thread, which may be inside the body.
+    return None
+
+
+def _watch_sigterm(fd):
+    import signal
+    while True:
+        try:
+            data = os.read(fd, 64)
+        except OSError:
+            return
+        if not data:
+            return
+        if signal.SIGTERM in data and signal.getsignal(signal.SIGTERM) is _on_sigterm:
+            _run_exit_hooks("SIGTERM")
+            os._exit(128 + signal.SIGTERM)
+
+
+def _install_run_control():
+    """Install the SIGINT handler and the SIGTERM watcher. Main thread only."""
+    try:
+        import signal
+        if not hasattr(signal, "set_wakeup_fd") or os.name == "nt":
+            return
+        _RUN["ignored"] = signal.getsignal(signal.SIGINT) == signal.SIG_IGN
+        signal.signal(signal.SIGINT, _on_sigint)
+        read_fd, write_fd = os.pipe()
+        os.set_blocking(write_fd, False)
+        signal.set_wakeup_fd(write_fd, warn_on_full_buffer=False)
+        signal.signal(signal.SIGTERM, _on_sigterm)
+    except (ValueError, OSError):
+        return
+    threading.Thread(target=_watch_sigterm, args=(read_fd,), daemon=True).start()
+
+
+def _forget_run_control():
+    """In a process the body forked: drop the worker's signal wiring."""
+    try:
+        import signal
+        signal.set_wakeup_fd(-1)
+        if signal.getsignal(signal.SIGTERM) is _on_sigterm:
+            signal.signal(signal.SIGTERM, signal.SIG_DFL)
+        if signal.getsignal(signal.SIGINT) is _on_sigint:
+            signal.signal(signal.SIGINT, signal.default_int_handler)
+    except (ValueError, OSError, AttributeError, NameError):
+        pass
+
+
+def _op_interrupt(request):
+    """Raise KeyboardInterrupt in the body's thread, as Ctrl-C does.
+
+    The signal is sent to the main thread, which runs the body, rather than set as an
+    asynchronous exception: a body blocked in a system call such as ``time.sleep`` or a
+    socket read is woken by the signal and stops at once, where an asynchronous exception
+    waits for the call to return. A body inside a long C call that never releases the
+    interpreter stops when that call returns, exactly as it does for Ctrl-C.
+    """
+    import signal
+    if not _RUN["body"]:
+        return {"ok": True, "value": {"interrupted": False, "reason": "nothing is running"}}
+    if not hasattr(signal, "pthread_kill"):
+        return {"ok": True, "value": {
+            "interrupted": False,
+            "reason": "this platform cannot signal the thread that runs the body",
+        }}
+    _RUN["op_signal"] = True
+    signal.pthread_kill(threading.main_thread().ident, signal.SIGINT)
+    return {"ok": True, "value": {"interrupted": True}}
+
+
+# Source run beside the body, with the body's own frame in reach.
+
+_EXEC = {"count": 0, "wrapped": {}, "sinks": {}, "roots": None}
+_EXEC_LOCK = threading.Lock()
+
+
+class _ThreadStream:
+    """Stands in for sys.stdout or sys.stderr and keeps what chosen threads write.
+
+    Any other thread, the body's among them, writes through to the stream it replaced.
+    """
+
+    def __init__(self, inner, name):
+        self._inner = inner
+        self._name = name
+
+    def write(self, text):
+        sink = _EXEC["sinks"].get(threading.get_ident())
+        if sink is not None:
+            return sink[self._name].write(text)
+        return self._inner.write(text)
+
+    def writelines(self, lines):
+        for line in lines:
+            self.write(line)
+
+    def flush(self):
+        if threading.get_ident() not in _EXEC["sinks"]:
+            self._inner.flush()
+
+    def __getattr__(self, name):
+        return getattr(self._inner, name)
+
+
+def _capture_begin(sink):
+    with _EXEC_LOCK:
+        for name, attr in (("out", "stdout"), ("err", "stderr")):
+            if not isinstance(getattr(sys, attr), _ThreadStream):
+                wrapper = _ThreadStream(getattr(sys, attr), name)
+                setattr(sys, attr, wrapper)
+                _EXEC["wrapped"][attr] = wrapper
+        _EXEC["count"] += 1
+        _EXEC["sinks"][threading.get_ident()] = sink
+
+
+def _capture_end():
+    with _EXEC_LOCK:
+        _EXEC["sinks"].pop(threading.get_ident(), None)
+        _EXEC["count"] -= 1
+        if _EXEC["count"] == 0:
+            for attr, wrapper in _EXEC["wrapped"].items():
+                if getattr(sys, attr) is wrapper:
+                    setattr(sys, attr, wrapper._inner)
+            _EXEC["wrapped"] = {}
+
+
+def _user_roots():
+    """Directories whose frames are not the user's: the standard library, site-packages, letify."""
+    if _EXEC["roots"] is None:
+        import sysconfig
+        roots = []
+        for key in ("stdlib", "platstdlib", "purelib", "platlib"):
+            path = sysconfig.get_paths().get(key)
+            if path:
+                roots.append(os.path.normpath(path))
+        package = sys.modules.get("letify")
+        if package is not None and getattr(package, "__file__", None):
+            roots.append(os.path.dirname(os.path.abspath(package.__file__)))
+        _EXEC["roots"] = roots
+    return _EXEC["roots"]
+
+
+def _is_user_frame(filename):
+    if filename.startswith("<frozen") or filename in ("letify-worker", "<letify>"):
+        return False
+    parts = filename.replace("\\", "/").split("/")
+    if "site-packages" in parts or "dist-packages" in parts:
+        return False
+    normal = os.path.normpath(filename)
+    for root in _user_roots():
+        if normal == root or normal.startswith(root + os.sep):
+            return False
+    return True
+
+
+class _Locals:
+    """A mapping over a frame's locals that records the names the source assigns."""
+
+    def __init__(self, frame):
+        self._frame = frame
+        self.assigned = []
+
+    def __getitem__(self, key):
+        return self._frame.f_locals[key]
+
+    def __setitem__(self, key, value):
+        self._frame.f_locals[key] = value
+        if key not in self.assigned:
+            self.assigned.append(key)
+
+    def __delitem__(self, key):
+        del self._frame.f_locals[key]
+        if key not in self.assigned:
+            self.assigned.append(key)
+
+    def __iter__(self):
+        return iter(list(self._frame.f_locals))
+
+    def __len__(self):
+        return len(self._frame.f_locals)
+
+    def __contains__(self, key):
+        return key in self._frame.f_locals
+
+    def get(self, key, default=None):
+        return self._frame.f_locals.get(key, default)
+
+    def keys(self):
+        return list(self._frame.f_locals.keys())
+
+    def values(self):
+        return list(self._frame.f_locals.values())
+
+    def items(self):
+        return list(self._frame.f_locals.items())
+
+    def update(self, *args, **kwargs):
+        for key, value in dict(*args, **kwargs).items():
+            self[key] = value
+
+    def pop(self, key, *default):
+        if key in self._frame.f_locals or not default:
+            value = self._frame.f_locals[key]
+            del self[key]
+            return value
+        return default[0]
+
+    def setdefault(self, key, default=None):
+        if key not in self._frame.f_locals:
+            self[key] = default
+        return self._frame.f_locals[key]
+
+    def __repr__(self):
+        return repr(dict(self._frame.f_locals))
+
+
+def _op_inspect_exec(request):
+    """Run source on this thread with the body's frame in reach, and answer what it did.
+
+    Standard output and error are captured for this thread only. A single expression
+    answers with the repr of its value.
+    """
+    import ast
+    import io
+    if not _RUN["body"]:
+        return {"ok": True, "value": {"ran": False, "reason": "nothing is running"}}
+    chain = []
+    top = sys._current_frames().get(threading.main_thread().ident)
+    while top is not None:
+        # The outermost frame of the worker is the bootstrap stub, which python -c names <string>.
+        stub = top.f_back is None and top.f_code.co_filename == "<string>"
+        if not stub and _is_user_frame(top.f_code.co_filename):
+            chain.append(top)
+        top = top.f_back
+    namespace = {"__name__": "letify_exec", "frames": list(reversed(chain))}
+    mapping = None
+    if chain:
+        mapping = _Locals(chain[0])
+        namespace.update({"frame": chain[0], "L": mapping, "G": chain[0].f_globals})
+    else:
+        namespace.update({"frame": None, "L": {}, "G": {}})
+    answer = {"ran": True, "has_value": False, "value": None, "error": None}
+    sink = {"out": io.StringIO(), "err": io.StringIO()}
+    _capture_begin(sink)
+    try:
+        try:
+            tree = ast.parse(request["source"], "<letify-exec>", "exec")
+            single = len(tree.body) == 1 and isinstance(tree.body[0], ast.Expr)
+            if single:
+                code = compile(request["source"].strip(), "<letify-exec>", "eval")
+                answer["value"] = repr(eval(code, namespace))
+                answer["has_value"] = True
+            else:
+                exec(compile(tree, "<letify-exec>", "exec"), namespace)
+        except BaseException as exc:
+            # Past this function's own frame, so the traceback starts at the user's source.
+            tb = None if isinstance(exc, SyntaxError) else exc.__traceback__.tb_next
+            answer["error"] = "".join(traceback.format_exception(type(exc), exc, tb))
+    finally:
+        _capture_end()
+    answer["stdout"] = sink["out"].getvalue()
+    answer["stderr"] = sink["err"].getvalue()
+    answer["assigned"] = list(mapping.assigned) if mapping is not None else []
+    # Before Python 3.13 f_locals is a snapshot, and writing to it never reaches the frame.
+    answer["applied"] = not answer["assigned"] or sys.version_info >= (3, 13)
+    namespace.clear()
+    return {"ok": True, "value": answer}
 
 
 _OPS = {
@@ -2668,6 +3038,8 @@ _OPS = {
     "device": _op_device,
     "stat": _op_stat,
     "lease": _op_lease,
+    "interrupt": _op_interrupt,
+    "inspect_exec": _op_inspect_exec,
     "reduce_peers": _op_reduce_peers,
     "drive_grant": _op_drive_grant,
 }
@@ -2677,7 +3049,7 @@ _OPS = {
 # is blocked on a blob the sender will never send, so a queued answer would deadlock.
 _LIGHT = (
     "stat", "lease", "reduce_peers", "drive_grant", "data_failed",
-    "pack_push_state", "pack_push_target",
+    "pack_push_state", "pack_push_target", "interrupt",
 )
 
 #: Answered by several replies, the last one marked. These send their own replies.
@@ -2911,6 +3283,12 @@ def _read():
         if op in _LIGHT:
             _run(stream, request, False)
             continue
+        if op == "inspect_exec":
+            # A thread of its own: the source may run for a while, and the reader must stay
+            # free to answer the lease and the stream requests of the body it is looking at.
+            threading.Thread(target=_run, args=(stream, request, False), daemon=True).start()
+            request = None
+            continue
         if op is not None and op.startswith("data_"):
             # Served beside the call, because the blobs a running call is waiting for
             # cannot queue behind it. Spec "Streaming the rest while the call runs".
@@ -2929,10 +3307,14 @@ def _read():
     inbox = _DEVICE.get("inbox")
     if inbox is not None:
         inbox.put(None)
+    # Spec "Exit hooks": a channel that closes while a body runs is a reason to end, and
+    # the hooks run before the main thread is told there is nothing more to serve.
+    _run_exit_hooks("the channel closed")
     _JOBS.put(None)
 
 
 def _serve():
+    _install_run_control()
     # The version travels in the hello frame, so the caller can refuse a worker whose
     # interpreter cannot run the bytecode it is about to send.
     _SENDER.frame(HELLO, 0, ("%d.%d" % sys.version_info[:2]).encode("ascii"))
