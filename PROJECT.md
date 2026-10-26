@@ -298,6 +298,10 @@ That is the only install. `letify` installs cloudpickle and blake3 and nothing e
 
 `host="local"` additionally needs PyTorch 2.1 or newer in the project, locally and in the runtime's environment, with the same major.minor version on both sides. letify never installs it: torch is the project's own dependency.
 
+## Rust crate
+
+The Rust crate `letify` is published on crates.io at the same version as the Python package. It will re-export the components meant for use outside letify, first the connection library `letify-link`.
+
 ## How this project is built
 
 Spec driven and test driven. [docs/SPEC.md](docs/SPEC.md) is the source of truth, a change edits it before the code, and every test traces to a section of it. The rules are in [CLAUDE.md](CLAUDE.md).
