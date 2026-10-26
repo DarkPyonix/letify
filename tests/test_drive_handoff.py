@@ -610,3 +610,40 @@ def test_a_drive_request_the_worker_cannot_send_is_named_on_its_stderr(capsys) -
     err = capsys.readouterr().err
     assert "letify: drive request unstash run-checkpoint was not sent: broken pipe" in err
 
+
+def test_a_grant_still_running_when_the_call_ends_is_named_with_its_age(monkeypatch, capsys) -> None:
+    import threading
+    import time
+
+    from letify.store import handoff
+
+    asked = [{"id": 1, "kind": "stash", "name": "run-checkpoint"}]
+    entered, release = threading.Event(), threading.Event()
+
+    class Connection:
+        def take_grants(self):
+            found, asked[:] = list(asked), []
+            return found
+
+    class Channel:
+        connection = Connection()
+
+        def request(self, message, timeout):
+            return None
+
+    def slow_grant(ask):
+        entered.set()
+        release.wait(10)
+        return {"done": True}
+
+    monkeypatch.setattr(handoff, "grant", slow_grant)
+    watcher = handoff.GrantWatcher(Channel(), poll_s=0.01, join_timeout_s=0.2)
+    watcher.start()
+    assert entered.wait(5)
+    time.sleep(0.05)
+    watcher.close()
+    err = capsys.readouterr().err
+    release.set()
+    assert "drive grant stash run-checkpoint: still running after " in err
+    assert "s when the call ended; its result will not be reported" in err
+    assert "answered in" not in err

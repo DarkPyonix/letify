@@ -439,9 +439,14 @@ class GrantWatcher:
     ``drive_grant`` request. It carries URLs and short-lived headers, never the bytes.
     """
 
-    def __init__(self, channel: Any, poll_s: float = 0.02) -> None:
+    def __init__(
+        self, channel: Any, poll_s: float = 0.02, join_timeout_s: float = 30.0
+    ) -> None:
         self._channel = channel
         self._poll_s = poll_s
+        self._join_timeout_s = join_timeout_s
+        #: The grant being made now, as (ask, monotonic start), or None between grants.
+        self._in_flight: tuple[dict[str, Any], float] | None = None
         self._stop = threading.Event()
         self._thread = threading.Thread(target=self._run, name="letify-drive", daemon=True)
 
@@ -450,7 +455,26 @@ class GrantWatcher:
 
     def close(self) -> None:
         self._stop.set()
-        self._thread.join(timeout=30)
+        self._thread.join(timeout=self._join_timeout_s)
+        busy = self._in_flight
+        if self._thread.is_alive() and busy is not None:
+            ask, started = busy
+            say(f"drive grant {ask.get('kind')} {ask.get('name')}: still running after "
+                f"{time.monotonic() - started:.1f} s when the call ended; "
+                f"its result will not be reported")
+
+    def _answer(self, ask: dict[str, Any], started: float) -> None:
+        reply = grant(ask)
+        label = f"drive grant {ask.get('kind')} {ask.get('name')}"
+        try:
+            self._channel.request({"op": "drive_grant", "id": ask.get("id"), **reply}, timeout=300)
+        except Exception as exc:
+            # Either nobody waits any more, or the worker waits out its grant timeout;
+            # the line tells the two apart from the worker's own error.
+            say(f"{label}: the answer was not delivered after "
+                f"{time.monotonic() - started:.1f} s: {type(exc).__name__}: {exc}")
+        else:
+            say(f"{label}: answered in {time.monotonic() - started:.1f} s")
 
     def _run(self) -> None:
         while not self._stop.is_set():
@@ -458,19 +482,11 @@ class GrantWatcher:
             asks = connection.take_grants() if connection is not None else []
             for ask in asks:
                 started = time.monotonic()
-                reply = grant(ask)
-                label = f"drive grant {ask.get('kind')} {ask.get('name')}"
+                self._in_flight = (ask, started)
                 try:
-                    self._channel.request(
-                        {"op": "drive_grant", "id": ask.get("id"), **reply}, timeout=300
-                    )
-                except Exception as exc:
-                    # Either nobody waits any more, or the worker waits out its grant timeout;
-                    # the line tells the two apart from the worker's own error.
-                    say(f"{label}: the answer was not delivered after "
-                        f"{time.monotonic() - started:.1f} s: {type(exc).__name__}: {exc}")
-                else:
-                    say(f"{label}: answered in {time.monotonic() - started:.1f} s")
+                    self._answer(ask, started)
+                finally:
+                    self._in_flight = None
             self._stop.wait(self._poll_s)
 
 
