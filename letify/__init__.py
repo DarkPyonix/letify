@@ -29,7 +29,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
-from typing import Final
+from typing import Final, overload
 
 from .declare.cache import session_cache
 from .declare.env import Env
@@ -93,13 +93,29 @@ def stash(name: str, path: str | os.PathLike[str]) -> str:
     return stash_handoff(name, path)
 
 
-def unstash(name: str, path: str | os.PathLike[str]) -> Path | None:
+@overload
+def unstash(name: str) -> dict[str, bytes] | None: ...
+@overload
+def unstash(name: str, path: str | os.PathLike[str]) -> Path | None: ...
+def unstash(
+    name: str, path: str | os.PathLike[str] | None = None
+) -> Path | dict[str, bytes] | None:
     """Put the handoff ``name`` at ``path``, replacing what was there.
 
     Returns ``path``, or None when no handoff has that name, in which case nothing changed.
+
+    With no ``path`` the handoff is returned in memory and nothing is written to disk: a
+    ``dict[str, bytes]`` from the path of each regular file in the handoff, as stored
+    (``ckpt/model.safetensors``, or ``checkpoint.safetensors`` for a one-file handoff), to
+    its bytes. Directories are not entries, and None means no handoff has that name. The
+    dict is returned only after the digest matches; a mismatch raises ``RuntimeFailure``.
+    Peak memory is about the handoff's size, because members are read straight from the
+    download.
     """
     from .store.handoff import unstash as unstash_handoff
 
+    if path is None:
+        return unstash_handoff(name)
     return unstash_handoff(name, path)
 
 

@@ -195,6 +195,7 @@ cache.resume(runtime, "run-1", path)   # put the newest one inside a session
 ```python
 letify.stash("ckpt", ckpt_dir)         # put a file or directory on the machine's Drive store
 letify.unstash("ckpt", ckpt_dir)       # put it back, or None when no handoff has that name
+letify.unstash("ckpt")                # no path: a dict of file path to bytes, nothing written to disk
 ```
 
 Both work in the local process and inside a shipped function, on any provider. They need `drive_login` and `drive_project` in the machine configuration and raise `ConfigError` without them. On a one-shot channel, which has no stream back to the local process, they raise `UnsupportedMode` naming the provider. `letify.fetch(tensor)` is a different call and still reads a tensor back.

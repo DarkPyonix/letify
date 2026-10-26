@@ -106,6 +106,24 @@ def download_to(url: str, headers: dict[str, str], destination: str | os.PathLik
     return os.path.getsize(destination)
 
 
+def open_stream(url: str, headers: dict[str, str]) -> Any:
+    """Open one Drive file for sequential reads and return the response.
+
+    The caller reads it and closes it. A failure to open raises ``RuntimeFailure`` as
+    ``download_to`` does.
+    """
+    request = urllib.request.Request(url, headers=headers)
+    try:
+        return urllib.request.urlopen(request, timeout=3600)
+    except urllib.error.HTTPError as exc:
+        detail = exc.read()[:300].decode(errors="replace")
+        raise RuntimeFailure(f"Drive download returned {exc.code}: {detail}") from exc
+    except (urllib.error.URLError, OSError) as exc:
+        raise RuntimeFailure(f"Drive download failed: {exc}") from exc
+    finally:
+        request = None  # type: ignore[assignment]
+
+
 class AccountTokenSource(TokenSource):
     """Access tokens minted from the refresh token in one account's ``token.json``."""
 

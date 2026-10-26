@@ -8,6 +8,8 @@ made inside a shipped function.
 
 from __future__ import annotations
 
+import io
+import tarfile
 from pathlib import Path
 from typing import Any
 
@@ -16,7 +18,9 @@ from test_drive_store import declare_drive
 
 import letify
 from letify.errors import ConfigError, RuntimeFailure
+from letify.protocol import codec
 from letify.store.backends import drive as drive_module
+from letify.store.handoff import read_archive
 
 LOCAL = '[a]\nkind = "local"\n'
 
@@ -444,6 +448,185 @@ def test_a_function_that_fetches_a_corrupt_blob_gets_a_runtime_failure_and_keeps
         answer = unstash_it(str(target))
     assert answer.startswith("RuntimeFailure")
     assert read_tree(target) == {"keep.txt": b"kept"}
+
+
+# -- unstash without a path: the handoff in memory -------------------------------------
+
+
+def corrupt_blob(server: Any, digest: str) -> None:
+    for entry in server.files.values():
+        if entry["name"] == digest:
+            entry["content"] = entry["content"][:-1] + b"X"
+
+
+def test_unstash_without_a_path_returns_a_directory_as_a_dict_of_its_files(
+    fake_drive, tmp_path
+) -> None:
+    """Spec: members are keyed by their path in the tar, directories are not entries."""
+    declare_drive(fake_drive)
+    source = make_tree(tmp_path / "ckpt")
+    letify.stash("run-1", source)
+    got = letify.unstash("run-1")
+    assert got == {
+        "ckpt/weights.bin": b"w" * 5000,
+        "ckpt/sub/step.txt": b"step 7",
+    }
+
+
+def test_unstash_without_a_path_returns_a_one_file_handoff_as_one_entry(
+    fake_drive, tmp_path
+) -> None:
+    declare_drive(fake_drive)
+    source = tmp_path / "checkpoint.safetensors"
+    source.write_bytes(bytes(range(256)) * 300)
+    letify.stash("one", source)
+    assert letify.unstash("one") == {"checkpoint.safetensors": bytes(range(256)) * 300}
+
+
+def test_unstash_without_a_path_round_trips_a_member_name_over_100_characters(
+    fake_drive, tmp_path
+) -> None:
+    declare_drive(fake_drive)
+    deep = tmp_path / "ckpt" / ("d" * 60) / ("f" * 90 + ".bin")
+    deep.parent.mkdir(parents=True)
+    deep.write_bytes(b"long")
+    (tmp_path / "ckpt" / "empty.bin").write_bytes(b"")
+    letify.stash("long", tmp_path / "ckpt")
+    key = "ckpt/" + "d" * 60 + "/" + "f" * 90 + ".bin"
+    assert len(key) > 100
+    assert letify.unstash("long") == {key: b"long", "ckpt/empty.bin": b""}
+
+
+def test_unstash_without_a_path_returns_none_for_an_unknown_name(fake_drive) -> None:
+    declare_drive(fake_drive)
+    assert letify.unstash("nobody") is None
+
+
+def test_unstash_without_a_path_refuses_a_corrupt_blob_and_returns_no_dict(
+    fake_drive, tmp_path
+) -> None:
+    declare_drive(fake_drive)
+    source = tmp_path / "f.txt"
+    source.write_text("good")
+    corrupt_blob(fake_drive, letify.stash("n", source))
+    with pytest.raises(RuntimeFailure, match="digest"):
+        letify.unstash("n")
+
+
+def test_unstash_without_a_path_writes_nothing_to_disk(
+    fake_drive, tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    declare_drive(fake_drive)
+    source = make_tree(tmp_path / "ckpt")
+    letify.stash("run-1", source)
+    work = tmp_path / "cwd"
+    work.mkdir()
+    monkeypatch.chdir(work)
+    scratch = tmp_path / "scratch"
+    scratch.mkdir()
+    monkeypatch.setenv("TMPDIR", str(scratch))
+    monkeypatch.setattr("tempfile.tempdir", None)
+    before = sorted(tmp_path.rglob("*"))
+    assert letify.unstash("run-1") is not None
+    assert sorted(tmp_path.rglob("*")) == before
+
+
+def test_unstash_without_a_path_reads_each_member_with_one_read_call(
+    fake_drive, tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Spec: a member's bytes come from one read(size), so peak memory is the handoff once."""
+    declare_drive(fake_drive)
+    big = tmp_path / "big.bin"
+    payload = bytes(range(251)) * 20000
+    big.write_bytes(payload)
+    letify.stash("big", big)
+    sizes: list[int] = []
+    real = drive_module.open_stream
+
+    class Counting:
+        def __init__(self, inner: Any) -> None:
+            self.inner = inner
+
+        def read(self, size: int = -1) -> bytes:
+            sizes.append(size)
+            return self.inner.read(size)
+
+        def close(self) -> None:
+            self.inner.close()
+
+    monkeypatch.setattr(drive_module, "open_stream", lambda *a, **k: Counting(real(*a, **k)))
+    assert letify.unstash("big") == {"big.bin": payload}
+    assert sizes.count(len(payload)) == 1
+    assert max(sizes) == len(payload)
+
+
+@pytest.mark.parametrize("fmt", [tarfile.GNU_FORMAT, tarfile.PAX_FORMAT, tarfile.USTAR_FORMAT])
+def test_the_archive_reader_handles_the_header_kinds_tarfile_writes(fmt) -> None:
+    long_name = "top/" + "n" * 120 + "/" + "m" * 80 + ".bin"
+    members = {"top/a.txt": b"a" * 700, long_name: b"b" * 512, "top/empty": b""}
+    if fmt == tarfile.USTAR_FORMAT:
+        del members[long_name]
+    raw = io.BytesIO()
+    with tarfile.open(fileobj=raw, mode="w", format=fmt) as tar:
+        info = tarfile.TarInfo("top")
+        info.type = tarfile.DIRTYPE
+        tar.addfile(info)
+        for name, data in members.items():
+            info = tarfile.TarInfo(name)
+            info.size = len(data)
+            tar.addfile(info, io.BytesIO(data))
+    blob = raw.getvalue()
+    hasher = codec.new_hasher()
+    assert read_archive(io.BytesIO(blob), hasher) == members
+    assert codec.finish_digest(hasher) == codec.finish_digest(_hashed(blob))
+
+
+def _hashed(blob: bytes) -> Any:
+    hasher = codec.new_hasher()
+    hasher.update(blob)
+    return hasher
+
+
+def test_a_function_unstashes_into_memory_with_the_same_result(
+    fake_drive, launcher_from, tmp_path, worker_sees_this_checkout
+) -> None:
+    declare_drive(fake_drive)
+    source = make_tree(tmp_path / "ckpt")
+    letify.stash("run-1", source)
+    let = launcher_from(LOCAL)
+
+    @let.function(device=let.providers.a.CPU, host=letify.remote)
+    def load(name: str) -> dict | None:
+        import letify as inner
+
+        return inner.unstash(name)
+
+    with let.keep_alive():
+        assert load("run-1") == letify.unstash("run-1")
+        assert load("nobody") is None
+
+
+def test_a_function_that_unstashes_a_corrupt_blob_into_memory_gets_a_runtime_failure(
+    fake_drive, launcher_from, tmp_path, worker_sees_this_checkout
+) -> None:
+    declare_drive(fake_drive)
+    source = tmp_path / "f.txt"
+    source.write_text("good")
+    corrupt_blob(fake_drive, letify.stash("n", source))
+    let = launcher_from(LOCAL)
+
+    @let.function(device=let.providers.a.CPU, host=letify.remote)
+    def load(name: str) -> str:
+        import letify as inner
+
+        try:
+            inner.unstash(name)
+        except inner.RuntimeFailure as exc:
+            return "RuntimeFailure: " + str(exc)
+        return "loaded"
+
+    with let.keep_alive():
+        assert load("n").startswith("RuntimeFailure")
 
 
 # -- a one-shot channel ---------------------------------------------------------------
