@@ -1063,6 +1063,21 @@ Every command takes `--json`, which prints one JSON object instead of text. The 
 
 A command against a run on a provider whose worker has no persistent channel, the one-shot channels, fails with `UnsupportedMode` naming the provider.
 
+### Taking over a running call <!-- id: run-takeover -->
+
+> `letify takeover <run>` makes the process that runs it the owner of a running call and its session, so a training run outlives a stuck or dying owner without anything outliving its owner.
+
+A call has exactly one owner at a time, and the session still ends with the call that needed it. Taking over moves that ownership to another process; it does not let a call run with no owner. The new owner renews the lease, receives the body's output and the call's result, writes the call's outputs back, and ends the session when the call ends, as the first owner would have.
+
+1. **The registry keeps an orphan.** The record also holds `project`, the project root the call was sent from, and `lease_deadline`, the Unix time at which the runtime's lease ends unless renewed, rewritten at each renewal. A record whose owner pid is gone is no longer removed when read while its `lease_deadline` is in the future: `letify runs` lists it with `owner` `gone` and the seconds left, and it can be taken over. After the deadline it is removed as stale.
+2. **The worker keeps a second door.** While a call runs, the worker listens on a Unix socket on the runtime, `<workspace root>/.letify/run-<run id>.sock`, mode 0600. A channel closing while a call runs does not end the worker: the body keeps running, as it does today, until the lease deadline passes.
+3. **The new owner connects.** `letify takeover <run>` reads the record, opens a channel to the same runtime through the record's provider and runtime name, and starts a relay to that socket instead of a new worker. It then sends `adopt` with the run id. The worker answers once with the call's state and from then on sends the call's output and its reply on the new channel. The old channel, if still open, is told `moved` and gets nothing more.
+4. **The old owner lets go.** When the old owner is alive, takeover first asks it through its control socket to release the run. Its waiting call raises `OwnershipMoved` naming the run and the new owner's pid, it stops renewing that runtime's lease, and it drops the runtime from its pool without stopping it. A `keep_alive` block in the old owner no longer holds that session. An old owner that does not answer within 5 s is treated as gone.
+5. **The call ends at the new owner.** `letify takeover` prints the body's output as it arrives. When the call returns it prints the `repr` of the value, or with `--result PATH` writes the value with pickle to `PATH`, and exits 0. When the body raises it prints the traceback and exits 1. With `--json` the last line is one object with `run`, `ok`, `value_repr` or `error`, and `result_path`. The call's outputs are written back under the record's `project`, not the current directory. The session is then ended.
+6. **The same from Python.** `letify.takeover(run)` does the same in the calling process and returns the value or raises the body's exception, as a call does. It holds no handle: it returns once the call has ended and the session is gone. A darkpyonix kernel uses this to adopt a run started elsewhere.
+
+A provider whose runtime cannot be reached by a second process refuses with `UnsupportedMode` naming it. The `Local` provider is one: its worker is a child of the owning process and dies with it.
+
 ### Ctrl-C in the owning process
 
 The first `KeyboardInterrupt` that reaches a thread waiting for a call's reply sends the same interrupt as `letify interrupt` and keeps waiting, so the body's handlers run and the outputs come back before the call raises. The waiting thread prints `letify: interrupting <run>; press Ctrl-C again to stop waiting`. A second `KeyboardInterrupt` during that wait stops waiting at once and propagates, as before this section existed. No signal handler is installed for this, so a notebook kernel's interrupt behaves the same way.
