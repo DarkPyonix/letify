@@ -38,6 +38,7 @@ def test_declared_paths_list_cannot_drift() -> None:
         "tmp",
         "ssh",
         "runtime",
+        "runs",
     }
     assert expected_local == DECLARED_LOCAL_PATHS
 
