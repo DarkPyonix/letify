@@ -2,10 +2,9 @@
 
 Only one subcommand has a spec entry: "Efficiency model" says ``letify efficiency``
 exposes the formula on the command line. The others (``providers``, ``devices``,
-``status``, ``check``, ``probe``) are pinned here only where they surface something a
-spec section does settle, which is the provider table under "Provider model" and the
-capability probe under "letify-core". ``status`` and ``check`` have no spec entry at all
-and are left for the report rather than frozen into this suite.
+``status``, ``check``) are pinned here only where they surface something a spec section
+does settle, which is the provider table under "Provider model". ``status`` and ``check``
+have no spec entry at all and are left for the report rather than frozen into this suite.
 
 Every test runs through ``main(argv)`` with an empty home directory and an empty project
 directory, because the entry point reads ``~/.letify`` and ``./.letify``.
@@ -126,18 +125,6 @@ def test_a_configuration_file_can_be_named_explicitly(isolated_home, tmp_path, c
     assert json.loads(capsys.readouterr().out)["lab"] == ["H100"]
 
 
-# -- Spec: letify-core ---------------------------------------------------------
-
-
-def test_the_capability_probe_is_on_the_command_line(isolated_home, capsys) -> None:
-    # Whether forwarding can run here, and what it would cost.
-    assert main(["probe", "--json"]) == 0
-    report = json.loads(capsys.readouterr().out)
-    assert report["platform"]
-    assert report["reason"]
-    assert "usable" in report
-
-
 # -- the parser ----------------------------------------------------------------
 
 
@@ -166,7 +153,6 @@ def test_every_subcommand_is_reachable_from_the_parser() -> None:
         "efficiency",
         "login",
         "logout",
-        "probe",
         "providers",
         "sessions",
         "setup",
