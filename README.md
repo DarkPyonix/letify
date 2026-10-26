@@ -146,7 +146,7 @@ uv add letify
 
 That is the whole install, for every provider. letify installs only cloudpickle and blake3. It needs [uv](https://docs.astral.sh/uv/) on the machine, because provider tools such as the Colab CLI and the Modal client run through uv in their own environments, not in your `.venv`.
 
-The wheel carries [letify-core](letify-core/), the Rust component behind `host=letify.local` that stands in for the CUDA driver. Wheels are built for Linux x86_64 and aarch64, Windows x86_64 and arm64, and macOS arm64 and x86_64. On another platform, pip falls back to the source distribution, which has no letify-core, and `host=letify.local` is refused.
+The wheel carries the `letify-quic` binary built from [letify-core](letify-core/), the Rust workspace. Wheels are built for Linux x86_64 and aarch64, Windows x86_64 and arm64, and macOS arm64 and x86_64. On another platform, pip falls back to the source distribution, which has no `letify-quic`, so the QUIC connection strategy is skipped.
 
 ---
 
@@ -234,9 +234,9 @@ Two words, and neither of them is a mechanism.
 
 **`device`** carries the provider, the account and the accelerator in one value, because those are one decision. Core count and memory come with the shape the provider registered, so there is nothing to ask for.
 
-**`host`** is the CUDA word for the CPU side. `letify.local` keeps Python and the libraries in this process and forwards only CUDA calls. `letify.remote` ships the function to the machine that holds the device. The strings `"local"` and `"remote"` are the same values.
+**`host`** is the CUDA word for the CPU side. `letify.local` keeps Python and the libraries in this process and forwards only PyTorch operators. `letify.remote` ships the function to the machine that holds the device. The strings `"local"` and `"remote"` are the same values.
 
-Leave `host` out and you get `letify.local`. When the device is far away, forwarding every CUDA call is slow, so the call warns with the expected efficiency and then runs. For a remote GPU, `host=letify.remote` is usually what you want.
+Leave `host` out and you get `letify.local`. When the device is far away, forwarding operators is slow, so the call warns with the expected efficiency and then runs. For a remote GPU, `host=letify.remote` is usually what you want.
 
 How long a session lives is not a declaration argument. A call ends its session. `with let.keep_alive():` keeps sessions for the length of a block, so a run of separate calls does not pay session start each time.
 
@@ -258,7 +258,7 @@ Counter-intuitive consequence: **a faster GPU makes forwarding worse**, because 
 
 Decoding is the case that stays bad. Throughput is bounded near `1000 / (k × RTT)` tokens per second, so the card stops mattering. Ship the whole `generate` call instead.
 
-Measure your own `k` with `torch.cuda.set_sync_debug_mode("warn")` and your round trip with `letify probe`. See [docs/NETWORK.md](docs/NETWORK.md).
+Measure your own `k` with `torch.cuda.set_sync_debug_mode("warn")` and your round trip with `ping`. See [docs/NETWORK.md](docs/NETWORK.md).
 
 </details>
 
@@ -470,7 +470,6 @@ letify status                 # what is running right now
 letify usage                  # what is left on each account
 letify utilization            # how busy each instance's GPU is
 letify check lab              # does this machine answer?
-letify probe lab              # is host=letify.local worth using here?
 letify efficiency 0.5 3 150   # the formula, from measured terms
 ```
 
@@ -488,7 +487,7 @@ Add `--json` to `usage`, `utilization` or `status` for output a program can read
 | 📐 [docs/SPEC.md](docs/SPEC.md) | The design as it stands, decision by decision |
 | 🧩 [docs/COMPONENT.md](docs/COMPONENT.md) | Every class, and the vocabulary |
 | 🌐 [docs/NETWORK.md](docs/NETWORK.md) | Transports, latency measurements, tunnel choices |
-| 🦀 [letify-core/](letify-core/) | The Rust workspace behind `host=letify.local` |
+| 🦀 [letify-core/](letify-core/) | The Rust workspace: the `letify` crate and the `letify-quic` binary |
 | 🧭 [docs/guide/](docs/guide/) | Task-oriented guides |
 | 🇰🇷 [docs/locales/README_ko.md](docs/locales/README_ko.md) | 한국어 |
 
@@ -502,11 +501,9 @@ Alpha, and honest about it. What works today:
 ✅ Persistent sessions: a session cache keeps values between calls, large arguments travel once
 ✅ Content addressed storage, configuration and secrets
 ✅ The `Local` and `Colab` providers
-✅ `letify-core`, verified on a real GPU: the agent opens the driver, the local driver forwards an allocation and a copy in both directions, and the bytes match
 
 Not finished yet:
 
-🚧 `letify-driver` covers the entry points a PyTorch process needs to start up and run one kernel. Anything else names itself and returns `CUDA_ERROR_NOT_SUPPORTED`, so a real run prints the list of what to build next
 🚧 `Modal` and `Elice` follow each published interface but have not been run against the live services
 🚧 Unified memory cannot be forwarded at all, so a paged optimizer needs `host=letify.remote`
 

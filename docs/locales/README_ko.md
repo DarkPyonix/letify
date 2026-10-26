@@ -140,7 +140,7 @@ uv add letify
 
 모든 프로바이더에 이것 하나면 됩니다. letify는 cloudpickle과 blake3만 설치합니다. 머신에 [uv](https://docs.astral.sh/uv/)가 있어야 합니다. Colab CLI와 Modal 클라이언트 같은 프로바이더 도구는 여러분의 `.venv`가 아니라 uv로 별도 환경에서 실행되기 때문입니다.
 
-휠에는 [letify-core](../../letify-core/)가 들어 있습니다. `host=letify.local`에서 CUDA 드라이버를 대신하는 Rust 구성 요소입니다. 휠은 Linux x86_64와 aarch64, Windows x86_64와 arm64, macOS arm64와 x86_64용으로 빌드됩니다. 다른 플랫폼에서는 letify-core가 없는 소스 배포판이 설치되고 `host=letify.local`은 거부됩니다.
+휠에는 Rust 워크스페이스 [letify-core](../../letify-core/)에서 빌드한 `letify-quic` 바이너리가 들어 있습니다. 휠은 Linux x86_64와 aarch64, Windows x86_64와 arm64, macOS arm64와 x86_64용으로 빌드됩니다. 다른 플랫폼에서는 `letify-quic`이 없는 소스 배포판이 설치되고 QUIC 연결 전략은 건너뜁니다.
 
 ---
 
@@ -228,9 +228,9 @@ print(train(lr=1e-4, bs=32))
 
 **`device`** 는 프로바이더, 계정, 가속기를 한 값에 담습니다. 셋은 하나의 결정이기 때문입니다. 코어 수와 메모리는 프로바이더가 등록한 사양에 딸려 오므로 따로 요청할 것이 없습니다.
 
-**`host`** 는 CUDA에서 CPU 쪽을 가리키는 말입니다. `letify.local`은 Python과 라이브러리를 이 프로세스에 두고 CUDA 호출만 중계합니다. `letify.remote`는 함수를 장치가 있는 머신으로 보냅니다. 문자열 `"local"`, `"remote"`도 같은 값입니다.
+**`host`** 는 CUDA에서 CPU 쪽을 가리키는 말입니다. `letify.local`은 Python과 라이브러리를 이 프로세스에 두고 PyTorch 연산만 중계합니다. `letify.remote`는 함수를 장치가 있는 머신으로 보냅니다. 문자열 `"local"`, `"remote"`도 같은 값입니다.
 
-`host`를 생략하면 `letify.local`이 됩니다. 장치가 멀면 CUDA 호출을 매번 중계하는 것이 느리므로, 호출할 때 예상 효율이 담긴 경고를 띄운 뒤 실행합니다. 원격 GPU라면 보통 `host=letify.remote`가 맞습니다.
+`host`를 생략하면 `letify.local`이 됩니다. 장치가 멀면 연산을 중계하는 것이 느리므로, 호출할 때 예상 효율이 담긴 경고를 띄운 뒤 실행합니다. 원격 GPU라면 보통 `host=letify.remote`가 맞습니다.
 
 세션이 얼마나 오래 사는지는 선언 인자가 아닙니다. 호출 하나가 끝나면 세션도 끝납니다. `with let.keep_alive():` 블록 안에서는 세션이 유지되므로, 따로따로 부르는 호출들이 매번 세션 시작 비용을 내지 않습니다.
 
@@ -252,7 +252,7 @@ Hugging Face 학습 스텝은 기본 설정에서 `k ≈ 3`입니다. Trainer의
 
 디코딩은 계속 나쁜 경우입니다. 처리량이 초당 `1000 / (k × RTT)` 토큰 근처에 묶여서 카드 성능이 의미가 없어집니다. 이때는 `generate` 호출 전체를 보내세요.
 
-`k`는 `torch.cuda.set_sync_debug_mode("warn")`으로, 왕복 시간은 `letify probe`로 직접 재보면 됩니다. [docs/NETWORK.md](../NETWORK.md)를 보세요.
+`k`는 `torch.cuda.set_sync_debug_mode("warn")`으로, 왕복 시간은 `ping`으로 직접 재보면 됩니다. [docs/NETWORK.md](../NETWORK.md)를 보세요.
 
 </details>
 
@@ -470,7 +470,6 @@ letify status         # 지금 돌고 있는 것
 letify usage          # 계정마다 남은 사용량
 letify utilization    # 인스턴스별 GPU가 얼마나 바쁜가
 letify check lab      # 이 머신이 응답하나?
-letify probe lab      # 호출 중계를 쓸 만큼 가까운가?
 ```
 
 `usage`, `utilization`, `status`에 `--json`을 붙이면 프로그램이 읽을 수 있는 출력이 나옵니다. [letify-ext/](../../letify-ext/)의 VS Code 확장이 이 출력으로 상태 표시줄에 사용량과 GPU 활동을 보여 줍니다.
@@ -500,11 +499,9 @@ letify probe lab      # 호출 중계를 쓸 만큼 가까운가?
 ✅ 상주 세션: 세션 캐시가 호출 사이에 값을 유지하고, 큰 인자는 한 번만 전송됩니다
 ✅ 내용 주소 저장소, 설정과 비밀 관리
 ✅ `Local`과 `Colab` 프로바이더
-✅ `letify-core`를 실제 GPU에서 확인: 에이전트가 드라이버를 열고, 로컬 드라이버가 할당과 양방향 복사를 중계하며 바이트가 일치합니다
 
 아직 안 된 것입니다.
 
-🚧 `letify-driver`는 PyTorch 프로세스가 시작해서 커널 하나를 돌리는 데 필요한 진입점까지만 덮습니다. 그 밖의 것은 자기 이름을 출력하고 `CUDA_ERROR_NOT_SUPPORTED`를 반환하므로, 실제 실행이 다음에 만들어야 할 목록을 알려줍니다
 🚧 `Modal`과 `Elice`는 공개된 인터페이스대로 작성했지만 실제 서비스에서 돌려보지 않았습니다
 🚧 통합 메모리는 중계가 불가능하므로, 페이지드 옵티마이저는 `host=letify.remote`가 필요합니다
 

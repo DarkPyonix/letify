@@ -238,7 +238,6 @@ letify status                 # live sessions and what they are costing
 letify usage [alias]          # what is left on each account
 letify utilization [alias]    # how busy each instance's accelerator is
 letify check <alias>          # confirm a machine answers
-letify probe <host>           # whether host="local" is worth using
 letify efficiency 0.5 3 150   # expected share of a direct run
 letify stubs                  # write typings/letify_providers.pyi for editor completion
 ```
