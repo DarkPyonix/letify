@@ -142,6 +142,24 @@ def test_a_replaced_blob_stays_when_another_stash_ref_names_it(fake_drive, tmp_p
     assert blob_names(fake_drive) == sorted([first, second])
 
 
+def test_restashing_a_name_downloads_no_other_ref(fake_drive, tmp_path) -> None:
+    """Spec: whether another ref names the replaced blob comes from one listing."""
+    declare_drive(fake_drive)
+    source = tmp_path / "state.txt"
+    for index in range(5):
+        source.write_text(f"other {index}")
+        letify.stash(f"other-{index}", source)
+    source.write_text("one")
+    first = letify.stash("state", source)
+    fake_drive.requests.clear()
+    source.write_text("two")
+    second = letify.stash("state", source)
+    # Only the ref being moved is read; the five others are judged from the listing.
+    assert len(fake_drive.downloads()) == 1
+    assert first not in fake_drive.blobs()
+    assert fake_drive.refs()["stash/state"] == second
+
+
 def test_stashing_the_same_digest_sends_nothing(fake_drive, tmp_path) -> None:
     declare_drive(fake_drive)
     source = make_tree(tmp_path / "ckpt")
@@ -337,6 +355,41 @@ def test_a_function_restashing_a_name_replaces_the_blob_through_the_client(
         assert len(fake_drive.uploads()) == sent
         second = stash_text(str(source), "two")
     assert fake_drive.refs() == {"stash/state": second}
+    assert blob_names(fake_drive) == [second]
+
+
+def test_a_function_restashing_a_name_returns_before_the_replaced_blob_is_deleted(
+    fake_drive, launcher_from, tmp_path, worker_sees_this_checkout
+) -> None:
+    """Spec: the grant answers once the ref is written, and the deletion follows."""
+    import threading
+    import time
+
+    declare_drive(fake_drive)
+    let = launcher_from(LOCAL)
+    source = tmp_path / "state.txt"
+
+    @let.function(device=let.providers.a.CPU, host=letify.remote)
+    def stash_text(path: str, text: str) -> str:
+        from pathlib import Path
+
+        import letify as inner
+
+        Path(path).write_text(text)
+        return inner.stash("state", path)
+
+    with let.keep_alive():
+        first = stash_text(str(source), "one")
+        fake_drive.hold_deletes = threading.Event()
+        try:
+            second = stash_text(str(source), "two")
+            assert fake_drive.refs() == {"stash/state": second}
+            assert first in fake_drive.blobs()
+        finally:
+            fake_drive.hold_deletes.set()
+        deadline = time.monotonic() + 10
+        while first in fake_drive.blobs() and time.monotonic() < deadline:
+            time.sleep(0.05)
     assert blob_names(fake_drive) == [second]
 
 
