@@ -27,7 +27,7 @@ from . import nat, portmap, quic, sshopts
 from .link import Link, PunchedLink, SSHLink
 
 #: Seconds a single attempt may take before the strategy counts as failed.
-CONNECT_TIMEOUT = 30.0
+CONNECT_TIMEOUT = 120.0
 #: The comment every reverse SSH session key carries in authorized_keys.
 SESSION_MARKER = "letify-session"
 RESTRICTION = 'restrict,port-forwarding,command="/bin/false"'

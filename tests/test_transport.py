@@ -982,3 +982,14 @@ def test_a_connected_strategy_is_considered_even_when_a_slow_probe_used_up_the_t
         floor=LinkFloor.default(),
     )
     assert race.connect().strategy == "tcp_punch"
+
+
+def test_connection_waits_cover_a_slow_rendezvous():
+    import inspect
+
+    from letify.transport import nat, strategies
+    from letify.transport.pipeline import Pipeline
+
+    assert strategies.CONNECT_TIMEOUT == 120.0
+    assert nat.DEFAULT_WINDOW == 150.0 > strategies.CONNECT_TIMEOUT
+    assert inspect.signature(Pipeline).parameters["timeout"].default == 180.0

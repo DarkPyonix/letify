@@ -270,7 +270,7 @@ class Pipeline:
         cache: LinkCache | None = None,
         fingerprint: Callable[[], Fingerprint] = network_fingerprint,
         grace: float = GRACE_SECONDS,
-        timeout: float = 60.0,
+        timeout: float = 180.0,
         say: Say = say,
         previous: str | None = None,
         floor: LinkFloor | None = None,

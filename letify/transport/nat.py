@@ -36,7 +36,7 @@ CONNECT_BACK_TIMEOUT = 20.0
 #: Seconds a punch keeps dialing. Longer than the rendezvous can take, because the agreed
 #: start is fixed before the rendezvous is sent and the remote reaches it while the answer
 #: is still travelling back. Spec "the simultaneous open".
-DEFAULT_WINDOW = 45.0
+DEFAULT_WINDOW = 150.0
 ANSWER_MARKER = "LETIFY-ANSWER "
 #: What a non-blocking ``connect_ex`` returns when the dial is under way. Windows answers
 #: with its own would-block code instead of EINPROGRESS.
