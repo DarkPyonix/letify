@@ -585,6 +585,19 @@ def serve_link(sock: socket.socket, target: tuple[str, int] = ("127.0.0.1", 22))
         sock.close()
 
 
+def serve_links(socks: list[socket.socket], target: tuple[str, int] = ("127.0.0.1", 22)) -> None:
+    """Serve every punched connection at once and return when the last one has ended.
+
+    Spec "Rendezvous": the detached process exits when this returns, so returning when only
+    the first connection ends would cut the session on every spare still in use.
+    """
+    threads = [threading.Thread(target=serve_link, args=(sock, target)) for sock in socks]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+
 # -- one rendezvous request ------------------------------------------------------------
 
 
@@ -647,9 +660,7 @@ def begin(request: dict):
                     print(f"letify agent: {message}; {fallback}", file=sys.stderr, flush=True)
                     return
                 raise
-            for extra in socks[1:]:
-                threading.Thread(target=serve_link, args=(extra, ssh), daemon=True).start()
-            serve_link(socks[0], ssh)
+            serve_links(socks, ssh)
 
         answer = {"mapping": list(mappings[0]), "mappings": [list(m) for m in mappings]}
         return {**answer, "punch_until": until}, punch_and_serve

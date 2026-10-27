@@ -154,3 +154,21 @@ def test_closing_a_punched_link_closes_its_spares() -> None:
     link = PunchedLink("tcp_punch", 2, first, lambda p, c: [], lambda: first, spares=[spare])
     link.close()
     assert spare_far.recv(1) == b""
+
+
+def test_serving_several_links_returns_only_when_every_link_has_ended():
+    # Spec "Rendezvous": the detached remote process exits when its continuation returns,
+    # so the continuation must outlive the splice on every spare, not just the first one.
+    first_near, first_far = socket.socketpair()
+    spare_near, spare_far = socket.socketpair()
+    finished = threading.Event()
+
+    def serve() -> None:
+        nat.serve_links([first_far, spare_far])
+        finished.set()
+
+    threading.Thread(target=serve, daemon=True).start()
+    first_near.close()
+    assert not finished.wait(0.5)
+    spare_near.close()
+    assert finished.wait(5)
