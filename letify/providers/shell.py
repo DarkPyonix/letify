@@ -485,9 +485,12 @@ class Shell(Provider):
                 files=getattr(link, "files", None),
                 provider=self.alias,
             )
+        # Spec "SSH authentication": a worker's ssh is its own connection, so its errors reach it.
         return PersistentChannel(
-            link.ssh_command(
-                self.remote_command(f"{self.remote_python} -u -c {shlex.quote(BOOTSTRAP)}")
+            sshopts.unshared(
+                link.ssh_command(
+                    self.remote_command(f"{self.remote_python} -u -c {shlex.quote(BOOTSTRAP)}")
+                )
             ),
             name=runtime.name,
         )
@@ -521,7 +524,9 @@ class Shell(Provider):
         program = shlex.quote(relay_program())
         door = shlex.quote(str(record["door"]))
         command = f"{self.remote_python} -c {program} {door}"
-        return AttachedChannel(link.ssh_command(self.remote_command(command)), name=name)
+        return AttachedChannel(
+            sshopts.unshared(link.ssh_command(self.remote_command(command))), name=name
+        )
 
     def transfer_command(self, runtime: Runtime | None) -> list[str]:
         """An SSH command for one transfer connection, outside the multiplexed one.
@@ -539,19 +544,7 @@ class Shell(Provider):
         command = link.ssh_command(
             self.remote_command(f"{self.remote_python} -u -c {_shlex.quote(BOOTSTRAP)}")
         )
-        kept: list[str] = []
-        index = 0
-        while index < len(command):
-            part = command[index]
-            if part == "-o" and index + 1 < len(command):
-                option = command[index + 1]
-                if option.startswith(("ControlMaster=", "ControlPath=", "ControlPersist=")):
-                    index += 2
-                    continue
-            kept.append(part)
-            index += 1
-        # After the program name, so they are options rather than the remote command.
-        return [kept[0], "-o", "ControlMaster=no", "-o", "ControlPath=none", *kept[1:]]
+        return sshopts.unshared(command)
 
     def transfer_channel(self, runtime: Runtime | None) -> Channel:
         """One channel for one transfer stream, on a connection of its own."""

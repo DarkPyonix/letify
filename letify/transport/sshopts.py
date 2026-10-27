@@ -87,6 +87,34 @@ def options(alias: str) -> list[str]:
     ]
 
 
+_SHARING = ("ControlMaster=", "ControlPath=", "ControlPersist=")
+
+
+def without_sharing(command: list[str]) -> list[str]:
+    """The command with the ControlMaster, ControlPath and ControlPersist options removed."""
+    kept: list[str] = []
+    index = 0
+    while index < len(command):
+        part = command[index]
+        if part == "-o" and index + 1 < len(command) and command[index + 1].startswith(_SHARING):
+            index += 2
+            continue
+        kept.append(part)
+        index += 1
+    return kept
+
+
+def unshared(command: list[str]) -> list[str]:
+    """The command as its own connection: no shared one is joined and none is left behind.
+
+    The options go right after the program, so they are never taken for the remote command.
+    """
+    kept = without_sharing(command)
+    if os.path.basename(kept[0]) not in ("ssh", "ssh.exe"):
+        return kept
+    return [kept[0], "-o", "ControlMaster=no", "-o", "ControlPath=none", *kept[1:]]
+
+
 __all__ = [
     "CIPHERS",
     "CONTROL_PERSIST",
@@ -95,4 +123,6 @@ __all__ = [
     "control_directory",
     "control_path",
     "options",
+    "unshared",
+    "without_sharing",
 ]

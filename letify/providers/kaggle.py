@@ -50,6 +50,7 @@ from ..errors import (
 )
 from ..protocol import wire
 from ..runtime.channel import Connection, FramedChannel, _drain, _Tail
+from ..transport import sshopts
 from .base import Provider
 from .usage import Usage
 
@@ -1541,7 +1542,7 @@ class Kaggle(Provider):
         libraries = self.kernel_library_path(bridge)
         if libraries:
             remote = f"env LD_LIBRARY_PATH={_shlex.quote(libraries)} {remote}"
-        return PersistentChannel(link.ssh_command(remote), name=name)
+        return PersistentChannel(sshopts.unshared(link.ssh_command(remote)), name=name)
 
     @property
     def min_session_interval_s(self) -> float:
@@ -1610,7 +1611,9 @@ class Kaggle(Provider):
                 f"connection and offers no second stream. A punched session does."
             )
         return PersistentChannel(
-            link.ssh_command(f"{self.remote_python} -u -c {_shlex.quote(BOOTSTRAP)}"),
+            sshopts.unshared(
+                link.ssh_command(f"{self.remote_python} -u -c {_shlex.quote(BOOTSTRAP)}")
+            ),
             name=f"{self.alias}-transfer",
         )
 
