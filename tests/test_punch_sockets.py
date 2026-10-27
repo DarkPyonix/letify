@@ -7,12 +7,11 @@ import threading
 import time
 
 import pytest
+from conftest import LoopbackRendezvous
 
 from letify.transport import nat
 from letify.transport.link import PunchedLink
 from letify.transport.strategies import PUNCH_SOCKETS, Target, TCPPunch
-
-from .conftest import LoopbackRendezvous
 
 
 def free_ports(count: int) -> list[int]:
@@ -38,7 +37,7 @@ def punch_both(mine, theirs, token, *, window=5.0, dead=()):
                 start_at=start_at,
                 window=window,
             )
-        except Exception as error:  # noqa: BLE001 - the test inspects it
+        except Exception as error:
             results[name] = error
 
     threads = [
@@ -121,6 +120,9 @@ def test_a_tcp_punch_over_loopback_returns_every_socket_it_asked_for(stun_server
     assert request["count"] == PUNCH_SOCKETS
     assert len(request["mappings"]) == PUNCH_SOCKETS
     assert len(link._spares) == PUNCH_SOCKETS - 1
+    assert link.note.startswith(
+        f"tcp_punch connected {PUNCH_SOCKETS} of {PUNCH_SOCKETS} sockets in "
+    )
     link.close()
 
 

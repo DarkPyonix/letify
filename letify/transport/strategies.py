@@ -28,6 +28,9 @@ from .link import Link, PunchedLink, SSHLink
 
 #: Seconds a single attempt may take before the strategy counts as failed.
 CONNECT_TIMEOUT = 120.0
+#: Sockets one TCP punch opens, the worker channel and the transfer channels a call uses.
+#: Spec "Rendezvous".
+PUNCH_SOCKETS = 4
 #: The comment every reverse SSH session key carries in authorized_keys.
 SESSION_MARKER = "letify-session"
 RESTRICTION = 'restrict,port-forwarding,command="/bin/false"'
@@ -270,47 +273,54 @@ class TCPPunch(Strategy):
         return _rendezvous_unmet(target)
 
     def attempt(self, target: Target, cancel: threading.Event | None = None) -> Link:
-        return PunchedLink(
+        began = time.monotonic()
+        socks = self._punch(target, cancel, PUNCH_SOCKETS)
+        link = PunchedLink(
             self.name,
             self.rank,
-            self._punch(target, cancel),
+            socks[0],
             target.forwarded_ssh,
-            lambda: self._punch(target),
+            lambda: self._punch(target)[0],
+            spares=socks[1:],
         )
+        link.note = (
+            f"{self.name} connected {len(socks)} of {PUNCH_SOCKETS} sockets "
+            f"in {time.monotonic() - began:.1f} s"
+        )
+        return link
 
-    def _punch(self, target: Target, cancel: threading.Event | None = None):
-        holder = nat.reusable_socket(0)
-        port = holder.getsockname()[1]
-        try:
-            mapping = nat.stun_mapping(port, tuple(target.stun))
-            token = secrets.token_bytes(nat.TOKEN_BYTES)
-            start_at = time.time() + float(getattr(target.rendezvous, "lead_seconds", 10.0))
-            answer = target.rendezvous.exchange(
-                {
-                    "kind": "tcp_punch",
-                    "mapping": list(mapping),
-                    "token": token.hex(),
-                    "start_at": start_at,
-                    "window": nat.DEFAULT_WINDOW,
-                    "ssh_port": target.ssh_port,
-                    "stun": list(target.stun),
-                },
-                CONNECT_TIMEOUT,
-            )
-            # The remote reports when it stops dialing, so both sides stop together even
-            # when the rendezvous took most of the window. Spec "the simultaneous open".
-            until = answer.get("punch_until")
-            return nat.punch(
-                port,
-                tuple(answer["mapping"]),
-                token,
-                initiator=True,
-                start_at=start_at,
-                until=float(until) if until is not None else None,
-                cancel=cancel,
-            )
-        finally:
-            holder.close()
+    def _punch(
+        self, target: Target, cancel: threading.Event | None = None, count: int = 1
+    ) -> list[socket.socket]:
+        ports, mappings = nat.local_mappings(count, tuple(target.stun))
+        token = secrets.token_bytes(nat.TOKEN_BYTES)
+        start_at = time.time() + float(getattr(target.rendezvous, "lead_seconds", 10.0))
+        answer = target.rendezvous.exchange(
+            {
+                "kind": "tcp_punch",
+                "mapping": list(mappings[0]),
+                "mappings": [list(m) for m in mappings],
+                "count": count,
+                "token": token.hex(),
+                "start_at": start_at,
+                "window": nat.DEFAULT_WINDOW,
+                "ssh_port": target.ssh_port,
+                "stun": list(target.stun),
+            },
+            CONNECT_TIMEOUT,
+        )
+        # The remote reports when it stops dialing, so both sides stop together even
+        # when the rendezvous took most of the window. Spec "the simultaneous open".
+        until = answer.get("punch_until")
+        return nat.punch_many(
+            ports,
+            [tuple(m) for m in answer.get("mappings") or [answer["mapping"]]],
+            token,
+            initiator=True,
+            start_at=start_at,
+            until=float(until) if until is not None else None,
+            cancel=cancel,
+        )
 
 
 class TailcatUDP(Strategy):

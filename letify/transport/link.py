@@ -37,6 +37,8 @@ class Link:
         #: The probe's upload rate, which the placement weighs a connection's cost
         #: against. Spec "Several connections at once".
         self.upload_bps: float | None = None
+        #: A line the pipeline prints with the probe, such as how many sockets a punch opened.
+        self.note: str | None = None
 
     def probe_stream(self) -> object | None:
         """A stream the probe can run over, or None when this link cannot carry it."""
@@ -116,8 +118,9 @@ class SSHLink(Link):
 class PunchedLink(Link):
     """A punched TCP connection. It carries the probe, then SSH through a local forwarding port.
 
-    The first SSH command uses the punched connection. Each later one punches again, because
-    one TCP connection carries one SSH session.
+    The first SSH command uses the punched connection and the next ones use the spare sockets
+    punched with it. Each one after those punches again, because one TCP connection carries
+    one SSH session. Spec "Rendezvous".
     """
 
     def __init__(
@@ -127,9 +130,11 @@ class PunchedLink(Link):
         sock: socket.socket,
         command_for_port: Callable[[int, str | None], list[str]],
         redial: Callable[[], socket.socket],
+        spares: list[socket.socket] | None = None,
     ):
         super().__init__(strategy, rank)
         self._sock: socket.socket | None = sock
+        self._spares = list(spares or [])
         self._command_for_port = command_for_port
         self._redial = redial
         self._lock = threading.Lock()
@@ -141,6 +146,8 @@ class PunchedLink(Link):
     def _take(self) -> socket.socket:
         with self._lock:
             sock, self._sock = self._sock, None
+            if sock is None and self._spares:
+                sock = self._spares.pop(0)
         return sock if sock is not None else self._redial()
 
     def ssh_command(self, remote_command: str | None = None) -> list[str]:
@@ -170,9 +177,11 @@ class PunchedLink(Link):
         for listener in self._listeners:
             listener.close()
         with self._lock:
-            sock, self._sock = self._sock, None
-        if sock is not None:
-            sock.close()
+            socks, self._sock = [self._sock, *self._spares], None
+            self._spares.clear()
+        for sock in socks:
+            if sock is not None:
+                sock.close()
 
 
 class OneShotLink(Link):
