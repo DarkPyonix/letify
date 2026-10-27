@@ -16,7 +16,7 @@ from collections.abc import Callable
 from pathlib import Path
 
 from ..errors import RuntimeFailure
-from . import nat
+from . import nat, sshopts
 
 
 def probe_source() -> str:
@@ -163,7 +163,8 @@ class PunchedLink(Link):
             nat.splice(conn, remote)
 
         threading.Thread(target=forward, daemon=True).start()
-        return self._command_for_port(port, remote_command)
+        # The port is new for every command, so no two could share a connection.
+        return sshopts.without_sharing(self._command_for_port(port, remote_command))
 
     def close(self) -> None:
         for listener in self._listeners:

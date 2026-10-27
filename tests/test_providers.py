@@ -3316,7 +3316,7 @@ def _shared_command() -> list[str]:
     command = ["ssh", "-p", "22"]
     for option in _CONTROL:
         command += ["-o", option]
-    return [*command, "-E", "/x/log", "host", "ControlMaster=auto"]
+    return [*command, "-E", "/x/log", "host", "true"]
 
 
 def test_unshared_drops_the_control_options_and_turns_sharing_off() -> None:
@@ -3325,14 +3325,14 @@ def test_unshared_drops_the_control_options_and_turns_sharing_off() -> None:
 
     command = sshopts.unshared(_shared_command())
     assert command[:5] == ["ssh", "-o", "ControlMaster=no", "-o", "ControlPath=none"]
-    assert command[5:] == ["-p", "22", "-E", "/x/log", "host", "ControlMaster=auto"]
+    assert command[5:] == ["-p", "22", "-E", "/x/log", "host", "true"]
 
 
 def test_without_sharing_only_drops_the_control_options() -> None:
     from letify.transport import sshopts
 
     command = sshopts.without_sharing(_shared_command())
-    assert command == ["ssh", "-p", "22", "-E", "/x/log", "host", "ControlMaster=auto"]
+    assert command == ["ssh", "-p", "22", "-E", "/x/log", "host", "true"]
 
 
 def test_the_worker_channel_runs_its_own_ssh_connection(isolated_home, monkeypatch) -> None:
