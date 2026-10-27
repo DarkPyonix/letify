@@ -198,6 +198,14 @@ letify.on_exit(fn)                    # inside a body: run fn if the worker ends
 
 The hook runs on `SIGTERM`, when the lease deadline passes and when the channel closes during the call, newest first, within 120 s in total. Outside a body it raises `UnsupportedMode`. `letify runs`, `interrupt` and `exec` reach a running call from the command line; see [Controlling a running call](docs/SPEC.md#run-control).
 
+### Taking over a running call
+
+```python
+value = letify.takeover(run)         # become the owner of a running call, return its value
+```
+
+`letify.takeover(run)` and `letify takeover <run>` make the calling process the owner of a call another process started: it renews the lease, receives the output and the result, writes the call's outputs back under the project the call was sent from, and ends the session. The previous owner, if it is alive, is asked to let go and its waiting call raises `OwnershipMoved`. A provider whose runtime a second process cannot reach raises `UnsupportedMode` naming it; see [Taking over a running call](docs/SPEC.md#run-takeover).
+
 ### Handoffs
 
 ```python
@@ -233,6 +241,7 @@ Both work in the local process and inside a shipped function, on any provider. T
 | `ProtocolError` | The remote process died before producing a result | yes |
 | `RemoteError` | The shipped function raised; carries the remote traceback | no |
 | `UnsupportedMode` | The requested mode cannot work here | no |
+| `OwnershipMoved` | The call you were waiting on was taken over by another process, which now receives its result | no |
 | `InsufficientDevices` | The devices a call asks for cannot be allocated; names what holds them | no |
 
 ### Command line
@@ -248,6 +257,7 @@ letify utilization [alias]    # how busy each instance's accelerator is
 letify runs                   # calls running from this machine, with their run ids
 letify interrupt <run>        # raise KeyboardInterrupt in a running call's body
 letify exec <run> CODE        # run source beside a running call (-f FILE, --timeout S)
+letify takeover <run>         # become the owner of a running call (--result PATH, --json)
 letify check <alias>          # confirm a machine answers
 letify efficiency 0.5 3 150   # expected share of a direct run
 letify stubs                  # write typings/letify_providers.pyi for editor completion

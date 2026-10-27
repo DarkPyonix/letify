@@ -24,7 +24,7 @@ from typing import Any
 
 import cloudpickle
 
-from ..errors import ConfigError, ProtocolError, RemoteError, RuntimeFailure
+from ..errors import ConfigError, OwnershipMoved, ProtocolError, RemoteError, RuntimeFailure
 from . import wire
 
 #: Markers the one-shot driver writes around its outcome, so a result can be found
@@ -257,6 +257,15 @@ def unwrap(outcome: dict[str, Any], *, runtime_key: str) -> Any:
     if not isinstance(outcome, dict) or "ok" not in outcome:
         raise ProtocolError(f"unexpected remote payload: {outcome!r}")
     if not outcome["ok"]:
+        if outcome.get("moved"):
+            # Spec "Taking over a running call": the worker now answers to another process.
+            run, owner = str(outcome.get("run", "")), outcome.get("owner")
+            raise OwnershipMoved(
+                f"{runtime_key}: run {run} now belongs to process {owner}, which receives its "
+                f"result",
+                run=run,
+                owner=owner if isinstance(owner, int) else None,
+            )
         if outcome.get("kind") == "runtime":
             # Infrastructure rather than the body's own error, so a retry is allowed.
             # Spec "When a blob does not arrive".

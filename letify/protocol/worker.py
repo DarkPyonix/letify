@@ -86,6 +86,32 @@ widen_pipe(0)
 widen_pipe(_FRAME_FD)
 _SENDER = (TextSender if _LETIFY_TEXT_FRAMES else Sender)(fd_writer(_FRAME_FD))
 
+# Spec "Taking over a running call": what the second door and the call it serves share. It is
+# defined here, before the output pumps start, because a pump consults it when a write fails.
+#   run          id of the call being served, or None. Set from the call's start until its reply
+#                has been delivered.
+#   path/listener  the door's socket file and listening socket
+#   stream       the stream id the call arrived on, on the channel it arrived on
+#   live         whether the channel the call's reply goes to is believed open
+#   ended_input  whether that channel closed while the call ran
+#   moved        whether the call has been adopted away from the channel it arrived on
+#   owner        the door connection that adopted the call, and owner_stream its request id
+#   finished/outcome  the call's reply once the body has ended and before it is delivered
+#   backlog      the tail of output made while no channel could take it
+_TAKE = {
+    "run": None, "path": None, "listener": None, "stream": None, "live": True,
+    "ended_input": False, "moved": False, "owner": None, "owner_stream": None,
+    "finished": False, "outcome": None, "primary": None, "new_owner": None,
+    "backlog": {STDOUT: bytearray(), STDERR: bytearray()},
+}
+_TAKE_COND = threading.Condition()
+
+#: The most output kept for a new owner while no channel could take it, per stream.
+_BACKLOG_BYTES = 256 << 10
+
+#: Seconds a connection to the door may stay silent before it has adopted a call.
+_DOOR_IDLE_S = 30.0
+
 
 #: Written to a captured descriptor to find out where its reader has got to. A pipe is
 #: read in order, so every byte written before this has been framed once it is reached.
@@ -123,6 +149,11 @@ class _Pump(threading.Thread):
         self.busy = True
         try:
             _SENDER.frame(self.kind, 0, data)
+        except OSError:
+            # While a call runs, a channel that closed must not take the pump with it: the body
+            # would die of a broken pipe on its next print. The output is kept for a new owner.
+            if not _orphan_output(self.kind, data):
+                raise
         finally:
             self.busy = False
 
@@ -323,20 +354,40 @@ def _load_call(request):
         raise
 
 
-def _reply(stream, outcome):
+def _send_outcome(sender, stream, outcome, last=False):
+    """Send a reply on ``sender``. ``last`` marks the final piece of a streamed answer."""
+    if last:
+        outcome = dict(outcome, last=True)
     try:
-        _SENDER.message(REPLY, stream, outcome)
+        sender.message(REPLY, stream, outcome)
     except OSError:
-        os._exit(0)
+        raise
     except BaseException:
-        _SENDER.message(REPLY, stream, {
+        failure = {
             "ok": False,
             "error": "the return value could not be serialized",
             "traceback": traceback.format_exc(),
-        })
+        }
+        if last:
+            failure["last"] = True
+        sender.message(REPLY, stream, failure)
+
+
+def _reply(stream, outcome):
+    try:
+        _send_outcome(_SENDER, stream, outcome)
+    except OSError:
+        os._exit(0)
 
 
 def _op_call(request):
+    take = request.pop("takeover", None)
+    if take:
+        _door_open(take)
+    return _op_call_body(request)
+
+
+def _op_call_body(request):
     data = request.pop("data", None)
     _letify_replica(request.pop("replica", None))
     modules_dir = request.pop("modules_dir", None)
@@ -3083,6 +3134,8 @@ def _data_serve():
 
 def _run(stream, request, settle):
     name = request.get("op")
+    if name == "call":
+        _TAKE["stream"] = stream
     op = _OPS.get(name)
     if op is None:
         outcome = {"ok": False, "error": "unknown op %r" % name, "traceback": ""}
@@ -3121,6 +3174,9 @@ def _run(stream, request, settle):
         # out. Every op that runs a program drains; a stat or a lease renewal does not,
         # because they write nothing and are on the hot path.
         _drain_output()
+    if name == "call" and _TAKE["run"] is not None:
+        _deliver_call(stream, outcome)
+        return
     _reply(stream, outcome)
 
 
@@ -3245,16 +3301,23 @@ def _use_connection(connections):
     return carrier
 
 
-def _read():
-    """Read frames, answer light requests, and queue the rest for the main thread."""
-    receiver = Receiver(sys.stdin.buffer.readinto)
+def _read(readinto=None, door=None):
+    """Read frames, answer light requests, and queue the rest for the main thread.
+
+    With no arguments it reads the channel the worker started on. With ``readinto`` and
+    ``door`` it reads a connection to the second door, which spec "Taking over a running call"
+    describes: such a connection may only adopt the call until it has, and is then the
+    channel the call's output and reply go to.
+    """
+    receiver = Receiver(readinto or sys.stdin.buffer.readinto)
     while True:
         try:
             event = receiver.next_event()
         except EOFError:
             break
         except Exception:
-            traceback.print_exc()
+            if door is None:
+                traceback.print_exc()
             break
         if event is None:
             continue
@@ -3280,6 +3343,20 @@ def _read():
             continue
         value = None
         op = request.get("op") if isinstance(request, dict) else None
+        if door is not None:
+            if op == "adopt":
+                _door_adopt(door, stream, request)
+                continue
+            if _TAKE["owner"] is not door:
+                _answer(door.sender, stream, {
+                    "ok": False, "kind": "runtime", "last": True,
+                    "error": "adopt the call before sending %r" % (op,),
+                })
+                continue
+        elif _TAKE["moved"]:
+            # The call was adopted away from this channel, which gets nothing but this.
+            _answer(_TAKE["primary"], stream, _moved_outcome())
+            continue
         if op in _LIGHT:
             _run(stream, request, False)
             continue
@@ -3304,13 +3381,238 @@ def _read():
         _JOBS.put((stream, request))
         if op == "reexec":
             return
+    _reader_ended(door)
+
+
+def _reader_ended(door):
+    """A channel's reader stopped: it was closed, or sent a shutdown."""
+    if door is None and _TAKE["moved"]:
+        # The call was adopted away; this channel closing is the old owner leaving.
+        return
+    during = False
+    with _TAKE_COND:
+        if door is None or (_TAKE["owner"] is door and _TAKE["live"]):
+            during = _TAKE["run"] is not None
+            if door is not None or during:
+                _TAKE["live"] = False
+            if during:
+                _TAKE["ended_input"] = True
+            _TAKE_COND.notify_all()
+        else:
+            # A connection that never adopted the call: the door goes on listening.
+            return
     inbox = _DEVICE.get("inbox")
     if inbox is not None:
         inbox.put(None)
     # Spec "Exit hooks": a channel that closes while a body runs is a reason to end, and
-    # the hooks run before the main thread is told there is nothing more to serve.
+    # the hooks run before the main thread is told there is nothing more to serve. Spec
+    # "Taking over a running call": the body keeps running, and the worker ends when the
+    # call's reply has been delivered or the lease deadline passes, so no end is queued yet.
     _run_exit_hooks("the channel closed")
-    _JOBS.put(None)
+    if not during:
+        _JOBS.put(None)
+
+
+# -- the second door ----------------------------------------------------------------------
+# Spec "Taking over a running call": while a call runs, a Unix socket on this machine lets
+# another process become the call's owner.
+
+
+class _Door:
+    """One connection to the second door, with a sender of its own."""
+
+    def __init__(self, connection):
+        self.connection = connection
+        self.sender = Sender(lambda view: connection.send(view))
+
+
+def _answer(sender, stream, outcome):
+    """Send one reply to a channel that may be gone, ignoring that it is."""
+    try:
+        sender.message(REPLY, stream, outcome)
+    except OSError:
+        pass
+
+
+def _moved_outcome():
+    return {
+        "ok": False, "moved": True, "run": _TAKE["run"] or "", "owner": _TAKE["new_owner"],
+        "error": "run %s now belongs to process %s" % (_TAKE["run"], _TAKE["new_owner"]),
+    }
+
+
+
+def _orphan_output(kind, data):
+    """Keep the tail of output no channel could take. False when no call is being served."""
+    with _TAKE_COND:
+        if _TAKE["run"] is None:
+            return False
+        kept = _TAKE["backlog"][kind]
+        kept += data
+        if len(kept) > _BACKLOG_BYTES:
+            del kept[: len(kept) - _BACKLOG_BYTES]
+        return True
+
+
+def _door_open(take):
+    """Start listening on the call's door. A door that cannot open leaves the call as it was."""
+    with _TAKE_COND:
+        _TAKE.update(
+            run=take["run"], live=True, ended_input=False, finished=False, outcome=None,
+            path=take["door"],
+        )
+        for kept in _TAKE["backlog"].values():
+            del kept[:]
+    listener = None
+    try:
+        import socket
+        path = os.path.expanduser(take["door"])
+        directory = os.path.dirname(path)
+        existed = os.path.isdir(directory)
+        os.makedirs(directory, mode=0o700, exist_ok=True)
+        if not existed:
+            os.chmod(directory, 0o700)
+        try:
+            os.unlink(path)
+        except FileNotFoundError:
+            pass
+        address, descriptor = unix_address(path)
+        listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            listener.bind(address)
+        finally:
+            if descriptor is not None:
+                os.close(descriptor)
+        os.chmod(path, 0o600)
+        listener.listen(1)
+    except OSError as exc:
+        if listener is not None:
+            listener.close()
+        print("letify: run %s has no second door: %s" % (take["run"], exc), file=sys.stderr)
+        return
+    with _TAKE_COND:
+        _TAKE.update(listener=listener, path=path)
+    threading.Thread(target=_door_serve, args=(listener,), daemon=True).start()
+
+
+def _door_serve(listener):
+    """Serve one connection at a time until the door closes."""
+    version = ("%d.%d" % sys.version_info[:2]).encode("ascii")
+    while True:
+        try:
+            connection, _address = listener.accept()
+        except OSError:
+            return
+        door = _Door(connection)
+        try:
+            connection.settimeout(_DOOR_IDLE_S)
+            door.sender.frame(HELLO, 0, version)
+            _read(connection.recv_into, door)
+        except OSError:
+            pass
+        finally:
+            connection.close()
+
+
+def _door_adopt(door, stream, request):
+    """Make this connection the owner: switch the call's output and reply to it."""
+    global _SENDER
+    run = request.get("run")
+    with _TAKE_COND:
+        if _TAKE["run"] is None or _TAKE["run"] != run:
+            _answer(door.sender, stream, {
+                "ok": False, "kind": "runtime", "last": True,
+                "error": "no call %s is running on this worker" % (run,),
+            })
+            return
+        was_live = _TAKE["live"]
+        _TAKE["new_owner"] = request.get("owner")
+        former, former_stream = _SENDER, _TAKE["stream"]
+        if _TAKE["owner"] is None:
+            _TAKE["primary"] = former
+        else:
+            former_stream = _TAKE["owner_stream"]
+        moved = _moved_outcome()
+        if _TAKE["owner"] is not None:
+            moved["last"] = True
+        # Told on a thread, because a former owner that has stopped reading can block the write.
+        told = threading.Thread(
+            target=_answer, args=(former, former_stream, moved), daemon=True
+        )
+        told.start()
+        told.join(2.0)
+        state = {
+            "run": run,
+            "state": "finished" if _TAKE["finished"] else "running",
+            "orphaned": not was_live,
+        }
+        try:
+            door.sender.message(REPLY, stream, {"ok": True, "value": state})
+            for kind in (STDOUT, STDERR):
+                kept = _TAKE["backlog"][kind]
+                if kept:
+                    door.sender.frame(kind, 0, bytes(kept))
+                    del kept[:]
+        except OSError:
+            return
+        door.connection.settimeout(None)
+        _TAKE.update(
+            owner=door, owner_stream=stream, moved=True, live=True, ended_input=False
+        )
+        _SENDER = door.sender
+        _TAKE_COND.notify_all()
+
+
+def _deliver_call(stream, outcome):
+    """Send a call's reply to whichever channel owns the call now, then close the door.
+
+    A call that ends while no channel is open waits for an owner until the lease deadline, so
+    its result is not lost to a process that died a moment before the body returned. Without a
+    lease nothing bounds the wait, so the worker ends as it did before taking over existed.
+    """
+    failed = False
+    with _TAKE_COND:
+        _TAKE["finished"] = True
+        _TAKE["outcome"] = outcome
+        while not _TAKE["live"]:
+            deadline = globals().get("_LEASE", {}).get("deadline")
+            left = (deadline or 0) - time.time()
+            if left <= 0:
+                break
+            _TAKE_COND.wait(min(left, 1.0))
+        owner = _TAKE["owner"]
+        try:
+            if owner is not None:
+                _send_outcome(owner.sender, _TAKE["owner_stream"], outcome, last=True)
+            else:
+                _send_outcome(_SENDER, stream, outcome)
+        except OSError:
+            failed = True
+        ended = _TAKE["ended_input"]
+        listener, path = _TAKE["listener"], _TAKE["path"]
+        _TAKE.update(run=None, listener=None, path=None, finished=False, outcome=None)
+    _door_close(listener, path)
+    if failed and owner is None:
+        os._exit(0)
+    if ended:
+        _JOBS.put(None)
+
+
+def _door_close(listener, path):
+    """Stop listening and remove the socket file."""
+    if listener is not None:
+        try:
+            # Wakes the accepting thread, which a close alone leaves blocked on Linux.
+            import socket
+            listener.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+        listener.close()
+    if path:
+        try:
+            os.unlink(os.path.expanduser(path))
+        except OSError:
+            pass
 
 
 def _serve():

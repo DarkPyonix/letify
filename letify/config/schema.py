@@ -42,6 +42,9 @@ class Config:
     providers: dict[str, ProviderConfig] = field(default_factory=dict)
     defaults: dict[str, Any] = field(default_factory=dict)
     sources: list[Path] = field(default_factory=list)
+    #: The project's own ``config.toml`` when it exists, which a run's record names so another
+    #: process can find the same accounts. Spec "Taking over a running call".
+    project_file: Path | None = None
 
     @property
     def order(self) -> list[str]:

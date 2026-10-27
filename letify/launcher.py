@@ -150,6 +150,7 @@ class Launcher:
         self.providers: ProvidersView = Providers(self)  # type: ignore[assignment]
         self.functions: list[Function] = []
         self.pool = RuntimePool(on_start=self._announce_start)
+        self.pool.config_file = self.config.project_file
         self._cache: dict[str, Provider] = {}
         self._guard = threading.Lock()
         self._at_exit_registered = False

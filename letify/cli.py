@@ -13,6 +13,7 @@ import os
 import shutil
 import sys
 import time
+from collections.abc import Callable
 from pathlib import Path
 
 from . import __version__, render
@@ -213,6 +214,17 @@ def build_parser() -> argparse.ArgumentParser:
         help="seconds to wait for the answer; the source keeps running after that",
     )
     exec_parser.add_argument("--json", action="store_true", help="print the record unformatted")
+
+    takeover_parser = sub.add_parser(
+        "takeover", help="become the owner of a running call and see it through"
+    )
+    takeover_parser.add_argument("run", help="a run id, as letify runs lists it")
+    takeover_parser.add_argument(
+        "--result", metavar="PATH", help="write the call's value to PATH with pickle"
+    )
+    takeover_parser.add_argument(
+        "--json", action="store_true", help="end with one JSON object about the call"
+    )
 
     setup_parser = sub.add_parser(
         "setup", help="install tailcat or eci from its publisher ahead of time"
@@ -635,21 +647,23 @@ def _run_control(args: argparse.Namespace) -> int:
     if args.command == "runs":
         if not control.available():
             return refuse("run control is not available on Windows", 1, "UnsupportedMode")
-        rows = control.list_runs()
+        rows = control.list_runs(orphans=True)
         if args.json:
             return _json(rows)
         if not rows:
             print("no calls are running")
             return 0
         now = time.time()
-        table = [("RUN", "FUNCTION", "RUNTIME", "PROVIDER", "AGE", "PID")] + [
+        table = [("RUN", "FUNCTION", "RUNTIME", "PROVIDER", "AGE", "OWNER")] + [
             (
                 str(row["run"]),
                 str(row.get("function", "")),
                 str(row.get("runtime", "")),
                 str(row.get("provider", "")),
                 _age(now - float(row.get("started_at", now))),
-                str(row.get("pid", "")),
+                f"gone, {_age(row['seconds_left'])} left"
+                if row.get("owner") == "gone"
+                else str(row.get("pid", "")),
             )
             for row in rows
         ]
@@ -658,6 +672,9 @@ def _run_control(args: argparse.Namespace) -> int:
             cells = (cell.ljust(width) for cell, width in zip(line, widths, strict=True))
             print("  ".join(cells).rstrip())
         return 0
+
+    if args.command == "takeover":
+        return _takeover(args, refuse)
 
     command: dict[str, object] = {"cmd": args.command}
     wait = 90.0
@@ -711,6 +728,55 @@ def _run_control(args: argparse.Namespace) -> int:
     return 0
 
 
+def _takeover(args: argparse.Namespace, refuse: Callable[..., int]) -> int:
+    """``letify takeover``: spec "Taking over a running call", item 5.
+
+    Exit status 0 when the call returned, 1 when its body raised or it could not be taken, 2
+    for a usage error and 3 when no such run is waiting for an owner.
+    """
+    import pickle
+
+    from .errors import RemoteError, RunNotFound, UnsupportedMode
+    from .runtime import control
+    from .runtime.takeover import take
+
+    if not control.available():
+        return refuse("run control is not available on Windows", 1, "UnsupportedMode")
+    try:
+        value = take(args.run)
+    except RunNotFound as exc:
+        return refuse(str(exc), 3, "RunNotFound")
+    except UnsupportedMode as exc:
+        return refuse(str(exc), 1, "UnsupportedMode")
+    except RemoteError as exc:
+        sys.stderr.write(f"{exc}\n")
+        if args.json:
+            _json_line({"run": args.run, "ok": False, "error": str(exc)})
+        return 1
+    result = None
+    if args.result:
+        result = str(args.result)
+        try:
+            Path(result).write_bytes(pickle.dumps(value))
+        except (OSError, pickle.PicklingError, TypeError) as exc:
+            return refuse(f"the value of {args.run} cannot be written to {result}: {exc}", 1)
+    if args.json:
+        _json_line(
+            {"run": args.run, "ok": True, "value_repr": repr(value), "result_path": result}
+        )
+    elif result is None:
+        print(repr(value))
+    else:
+        _say("ok", f"{args.run} returned; its value is in {result}")
+    return 0
+
+
+def _json_line(value: object) -> None:
+    """One JSON object on one line, which is how a program reads the end of a stream."""
+    print(json.dumps(value))
+    sys.stdout.flush()
+
+
 def _age(seconds: float) -> str:
     seconds = max(0, int(seconds))
     if seconds < 60:
@@ -747,7 +813,7 @@ def _dispatch(args: argparse.Namespace) -> int:
     if args.command == "setup":
         return _setup_tool(args)
 
-    if args.command in ("runs", "interrupt", "exec"):
+    if args.command in ("runs", "interrupt", "exec", "takeover"):
         # Talks to the process that owns the run, so no Launcher is built.
         return _run_control(args)
 

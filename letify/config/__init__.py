@@ -56,6 +56,8 @@ def load(path: str | Path | None = None, *, home: bool = True) -> Config:
 
     home_entries = _read_entries(home_path, config, require_kind=True) if home else {}
     project_entries = _read_entries(project_path, config, require_kind=False)
+    if project_path.is_file():
+        config.project_file = project_path.resolve()
 
     counter = 0
 

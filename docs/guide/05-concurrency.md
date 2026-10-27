@@ -161,6 +161,24 @@ The hook runs when the worker receives `SIGTERM`, when its lease runs out, or wh
 
 None of this works on a provider whose worker has only a one-shot channel, and the commands say which provider. There is no control socket on Windows. See the spec section "Controlling a running call".
 
+### Handing a call to another process
+
+A call has one owner: the process that sent it, which renews the runtime's lease, receives the output and the result, and ends the session. When that process is stuck, or you want to close the notebook that started it, move the call to another process:
+
+```bash
+letify takeover 3f9a0c61d2b4                    # prints the body's output, then the repr of the value
+letify takeover 3f9a0c61d2b4 --result out.pkl   # writes the value with pickle instead
+letify takeover 3f9a0c61d2b4 --json             # the last line is one JSON object: run, ok, value_repr or error, result_path
+```
+
+The old owner is asked to let go. Its waiting call raises `OwnershipMoved`, which names the run and the new owner and is never retried. It stops renewing the lease and leaves the session alone, even inside a `keep_alive` block. If it does not answer within 5 seconds it is treated as gone. The new owner prints the output from then on, writes the files the call produced under the project the call was sent from, not the current directory, and ends the session when the call ends. The exit status is 0 when the call returned, 1 when its body raised (the traceback is printed) or the run could not be taken, and 3 when no such run exists.
+
+From Python, `value = letify.takeover("3f9a0c61d2b4")` does the same in the calling process and raises the body's exception as a call does.
+
+If the owner died, `letify runs` still lists the call while the runtime's lease has time left, with `gone` as its owner and the seconds left. Take it over before the lease ends, or the worker ends with it. Output the body made while nobody listened is kept (the last 256 KiB) and printed first.
+
+A provider whose runtime a second process cannot reach raises `UnsupportedMode` naming it. Local and Shell can be taken over. A Local worker is a child of its owner and has no lease, so a Local call can be taken over only while its owner is alive. Kaggle, Modal and Elice cannot be taken over, and Colab can only on its default SSH channel. See the spec section "Taking over a running call".
+
 ## Practical patterns
 
 **Run the configurations, collect a table.**

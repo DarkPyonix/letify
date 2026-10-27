@@ -366,6 +366,12 @@ class Modal(Provider):
     default_persistence = "persistent"
     has_fast_path = False
 
+    takeover_refusal = (
+        "the worker reads the standard input of a sandbox process that only the adapter which "
+        "created it holds, and the adapter has no operation to run a relay inside an existing "
+        "sandbox"
+    )
+
     #: Modal bills in dollars and publishes the month's spend, not a balance, so the balance
     #: is the monthly credit minus the month's metered cost.
     usage_unit = "USD"

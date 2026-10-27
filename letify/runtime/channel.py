@@ -26,6 +26,7 @@ import contextlib
 import contextvars
 import os
 import select
+import socket
 import subprocess
 import sys
 import tempfile
@@ -87,6 +88,15 @@ class Channel(abc.ABC):
 
     @abc.abstractmethod
     def close(self) -> None: ...
+
+    def detach(self) -> None:
+        """Let go of this channel without ending what is on the other side of it.
+
+        Spec "Taking over a running call": after the run moved to another process, closing the
+        channel the usual way would end the worker the new owner now relies on. The default
+        does what ``close`` does, for a channel with nothing on the other side to protect.
+        """
+        self.close()
 
     def declare_lost(self, message: str) -> None:
         """Make a call waiting on this channel fail with ``RuntimeLost(message)``.
@@ -869,6 +879,10 @@ class PersistentChannel(FramedChannel):
     worker source is written once, and every message after that is frames.
     """
 
+    #: Whether ``start`` hands the worker source to the process. An attached channel reaches a
+    #: worker that is already running, so it does not.
+    sends_worker = True
+
     def __init__(
         self, command: list[str], *, name: str = "runtime", env: dict[str, str] | None = None
     ):
@@ -924,12 +938,29 @@ class PersistentChannel(FramedChannel):
                 death_cause=self._exit_cause,
                 poll_fd=process.stdout.fileno(),
             )
-            self._send_worker()
+            if self.sends_worker:
+                self._send_worker()
             self._await_ready()
 
     def _kill(self) -> None:
         if self._process is not None:
             self._process.kill()
+
+    def detach(self) -> None:
+        """Close our ends of the pipes and leave the process on the other end running.
+
+        Spec "Taking over a running call". The process is not waited for, because it is
+        serving another owner now and ending is not its business here.
+        """
+        process, self._process = self._process, None
+        self._connection = None
+        if process is None:
+            return
+        for pipe in (process.stdin, process.stdout):
+            if pipe is not None:
+                with contextlib.suppress(OSError, ValueError):
+                    pipe.close()
+        self._drop_ssh_log()
 
     def _with_ssh_log(self) -> list[str]:
         """The command, with ``-E <file>`` after the program when that program is ssh.
@@ -1037,6 +1068,136 @@ class PersistentChannel(FramedChannel):
             code = exit_text(process.returncode)
             raise RuntimeLost(f"{self.name}: the worker exited with {code}")
         return connection.request(payload, timeout=timeout, kill=self._kill)
+
+
+class AttachedChannel(PersistentChannel):
+    """A persistent channel to a worker that is already running, through a relay program.
+
+    Spec "Taking over a running call". The command starts ``relay_program`` on the runtime,
+    which connects to the worker's second door and carries frames both ways, in place of the
+    bootstrap stub that starts a worker. Everything else is a ``PersistentChannel``.
+    """
+
+    sends_worker = False
+
+
+class SocketChannel(FramedChannel):
+    """A persistent channel to a worker on this machine, over its second door.
+
+    Spec "Taking over a running call": on the Local provider the runtime is this machine, so
+    the door is connected to directly and no relay runs.
+    """
+
+    def __init__(self, path: str, *, name: str = "runtime"):
+        self.path = path
+        self.name = name
+        self._socket: socket.socket | None = None
+        self._start_lock = threading.Lock()
+
+    def start(self) -> None:
+        with self._start_lock:
+            if self._socket is not None:
+                return
+            address, descriptor = "", None
+            try:
+                address, descriptor = wire.unix_address(os.path.expanduser(self.path))
+                sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                try:
+                    sock.connect(address)
+                except OSError:
+                    sock.close()
+                    raise
+            except OSError as exc:
+                raise RuntimeFailure(
+                    f"{self.name}: cannot reach the worker's door at {self.path}: {exc}"
+                ) from exc
+            finally:
+                if descriptor is not None:
+                    os.close(descriptor)
+            self._socket = sock
+            self._connection = Connection(
+                self.name, lambda view: sock.send(view), sock.recv_into, self._emit
+            )
+            self._await_ready()
+
+    def _kill(self) -> None:
+        if self._socket is not None:
+            with contextlib.suppress(OSError):
+                self._socket.shutdown(socket.SHUT_RDWR)
+
+    def close(self) -> None:
+        sock, self._socket = self._socket, None
+        connection, self._connection = self._connection, None
+        if sock is None:
+            return
+        try:
+            if connection is not None:
+                with contextlib.suppress(OSError):
+                    connection.sender.frame(wire.SHUTDOWN, 0)
+        finally:
+            with contextlib.suppress(OSError):
+                sock.shutdown(socket.SHUT_RDWR)
+            sock.close()
+
+    def detach(self) -> None:
+        """Close the connection without a shutdown, which the worker would take as an end."""
+        sock, self._socket = self._socket, None
+        self._connection = None
+        if sock is not None:
+            with contextlib.suppress(OSError):
+                sock.shutdown(socket.SHUT_RDWR)
+            sock.close()
+
+
+#: The part of the relay program after its address helper. It joins the worker's second door
+#: to its own standard input and output, and ends when either side does.
+_RELAY_MAIN = """
+def relay(path):
+    path = os.path.expanduser(path)
+    try:
+        address, descriptor = unix_address(path)
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        sock.connect(address)
+    except OSError as exc:
+        sys.stderr.write("letify relay: cannot reach %s: %s\\n" % (path, exc))
+        sys.exit(2)
+    if descriptor is not None:
+        os.close(descriptor)
+    source, sink = sys.stdin.fileno(), sys.stdout.fileno()
+    while True:
+        ready = select.select([source, sock], [], [])[0]
+        if sock in ready:
+            data = sock.recv(1 << 16)
+            if not data:
+                return
+            view = memoryview(data)
+            while view:
+                view = view[os.write(sink, view):]
+        if source in ready:
+            data = os.read(source, 1 << 16)
+            if not data:
+                return
+            sock.sendall(data)
+
+
+relay(sys.argv[1])
+"""
+
+
+def relay_program() -> str:
+    """The standard library only Python program an ``AttachedChannel`` runs on the runtime.
+
+    It takes the door's path as its one argument. The helper that reaches a path longer than a
+    Unix socket address allows is the one the worker uses, so both ends agree on it.
+    """
+    import inspect
+
+    return (
+        "import os, select, socket, sys\n"
+        f"UNIX_PATH_LIMIT = {wire.UNIX_PATH_LIMIT}\n"
+        + inspect.getsource(wire.unix_address)
+        + _RELAY_MAIN
+    )
 
 
 def _drain(stream: IO[bytes] | None, sink: Callable[[bytes], None] | None) -> None:
@@ -1198,9 +1359,12 @@ def _lease_source(grace: float) -> str:
 
 __all__ = [
     "STARTUP_TIMEOUT",
+    "AttachedChannel",
     "Channel",
     "Connection",
     "FramedChannel",
     "OneShotChannel",
     "PersistentChannel",
+    "SocketChannel",
+    "relay_program",
 ]

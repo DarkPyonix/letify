@@ -143,6 +143,19 @@ class Local(Provider):
 
         return PersistentChannel([str(interpreter), "-u", "-c", BOOTSTRAP], name=runtime.name)
 
+    takeover_refusal = None
+
+    def attach_channel(self, name: str, record: Mapping[str, Any]) -> Channel:
+        """The worker's second door, connected to directly, since the runtime is this machine.
+
+        Spec "Taking over a running call". The worker is a child of the process that started
+        it and ends with that process's session, so a run can be taken over from an owner that
+        is still alive, or from one that died while the lease was running.
+        """
+        from ..runtime.channel import SocketChannel
+
+        return SocketChannel(str(record["door"]), name=name)
+
     def transfer_channel(self, runtime: Runtime | None) -> Channel:
         """Another worker subprocess for one transfer stream.
 
