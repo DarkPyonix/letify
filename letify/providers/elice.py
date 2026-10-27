@@ -330,6 +330,11 @@ class Elice(Shell):
     default_persistence = "ephemeral"
     has_fast_path = True
     offers_spot = True
+
+    takeover_refusal = (
+        "its machine is allocated for the session and the allocation, which names the address "
+        "to dial, is not kept in the run record, so a second process cannot find the machine"
+    )
     #: Its machine lives only as long as a session, so utilization is read inside one.
     reads_machine = False
 

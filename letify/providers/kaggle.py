@@ -1227,6 +1227,11 @@ class Kaggle(Provider):
     has_fast_path = False
     needs_lease = False
 
+    takeover_refusal = (
+        "the worker reads the input of a notebook cell that only the process that started the "
+        "session holds, and a second process has no way to reach the kernel's worker"
+    )
+
     #: A session carries one worker for the runtime, so the object and blob tables survive.
     persistent_channel = True
 

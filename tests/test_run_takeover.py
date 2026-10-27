@@ -53,7 +53,10 @@ OWNER = textwrap.dedent(
         from letify.runtime import lease
 
         Local.needs_lease = True
-        lease.GRACE = float(grace)
+        original = lease.Lease.__init__
+        lease.Lease.__init__ = lambda self, runtime: original(
+            self, runtime, interval=1.0, grace=float(grace)
+        )
     let = letify.Launcher(config, home=False, announce=False)
 
 
@@ -201,6 +204,15 @@ class Owner:
             os.kill(self.worker, signal.SIGKILL)
 
 
+def taking(owner: Owner, function: Callable[..., Any], *args: Any) -> Running:
+    """Take the run over on a thread, let the body finish once the old owner let go, and join."""
+    call = Running(function, *args)
+    owner.answer()
+    owner.finish_body()
+    call.join()
+    return call
+
+
 @pytest.fixture
 def owners(tmp_path: Path) -> Iterator[Callable[..., Owner]]:
     made: list[Owner] = []
@@ -282,6 +294,8 @@ def test_a_wedged_owner_that_does_not_answer_is_treated_as_gone(
     try:
         taking = Running(main, ["takeover", owner.run])
         until(lambda: any(r["pid"] == os.getpid() for r in control.list_runs()), "the new record")
+        # The new owner controls the run through its own socket only once the call is adopted.
+        until(lambda: main(["exec", owner.run, "1"]) == 0, "the call to be adopted")
         owner.finish_body()
         taking.join()
         assert taking.value == 0
@@ -295,9 +309,8 @@ def test_a_wedged_owner_that_does_not_answer_is_treated_as_gone(
 def test_result_writes_the_value_as_a_pickle(world, owners, tmp_path, capsys) -> None:
     owner = owners()
     target = tmp_path / "value.pkl"
-    owner.finish_body()
-    code = main(["takeover", owner.run, "--result", str(target), "--json"])
-    assert code == 0
+    call = taking(owner, main, ["takeover", owner.run, "--result", str(target), "--json"])
+    assert call.value == 0
     assert pickle.loads(target.read_bytes()) == 42
     last = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
     assert last["result_path"] == str(target)
@@ -306,15 +319,13 @@ def test_result_writes_the_value_as_a_pickle(world, owners, tmp_path, capsys) ->
 
 def test_without_result_the_repr_of_the_value_is_printed(world, owners, capsys) -> None:
     owner = owners()
-    owner.finish_body()
-    assert main(["takeover", owner.run]) == 0
+    assert taking(owner, main, ["takeover", owner.run]).value == 0
     assert capsys.readouterr().out.strip().splitlines()[-1] == "42"
 
 
 def test_a_body_that_raises_exits_one_and_prints_the_traceback(world, owners, capsys) -> None:
     owner = owners(mode="raise")
-    owner.finish_body()
-    assert main(["takeover", owner.run, "--json"]) == 1
+    assert taking(owner, main, ["takeover", owner.run, "--json"]).value == 1
     captured = capsys.readouterr()
     assert "ValueError: boom from the body" in captured.err
     assert "Traceback" in captured.err
@@ -331,24 +342,22 @@ def test_output_files_the_body_wrote_land_under_the_records_project(
     elsewhere = tmp_path / "elsewhere"
     elsewhere.mkdir()
     monkeypatch.chdir(elsewhere)
-    owner.finish_body()
-    assert main(["takeover", owner.run]) == 0
+    assert taking(owner, main, ["takeover", owner.run]).value == 0
     assert (owner.out / "result.txt").read_text(encoding="utf-8") == "written by the body"
     assert list(elsewhere.iterdir()) == []
 
 
 def test_takeover_from_python_returns_the_value(world, owners) -> None:
     owner = owners()
-    owner.finish_body()
-    assert letify.takeover(owner.run) == 42
+    assert taking(owner, letify.takeover, owner.run).value == 42
     assert control.list_runs(orphans=True) == []
 
 
 def test_takeover_from_python_raises_the_bodys_exception(world, owners) -> None:
     owner = owners(mode="raise")
-    owner.finish_body()
-    with pytest.raises(letify.RemoteError, match="boom from the body"):
-        letify.takeover(owner.run)
+    call = taking(owner, letify.takeover, owner.run)
+    assert isinstance(call.error, letify.RemoteError)
+    assert "boom from the body" in str(call.error)
 
 
 # -- the registry ----------------------------------------------------------------

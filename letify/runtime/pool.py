@@ -26,6 +26,8 @@ from typing import TYPE_CHECKING
 from ..errors import InsufficientDevices, LetifyError
 
 if TYPE_CHECKING:
+    from pathlib import Path
+
     from ..declare.env import Env
     from ..declare.instance import Instance
     from ..store.volume import Volume
@@ -49,6 +51,8 @@ class RuntimePool:
 
     def __init__(self, *, on_start: object | None = None):
         self.on_start = on_start
+        #: The project ``config.toml`` the launcher read, named in the record of each call.
+        self.config_file: Path | None = None
         self._runtimes: dict[str, list[Runtime]] = {}
         self._guard = threading.RLock()
         self._free = threading.Condition(self._guard)
@@ -196,6 +200,11 @@ class RuntimePool:
 
     def release(self, runtime: Runtime) -> None:
         """Give a runtime back. It ends here unless the pool is held."""
+        if runtime.handing_over and not runtime.handed_over:
+            # Released to another process that never took the run: the call returned here, so
+            # the session ends with it as it would have.
+            runtime.shutdown(reason="released_but_not_taken")
+            return
         with self._guard:
             runtime.busy = False
             runtime.last_used = time.monotonic()
@@ -205,6 +214,25 @@ class RuntimePool:
                 self._free.notify_all()
             return
         self.discard(runtime, reason="call_complete", idle_only=True)
+
+    def forget(self, runtime: Runtime) -> None:
+        """Drop a runtime from this pool without stopping it, because another process owns it now.
+
+        Spec "Taking over a running call". Its devices are given back to this process's
+        inventory: the worker still uses them, and ``busy`` sees it as another user's work, so
+        nothing here is started onto them by mistake. A ``keep_alive`` block no longer holds it.
+        """
+        with self._guard:
+            bucket = self._runtimes.get(runtime.key, [])
+            present = runtime in bucket
+            if present:
+                bucket.remove(runtime)
+        if present:
+            runtime.provider.unreserve(
+                runtime.instance.accelerator, runtime.held_devices, runtime.instance.devices
+            )
+        with self._free:
+            self._free.notify_all()
 
     def discard(
         self,

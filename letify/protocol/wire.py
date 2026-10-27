@@ -611,6 +611,31 @@ def chunks_readinto(read_chunks):
     return readinto
 
 
+#: The longest Unix socket path used as written. The kernel limit is 107 bytes on Linux and 103 on
+#: macOS, so this leaves room under both.
+UNIX_PATH_LIMIT = 100
+
+
+def unix_address(path: str):
+    """``(address, descriptor)`` to bind or connect a Unix socket at ``path``.
+
+    A path within ``UNIX_PATH_LIMIT`` bytes is its own address. A longer one is reached
+    through ``/proc/self/fd/<n>``, where ``n`` is a descriptor of its directory, so the socket
+    still lives at ``path`` and a program that knows only the long path can find it. The
+    caller closes ``descriptor`` once the bind or connect has returned. Without ``/proc``
+    the bind or connect fails with ``OSError``, which the caller reports.
+    """
+    if len(os.fsencode(path)) <= UNIX_PATH_LIMIT:
+        return path, None
+    directory, name = os.path.split(path)
+    descriptor = os.open(directory, os.O_RDONLY)
+    address = f"/proc/self/fd/{descriptor}/{name}"
+    if len(os.fsencode(address)) > UNIX_PATH_LIMIT + 7:
+        os.close(descriptor)
+        raise OSError(f"the socket path {path!r} is too long for a Unix socket")
+    return address, descriptor
+
+
 def fd_writer(fd: int):
     """A ``write`` for ``Sender`` over a file descriptor."""
     return lambda view: os.write(fd, view)
@@ -635,6 +660,7 @@ __all__ = [
     "STDOUT",
     "STRIPE_HOLD",
     "STRIPE_MIN",
+    "UNIX_PATH_LIMIT",
     "FrameError",
     "Receiver",
     "Sender",
@@ -644,5 +670,6 @@ __all__ = [
     "dumps",
     "fd_writer",
     "loads",
+    "unix_address",
     "widen_pipe",
 ]

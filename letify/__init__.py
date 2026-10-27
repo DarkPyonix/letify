@@ -44,6 +44,7 @@ from .errors import (
     InsufficientDevices,
     InterpreterMismatch,
     LetifyError,
+    OwnershipMoved,
     ProtocolError,
     ProviderUnavailable,
     ReductionFailed,
@@ -94,6 +95,22 @@ def stash(name: str, path: str | os.PathLike[str]) -> str:
     return stash_handoff(name, path)
 
 
+def takeover(run: str, *, launcher: Launcher | None = None) -> object:
+    """Become the owner of the running call ``run`` and return its value.
+
+    Spec "Taking over a running call". The previous owner, if it is alive, is asked to let go
+    and its waiting call raises ``OwnershipMoved``. This process then renews the runtime's
+    lease, prints the body's output as it arrives, writes the call's outputs back under the
+    project the call was sent from, ends the session, and returns the value or raises the
+    body's exception as a call does. It holds no handle and returns only once the call has
+    ended and the session is gone. ``launcher`` supplies the accounts when this process
+    already has one; otherwise they are read from the configuration the run was started with.
+    """
+    from .runtime.takeover import take
+
+    return take(run, launcher=launcher)
+
+
 @overload
 def unstash(name: str) -> dict[str, bytes] | None: ...
 @overload
@@ -132,6 +149,7 @@ __all__ = [
     "InterpreterMismatch",
     "Launcher",
     "LetifyError",
+    "OwnershipMoved",
     "ProtocolError",
     "ProviderUnavailable",
     "Providers",
@@ -158,6 +176,7 @@ __all__ = [
     "session_cache",
     "stash",
     "sum",
+    "takeover",
     "unstash",
     "world_size",
 ]

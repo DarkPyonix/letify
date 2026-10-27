@@ -132,6 +132,21 @@ class RunNotFound(LetifyError):
     """
 
 
+class OwnershipMoved(LetifyError):
+    """The run this call was waiting on now belongs to another process.
+
+    Spec "Taking over a running call": ``letify takeover`` made another process the owner,
+    which receives the result. An infrastructure error, since the call did not fail, but never
+    retried: a retry would start the work again on a fresh runtime beside the one still
+    running. ``run`` is the run id and ``owner`` the new owner's process id when it is known.
+    """
+
+    def __init__(self, message: str, *, run: str = "", owner: int | None = None):
+        self.run = run
+        self.owner = owner
+        super().__init__(message)
+
+
 class ReductionFailed(RuntimeFailure):
     """An ``all_reduce`` round could not reach ``min_peers`` within its timeout.
 

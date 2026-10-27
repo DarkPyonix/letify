@@ -14,6 +14,7 @@ kill a training run.
 from __future__ import annotations
 
 import threading
+import time
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -37,6 +38,9 @@ class Lease:
         self.grace = grace
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
+        #: The Unix time the runtime's lease ends unless renewed, by this machine's clock, from
+        #: the last renewal that succeeded. Spec "Taking over a running call".
+        self.deadline: float | None = None
 
     def arm(self) -> None:
         """Set the deadline once and start renewing it."""
@@ -71,6 +75,12 @@ class Lease:
 
         try:
             self.runtime.request({"op": "lease", "grace": self.grace}, timeout=60)
+            self.deadline = time.time() + self.grace
+            # The record of a running call carries the deadline, so a takeover can tell how long
+            # an orphan has left.
+            from . import control
+
+            control.refresh(self.runtime)
         except RuntimeLost:
             # The session is gone. The pool notices on its next call.
             return False

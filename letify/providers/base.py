@@ -496,6 +496,26 @@ class Provider(abc.ABC):
     def open_channel(self, runtime: Runtime) -> Channel:
         """Return the channel that talks to this runtime."""
 
+    #: Why a second process cannot reach a runtime of this provider, or None when it can. Spec
+    #: "Taking over a running call": the sentence is what ``UnsupportedMode`` carries.
+    takeover_refusal: str | None = (
+        "its channel to the runtime is held by the process that started the session, and "
+        "nothing in it lets a second process reach the same worker"
+    )
+
+    def attach_channel(self, name: str, record: Mapping[str, Any]) -> Channel:
+        """A channel to the worker of the running call ``record`` describes, from a new process.
+
+        Spec "Taking over a running call". ``name`` is the runtime's name and ``record`` the
+        run record, which holds the worker's second door. The channel is not started. A
+        provider whose runtime a second process cannot reach refuses with ``UnsupportedMode``
+        naming itself.
+        """
+        raise UnsupportedMode(
+            f"{self.alias} cannot hand a running call to another process: "
+            f"{self.takeover_refusal or 'no attach is implemented for this provider'}"
+        )
+
     def create_session(self, instance: Instance, name: str) -> None:
         """Ask the provider for a machine. Nothing to do where one already exists."""
         return None

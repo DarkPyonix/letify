@@ -33,6 +33,7 @@ from .. import protocol
 from ..errors import (
     EnvironmentFailure,
     InterpreterMismatch,
+    OwnershipMoved,
     ProtocolError,
     RemoteError,
     RuntimeFailure,
@@ -183,6 +184,13 @@ class Runtime:
     #: Set once ``shutdown`` has run, so a second discard does nothing.
     _shut_down: bool = field(default=False, repr=False)
 
+    #: Set when another process asked to take the running call over. Spec "Taking over a
+    #: running call": this session is no longer this process's to end.
+    handing_over: bool = field(default=False, repr=False)
+
+    #: Set once the worker switched to the other process, which ends the session from now on.
+    handed_over: bool = field(default=False, repr=False)
+
     #: The environment pack running on the worker, or None. Spec "Materializing into a
     #: runtime": the pack to Drive runs beside the session's calls.
     _pack: _DrivePack | None = field(default=None, repr=False)
@@ -278,6 +286,21 @@ class Runtime:
             {"op": "blob_dir", "path": f"{root.rstrip('/')}/blobs", "limit": BLOB_DISK_LIMIT},
             timeout=120,
         )
+
+    def hand_over(self) -> None:
+        """Let go of this session for another process without stopping it.
+
+        Spec "Taking over a running call": the lease is not renewed from here on, the session
+        leaves the pool and the provider stops counting its worker as this process's own.
+        Nothing is shut down, so the worker and its call go on.
+        """
+        self.handing_over = True
+        if self.lease is not None:
+            self.lease.release()
+        if self.worker_pid is not None:
+            self.provider.remove_worker_pid(self.worker_pid)
+        if self._pool is not None:
+            self._pool.forget(self)
 
     def lose(self, message: str) -> None:
         """Declare the runtime gone: wake a waiting call with ``RuntimeLost`` and discard it.
@@ -484,24 +507,69 @@ class Runtime:
         # "Named handoffs on the Drive store" describes.
         grants = handoff.GrantWatcher(self.channel)
         grants.start()
-        # The record exists before the call is sent and goes when it returns or raises.
-        run = control.begin(self, name)
+        # The record exists before the call is sent and goes when it returns or raises. It
+        # carries what another process needs to take the call over, spec "Taking over a
+        # running call", and the worker is told where to open its second door.
+        run = control.begin(self, name, details=self._takeover_details(collector, call_dir, blobs))
+        if "door" in run.details:
+            request["takeover"] = {"run": run.id, "door": run.details["door"]}
+        moved = False
         try:
             with run.interruptible():
                 outcome = self.channel.request(request, timeout=timeout)
+        except OwnershipMoved:
+            moved = True
+            raise
         finally:
             run.end()
             grants.close()
             if back is not None:
                 back.cancel()
-            added = self._finish_data(stream, call_dir)
-            try:
-                if outcome is not None and collector.outputs:
-                    added += pathdata.write_back(self, collector, blobs, back)
-            finally:
-                if added:
-                    pathdata.evict(self, blobs)
+            if moved:
+                # The worker is the new owner's now, and a request sent on this channel would
+                # only be answered with "moved". Closing our side of the pipes ends no worker.
+                self.handed_over = True
+                self.channel.detach()
+            else:
+                added = self._finish_data(stream, call_dir)
+                try:
+                    if outcome is not None and collector.outputs:
+                        added += pathdata.write_back(self, collector, blobs, back)
+                finally:
+                    if added:
+                        pathdata.evict(self, blobs)
         return outcome
+
+    def _takeover_details(self, collector: Any, call_dir: str, blobs: str) -> dict[str, Any]:
+        """What another process needs, from the record, to take this call over.
+
+        Spec "Taking over a running call": the project the call was sent from, the
+        configuration that names its account, and the output locations to write back. No
+        secret is among them. Paths inside the project are stored relative to it.
+        """
+        from ..store import pathdata
+
+        project = pathdata.project_root()
+
+        def relative(path: Path) -> str:
+            try:
+                return str(path.relative_to(project))
+            except ValueError:
+                return str(path)
+
+        pool = self._pool
+        config = getattr(pool, "config_file", None)
+        return {
+            "project": str(project),
+            "config": str(config) if config else None,
+            "call_dir": call_dir,
+            "blobs": blobs,
+            "outputs": [
+                {"runtime": placed.runtime, "local": relative(placed.local),
+                 "directory": placed.directory}
+                for placed in collector.outputs
+            ],
+        }
 
     def _stream_data(
         self,

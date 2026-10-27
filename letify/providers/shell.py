@@ -492,6 +492,37 @@ class Shell(Provider):
             name=runtime.name,
         )
 
+    takeover_refusal = None
+
+    def attach_channel(self, name: str, record: Mapping[str, Any]) -> Channel:
+        """A relay on the machine, reached by the same link as a worker, to the worker's door.
+
+        Spec "Taking over a running call". The link is made the way a session makes it, from
+        the account, and the command it runs on the machine is the relay program with the
+        door's path, in place of the bootstrap that starts a worker.
+        """
+        from types import SimpleNamespace
+
+        from ..errors import UnsupportedMode
+        from ..runtime.channel import AttachedChannel, relay_program
+
+        if self.takeover_refusal is not None or not self.persistent_channel:
+            raise UnsupportedMode(
+                f"{self.alias} cannot hand a running call to another process: "
+                f"{self.takeover_refusal or 'its runtime is reached one command per call'}"
+            )
+        runtime: Any = SimpleNamespace(name=name, external_id=record.get("external_id"))
+        link = self.link(runtime)
+        if not link.persistent:
+            raise UnsupportedMode(
+                f"{self.alias} is reached over a link that runs one command per call, so a "
+                f"second process cannot attach to the worker"
+            )
+        program = shlex.quote(relay_program())
+        door = shlex.quote(str(record["door"]))
+        command = f"{self.remote_python} -c {program} {door}"
+        return AttachedChannel(link.ssh_command(self.remote_command(command)), name=name)
+
     def transfer_command(self, runtime: Runtime | None) -> list[str]:
         """An SSH command for one transfer connection, outside the multiplexed one.
 
