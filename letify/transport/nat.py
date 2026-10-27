@@ -38,6 +38,11 @@ CONNECT_BACK_TIMEOUT = 20.0
 #: is still travelling back. Spec "the simultaneous open".
 DEFAULT_WINDOW = 150.0
 ANSWER_MARKER = "LETIFY-ANSWER "
+#: Most sockets one punch opens. Spec "Rendezvous": several sockets share one rendezvous.
+MAX_PUNCH_SOCKETS = 8
+#: Keepalive for a punched socket, so the NAT mapping of one waiting for its turn survives.
+KEEPIDLE_S = 20
+KEEPINTVL_S = 10
 #: What a non-blocking ``connect_ex`` returns when the dial is under way. Windows answers
 #: with its own would-block code instead of EINPROGRESS.
 _DIAL_IN_PROGRESS = frozenset(
@@ -351,6 +356,99 @@ def punch(
     )
 
 
+def pair_token(token: bytes, index: int) -> bytes:
+    """The token of pair ``index`` of a punch, so a hello cannot connect the wrong pair."""
+    return token + bytes([index])
+
+
+def keep_alive(sock: socket.socket) -> None:
+    """Turn on TCP keepalive where the platform lets the timers be set."""
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+    for name, value in (("TCP_KEEPIDLE", KEEPIDLE_S), ("TCP_KEEPINTVL", KEEPINTVL_S)):
+        if hasattr(socket, name):
+            sock.setsockopt(socket.IPPROTO_TCP, getattr(socket, name), value)
+
+
+def local_mappings(count: int, stun: tuple[str, int]) -> tuple[list[int], list[tuple[str, int]]]:
+    """Choose ``count`` local ports and learn the STUN mapping of each, concurrently."""
+    holders = [reusable_socket(0) for _ in range(count)]
+    ports = [holder.getsockname()[1] for holder in holders]
+    mappings: list[tuple[str, int] | BaseException] = [("", 0)] * count
+
+    def learn(index: int) -> None:
+        try:
+            mappings[index] = stun_mapping(ports[index], stun)
+        except BaseException as error:
+            mappings[index] = error
+
+    threads = [threading.Thread(target=learn, args=(i,)) for i in range(1, count)]
+    for thread in threads:
+        thread.start()
+    learn(0)
+    for thread in threads:
+        thread.join()
+    for holder in holders:
+        holder.close()
+    for found in mappings:
+        if isinstance(found, BaseException):
+            raise found
+    return ports, mappings  # type: ignore[return-value]
+
+
+def punch_many(
+    ports: list[int],
+    peers: list[tuple[str, int]],
+    token: bytes,
+    *,
+    initiator: bool,
+    start_at: float,
+    window: float = DEFAULT_WINDOW,
+    until: float | None = None,
+    cancel: threading.Event | None = None,
+) -> list[socket.socket]:
+    """Punch pair ``i`` from ``ports[i]`` to ``peers[i]`` at once and return those that connected.
+
+    Spec "Rendezvous": every pair has its own token and its own thread and shares the one
+    window. A pair that fails is absent. The call raises only when no pair connected, with
+    the failure of an unexpected kind first, then the first one.
+    """
+    connected: list[tuple[int, socket.socket]] = []
+    failures: list[BaseException] = []
+    lock = threading.Lock()
+
+    def run(index: int) -> None:
+        try:
+            sock = punch(
+                ports[index],
+                tuple(peers[index]),
+                pair_token(token, index),
+                initiator=initiator,
+                start_at=start_at,
+                window=window,
+                until=until,
+                cancel=cancel,
+            )
+            keep_alive(sock)
+        except BaseException as error:
+            with lock:
+                failures.append(error)
+            return
+        with lock:
+            connected.append((index, sock))
+
+    pairs = min(len(ports), len(peers))
+    threads = [threading.Thread(target=run, args=(i,), daemon=True) for i in range(1, pairs)]
+    for thread in threads:
+        thread.start()
+    run(0)
+    for thread in threads:
+        thread.join()
+    if not connected:
+        expected = (TimeoutError, OSError, Cancelled)
+        raise next((e for e in failures if not isinstance(e, expected)), failures[0])
+    return [sock for _, sock in sorted(connected, key=lambda pair: pair[0])]
+
+
 def accept_hello(
     listener: socket.socket,
     token: bytes,
@@ -487,6 +585,19 @@ def serve_link(sock: socket.socket, target: tuple[str, int] = ("127.0.0.1", 22))
         sock.close()
 
 
+def serve_links(socks: list[socket.socket], target: tuple[str, int] = ("127.0.0.1", 22)) -> None:
+    """Serve every punched connection at once and return when the last one has ended.
+
+    Spec "Rendezvous": the detached process exits when this returns, so returning when only
+    the first connection ends would cut the session on every spare still in use.
+    """
+    threads = [threading.Thread(target=serve_link, args=(sock, target)) for sock in socks]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+
 # -- one rendezvous request ------------------------------------------------------------
 
 
@@ -516,12 +627,11 @@ def begin(request: dict):
     if request.get("start_sshd"):
         _start_sshd(int(request.get("ssh_port", 22)))
     if kind == "tcp_punch":
-        holder = reusable_socket(0)
-        port = holder.getsockname()[1]
-        mapping = stun_mapping(port, tuple(request.get("stun") or DEFAULT_STUN))
-        holder.close()
+        peers = [tuple(m) for m in request.get("mappings") or [request["mapping"]]]
+        peers = peers[:MAX_PUNCH_SOCKETS]
+        ports, mappings = local_mappings(len(peers), tuple(request.get("stun") or DEFAULT_STUN))
         token = bytes.fromhex(request["token"])
-        peer = tuple(request["mapping"])
+        peer = peers[0]
         ssh = ("127.0.0.1", int(request.get("ssh_port", 22)))
 
         window = float(request.get("window", DEFAULT_WINDOW))
@@ -531,9 +641,9 @@ def begin(request: dict):
             where = f"{peer[0]}:{peer[1]}"
             fallback = "the Tailcat link is used instead"
             try:
-                sock = punch(
-                    port,
-                    peer,
+                socks = punch_many(
+                    ports,
+                    peers,
                     token,
                     initiator=False,
                     start_at=float(request["start_at"]),
@@ -550,9 +660,10 @@ def begin(request: dict):
                     print(f"letify agent: {message}; {fallback}", file=sys.stderr, flush=True)
                     return
                 raise
-            serve_link(sock, ssh)
+            serve_links(socks, ssh)
 
-        return {"mapping": list(mapping), "punch_until": until}, punch_and_serve
+        answer = {"mapping": list(mappings[0]), "mappings": [list(m) for m in mappings]}
+        return {**answer, "punch_until": until}, punch_and_serve
     if kind == "connect_back":
         # Spec "Connect back": an ordinary outbound connection, then the same hello and
         # the same splice a punched connection uses.

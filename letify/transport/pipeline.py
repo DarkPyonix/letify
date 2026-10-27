@@ -591,6 +591,8 @@ class Pipeline:
             self._say(f"{link.strategy} probe failed: {exc}")
             raise
         self._say(f"{link.strategy} probe: {_numbers(measured)}")
+        if getattr(link, "note", None):
+            self._say(link.note)
         return measured
 
     def _fall_back(self, link: Any) -> None:
