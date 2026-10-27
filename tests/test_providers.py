@@ -3307,3 +3307,59 @@ def test_a_sandbox_at_its_lifetime_keeps_the_lifetime_message_without_a_poll(
     assert "lifetime letify asked for" in text
     assert "exited with code" not in text
     assert fake_modal.requests("poll") == []
+
+
+_CONTROL = ("ControlMaster=auto", "ControlPersist=60", "ControlPath=/x/ab-%C")
+
+
+def _shared_command() -> list[str]:
+    command = ["ssh", "-p", "22"]
+    for option in _CONTROL:
+        command += ["-o", option]
+    return [*command, "-E", "/x/log", "host", "ControlMaster=auto"]
+
+
+def test_unshared_drops_the_control_options_and_turns_sharing_off() -> None:
+    # Spec "SSH authentication": a worker channel and a transfer stream run on their own.
+    from letify.transport import sshopts
+
+    command = sshopts.unshared(_shared_command())
+    assert command[:5] == ["ssh", "-o", "ControlMaster=no", "-o", "ControlPath=none"]
+    assert command[5:] == ["-p", "22", "-E", "/x/log", "host", "ControlMaster=auto"]
+
+
+def test_without_sharing_only_drops_the_control_options() -> None:
+    from letify.transport import sshopts
+
+    command = sshopts.without_sharing(_shared_command())
+    assert command == ["ssh", "-p", "22", "-E", "/x/log", "host", "ControlMaster=auto"]
+
+
+def test_the_worker_channel_runs_its_own_ssh_connection(isolated_home, monkeypatch) -> None:
+    from letify.transport import sshopts
+
+    monkeypatch.setattr(sshopts, "WINDOWS", False)
+    monkeypatch.setattr(sshopts, "SOCKET_LIMIT", 500)
+    provider = provider_of(Shell, "lab", address="gpu.lab.example.edu", user="researcher")
+    runtime = type("R", (), {"name": "lab-1"})()
+    link = type(
+        "L",
+        (),
+        {"persistent": True, "ssh_command": lambda self, c=None: provider.ssh_command(c)},
+    )()
+    monkeypatch.setattr(provider, "link", lambda runtime: link)
+    command = provider.open_channel(runtime).command
+    assert "ControlMaster=no" in command and "ControlPath=none" in command
+    assert not any(part.startswith(("ControlMaster=auto", "ControlPersist=")) for part in command)
+    # The short commands still share.
+    assert "ControlMaster=auto" in provider.ssh_command("true")
+
+
+def test_a_punched_link_command_shares_no_connection() -> None:
+    from letify.transport.link import PunchedLink
+
+    link = PunchedLink("punch", 1, None, lambda port, c=None: _shared_command(), lambda: None)
+    command = link.ssh_command("true")
+    assert not any(part.startswith("Control") for part in command)
+    assert command[:3] == ["ssh", "-p", "22"]
+    link.close()
