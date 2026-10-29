@@ -289,7 +289,10 @@ mod tests {
         let seen: SocketAddr = "[2001:db8::9]:777".parse().unwrap();
         let reply = encode_reply(&id, &nonce, seen);
         assert!(reply.len() <= REQUEST_LEN);
-        assert_eq!(decode_reply(&reply, &nonce, Some(id.node_id())).unwrap(), seen);
+        assert_eq!(
+            decode_reply(&reply, &nonce, Some(id.node_id())).unwrap(),
+            seen
+        );
     }
 
     #[tokio::test]
