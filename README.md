@@ -467,6 +467,8 @@ letify setup tailcat          # install tailcat or eci from its publisher ahead 
 letify providers              # who is declared, storage, channel kind
 letify devices                # what each one offers
 letify status                 # what is running right now
+letify sessions               # what each account holds, workers on a shell host
+letify stop --orphans         # end what a dead process left behind
 letify usage                  # what is left on each account
 letify utilization            # how busy each instance's GPU is
 letify check lab              # does this machine answer?

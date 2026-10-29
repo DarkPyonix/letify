@@ -467,6 +467,8 @@ letify setup tailcat  # 배포처에서 tailcat 또는 eci를 미리 설치
 letify providers      # 선언된 프로바이더, 저장소 수명, 기본 배치
 letify devices           # 각자 제공하는 GPU
 letify status         # 지금 돌고 있는 것
+letify sessions       # 계정이 잡고 있는 것, shell 호스트의 워커
+letify stop --orphans # 죽은 프로세스가 남긴 것 정리
 letify usage          # 계정마다 남은 사용량
 letify utilization    # 인스턴스별 GPU가 얼마나 바쁜가
 letify check lab      # 이 머신이 응답하나?
