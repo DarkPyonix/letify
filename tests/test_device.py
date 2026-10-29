@@ -570,7 +570,9 @@ def test_torch_compile_returns_the_module_and_warns_that_the_runtime_compiles_st
     assert torch.equal(compiled(x).cpu(), model(x).cpu())
 
 
-def test_a_compiled_training_loop_matches_the_same_loop_run_eagerly(compile_steps_on, client) -> None:
+def test_a_compiled_training_loop_matches_the_same_loop_run_eagerly(
+    compile_steps_on, client
+) -> None:
     def train(compile_it):
         torch.manual_seed(0)
         model = torch.nn.Sequential(
@@ -619,8 +621,10 @@ def test_torch_compile_under_host_local_runs_eagerly_unless_step_compilation_is_
 
 @pytest.mark.parametrize(
     ("value", "expected"),
-    [("1", True), ("true", True), ("Yes", True), ("ON", True)]
-    + [("0", False), ("false", False), ("No", False), ("off", False), ("", False)],
+    [
+        *[("1", True), ("true", True), ("Yes", True), ("ON", True)],
+        *[("0", False), ("false", False), ("No", False), ("off", False), ("", False)],
+    ],
 )
 def test_letify_compile_steps_in_the_environment_enables_step_compilation(
     monkeypatch, value, expected
