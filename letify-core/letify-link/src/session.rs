@@ -890,13 +890,14 @@ impl State {
                 self.apply_ack(next);
                 self.apply_sub_ack(id, sub);
             }
-            Frame::Hello { next } => self.apply_ack(next),
+            Frame::Hello { next, .. } => self.apply_ack(next),
             // Keepalives are answered by the subflow's reader, which knows the subflow.
             Frame::Ping { .. }
             | Frame::Pong { .. }
             | Frame::Probe
             | Frame::ProbeAck { .. }
-            | Frame::Keepalive { .. } => {}
+            | Frame::Keepalive { .. }
+            | Frame::Rekey { .. } => {}
             Frame::Seq { seq, .. } => {
                 if let Some(sub) = self.subflows.get_mut(&id) {
                     sub.recv_seq += len as u64;
@@ -1127,8 +1128,11 @@ impl Shared {
     }
 
     /// Encrypt `plain` into a record: length, epoch, nonce, ciphertext.
-    fn seal(&self, plain: &[u8]) -> Result<Vec<u8>> {
-        self.keys.seal(plain)
+    ///
+    /// `announced` is the subflow's count of key announcements already written, see
+    /// `Keys::seal`.
+    fn seal(&self, plain: &[u8], announced: &mut u16) -> Result<Vec<u8>> {
+        self.keys.seal(plain, announced)
     }
 
     /// Decrypt a record. `None` means the record was dropped without an error: its nonce was
@@ -1146,6 +1150,7 @@ impl Shared {
         self: &Arc<Self>,
         t: T,
         gauge: Option<Gauge>,
+        announced: u16,
     ) -> Result<SubflowId> {
         let (rd, wr) = tokio::io::split(t);
         let notify = Arc::new(Notify::new());
@@ -1171,6 +1176,7 @@ impl Shared {
             wr,
             notify.clone(),
             sent.clone(),
+            announced,
         ));
         let aborts = vec![reader.abort_handle(), writer.abort_handle()];
         st.subflows.insert(
@@ -1254,6 +1260,7 @@ async fn reader_task<R: AsyncRead + Unpin>(
                 continue;
             };
             match frame::decode(plain)? {
+                Frame::Rekey { next } => shared.keys.announce(next, nonce),
                 Frame::Ping { stamp } => {
                     if let Some(sub) = shared.lock().subflows.get_mut(&id) {
                         sub.pong = Some(stamp);
@@ -1321,6 +1328,7 @@ async fn writer_task<W: AsyncWrite + Unpin>(
     mut wr: W,
     notify: Arc<Notify>,
     sent: Arc<AtomicU64>,
+    mut announced: u16,
 ) {
     let mut last_write = tokio::time::Instant::now();
     let result: Result<()> = async {
@@ -1437,37 +1445,37 @@ async fn writer_task<W: AsyncWrite + Unpin>(
             };
             match work {
                 Work::Keepalive(ms) => {
-                    let record = shared.seal(&frame::encode_keepalive(ms))?;
+                    let record = shared.seal(&frame::encode_keepalive(ms), &mut announced)?;
                     wr.write_all(&record).await?;
                     wr.flush().await?;
                     last_write = tokio::time::Instant::now();
                 }
                 Work::Pong(stamp) => {
-                    let record = shared.seal(&frame::encode_pong(stamp))?;
+                    let record = shared.seal(&frame::encode_pong(stamp), &mut announced)?;
                     wr.write_all(&record).await?;
                     wr.flush().await?;
                     // An answer is not activity of this side: each side still pings on its
                     // own schedule, so both get a round trip estimate.
                 }
                 Work::ProbeAck(bytes) => {
-                    let record = shared.seal(&frame::encode_probe_ack(bytes))?;
+                    let record = shared.seal(&frame::encode_probe_ack(bytes), &mut announced)?;
                     wr.write_all(&record).await?;
                     wr.flush().await?;
                 }
                 Work::Probe(size) => {
-                    let record = shared.seal(&frame::encode_probe(size))?;
+                    let record = shared.seal(&frame::encode_probe(size), &mut announced)?;
                     wr.write_all(&record).await?;
                     wr.flush().await?;
                     sent.fetch_add(record.len() as u64, Ordering::Relaxed);
                     last_write = tokio::time::Instant::now();
                 }
                 Work::Ack(next, sub) => {
-                    let record = shared.seal(&frame::encode_ack(next, sub))?;
+                    let record = shared.seal(&frame::encode_ack(next, sub), &mut announced)?;
                     wr.write_all(&record).await?;
                     last_write = tokio::time::Instant::now();
                 }
                 Work::Frame(bytes) => {
-                    let record = shared.seal(&bytes)?;
+                    let record = shared.seal(&bytes, &mut announced)?;
                     wr.write_all(&record).await?;
                     sent.fetch_add(record.len() as u64, Ordering::Relaxed);
                     last_write = tokio::time::Instant::now();
@@ -1500,7 +1508,8 @@ async fn writer_task<W: AsyncWrite + Unpin>(
                     };
                     if timed_out && ka_due.is_some_and(|d| tokio::time::Instant::now() >= d) {
                         // Idle for a whole interval: keep the path and its NAT mapping alive.
-                        let record = shared.seal(&frame::encode_ping(shared.stamp()))?;
+                        let record =
+                            shared.seal(&frame::encode_ping(shared.stamp()), &mut announced)?;
                         wr.write_all(&record).await?;
                         wr.flush().await?;
                         last_write = tokio::time::Instant::now();
@@ -1618,13 +1627,7 @@ impl Session {
         let shared = Arc::new(Shared {
             state: Mutex::new(state),
             accept: Notify::new(),
-            keys: Keys::new(
-                est.crypto,
-                est.rekey_secret,
-                initiator,
-                cfg.rekey_after_records,
-                cfg.rekey_after,
-            ),
+            keys: Keys::new(est.crypto, cfg.rekey_after_records, cfg.rekey_after),
             dropped: AtomicU64::new(0),
             cfg,
             peer: est.peer,
@@ -1638,7 +1641,7 @@ impl Session {
             keepalive_changed: Notify::new(),
             hints: watch::channel(0).0,
         });
-        shared.start_subflow(transport, gauge)?;
+        shared.start_subflow(transport, gauge, 0)?;
         Ok(Session {
             guard: Arc::new(Guard {
                 shared,
@@ -1768,11 +1771,15 @@ impl Session {
             }
         }
         let limit = shared.cfg.handshake_timeout;
-        let peer_next = tokio::time::timeout(limit, async {
+        let (peer_next, announced) = tokio::time::timeout(limit, async {
             let next = shared.lock().recv_next;
+            let mut announced = 0;
+            let hello = frame::encode_hello(next, shared.keys.receive_epoch());
             let mut out = SUBFLOW_MAGIC.to_vec();
             out.extend_from_slice(&shared.session_id);
-            out.extend_from_slice(&shared.seal(&frame::encode_hello(next))?);
+            // The announcements of earlier rekeys come first, so a peer that missed them with
+            // a dead subflow reaches the epoch the Hello is sealed in.
+            out.extend_from_slice(&shared.seal(&hello, &mut announced)?);
             transport.write_all(&out).await?;
             transport.flush().await?;
             if !preamble_read {
@@ -1784,26 +1791,40 @@ impl Session {
                     ));
                 }
             }
-            let mut rec = [0u8; RECORD_HDR];
-            transport.read_exact(&mut rec).await?;
-            let len = u16::from_be_bytes([rec[0], rec[1]]) as usize;
-            let epoch = u16::from_be_bytes([rec[2], rec[3]]);
-            let nonce = u64::from_be_bytes(rec[4..].try_into().unwrap());
-            let mut ct = vec![0u8; len];
-            transport.read_exact(&mut ct).await?;
-            let plain = shared
-                .open(epoch, nonce, &ct)
-                .map_err(|e| Error::Subflow(e.to_string()))?
-                .ok_or_else(|| Error::Subflow("the hello was replayed".into()))?;
-            match frame::decode(plain)? {
-                Frame::Hello { next } => Ok(next),
-                _ => Err(Error::Subflow("the first record is not a hello".into())),
+            loop {
+                let mut rec = [0u8; RECORD_HDR];
+                transport.read_exact(&mut rec).await?;
+                let len = u16::from_be_bytes([rec[0], rec[1]]) as usize;
+                let epoch = u16::from_be_bytes([rec[2], rec[3]]);
+                let nonce = u64::from_be_bytes(rec[4..].try_into().unwrap());
+                let mut ct = vec![0u8; len];
+                transport.read_exact(&mut ct).await?;
+                let Some(plain) = shared
+                    .keys
+                    .open(epoch, nonce, &ct)
+                    .map_err(|e| Error::Subflow(e.to_string()))?
+                else {
+                    // An announcement this side already holds is repeated by a peer that
+                    // cannot know it. Anything else that is dropped here is a replay.
+                    if shared.keys.is_stale(epoch, nonce) {
+                        continue;
+                    }
+                    return Err(Error::Subflow("the hello was replayed".into()));
+                };
+                match frame::decode(plain)? {
+                    Frame::Rekey { next } => shared.keys.announce(next, nonce),
+                    Frame::Hello { next, epoch } => {
+                        shared.keys.prune(epoch);
+                        return Ok((next, announced));
+                    }
+                    _ => return Err(Error::Subflow("the first record is not a hello".into())),
+                }
             }
         })
         .await
         .map_err(|_| Error::Subflow("timed out".into()))??;
         shared.lock().apply_ack(peer_next);
-        shared.start_subflow(transport, gauge)
+        shared.start_subflow(transport, gauge, announced)
     }
 
     /// Close the session. Frames already queued are written first; the peer's streams then end
