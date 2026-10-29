@@ -34,6 +34,22 @@ E_REQUEST = 2
 E_STEP_DEFINE = 3
 E_STEP = 4
 
+#: Compiled variants one step may have in a session, as spec "Compilation" decides.
+MAX_VARIANTS = 4
+
+#: Operator name fragments whose segments stay eager, because Inductor draws random numbers
+#: from its own generator.
+RANDOM_TOKENS = (
+    "rand",
+    "dropout",
+    "bernoulli",
+    "normal",
+    "multinomial",
+    "uniform",
+    "exponential",
+    "random",
+)
+
 #: Bytes of recent uploads the executor keeps by digest and length, least recently used out.
 UPLOAD_CACHE_BYTES = 1 << 30
 
@@ -47,6 +63,73 @@ def _missing(handle: int) -> MissingHandle:
         f"handle {handle} is not on the runtime: the operator that produced it "
         f"failed or was skipped after a failure"
     )
+
+
+#: Held while a segment is traced and compiled, because tracing patches global state.
+_COMPILE_LOCK = threading.Lock()
+
+
+def _meta(tensor) -> tuple:
+    return (tuple(tensor.shape), tuple(tensor.stride()), tensor.dtype, str(tensor.device))
+
+
+def _varying(previous, current, known) -> tuple:
+    """The scalar slots to lift to tensors: ``known`` and those that changed, if numbers."""
+    slots = set(known)
+    for slot, (before, now) in enumerate(zip(previous, current, strict=True)):
+        if type(before) in (int, float) and type(now) is type(before) and before != now:
+            slots.add(slot)
+    return tuple(sorted(slots))
+
+
+class _Segment:
+    """The compilation state of one ``(step, start, stop)`` segment."""
+
+    def __init__(self, key: tuple, first: tuple, candidates: frozenset):
+        self.key = key
+        #: Offsets some entry of the segment kept, which a compiled form returns.
+        self.candidates = candidates
+        #: Scalars of the first sighting.
+        self.first = first
+        self.varying: tuple = ()
+        #: The ready ``_Variant``, if any.
+        self.variant = None
+        self.thread: threading.Thread | None = None
+        self.error: str | None = None
+        #: Whether the segment runs eagerly for the rest of the session.
+        self.eager = False
+
+
+class _Variant:
+    """One compiled form of a segment and what it was compiled for."""
+
+    def __init__(
+        self, pattern: tuple, metas: tuple, scalars: tuple, varying: tuple, candidates: frozenset
+    ):
+        self.candidates = candidates
+        self.pattern = pattern
+        self.metas = metas
+        self.scalars = scalars
+        self.varying = varying
+        self.kinds = tuple(type(scalars[slot]) for slot in varying)
+        self.compiled = None
+        self.survivors: tuple = ()
+        self.persistent: frozenset = frozenset()
+        self.drops: tuple = ()
+        self.blobs: tuple = ()
+
+    def matches(self, scalars: tuple) -> bool:
+        """Whether the constants are unchanged and the varying slots keep their type."""
+        if len(scalars) != len(self.scalars):
+            return False
+        varying = self.varying
+        for slot, (was, now) in enumerate(zip(self.scalars, scalars, strict=True)):
+            if slot in varying:
+                if type(now) is not type(was):
+                    return False
+            elif type(now) is not type(was) or now != was:
+                return False
+        return True
 
 
 class Executor:
@@ -70,6 +153,15 @@ class Executor:
         self._uploads: collections.OrderedDict = collections.OrderedDict()
         self._upload_bytes = 0
         self._upload_budget = UPLOAD_CACHE_BYTES
+        #: ``(mode, options)`` once the client asked for compilation, else None.
+        self._compilation: tuple | None = None
+        #: Segment key to its ``_Segment``.
+        self._segments: dict = {}
+        #: Step number to the compilations started for it.
+        self._variants: dict = {}
+        self._compile_counts = {"compiled": 0, "failed": 0, "runs": 0}
+        #: Lines for the client, sent with the next reply.
+        self._notes: list = []
 
     # -- identity ----------------------------------------------------------------
 
@@ -343,7 +435,10 @@ class Executor:
         if not message.get("reply"):
             return None
         failure, self.failure = self.failure, None
-        head = pickle.dumps({"results": results, "failure": failure}, protocol=5)
+        reply = {"results": results, "failure": failure}
+        if self._notes:
+            reply["notes"], self._notes = self._notes, []
+        head = pickle.dumps(reply, protocol=5)
         views = [tensor_view(tensor) for tensor in out_buffers]
         return head, views, keep
 
@@ -384,6 +479,8 @@ class Executor:
         return value if want == "value" else None
 
     def replay(self, entry) -> None:
+        if self._compilation is not None and self._replay_compiled(entry):
+            return
         _, sid, first, start, stop, externals, scalars, blobs, keep = entry
         ops, before, frees = self._steps[sid]
         if len(keep) > 8:
@@ -432,6 +529,300 @@ class Executor:
                 for offset in drop:
                     if offset not in keep:
                         table.pop(first + offset, None)
+
+    # -- compiled segments -----------------------------------------------------------
+
+    def compile_stats(self, wait: bool) -> dict:
+        """Counters of compiled segments, after joining the compilations in progress if asked."""
+        if wait:
+            for segment in list(self._segments.values()):
+                if segment.thread is not None:
+                    segment.thread.join()
+                    self._adopt(segment)
+        eager = sum(1 for segment in self._segments.values() if segment.eager)
+        return {**self._compile_counts, "eager": eager}
+
+    def _adopt(self, segment) -> None:
+        """Take the result of a finished background compilation."""
+        thread = segment.thread
+        if thread is None or thread.is_alive():
+            return
+        segment.thread = None
+        if segment.error is not None:
+            segment.eager = True
+            self._compile_counts["failed"] += 1
+            self._notes.append(
+                f"letify: step {segment.key[0]} could not be compiled: {segment.error}; "
+                f"it runs eagerly"
+            )
+        else:
+            self._compile_counts["compiled"] += 1
+
+    def _replay_compiled(self, entry) -> bool:
+        """Run ``entry`` as a compiled segment when one is ready. False means run it eagerly."""
+        _, sid, _first, start, stop, _externals, scalars, _blobs, keep = entry
+        key = (sid, start, stop)
+        segment = self._segments.get(key)
+        if segment is None:
+            self._segments[key] = _Segment(key, tuple(scalars), frozenset(keep))
+            return False
+        if segment.thread is not None:
+            self._adopt(segment)
+        if segment.eager or segment.thread is not None:
+            return False
+        variant = segment.variant
+        if variant is None:
+            # The second sighting: the slots that differ from the first are varying.
+            segment.varying = _varying(segment.first, scalars, ())
+        elif variant.matches(scalars) and self._unchanged(variant, entry):
+            if variant.candidates.issuperset(keep):
+                return self._run_compiled(segment, variant, entry)
+            segment.varying = variant.varying
+        else:
+            segment.varying = _varying(variant.scalars, scalars, variant.varying)
+        # Offsets any entry kept so far stay outputs, so the keeps of a loop whose live
+        # tensors come and go with garbage collection converge on one compilation.
+        segment.candidates = segment.candidates | frozenset(keep)
+        self._start_compile(segment, entry)
+        return False
+
+    def _inputs(self, entry):
+        """The distinct tensors a segment reads from outside itself and their repeat pattern."""
+        _, sid, first, start, stop, externals, _scalars, _blobs, _keep = entry
+        ops, before, _frees = self._steps[sid]
+        table = self.tensors
+        slots: dict = {}
+        tensors: list = []
+        pattern: list = []
+        external = 0
+        for index in range(start, stop):
+            for offset in ops[index][5]:
+                if offset < 0:
+                    handle = externals[external]
+                    external += 1
+                elif offset < before[start]:
+                    handle = first + offset
+                else:
+                    continue
+                at = slots.get(handle)
+                if at is None:
+                    tensor = table.get(handle)
+                    if tensor is None:
+                        return None, None
+                    at = slots[handle] = len(tensors)
+                    tensors.append(tensor)
+                pattern.append(at)
+        return tensors, tuple(pattern)
+
+    def _unchanged(self, variant, entry) -> bool:
+        """Whether the inputs of ``entry`` are what ``variant`` was compiled for."""
+        tensors, pattern = self._inputs(entry)
+        if tensors is None or pattern != variant.pattern:
+            return False
+        if tuple(_meta(tensor) for tensor in tensors) != variant.metas:
+            return False
+        pointers = {tensor.untyped_storage().data_ptr() for tensor in tensors}
+        return len(pointers) == len(tensors)
+
+    def _start_compile(self, segment, entry) -> None:
+        _, sid, _first, start, stop, _externals, scalars, _blobs, _keep = entry
+        names = [self._steps[sid][0][index][2] for index in range(start, stop)]
+        if any(token in name.split(".")[1] for name in names for token in RANDOM_TOKENS):
+            segment.eager = True
+            return
+        tensors, pattern = self._inputs(entry)
+        if tensors is None:
+            return
+        started = self._variants.get(sid, 0)
+        if started >= MAX_VARIANTS:
+            segment.eager = True
+            self._notes.append(
+                f"letify: step {sid} reached {MAX_VARIANTS} compiled variants; it runs eagerly"
+            )
+            return
+        self._variants[sid] = started + 1
+        variant = _Variant(
+            pattern,
+            tuple(_meta(tensor) for tensor in tensors),
+            tuple(scalars),
+            segment.varying,
+            segment.candidates,
+        )
+        examples = [tensor.detach() for tensor in tensors]
+        segment.variant = None
+        segment.error = None
+        segment.thread = threading.Thread(
+            target=self._compile_variant,
+            args=(segment, variant, examples),
+            name="letify-compile",
+            daemon=True,
+        )
+        segment.thread.start()
+
+    def _compile_variant(self, segment, variant, examples) -> None:
+        """Trace and compile one segment variant. Runs in a thread of its own."""
+        try:
+            sid, start, stop = segment.key
+            torch = self.torch
+            function, survivors, persistent, drops, blobs = self._segment_function(
+                sid, start, stop, variant
+            )
+            flat = list(examples)
+            flat.extend(
+                torch.empty(shape, dtype=getattr(torch, dtype)) for _, dtype, shape in blobs
+            )
+            for slot in variant.varying:
+                value = variant.scalars[slot]
+                flat.append(
+                    torch.tensor(
+                        value, dtype=torch.float64 if type(value) is float else torch.int64
+                    )
+                )
+            mode, options = self._compilation
+            options = dict(options)
+            if mode in ("max-autotune", "max-autotune-no-cudagraphs"):
+                options.setdefault("max_autotune", True)
+            import torch._dynamo.config as dynamo_config
+            import torch._inductor.config as inductor_config
+            from torch._inductor.compile_fx import compile_fx
+            from torch._subclasses.fake_tensor import FakeTensorMode
+            from torch.fx.experimental.proxy_tensor import make_fx
+            from torch.fx.experimental.symbolic_shapes import ShapeEnv
+
+            # Tracing patches PyTorch's own state, so one compilation runs at a time.
+            with (
+                _COMPILE_LOCK,
+                dynamo_config.patch(capture_scalar_outputs=True),
+                inductor_config.patch(options),
+            ):
+                graph = make_fx(function, tracing_mode="symbolic")(*flat)
+                fake = FakeTensorMode(shape_env=ShapeEnv(), static_shapes=True)
+                compiled = compile_fx(graph, [fake.from_tensor(tensor) for tensor in flat])
+            variant.compiled = compiled
+            variant.survivors = survivors
+            variant.persistent = persistent
+            variant.drops = drops
+            variant.blobs = blobs
+            segment.variant = variant
+        except BaseException as exc:
+            segment.error = f"{type(exc).__name__}: {exc}".splitlines()[0]
+
+    def _segment_function(self, sid, start, stop, variant):
+        """The function replaying ``start`` to ``stop - 1`` of a step over a table of its own.
+
+        Returns it with the offsets of the survivors it returns, those of them no entry
+        releases, the carried offsets a replay would release, and the blobs it takes as
+        ``(index, dtype, shape)``.
+        """
+        ops, before, frees = self._steps[sid]
+        released = {offset for index in range(start, stop) for offset in frees[index]}
+        persistent = frozenset(
+            offset for offset in range(before[start], before[stop]) if offset not in released
+        )
+        survivors = tuple(
+            offset
+            for offset in range(before[start], before[stop])
+            if offset in persistent or offset in variant.candidates
+        )
+        drops = tuple(offset for offset in sorted(released) if offset < before[start])
+        # The blobs the segment reads: each builder asks its reader once per blob, with
+        # placeholders for its tensors, so the dtypes and shapes are known before tracing.
+        blobs: list = []
+        scalar = 0
+        blob = 0
+        for index in range(start, stop):
+            _fn, builder, _name, n_scalars, n_blobs, wiring, _news = ops[index]
+
+            def record(i, dtype, shape, base=blob):
+                blobs.append((base + i, dtype, tuple(shape)))
+                return self.torch.empty(shape, dtype=getattr(self.torch, dtype))
+
+            builder([None] * len(wiring), variant.scalars[scalar : scalar + n_scalars], record)
+            scalar += n_scalars
+            blob += n_blobs
+        position = {absolute: at for at, (absolute, _d, _s) in enumerate(blobs)}
+        n_inputs = len(set(variant.pattern))
+        n_blobs_total = len(blobs)
+        dense = self.torch.ops.aten._local_scalar_dense.default
+        torch_tensor = self.torch.Tensor
+        pattern = variant.pattern
+        varying = variant.varying
+        scalars = variant.scalars
+        first_created = before[start]
+
+        def function(*flat):
+            inputs = flat[:n_inputs]
+            blob_tensors = flat[n_inputs : n_inputs + n_blobs_total]
+            values = list(scalars)
+            for at, slot in enumerate(varying):
+                values[slot] = dense(flat[n_inputs + n_blobs_total + at])
+            local: dict = {}
+            handle = first_created
+            cursor = 0
+            scalar = 0
+            blob = 0
+            for index in range(start, stop):
+                fn, builder, _name, n_scalars, n_blobs, wiring, news = ops[index]
+                arguments = []
+                for offset in wiring:
+                    if offset >= first_created:
+                        arguments.append(local[offset])
+                    else:
+                        arguments.append(inputs[pattern[cursor]])
+                        cursor += 1
+
+                def read(i, _dtype, _shape, base=blob):
+                    return blob_tensors[position[base + i]]
+
+                args, kwargs = builder(
+                    arguments, values[scalar : scalar + n_scalars], read if n_blobs else None
+                )
+                scalar += n_scalars
+                blob += n_blobs
+                value = fn(*args, **kwargs)
+                if news:
+                    if isinstance(value, torch_tensor):
+                        if news[0]:
+                            local[handle] = value
+                            handle += 1
+                    else:
+                        leaves = [leaf for leaf in value if isinstance(leaf, torch_tensor)]
+                        for flag, leaf in zip(news, leaves, strict=True):
+                            if flag:
+                                local[handle] = leaf
+                                handle += 1
+            return tuple(local[offset] for offset in survivors)
+
+        return function, survivors, persistent, drops, tuple(blobs)
+
+    def _run_compiled(self, segment, variant, entry) -> bool:
+        _, sid, first, _start, _stop, _externals, scalars, blobs, keep = entry
+        torch = self.torch
+        tensors, _pattern = self._inputs(entry)
+        reader = self._blob_reader(blobs)
+        flat = list(tensors)
+        flat.extend(reader(index, dtype, shape) for index, dtype, shape in variant.blobs)
+        for slot in variant.varying:
+            value = scalars[slot]
+            flat.append(
+                torch.tensor(value, dtype=torch.float64 if type(value) is float else torch.int64)
+            )
+        self._current = f"compiled step {sid}"
+        try:
+            outputs = variant.compiled(*flat)
+        except BaseException:
+            segment.eager = True
+            raise
+        table = self.tensors
+        persistent = variant.persistent
+        for offset, tensor in zip(variant.survivors, outputs, strict=True):
+            if offset in persistent or offset in keep:
+                table[first + offset] = tensor
+        for offset in variant.drops:
+            if offset not in keep:
+                table.pop(first + offset, None)
+        self._compile_counts["runs"] += 1
+        return True
 
     def _describe(self, value):
         torch = self.torch
@@ -488,6 +879,11 @@ class Executor:
             if self.device.type == "cuda":
                 torch.cuda.empty_cache()
             return None
+        if name == "letify.compile":
+            self._compilation = (args[0], dict(args[1]))
+            return None
+        if name == "letify.compile_stats":
+            return self.compile_stats(bool(args[0]))
         if name == "letify.kernel":
             return self.kernel(*args)
         raise ValueError(f"unknown request {name}")

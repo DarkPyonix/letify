@@ -537,7 +537,7 @@ def test_a_dataloader_with_pin_memory_feeds_non_blocking_uploads(monkeypatch) ->
 # -- Spec: Compilation --------------------------------------------------------------
 
 
-def test_torch_compile_returns_the_module_and_warns_that_it_runs_eagerly(
+def test_torch_compile_returns_the_module_and_warns_that_the_runtime_compiles_steps(
     client, monkeypatch
 ) -> None:
     import warnings
@@ -547,7 +547,7 @@ def test_torch_compile_returns_the_module_and_warns_that_it_runs_eagerly(
     _forbid_local_cuda(monkeypatch)
     monkeypatch.setattr(mapping, "_COMPILE_WARNED", [False])
     model = torch.nn.Linear(4, 2).cuda()
-    with pytest.warns(UserWarning, match="host='local'"):
+    with pytest.warns(UserWarning, match="host='local'.*captured step.*on the runtime"):
         compiled = torch.compile(model)
     assert compiled is model
     with warnings.catch_warnings():

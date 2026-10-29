@@ -659,33 +659,42 @@ def host_replacements() -> dict[tuple[Any, str], Any]:
     return table
 
 
-#: Whether this process has warned that ``torch.compile`` runs eagerly, as a mutable cell.
+#: Whether this process has warned that ``torch.compile`` compiles on the runtime, as a cell.
 _COMPILE_WARNED = [False]
 
 
-def _warn_compile() -> None:
-    if _COMPILE_WARNED[0]:
+def _request_compile(kwargs: dict) -> None:
+    """Warn once and ask the runtime to compile captured steps, as spec "Compilation" says."""
+    if kwargs.get("disable") or kwargs.get("backend", "inductor") != "inductor":
         return
-    _COMPILE_WARNED[0] = True
-    warnings.warn(
-        "torch.compile runs eagerly under host='local': compilation needs a CUDA driver in "
-        "this process, and the runtime already receives each repeated step as one entry",
-        UserWarning,
-        stacklevel=3,
-    )
+    if not _COMPILE_WARNED[0]:
+        _COMPILE_WARNED[0] = True
+        warnings.warn(
+            "torch.compile under host='local' returns the model unchanged: each captured step "
+            "is compiled on the runtime with Inductor, because compilation needs a CUDA driver "
+            "this process does not have",
+            UserWarning,
+            stacklevel=4,
+        )
+    client = current_client()
+    if client is not None and not client.compile_requested:
+        client.compile_requested = True
+        client.call(
+            "letify.compile", kwargs.get("mode"), dict(kwargs.get("options") or {}), reply=False
+        )
 
 
 def compile_replacements() -> dict[tuple[Any, str], Any]:
     """``torch.compile`` and ``Module.compile`` as spec "Compilation" describes."""
 
     def compile(model: Any = None, *args: Any, **kwargs: Any) -> Any:
-        _warn_compile()
+        _request_compile(kwargs)
         if model is None:
             return lambda function: function
         return model
 
     def module_compile(self: torch.nn.Module, *args: Any, **kwargs: Any) -> None:
-        _warn_compile()
+        _request_compile(kwargs)
 
     return {(torch, "compile"): compile, (torch.nn.Module, "compile"): module_compile}
 
