@@ -14,7 +14,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::io;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -43,8 +43,14 @@ pub fn new_token() -> [u8; TOKEN_LEN] {
 /// Settings of a relay, chosen by its operator.
 #[derive(Clone, Debug)]
 pub struct RelayConfig {
-    /// Time a client has to finish the handshake and send its request. Default 10 s.
+    /// Time a client has to finish the handshake and send its request, together. Default 4 s.
     pub handshake_timeout: Duration,
+    /// Unauthenticated connections held at once, whoever they come from. Default 64.
+    pub max_preauth: usize,
+    /// Unauthenticated connections held at once from one source address. Default 4.
+    pub max_preauth_per_ip: usize,
+    /// Waiting requests held at once, all clients together. Default 4096.
+    pub max_waiting: usize,
     /// Time a request waits for its counterpart. Default 30 s.
     pub pair_timeout: Duration,
     /// Waiting requests one client may hold. Default 64, sized for a hub that serves many
@@ -66,7 +72,10 @@ pub struct RelayConfig {
 impl Default for RelayConfig {
     fn default() -> Self {
         RelayConfig {
-            handshake_timeout: Duration::from_secs(10),
+            handshake_timeout: Duration::from_secs(4),
+            max_preauth: 64,
+            max_preauth_per_ip: 4,
+            max_waiting: 4096,
             pair_timeout: Duration::from_secs(30),
             max_pending: 64,
             buffer_bytes: 16 << 10,
@@ -175,6 +184,51 @@ struct Inner {
     waiting: Mutex<HashMap<PairKey, Waiting>>,
     shares: Mutex<HashMap<NodeId, Arc<ClientShare>>>,
     serial: AtomicU64,
+    preauth: Preauth,
+}
+
+/// The budget of connections that have not yet sent a request.
+struct Preauth {
+    slots: Arc<Semaphore>,
+    per_ip: Mutex<HashMap<IpAddr, usize>>,
+}
+
+/// A held unauthenticated slot, released on drop (or when the request has been read).
+struct PreauthGuard {
+    inner: Arc<Inner>,
+    ip: IpAddr,
+    _permit: tokio::sync::OwnedSemaphorePermit,
+}
+
+impl Drop for PreauthGuard {
+    fn drop(&mut self) {
+        let mut map = self.inner.preauth.per_ip.lock().unwrap();
+        if let Some(n) = map.get_mut(&self.ip) {
+            *n -= 1;
+            if *n == 0 {
+                map.remove(&self.ip);
+            }
+        }
+    }
+}
+
+impl Inner {
+    /// Take an unauthenticated slot for a connection from `ip`, or none when either the global
+    /// or the per-address budget is spent.
+    fn preauth_slot(self: &Arc<Self>, ip: IpAddr) -> Option<PreauthGuard> {
+        let permit = self.preauth.slots.clone().try_acquire_owned().ok()?;
+        let mut map = self.preauth.per_ip.lock().unwrap();
+        let n = map.entry(ip).or_insert(0);
+        if *n >= self.cfg.max_preauth_per_ip {
+            return None;
+        }
+        *n += 1;
+        Some(PreauthGuard {
+            inner: self.clone(),
+            ip,
+            _permit: permit,
+        })
+    }
 }
 
 /// A relay bound to a TCP address.
@@ -202,6 +256,7 @@ impl Relay {
                 !e.revoked.contains(&id) && (e.allowed.contains(&id) || policy.accepts(&id))
             })
         };
+        let cfg_preauth = cfg.max_preauth;
         let link = Config {
             handshake_timeout: cfg.handshake_timeout,
             ..Config::default()
@@ -218,6 +273,10 @@ impl Relay {
                 waiting: Mutex::new(HashMap::new()),
                 shares: Mutex::new(HashMap::new()),
                 serial: AtomicU64::new(0),
+                preauth: Preauth {
+                    slots: Arc::new(Semaphore::new(cfg_preauth)),
+                    per_ip: Mutex::new(HashMap::new()),
+                },
             }),
         })
     }
@@ -256,7 +315,7 @@ impl Relay {
     pub async fn run(self) {
         let slots = Arc::new(Semaphore::new(self.inner.cfg.max_connections));
         loop {
-            let Ok((tcp, _)) = self.listener.accept().await else {
+            let Ok((tcp, peer_addr)) = self.listener.accept().await else {
                 // Accept errors such as too many open files are transient.
                 tokio::time::sleep(Duration::from_millis(50)).await;
                 continue;
@@ -264,9 +323,13 @@ impl Relay {
             let Ok(permit) = slots.clone().try_acquire_owned() else {
                 continue;
             };
+            // A connection over the unauthenticated budget is closed with no reply.
+            let Some(guard) = self.inner.preauth_slot(peer_addr.ip()) else {
+                continue;
+            };
             let inner = self.inner.clone();
             tokio::spawn(async move {
-                let _ = serve(inner, tcp).await;
+                let _ = serve(inner, tcp, guard).await;
                 drop(permit);
             });
         }
@@ -360,16 +423,23 @@ async fn status(conn: &mut Conn, ok: bool, reason: &str) -> io::Result<()> {
     write_record(&mut conn.tcp, &conn.crypto, &plain).await
 }
 
-async fn serve(inner: Arc<Inner>, mut tcp: TcpStream) -> io::Result<()> {
+async fn serve(inner: Arc<Inner>, mut tcp: TcpStream, guard: PreauthGuard) -> io::Result<()> {
     crate::tcp::tune(&tcp)?;
-    // A client the policy refuses, or one that is not speaking the handshake, is just closed.
-    let est = handshake::respond(&mut tcp, &inner.identity, &inner.policy, &inner.link)
-        .await
-        .map_err(io_err)?;
+    // The handshake and the request share one deadline. A client the policy refuses, or one
+    // that is not speaking the handshake, is just closed.
+    let deadline = Instant::now() + inner.cfg.handshake_timeout;
+    let est = tokio::time::timeout_at(
+        deadline,
+        handshake::respond(&mut tcp, &inner.identity, &inner.policy, &inner.link),
+    )
+    .await
+    .map_err(|_| io_err("no handshake"))?
+    .map_err(io_err)?;
     let crypto = est.crypto;
-    let request = tokio::time::timeout(inner.cfg.handshake_timeout, read_record(&mut tcp, &crypto))
+    let request = tokio::time::timeout_at(deadline, read_record(&mut tcp, &crypto))
         .await
         .map_err(|_| io_err("no request"))??;
+    drop(guard);
     if request.len() != 32 + TOKEN_LEN {
         return Err(io_err("malformed request"));
     }
@@ -403,6 +473,8 @@ async fn serve(inner: Arc<Inner>, mut tcp: TcpStream) -> io::Result<()> {
             )
         } else if waiting.keys().filter(|k| k.0 == me).count() >= inner.cfg.max_pending {
             Next::Refuse(mine, "too many waiting requests")
+        } else if waiting.len() >= inner.cfg.max_waiting {
+            Next::Refuse(mine, "the relay has too many waiting requests")
         } else {
             let serial = inner.serial.fetch_add(1, Ordering::Relaxed);
             // The waiting entry owns the connection until the counterpart arrives or it times out.
