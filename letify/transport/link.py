@@ -44,6 +44,10 @@ class Link:
         """A stream the probe can run over, or None when this link cannot carry it."""
         return None
 
+    def spare_connections(self) -> int:
+        """Connections handed out with no rendezvous. Spec "Several connections at once"."""
+        return 0
+
     def ssh_command(self, remote_command: str | None = None) -> list[str]:
         raise RuntimeFailure(f"the {self.strategy} link carries no SSH session")
 
@@ -149,6 +153,11 @@ class PunchedLink(Link):
             if sock is None and self._spares:
                 sock = self._spares.pop(0)
         return sock if sock is not None else self._redial()
+
+    def spare_connections(self) -> int:
+        """The spare sockets of the punch that no SSH command has taken yet."""
+        with self._lock:
+            return len(self._spares)
 
     def ssh_command(self, remote_command: str | None = None) -> list[str]:
         listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
