@@ -74,7 +74,13 @@ impl<T> Gated<T> {
     pub fn new(inner: T) -> (Self, Gate) {
         let gate = Gate::default();
         gate.open.store(true, Ordering::SeqCst);
-        (Self { inner, gate: gate.clone() }, gate)
+        (
+            Self {
+                inner,
+                gate: gate.clone(),
+            },
+            gate,
+        )
     }
 }
 
@@ -119,7 +125,11 @@ pub struct Tamper<T> {
 
 impl<T> Tamper<T> {
     pub fn new(inner: T, offset: usize) -> Self {
-        Self { inner, offset, written: 0 }
+        Self {
+            inner,
+            offset,
+            written: 0,
+        }
     }
 }
 
@@ -192,7 +202,11 @@ impl Proxy {
                 }
             }
         });
-        Proxy { addr, conns, accept }
+        Proxy {
+            addr,
+            conns,
+            accept,
+        }
     }
 
     pub fn cut(&self) {

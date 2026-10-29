@@ -11,14 +11,16 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::time::timeout;
 
 #[tokio::test(flavor = "multi_thread")]
-async fn a_session_survives_its_only_subflow_dying_and_resumes_on_a_new_one_without_losing_bytes()
-{
+async fn a_session_survives_its_only_subflow_dying_and_resumes_on_a_new_one_without_losing_bytes() {
     let a_id = Identity::generate();
     let b_id = Identity::generate();
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let target = listener.local_addr().unwrap();
     let proxy = Proxy::to(target).await;
-    let config = Config { resume_window: Duration::from_secs(60), ..Config::default() };
+    let config = Config {
+        resume_window: Duration::from_secs(60),
+        ..Config::default()
+    };
 
     let responder = tokio::spawn({
         let (b_id, a_node, config) = (b_id.clone(), a_id.node_id(), config.clone());
@@ -31,7 +33,9 @@ async fn a_session_survives_its_only_subflow_dying_and_resumes_on_a_new_one_with
         }
     });
     let tcp = TcpStream::connect(proxy.addr).await.unwrap();
-    let a = Session::connect(tcp, &a_id, b_id.node_id(), config).await.unwrap();
+    let a = Session::connect(tcp, &a_id, b_id.node_id(), config)
+        .await
+        .unwrap();
     let (b, listener) = responder.await.unwrap();
 
     let total = 8 << 20;
@@ -68,7 +72,10 @@ async fn a_session_survives_its_only_subflow_dying_and_resumes_on_a_new_one_with
 
     // Every byte arrives, and the writer saw no error at any point.
     let mut rest = Vec::new();
-    timeout(Duration::from_secs(60), sb.read_to_end(&mut rest)).await.unwrap().unwrap();
+    timeout(Duration::from_secs(60), sb.read_to_end(&mut rest))
+        .await
+        .unwrap()
+        .unwrap();
     got.extend_from_slice(&rest);
     writer.await.unwrap();
     assert_eq!(got.len(), total);
@@ -82,16 +89,23 @@ async fn a_session_that_gets_no_new_subflow_within_the_window_fails_streams_with
     let b_id = Identity::generate();
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let proxy = Proxy::to(listener.local_addr().unwrap()).await;
-    let config = Config { resume_window: Duration::from_millis(300), ..Config::default() };
+    let config = Config {
+        resume_window: Duration::from_millis(300),
+        ..Config::default()
+    };
     let responder = tokio::spawn({
         let (b_id, a_node, config) = (b_id.clone(), a_id.node_id(), config.clone());
         async move {
             let (tcp, _) = listener.accept().await.unwrap();
-            Session::accept(tcp, &b_id, PeerPolicy::allow(vec![a_node]), config).await.unwrap()
+            Session::accept(tcp, &b_id, PeerPolicy::allow(vec![a_node]), config)
+                .await
+                .unwrap()
         }
     });
     let tcp = TcpStream::connect(proxy.addr).await.unwrap();
-    let a = Session::connect(tcp, &a_id, b_id.node_id(), config).await.unwrap();
+    let a = Session::connect(tcp, &a_id, b_id.node_id(), config)
+        .await
+        .unwrap();
     let b = responder.await.unwrap();
 
     let mut s = a.open_stream().await.unwrap();
@@ -102,14 +116,33 @@ async fn a_session_that_gets_no_new_subflow_within_the_window_fails_streams_with
 
     proxy.cut();
     // Within the window the stream only pauses: the read is still pending.
-    assert!(timeout(Duration::from_millis(100), sb.read(&mut buf)).await.is_err());
+    assert!(
+        timeout(Duration::from_millis(100), sb.read(&mut buf))
+            .await
+            .is_err()
+    );
 
     // After the window it fails with an error that says the connection was lost.
-    let err = timeout(Duration::from_secs(5), sb.read(&mut buf)).await.unwrap().unwrap_err();
-    assert!(matches!(Error::from_io(&err), Some(Error::ConnectionLost(_))), "{err:?}");
-    let err = timeout(Duration::from_secs(5), s.write_all(b"after")).await.unwrap().unwrap_err();
-    assert!(matches!(Error::from_io(&err), Some(Error::ConnectionLost(_))), "{err:?}");
-    assert!(matches!(a.accept_stream().await, Err(Error::ConnectionLost(_))));
+    let err = timeout(Duration::from_secs(5), sb.read(&mut buf))
+        .await
+        .unwrap()
+        .unwrap_err();
+    assert!(
+        matches!(Error::from_io(&err), Some(Error::ConnectionLost(_))),
+        "{err:?}"
+    );
+    let err = timeout(Duration::from_secs(5), s.write_all(b"after"))
+        .await
+        .unwrap()
+        .unwrap_err();
+    assert!(
+        matches!(Error::from_io(&err), Some(Error::ConnectionLost(_))),
+        "{err:?}"
+    );
+    assert!(matches!(
+        a.accept_stream().await,
+        Err(Error::ConnectionLost(_))
+    ));
     assert!(Error::ConnectionLost("x".into()).is_infrastructure());
 }
 

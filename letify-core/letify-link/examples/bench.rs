@@ -15,7 +15,11 @@ async fn run(subflows: usize) -> f64 {
     let b_id = Identity::generate();
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    let config = Config { max_unacked_bytes: 32 << 20, stream_window: 16 << 20, ..Config::default() };
+    let config = Config {
+        max_unacked_bytes: 32 << 20,
+        stream_window: 16 << 20,
+        ..Config::default()
+    };
     let responder = tokio::spawn({
         let (b_id, a_node, config) = (b_id.clone(), a_id.node_id(), config.clone());
         async move {
@@ -30,11 +34,18 @@ async fn run(subflows: usize) -> f64 {
             b
         }
     });
-    let a = Session::connect(TcpStream::connect(addr).await.unwrap(), &a_id, b_id.node_id(), config)
-        .await
-        .unwrap();
+    let a = Session::connect(
+        TcpStream::connect(addr).await.unwrap(),
+        &a_id,
+        b_id.node_id(),
+        config,
+    )
+    .await
+    .unwrap();
     for _ in 1..subflows {
-        a.add_subflow(TcpStream::connect(addr).await.unwrap()).await.unwrap();
+        a.add_subflow(TcpStream::connect(addr).await.unwrap())
+            .await
+            .unwrap();
     }
     let b = responder.await.unwrap();
 
@@ -63,6 +74,9 @@ async fn run(subflows: usize) -> f64 {
 async fn main() {
     for subflows in [1, 4] {
         let rate = run(subflows).await;
-        println!("{subflows} subflow(s): {rate:.0} MiB/s over {} MiB", TOTAL >> 20);
+        println!(
+            "{subflows} subflow(s): {rate:.0} MiB/s over {} MiB",
+            TOTAL >> 20
+        );
     }
 }

@@ -29,7 +29,9 @@ async fn each_side_learns_the_other_sides_node_id() {
     let responder = tokio::spawn(async move {
         Session::accept(tb, &bb, PeerPolicy::allow(vec![a_id]), Config::default()).await
     });
-    let initiator = Session::connect(ta, &a, b.node_id(), Config::default()).await.unwrap();
+    let initiator = Session::connect(ta, &a, b.node_id(), Config::default())
+        .await
+        .unwrap();
     let responder = responder.await.unwrap().unwrap();
     assert_eq!(initiator.peer(), b.node_id());
     assert_eq!(responder.peer(), a.node_id());
@@ -43,7 +45,13 @@ async fn an_unknown_initiator_key_is_refused() {
     let (ta, tb) = duplex_pair();
     let bb = b.clone();
     let responder = tokio::spawn(async move {
-        Session::accept(tb, &bb, PeerPolicy::allow(vec![known.node_id()]), Config::default()).await
+        Session::accept(
+            tb,
+            &bb,
+            PeerPolicy::allow(vec![known.node_id()]),
+            Config::default(),
+        )
+        .await
     });
     let initiator = Session::connect(ta, &stranger, b.node_id(), Config::default()).await;
     assert!(initiator.is_err());
@@ -60,10 +68,17 @@ async fn a_policy_callback_decides_which_initiators_are_accepted() {
     let (ta, tb) = duplex_pair();
     let (bb, a_id) = (b.clone(), a.node_id());
     let responder = tokio::spawn(async move {
-        Session::accept(tb, &bb, PeerPolicy::from_fn(move |id| *id == a_id), Config::default())
-            .await
+        Session::accept(
+            tb,
+            &bb,
+            PeerPolicy::from_fn(move |id| *id == a_id),
+            Config::default(),
+        )
+        .await
     });
-    Session::connect(ta, &a, b.node_id(), Config::default()).await.unwrap();
+    Session::connect(ta, &a, b.node_id(), Config::default())
+        .await
+        .unwrap();
     responder.await.unwrap().unwrap();
 }
 
@@ -96,7 +111,9 @@ async fn a_caller_supplied_ed25519_secret_key_gives_the_same_node_id_every_time(
     let responder = tokio::spawn(async move {
         Session::accept(tb, &bb, PeerPolicy::allow(vec![id]), Config::default()).await
     });
-    Session::connect(ta, &one, b.node_id(), Config::default()).await.unwrap();
+    Session::connect(ta, &one, b.node_id(), Config::default())
+        .await
+        .unwrap();
     responder.await.unwrap().unwrap();
 }
 
@@ -109,8 +126,14 @@ async fn a_tampered_version_header_fails_the_handshake() {
     // 2..=3 and the tamper turns the highest into 2. The responder still finds a common
     // version, so only the prologue binding can reject the handshake.
     let ta = Tamper::new(ta, 7);
-    let offered = Config { versions: 2..=3, ..Config::default() };
-    let supported = Config { versions: 1..=3, ..Config::default() };
+    let offered = Config {
+        versions: 2..=3,
+        ..Config::default()
+    };
+    let supported = Config {
+        versions: 1..=3,
+        ..Config::default()
+    };
     let (bb, a_id) = (b.clone(), a.node_id());
     let responder = tokio::spawn(async move {
         Session::accept(tb, &bb, PeerPolicy::allow(vec![a_id]), supported).await
@@ -125,8 +148,14 @@ async fn mismatched_versions_are_refused_naming_both() {
     let a = Identity::generate();
     let b = Identity::generate();
     let (ta, tb) = duplex_pair();
-    let ours = Config { versions: 3..=4, ..Config::default() };
-    let theirs = Config { versions: 1..=2, ..Config::default() };
+    let ours = Config {
+        versions: 3..=4,
+        ..Config::default()
+    };
+    let theirs = Config {
+        versions: 1..=2,
+        ..Config::default()
+    };
     let (bb, a_id) = (b.clone(), a.node_id());
     let responder = tokio::spawn(async move {
         Session::accept(tb, &bb, PeerPolicy::allow(vec![a_id]), theirs).await
@@ -144,7 +173,10 @@ async fn mismatched_versions_are_refused_naming_both() {
     }
     let text = err.to_string();
     assert!(text.contains("3..=4") && text.contains("1..=2"), "{text}");
-    assert!(matches!(responder.await.unwrap(), Err(Error::VersionMismatch { .. })));
+    assert!(matches!(
+        responder.await.unwrap(),
+        Err(Error::VersionMismatch { .. })
+    ));
 }
 
 #[tokio::test]
@@ -152,8 +184,14 @@ async fn the_highest_common_version_is_chosen() {
     let a = Identity::generate();
     let b = Identity::generate();
     let (ta, tb) = duplex_pair();
-    let ours = Config { versions: 1..=5, ..Config::default() };
-    let theirs = Config { versions: 3..=9, ..Config::default() };
+    let ours = Config {
+        versions: 1..=5,
+        ..Config::default()
+    };
+    let theirs = Config {
+        versions: 3..=9,
+        ..Config::default()
+    };
     let (bb, a_id) = (b.clone(), a.node_id());
     let responder = tokio::spawn(async move {
         Session::accept(tb, &bb, PeerPolicy::allow(vec![a_id]), theirs).await
