@@ -30,8 +30,8 @@
 //!
 //! # What it does not own yet
 //!
-//! UDP paths, the relay role, the `letify-link` sidecar
-//! and the Python binding. The caller supplies the candidate dialers.
+//! UDP paths, the `letify-link` sidecar control protocol and the Python binding. The relay
+//! role is the Cargo feature `relay` ([`relay`]). The caller supplies the candidate dialers.
 //!
 //! # Errors
 //!
@@ -50,6 +50,8 @@ mod paths;
 pub mod policing;
 pub mod punch;
 pub mod record;
+#[cfg(feature = "relay")]
+pub mod relay;
 pub mod rendezvous;
 mod replay;
 mod session;
