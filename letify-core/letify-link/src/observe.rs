@@ -10,9 +10,9 @@
 //! (2 bytes big endian), the observed IP (4 or 16 bytes) and a 64 byte ed25519 signature by the
 //! responder over `letify-link qad v1`, the nonce and every earlier byte of the reply.
 
+use std::collections::HashMap;
 use std::future::Future;
 use std::io;
-use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::pin::Pin;
 use std::sync::Arc;

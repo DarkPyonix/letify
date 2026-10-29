@@ -601,3 +601,131 @@ async fn a_tcp_stream_socket_needs_its_secret_and_ignores_a_stray_connection() {
     local_b.read_exact(&mut first).await.unwrap();
     assert_eq!(&first, b"x");
 }
+
+#[tokio::test]
+async fn a_silent_connection_does_not_delay_the_one_that_authenticates() {
+    let (_child, ready, _dir) = start_unconnected("tcp").await;
+    let token = ready["token"].as_str().unwrap();
+    let addr = ready["control"]
+        .as_str()
+        .unwrap()
+        .strip_prefix("tcp:")
+        .unwrap()
+        .to_string();
+    // The silent connection comes first and holds the 5 s authentication window.
+    let _silent = TcpStream::connect(&addr).await.unwrap();
+    let mut good = TcpStream::connect(&addr).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(2), authenticate(&mut good, token))
+        .await
+        .expect("the silent connection delayed the right one");
+}
+
+/// Run `letify-link serve` until it exits and return whether it succeeded and what it printed
+/// on standard error. A sidecar that starts instead is killed and reported as a success.
+async fn serve_outcome(control: &str, key: &str, extra: &[&str]) -> (bool, String) {
+    let mut child = Command::new(BIN)
+        .args(["serve", "--control", control, "--key", key])
+        .args(extra)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    let mut err = child.stderr.take().unwrap();
+    let mut lines = BufReader::new(child.stdout.take().unwrap()).lines();
+    tokio::select! {
+        _ = lines.next_line() => (true, String::new()),
+        status = child.wait() => {
+            let mut text = String::new();
+            let _ = err.read_to_string(&mut text).await;
+            (status.unwrap().success(), text)
+        }
+        _ = tokio::time::sleep(Duration::from_secs(10)) => panic!("neither ready nor exited"),
+    }
+}
+
+fn mode(path: &std::path::Path) -> u32 {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(path).unwrap().permissions().mode() & 0o7777
+}
+
+fn set_mode(path: &std::path::Path, bits: u32) {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(bits)).unwrap();
+}
+
+#[tokio::test]
+async fn a_control_directory_that_others_can_write_is_refused() {
+    let dir = tempdir::Dir::new();
+    let key = dir.path().join("key");
+    set_mode(dir.path(), 0o777);
+    let control = dir.path().join("c");
+    let (ok, err) = serve_outcome(control.to_str().unwrap(), key.to_str().unwrap(), &[]).await;
+    assert!(!ok, "started in a world writable directory");
+    assert!(err.contains(dir.path().to_str().unwrap()), "{err}");
+    // With the sticky bit, as /tmp has, it is accepted.
+    set_mode(dir.path(), 0o1777);
+    let (ok, _) = serve_outcome(control.to_str().unwrap(), key.to_str().unwrap(), &[]).await;
+    assert!(ok);
+}
+
+#[tokio::test]
+async fn a_stream_directory_that_others_can_write_is_refused() {
+    let dir = tempdir::Dir::new();
+    let streams = dir.path().join("streams");
+    std::fs::create_dir(&streams).unwrap();
+    set_mode(&streams, 0o775);
+    let key = dir.path().join("key");
+    let control = dir.path().join("c");
+    let (ok, err) = serve_outcome(
+        control.to_str().unwrap(),
+        key.to_str().unwrap(),
+        &["--stream-dir", streams.to_str().unwrap()],
+    )
+    .await;
+    assert!(!ok);
+    assert!(err.contains("streams"), "{err}");
+}
+
+#[tokio::test]
+async fn the_control_socket_is_private_and_so_is_the_directory_of_a_stream_socket() {
+    let (mut a, _b, sa, _sb) = pair_over_tcp(None).await;
+    let control = a.control.strip_prefix("unix:").unwrap().to_string();
+    assert_eq!(mode(std::path::Path::new(&control)), 0o600);
+    let st = a.ok(json!({"op": "open_stream", "session": sa})).await;
+    let socket = st["socket"]
+        .as_str()
+        .unwrap()
+        .strip_prefix("unix:")
+        .unwrap();
+    let socket = std::path::Path::new(socket);
+    assert_eq!(mode(socket), 0o600);
+    assert_eq!(mode(socket.parent().unwrap()), 0o700);
+    // No leftover private directory of the control socket stays beside it.
+    let beside: Vec<_> = std::fs::read_dir(std::path::Path::new(&control).parent().unwrap())
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    assert!(
+        beside
+            .iter()
+            .all(|n| n == "c" || n == "key" || n.starts_with("ll-")),
+        "{beside:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_key_file_that_others_can_read_is_refused() {
+    let dir = tempdir::Dir::new();
+    let key = dir.path().join("key");
+    std::fs::write(&key, "ab".repeat(32)).unwrap();
+    let control = dir.path().join("c");
+    set_mode(&key, 0o644);
+    let (ok, err) = serve_outcome(control.to_str().unwrap(), key.to_str().unwrap(), &[]).await;
+    assert!(!ok, "loaded a world readable key");
+    assert!(err.contains("chmod 600"), "{err}");
+    set_mode(&key, 0o600);
+    let (ok, _) = serve_outcome(control.to_str().unwrap(), key.to_str().unwrap(), &[]).await;
+    assert!(ok);
+}
