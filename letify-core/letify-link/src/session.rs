@@ -11,11 +11,11 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::task::Waker;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use snow::StatelessTransportState;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
-use tokio::sync::Notify;
+use tokio::sync::{Notify, watch};
 use tokio::task::AbortHandle;
 
 use crate::config::Config;
@@ -38,9 +38,37 @@ pub(crate) struct Sent {
     on: Option<u64>,
 }
 
+/// Identifies a subflow within its session. Ids are never reused.
+pub type SubflowId = u64;
+
+/// Identifies a session: the first 16 bytes of its handshake hash.
+pub type SessionId = [u8; 16];
+
+/// What the session measured on one subflow.
+#[derive(Clone, Debug)]
+pub struct SubflowStats {
+    /// The id that [`Session::add_subflow`] returned.
+    pub id: SubflowId,
+    /// Bytes written to the subflow, record headers included.
+    pub sent_bytes: u64,
+    /// Bytes read from the subflow, record headers included.
+    pub received_bytes: u64,
+    /// Bytes of frames sent on this subflow that the peer acknowledged.
+    pub acked_bytes: u64,
+    /// Round trip of the latest keepalive answered on this subflow, if any.
+    pub rtt: Option<Duration>,
+}
+
+const NO_RTT: u64 = u64::MAX;
+
 pub(crate) struct Sub {
     inflight: usize,
     sent: Arc<AtomicU64>,
+    received: Arc<AtomicU64>,
+    acked: u64,
+    rtt_us: Arc<AtomicU64>,
+    /// A Ping stamp waiting to be answered by this subflow's writer.
+    pong: Option<u64>,
     notify: Arc<Notify>,
     aborts: Vec<AbortHandle>,
 }
@@ -170,6 +198,7 @@ impl State {
             self.unacked_bytes -= sent.bytes.len();
             if let Some(sub) = sent.on.and_then(|id| self.subflows.get_mut(&id)) {
                 sub.inflight = sub.inflight.saturating_sub(sent.bytes.len());
+                sub.acked += sent.bytes.len() as u64;
             }
         }
         self.pending = self.pending.split_off(&next);
@@ -180,6 +209,8 @@ impl State {
     fn handle(&mut self, frame: Frame, accept: &Notify) {
         match frame {
             Frame::Ack { next } | Frame::Hello { next } => self.apply_ack(next),
+            // Keepalives are answered by the subflow's reader, which knows the subflow.
+            Frame::Ping { .. } | Frame::Pong { .. } => {}
             Frame::Seq { seq, .. } if seq < self.recv_next => {
                 self.ack_dirty = true;
                 self.wake_subflows();
@@ -267,7 +298,11 @@ pub(crate) struct Shared {
     cfg: Config,
     peer: NodeId,
     version: u16,
-    session_id: [u8; 16],
+    session_id: SessionId,
+    /// Counts every change in the set of subflows, so a path manager can wait for one.
+    changes: watch::Sender<u64>,
+    /// Origin of the keepalive stamps.
+    origin: Instant,
 }
 
 /// Closes the session when the last handle goes away.
@@ -298,8 +333,17 @@ impl Shared {
         for (_, sub) in st.subflows.drain() {
             sub.aborts.iter().for_each(AbortHandle::abort);
         }
+        self.bump();
         st.wake_all_streams();
         self.accept.notify_waiters();
+    }
+
+    fn bump(&self) {
+        self.changes.send_modify(|n| *n += 1);
+    }
+
+    fn stamp(&self) -> u64 {
+        self.origin.elapsed().as_micros() as u64
     }
 
     fn subflow_died(self: &Arc<Self>, id: u64) {
@@ -307,6 +351,7 @@ impl Shared {
         let Some(sub) = st.subflows.remove(&id) else {
             return;
         };
+        self.bump();
         sub.aborts.iter().for_each(AbortHandle::abort);
         // Everything sent on the dead subflow and not acknowledged goes out again.
         let lost: Vec<u64> = st
@@ -379,17 +424,25 @@ impl Shared {
         Ok(Some(out))
     }
 
-    fn start_subflow<T: Transport>(self: &Arc<Self>, t: T) -> Result<()> {
+    fn start_subflow<T: Transport>(self: &Arc<Self>, t: T) -> Result<SubflowId> {
         let (rd, wr) = tokio::io::split(t);
         let notify = Arc::new(Notify::new());
         let sent = Arc::new(AtomicU64::new(0));
+        let received = Arc::new(AtomicU64::new(0));
+        let rtt_us = Arc::new(AtomicU64::new(NO_RTT));
         let mut st = self.lock();
         if let Some(why) = &st.failed {
             return Err(Error::ConnectionLost(why.clone()));
         }
         let id = st.next_sub_id;
         st.next_sub_id += 1;
-        let reader = tokio::spawn(reader_task(self.clone(), id, rd));
+        let reader = tokio::spawn(reader_task(
+            self.clone(),
+            id,
+            rd,
+            received.clone(),
+            rtt_us.clone(),
+        ));
         let writer = tokio::spawn(writer_task(
             self.clone(),
             id,
@@ -403,31 +456,70 @@ impl Shared {
             Sub {
                 inflight: 0,
                 sent,
+                received,
+                acked: 0,
+                rtt_us,
+                pong: None,
                 notify,
                 aborts,
             },
         );
         // A new subflow cancels any running resume timer.
         st.epoch += 1;
-        Ok(())
+        self.bump();
+        Ok(id)
     }
 }
 
-async fn reader_task<R: AsyncRead + Unpin>(shared: Arc<Shared>, id: u64, rd: R) {
+/// Read one record: its nonce and ciphertext.
+async fn read_record<R: AsyncRead + Unpin>(rd: &mut R) -> std::io::Result<(u64, Vec<u8>)> {
+    let mut head = [0u8; RECORD_HDR];
+    rd.read_exact(&mut head).await?;
+    let len = u16::from_be_bytes([head[0], head[1]]) as usize;
+    let nonce = u64::from_be_bytes(head[2..].try_into().unwrap());
+    let mut ct = vec![0u8; len];
+    rd.read_exact(&mut ct).await?;
+    Ok((nonce, ct))
+}
+
+async fn reader_task<R: AsyncRead + Unpin>(
+    shared: Arc<Shared>,
+    id: u64,
+    rd: R,
+    received: Arc<AtomicU64>,
+    rtt_us: Arc<AtomicU64>,
+) {
     let mut rd = BufReader::with_capacity(128 * 1024, rd);
+    // A subflow that delivers no record for three keepalive intervals is dead.
+    let limit = shared.cfg.keepalive_interval * 3;
     let result: Result<()> = async {
         loop {
-            let mut head = [0u8; RECORD_HDR];
-            rd.read_exact(&mut head).await?;
-            let len = u16::from_be_bytes([head[0], head[1]]) as usize;
-            let nonce = u64::from_be_bytes(head[2..].try_into().unwrap());
-            let mut ct = vec![0u8; len];
-            rd.read_exact(&mut ct).await?;
+            let (nonce, ct) = if limit.is_zero() {
+                read_record(&mut rd).await?
+            } else {
+                tokio::time::timeout(limit, read_record(&mut rd))
+                    .await
+                    .map_err(|_| {
+                        Error::ConnectionLost("no record for 3 keepalive intervals".into())
+                    })??
+            };
+            received.fetch_add((RECORD_HDR + ct.len()) as u64, Ordering::Relaxed);
             let Some(plain) = shared.open(nonce, &ct)? else {
                 continue;
             };
-            let frame = frame::decode(plain)?;
-            shared.lock().handle(frame, &shared.accept);
+            match frame::decode(plain)? {
+                Frame::Ping { stamp } => {
+                    if let Some(sub) = shared.lock().subflows.get_mut(&id) {
+                        sub.pong = Some(stamp);
+                        sub.notify.notify_one();
+                    }
+                }
+                Frame::Pong { stamp } => {
+                    let rtt = shared.stamp().saturating_sub(stamp);
+                    rtt_us.store(rtt, Ordering::Relaxed);
+                }
+                frame => shared.lock().handle(frame, &shared.accept),
+            }
         }
     }
     .await;
@@ -436,6 +528,7 @@ async fn reader_task<R: AsyncRead + Unpin>(shared: Arc<Shared>, id: u64, rd: R) 
 }
 
 enum Work {
+    Pong(u64),
     Ack(u64),
     Frame(Arc<Vec<u8>>),
     Idle,
@@ -450,11 +543,16 @@ async fn writer_task<W: AsyncWrite + Unpin>(
     notify: Arc<Notify>,
     sent: Arc<AtomicU64>,
 ) {
+    let keepalive = shared.cfg.keepalive_interval;
+    let mut last_write = tokio::time::Instant::now();
     let result: Result<()> = async {
         loop {
             let work = {
                 let mut st = shared.lock();
-                if !st.subflows.contains_key(&id) {
+                let pong = st.subflows.get_mut(&id).and_then(|s| s.pong.take());
+                if let Some(stamp) = pong {
+                    Work::Pong(stamp)
+                } else if !st.subflows.contains_key(&id) {
                     // The subflow was declared dead while this task ran. Taking a frame now
                     // would assign it to a subflow that no longer exists and lose it.
                     Work::Gone
@@ -489,18 +587,38 @@ async fn writer_task<W: AsyncWrite + Unpin>(
                 }
             };
             match work {
+                Work::Pong(stamp) => {
+                    let record = shared.seal(&frame::encode_pong(stamp))?;
+                    wr.write_all(&record).await?;
+                    wr.flush().await?;
+                    // An answer is not activity of this side: each side still pings on its
+                    // own schedule, so both get a round trip estimate.
+                }
                 Work::Ack(next) => {
                     let record = shared.seal(&frame::encode_ack(next))?;
                     wr.write_all(&record).await?;
+                    last_write = tokio::time::Instant::now();
                 }
                 Work::Frame(bytes) => {
                     let record = shared.seal(&bytes)?;
                     wr.write_all(&record).await?;
                     sent.fetch_add(record.len() as u64, Ordering::Relaxed);
+                    last_write = tokio::time::Instant::now();
                 }
                 Work::Idle => {
                     wr.flush().await?;
-                    notify.notified().await;
+                    if keepalive.is_zero() {
+                        notify.notified().await;
+                    } else if tokio::time::timeout_at(last_write + keepalive, notify.notified())
+                        .await
+                        .is_err()
+                    {
+                        // Idle for a whole interval: keep the path and its NAT mapping alive.
+                        let record = shared.seal(&frame::encode_ping(shared.stamp()))?;
+                        wr.write_all(&record).await?;
+                        wr.flush().await?;
+                        last_write = tokio::time::Instant::now();
+                    }
                 }
                 Work::Gone => return Ok(()),
                 Work::Done => {
@@ -586,11 +704,17 @@ impl Session {
             peer: est.peer,
             version: est.version,
             session_id: est.session_id,
+            changes: watch::channel(0).0,
+            origin: Instant::now(),
         });
         shared.start_subflow(transport)?;
         Ok(Session {
             guard: Arc::new(Guard { shared }),
         })
+    }
+
+    pub(crate) fn from_guard(guard: Arc<Guard>) -> Session {
+        Session { guard }
     }
 
     fn shared(&self) -> &Arc<Shared> {
@@ -653,8 +777,23 @@ impl Session {
 
     /// Add a subflow. Both sides call this with the two ends of one new transport. The two
     /// sides first name the highest sequence they received, so a session whose last subflow
-    /// died resumes on this one and retransmits what the peer lacks.
-    pub async fn add_subflow<T: Transport>(&self, mut transport: T) -> Result<()> {
+    /// died resumes on this one and retransmits what the peer lacks. A listener that routes
+    /// transports by session id uses [`crate::Acceptor`] instead on its side.
+    pub async fn add_subflow<T: Transport>(&self, transport: T) -> Result<SubflowId> {
+        self.add_subflow_inner(transport, false).await
+    }
+
+    /// Add a subflow whose peer preamble (magic and session id) the caller already read and
+    /// checked, as the acceptor does.
+    pub(crate) async fn add_subflow_routed<T: Transport>(&self, transport: T) -> Result<SubflowId> {
+        self.add_subflow_inner(transport, true).await
+    }
+
+    async fn add_subflow_inner<T: Transport>(
+        &self,
+        mut transport: T,
+        preamble_read: bool,
+    ) -> Result<SubflowId> {
         let shared = self.shared().clone();
         {
             let st = shared.lock();
@@ -673,12 +812,14 @@ impl Session {
             out.extend_from_slice(&shared.seal(&frame::encode_hello(next))?);
             transport.write_all(&out).await?;
             transport.flush().await?;
-            let mut head = [0u8; 20];
-            transport.read_exact(&mut head).await?;
-            if &head[..4] != SUBFLOW_MAGIC || head[4..] != shared.session_id {
-                return Err(Error::Subflow(
-                    "the subflow belongs to another session".into(),
-                ));
+            if !preamble_read {
+                let mut head = [0u8; 20];
+                transport.read_exact(&mut head).await?;
+                if &head[..4] != SUBFLOW_MAGIC || head[4..] != shared.session_id {
+                    return Err(Error::Subflow(
+                        "the subflow belongs to another session".into(),
+                    ));
+                }
             }
             let mut rec = [0u8; RECORD_HDR];
             transport.read_exact(&mut rec).await?;
@@ -727,6 +868,49 @@ impl Session {
         }
     }
 
+    /// The id of this session, shared by both sides.
+    pub fn session_id(&self) -> SessionId {
+        self.shared().session_id
+    }
+
+    /// A handle that does not keep the session open.
+    pub fn downgrade(&self) -> WeakSession {
+        WeakSession {
+            guard: Arc::downgrade(&self.guard),
+        }
+    }
+
+    /// True once the session was closed or failed. It accepts no subflow then.
+    pub fn is_closed(&self) -> bool {
+        let st = self.shared().lock();
+        st.closing || st.failed.is_some()
+    }
+
+    /// A counter that changes whenever a subflow is added or dies.
+    pub fn subflow_changes(&self) -> watch::Receiver<u64> {
+        self.shared().changes.subscribe()
+    }
+
+    /// What was measured on each live subflow, ordered by the subflow's age.
+    pub fn subflow_stats(&self) -> Vec<SubflowStats> {
+        let st = self.shared().lock();
+        let mut ids: Vec<_> = st.subflows.keys().copied().collect();
+        ids.sort_unstable();
+        ids.iter()
+            .map(|id| {
+                let sub = &st.subflows[id];
+                let rtt = sub.rtt_us.load(Ordering::Relaxed);
+                SubflowStats {
+                    id: *id,
+                    sent_bytes: sub.sent.load(Ordering::Relaxed),
+                    received_bytes: sub.received.load(Ordering::Relaxed),
+                    acked_bytes: sub.acked,
+                    rtt: (rtt != NO_RTT).then(|| Duration::from_micros(rtt)),
+                }
+            })
+            .collect()
+    }
+
     /// The number of subflows that are alive now.
     pub fn subflow_count(&self) -> usize {
         self.shared().lock().subflows.len()
@@ -751,5 +935,18 @@ impl Session {
     /// Bytes of frames sent and not yet acknowledged.
     pub fn unacked_bytes(&self) -> usize {
         self.shared().lock().unacked_bytes
+    }
+}
+
+/// A reference to a session that does not keep it open.
+#[derive(Clone)]
+pub struct WeakSession {
+    guard: std::sync::Weak<Guard>,
+}
+
+impl WeakSession {
+    /// The session, unless every handle to it was dropped.
+    pub fn upgrade(&self) -> Option<Session> {
+        self.guard.upgrade().map(Session::from_guard)
     }
 }

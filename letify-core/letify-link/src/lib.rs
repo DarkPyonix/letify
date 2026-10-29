@@ -11,13 +11,19 @@
 //!   ([`Stream`], tokio `AsyncRead` and `AsyncWrite`), several subflows at once, and resumption
 //!   on a new subflow after every subflow died.
 //!
+//! - Keepalive: an idle subflow sends a Ping, the peer answers with a Pong that gives a round
+//!   trip estimate, and a subflow with no record for three intervals is declared dead.
+//! - The [`Acceptor`], which routes incoming transports to a live session or to a new one.
+//! - The [`PathManager`], which dials candidate paths, starts the session on the first that
+//!   answers, adds the others as subflows and redials when every subflow died, and the pure
+//!   switching rules in [`hysteresis`].
+//!
 //! A subflow is any reliable byte transport: a TCP connection, a pipe or an in-memory duplex.
 //!
 //! # What it does not own yet
 //!
-//! Rendezvous, NAT traversal and punching, UDP paths, the path manager, the relay role, the
-//! `letify-link` sidecar and the Python binding. The caller finds paths and hands each new
-//! transport to [`Session::add_subflow`].
+//! Rendezvous, NAT traversal and punching, UDP paths, the relay role, the `letify-link` sidecar
+//! and the Python binding. The caller supplies the candidate dialers.
 //!
 //! # Errors
 //!
@@ -25,18 +31,24 @@
 //! `io::Error` that wraps [`Error::ConnectionLost`]. Recover it with [`Error::from_io`]. It is
 //! an infrastructure failure and never an application error.
 
+mod acceptor;
 mod config;
 mod error;
 mod frame;
 mod handshake;
+pub mod hysteresis;
 mod identity;
+mod paths;
 mod replay;
 mod session;
 mod stream;
+pub mod tcp;
 
+pub use acceptor::{Accepted, Acceptor};
 pub use config::{Config, PROTOCOL_VERSION};
 pub use error::{Error, Result};
 pub use identity::{Identity, NodeId, PeerPolicy};
+pub use paths::{BoxTransport, Candidate, ManagerConfig, PathEvent, PathManager};
 pub use replay::REPLAY_WINDOW;
-pub use session::{Session, Transport};
+pub use session::{Session, SessionId, SubflowId, SubflowStats, Transport, WeakSession};
 pub use stream::Stream;

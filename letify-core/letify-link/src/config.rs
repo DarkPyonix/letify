@@ -23,6 +23,10 @@ pub struct Config {
     /// How long a session without any subflow waits for a new one before its streams fail
     /// with `Error::ConnectionLost`. Default 24 h.
     pub resume_window: Duration,
+    /// A subflow that sent nothing for this long sends a keepalive, and one that received no
+    /// record for three times this long is declared dead. Zero turns keepalives off. The two
+    /// sides should use the same value. Default 15 s.
+    pub keepalive_interval: Duration,
     /// Time limit for a handshake or for adding a subflow. Default 30 s.
     pub handshake_timeout: Duration,
 }
@@ -35,6 +39,7 @@ impl Default for Config {
             stream_window: 4 << 20,
             subflow_window: 2 << 20,
             resume_window: Duration::from_secs(24 * 3600),
+            keepalive_interval: Duration::from_secs(15),
             handshake_timeout: Duration::from_secs(30),
         }
     }
