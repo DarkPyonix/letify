@@ -104,16 +104,18 @@ impl Acceptor {
         .map_err(|e| Error::Handshake(format!("the transport closed at once: {e}")))?;
         match &magic {
             b"LLNK" => {
+                let gauge = crate::session::gauge_of(&transport);
                 let prefixed = Prefixed {
                     prefix: magic.to_vec(),
                     pos: 0,
                     inner: transport,
                 };
-                let session = Session::accept(
+                let session = Session::accept_gauged(
                     prefixed,
                     &self.identity,
                     self.policy.clone(),
                     self.config.clone(),
+                    gauge,
                 )
                 .await?;
                 let mut sessions = self.sessions.lock().unwrap_or_else(|e| e.into_inner());

@@ -61,14 +61,12 @@ async fn bulk_tagged(a: &Session, tag: u8, stop: Arc<AtomicBool>) -> tokio::task
     })
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn a_small_message_is_not_queued_behind_a_bulk_stream() {
-    let rate = 8.0 * MIB;
-    let (a, b, _p) = throttled_session(&[rate], Config::default(), Config::default()).await;
+/// p50 and p99 of a 64 byte echo sent every 20 ms beside a saturating bulk stream on `a`.
+async fn small_message_rtts(a: &Session, b: Session) -> (Duration, Duration) {
     let counters = vec![Arc::new(AtomicU64::new(0))];
     let server = spawn_server(b, counters.clone());
     let stop = Arc::new(AtomicBool::new(false));
-    let bulk = bulk_tagged(&a, 0, stop.clone()).await;
+    let bulk = bulk_tagged(a, 0, stop.clone()).await;
     let mut s = a.open_stream().await.unwrap();
     s.write_all(&[1, 0]).await.unwrap();
     // Let the bulk stream saturate the link before measuring.
@@ -88,9 +86,30 @@ async fn a_small_message_is_not_queued_behind_a_bulk_stream() {
     server.abort();
     rtts.sort();
     let p99 = rtts[((rtts.len() - 1) as f64 * 0.99).round() as usize];
-    let p50 = rtts[rtts.len() / 2];
+    (rtts[rtts.len() / 2], p99)
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_small_message_is_not_queued_behind_a_bulk_stream() {
+    let rate = 8.0 * MIB;
+    let (a, b, _p) = throttled_session(&[rate], Config::default(), Config::default()).await;
+    let (p50, p99) = small_message_rtts(&a, b).await;
     eprintln!("small message under a saturating bulk stream: p50 {p50:?}, p99 {p99:?}");
     // 4 x R + one frame time + margin, as the spec states: 80 ms + 6 ms + 14 ms.
+    assert!(
+        p99 < Duration::from_millis(100),
+        "p99 {p99:?} with p50 {p50:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_small_message_is_not_queued_behind_a_bulk_stream_over_a_udp_path() {
+    // A 20 ms round trip and 8 MiB/s, as the TCP case, with no loss.
+    let rate = 8.0 * MIB;
+    let one_way = Duration::from_millis(10);
+    let (a, b, _p) = udp_session(Config::default(), one_way, 0.0, Some(rate)).await;
+    let (p50, p99) = small_message_rtts(&a, b).await;
+    eprintln!("small message over UDP under a saturating bulk stream: p50 {p50:?}, p99 {p99:?}");
     assert!(
         p99 < Duration::from_millis(100),
         "p99 {p99:?} with p50 {p50:?}"

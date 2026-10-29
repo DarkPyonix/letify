@@ -204,9 +204,10 @@ async fn latencies(
     tokio::time::sleep(run).await;
     for st in a.subflow_stats() {
         println!(
-            "    subflow {}: cap {} KiB, rate {:?} B/s, srtt {:?}",
+            "    subflow {}: cap {} KiB, cwnd {:?} KiB, rate {:?} B/s, srtt {:?}",
             st.id,
             st.bulk_cap >> 10,
+            st.congestion_window.map(|w| w >> 10),
             st.delivery_rate.map(|r| r as u64),
             st.srtt
         );

@@ -17,6 +17,7 @@
 //! a subflow are capped to about two bandwidth delay products so interactive frames do not wait
 //! behind a deep queue.
 
+use std::any::Any;
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -38,8 +39,35 @@ use crate::stream::Stream;
 
 /// A reliable, ordered byte transport that a session can use as a subflow: a TCP connection,
 /// a pipe, or anything else that implements `AsyncRead` and `AsyncWrite`.
-pub trait Transport: AsyncRead + AsyncWrite + Send + Unpin + 'static {}
+pub trait Transport: AsyncRead + AsyncWrite + Send + Unpin + Any {}
 impl<T: AsyncRead + AsyncWrite + Send + Unpin + 'static> Transport for T {}
+
+/// What a transport that runs its own congestion control reports about it.
+#[derive(Clone, Copy, Debug)]
+pub struct CongestionStats {
+    /// The congestion window in bytes: the most the transport puts in flight.
+    pub window: usize,
+    /// The transport's smoothed round trip.
+    pub rtt: Duration,
+    /// Packets the transport has declared lost so far.
+    pub lost_packets: u64,
+}
+
+/// Reads the congestion statistics of one subflow's transport.
+pub(crate) type Gauge = Arc<dyn Fn() -> CongestionStats + Send + Sync>;
+
+/// The gauge of `transport` when it is a UDP path, directly or behind a [`crate::BoxTransport`].
+pub(crate) fn gauge_of<T: Transport>(transport: &T) -> Option<Gauge> {
+    let any: &dyn Any = transport;
+    if let Some(path) = any.downcast_ref::<crate::udp::UdpPath>() {
+        return Some(path.gauge());
+    }
+    let boxed = any.downcast_ref::<crate::BoxTransport>()?;
+    let inner: &dyn Any = &**boxed;
+    inner
+        .downcast_ref::<crate::udp::UdpPath>()
+        .map(crate::udp::UdpPath::gauge)
+}
 
 const SUBFLOW_MAGIC: &[u8; 4] = b"LLNS";
 
@@ -91,6 +119,10 @@ const RATE_KEEP: usize = 8;
 /// The lowest round trip of a subflow is taken over this span.
 const MIN_RTT_SPAN: Duration = Duration::from_secs(10);
 const CAP_HOLD: u32 = 6;
+/// A subflow whose transport lost a packet this recently is recovering from loss.
+const LOSS_HOLD: Duration = Duration::from_secs(1);
+/// A transport's congestion window is read at most this often.
+const GAUGE_EVERY: Duration = Duration::from_millis(10);
 /// While both classes have frames queued, this many interactive frames are followed by one
 /// bulk frame, so bulk gets one stream frame in ten at least.
 const GUARD_RUN: u32 = 9;
@@ -142,9 +174,21 @@ pub struct SubflowStats {
     pub bulk_cap: usize,
     /// The latest delivery rate sample of the subflow in bytes per second, if any.
     pub delivery_rate: Option<f64>,
+    /// The congestion window of the subflow's transport, for a transport that reports one (a
+    /// UDP path), as read at most every 10 ms.
+    pub congestion_window: Option<usize>,
 }
 
 const NO_RTT: u64 = u64::MAX;
+
+/// The handles a subflow shares with its two tasks.
+struct SubShared {
+    sent: Arc<AtomicU64>,
+    received: Arc<AtomicU64>,
+    rtt_us: Arc<AtomicU64>,
+    notify: Arc<Notify>,
+    aborts: Vec<AbortHandle>,
+}
 
 pub(crate) struct Sub {
     /// Bytes of sequenced frames written to this subflow.
@@ -176,6 +220,11 @@ pub(crate) struct Sub {
     cap_mode: CapMode,
     /// A bulk frame had to wait for the cap since the last sample.
     capped: bool,
+    /// Reads the transport's congestion window, and the latest reading with its time.
+    gauge: Option<Gauge>,
+    gauged: Option<(CongestionStats, Instant)>,
+    /// When the transport last reported more lost packets than before.
+    loss_at: Option<Instant>,
     sent: Arc<AtomicU64>,
     received: Arc<AtomicU64>,
     acked: u64,
@@ -197,6 +246,46 @@ pub(crate) struct Sub {
 }
 
 impl Sub {
+    fn new(window: usize, gauge: Option<Gauge>, shared: SubShared) -> Sub {
+        Sub {
+            sent_seq: 0,
+            acked_seq: 0,
+            recv_seq: 0,
+            ack_dirty: false,
+            window,
+            last_penalty: None,
+            srtt: None,
+            marks: VecDeque::new(),
+            bulk_inflight: 0,
+            rate_from: Instant::now(),
+            rate_bytes: 0,
+            rates: VecDeque::new(),
+            min_rtt: None,
+            cap: START_BULK,
+            cap_ref: 0.0,
+            cap_saved: START_BULK,
+            cap_mode: CapMode::Grow,
+            capped: false,
+            gauge,
+            gauged: None,
+            loss_at: None,
+            sent: shared.sent,
+            received: shared.received,
+            acked: 0,
+            rtt_us: shared.rtt_us,
+            pong: None,
+            probe_request: None,
+            probe_answer: None,
+            probe_pending: None,
+            probe_sent: 0,
+            probe_received: 0,
+            probe_acked: 0,
+            probe_rate: None,
+            notify: shared.notify,
+            aborts: shared.aborts,
+        }
+    }
+
     /// The most bulk bytes this subflow may have in flight: the smallest cap found by probing
     /// that keeps the delivery rate, between two frames and half the window. See SPEC.md
     /// letify-link, Session item 7.
@@ -205,7 +294,42 @@ impl Sub {
         let rtt = self.min_rtt.map_or(RTT_FLOOR, |(r, _)| r).max(RTT_FLOOR);
         let bound = (CAP_BOUND * best * rtt.as_secs_f64()) as usize;
         let top = (self.window / 2).max(QUANTUM);
-        self.cap.min(bound).max(MIN_BULK).min(top)
+        let probed = self.cap.min(bound).max(MIN_BULK).min(top);
+        match self.gauged {
+            // A path whose transport recovers losses by itself holds back the acknowledgements
+            // for about one round trip of rate while it does, on top of what it has in flight.
+            Some((stats, at))
+                if self
+                    .loss_at
+                    .is_some_and(|l| at.saturating_duration_since(l) <= LOSS_HOLD) =>
+            {
+                let stall = (best * rtt.as_secs_f64()) as usize;
+                probed
+                    .max(stats.window.saturating_add(stall))
+                    .min(self.window.max(QUANTUM))
+            }
+            _ => probed,
+        }
+    }
+
+    /// Read the transport's congestion window if the last reading is older than `GAUGE_EVERY`.
+    fn read_gauge(&mut self, now: Instant) {
+        let Some(gauge) = &self.gauge else {
+            return;
+        };
+        if self
+            .gauged
+            .is_none_or(|(_, at)| now.saturating_duration_since(at) >= GAUGE_EVERY)
+        {
+            let stats = gauge();
+            if self
+                .gauged
+                .is_some_and(|(old, _)| stats.lost_packets > old.lost_packets)
+            {
+                self.loss_at = Some(now);
+            }
+            self.gauged = Some((stats, now));
+        }
     }
 
     /// Judge the cap by one delivery rate sample `rate` (bytes per second). Only a sample in
@@ -954,7 +1078,11 @@ impl Shared {
         Ok(Some(out))
     }
 
-    fn start_subflow<T: Transport>(self: &Arc<Self>, t: T) -> Result<SubflowId> {
+    fn start_subflow<T: Transport>(
+        self: &Arc<Self>,
+        t: T,
+        gauge: Option<Gauge>,
+    ) -> Result<SubflowId> {
         let (rd, wr) = tokio::io::split(t);
         let notify = Arc::new(Notify::new());
         let sent = Arc::new(AtomicU64::new(0));
@@ -983,40 +1111,17 @@ impl Shared {
         let aborts = vec![reader.abort_handle(), writer.abort_handle()];
         st.subflows.insert(
             id,
-            Sub {
-                sent_seq: 0,
-                acked_seq: 0,
-                recv_seq: 0,
-                ack_dirty: false,
-                window: self.cfg.subflow_window,
-                last_penalty: None,
-                srtt: None,
-                marks: VecDeque::new(),
-                bulk_inflight: 0,
-                rate_from: Instant::now(),
-                rate_bytes: 0,
-                rates: VecDeque::new(),
-                min_rtt: None,
-                cap: START_BULK,
-                cap_ref: 0.0,
-                cap_saved: START_BULK,
-                cap_mode: CapMode::Grow,
-                capped: false,
-                sent,
-                received,
-                acked: 0,
-                rtt_us,
-                pong: None,
-                probe_request: None,
-                probe_answer: None,
-                probe_pending: None,
-                probe_sent: 0,
-                probe_received: 0,
-                probe_acked: 0,
-                probe_rate: None,
-                notify,
-                aborts,
-            },
+            Sub::new(
+                self.cfg.subflow_window,
+                gauge,
+                SubShared {
+                    sent,
+                    received,
+                    rtt_us,
+                    notify,
+                    aborts,
+                },
+            ),
         );
         // A new subflow cancels any running resume timer.
         st.epoch += 1;
@@ -1163,6 +1268,9 @@ async fn writer_task<W: AsyncWrite + Unpin>(
                 } else {
                     let now = Instant::now();
                     st.maybe_reinject(now);
+                    if let Some(s) = st.subflows.get_mut(&id) {
+                        s.read_gauge(now);
+                    }
                     let (window, inflight, bulk_cap, bulk_inflight) =
                         st.subflows.get(&id).map_or((0, 0, 0, 0), |s| {
                             (
@@ -1327,20 +1435,33 @@ impl Session {
         remote: NodeId,
         config: Config,
     ) -> Result<Session> {
+        let gauge = gauge_of(&transport);
         let est = handshake::initiate(&mut transport, identity, remote, &config).await?;
-        Self::establish(transport, est, config, true)
+        Self::establish(transport, est, config, true, gauge)
     }
 
     /// Accept as the responder over `transport`. An initiator the policy does not accept is
     /// refused with `Error::UnknownPeer`.
     pub async fn accept<T: Transport>(
-        mut transport: T,
+        transport: T,
         identity: &Identity,
         policy: PeerPolicy,
         config: Config,
     ) -> Result<Session> {
+        let gauge = gauge_of(&transport);
+        Self::accept_gauged(transport, identity, policy, config, gauge).await
+    }
+
+    /// `accept` for a transport that the caller wrapped, with the gauge of the transport inside.
+    pub(crate) async fn accept_gauged<T: Transport>(
+        mut transport: T,
+        identity: &Identity,
+        policy: PeerPolicy,
+        config: Config,
+        gauge: Option<Gauge>,
+    ) -> Result<Session> {
         let est = handshake::respond(&mut transport, identity, &policy, &config).await?;
-        Self::establish(transport, est, config, false)
+        Self::establish(transport, est, config, false, gauge)
     }
 
     fn establish<T: Transport>(
@@ -1348,6 +1469,7 @@ impl Session {
         est: Established,
         cfg: Config,
         initiator: bool,
+        gauge: Option<Gauge>,
     ) -> Result<Session> {
         let dead_after = {
             let (own, peer) = (cfg.keepalive_interval, est.peer_keepalive);
@@ -1400,7 +1522,7 @@ impl Session {
             origin: Instant::now(),
             dead_after,
         });
-        shared.start_subflow(transport)?;
+        shared.start_subflow(transport, gauge)?;
         Ok(Session {
             guard: Arc::new(Guard { shared }),
         })
@@ -1494,6 +1616,7 @@ impl Session {
         preamble_read: bool,
     ) -> Result<SubflowId> {
         let shared = self.shared().clone();
+        let gauge = gauge_of(&transport);
         {
             let st = shared.lock();
             if let Some(why) = &st.failed {
@@ -1538,7 +1661,7 @@ impl Session {
         .await
         .map_err(|_| Error::Subflow("timed out".into()))??;
         shared.lock().apply_ack(peer_next);
-        shared.start_subflow(transport)
+        shared.start_subflow(transport, gauge)
     }
 
     /// Close the session. Frames already queued are written first; the peer's streams then end
@@ -1613,6 +1736,7 @@ impl Session {
                     probe_rate: sub.probe_rate,
                     bulk_cap: sub.bulk_cap(),
                     delivery_rate: sub.rates.back().copied(),
+                    congestion_window: sub.gauged.map(|(g, _)| g.window),
                 }
             })
             .collect()
@@ -1689,5 +1813,125 @@ impl WeakSession {
     /// The session, unless every handle to it was dropped.
     pub fn upgrade(&self) -> Option<Session> {
         self.guard.upgrade().map(Session::from_guard)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sub(gauge: Option<Gauge>) -> Sub {
+        Sub::new(
+            2 << 20,
+            gauge,
+            SubShared {
+                sent: Arc::new(AtomicU64::new(0)),
+                received: Arc::new(AtomicU64::new(0)),
+                rtt_us: Arc::new(AtomicU64::new(NO_RTT)),
+                notify: Arc::new(Notify::new()),
+                aborts: Vec::new(),
+            },
+        )
+    }
+
+    /// A subflow that carried 10 MB/s with a lowest round trip of 50 ms.
+    fn busy(gauge: Option<Gauge>) -> Sub {
+        let mut s = sub(gauge);
+        s.rates.push_back(10e6);
+        s.min_rtt = Some((Duration::from_millis(50), Instant::now()));
+        s
+    }
+
+    fn reading(window: usize, lost: u64) -> Gauge {
+        Arc::new(move || CongestionStats {
+            window,
+            rtt: Duration::from_millis(50),
+            lost_packets: lost,
+        })
+    }
+
+    #[test]
+    fn a_subflow_without_loss_keeps_the_probed_cap_whatever_its_congestion_window() {
+        let mut s = busy(Some(reading(1900 << 10, 0)));
+        let probed = busy(None).bulk_cap();
+        s.read_gauge(Instant::now());
+        assert_eq!(s.bulk_cap(), probed);
+        assert!(s.bulk_cap() < 1900 << 10);
+    }
+
+    #[test]
+    fn a_subflow_recovering_from_loss_sizes_its_bulk_cap_from_the_window_and_one_stall() {
+        let lost = Arc::new(AtomicU64::new(0));
+        let gauge: Gauge = {
+            let lost = lost.clone();
+            Arc::new(move || CongestionStats {
+                window: 600 << 10,
+                rtt: Duration::from_millis(50),
+                lost_packets: lost.load(Ordering::Relaxed),
+            })
+        };
+        let mut s = busy(Some(gauge));
+        let t0 = Instant::now();
+        s.read_gauge(t0);
+        lost.store(3, Ordering::Relaxed);
+        s.read_gauge(t0 + GAUGE_EVERY);
+        // The window and 10 MB/s x 50 ms of rate: 600 KiB + 500 kB.
+        let want = (600 << 10) + 500_000;
+        assert_eq!(s.bulk_cap(), want);
+        assert!(s.bulk_cap() > busy(None).bulk_cap());
+    }
+
+    #[test]
+    fn the_cap_of_a_subflow_recovering_from_loss_stays_inside_the_subflow_window() {
+        let mut s = busy(Some(reading(8 << 20, 0)));
+        s.gauged = Some((
+            CongestionStats {
+                window: 8 << 20,
+                rtt: Duration::from_millis(50),
+                lost_packets: 9,
+            },
+            Instant::now(),
+        ));
+        s.loss_at = Some(Instant::now());
+        assert_eq!(s.bulk_cap(), 2 << 20);
+    }
+
+    #[test]
+    fn a_loss_forgotten_after_a_second_returns_the_cap_to_the_probed_one() {
+        let mut s = busy(Some(reading(600 << 10, 0)));
+        let t0 = Instant::now();
+        s.gauged = Some((
+            CongestionStats {
+                window: 600 << 10,
+                rtt: Duration::from_millis(50),
+                lost_packets: 3,
+            },
+            t0 + Duration::from_secs(2),
+        ));
+        s.loss_at = Some(t0);
+        assert_eq!(s.bulk_cap(), busy(None).bulk_cap());
+    }
+
+    #[test]
+    fn the_congestion_window_is_read_at_most_every_ten_milliseconds() {
+        let reads = Arc::new(AtomicU64::new(0));
+        let gauge: Gauge = {
+            let reads = reads.clone();
+            Arc::new(move || {
+                reads.fetch_add(1, Ordering::Relaxed);
+                CongestionStats {
+                    window: 1 << 20,
+                    rtt: Duration::from_millis(50),
+                    lost_packets: 0,
+                }
+            })
+        };
+        let mut s = sub(Some(gauge));
+        let t0 = Instant::now();
+        s.read_gauge(t0);
+        s.read_gauge(t0 + Duration::from_millis(5));
+        assert_eq!(reads.load(Ordering::Relaxed), 1);
+        s.read_gauge(t0 + GAUGE_EVERY);
+        assert_eq!(reads.load(Ordering::Relaxed), 2);
     }
 }
