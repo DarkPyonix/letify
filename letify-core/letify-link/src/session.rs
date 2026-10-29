@@ -23,6 +23,7 @@ use crate::error::{Error, Result};
 use crate::frame::{self, Frame, HDR, Kind, RECORD_HDR, TAG};
 use crate::handshake::{self, Established};
 use crate::identity::{Identity, NodeId, PeerPolicy};
+use crate::replay::{MAX_UNACKED_FRAMES, ReplayWindow};
 use crate::stream::Stream;
 
 /// A reliable, ordered byte transport that a session can use as a subflow: a TCP connection,
@@ -108,7 +109,9 @@ impl State {
 
     /// Room for a data frame of `len` payload bytes, by the byte bound on the unacked buffer.
     pub fn has_room(&self, len: usize) -> bool {
-        self.unacked_bytes == 0 || self.unacked_bytes + HDR + len <= self.max_unacked
+        self.unacked_bytes == 0
+            || (self.unacked_bytes + HDR + len <= self.max_unacked
+                && self.unacked.len() < MAX_UNACKED_FRAMES)
     }
 
     /// Queue a sequenced frame built by `build(seq)`.
@@ -258,6 +261,9 @@ pub(crate) struct Shared {
     accept: Notify,
     crypto: Arc<StatelessTransportState>,
     nonce: AtomicU64,
+    /// Nonces accepted from the peer, over all subflows and across resumption.
+    replay: Mutex<ReplayWindow>,
+    dropped: AtomicU64,
     cfg: Config,
     peer: NodeId,
     version: u16,
@@ -352,14 +358,25 @@ impl Shared {
         Ok(out)
     }
 
-    fn open(&self, nonce: u64, ct: &[u8]) -> Result<Vec<u8>> {
+    /// Decrypt a record. `None` means the nonce was already accepted or is older than the
+    /// replay window; the record is dropped and counted, not an error.
+    fn open(&self, nonce: u64, ct: &[u8]) -> Result<Option<Vec<u8>>> {
         let mut out = vec![0u8; ct.len()];
         let n = self
             .crypto
             .read_message(nonce, ct, &mut out)
             .map_err(|e| Error::ConnectionLost(format!("decrypt: {e}")))?;
         out.truncate(n);
-        Ok(out)
+        let fresh = self
+            .replay
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .accept(nonce);
+        if !fresh {
+            self.dropped.fetch_add(1, Ordering::Relaxed);
+            return Ok(None);
+        }
+        Ok(Some(out))
     }
 
     fn start_subflow<T: Transport>(self: &Arc<Self>, t: T) -> Result<()> {
@@ -406,7 +423,10 @@ async fn reader_task<R: AsyncRead + Unpin>(shared: Arc<Shared>, id: u64, rd: R) 
             let nonce = u64::from_be_bytes(head[2..].try_into().unwrap());
             let mut ct = vec![0u8; len];
             rd.read_exact(&mut ct).await?;
-            let frame = frame::decode(shared.open(nonce, &ct)?)?;
+            let Some(plain) = shared.open(nonce, &ct)? else {
+                continue;
+            };
+            let frame = frame::decode(plain)?;
             shared.lock().handle(frame, &shared.accept);
         }
     }
@@ -560,6 +580,8 @@ impl Session {
             accept: Notify::new(),
             crypto: est.crypto,
             nonce: AtomicU64::new(0),
+            replay: Mutex::new(ReplayWindow::new()),
+            dropped: AtomicU64::new(0),
             cfg,
             peer: est.peer,
             version: est.version,
@@ -664,11 +686,11 @@ impl Session {
             let nonce = u64::from_be_bytes(rec[2..].try_into().unwrap());
             let mut ct = vec![0u8; len];
             transport.read_exact(&mut ct).await?;
-            match frame::decode(
-                shared
-                    .open(nonce, &ct)
-                    .map_err(|e| Error::Subflow(e.to_string()))?,
-            )? {
+            let plain = shared
+                .open(nonce, &ct)
+                .map_err(|e| Error::Subflow(e.to_string()))?
+                .ok_or_else(|| Error::Subflow("the hello was replayed".into()))?;
+            match frame::decode(plain)? {
                 Frame::Hello { next } => Ok(next),
                 _ => Err(Error::Subflow("the first record is not a hello".into())),
             }
@@ -718,6 +740,12 @@ impl Session {
         ids.iter()
             .map(|id| st.subflows[id].sent.load(Ordering::Relaxed))
             .collect()
+    }
+
+    /// Records dropped because their nonce was already accepted or older than the replay
+    /// window ([`crate::REPLAY_WINDOW`]).
+    pub fn dropped_records(&self) -> u64 {
+        self.shared().dropped.load(Ordering::Relaxed)
     }
 
     /// Bytes of frames sent and not yet acknowledged.

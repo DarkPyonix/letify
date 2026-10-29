@@ -30,11 +30,13 @@ mod error;
 mod frame;
 mod handshake;
 mod identity;
+mod replay;
 mod session;
 mod stream;
 
 pub use config::{Config, PROTOCOL_VERSION};
 pub use error::{Error, Result};
 pub use identity::{Identity, NodeId, PeerPolicy};
+pub use replay::REPLAY_WINDOW;
 pub use session::{Session, Transport};
 pub use stream::Stream;

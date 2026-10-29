@@ -252,8 +252,12 @@ impl Mitm {
             let _ = tokio::io::copy(&mut br, &mut aw).await;
         });
         tokio::spawn({
-            let (to_b, records, withhold, prefix_seen) =
-                (to_b.clone(), records.clone(), withhold.clone(), prefix_seen.clone());
+            let (to_b, records, withhold, prefix_seen) = (
+                to_b.clone(),
+                records.clone(),
+                withhold.clone(),
+                prefix_seen.clone(),
+            );
             async move {
                 let mut head = match prefix {
                     Prefix::Handshake => vec![0u8; 10],
@@ -292,7 +296,12 @@ impl Mitm {
                 }
             }
         });
-        Mitm { records, withhold, prefix: prefix_seen, to_b }
+        Mitm {
+            records,
+            withhold,
+            prefix: prefix_seen,
+            to_b,
+        }
     }
 
     pub async fn inject(&self, bytes: &[u8]) {

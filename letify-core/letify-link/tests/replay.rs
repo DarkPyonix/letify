@@ -67,9 +67,15 @@ async fn records_arriving_out_of_order_within_the_window_are_accepted() {
     for record in held.iter().rev() {
         mitm.inject(record).await;
     }
-    let mut sb = timeout(Duration::from_secs(5), b.accept_stream()).await.unwrap().unwrap();
+    let mut sb = timeout(Duration::from_secs(5), b.accept_stream())
+        .await
+        .unwrap()
+        .unwrap();
     let mut got = [0u8; 6];
-    timeout(Duration::from_secs(5), sb.read_exact(&mut got)).await.unwrap().unwrap();
+    timeout(Duration::from_secs(5), sb.read_exact(&mut got))
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(&got, b"aabbcc");
     assert_eq!(b.dropped_records(), 0);
 }
@@ -84,13 +90,24 @@ async fn a_record_older_than_the_window_is_dropped() {
     }
     let mut sb = b.accept_stream().await.unwrap();
     let mut got = vec![0u8; count];
-    timeout(Duration::from_secs(30), sb.read_exact(&mut got)).await.unwrap().unwrap();
+    timeout(Duration::from_secs(30), sb.read_exact(&mut got))
+        .await
+        .unwrap()
+        .unwrap();
     let seen = mitm.recorded();
-    assert!(seen.len() > REPLAY_WINDOW as usize + 100, "{} records", seen.len());
+    assert!(
+        seen.len() > REPLAY_WINDOW as usize + 100,
+        "{} records",
+        seen.len()
+    );
     assert_eq!(b.dropped_records(), 0);
     mitm.inject(&seen[0]).await;
     sleep(Duration::from_millis(200)).await;
-    assert_eq!(b.dropped_records(), 1, "a record below the window is dropped");
+    assert_eq!(
+        b.dropped_records(),
+        1,
+        "a record below the window is dropped"
+    );
 }
 
 #[tokio::test]
@@ -105,7 +122,11 @@ async fn a_replayed_resume_hello_is_refused() {
     rb.unwrap();
     sleep(Duration::from_millis(100)).await;
     let records = mitm.recorded();
-    assert_eq!(records.len(), 1, "the Hello is the first record on the subflow");
+    assert_eq!(
+        records.len(),
+        1,
+        "the Hello is the first record on the subflow"
+    );
     let mut replay = mitm.prefix.lock().unwrap().clone();
     replay.extend_from_slice(&records[0]);
 
@@ -119,7 +140,10 @@ async fn a_replayed_resume_hello_is_refused() {
     });
     let before = b.subflow_count();
     let refused = b.add_subflow(victim).await;
-    assert!(matches!(refused, Err(letify_link::Error::Subflow(_))), "{refused:?}");
+    assert!(
+        matches!(refused, Err(letify_link::Error::Subflow(_))),
+        "{refused:?}"
+    );
     assert_eq!(b.subflow_count(), before);
     attacker.abort();
 }

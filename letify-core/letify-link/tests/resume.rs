@@ -131,10 +131,17 @@ async fn a_session_that_gets_no_new_subflow_within_the_window_fails_streams_with
         matches!(Error::from_io(&err), Some(Error::ConnectionLost(_))),
         "{err:?}"
     );
-    let err = timeout(Duration::from_secs(5), s.write_all(b"after"))
-        .await
-        .unwrap()
-        .unwrap_err();
+    // The writer's own side ends its window at about the same time, not at the same instant.
+    let err = timeout(Duration::from_secs(5), async {
+        loop {
+            if let Err(e) = s.write_all(b"after").await {
+                return e;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
     assert!(
         matches!(Error::from_io(&err), Some(Error::ConnectionLost(_))),
         "{err:?}"
