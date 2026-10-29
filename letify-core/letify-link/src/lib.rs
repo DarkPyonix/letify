@@ -75,5 +75,5 @@ pub use error::{Error, Result};
 pub use identity::{Identity, NodeId, PeerPolicy};
 pub use paths::{BoxTransport, Candidate, ManagerConfig, PathEvent, PathKind, PathManager};
 pub use replay::REPLAY_WINDOW;
-pub use session::{Session, SessionId, SubflowId, SubflowStats, Transport, WeakSession};
+pub use session::{Priority, Session, SessionId, SubflowId, SubflowStats, Transport, WeakSession};
 pub use stream::Stream;

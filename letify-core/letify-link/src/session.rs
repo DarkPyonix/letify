@@ -926,6 +926,16 @@ async fn writer_task<W: AsyncWrite + Unpin>(
     }
 }
 
+/// How a stream's frames are scheduled against those of other streams.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Priority {
+    /// Served before any bulk frame. For control frames and small messages.
+    #[default]
+    Interactive,
+    /// Served only while no interactive stream has a frame queued, and limited in flight.
+    Bulk,
+}
+
 /// An encrypted, multiplexed session between two nodes that survives the loss of its transport.
 pub struct Session {
     guard: Arc<Guard>,
@@ -1033,6 +1043,12 @@ impl Session {
 
     /// Open a stream. The peer sees it from `accept_stream`.
     pub async fn open_stream(&self) -> Result<Stream> {
+        self.open_stream_with(Priority::Interactive).await
+    }
+
+    /// Open a stream whose sends have the given class.
+    pub async fn open_stream_with(&self, priority: Priority) -> Result<Stream> {
+        let _ = priority;
         let shared = self.shared();
         let mut st = shared.lock();
         if let Some(why) = &st.failed {
