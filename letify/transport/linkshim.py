@@ -2,10 +2,12 @@
 
 Owns starting the remote ``letify-link`` sidecar, listening for the one local node, relaying
 rendezvous messages as JSON lines on standard input and output until the hand-over, and
-starting one worker process per stream the local side opens. It does not own the local side
-(``linkchannel.py``), the worker program (it is passed in) or any path decision. Spec
-"Sidecar interface" item 7. This file is sent to the machine as the argument of ``python -c``,
-so it imports nothing from letify and avoids syntax newer than Python 3.6.
+serving each stream the local side opens: a new worker process, the relay to a running
+worker's second door, or the tail of a worker's standard error, as the first line of the
+stream says. It does not own the local side (``linkchannel.py``), the worker program and the
+relay program (both are passed in) or any path decision. Spec "Sidecar interface" item 7.
+This file is sent to the machine as the argument of ``python -c``, so it imports nothing from
+letify and avoids syntax newer than Python 3.6.
 """
 
 # ruff: noqa: SIM115, UP031
@@ -13,6 +15,7 @@ so it imports nothing from letify and avoids syntax newer than Python 3.6.
 import json
 import os
 import queue
+import re
 import signal
 import socket
 import struct
@@ -103,16 +106,22 @@ class Control:
         return reply
 
 
+LINES = 40
+HEADER_LIMIT = 4096
+HEADER_WAIT_S = 10.0
+TOKEN = re.compile(r"^[0-9a-f]{1,32}$")
+
+
 class Shim:
     def __init__(self, config):
         self.config = config
-        self.session = None
-        self.paths = set()
+        #: Live paths by session number. A session is a key from its first event on.
+        self.sessions = {}
         self.last_path = time.monotonic()
         self.handed_over = False
         self.events = queue.Queue()
         self.out_lock = threading.Lock()
-        self.workers = 0
+        self.directory = None
 
     def start_sidecar(self):
         binary = self.config["binary"]
@@ -144,6 +153,36 @@ class Shim:
             if not self.handed_over:
                 say(**fields)
 
+    def listen_request(self):
+        """The ``listen`` request: only the local node may start a session, for the lease."""
+        return {
+            "op": "listen",
+            "allow": [self.config["allow"]],
+            "bind": self.config["bind"],
+            "config": {"resume_window_s": int(self.config["resume_s"])},
+        }
+
+    def on_event(self, event):
+        """Track the sessions and their paths. Returns True when the shim has nothing to serve."""
+        name = event["event"]
+        session = event.get("session")
+        if name == "session_incoming":
+            self.sessions[session] = set()
+            self.last_path = time.monotonic()
+        elif name == "path_added" and session in self.sessions:
+            self.sessions[session].add(event["name"])
+        elif name == "path_lost" and session in self.sessions:
+            self.sessions[session].discard(event["name"])
+            self.last_path = time.monotonic()
+        elif name == "stream_incoming" and session in self.sessions:
+            threading.Thread(target=self.serve_stream, args=(event["socket"],), daemon=True).start()
+        elif name == "session_closed" and session in self.sessions:
+            del self.sessions[session]
+            return not self.sessions
+        elif name == "control_closed":
+            return True
+        return False
+
     def pump(self):
         """Dispatch sidecar events until the shim has nothing left to serve."""
         while True:
@@ -152,45 +191,74 @@ class Shim:
             except queue.Empty:
                 self.check_idle()
                 continue
-            name = event["event"]
-            if name == "rendezvous_out":
+            if event["event"] == "rendezvous_out":
                 self.emit(event="rendezvous", to=event["to"], message=event["message"])
-            elif name == "session_incoming":
-                self.session = event["session"]
-            elif name == "path_added" and event.get("session") == self.session:
-                self.paths.add(event["name"])
-            elif name == "path_lost" and event.get("session") == self.session:
-                self.paths.discard(event["name"])
-                self.last_path = time.monotonic()
-            elif name == "stream_incoming" and event.get("session") == self.session:
-                self.serve_stream(event["socket"])
-            elif name == "control_closed" or (
-                name == "session_closed" and event.get("session") == self.session
-            ):
+            elif self.on_event(event):
                 return
 
     def check_idle(self):
-        """Leave when no session came, or every path stayed lost past the resume window."""
+        """Leave when no session came, or no session has a path for the resume window."""
         limit = self.config["resume_s"]
-        if self.session is None:
+        if not self.sessions:
             if self.handed_over and time.monotonic() - self.started > self.config["wait_s"]:
                 sys.exit(0)
-        elif not self.paths and time.monotonic() - self.last_path > limit:
+        elif not any(self.sessions.values()) and time.monotonic() - self.last_path > limit:
             sys.exit(0)
 
     def serve_stream(self, address):
-        """Start the worker program with the stream socket as its standard input and output."""
-        sock = connect(address)
-        self.workers += 1
-        log = open(os.path.join(self.directory, "worker%d.log" % self.workers), "wb")
-        proc = subprocess.Popen(
-            [self.config["python"], "-u", "-c", self.config["bootstrap"]],
-            stdin=sock,
-            stdout=sock,
-            stderr=log,
-        )
+        """Serve one stream: read its first line, then start what the line asks for."""
+        self.serve_socket(connect(address))
+
+    def read_header(self, sock):
+        """The first line of the stream as an object, or None. Reads no byte past the newline."""
+        sock.settimeout(HEADER_WAIT_S)
+        data = b""
+        try:
+            while not data.endswith(b"\n") and len(data) < HEADER_LIMIT:
+                byte = sock.recv(1)
+                if not byte:
+                    return None
+                data += byte
+            header = json.loads(data.decode("utf-8"))
+        except (OSError, ValueError):
+            return None
+        sock.settimeout(None)
+        if not isinstance(header, dict) or not TOKEN.match(str(header.get("token", ""))):
+            return None
+        return header
+
+    def log_path(self, token):
+        return os.path.join(self.directory, "stream-%s.log" % token)
+
+    def serve_socket(self, sock):
+        header = self.read_header(sock)
+        kind = header.get("kind") if header else None
+        if kind == "worker":
+            command = [self.config["python"], "-u", "-c", self.config["bootstrap"]]
+        elif kind == "door" and isinstance(header.get("path"), str):
+            command = [self.config["python"], "-c", self.config["relay"], header["path"]]
+        elif kind == "stderr":
+            self.send_tail(sock, header["token"])
+            return
+        else:
+            sock.close()
+            return
+        log = open(self.log_path(header["token"]), "wb")
+        proc = subprocess.Popen(command, stdin=sock, stdout=sock, stderr=log)
         sock.close()
+        log.close()
         threading.Thread(target=proc.wait, daemon=True).start()
+
+    def send_tail(self, sock, token):
+        """Send the last lines of the standard error kept for ``token`` and close."""
+        try:
+            with open(self.log_path(token), "rb") as handle:
+                text = b"".join(handle.read().splitlines(True)[-LINES:])
+            sock.sendall(text)
+        except OSError:
+            pass
+        finally:
+            sock.close()
 
     def stdin_loop(self):
         """Commands from the local side: rendezvous messages, punch, hand-over."""
@@ -252,9 +320,7 @@ class Shim:
     def run(self):
         self.started = time.monotonic()
         self.start_sidecar()
-        reply = self.control.request(
-            {"op": "listen", "allow": [self.config["allow"]], "bind": self.config["bind"]}
-        )
+        reply = self.control.request(self.listen_request())
         self.listener = reply["listener"]
         port = int(reply["addr"].rpartition(":")[2])
         say(event="ready", node_id=self.node_id, port=port)
