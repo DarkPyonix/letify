@@ -587,7 +587,12 @@ async fn a_pair_rate_cap_holds_one_pair_below_the_client_budget() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn many_pending_pairings_on_a_hub() {
-    let (relay_id, relay_addr) = start_relay(open(), RelayConfig::default()).await;
+    // The 40 devices dial from one address, as devices behind one NAT would.
+    let hub_cfg = RelayConfig {
+        max_preauth_per_ip: 64,
+        ..RelayConfig::default()
+    };
+    let (relay_id, relay_addr) = start_relay(open(), hub_cfg).await;
     assert_eq!(RelayConfig::default().max_pending, 64);
     let hub_client = Identity::generate();
     // One device waits on 40 peers at once, more than the old limit of 8.
@@ -639,4 +644,101 @@ async fn revoking_an_alternate_encoding_of_a_node_refuses_the_node_at_the_relay(
     handle.revoke(letify_link::NodeId::from_bytes(other));
     let d = RelayDialer::new(addr.to_string(), id.node_id(), a.clone());
     assert!(d.connect(b.node_id(), new_token()).await.is_err());
+}
+
+/// Hold `n` connections to the relay that send nothing.
+async fn silent(addr: std::net::SocketAddr, n: usize) -> Vec<TcpStream> {
+    let mut held = Vec::new();
+    for _ in 0..n {
+        held.push(TcpStream::connect(addr).await.unwrap());
+    }
+    // Let the relay accept them.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    held
+}
+
+async fn can_reach(relay: &Identity, addr: std::net::SocketAddr) -> bool {
+    let d = RelayDialer::new(addr.to_string(), relay.node_id(), Identity::generate())
+        .pair_wait(Duration::from_millis(400));
+    // A refusal at accept shows as an error before pairing; a pair timeout shows as a refusal
+    // by the relay after the handshake, which is also a connection that got through.
+    match d.connect(Identity::generate().node_id(), new_token()).await {
+        Ok(_) => true,
+        Err(e) => {
+            e.kind() == std::io::ErrorKind::PermissionDenied
+                || e.kind() == std::io::ErrorKind::TimedOut
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_unauthenticated_budget_has_defaults_below_the_connection_limit() {
+    let cfg = RelayConfig::default();
+    assert_eq!(cfg.max_preauth, 64);
+    assert_eq!(cfg.max_preauth_per_ip, 4);
+    assert_eq!(cfg.max_waiting, 4096);
+    assert_eq!(cfg.handshake_timeout, Duration::from_secs(4));
+    assert!(cfg.max_preauth < cfg.max_connections);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn one_source_address_cannot_hold_more_unauthenticated_connections_than_its_cap() {
+    let cfg = RelayConfig {
+        max_preauth_per_ip: 3,
+        handshake_timeout: Duration::from_secs(2),
+        ..RelayConfig::default()
+    };
+    let (relay_id, addr) = start_relay(open(), cfg).await;
+    let held = silent(addr, 3).await;
+    assert!(
+        !can_reach(&relay_id, addr).await,
+        "a fourth connection from the same address got through"
+    );
+    // The silent ones are closed at the pre-auth timeout, and the address is served again.
+    tokio::time::sleep(Duration::from_millis(2300)).await;
+    assert!(can_reach(&relay_id, addr).await);
+    drop(held);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_unauthenticated_budget_is_global() {
+    let cfg = RelayConfig {
+        max_preauth: 2,
+        max_preauth_per_ip: 100,
+        handshake_timeout: Duration::from_secs(2),
+        ..RelayConfig::default()
+    };
+    let (relay_id, addr) = start_relay(open(), cfg).await;
+    let held = silent(addr, 2).await;
+    assert!(!can_reach(&relay_id, addr).await);
+    drop(held);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(
+        can_reach(&relay_id, addr).await,
+        "the budget was not released"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_waiting_pairs_are_capped_as_a_whole() {
+    let cfg = RelayConfig {
+        max_waiting: 2,
+        ..RelayConfig::default()
+    };
+    let (relay_id, addr) = start_relay(open(), cfg).await;
+    let mut waits = Vec::new();
+    for _ in 0..2 {
+        let d = RelayDialer::new(addr.to_string(), relay_id.node_id(), Identity::generate());
+        let peer = Identity::generate().node_id();
+        waits.push(tokio::spawn(
+            async move { d.connect(peer, new_token()).await },
+        ));
+    }
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let d = RelayDialer::new(addr.to_string(), relay_id.node_id(), Identity::generate());
+    let err = d
+        .connect(Identity::generate().node_id(), new_token())
+        .await
+        .expect_err("a third waiting pair is refused");
+    assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied, "{err}");
 }

@@ -309,7 +309,9 @@ mod tests {
         let me = Identity::generate().node_id();
         let key = VerifyingKey::from_bytes(me.as_bytes()).unwrap();
         let small = VerifyingKey::from_bytes(&ORDER_8).unwrap();
-        let mixed = (key.to_edwards() + small.to_edwards()).compress().to_bytes();
+        let mixed = (key.to_edwards() + small.to_edwards())
+            .compress()
+            .to_bytes();
         assert!(VerifyingKey::from_bytes(&mixed).is_ok());
         assert!(NodeId::try_from_bytes(mixed).is_err());
         assert!(!PeerPolicy::from_fn(|_| true).accepts(&NodeId::from_bytes(mixed)));

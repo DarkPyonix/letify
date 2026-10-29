@@ -318,7 +318,11 @@ impl Inner {
     }
 
     fn is_revoked(&self, node: &NodeId) -> bool {
-        self.edits.lock().unwrap().revoked.contains(&node.canonical())
+        self.edits
+            .lock()
+            .unwrap()
+            .revoked
+            .contains(&node.canonical())
     }
 }
 
