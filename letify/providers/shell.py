@@ -457,6 +457,84 @@ class Shell(Provider):
 
         return run
 
+    # -- the workers on this machine ----------------------------------------
+
+    records_workers = True
+    discovers_sessions = True
+
+    def _run_program(self, source: str, *args: str, timeout: float = 120) -> str:
+        """Run one Python program on the machine over its link and return what it printed."""
+        link = self.link()
+        remote = f"{self.remote_python} -c {shlex.quote(source)} {shlex.join(args)}"
+        result = subprocess.run(
+            link.ssh_command(self.remote_command(remote)),
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+        if result.returncode != 0:
+            raise RuntimeFailure(
+                f"{self.alias}: the worker program exited {result.returncode}",
+                command=f"{self.remote_python} -c <program>",
+                stderr=result.stderr.strip(),
+            )
+        return result.stdout
+
+    def _workers(self) -> list[tuple[dict[str, Any], str, bool]]:
+        """Each live worker record with its owner's state and whether it is an orphan."""
+        from ..runtime import workers
+
+        output = self._run_program(workers.LIST_PROGRAM, self.workspace_root)
+        now, records = workers.parse_listing(output)
+        rows = []
+        for record in records:
+            state = workers.owner_state(record)
+            rows.append((record, state, workers.is_orphan(record, state, now)))
+        return rows
+
+    def sessions(self) -> list[str]:
+        """One line per letify worker running on the machine. Spec "Workers on a shell host"."""
+        from ..runtime import workers
+
+        return [workers.describe(record, state) for record, state, _ in self._workers()]
+
+    def orphans(self) -> list[str]:
+        """The pids of workers whose lease passed or whose owner is gone with no call running."""
+        return [str(record["pid"]) for record, _state, orphan in self._workers() if orphan]
+
+    def stop_worker(self, ref: str) -> bool:
+        """SIGTERM one worker named by pid, SIGKILL after the grace, and report it gone."""
+        import json
+
+        from ..runtime import workers
+
+        if not self.records_workers:
+            return super().stop_worker(ref)
+        if not ref.isdigit():
+            raise RuntimeFailure(f"{self.alias}: {ref!r} is not a letify worker pid")
+        grace, kill_wait = workers.STOP_GRACE_S, workers.KILL_WAIT_S
+        output = self._run_program(
+            workers.STOP_PROGRAM,
+            self.workspace_root,
+            ref,
+            str(grace),
+            str(kill_wait),
+            timeout=grace + kill_wait + 120,
+        )
+        try:
+            answer = json.loads(output)
+        except ValueError as exc:
+            raise RuntimeFailure(
+                f"{self.alias}: the stop program answered nothing readable", stderr=output[-400:]
+            ) from exc
+        if not answer.get("ok"):
+            raise RuntimeFailure(f"{self.alias}: {answer.get('reason')}")
+        return bool(answer.get("gone"))
+
+    def stop_orphan(self, ref: str) -> bool:
+        """End one worker `orphans` reported, and report whether it is gone."""
+        return self.stop_worker(ref)
+
     reads_machine = True
 
     def read_machine(self) -> tuple[list[Any], dict[int, tuple[str, tuple[str, ...]]]]:

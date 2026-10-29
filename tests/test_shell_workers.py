@@ -23,8 +23,11 @@ from conftest import provider_of
 
 import letify
 from letify.cli import main
+from letify.declare.env import Env
+from letify.declare.instance import Instance
 from letify.protocol.worker import BOOTSTRAP
 from letify.providers.colab import Colab
+from letify.providers.local import Local
 from letify.providers.shell import Shell
 from letify.runtime import workers
 from letify.runtime.channel import PersistentChannel
@@ -57,11 +60,19 @@ class LocalHop:
         return result.stdout
 
 
+def install_hop(monkeypatch) -> LocalHop:
+    hop = LocalHop()
+    monkeypatch.setattr(
+        Shell,
+        "_run_program",
+        lambda provider, source, *args, timeout=120: hop(provider, source, *args, timeout=timeout),
+    )
+    return hop
+
+
 @pytest.fixture
 def hop(monkeypatch) -> LocalHop:
-    hop = LocalHop()
-    monkeypatch.setattr(Shell, "_run_program", hop)
-    return hop
+    return install_hop(monkeypatch)
 
 
 @pytest.fixture
@@ -70,7 +81,7 @@ def machine(tmp_path: Path, hop: LocalHop) -> Shell:
 
 
 def records_dir(provider: Shell) -> Path:
-    path = Path(provider.workspace_root) / workers.RECORD_DIR
+    path = Path(os.path.expanduser(provider.workspace_root)) / workers.RECORD_DIR
     path.mkdir(parents=True, exist_ok=True)
     return path
 
@@ -81,7 +92,7 @@ def sleeper() -> subprocess.Popen:
 
 def write_record(provider: Shell, process: subprocess.Popen | None, **fields: Any) -> dict:
     """A worker record for ``process``, with the fields a test overrides."""
-    pid = process.pid if process is not None else 2**22 + 7
+    pid = fields.pop("pid", None) or (process.pid if process is not None else 2**22 + 7)
     record = {
         "pid": pid,
         "proc_start": workers.proc_start(pid) if process is not None else None,
@@ -178,6 +189,36 @@ def test_a_worker_that_is_terminated_removes_its_record(tmp_path) -> None:
     os.kill(pid, signal.SIGTERM)
     assert wait_for(lambda: not path.exists())
     channel.close()
+
+
+class RecordingLocal(Local):
+    """A local provider that boots like a shell host: a workspace root and a worker record."""
+
+    prepares_workspace = True
+    records_workers = True
+    needs_lease = True
+
+    @property
+    def workspace_root(self) -> str:
+        return str(self.config.option("workspace"))
+
+
+def test_a_booted_session_registers_its_worker_with_its_runtime_name(tmp_path) -> None:
+    root = tmp_path / "ws"
+    provider = provider_of(RecordingLocal, "lab", python=sys.executable, workspace=str(root))
+    instance = Instance(provider, gpu=None)._placed("remote")
+    runtime = provider.start(instance, Env(lock=str(tmp_path / "absent.lock")), name="lab-7")
+    try:
+        (path,) = (root / workers.RECORD_DIR).glob("*.json")
+        record = json.loads(path.read_text())
+        assert record["pid"] == runtime.worker_pid
+        assert record["runtime"] == "lab-7"
+        assert record["key"] == runtime.key
+        assert record["owner"] == {"host": HOST, "pid": os.getpid()}
+        assert record["lease_deadline"] is not None
+    finally:
+        runtime.shutdown()
+    assert wait_for(lambda: not path.exists())
 
 
 # -- listing ---------------------------------------------------------------------------------
@@ -326,9 +367,7 @@ def test_a_non_numeric_ref_is_refused(machine) -> None:
 
 
 def test_stop_worker_without_an_alias_is_a_usage_error(capsys) -> None:
-    with pytest.raises(SystemExit) as caught:
-        main(["stop", "--worker", "4242"])
-    assert caught.value.code == 2
+    assert main(["stop", "--worker", "4242"]) == 2
     assert "--alias" in capsys.readouterr().err
 
 
@@ -336,9 +375,10 @@ def test_the_launcher_stops_one_named_worker(tmp_path, monkeypatch, children) ->
     project = tmp_path / "proj" / ".letify"
     project.mkdir(parents=True)
     (project / "config.toml").write_text(
-        f'[lab]\nkind = "shell"\naddress = "gpu.example.edu"\nworkspace = "{tmp_path / "ws"}"\n'
+        '[lab]\nkind = "shell"\naddress = "gpu.example.edu"\n'
     )
-    monkeypatch.setattr(Shell, "_run_program", LocalHop())
+    monkeypatch.setenv("HOME", str(tmp_path))
+    install_hop(monkeypatch)
     let = letify.Launcher(project, home=False, announce=False)
     process = sleeper()
     children.append(process)
@@ -352,14 +392,15 @@ def test_the_launcher_lists_a_shell_host_instead_of_refusing(tmp_path, monkeypat
     project = tmp_path / "proj" / ".letify"
     project.mkdir(parents=True)
     (project / "config.toml").write_text(
-        f'[lab]\nkind = "shell"\naddress = "gpu.example.edu"\nworkspace = "{tmp_path / "ws"}"\n'
+        '[lab]\nkind = "shell"\naddress = "gpu.example.edu"\n'
     )
-    monkeypatch.setattr(Shell, "_run_program", LocalHop())
+    monkeypatch.setenv("HOME", str(tmp_path))
+    install_hop(monkeypatch)
     let = letify.Launcher(project, home=False, announce=False)
     process = sleeper()
     children.append(process)
     write_record(let.provider("lab"), process)
-    (row,) = let.sessions()
+    (row,) = [row for row in let.sessions() if row["alias"] == "lab"]
     assert row["reason"] is None
     assert f"pid {process.pid}" in row["sessions"][0]
 

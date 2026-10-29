@@ -358,6 +358,9 @@ class Colab(Shell):
 
     discovers_sessions = True
 
+    #: Its runtime is a notebook kernel, not a host process it could list or signal.
+    records_workers = False
+
     def sessions(self) -> list[str]:
         """Names of the sessions this account currently holds."""
         names = []

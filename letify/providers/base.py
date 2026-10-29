@@ -398,6 +398,17 @@ class Provider(abc.ABC):
         """Delete one thing `orphans` reported, and report whether it is gone."""
         return False
 
+    #: Whether a worker on this provider writes a record of itself on its host. Spec
+    #: "Workers on a shell host".
+    records_workers: bool = False
+
+    def stop_worker(self, ref: str) -> bool:
+        """End one letify worker named by ``ref`` on its host, and report whether it is gone.
+
+        Spec "Workers on a shell host". Only a provider that keeps worker records can.
+        """
+        raise UnsupportedMode(f"{self.alias} keeps no worker records, so no worker can be stopped")
+
     def expected_cards(self, instance: Any) -> tuple[str, int] | None:
         """The card name fragment and count a session for ``instance`` must have, or None.
 
