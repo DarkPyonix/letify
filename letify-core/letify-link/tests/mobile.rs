@@ -3,8 +3,8 @@
 
 mod common;
 
-use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use common::*;
@@ -53,8 +53,14 @@ fn the_mobile_profile_holds_less_and_pings_less_often() {
     assert!(mobile.keepalive_interval > normal.keepalive_interval);
     // The states: 15 s in the foreground and 120 s in the background by default.
     assert_eq!(normal.keepalive_interval, Duration::from_secs(15));
-    assert_eq!(normal.background_keepalive_interval, Duration::from_secs(120));
-    assert_eq!(mobile.background_keepalive_interval, Duration::from_secs(120));
+    assert_eq!(
+        normal.background_keepalive_interval,
+        Duration::from_secs(120)
+    );
+    assert_eq!(
+        mobile.background_keepalive_interval,
+        Duration::from_secs(120)
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -103,7 +109,10 @@ async fn set_keepalive_interval_changes_how_often_an_idle_subflow_pings() {
     let before = read_by(&b);
     sleep(Duration::from_millis(600)).await;
     let fast = read_by(&b) - before;
-    assert!(fast >= 2 * steady / 2, "{fast} bytes at 50 ms, {steady} at 100 ms");
+    assert!(
+        fast >= 2 * steady / 2,
+        "{fast} bytes at 50 ms, {steady} at 100 ms"
+    );
     assert!(fast > steady, "{fast} bytes at 50 ms, {steady} at 100 ms");
 }
 
@@ -224,19 +233,37 @@ async fn resume_now_resumes_within_one_second_at_p95() {
     echo_once(&mut s).await;
     let mut times = Vec::new();
     for _ in 0..20 {
-        let old: Vec<u64> = client.pm.session().subflow_stats().iter().map(|x| x.id).collect();
+        let old: Vec<u64> = client
+            .pm
+            .session()
+            .subflow_stats()
+            .iter()
+            .map(|x| x.id)
+            .collect();
         client.black_hole();
         let t = Instant::now();
         client.pm.session().resume_now();
         let took = echo_once(&mut s).await;
         assert!(t.elapsed() >= took);
-        let now: Vec<u64> = client.pm.session().subflow_stats().iter().map(|x| x.id).collect();
-        assert!(now.iter().all(|id| !old.contains(id)), "{old:?} still alive in {now:?}");
+        let now: Vec<u64> = client
+            .pm
+            .session()
+            .subflow_stats()
+            .iter()
+            .map(|x| x.id)
+            .collect();
+        assert!(
+            now.iter().all(|id| !old.contains(id)),
+            "{old:?} still alive in {now:?}"
+        );
         times.push(took);
     }
     times.sort();
     let p95 = times[(times.len() as f64 * 0.95).ceil() as usize - 1];
-    eprintln!("resume_now: median {:?}, p95 {p95:?}, worst {:?}", times[10], times[19]);
+    eprintln!(
+        "resume_now: median {:?}, p95 {p95:?}, worst {:?}",
+        times[10], times[19]
+    );
     assert!(p95 < Duration::from_secs(1), "p95 {p95:?}");
 }
 
@@ -290,13 +317,25 @@ async fn invalidate_paths_replaces_every_subflow_at_once() {
     let client = Client::start(&server, addr, ManagerConfig::default()).await;
     let mut s = client.pm.session().open_stream().await.unwrap();
     echo_once(&mut s).await;
-    let old: Vec<u64> = client.pm.session().subflow_stats().iter().map(|x| x.id).collect();
+    let old: Vec<u64> = client
+        .pm
+        .session()
+        .subflow_stats()
+        .iter()
+        .map(|x| x.id)
+        .collect();
     client.black_hole();
     let t = Instant::now();
     client.pm.invalidate_paths();
     echo_once(&mut s).await;
     assert!(t.elapsed() < Duration::from_secs(1), "{:?}", t.elapsed());
-    let now: Vec<u64> = client.pm.session().subflow_stats().iter().map(|x| x.id).collect();
+    let now: Vec<u64> = client
+        .pm
+        .session()
+        .subflow_stats()
+        .iter()
+        .map(|x| x.id)
+        .collect();
     assert!(now.iter().all(|id| !old.contains(id)));
 }
 
@@ -317,17 +356,27 @@ async fn set_probe_policy_turns_idle_probes_off_and_on() {
     };
     let client = Client::start(&server, addr, cfg).await;
     sleep(Duration::from_millis(1200)).await;
-    assert!(client.pm.probe_bytes_spent() > 0, "the idle subflow was never probed");
+    assert!(
+        client.pm.probe_bytes_spent() > 0,
+        "the idle subflow was never probed"
+    );
 
     client.pm.set_probe_policy(ProbePolicy::off());
     sleep(Duration::from_millis(300)).await;
     let off = client.pm.probe_bytes_spent();
     sleep(Duration::from_millis(1200)).await;
-    assert_eq!(client.pm.probe_bytes_spent(), off, "probes continued while off");
+    assert_eq!(
+        client.pm.probe_bytes_spent(),
+        off,
+        "probes continued while off"
+    );
 
     client.pm.set_probe_policy(probing);
     sleep(Duration::from_millis(1500)).await;
-    assert!(client.pm.probe_bytes_spent() > off, "probes did not come back");
+    assert!(
+        client.pm.probe_bytes_spent() > off,
+        "probes did not come back"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -349,7 +398,13 @@ async fn the_power_states_of_the_path_manager_set_keepalives_and_probes() {
     assert_eq!(client.pm.probe_bytes_spent(), saved, "power save probed");
 
     client.pm.set_power_state(PowerState::Foreground);
-    assert_eq!(client.pm.session().keepalive_interval(), Config::default().keepalive_interval);
+    assert_eq!(
+        client.pm.session().keepalive_interval(),
+        Config::default().keepalive_interval
+    );
     sleep(Duration::from_millis(1500)).await;
-    assert!(client.pm.probe_bytes_spent() > saved, "the foreground did not probe");
+    assert!(
+        client.pm.probe_bytes_spent() > saved,
+        "the foreground did not probe"
+    );
 }

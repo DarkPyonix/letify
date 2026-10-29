@@ -28,7 +28,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::sync::{Notify, watch};
 use tokio::task::AbortHandle;
 
-use crate::config::Config;
+use crate::config::{Config, PowerState};
 use crate::error::{Error, Result};
 use crate::frame::{self, Frame, HDR, Kind, RECORD_HDR, TAG};
 use crate::handshake::{self, Established};
@@ -218,6 +218,8 @@ pub(crate) struct Sub {
     cap_ref: f64,
     cap_saved: usize,
     cap_mode: CapMode,
+    /// The keepalive interval in milliseconds that the peer knows through this subflow.
+    told_keepalive: u64,
     /// A bulk frame had to wait for the cap since the last sample.
     capped: bool,
     /// Reads the transport's congestion window, and the latest reading with its time.
@@ -265,6 +267,7 @@ impl Sub {
             cap_ref: 0.0,
             cap_saved: START_BULK,
             cap_mode: CapMode::Grow,
+            told_keepalive: 0,
             capped: false,
             gauge,
             gauged: None,
@@ -854,7 +857,11 @@ impl State {
             }
             Frame::Hello { next } => self.apply_ack(next),
             // Keepalives are answered by the subflow's reader, which knows the subflow.
-            Frame::Ping { .. } | Frame::Pong { .. } | Frame::Probe | Frame::ProbeAck { .. } => {}
+            Frame::Ping { .. }
+            | Frame::Pong { .. }
+            | Frame::Probe
+            | Frame::ProbeAck { .. }
+            | Frame::Keepalive { .. } => {}
             Frame::Seq { seq, .. } => {
                 if let Some(sub) = self.subflows.get_mut(&id) {
                     sub.recv_seq += len as u64;
@@ -957,9 +964,26 @@ pub(crate) struct Shared {
     changes: watch::Sender<u64>,
     /// Origin of the keepalive stamps.
     origin: Instant,
-    /// A subflow with no record for this long is dead. `None` when neither side sends
-    /// keepalives, so only a transport error ends a subflow.
-    dead_after: Option<Duration>,
+    /// This side's keepalive interval in milliseconds (0 is off) and the peer's, as the
+    /// handshake or a later Keepalive frame advertised it. A subflow with no record for 3 x
+    /// the larger one is dead; with both off only a transport error ends a subflow.
+    keepalive_ms: AtomicU64,
+    peer_keepalive_ms: AtomicU64,
+    /// The interval this side's handshake advertised. A subflow tells the peer when the
+    /// current one differs.
+    handshake_keepalive_ms: u64,
+    /// Wakes the readers when either interval changed, so they recompute their dead time.
+    keepalive_changed: Notify,
+    /// Counts the calls of `resume_now`, so a path manager can redial at once.
+    hints: watch::Sender<u64>,
+}
+
+/// An interval in the milliseconds the wire carries: a nonzero interval is at least 1.
+fn interval_ms(interval: Duration) -> u64 {
+    match interval.as_millis().min(u32::MAX as u128) as u64 {
+        0 if !interval.is_zero() => 1,
+        ms => ms,
+    }
 }
 
 /// Closes the session when the last handle goes away.
@@ -1003,6 +1027,21 @@ impl Shared {
         self.bump();
         st.wake_all_streams();
         self.accept.notify_waiters();
+    }
+
+    /// This side's keepalive interval, zero for off.
+    fn keepalive(&self) -> Duration {
+        Duration::from_millis(self.keepalive_ms.load(Ordering::Relaxed))
+    }
+
+    /// How long a subflow may stay silent before it is dead, or `None` when neither side
+    /// sends keepalives.
+    fn dead_after(&self) -> Option<Duration> {
+        let longer = self
+            .keepalive_ms
+            .load(Ordering::Relaxed)
+            .max(self.peer_keepalive_ms.load(Ordering::Relaxed));
+        (longer > 0).then(|| Duration::from_millis(longer) * 3)
     }
 
     fn bump(&self) {
@@ -1113,6 +1152,9 @@ impl Shared {
                 },
             ),
         );
+        if let Some(sub) = st.subflows.get_mut(&id) {
+            sub.told_keepalive = self.handshake_keepalive_ms;
+        }
         // A new subflow cancels any running resume timer.
         st.epoch += 1;
         self.bump();
@@ -1140,18 +1182,38 @@ async fn reader_task<R: AsyncRead + Unpin>(
     rtt_us: Arc<AtomicU64>,
 ) {
     let mut rd = BufReader::with_capacity(128 * 1024, rd);
-    let limit = shared.dead_after.unwrap_or(Duration::ZERO);
     let result: Result<()> = async {
+        let mut last = tokio::time::Instant::now();
         loop {
-            let (epoch, nonce, ct) = if limit.is_zero() {
-                read_record(&mut rd).await?
-            } else {
-                tokio::time::timeout(limit, read_record(&mut rd))
-                    .await
-                    .map_err(|_| {
-                        Error::ConnectionLost("no record for 3 keepalive intervals".into())
-                    })??
+            let read = read_record(&mut rd);
+            tokio::pin!(read);
+            // The dead time follows the intervals, which can change while a record is awaited.
+            let (epoch, nonce, ct) = loop {
+                let changed = shared.keepalive_changed.notified();
+                tokio::pin!(changed);
+                changed.as_mut().enable();
+                let deadline = shared.dead_after().map(|limit| last + limit);
+                tokio::select! {
+                    record = &mut read => break record?,
+                    _ = async {
+                        match deadline {
+                            Some(at) => tokio::time::sleep_until(at).await,
+                            None => std::future::pending().await,
+                        }
+                    } => {
+                        let now = tokio::time::Instant::now();
+                        if shared.dead_after().is_some_and(|limit| last + limit <= now) {
+                            return Err(Error::ConnectionLost(
+                                "no record for 3 keepalive intervals".into(),
+                            ));
+                        }
+                    }
+                    // A new interval starts the silence over: a side that had keepalives off
+                    // has heard nothing for as long as it liked.
+                    _ = &mut changed => last = tokio::time::Instant::now(),
+                }
             };
+            last = tokio::time::Instant::now();
             received.fetch_add((RECORD_HDR + ct.len()) as u64, Ordering::Relaxed);
             let Some(plain) = shared.open(epoch, nonce, &ct)? else {
                 continue;
@@ -1162,6 +1224,10 @@ async fn reader_task<R: AsyncRead + Unpin>(
                         sub.pong = Some(stamp);
                         sub.notify.notify_one();
                     }
+                }
+                Frame::Keepalive { ms } => {
+                    shared.peer_keepalive_ms.store(ms, Ordering::Relaxed);
+                    shared.keepalive_changed.notify_waiters();
                 }
                 Frame::Pong { stamp } => {
                     let rtt = shared.stamp().saturating_sub(stamp);
@@ -1203,6 +1269,7 @@ async fn reader_task<R: AsyncRead + Unpin>(
 }
 
 enum Work {
+    Keepalive(u64),
     Pong(u64),
     ProbeAck(u64),
     Probe(usize),
@@ -1220,7 +1287,6 @@ async fn writer_task<W: AsyncWrite + Unpin>(
     notify: Arc<Notify>,
     sent: Arc<AtomicU64>,
 ) {
-    let keepalive = shared.cfg.keepalive_interval;
     let mut last_write = tokio::time::Instant::now();
     let result: Result<()> = async {
         loop {
@@ -1242,6 +1308,16 @@ async fn writer_task<W: AsyncWrite + Unpin>(
                     Work::Gone
                 } else if st.failed.is_some() {
                     Work::Done
+                } else if let Some(ms) = {
+                    let now_ms = shared.keepalive_ms.load(Ordering::Relaxed);
+                    st.subflows.get_mut(&id).and_then(|s| {
+                        (s.told_keepalive != now_ms).then(|| {
+                            s.told_keepalive = now_ms;
+                            now_ms
+                        })
+                    })
+                } {
+                    Work::Keepalive(ms)
                 } else if let Some(owed) = {
                     let next = st.recv_next;
                     st.subflows.get_mut(&id).and_then(|s| {
@@ -1325,6 +1401,12 @@ async fn writer_task<W: AsyncWrite + Unpin>(
                 }
             };
             match work {
+                Work::Keepalive(ms) => {
+                    let record = shared.seal(&frame::encode_keepalive(ms))?;
+                    wr.write_all(&record).await?;
+                    wr.flush().await?;
+                    last_write = tokio::time::Instant::now();
+                }
                 Work::Pong(stamp) => {
                     let record = shared.seal(&frame::encode_pong(stamp))?;
                     wr.write_all(&record).await?;
@@ -1357,6 +1439,7 @@ async fn writer_task<W: AsyncWrite + Unpin>(
                 }
                 Work::Idle => {
                     wr.flush().await?;
+                    let keepalive = shared.keepalive();
                     // With several subflows and frames in flight, wake every tick to look for a
                     // frame that blocks delivery.
                     let ticking = {
@@ -1464,11 +1547,7 @@ impl Session {
         initiator: bool,
         gauge: Option<Gauge>,
     ) -> Result<Session> {
-        let dead_after = {
-            let (own, peer) = (cfg.keepalive_interval, est.peer_keepalive);
-            let longer = own.max(peer);
-            (!longer.is_zero()).then(|| longer * 3)
-        };
+        let own_keepalive_ms = interval_ms(cfg.keepalive_interval);
         let state = State {
             window: cfg.stream_window,
             peer_window: est.peer_window,
@@ -1518,7 +1597,11 @@ impl Session {
             session_id: est.session_id,
             changes: watch::channel(0).0,
             origin: Instant::now(),
-            dead_after,
+            keepalive_ms: AtomicU64::new(own_keepalive_ms),
+            peer_keepalive_ms: AtomicU64::new(interval_ms(est.peer_keepalive)),
+            handshake_keepalive_ms: own_keepalive_ms,
+            keepalive_changed: Notify::new(),
+            hints: watch::channel(0).0,
         });
         shared.start_subflow(transport, gauge)?;
         Ok(Session {
@@ -1760,6 +1843,49 @@ impl Session {
     /// The newest epoch of the peer's keys that a record opened in.
     pub fn receive_epoch(&self) -> u16 {
         self.shared().keys.receive_epoch()
+    }
+
+    /// Change this side's keepalive interval at once. Zero turns this side's keepalives off.
+    /// Every subflow tells the peer, which then computes its dead time from the new value, so a
+    /// longer interval does not get the subflows declared dead. SPEC.md letify-link, Mobile and
+    /// power states item 2.
+    pub fn set_keepalive_interval(&self, interval: Duration) {
+        let shared = self.shared();
+        shared
+            .keepalive_ms
+            .store(interval_ms(interval), Ordering::Relaxed);
+        shared.keepalive_changed.notify_waiters();
+        shared.lock().wake_subflows();
+    }
+
+    /// This side's keepalive interval now, zero when off.
+    pub fn keepalive_interval(&self) -> Duration {
+        self.shared().keepalive()
+    }
+
+    /// Set the keepalive interval of a power state from the session's [`Config`].
+    pub fn set_power_state(&self, state: PowerState) {
+        self.set_keepalive_interval(self.shared().cfg.keepalive_for(state));
+    }
+
+    /// Drop every subflow and tell the path manager to dial again at once. A client calls it
+    /// when the application returns to the foreground, because a session that was suspended
+    /// cannot tell which of its subflows still reach the peer. What the peer has not
+    /// acknowledged goes out again on the first new subflow. SPEC.md letify-link, Mobile and
+    /// power states item 4.
+    pub fn resume_now(&self) {
+        let shared = self.shared();
+        let ids: Vec<SubflowId> = shared.lock().subflows.keys().copied().collect();
+        for id in ids {
+            shared.subflow_died(id);
+        }
+        shared.hints.send_modify(|n| *n += 1);
+    }
+
+    /// A counter that changes on every [`Session::resume_now`], for a path manager that waits
+    /// to redial.
+    pub fn resume_hints(&self) -> watch::Receiver<u64> {
+        self.shared().hints.subscribe()
     }
 
     /// A counter that changes whenever a subflow is added or dies.

@@ -23,6 +23,7 @@ const T_PING: u8 = 0x12;
 const T_PONG: u8 = 0x13;
 const T_PROBE: u8 = 0x14;
 const T_PROBE_ACK: u8 = 0x15;
+const T_KEEPALIVE: u8 = 0x16;
 
 /// What a sequenced frame does.
 #[derive(Debug)]
@@ -53,6 +54,8 @@ pub(crate) enum Frame {
     Probe,
     /// The answer to a `Probe`: the size of the probe's record in bytes.
     ProbeAck { bytes: u64 },
+    /// The sender's keepalive interval changed to `ms` milliseconds, 0 for off.
+    Keepalive { ms: u64 },
 }
 
 fn head(t: u8, seq: u64, stream: u32, extra: usize) -> Vec<u8> {
@@ -135,6 +138,12 @@ pub(crate) fn encode_probe_ack(bytes: u64) -> Vec<u8> {
     out
 }
 
+pub(crate) fn encode_keepalive(ms: u64) -> Vec<u8> {
+    let mut out = vec![T_KEEPALIVE];
+    out.extend_from_slice(&ms.to_be_bytes());
+    out
+}
+
 pub(crate) fn encode_pong(stamp: u64) -> Vec<u8> {
     let mut out = vec![T_PONG];
     out.extend_from_slice(&stamp.to_be_bytes());
@@ -165,7 +174,7 @@ pub(crate) fn decode(buf: Vec<u8>) -> Result<Frame> {
         );
         return Ok(Frame::Ack { next, sub });
     }
-    if t == T_HELLO || t == T_PING || t == T_PONG || t == T_PROBE_ACK {
+    if t == T_HELLO || t == T_PING || t == T_PONG || t == T_PROBE_ACK || t == T_KEEPALIVE {
         let raw: [u8; 8] = buf
             .get(1..9)
             .ok_or_else(|| bad("short ack"))?
@@ -176,6 +185,7 @@ pub(crate) fn decode(buf: Vec<u8>) -> Result<Frame> {
             T_HELLO => Frame::Hello { next },
             T_PING => Frame::Ping { stamp: next },
             T_PROBE_ACK => Frame::ProbeAck { bytes: next },
+            T_KEEPALIVE => Frame::Keepalive { ms: next },
             _ => Frame::Pong { stamp: next },
         });
     }

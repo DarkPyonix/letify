@@ -6,6 +6,19 @@ use std::time::Duration;
 /// The protocol version this crate speaks.
 pub const PROTOCOL_VERSION: u16 = 1;
 
+/// What the application tells the library about the device. It sets the keepalive interval of
+/// a session and the probing of a path manager, see SPEC.md letify-link, Mobile and power
+/// states.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum PowerState {
+    /// The application is in use. Keepalives every `keepalive_interval`.
+    Foreground,
+    /// The application is in the background. Keepalives every `background_keepalive_interval`.
+    Background,
+    /// The device saves power. No keepalives, no probes: the session relies on resumption.
+    PowerSave,
+}
+
 /// Settings for one session.
 #[derive(Clone, Debug)]
 pub struct Config {
@@ -33,6 +46,9 @@ pub struct Config {
     /// one side advertises zero the other's value is used, and when both do only a transport
     /// error ends a subflow. Default 15 s.
     pub keepalive_interval: Duration,
+    /// The keepalive interval of the `Background` power state. Zero turns keepalives off.
+    /// Default 120 s.
+    pub background_keepalive_interval: Duration,
     /// Time limit for a handshake or for adding a subflow. Default 30 s.
     pub handshake_timeout: Duration,
     /// This side moves its sending keys to the next epoch after sealing this many records in
@@ -44,6 +60,30 @@ pub struct Config {
 }
 
 impl Config {
+    /// The keepalive interval of a power state: `keepalive_interval` in the foreground,
+    /// `background_keepalive_interval` in the background and none in power save.
+    pub fn keepalive_for(&self, state: PowerState) -> Duration {
+        match state {
+            PowerState::Foreground => self.keepalive_interval,
+            PowerState::Background => self.background_keepalive_interval,
+            PowerState::PowerSave => Duration::ZERO,
+        }
+    }
+
+    /// A profile for a phone or a tablet: less memory in flight and fewer pings than the
+    /// default. `max_unacked_bytes` 4 MiB, `max_reorder_bytes` 8 MiB, `stream_window` 2 MiB,
+    /// `subflow_window` 1 MiB and `keepalive_interval` 30 s. Every other field is the default.
+    pub fn mobile() -> Config {
+        Config {
+            max_unacked_bytes: 4 << 20,
+            stream_window: 2 << 20,
+            subflow_window: 1 << 20,
+            max_reorder_bytes: 8 << 20,
+            keepalive_interval: Duration::from_secs(30),
+            ..Config::default()
+        }
+    }
+
     /// The reorder bound in KiB as the handshake carries it, after the 128 KiB least.
     pub(crate) fn reorder_kib(&self) -> u32 {
         (self.max_reorder_bytes.max(128 << 10) >> 10).min(u32::MAX as usize) as u32
@@ -60,6 +100,7 @@ impl Default for Config {
             max_reorder_bytes: 16 << 20,
             resume_window: Duration::from_secs(24 * 3600),
             keepalive_interval: Duration::from_secs(15),
+            background_keepalive_interval: Duration::from_secs(120),
             handshake_timeout: Duration::from_secs(30),
             rekey_after_records: 1 << 32,
             rekey_after: Duration::from_secs(24 * 3600),
