@@ -7,7 +7,7 @@ This file is planning. The design is in [SPEC.md, letify-link](SPEC.md#letify-li
 | Milestone | Content | State |
 |---|---|---|
 | M1 | Multi-socket TCP punch with spare sockets | Done in 2.10.0 |
-| M2 | Session layer and path manager | Open |
+| M2 | Session layer and path manager, with the hysteresis of the path manager and the head-of-line blocking measurement of many streams over TCP subflows against QUIC streams | Open |
 | M3 | NAT type detection, port spraying, policing detection, Tailcat replacement | Open |
 | M4 | The `letify-link` crate and sidecar wired into letify | Open, ships as 3.0 |
 
