@@ -48,11 +48,7 @@ fn spawn_server(b: Session, counters: Vec<Arc<AtomicU64>>) -> tokio::task::JoinH
 }
 
 /// A bulk stream tagged `tag`, which the server counts.
-async fn bulk_tagged(
-    a: &Session,
-    tag: u8,
-    stop: Arc<AtomicBool>,
-) -> tokio::task::JoinHandle<()> {
+async fn bulk_tagged(a: &Session, tag: u8, stop: Arc<AtomicBool>) -> tokio::task::JoinHandle<()> {
     let mut s = a.open_stream_with(Priority::Bulk).await.unwrap();
     tokio::spawn(async move {
         let _ = s.write_all(&[0, tag]).await;
@@ -145,6 +141,9 @@ async fn bulk_throughput_is_not_reduced_by_more_than_10_percent_by_fairness() {
     stop.store(true, Ordering::Relaxed);
     bulk.abort();
     server.abort();
-    eprintln!("bulk stream: {got:.2} MiB/s of a {:.0} MiB/s link", rate / MIB);
+    eprintln!(
+        "bulk stream: {got:.2} MiB/s of a {:.0} MiB/s link",
+        rate / MIB
+    );
     assert!(got >= 0.9 * rate / MIB, "{got:.2} MiB/s");
 }

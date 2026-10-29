@@ -9,6 +9,13 @@
 //! alone frees the retransmit buffer. A frame that blocks delivery behind a slow or stalled
 //! subflow is reinjected on another subflow, and the slow one's window is halved. The receiver
 //! reorders by sequence number in a buffer bounded in bytes.
+//!
+//! Stream scheduling (SPEC.md letify-link, Session item 7): each stream has its own send queue
+//! of frames without a sequence number. A writer picks retransmissions first, then control
+//! frames, then interactive streams and then bulk streams, each class by deficit round robin
+//! over bytes, and assigns the sequence number when it takes the frame. Bulk bytes in flight on
+//! a subflow are capped to about two bandwidth delay products so interactive frames do not wait
+//! behind a deep queue.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -38,6 +45,8 @@ const SUBFLOW_MAGIC: &[u8; 4] = b"LLNS";
 
 pub(crate) struct Sent {
     bytes: Arc<Vec<u8>>,
+    /// The frame belongs to a bulk stream and counts toward the bulk cap of its subflow.
+    bulk: bool,
     /// The subflow that carries the latest copy.
     on: Option<u64>,
     /// When the latest copy was taken by a writer.
@@ -59,6 +68,40 @@ const PENALTY_GAP: Duration = Duration::from_millis(100);
 const MIN_WINDOW: usize = 2 * (HDR + frame::CHUNK);
 /// Most frames one reinjection moves.
 const REINJECT_MAX: usize = 256;
+/// Bytes of frames one stream may queue before its writer waits.
+const QUEUE_LIMIT: usize = 256 << 10;
+/// What a stream receives each turn of the deficit round robin: one full frame.
+const QUANTUM: usize = HDR + frame::CHUNK;
+/// The bulk cap of a subflow is never below this: two full frames.
+const MIN_BULK: usize = 2 * (HDR + frame::CHUNK);
+/// A subflow starts with this bulk cap: four full frames.
+const START_BULK: usize = 4 * (HDR + frame::CHUNK);
+/// A delivery rate sample covers at least this long, and at least four smoothed round trips.
+const RATE_SAMPLE_FLOOR: Duration = Duration::from_millis(150);
+/// The bulk cap grows by this factor while a larger cap still raises the delivery rate.
+const CAP_GROWTH: f64 = 1.5;
+/// A rate this much above the previous sample counts as a response to a larger cap.
+const CAP_RESPONSE: f64 = 1.25;
+/// A held cap is tried at this fraction of itself after `CAP_HOLD` samples.
+const CAP_SHRINK: f64 = 0.75;
+/// The bulk cap never exceeds this many times rate x lowest round trip, whatever probing says.
+const CAP_BOUND: f64 = 8.0;
+/// The rate bound uses the best of this many latest delivery rate samples.
+const RATE_KEEP: usize = 8;
+/// The lowest round trip of a subflow is taken over this span.
+const MIN_RTT_SPAN: Duration = Duration::from_secs(10);
+const CAP_HOLD: u32 = 6;
+
+/// How the bulk cap of a subflow is moving.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CapMode {
+    /// Raising the cap while the delivery rate responds.
+    Grow,
+    /// The rate did not respond to a larger cap; counting samples until a trial shrink.
+    Hold(u32),
+    /// Trying a smaller cap; the larger one is kept in `cap_saved`.
+    Shrink,
+}
 
 /// Identifies a subflow within its session. Ids are never reused.
 pub type SubflowId = u64;
@@ -92,6 +135,10 @@ pub struct SubflowStats {
     /// The latest probe's size divided by the time to its answer, in bytes per second. A lower
     /// bound of the subflow's rate, because one small probe does not fill the path.
     pub probe_rate: Option<f64>,
+    /// The most bulk bytes the session lets this subflow carry in flight at this moment.
+    pub bulk_cap: usize,
+    /// The latest delivery rate sample of the subflow in bytes per second, if any.
+    pub delivery_rate: Option<f64>,
 }
 
 const NO_RTT: u64 = u64::MAX;
@@ -109,7 +156,23 @@ pub(crate) struct Sub {
     last_penalty: Option<Instant>,
     srtt: Option<Duration>,
     /// For each frame written: the value of `sent_seq` after it and when, to time its ack.
-    marks: VecDeque<(u64, Instant)>,
+    marks: VecDeque<(u64, Instant, usize)>,
+    /// Bytes of bulk frames written to this subflow and not yet covered by its subflow ack.
+    bulk_inflight: usize,
+    /// Start of the current delivery rate sample and the bytes acknowledged since.
+    rate_from: Instant,
+    rate_bytes: u64,
+    /// The latest delivery rate samples in bytes per second.
+    rates: VecDeque<f64>,
+    /// The lowest write to subflow ack time, and when it was taken.
+    min_rtt: Option<(Duration, Instant)>,
+    /// The bulk cap, see `adjust_cap`, the rate it was last judged by and its mode.
+    cap: usize,
+    cap_ref: f64,
+    cap_saved: usize,
+    cap_mode: CapMode,
+    /// A bulk frame had to wait for the cap since the last sample.
+    capped: bool,
     sent: Arc<AtomicU64>,
     received: Arc<AtomicU64>,
     acked: u64,
@@ -130,6 +193,65 @@ pub(crate) struct Sub {
     aborts: Vec<AbortHandle>,
 }
 
+impl Sub {
+    /// The most bulk bytes this subflow may have in flight: the smallest cap found by probing
+    /// that keeps the delivery rate, between two frames and half the window. See SPEC.md
+    /// letify-link, Session item 7.
+    fn bulk_cap(&self) -> usize {
+        let best = self.rates.iter().copied().fold(0.0, f64::max);
+        let rtt = self.min_rtt.map_or(RTT_FLOOR, |(r, _)| r).max(RTT_FLOOR);
+        let bound = (CAP_BOUND * best * rtt.as_secs_f64()) as usize;
+        let top = (self.window / 2).max(QUANTUM);
+        self.cap.min(bound).max(MIN_BULK).min(top)
+    }
+
+    /// Judge the cap by one delivery rate sample `rate` (bytes per second). Only a sample in
+    /// which a bulk frame waited for the cap says anything about it. The cap grows by half
+    /// while the rate responds to it. Once the rate stops responding the cap is held, and after
+    /// `CAP_HOLD` samples a smaller cap is tried and kept if the rate stays within 10%.
+    fn adjust_cap(&mut self, rate: f64) {
+        self.rates.push_back(rate);
+        if self.rates.len() > RATE_KEEP {
+            self.rates.pop_front();
+        }
+        if !std::mem::take(&mut self.capped) {
+            return;
+        }
+        match self.cap_mode {
+            CapMode::Grow => {
+                if rate > self.cap_ref * CAP_RESPONSE {
+                    self.cap = (self.cap as f64 * CAP_GROWTH) as usize;
+                    self.cap_ref = rate;
+                } else {
+                    self.cap_ref = self.cap_ref.max(rate);
+                    self.cap_mode = CapMode::Hold(0);
+                }
+            }
+            CapMode::Hold(n) if n + 1 < CAP_HOLD => {
+                self.cap_ref = self.cap_ref.max(rate);
+                self.cap_mode = CapMode::Hold(n + 1);
+            }
+            CapMode::Hold(_) => {
+                self.cap_ref = rate;
+                self.cap_saved = self.cap;
+                self.cap = ((self.cap as f64 * CAP_SHRINK) as usize).max(MIN_BULK);
+                self.cap_mode = CapMode::Shrink;
+            }
+            CapMode::Shrink => {
+                if rate < self.cap_ref * 0.9 {
+                    // The smaller cap cost rate: go back and grow from there if need be.
+                    self.cap = self.cap_saved;
+                    self.cap_ref = rate;
+                    self.cap_mode = CapMode::Grow;
+                } else {
+                    self.cap_ref = rate;
+                    self.cap_mode = CapMode::Hold(CAP_HOLD / 2);
+                }
+            }
+        }
+    }
+}
+
 #[derive(Default)]
 pub(crate) struct StreamState {
     pub send_credit: u64,
@@ -140,6 +262,19 @@ pub(crate) struct StreamState {
     pub dropped: bool,
     pub read_waker: Option<Waker>,
     pub write_waker: Option<Waker>,
+    /// Encoded frames (sequence number 0) waiting for a subflow writer.
+    pub queue: VecDeque<Vec<u8>>,
+    pub queued: usize,
+    pub bulk: bool,
+    deficit: usize,
+    in_ring: bool,
+}
+
+/// The next fresh frame a writer would take.
+enum Fresh {
+    Ctl,
+    Stream(u32),
+    Close,
 }
 
 pub(crate) struct State {
@@ -151,6 +286,13 @@ pub(crate) struct State {
     unacked: BTreeMap<u64, Sent>,
     pub unacked_bytes: usize,
     pending: BTreeSet<u64>,
+    /// Control frames (credit) that go before any stream frame.
+    ctl: VecDeque<Vec<u8>>,
+    /// Streams with queued frames, by class, in turn order.
+    ring_interactive: VecDeque<u32>,
+    ring_bulk: VecDeque<u32>,
+    /// The Close frame is owed once every queue is empty.
+    close_wanted: bool,
     peer_next: u64,
     recv_next: u64,
     reorder: BTreeMap<u64, (Frame, usize)>,
@@ -202,27 +344,72 @@ impl State {
                 && self.unacked.len() < MAX_UNACKED_FRAMES)
     }
 
-    /// Queue a sequenced frame built by `build(seq)`.
-    pub fn enqueue(&mut self, build: impl FnOnce(u64) -> Vec<u8>) {
-        let seq = self.next_seq;
-        self.next_seq += 1;
-        let bytes = build(seq);
-        self.unacked_bytes += bytes.len();
-        self.unacked.insert(
-            seq,
-            Sent {
-                bytes: Arc::new(bytes),
-                on: None,
-                at: None,
-                avoid: None,
-            },
-        );
-        self.pending.insert(seq);
+    /// Whether every queue of fresh frames and the retransmission set are empty.
+    pub fn out_empty(&self) -> bool {
+        self.pending.is_empty()
+            && self.ctl.is_empty()
+            && self.ring_interactive.is_empty()
+            && self.ring_bulk.is_empty()
+            && !self.close_wanted
+    }
+
+    /// Room in the stream's own queue for a frame of `len` payload bytes.
+    pub fn queue_room(&self, stream: u32, len: usize) -> bool {
+        self.streams
+            .get(&stream)
+            .is_none_or(|s| s.queued == 0 || s.queued + HDR + len <= QUEUE_LIMIT)
+    }
+
+    /// Queue a frame of `stream`, encoded with sequence number 0. The writer that takes it
+    /// assigns the real number.
+    pub fn enqueue_stream(&mut self, stream: u32, bytes: Vec<u8>) {
+        let Some(s) = self.streams.get_mut(&stream) else {
+            return;
+        };
+        s.queued += bytes.len();
+        s.queue.push_back(bytes);
+        if !s.in_ring {
+            s.in_ring = true;
+            s.deficit = 0;
+            if s.bulk {
+                self.ring_bulk.push_back(stream);
+            } else {
+                self.ring_interactive.push_back(stream);
+            }
+        }
         self.wake_subflows();
     }
 
     pub fn enqueue_fin(&mut self, stream: u32) {
-        self.enqueue(|seq| frame::encode_fin(seq, stream));
+        self.enqueue_stream(stream, frame::encode_fin(0, stream));
+    }
+
+    /// Ask for the Close frame, which goes after every queued frame.
+    pub fn want_close(&mut self) {
+        self.close_wanted = true;
+        self.wake_subflows();
+    }
+
+    /// Change the class of a stream's sends.
+    pub fn set_bulk(&mut self, stream: u32, bulk: bool) {
+        let Some(s) = self.streams.get_mut(&stream) else {
+            return;
+        };
+        if s.bulk == bulk {
+            return;
+        }
+        s.bulk = bulk;
+        if s.in_ring {
+            s.deficit = 0;
+            self.ring_interactive.retain(|i| *i != stream);
+            self.ring_bulk.retain(|i| *i != stream);
+            if bulk {
+                self.ring_bulk.push_back(stream);
+            } else {
+                self.ring_interactive.push_back(stream);
+            }
+        }
+        self.wake_subflows();
     }
 
     /// Account for bytes the reader consumed or discarded, and grant credit when enough
@@ -235,8 +422,108 @@ impl State {
         s.unreported += n as u64;
         if s.unreported >= threshold {
             let grant = std::mem::take(&mut s.unreported);
-            self.enqueue(|seq| frame::encode_credit(seq, stream, grant));
+            self.ctl.push_back(frame::encode_credit(0, stream, grant));
+            self.wake_subflows();
         }
+    }
+
+    /// The next fresh frame, without taking it, and its size. Deficit round robin: the stream
+    /// at the front of its ring is served while its deficit covers its next frame, and
+    /// otherwise gets a quantum and moves to the back. `None` when nothing may be sent now.
+    fn peek_fresh(&mut self) -> Option<(Fresh, usize, bool)> {
+        let count_ok = |st: &State, reserve: usize| st.unacked.len() + reserve < MAX_UNACKED_FRAMES;
+        if let Some(f) = self.ctl.front() {
+            return count_ok(self, 0).then_some((Fresh::Ctl, f.len(), false));
+        }
+        for bulk in [false, true] {
+            // Bulk frames leave an eighth of the retransmit buffer to interactive ones.
+            let (bytes_cap, count_reserve) = if bulk {
+                (
+                    self.max_unacked - self.max_unacked / 8,
+                    MAX_UNACKED_FRAMES / 8,
+                )
+            } else {
+                (self.max_unacked, 0)
+            };
+            loop {
+                let ring = if bulk {
+                    &mut self.ring_bulk
+                } else {
+                    &mut self.ring_interactive
+                };
+                let Some(&id) = ring.front() else {
+                    break;
+                };
+                let Some(s) = self.streams.get_mut(&id) else {
+                    ring.pop_front();
+                    continue;
+                };
+                let Some(front) = s.queue.front() else {
+                    s.in_ring = false;
+                    ring.pop_front();
+                    continue;
+                };
+                let len = front.len();
+                if s.deficit < len {
+                    s.deficit += QUANTUM;
+                    ring.rotate_left(1);
+                    continue;
+                }
+                let ok = (self.unacked_bytes == 0 || self.unacked_bytes + len <= bytes_cap)
+                    && count_ok(self, count_reserve);
+                return ok.then_some((Fresh::Stream(id), len, bulk));
+            }
+        }
+        (self.close_wanted && count_ok(self, 0)).then_some((Fresh::Close, frame::HDR, false))
+    }
+
+    /// Take the frame that `peek_fresh` returned, give it the next sequence number, and keep
+    /// it for retransmission.
+    fn take_fresh(&mut self, which: Fresh, bulk: bool, id: u64, now: Instant) -> Arc<Vec<u8>> {
+        let mut bytes = match which {
+            Fresh::Ctl => self.ctl.pop_front().expect("peeked"),
+            Fresh::Close => frame::encode_close(0),
+            Fresh::Stream(stream) => {
+                let s = self.streams.get_mut(&stream).expect("peeked");
+                let bytes = s.queue.pop_front().expect("peeked");
+                s.queued -= bytes.len();
+                s.deficit -= bytes.len();
+                if let Some(w) = s.write_waker.take() {
+                    w.wake();
+                }
+                if s.queue.is_empty() {
+                    s.in_ring = false;
+                    s.deficit = 0;
+                    let ring = if s.bulk {
+                        &mut self.ring_bulk
+                    } else {
+                        &mut self.ring_interactive
+                    };
+                    ring.retain(|i| *i != stream);
+                    self.forget_if_done(stream);
+                }
+                bytes
+            }
+        };
+        if matches!(which, Fresh::Close) {
+            self.close_wanted = false;
+        }
+        let seq = self.next_seq;
+        self.next_seq += 1;
+        bytes[1..9].copy_from_slice(&seq.to_be_bytes());
+        self.unacked_bytes += bytes.len();
+        let bytes = Arc::new(bytes);
+        self.unacked.insert(
+            seq,
+            Sent {
+                bytes: bytes.clone(),
+                bulk,
+                on: Some(id),
+                at: Some(now),
+                avoid: None,
+            },
+        );
+        bytes
     }
 
     pub fn forget_if_done(&mut self, stream: u32) {
@@ -244,6 +531,7 @@ impl State {
             && s.dropped
             && s.remote_fin
             && s.fin_sent
+            && s.queue.is_empty()
         {
             self.streams.remove(&stream);
         }
@@ -281,15 +569,34 @@ impl State {
         sub.acked_seq = n;
         let now = Instant::now();
         let mut covered = None;
-        while sub.marks.front().is_some_and(|(after, _)| *after <= n) {
-            covered = sub.marks.pop_front();
+        while sub.marks.front().is_some_and(|(after, _, _)| *after <= n) {
+            if let Some((_, at, bulk)) = sub.marks.pop_front() {
+                sub.bulk_inflight = sub.bulk_inflight.saturating_sub(bulk);
+                covered = Some((at, bulk));
+            }
         }
-        if let Some((_, at)) = covered {
+        if let Some((at, _)) = covered {
             let sample = now.saturating_duration_since(at);
+            if sub
+                .min_rtt
+                .is_none_or(|(low, when)| sample <= low || now - when > MIN_RTT_SPAN)
+            {
+                sub.min_rtt = Some((sample, now));
+            }
+
             sub.srtt = Some(match sub.srtt {
                 None => sample,
                 Some(old) => old.mul_f64(7.0 / 8.0) + sample.mul_f64(1.0 / 8.0),
             });
+        }
+        sub.rate_bytes += delta;
+        let span = (sub.srtt.unwrap_or_default() * 4).max(RATE_SAMPLE_FLOOR);
+        let since = now.saturating_duration_since(sub.rate_from);
+        if since >= span {
+            let rate = sub.rate_bytes as f64 / since.as_secs_f64();
+            sub.adjust_cap(rate);
+            sub.rate_from = now;
+            sub.rate_bytes = 0;
         }
         // A penalised window regains an eighth of what the subflow got acknowledged.
         sub.window = (sub.window + (delta / 8) as usize).min(cap);
@@ -320,7 +627,10 @@ impl State {
         if age > owner_rtt * REINJECT_K {
             threshold = Some(owner_rtt * REINJECT_K);
         } else if !self.has_room(frame::CHUNK)
-            || self.streams.values().any(|s| s.write_waker.is_some())
+            || self
+                .streams
+                .values()
+                .any(|s| s.write_waker.is_some() && s.queued + HDR + frame::CHUNK <= QUEUE_LIMIT)
         {
             let fastest = self
                 .subflows
@@ -504,7 +814,7 @@ impl Drop for Guard {
         let mut st = self.shared.lock();
         if !st.closing && st.failed.is_none() {
             st.closing = true;
-            st.enqueue(frame::encode_close);
+            st.want_close();
         }
     }
 }
@@ -651,6 +961,16 @@ impl Shared {
                 last_penalty: None,
                 srtt: None,
                 marks: VecDeque::new(),
+                bulk_inflight: 0,
+                rate_from: Instant::now(),
+                rate_bytes: 0,
+                rates: VecDeque::new(),
+                min_rtt: None,
+                cap: START_BULK,
+                cap_ref: 0.0,
+                cap_saved: START_BULK,
+                cap_mode: CapMode::Grow,
+                capped: false,
                 sent,
                 received,
                 acked: 0,
@@ -812,37 +1132,64 @@ async fn writer_task<W: AsyncWrite + Unpin>(
                 } else {
                     let now = Instant::now();
                     st.maybe_reinject(now);
-                    let (window, inflight) = st
-                        .subflows
-                        .get(&id)
-                        .map_or((0, 0), |s| (s.window, (s.sent_seq - s.acked_seq) as usize));
+                    let (window, inflight, bulk_cap, bulk_inflight) =
+                        st.subflows.get(&id).map_or((0, 0, 0, 0), |s| {
+                            (
+                                s.window,
+                                (s.sent_seq - s.acked_seq) as usize,
+                                s.bulk_cap(),
+                                s.bulk_inflight,
+                            )
+                        });
                     // A frame reinjected away from this subflow is skipped, unless it is the
                     // only subflow left.
                     let sole = st.subflows.len() == 1;
-                    let next = st
+                    let retransmit = st
                         .pending
                         .iter()
                         .copied()
                         .find(|q| sole || st.unacked[q].avoid != Some(id));
-                    match next {
-                        Some(seq) => {
-                            let len = st.unacked[&seq].bytes.len();
-                            if inflight == 0 || inflight + len <= window {
-                                st.pending.remove(&seq);
-                                let entry = st.unacked.get_mut(&seq).expect("pending is unacked");
-                                entry.on = Some(id);
-                                entry.at = Some(now);
-                                let bytes = entry.bytes.clone();
-                                if let Some(s) = st.subflows.get_mut(&id) {
-                                    s.sent_seq += len as u64;
-                                    s.marks.push_back((s.sent_seq, now));
-                                }
-                                Work::Frame(bytes)
-                            } else {
-                                Work::Idle
-                            }
+                    let mut hit_cap = false;
+                    let mut fits = |len: usize, bulk: bool| {
+                        let in_window = inflight == 0 || inflight + len <= window;
+                        let in_cap = !bulk || bulk_inflight == 0 || bulk_inflight + len <= bulk_cap;
+                        hit_cap |= in_window && !in_cap;
+                        in_window && in_cap
+                    };
+                    // `Some(frame, bulk)` when this writer takes a frame now.
+                    let taken = if let Some(seq) = retransmit {
+                        let (len, bulk) = (st.unacked[&seq].bytes.len(), st.unacked[&seq].bulk);
+                        if fits(len, bulk) {
+                            st.pending.remove(&seq);
+                            let entry = st.unacked.get_mut(&seq).expect("pending is unacked");
+                            entry.on = Some(id);
+                            entry.at = Some(now);
+                            Some((entry.bytes.clone(), bulk))
+                        } else {
+                            None
                         }
-                        None if st.closing && st.pending.is_empty() => Work::Done,
+                    } else if let Some((which, len, bulk)) = st.peek_fresh() {
+                        fits(len, bulk).then(|| (st.take_fresh(which, bulk, id, now), bulk))
+                    } else {
+                        None
+                    };
+                    if hit_cap && let Some(s) = st.subflows.get_mut(&id) {
+                        s.capped = true;
+                    }
+                    match taken {
+                        Some((bytes, bulk)) => {
+                            let len = bytes.len();
+                            if let Some(s) = st.subflows.get_mut(&id) {
+                                s.sent_seq += len as u64;
+                                s.marks
+                                    .push_back((s.sent_seq, now, if bulk { len } else { 0 }));
+                                if bulk {
+                                    s.bulk_inflight += len;
+                                }
+                            }
+                            Work::Frame(bytes)
+                        }
+                        None if st.closing && st.out_empty() => Work::Done,
                         None => Work::Idle,
                     }
                 }
@@ -985,6 +1332,10 @@ impl Session {
             unacked: BTreeMap::new(),
             unacked_bytes: 0,
             pending: BTreeSet::new(),
+            ctl: VecDeque::new(),
+            ring_interactive: VecDeque::new(),
+            ring_bulk: VecDeque::new(),
+            close_wanted: false,
             peer_next: 0,
             recv_next: 0,
             reorder: BTreeMap::new(),
@@ -1048,7 +1399,6 @@ impl Session {
 
     /// Open a stream whose sends have the given class.
     pub async fn open_stream_with(&self, priority: Priority) -> Result<Stream> {
-        let _ = priority;
         let shared = self.shared();
         let mut st = shared.lock();
         if let Some(why) = &st.failed {
@@ -1061,10 +1411,11 @@ impl Session {
         st.next_stream_id += 2;
         let s = StreamState {
             send_credit: st.peer_window as u64,
+            bulk: priority == Priority::Bulk,
             ..Default::default()
         };
         st.streams.insert(id, s);
-        st.enqueue(|seq| frame::encode_open(seq, id));
+        st.enqueue_stream(id, frame::encode_open(0, id));
         Ok(Stream::new(self.guard.clone(), id))
     }
 
@@ -1166,14 +1517,14 @@ impl Session {
             let mut st = shared.lock();
             if !st.closing && st.failed.is_none() {
                 st.closing = true;
-                st.enqueue(frame::encode_close);
+                st.want_close();
             }
         }
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
         loop {
             {
                 let st = shared.lock();
-                if st.pending.is_empty() || st.subflows.is_empty() || st.failed.is_some() {
+                if st.out_empty() || st.subflows.is_empty() || st.failed.is_some() {
                     return;
                 }
             }
@@ -1228,6 +1579,8 @@ impl Session {
                     srtt: sub.srtt,
                     probe_acked_bytes: sub.probe_acked,
                     probe_rate: sub.probe_rate,
+                    bulk_cap: sub.bulk_cap(),
+                    delivery_rate: sub.rates.back().copied(),
                 }
             })
             .collect()

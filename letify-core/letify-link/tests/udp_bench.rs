@@ -159,7 +159,10 @@ async fn latencies(
     });
     let stop = Arc::new(AtomicBool::new(false));
     let sent = Arc::new(AtomicU64::new(0));
-    let mut bulk = a.open_stream().await.unwrap();
+    let mut bulk = a
+        .open_stream_with(letify_link::Priority::Bulk)
+        .await
+        .unwrap();
     let bulk_task = tokio::spawn({
         let (stop, sent) = (stop.clone(), sent.clone());
         async move {
@@ -199,6 +202,15 @@ async fn latencies(
         }));
     }
     tokio::time::sleep(run).await;
+    for st in a.subflow_stats() {
+        println!(
+            "    subflow {}: cap {} KiB, rate {:?} B/s, srtt {:?}",
+            st.id,
+            st.bulk_cap >> 10,
+            st.delivery_rate.map(|r| r as u64),
+            st.srtt
+        );
+    }
     stop.store(true, Ordering::Relaxed);
     let mut all = Vec::new();
     for t in tasks {
