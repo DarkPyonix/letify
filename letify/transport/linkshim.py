@@ -37,7 +37,7 @@ def fail(error):
     sys.exit(1)
 
 
-def connect(address, timeout=10.0):
+def connect(address, timeout=10.0, secret=None):
     kind, _, rest = address.partition(":")
     if kind == "unix":
         sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -46,6 +46,8 @@ def connect(address, timeout=10.0):
     else:
         host, _, port = rest.rpartition(":")
         sock = socket.create_connection((host, int(port)), timeout=timeout)
+        if secret:
+            sock.sendall(bytes.fromhex(secret))
     sock.settimeout(None)
     return sock
 
@@ -175,7 +177,7 @@ class Shim:
             self.sessions[session].discard(event["name"])
             self.last_path = time.monotonic()
         elif name == "stream_incoming" and session in self.sessions:
-            threading.Thread(target=self.serve_stream, args=(event["socket"],), daemon=True).start()
+            threading.Thread(target=self.serve_stream, args=(event["socket"], event.get("secret")), daemon=True).start()
         elif name == "session_closed" and session in self.sessions:
             del self.sessions[session]
             return not self.sessions
@@ -205,9 +207,9 @@ class Shim:
         elif not any(self.sessions.values()) and time.monotonic() - self.last_path > limit:
             sys.exit(0)
 
-    def serve_stream(self, address):
+    def serve_stream(self, address, secret=None):
         """Serve one stream: read its first line, then start what the line asks for."""
-        self.serve_socket(connect(address))
+        self.serve_socket(connect(address, secret=secret))
 
     def read_header(self, sock):
         """The first line of the stream as an object, or None. Reads no byte past the newline."""

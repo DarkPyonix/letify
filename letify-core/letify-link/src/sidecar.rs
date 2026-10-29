@@ -269,6 +269,9 @@ struct ListenerEntry {
 struct LocalListener {
     inner: LocalListenerKind,
     address: String,
+    /// The bytes a client must send first. Only a TCP socket has one; a Unix socket is
+    /// limited to its owner by its mode.
+    secret: Option<[u8; 32]>,
 }
 
 enum LocalListenerKind {
@@ -287,12 +290,36 @@ impl Drop for LocalListener {
 }
 
 impl LocalListener {
+    /// Wait for the controlling process. A TCP connection counts only after it has sent the
+    /// stream secret; the others are closed and the wait goes on. Connections are checked
+    /// concurrently, so a connection that stays silent delays no other.
     async fn accept(&self) -> io::Result<LocalConn> {
         match &self.inner {
             LocalListenerKind::Tcp(l) => {
-                let (s, _) = l.accept().await?;
-                s.set_nodelay(true)?;
-                Ok(Box::new(s))
+                let secret = self.secret.unwrap_or([0; 32]);
+                let (tx, mut rx) = mpsc::unbounded_channel();
+                loop {
+                    tokio::select! {
+                        accepted = l.accept() => {
+                            let (s, _) = accepted?;
+                            s.set_nodelay(true)?;
+                            let tx = tx.clone();
+                            tokio::spawn(async move {
+                                let mut s = s;
+                                let mut given = [0u8; 32];
+                                let read = tokio::time::timeout(
+                                    AUTH_TIMEOUT,
+                                    s.read_exact(&mut given),
+                                )
+                                .await;
+                                if matches!(read, Ok(Ok(_))) && same_bytes(&given, &secret) {
+                                    let _ = tx.send(s);
+                                }
+                            });
+                        }
+                        Some(s) = rx.recv() => return Ok(Box::new(s)),
+                    }
+                }
             }
             #[cfg(unix)]
             LocalListenerKind::Unix(l, _) => Ok(Box::new(l.accept().await?.0)),
@@ -334,20 +361,23 @@ impl Shared {
             return Ok(LocalListener {
                 address: format!("unix:{}", path.display()),
                 inner: LocalListenerKind::Unix(l, path),
+                secret: None,
             });
         }
         let l = TcpListener::bind("127.0.0.1:0").await?;
         Ok(LocalListener {
             address: format!("tcp:{}", l.local_addr()?),
             inner: LocalListenerKind::Tcp(l),
+            secret: Some(new_secret()?),
         })
     }
 
     /// Bind a local socket for `stream`, bridge it once the controlling process connects and
     /// return the socket's address.
-    async fn bridge(&self, stream: crate::stream::Stream) -> io::Result<String> {
+    async fn bridge(&self, stream: crate::stream::Stream) -> io::Result<(String, Option<String>)> {
         let listener = self.stream_listener().await?;
         let address = listener.address.clone();
+        let secret = listener.secret.map(|s| hex(&s));
         tokio::spawn(async move {
             let mut stream = stream;
             match tokio::time::timeout(STREAM_CONNECT_WAIT, listener.accept()).await {
@@ -363,7 +393,7 @@ impl Shared {
                 }
             }
         });
-        Ok(address)
+        Ok((address, secret))
     }
 }
 
@@ -402,10 +432,16 @@ fn register(
                     Ok(stream) => {
                         let sid = stream.id();
                         match sh.bridge(stream).await {
-                            Ok(socket) => sh.emit(json!({
-                                "event": "stream_incoming", "session": id,
-                                "stream": sid, "socket": socket,
-                            })),
+                            Ok((socket, secret)) => {
+                                let mut ev = json!({
+                                    "event": "stream_incoming", "session": id,
+                                    "stream": sid, "socket": socket,
+                                });
+                                if let Some(secret) = secret {
+                                    ev["secret"] = json!(secret);
+                                }
+                                sh.emit(ev);
+                            }
                             Err(e) => eprintln!("letify-link: cannot bind a stream socket: {e}"),
                         }
                     }
@@ -511,11 +547,15 @@ async fn handle(shared: &Arc<Shared>, req: &Value) -> OpResult {
             };
             let stream = session.open_stream_with(priority).await?;
             let sid = stream.id();
-            let socket = shared
+            let (socket, secret) = shared
                 .bridge(stream)
                 .await
                 .map_err(|e| infra(format!("cannot bind a stream socket: {e}")))?;
-            Ok(json!({"stream": sid, "socket": socket}))
+            let mut reply = json!({"stream": sid, "socket": socket});
+            if let Some(secret) = secret {
+                reply["secret"] = json!(secret);
+            }
+            Ok(reply)
         }
         "close" => op_close(shared, req).await,
         other => Err(usage(format!("unknown op {other}"))),
@@ -911,6 +951,18 @@ fn new_token() -> io::Result<String> {
     let mut bytes = [0u8; 32];
     getrandom::getrandom(&mut bytes).map_err(|e| io::Error::other(e.to_string()))?;
     Ok(hex(&bytes))
+}
+
+/// 32 random bytes from the operating system.
+fn new_secret() -> io::Result<[u8; 32]> {
+    let mut bytes = [0u8; 32];
+    getrandom::getrandom(&mut bytes).map_err(|e| io::Error::other(e.to_string()))?;
+    Ok(bytes)
+}
+
+/// Compare without stopping at the first difference.
+fn same_bytes(a: &[u8; 32], b: &[u8; 32]) -> bool {
+    a.iter().zip(b).fold(0u8, |diff, (x, y)| diff | (x ^ y)) == 0
 }
 
 /// Compare without stopping at the first difference.

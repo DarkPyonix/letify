@@ -219,3 +219,29 @@ def test_a_stream_can_be_opened_as_bulk(pair):
     peer.close()
     with pytest.raises(linkd.LinkError):
         session_a.open_stream(priority="urgent")
+
+
+def test_a_stray_local_connection_does_not_get_a_loopback_stream(sidecar_binary, tmp_path):
+    a = linkd.LinkDaemon(tmp_path / "a.key", binary=sidecar_binary, loopback=True)
+    b = linkd.LinkDaemon(tmp_path / "b.key", binary=sidecar_binary, loopback=True)
+    try:
+        listener = b.listen([a.node_id], bind="127.0.0.1:0")
+        session_a = a.open_session(b.node_id, [listener.address])
+        session_b = listener.accept_session(timeout=10)
+        reply = a.request({"op": "open_stream", "session": session_a.number})
+        assert reply["socket"].startswith("tcp:") and len(reply["secret"]) == 64
+
+        stray = linkd._connect(reply["socket"])
+        stray.sendall(b"\0" * 32)
+        stray.settimeout(5)
+        assert stray.recv(1) == b""
+
+        mine = linkd._connect(reply["socket"], secret=reply["secret"])
+        mine.sendall(b"x")
+        peer = session_b.accept_stream(timeout=10)
+        assert peer.recv(1) == b"x"
+        for sock in (stray, mine, peer):
+            sock.close()
+    finally:
+        a.close()
+        b.close()
