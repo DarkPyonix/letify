@@ -12,13 +12,14 @@
 
 use std::future::Future;
 use std::io;
+use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::net::UdpSocket;
-use tokio::time::timeout;
+use tokio::time::{Instant, timeout};
 
 use crate::identity::{Identity, NodeId};
 use crate::stun::Mapping;
@@ -40,10 +41,107 @@ pub trait AddressObserver: Send + Sync {
     fn observe<'a>(&'a self, socket: &'a UdpSocket) -> ObserveFuture<'a>;
 }
 
+/// How many requests a [`QadResponder`] signs. A request that finds a bucket empty is dropped.
+#[derive(Clone, Copy, Debug)]
+pub struct QadLimits {
+    /// Requests per second, all sources together. Default 2000.
+    pub global_per_s: f64,
+    /// Burst of the global bucket. Default 2000.
+    pub global_burst: u32,
+    /// Requests per second from one source address. Default 10.
+    pub source_per_s: f64,
+    /// Burst of the bucket of one source address. Default 20.
+    pub source_burst: u32,
+}
+
+impl Default for QadLimits {
+    fn default() -> Self {
+        QadLimits {
+            global_per_s: 2000.0,
+            global_burst: 2000,
+            source_per_s: 10.0,
+            source_burst: 20,
+        }
+    }
+}
+
+/// A token bucket: `burst` tokens at most, refilled at `per_s` tokens a second.
+struct TokenBucket {
+    tokens: f64,
+    burst: f64,
+    per_s: f64,
+    last: Instant,
+}
+
+impl TokenBucket {
+    fn new(burst: u32, per_s: f64) -> Self {
+        TokenBucket {
+            tokens: f64::from(burst),
+            burst: f64::from(burst),
+            per_s,
+            last: Instant::now(),
+        }
+    }
+
+    fn take(&mut self, now: Instant) -> bool {
+        let dt = now.saturating_duration_since(self.last).as_secs_f64();
+        self.tokens = (self.tokens + dt * self.per_s).min(self.burst);
+        self.last = self.last.max(now);
+        if self.tokens >= 1.0 {
+            self.tokens -= 1.0;
+            true
+        } else {
+            false
+        }
+    }
+}
+
+/// Most source addresses the responder keeps a bucket for.
+const MAX_SOURCES: usize = 4096;
+
+struct Limiter {
+    limits: QadLimits,
+    global: TokenBucket,
+    sources: HashMap<IpAddr, TokenBucket>,
+}
+
+impl Limiter {
+    fn new(limits: QadLimits) -> Self {
+        Limiter {
+            global: TokenBucket::new(limits.global_burst, limits.global_per_s),
+            sources: HashMap::new(),
+            limits,
+        }
+    }
+
+    /// Whether to answer a request from `from` now. The source bucket is charged first, so
+    /// one flooding source cannot spend the global tokens of the others.
+    fn allow(&mut self, from: IpAddr, now: Instant) -> bool {
+        if !self.sources.contains_key(&from) && self.sources.len() >= MAX_SOURCES {
+            // Drop the source that was seen longest ago.
+            if let Some(old) = self
+                .sources
+                .iter()
+                .min_by_key(|(_, b)| b.last)
+                .map(|(k, _)| *k)
+            {
+                self.sources.remove(&old);
+            }
+        }
+        let limits = self.limits;
+        let bucket = self
+            .sources
+            .entry(from)
+            .or_insert_with(|| TokenBucket::new(limits.source_burst, limits.source_per_s));
+        bucket.take(now) && self.global.take(now)
+    }
+}
+
 /// Answers QAD requests with the address they came from. Any node can run one over UDP.
 pub struct QadResponder {
     socket: UdpSocket,
     identity: Identity,
+    limits: QadLimits,
 }
 
 impl QadResponder {
@@ -52,7 +150,14 @@ impl QadResponder {
         Ok(QadResponder {
             socket: UdpSocket::bind(addr).await?,
             identity,
+            limits: QadLimits::default(),
         })
+    }
+
+    /// Replace the default limits on how many requests are signed.
+    pub fn with_limits(mut self, limits: QadLimits) -> Self {
+        self.limits = limits;
+        self
     }
 
     /// The address the responder listens on.
@@ -70,8 +175,12 @@ impl QadResponder {
     /// Answer requests until the task is dropped. A datagram that is not a request is ignored.
     pub async fn run(self) {
         let mut buf = [0u8; 2048];
+        let mut limiter = Limiter::new(self.limits);
         while let Ok((n, from)) = self.socket.recv_from(&mut buf).await {
             if n != REQUEST_LEN || &buf[..4] != MAGIC || buf[4] != VERSION {
+                continue;
+            }
+            if !limiter.allow(from.ip(), Instant::now()) {
                 continue;
             }
             let nonce: [u8; NONCE_LEN] = buf[5..5 + NONCE_LEN].try_into().unwrap();
