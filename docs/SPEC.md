@@ -2015,6 +2015,17 @@ Terms used below. A **path** is one transport route between two nodes: one TCP c
 
 TCP carries the networks that pass a simultaneous open, and UDP carries those that pass only datagrams. QUIC migrates a connection only between UDP paths and cannot carry TCP subflows, so a QUIC connection cannot be the session. The session is a Noise session that runs over either transport and over several paths at once. The cost of this choice is measured in M2: head-of-line blocking of many streams over TCP subflows, compared with QUIC streams.
 
+#### Library API and embedding <!-- id: link-embedding -->
+
+> The crate is a library an application links. It owns no runtime, and a node is the pieces the embedder holds.
+
+1. **Public surface.** The crate root re-exports what an application needs: `Identity`, `NodeId` and `PeerPolicy`; `Session`, `Stream` and `Config`; `Acceptor`; `PathManager` with `Candidate`; and the modules `rendezvous`, `record`, `stun`, `observe`, `punch`, `policing`, `udp`, `tcp` and, with the Cargo feature `relay`, `relay`. The sidecar protocol is also public, as the module `sidecar`, so another embedder can reuse it.
+2. **No `Node` object.** A node is an `Identity`, an `Acceptor` for incoming transports, and a `PathManager` or a `Session::connect` for outgoing ones. The embedder owns them and decides their lifetime.
+3. **The caller owns the runtime.** The crate never creates a tokio runtime and never blocks a thread. Every function is async, and the tasks that a session, a path manager or a relay start are spawned with `tokio::spawn`, so they run on the runtime that is current at the call. An embedder with its own runtime calls the crate from inside it (`handle.spawn`, or inside `handle.enter()`). An embedder with no runtime builds one and keeps it alive while it holds a session; the sidecar does so. A runtime that the crate creates for C callers belongs to the future `letify-link-ffi` crate.
+4. **Start and stop.** Start is: load or generate the `Identity`, build the `Acceptor`, then accept transports or start a `PathManager`. Stop is: `Session::close` (it writes the queued frames first), drop the `PathManager` (it aborts its dialers), and last shut the runtime down. Dropping every handle of a session ends it. A relay stops when its `run` task is dropped.
+5. **Crate types.** The crate builds as an `rlib`. It does not set `staticlib` or `cdylib`, because they would export nothing: a C ABI needs `extern "C"` functions and a header, and those belong in a separate `letify-link-ffi` crate, added when an embedder needs one. That crate would own the runtime of item 3. The crate is pure Rust, with rustls on the ring backend.
+6. **Platforms.** CI builds and tests the crate on Linux, macOS and Windows, and checks that it compiles for `aarch64-apple-ios` and `aarch64-linux-android`, as [Versioning and releases](#versioning) says. The mobile checks are a separate job that does not gate a release. [NAT traversal](#link-nat) item 7 gives the Windows socket behaviour.
+
 #### Session <!-- id: link-session -->
 
 > Noise IK, then encrypted frames with their own stream multiplexing, independent of the transport.
@@ -2152,11 +2163,23 @@ The library can forward frames through a third node when no direct path exists. 
 13. **Allow-list updates and revocation.** The allow list of a running relay can change. `Relay::allow(node)` admits a node id from then on, and `Relay::revoke(node)` removes it: the relay refuses its new handshakes, drops its waiting requests and closes every live splice that has the node on either end at once, which closes the other end of each splice as item 10 says. The relay has no heartbeat, so "at once" means the splice ends within one scheduling step of the call and not at the next keepalive. `revoke` overrides the startup policy, so a node an open relay admitted is refused after a revoke until `allow` is called for it. `Relay::handle()` returns a cloneable `RelayHandle` with the same two calls, because `Relay::run` consumes the relay.
 14. **Run mode.** `letify-link relay --listen ADDR --key PATH [--allow NODEID ...] [--rate-limit BYTES_PER_SECOND]` runs a relay. The key file holds the 32 byte node secret as 64 hex characters; the command creates it with mode 0600 when it is missing and prints the node id on the first line of standard output. Without `--allow` the relay is open. Without the Cargo feature `relay` the command exits with an error that says so.
 
+#### Identity <!-- id: link-identity -->
+
+> Nodes are ed25519 keys. The Noise static key is derived from the node key.
+
+A node holds an ed25519 key pair. Its node id is the public key. The X25519 static key used by the handshake is derived from the ed25519 key by the standard conversion, so one identity serves both signatures and the handshake. The handshake proves the node id by the check of [Session](#link-session) item 1: the responder compares the Montgomery form of the claimed ed25519 node id with the static key that authenticated. letify keeps its node key in `~/.letify/accounts` and never in a tracked file. The remote key lives for one session.
+
+The embedding application may supply its own ed25519 secret key, and the library derives the Noise static key from it. Ember, for example, registers a device by an iroh NodeId, which is an ed25519 public key. letify generates its own key and supplies none.
+
+The session resumption of Session item 5 also serves a client whose process was suspended, as a phone app is: keys are kept, and the streams resume after the path manager reconnects or fail with a connection error when the resume window ends. Nothing in the library may require a desktop operating system, so iOS and Android clients are not precluded. Browsers are out of scope.
+
+The library does not assume a topology. A star of one server and about 10 nodes and clients per account, with long-lived connections and many streams, is the intended case for Ember. It requires only the Rendezvous trait, node ids and the relay role of [Relay](#link-relay), and letify does not depend on it.
+
 #### Sidecar interface <!-- id: link-sidecar -->
 
 > Python starts one executable per node and talks to it over local sockets. No Python extension is linked.
 
-The library comes first and the sidecar second. This interface is how the pure-Python package uses the crate, and an application that links the crate does not use it.
+**Appendix.** This subsection is the last of the letify-link section on purpose. The library, described in the subsections above, is the product; the sidecar is one embedder of it, the binding that the pure-Python package uses. An application that links the crate does not use this interface and owes it nothing.
 
 The sidecar is a binary named `letify-link`, built for each wheel and installed in `letify/remoting/lib/` next to `letify-quic`. The package stays pure Python.
 
@@ -2212,18 +2235,6 @@ The sidecar is a binary named `letify-link`, built for each wheel and installed 
    **Taking over a call.** The run record of [Taking over a running call](#run-takeover) carries a `link` object for a worker that was reached through a session: `node_id`, the remote node id; `endpoint`, the `address:port` the shim listens on; and `local_node`, the node id of the owner. The shim accepts a session from every node id in its `allow` list at any time while it runs, so a second session is a second owner, and it leaves only when no session has a live path for the resume window. A new owner opens a session to `endpoint` with the account's own key (`~/.letify/accounts/<alias>/link.key`), opens one stream with a `door` line, adopts the call on it and speaks the frames of [Channels](#channels). It uses no ssh. A new owner whose node id differs from `local_node`, which is a second machine or a second key, is refused with `UnsupportedMode` saying so, because the shim's `allow` list would need that node id added. Adding it is later work: it needs one more ssh command that reaches the running shim, which has no standard input after the hand-over, and is not built.
 
    The connect fails with its reason when any step fails: the binary is missing, the shim reports an error, the handshake is refused, or no candidate answers within `start_timeout_ms`. It does not use the ssh data path instead, unless the account says `link = "ssh"`. [Link floor](#link-floor) and [Choosing a link](#choosing-a-link) apply to the session's measured path: the round trip that `paths` reports is held to `max_rtt_ms` and a `path_probe` throughput to `min_mib_per_s`, and a path below either fails the connect with the account settings named. A path the sidecar has not measured yet is not rejected.
-
-#### Identity <!-- id: link-identity -->
-
-> Nodes are ed25519 keys. The Noise static key is derived from the node key.
-
-A node holds an ed25519 key pair. Its node id is the public key. The X25519 static key used by the handshake is derived from the ed25519 key by the standard conversion, so one identity serves both signatures and the handshake. The handshake proves the node id by the check of [Session](#link-session) item 1: the responder compares the Montgomery form of the claimed ed25519 node id with the static key that authenticated. letify keeps its node key in `~/.letify/accounts` and never in a tracked file. The remote key lives for one session.
-
-The embedding application may supply its own ed25519 secret key, and the library derives the Noise static key from it. Ember, for example, registers a device by an iroh NodeId, which is an ed25519 public key. letify generates its own key and supplies none.
-
-The session resumption of Session item 5 also serves a client whose process was suspended, as a phone app is: keys are kept, and the streams resume after the path manager reconnects or fail with a connection error when the resume window ends. Nothing in the library may require a desktop operating system, so iOS and Android clients are not precluded. Browsers are out of scope.
-
-The library does not assume a topology. A star of one server and about 10 nodes and clients per account, with long-lived connections and many streams, is the intended case for Ember. It requires only the Rendezvous trait, node ids and the relay role of [Relay](#link-relay), and letify does not depend on it.
 
 ### Reverse SSH <!-- id: reverse-ssh -->
 
@@ -3127,6 +3138,8 @@ Linux wheels are built inside the `manylinux_2_28` containers, so the binaries n
 Pushing a tag `v*` runs `.github/workflows/publish.yml`. It builds the sdist, the six platform wheels above and, when `letify-ext/` exists, the extension's `letify-ext-<version>.vsix` after its unit tests pass. It then creates the GitHub Release for the tag with every one of those files attached, and uploads the sdist and wheels to PyPI. The extension is not published to the VS Code Marketplace.
 
 The same tag also runs `.github/workflows/publish-crates.yml`, which publishes the crate `letify` to crates.io at the same version. `letify` is the Rust face of the project: a library crate in `letify-core/letify` that re-exports the letify components meant for use outside letify, the first being the connection library `letify-link` once it exists. Every other crate in `letify-core/` sets `publish = false`, because each is a binary shipped inside the wheels and tied to the Python package of the same version. The workflow checks before it uploads anything: the tag agrees with every version file, the tagged commit is on `develop`, the workspace builds and its tests pass, and `cargo publish -p letify --dry-run` packages and builds the crate on its own. The upload comes last, because crates.io never replaces a version: a published number can be yanked but is taken forever. It runs in the GitHub environment `crates-io` with the repository secret `CARGO_REGISTRY_TOKEN`, a crates.io API token scoped to publishing `letify` and the future `letify-*` crates. A tag pushed before that secret exists fails at the upload and publishes nothing.
+
+The workflow `.github/workflows/letify-link.yml` checks letify-link on every push and pull request that touches `letify-core/`. It is not a release gate: `publish.yml` and `publish-crates.yml` do not read it and keep their own checks. Its job `test` formats, lints, builds and tests the crate with the Cargo feature `relay` on Ubuntu, macOS and Windows, with `fail-fast` off so one platform's failure does not hide another's. Two further jobs run `cargo check --lib --target` for `aarch64-apple-ios` (on macOS, where Xcode supplies the C compiler that ring's build script needs) and for `aarch64-linux-android` (on Ubuntu, with the C compiler of the runner's NDK). Each mobile target is its own job, so a missing mobile tool fails that job alone.
 
 A `letify-*` crate name is reserved before its first release by pushing the tag `reserve/<crate>`, which runs `.github/workflows/reserve-crates.yml` and publishes version 0.0.0 of that name with no code and a README naming the letify release that ships it. A name crates.io already has is skipped, and a name not of the form `letify-<word>` is refused. The real crate then publishes at letify's version like every other, so 0.0.0 stays below every real release. `letify-link` and `letify-proto` are reserved this way, for letify 3.0.
 
