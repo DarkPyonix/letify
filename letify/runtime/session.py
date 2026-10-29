@@ -588,7 +588,10 @@ class Runtime:
 
         pool = self._pool
         config = getattr(pool, "config_file", None)
+        link = getattr(self.channel, "takeover_record", None)
+        extra = {"link": link()} if callable(link) else {}
         return {
+            **extra,
             "project": str(project),
             "config": str(config) if config else None,
             "call_dir": call_dir,

@@ -313,9 +313,22 @@ class Shell(Provider):
         return ""
 
     def link(self, runtime: Runtime | None = None) -> Link:
-        """The chosen link, connecting through the pipeline the first time it is asked for."""
+        """The chosen link, connecting through the pipeline the first time it is asked for.
+
+        On an account with ``link = "letify-link"`` it is the plain ssh command with the
+        session's measurements and no pipeline: the data path is the session, so no strategy
+        is raced and no probe runs. Spec "Sidecar interface" item 7.
+        """
         links: dict[str, Link] = self.__dict__.setdefault("_links", {})
         key = self._link_key(runtime)
+        if key not in links and self.uses_letify_link:
+            from ..transport.linkchannel import PlainSshLink
+
+            remotes = self.__dict__.setdefault("_link_remotes", {})
+            links[key] = PlainSshLink(  # type: ignore[assignment]
+                lambda command: self.ssh_command(command and self.remote_command(command)),
+                lambda: remotes.get(key),
+            )
         if key not in links:
             from ..transport.announce import printer
             from ..transport.pipeline import LinkCache, Pipeline, network_fingerprint
@@ -587,16 +600,17 @@ class Shell(Provider):
         address = self.address
         if address is None:
             raise ProviderUnavailable(
-                self.kind, f"{self.alias} sets link = \"letify-link\" but has no 'address'"
+                self.kind,
+                f'{self.alias} sets link = "letify-link" and has no address: letify-link '
+                f"needs an address until the NAT rendezvous lands",
             )
-        ssh_link = self.link(runtime)
         directory = account_directory(self.alias)
         directory.mkdir(mode=0o700, parents=True, exist_ok=True)
         floor = self.link_floor
         binary = self.config.option("link_binary")
         remotes[key] = linkchannel.connect(
             self.alias,
-            ssh=lambda command: ssh_link.ssh_command(self.remote_command(command)),
+            ssh=lambda command: sshopts.unshared(self.ssh_command(self.remote_command(command))),
             address=address,
             python=self.remote_python,
             bootstrap=BOOTSTRAP,
@@ -640,6 +654,13 @@ class Shell(Provider):
 
     takeover_refusal = None
 
+    @property
+    def transfer_connection_cost_s(self) -> float:  # type: ignore[override]
+        """Zero on a letify-link account, where one more connection is one more stream."""
+        if self.uses_letify_link:
+            return 0.0
+        return float(super().transfer_connection_cost_s)
+
     def attach_channel(self, name: str, record: Mapping[str, Any]) -> Channel:
         """A relay on the machine, reached by the same link as a worker, to the worker's door.
 
@@ -653,10 +674,7 @@ class Shell(Provider):
         from ..runtime.channel import AttachedChannel, relay_program
 
         if self.uses_letify_link:
-            raise UnsupportedMode(
-                f"{self.alias} carries its channel over letify-link, and a second process "
-                f'cannot yet attach to a worker through it. Set link = "ssh" to take over.'
-            )
+            return self._attach_link(name, record)
         if self.takeover_refusal is not None or not self.persistent_channel:
             raise UnsupportedMode(
                 f"{self.alias} cannot hand a running call to another process: "
@@ -674,6 +692,29 @@ class Shell(Provider):
         command = f"{self.remote_python} -c {program} {door}"
         return AttachedChannel(
             sshopts.unshared(link.ssh_command(self.remote_command(command))), name=name
+        )
+
+    def _attach_link(self, name: str, record: Mapping[str, Any]) -> Channel:
+        """A door stream of a new session to the shim that serves the run's worker.
+
+        Spec "Sidecar interface" item 7, taking over a call. The new owner uses the account's
+        own key, so it is the node the shim already allows, and it uses no ssh.
+        """
+        from ..config.secrets import account_directory
+        from ..errors import UnsupportedMode
+        from ..transport import linkchannel
+
+        info = record.get("link")
+        if not isinstance(info, Mapping) or not record.get("door"):
+            raise UnsupportedMode(
+                f"{self.alias} carries its channel over letify-link, and the record of this "
+                f"run names no letify-link endpoint to attach to"
+            )
+        directory = account_directory(self.alias)
+        directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+        remote = linkchannel.attach(self.alias, dict(info), key_path=directory / "link.key")
+        return linkchannel.LinkChannel(
+            remote, name=name, door=str(record["door"]), owns_remote=True
         )
 
     def transfer_command(self, runtime: Runtime | None) -> list[str]:

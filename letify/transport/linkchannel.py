@@ -12,6 +12,7 @@ from __future__ import annotations
 import contextlib
 import json
 import os
+import secrets
 import shlex
 import socket
 import subprocess
@@ -23,7 +24,8 @@ from typing import Any
 
 from ..errors import ProviderUnavailable, RuntimeFailure
 from ..protocol import wire
-from ..runtime.channel import FramedChannel
+from ..runtime.channel import FramedChannel, relay_program
+from ..runtime.lease import GRACE
 from . import linkd
 
 #: Seconds the remote gets to download the wheel and take ``letify-link`` out of it.
@@ -32,22 +34,96 @@ PREPARE_TIMEOUT = 600.0
 SHIM_TIMEOUT = 60.0
 #: Seconds the remote shim waits for a session after the hand-over before it leaves.
 WAIT_SESSION_S = 120
-#: Seconds the remote shim keeps a session with no live path before it leaves.
-RESUME_S = 900
+#: Seconds a session keeps its place with no live path. It is the lease of spec "Sessions",
+#: so a session never outlives what the lease allows. The shim leaves after the same time.
+RESUME_S = int(GRACE)
+#: Lines of a worker's standard error the shim returns on request.
+STDERR_LINES = 40
+#: Seconds to wait for the shim to answer a request for a worker's standard error.
+STDERR_WAIT_S = 5.0
+
+
+def shim_path() -> Path:
+    """The file of ``linkshim.py``."""
+    return Path(__file__).with_name("linkshim.py")
 
 
 def shim_source() -> str:
     """The text of ``linkshim.py``, which the machine runs with its own Python."""
-    return (Path(__file__).with_name("linkshim.py")).read_text(encoding="utf-8")
+    return shim_path().read_text(encoding="utf-8")
+
+
+def stream_header(kind: str, token: str, **fields: Any) -> bytes:
+    """The one line of JSON that opens a stream. Spec "Sidecar interface" item 7."""
+    return json.dumps({"kind": kind, "token": token, **fields}).encode() + b"\n"
+
+
+class PlainSshLink:
+    """The ssh command of an account that carries its channel over letify-link.
+
+    Owns the ssh command for the commands that are not the data path (a card query, a worker
+    stop) and the numbers the transfer decision reads, which are the session's. It runs no
+    strategy race and no probe. Spec "Sidecar interface" item 7.
+    """
+
+    persistent = True
+    strategy = "direct_ssh"
+    rank = 0
+    note: str | None = None
+
+    def __init__(self, command: Callable[[str | None], list[str]], remote: Callable[[], Any]):
+        self._command = command
+        self._remote = remote
+
+    def ssh_command(self, remote_command: str | None = None) -> list[str]:
+        return self._command(remote_command)
+
+    @property
+    def rtt_ms(self) -> float | None:
+        remote = self._remote()
+        return remote.rtt_ms if remote is not None else None
+
+    @property
+    def upload_bps(self) -> float | None:
+        remote = self._remote()
+        return remote.upload_bps if remote is not None else None
+
+    def spare_connections(self) -> int:
+        return 0
+
+    def probe_stream(self) -> object | None:
+        return None
+
+    def close(self) -> None:
+        return None
 
 
 class LinkRemote:
     """One connected machine: the local sidecar, the session, and the ssh command that ended."""
 
-    def __init__(self, daemon: linkd.LinkDaemon, session: linkd.LinkSession, alias: str):
+    def __init__(
+        self,
+        daemon: linkd.LinkDaemon,
+        session: linkd.LinkSession,
+        alias: str,
+        *,
+        remote_id: str = "",
+        endpoint: str = "",
+    ):
         self.daemon = daemon
         self.session = session
         self.alias = alias
+        #: The shim's node id and the ``address:port`` it listens on, which a run record keeps.
+        self.remote_id = remote_id
+        self.endpoint = endpoint
+
+    def record(self) -> dict[str, str]:
+        """What a second process needs to open its own session to this machine."""
+        return {
+            "node_id": self.remote_id,
+            "endpoint": self.endpoint,
+            "local_node": self.daemon.node_id,
+        }
 
     def open_stream(self) -> socket.socket:
         """One more stream of the session. No punch and no ssh connection."""
@@ -58,14 +134,23 @@ class LinkRemote:
                 f"{self.alias}: cannot open a letify-link stream: {error}"
             ) from error
 
+    def _paths(self) -> list[dict[str, Any]]:
+        try:
+            return list(self.session.paths())
+        except linkd.LinkError:
+            return []
+
     @property
     def rtt_ms(self) -> float | None:
         """The round trip the session measured on its best path, or None before one is known."""
-        try:
-            rtts = [p["srtt_ms"] for p in self.session.paths() if p.get("srtt_ms")]
-        except linkd.LinkError:
-            return None
+        rtts = [p["srtt_ms"] for p in self._paths() if p.get("srtt_ms")]
         return min(rtts) if rtts else None
+
+    @property
+    def upload_bps(self) -> float | None:
+        """The rate the session measured on its best path, or None before one is known."""
+        rates = [p["probe_rate"] for p in self._paths() if p.get("probe_rate")]
+        return max(rates) if rates else None
 
     @property
     def alive(self) -> bool:
@@ -168,6 +253,7 @@ def connect(
                 "bind": "0.0.0.0:0",
                 "python": python,
                 "bootstrap": bootstrap,
+                "relay": relay_program(),
                 "wait_s": WAIT_SESSION_S,
                 "resume_s": RESUME_S,
             }
@@ -183,9 +269,13 @@ def connect(
             names = daemon.punch(remote_id, "initiator", sockets=4, public_ip=address)
             candidates += [{"name": f"punch{i}", "punched": n} for i, n in enumerate(names)]
         session = daemon.open_session(
-            remote_id, candidates, config={"start_timeout_ms": start_timeout_ms}
+            remote_id,
+            candidates,
+            config={"start_timeout_ms": start_timeout_ms, "resume_window_s": RESUME_S},
         )
-        remote = LinkRemote(daemon, session, alias)
+        remote = LinkRemote(
+            daemon, session, alias, remote_id=remote_id, endpoint=f"{address}:{ready['port']}"
+        )
         _hold_to_floor(remote, max_rtt_ms, min_bps)
         write({"op": "handover"})
         lines.wait("handed_over", SHIM_TIMEOUT, alias, proc)
@@ -205,6 +295,55 @@ def connect(
         if proc is not None and proc.poll() is None:
             with contextlib.suppress(OSError):
                 proc.kill()
+
+
+def attach(
+    alias: str,
+    record: dict[str, Any],
+    *,
+    key_path: str | os.PathLike[str],
+    start_timeout_ms: int = 60_000,
+) -> LinkRemote:
+    """A new session to a shim that already serves a worker, for a second owner.
+
+    Spec "Sidecar interface" item 7, taking over a call. The shim's ``allow`` list holds the
+    node id of the first owner, so the new owner has to be that node: the same key. Another
+    node is refused here rather than at a handshake that would fail with no reason given.
+    """
+    from ..errors import UnsupportedMode
+
+    try:
+        daemon = linkd.LinkDaemon(key_path)
+    except linkd.LinkMissing as error:
+        raise _fail(alias, str(error)) from error
+    except linkd.LinkError as error:
+        raise _fail(alias, f"the local sidecar failed: {error}") from error
+    try:
+        if daemon.node_id != record.get("local_node"):
+            raise UnsupportedMode(
+                f"{alias} runs this call behind a letify-link shim whose allow list holds "
+                f"node {str(record.get('local_node'))[:12]}, and this process is node "
+                f"{daemon.node_id[:12]}. A takeover from another machine or key needs that node "
+                f"added to the allow list, which is not built yet"
+            )
+        session = daemon.open_session(
+            str(record["node_id"]),
+            [str(record["endpoint"])],
+            config={"start_timeout_ms": start_timeout_ms, "resume_window_s": RESUME_S},
+        )
+    except linkd.LinkError as error:
+        daemon.close()
+        raise _fail(alias, str(error)) from error
+    except BaseException:
+        daemon.close()
+        raise
+    return LinkRemote(
+        daemon,
+        session,
+        alias,
+        remote_id=str(record["node_id"]),
+        endpoint=str(record["endpoint"]),
+    )
 
 
 def _hold_to_floor(remote: LinkRemote, max_rtt_ms: float | None, min_bps: float | None) -> None:
@@ -295,9 +434,21 @@ class LinkChannel(FramedChannel):
     bootstrap source and everything after is frames.
     """
 
-    def __init__(self, remote: LinkRemote, *, name: str = "runtime"):
+    def __init__(
+        self,
+        remote: LinkRemote,
+        *,
+        name: str = "runtime",
+        door: str | None = None,
+        owns_remote: bool = False,
+    ):
         self.remote = remote
         self.name = name
+        #: The path of a running worker's second door, for a channel that attaches to it.
+        self.door = door
+        #: Whether closing the channel ends the session, as for an attached channel.
+        self.owns_remote = owns_remote
+        self.token = secrets.token_hex(8)
         self._socket: socket.socket | None = None
         self._start_lock = threading.Lock()
 
@@ -313,8 +464,40 @@ class LinkChannel(FramedChannel):
             self._connection = Connection(
                 self.name, lambda view: sock.send(view), sock.recv_into, self._emit
             )
-            self._send_worker()
+            if self.door is None:
+                header = stream_header("worker", self.token)
+            else:
+                header = stream_header("door", self.token, path=self.door)
+            self._connection.sender.raw(header)
+            if self.door is None:
+                self._send_worker()
             self._await_ready()
+
+    def takeover_record(self) -> dict[str, str]:
+        """What a run record keeps so a second process can reach this machine's shim."""
+        return self.remote.record()
+
+    def tail(self) -> str:
+        """The last lines of the standard error of this stream's worker, or "" when unknown."""
+        try:
+            sock = self.remote.session.open_stream()
+        except Exception:
+            return ""
+        chunks: list[bytes] = []
+        try:
+            sock.settimeout(STDERR_WAIT_S)
+            sock.sendall(stream_header("stderr", self.token))
+            while len(chunks) < 64:
+                data = sock.recv(65536)
+                if not data:
+                    break
+                chunks.append(data)
+        except OSError:
+            pass
+        finally:
+            with contextlib.suppress(OSError):
+                sock.close()
+        return b"".join(chunks).decode("utf-8", "replace")
 
     def _kill(self) -> None:
         if self._socket is not None:
@@ -322,11 +505,13 @@ class LinkChannel(FramedChannel):
                 self._socket.shutdown(socket.SHUT_RDWR)
 
     def _startup_failure(self, expired: bool, cause: Exception) -> Exception:
+        stderr = self.tail().strip()
         if expired:
-            return super()._startup_failure(expired, cause)
+            return RuntimeFailure(f"{super()._startup_failure(expired, cause)}", stderr=stderr)
         return RuntimeFailure(
             f"{self.name}: the worker exited before it was ready, or the letify-link "
-            f"session closed ({self.remote.session.close_reason or 'no reason given'})"
+            f"session closed ({self.remote.session.close_reason or 'no reason given'})",
+            stderr=stderr,
         )
 
     def close(self) -> None:
@@ -342,6 +527,8 @@ class LinkChannel(FramedChannel):
             with contextlib.suppress(OSError):
                 sock.shutdown(socket.SHUT_RDWR)
             sock.close()
+            if self.owns_remote:
+                self.remote.close()
 
     def detach(self) -> None:
         """Close the stream without a shutdown frame, which the worker would take as an end."""
@@ -357,4 +544,14 @@ class LinkChannel(FramedChannel):
         return self._socket is not None and self.remote.alive
 
 
-__all__ = ["LinkChannel", "LinkRemote", "connect", "prepare_binary", "shim_source"]
+__all__ = [
+    "LinkChannel",
+    "LinkRemote",
+    "PlainSshLink",
+    "attach",
+    "connect",
+    "prepare_binary",
+    "shim_path",
+    "shim_source",
+    "stream_header",
+]
