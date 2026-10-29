@@ -537,8 +537,14 @@ def test_a_dataloader_with_pin_memory_feeds_non_blocking_uploads(monkeypatch) ->
 # -- Spec: Compilation --------------------------------------------------------------
 
 
+@pytest.fixture
+def compile_steps_on(monkeypatch):
+    """Enable step compilation before the ``client`` fixture reads the switch."""
+    monkeypatch.setenv("LETIFY_COMPILE_STEPS", "1")
+
+
 def test_torch_compile_returns_the_module_and_warns_that_the_runtime_compiles_steps(
-    client, monkeypatch
+    compile_steps_on, client, monkeypatch
 ) -> None:
     import warnings
 
@@ -564,7 +570,7 @@ def test_torch_compile_returns_the_module_and_warns_that_the_runtime_compiles_st
     assert torch.equal(compiled(x).cpu(), model(x).cpu())
 
 
-def test_a_compiled_training_loop_matches_the_same_loop_run_eagerly(client) -> None:
+def test_a_compiled_training_loop_matches_the_same_loop_run_eagerly(compile_steps_on, client) -> None:
     def train(compile_it):
         torch.manual_seed(0)
         model = torch.nn.Sequential(
@@ -587,6 +593,59 @@ def test_a_compiled_training_loop_matches_the_same_loop_run_eagerly(client) -> N
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
         assert train(True) == train(False)
+
+
+def test_torch_compile_under_host_local_runs_eagerly_unless_step_compilation_is_enabled(
+    monkeypatch,
+) -> None:
+    from letify.remoting.device import cuda as mapping
+
+    monkeypatch.delenv("LETIFY_COMPILE_STEPS", raising=False)
+    monkeypatch.setattr(mapping, "_COMPILE_WARNED", [False])
+    connected = forwarding.connect(forwarding.worker_command(sys.executable), device="cpu")
+    try:
+        with connected.activate():
+            _forbid_local_cuda(monkeypatch)
+            model = torch.nn.Linear(4, 2).cuda()
+            with pytest.warns(UserWarning, match="eagerly.*LETIFY_COMPILE_STEPS=1.*compile_steps"):
+                assert torch.compile(model) is model
+            x = torch.ones(3, 4, device="cuda")
+            assert torch.equal(model(x).cpu(), model(x).cpu())
+            assert connected.compile_requested is False
+            assert connected.call("letify.compile_stats", True)["compiled"] == 0
+    finally:
+        connected.close()
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [("1", True), ("true", True), ("Yes", True), ("ON", True)]
+    + [("0", False), ("false", False), ("No", False), ("off", False), ("", False)],
+)
+def test_letify_compile_steps_in_the_environment_enables_step_compilation(
+    monkeypatch, value, expected
+) -> None:
+    from letify.remoting.device.value import compile_steps_enabled
+
+    monkeypatch.setenv("LETIFY_COMPILE_STEPS", value)
+    assert compile_steps_enabled(None) is expected
+
+
+def test_compile_steps_in_the_config_enables_step_compilation(
+    isolated_home, monkeypatch, tmp_path
+) -> None:
+    from letify.remoting.device.value import compile_steps_enabled
+
+    monkeypatch.delenv("LETIFY_COMPILE_STEPS", raising=False)
+    monkeypatch.delenv("LETIFY_CONFIG", raising=False)
+    moved = tmp_path / "moved"
+    moved.mkdir()
+    monkeypatch.setenv("LETIFY_HOME", str(moved))
+    assert compile_steps_enabled(None) is False
+    (moved / "config.toml").write_text("compile_steps = true\n", encoding="utf-8")
+    assert compile_steps_enabled(None) is True
+    monkeypatch.setenv("LETIFY_COMPILE_STEPS", "0")
+    assert compile_steps_enabled(None) is False
 
 
 def test_torch_compile_is_restored_when_forwarding_ends() -> None:
