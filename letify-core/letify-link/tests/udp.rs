@@ -178,6 +178,7 @@ fn collect(mut pm: PathManager) -> mpsc::UnboundedReceiver<(Instant, PathEvent)>
     let (tx, rx) = mpsc::unbounded_channel();
     tokio::spawn(async move {
         while let Some(ev) = pm.next_event().await {
+            eprintln!("path event: {ev:?}");
             if tx.send((Instant::now(), ev)).is_err() {
                 break;
             }
@@ -236,7 +237,12 @@ async fn a_session_moves_from_tcp_to_udp_without_losing_bytes() {
         let at = until(&mut events, &mut seen, |ev| is_moved(ev, "tcp")).await;
         (at, seen)
     });
-    let done = transfer(&a, &b, 64, Duration::ZERO).await;
+    let done = timeout(
+        Duration::from_secs(120),
+        transfer(&a, &b, 64, Duration::ZERO),
+    )
+    .await
+    .expect("the transfer completes");
     let (moved_at, seen) = moved_at.await.unwrap();
     assert!(
         moved_at < done,
@@ -278,7 +284,10 @@ async fn a_session_moves_from_udp_to_tcp_when_udp_dies() {
     });
     let mut seen = Vec::new();
     until(&mut events, &mut seen, |ev| is_moved(ev, "tcp")).await;
-    warm.await.unwrap();
+    timeout(Duration::from_secs(120), warm)
+        .await
+        .expect("the warm transfer completes")
+        .unwrap();
 
     let knobs = duo.udp_proxy.knobs.clone();
     let cut = tokio::spawn(async move {
