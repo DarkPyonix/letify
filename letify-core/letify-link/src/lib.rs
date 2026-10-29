@@ -21,11 +21,16 @@
 //!   answers, adds the others as subflows and redials when every subflow died, and the pure
 //!   switching rules in [`hysteresis`].
 //!
+//! - The [`rendezvous`] trait with its messages and an in-memory implementation, the signed
+//!   address [`record`], the [`stun`] client and NAT classification, [`punch`] (TCP simultaneous
+//!   open over several sockets, UDP probing, port prediction, the many-port attempt) and the
+//!   [`policing`] check.
+//!
 //! A subflow is any reliable byte transport: a TCP connection, a pipe or an in-memory duplex.
 //!
 //! # What it does not own yet
 //!
-//! Rendezvous, NAT traversal and punching, UDP paths, the relay role, the `letify-link` sidecar
+//! UDP paths, the relay role, the `letify-link` sidecar
 //! and the Python binding. The caller supplies the candidate dialers.
 //!
 //! # Errors
@@ -42,9 +47,14 @@ mod handshake;
 pub mod hysteresis;
 mod identity;
 mod paths;
+pub mod policing;
+pub mod punch;
+pub mod record;
+pub mod rendezvous;
 mod replay;
 mod session;
 mod stream;
+pub mod stun;
 pub mod tcp;
 
 pub use acceptor::{Accepted, Acceptor};
