@@ -289,6 +289,8 @@ def test_the_new_owner_takes_the_record_and_removes_it_when_the_call_ends(world,
     until(lambda: any(r["pid"] == os.getpid() for r in control.list_runs()), "the new record")
     row = next(r for r in control.list_runs() if r["pid"] == os.getpid())
     assert row["run"] == owner.run
+    # The body returns only once the old owner has let go, which is after the adoption.
+    owner.answer()
     owner.finish_body()
     taking.join()
     assert control.list_runs(orphans=True) == []
@@ -742,3 +744,111 @@ def test_detaching_a_persistent_channel_sends_no_shutdown(monkeypatch) -> None:
     channel.detach()
     assert wire.SHUTDOWN not in sent
     assert sent == []
+
+
+#: The old owner's channel closes while the worker is still adopting the call to the new owner.
+#: The adoption holds the call's lock, so the close has to wait for it and then see the move.
+RACE_PROBE = textwrap.dedent(
+    """
+    import json, sys, threading, time
+    from pathlib import Path
+
+    from letify.protocol import worker
+
+    out = sys.argv[1]
+    text = worker.SOURCE.rstrip()
+    assert text.endswith("_serve()")
+    space = {"__name__": "probe"}
+    exec(compile(text[: -len("_serve()")], "worker", "exec"), space)
+    hooks = []
+    space["_run_exit_hooks"] = lambda reason: hooks.append(reason)
+    take, cond = space["_TAKE"], space["_TAKE_COND"]
+    take.update(run="abcdef012345", live=True, moved=False)
+    new_owner = object()
+    with cond:
+        closing = threading.Thread(target=space["_reader_ended"], args=(None, False))
+        closing.start()
+        time.sleep(0.5)
+        # The adoption finishes under the lock, after the close began.
+        take.update(owner=new_owner, moved=True, live=True, ended_input=False)
+    closing.join(30)
+    Path(out).write_text(json.dumps({
+        "live": take["live"], "ended_input": take["ended_input"], "hooks": hooks,
+    }))
+    """
+)
+
+
+def test_the_old_owners_channel_closing_during_the_adoption_leaves_the_new_owner_live(
+    tmp_path,
+) -> None:
+    script = tmp_path / "race.py"
+    script.write_text(RACE_PROBE, encoding="utf-8")
+    out = tmp_path / "race.out"
+    root = str(Path(letify.__file__).resolve().parent.parent)
+    subprocess.run(
+        [sys.executable, str(script), str(out)],
+        check=True, timeout=60, env={**os.environ, "PYTHONPATH": root},
+        stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    )
+    assert json.loads(out.read_text(encoding="utf-8")) == {
+        "live": True, "ended_input": False, "hooks": [],
+    }
+
+
+#: Adopts a call with stand-in channels and records whether the worker already sends output
+#: to the new owner at the moment the old owner is told the call has moved.
+ORDER_PROBE = textwrap.dedent(
+    """
+    import json, sys
+    from pathlib import Path
+
+    from letify.protocol import worker
+
+    out = sys.argv[1]
+    text = worker.SOURCE.rstrip()
+    assert text.endswith("_serve()")
+    space = {"__name__": "probe"}
+    exec(compile(text[: -len("_serve()")], "worker", "exec"), space)
+
+
+    class Channel:
+        def message(self, *args):
+            pass
+
+        def frame(self, *args):
+            pass
+
+
+    class Connection:
+        def settimeout(self, value):
+            pass
+
+
+    class Door:
+        sender = Channel()
+        connection = Connection()
+
+
+    door, former = Door(), Channel()
+    seen = []
+    space["_answer"] = lambda sender, stream, outcome: seen.append(space["_SENDER"] is door.sender)
+    space["_SENDER"] = former
+    space["_TAKE"].update(run="abcdef012345", live=True, stream=3)
+    space["_door_adopt"](door, 7, {"run": "abcdef012345", "owner": 1234})
+    Path(out).write_text(json.dumps(seen))
+    """
+)
+
+
+def test_output_after_the_old_owner_is_told_the_call_moved_goes_to_the_new_owner(tmp_path) -> None:
+    script = tmp_path / "order.py"
+    script.write_text(ORDER_PROBE, encoding="utf-8")
+    out = tmp_path / "order.out"
+    root = str(Path(letify.__file__).resolve().parent.parent)
+    subprocess.run(
+        [sys.executable, str(script), str(out)],
+        check=True, timeout=60, env={**os.environ, "PYTHONPATH": root},
+        stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    )
+    assert json.loads(out.read_text(encoding="utf-8")) == [True]
