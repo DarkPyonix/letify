@@ -14,7 +14,7 @@ use tokio::net::TcpStream;
 
 use crate::config::Config;
 use crate::error::{Error, Result};
-use crate::identity::{Identity, PeerPolicy};
+use crate::identity::{Identity, NodeId, PeerPolicy};
 use crate::session::{Session, SessionId, Transport, WeakSession};
 
 /// What an incoming transport turned out to be.
@@ -85,6 +85,26 @@ impl Acceptor {
         }
     }
 
+    /// Refuse `node` from now on and close every live session this acceptor created to it,
+    /// with the reason `revoked`. A handshake from it fails with `Error::UnknownPeer`, and so
+    /// does a subflow that tries to resume one of its sessions. SPEC.md letify-link, Session
+    /// item 9.
+    pub fn revoke(&self, node: NodeId) {
+        self.policy.revoke(node);
+        let sessions = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
+        for session in sessions.values().filter_map(WeakSession::upgrade) {
+            if session.peer() == node {
+                session.begin_close(Some("revoked"));
+            }
+        }
+    }
+
+    /// Accept `node` again after [`Acceptor::revoke`], subject to the policy as before. A
+    /// session that was closed stays closed.
+    pub fn reinstate(&self, node: NodeId) {
+        self.policy.reinstate(node);
+    }
+
     /// Tune an accepted TCP stream as [`crate::tcp::tune`] does, then accept it.
     pub async fn accept_tcp(&self, stream: TcpStream) -> Result<Accepted> {
         crate::tcp::tune(&stream)?;
@@ -139,6 +159,9 @@ impl Acceptor {
                 };
                 let session =
                     session.ok_or_else(|| Error::Subflow("no live session has this id".into()))?;
+                if !self.policy.accepts(&session.peer()) {
+                    return Err(Error::UnknownPeer(session.peer()));
+                }
                 session.add_subflow_routed(transport).await?;
                 Ok(Accepted::Subflow(id))
             }

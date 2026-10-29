@@ -32,7 +32,8 @@ pub(crate) enum Kind {
     Data(Vec<u8>),
     Fin,
     Credit(u64),
-    Close,
+    /// The session is closed, with the closer's reason when it gave one.
+    Close(Option<String>),
 }
 
 #[derive(Debug)]
@@ -82,8 +83,24 @@ pub(crate) fn encode_credit(seq: u64, stream: u32, bytes: u64) -> Vec<u8> {
     out
 }
 
-pub(crate) fn encode_close(seq: u64) -> Vec<u8> {
-    head(T_CLOSE, seq, 0, 0)
+/// Longest reason a Close frame carries, in bytes.
+pub(crate) const MAX_REASON: usize = 256;
+
+/// A Close frame. The reason is cut to `MAX_REASON` bytes on a character boundary.
+pub(crate) fn encode_close(seq: u64, reason: Option<&str>) -> Vec<u8> {
+    let reason = reason.map(cut_reason).unwrap_or_default();
+    let mut out = head(T_CLOSE, seq, 0, reason.len());
+    out.extend_from_slice(reason.as_bytes());
+    out
+}
+
+/// `reason` cut to at most `MAX_REASON` bytes without splitting a character.
+pub(crate) fn cut_reason(reason: &str) -> &str {
+    let mut end = reason.len().min(MAX_REASON);
+    while !reason.is_char_boundary(end) {
+        end -= 1;
+    }
+    &reason[..end]
 }
 
 pub(crate) fn encode_ack(next: u64, sub: u64) -> Vec<u8> {
@@ -179,7 +196,10 @@ pub(crate) fn decode(buf: Vec<u8>) -> Result<Frame> {
                 .unwrap();
             Kind::Credit(u64::from_be_bytes(raw))
         }
-        T_CLOSE => Kind::Close,
+        T_CLOSE => {
+            let text = String::from_utf8_lossy(&buf[HDR..]);
+            Kind::Close((!text.is_empty()).then(|| cut_reason(&text).to_string()))
+        }
         _ => return Err(bad("unknown type")),
     };
     Ok(Frame::Seq { seq, stream, kind })

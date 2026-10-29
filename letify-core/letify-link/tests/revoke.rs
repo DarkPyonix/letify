@@ -95,8 +95,14 @@ async fn revoking_a_node_closes_its_open_session_at_once() {
     let rb = responder.await.unwrap().unwrap();
     assert!(!rb.is_closed());
     policy.revoke(a.node_id());
-    assert!(until(2, || rb.is_closed()).await, "the responder stays open");
-    assert!(until(2, || ia.is_closed()).await, "the initiator stays open");
+    assert!(
+        until(2, || rb.is_closed()).await,
+        "the responder stays open"
+    );
+    assert!(
+        until(2, || ia.is_closed()).await,
+        "the initiator stays open"
+    );
     assert_eq!(rb.close_reason().as_deref(), Some("revoked"));
     assert_eq!(ia.close_reason().as_deref(), Some("revoked"));
 }
@@ -189,7 +195,10 @@ async fn a_revoked_node_is_refused_when_it_resumes() {
     let (accepted, added) = timeout(Duration::from_secs(5), async { tokio::join!(accept, dial) })
         .await
         .unwrap();
-    assert!(matches!(accepted, Err(Error::UnknownPeer(_))), "{accepted:?}");
+    assert!(
+        matches!(accepted, Err(Error::UnknownPeer(_))),
+        "the resume was not refused"
+    );
     assert!(added.is_err());
     assert_eq!(b.subflow_count(), 1);
 }

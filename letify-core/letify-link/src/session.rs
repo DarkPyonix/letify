@@ -438,6 +438,8 @@ pub(crate) struct State {
     pub failed: Option<String>,
     pub closing: bool,
     pub remote_closed: bool,
+    /// Why the session was closed, as the closing side gave it.
+    close_reason: Option<String>,
 }
 
 impl State {
@@ -632,7 +634,7 @@ impl State {
     fn take_fresh(&mut self, which: Fresh, bulk: bool, id: u64, now: Instant) -> Arc<Vec<u8>> {
         let mut bytes = match which {
             Fresh::Ctl => self.ctl.pop_front().expect("peeked"),
-            Fresh::Close => frame::encode_close(0),
+            Fresh::Close => frame::encode_close(0, self.close_reason.as_deref()),
             Fresh::Stream(stream) => {
                 let s = self.streams.get_mut(&stream).expect("peeked");
                 let bytes = s.queue.pop_front().expect("peeked");
@@ -927,8 +929,11 @@ impl State {
                     }
                 }
             }
-            Kind::Close => {
+            Kind::Close(reason) => {
                 self.remote_closed = true;
+                if self.close_reason.is_none() {
+                    self.close_reason = reason;
+                }
                 self.closing = true;
                 self.wake_all_streams();
                 accept.notify_waiters();
@@ -960,10 +965,20 @@ pub(crate) struct Shared {
 /// Closes the session when the last handle goes away.
 pub(crate) struct Guard {
     pub shared: Arc<Shared>,
+    /// The task that closes the session when its peer is revoked, see `Session::watch_policy`.
+    watcher: Mutex<Option<AbortHandle>>,
 }
 
 impl Drop for Guard {
     fn drop(&mut self) {
+        if let Some(task) = self
+            .watcher
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+        {
+            task.abort();
+        }
         let mut st = self.shared.lock();
         if !st.closing && st.failed.is_none() {
             st.closing = true;
@@ -1437,7 +1452,9 @@ impl Session {
         gauge: Option<Gauge>,
     ) -> Result<Session> {
         let est = handshake::respond(&mut transport, identity, &policy, &config).await?;
-        Self::establish(transport, est, config, false, gauge)
+        let session = Self::establish(transport, est, config, false, gauge)?;
+        session.watch_policy(policy);
+        Ok(session)
     }
 
     fn establish<T: Transport>(
@@ -1482,6 +1499,7 @@ impl Session {
             failed: None,
             closing: false,
             remote_closed: false,
+            close_reason: None,
         };
         let shared = Arc::new(Shared {
             state: Mutex::new(state),
@@ -1504,8 +1522,33 @@ impl Session {
         });
         shared.start_subflow(transport, gauge)?;
         Ok(Session {
-            guard: Arc::new(Guard { shared }),
+            guard: Arc::new(Guard {
+                shared,
+                watcher: Mutex::new(None),
+            }),
         })
+    }
+
+    /// Close the session with the reason `revoked` as soon as `policy` stops accepting the
+    /// peer. SPEC.md letify-link, Session item 9.
+    fn watch_policy(&self, policy: PeerPolicy) {
+        let peer = self.shared().peer;
+        let weak = self.downgrade();
+        let mut changes = policy.changes();
+        let task = tokio::spawn(async move {
+            loop {
+                if !policy.accepts(&peer) {
+                    if let Some(session) = weak.upgrade() {
+                        session.begin_close(Some("revoked"));
+                    }
+                    return;
+                }
+                if changes.changed().await.is_err() {
+                    return;
+                }
+            }
+        });
+        *self.guard.watcher.lock().unwrap_or_else(|e| e.into_inner()) = Some(task.abort_handle());
     }
 
     pub(crate) fn from_guard(guard: Arc<Guard>) -> Session {
@@ -1648,14 +1691,33 @@ impl Session {
     /// Close the session. Frames already queued are written first; the peer's streams then end
     /// as they would after a clean close.
     pub async fn close(&self) {
-        let shared = self.shared();
-        {
-            let mut st = shared.lock();
-            if !st.closing && st.failed.is_none() {
-                st.closing = true;
-                st.want_close();
-            }
+        self.close_inner(None).await;
+    }
+
+    /// Close the session as [`Session::close`] does, and tell the peer why. The reason is UTF-8
+    /// and is cut to 256 bytes. Both sides can read it with [`Session::close_reason`].
+    pub async fn close_with_reason(&self, reason: &str) {
+        self.close_inner(Some(reason)).await;
+    }
+
+    /// Mark the session as closing with `reason`, without waiting for the Close frame to leave.
+    pub(crate) fn begin_close(&self, reason: Option<&str>) {
+        let mut st = self.shared().lock();
+        if !st.closing && st.failed.is_none() {
+            st.closing = true;
+            st.close_reason = reason.map(|r| frame::cut_reason(r).to_string());
+            st.want_close();
         }
+    }
+
+    /// Why the session was closed, if the side that closed it gave a reason.
+    pub fn close_reason(&self) -> Option<String> {
+        self.shared().lock().close_reason.clone()
+    }
+
+    async fn close_inner(&self, reason: Option<&str>) {
+        let shared = self.shared();
+        self.begin_close(reason);
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
         loop {
             {
