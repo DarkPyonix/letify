@@ -421,3 +421,13 @@ def test_colab_refuses_to_stop_a_worker_by_pid() -> None:
     provider = provider_of(Colab, "c")
     with pytest.raises(letify.UnsupportedMode):
         provider.stop_worker("4242")
+
+
+def test_hosts_reached_only_through_a_connection_pipeline_do_not_discover_sessions() -> None:
+    # Spec "Workers on a shell host": listing must not punch, start Tailcat or allocate a
+    # machine, so a host with no direct address answers that it cannot be asked.
+    from letify.providers.elice import Elice
+    from letify.providers.tunnel import Tunnel
+
+    assert Tunnel.discovers_sessions is False
+    assert Elice.discovers_sessions is False

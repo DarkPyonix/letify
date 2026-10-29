@@ -330,6 +330,8 @@ class Elice(Shell):
     default_persistence = "ephemeral"
     has_fast_path = True
     offers_spot = True
+    #: Listing its workers would run the connection pipeline. Spec "Workers on a shell host".
+    discovers_sessions = False
 
     takeover_refusal = (
         "its machine is allocated for the session and the allocation, which names the address "
