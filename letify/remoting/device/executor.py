@@ -83,7 +83,7 @@ def _varying(previous, current, known) -> tuple:
 
 
 class _Segment:
-    """The compilation state of one ``(step, start, stop, keep)`` segment."""
+    """The compilation state of one ``(step, start, stop)`` segment."""
 
     def __init__(self, key: tuple, first: tuple, candidates: frozenset):
         self.key = key
