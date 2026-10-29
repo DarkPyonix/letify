@@ -16,6 +16,11 @@ getrandom = "0.2"
 tokio = { version = "1", features = ["rt", "net", "io-util", "macros", "time", "sync"] }
 # socket2 sets the TCP keepalive options that tokio does not expose.
 socket2 = { version = "0.5", features = ["all"] }
+# quinn carries a UDP path: loss recovery and BBR over a punched UDP socket. rustls with the
+# ring backend keeps the build pure Rust, and rcgen makes the throwaway certificate QUIC needs.
+quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+rcgen = "0.13"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full"] }

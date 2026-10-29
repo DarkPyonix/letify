@@ -3,8 +3,10 @@
 //! as subflows, redialing when a subflow dies, and measuring each subflow from its traffic. It
 //! does not own the switching rules (see `hysteresis`), the session or any listener.
 //!
-//! With TCP only, every candidate that connects is a subflow and the session spreads frames
-//! over all of them. The switching rules then only decide which path is reported as preferred.
+//! Every candidate that connects is a subflow and the session spreads frames over all of them.
+//! With one kind of candidate (all TCP) the switching rules only decide which path is reported
+//! as preferred. With TCP and UDP candidates, a preferred path of another kind than the last is
+//! a move: once it carried acknowledged traffic the subflows of the old kind are closed.
 //! The manager also measures an idle subflow with probes within the probe budget, closes a
 //! subflow that stays below the caller's floor while another is above it, and reports path
 //! events without loss for the lifecycle kinds.
@@ -18,13 +20,15 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use tokio::sync::mpsc;
+use tokio::sync::{Notify, mpsc};
 use tokio::task::AbortHandle;
 use tokio::time::Instant;
 
 use crate::config::Config;
 use crate::error::{Error, Result};
-use crate::hysteresis::{Decision, FloorWatch, PathView, Policy, Selector, probe_may_start};
+use crate::hysteresis::{
+    Decision, FloorWatch, PathView, Policy, Reason, Selector, probe_may_start,
+};
 use crate::identity::{Identity, NodeId};
 use crate::session::{Session, SubflowId, Transport, WeakSession};
 
@@ -33,10 +37,21 @@ pub type BoxTransport = Box<dyn Transport>;
 
 type Dial = Pin<Box<dyn Future<Output = io::Result<BoxTransport>> + Send>>;
 
+/// The transport kind of a candidate. A preferred path of another kind than the previous
+/// preferred path is a move between kinds, as SPEC.md Paths and the path manager says.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum PathKind {
+    /// A TCP connection.
+    Tcp,
+    /// A UDP path, see [`crate::udp`].
+    Udp,
+}
+
 /// One way to reach the peer: a name and an async function that returns a new transport.
 #[derive(Clone)]
 pub struct Candidate {
     name: String,
+    kind: PathKind,
     dial: Arc<dyn Fn() -> Dial + Send + Sync>,
 }
 
@@ -50,11 +65,39 @@ impl Candidate {
     {
         Candidate {
             name: name.into(),
+            kind: PathKind::Tcp,
             dial: Arc::new(move || {
                 let fut = dial();
                 Box::pin(async move { fut.await.map(|t| Box::new(t) as BoxTransport) })
             }),
         }
+    }
+
+    /// A candidate of the UDP kind that calls `dial` for each new transport, usually a
+    /// [`crate::udp::UdpPath`] over a socket the caller punched.
+    pub fn udp<F, Fut, T>(name: impl Into<String>, dial: F) -> Self
+    where
+        F: Fn() -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = io::Result<T>> + Send + 'static,
+        T: Transport,
+    {
+        Candidate {
+            kind: PathKind::Udp,
+            ..Self::new(name, dial)
+        }
+    }
+
+    /// A UDP path to `addr` over a new socket bound to an unspecified local address and port
+    /// for each dial. A punched socket needs [`Candidate::udp`] instead.
+    pub fn udp_to(name: impl Into<String>, addr: SocketAddr) -> Self {
+        Self::udp(name, move || async move {
+            let bind = if addr.is_ipv4() {
+                "0.0.0.0:0"
+            } else {
+                "[::]:0"
+            };
+            crate::udp::UdpPath::connect(std::net::UdpSocket::bind(bind)?, addr).await
+        })
     }
 
     /// A TCP connection to `addr`, tuned by [`crate::tcp::tune`].
@@ -65,6 +108,11 @@ impl Candidate {
     /// The candidate's name, as path events report it.
     pub fn name(&self) -> &str {
         &self.name
+    }
+
+    /// The candidate's kind.
+    pub fn kind(&self) -> PathKind {
+        self.kind
     }
 }
 
@@ -129,11 +177,13 @@ pub enum PathEvent {
         /// The candidate's name.
         name: String,
     },
-    /// The subflow of a candidate died or was closed. The manager redials it.
+    /// The subflow of a candidate died or was closed. The manager redials it, unless it was
+    /// "moved", in which case the candidate stays on standby.
     Lost {
         /// The candidate's name.
         name: String,
-        /// Why: "below the floor" when the manager closed it, otherwise "the subflow died".
+        /// Why: "below the floor" or "moved" when the manager closed it, otherwise "the subflow
+        /// died".
         reason: String,
     },
     /// A measurement of a live subflow.
@@ -156,9 +206,38 @@ pub enum PathEvent {
 
 struct Table {
     names: Vec<String>,
+    kinds: Vec<PathKind>,
     subflow: Vec<Option<SubflowId>>,
     /// Set when the manager closed the candidate's subflow for being below the floor.
     floor_closed: Vec<bool>,
+    /// Set when the manager closed the candidate's subflow because the session moved to
+    /// another kind.
+    moved: Vec<bool>,
+    /// Candidates of the old kind after a move: not dialed until the preferred kind has no
+    /// live subflow left.
+    standby: Vec<bool>,
+    /// Wakes the candidate loops when `standby` changes.
+    wake: Arc<Notify>,
+}
+
+/// Wait until the candidate is no longer on standby.
+async fn wait_standby(table: &Mutex<Table>, idx: usize) {
+    loop {
+        let wake = {
+            let t = table.lock().unwrap_or_else(|e| e.into_inner());
+            if !t.standby[idx] {
+                return;
+            }
+            t.wake.clone()
+        };
+        let woken = wake.notified();
+        tokio::pin!(woken);
+        woken.as_mut().enable();
+        if !table.lock().unwrap_or_else(|e| e.into_inner()).standby[idx] {
+            return;
+        }
+        woken.await;
+    }
 }
 
 /// The sending side of the event queue. One queue keeps the order of events. Lifecycle events
@@ -286,8 +365,12 @@ impl PathManager {
 
         let table = Arc::new(Mutex::new(Table {
             names: candidates.iter().map(|c| c.name.clone()).collect(),
+            kinds: candidates.iter().map(|c| c.kind).collect(),
             subflow: vec![None; n],
             floor_closed: vec![false; n],
+            moved: vec![false; n],
+            standby: vec![false; n],
+            wake: Arc::new(Notify::new()),
         }));
         let (tx, events) = mpsc::unbounded_channel();
         let unread_measured = Arc::new(AtomicUsize::new(0));
@@ -374,6 +457,9 @@ async fn candidate_loop(
             Some(id) => id,
             None => {
                 drop(session);
+                if transport.is_none() {
+                    wait_standby(&table, idx).await;
+                }
                 let t = match transport.take() {
                     Some(t) => t,
                     None => match tokio::time::timeout(cfg.dial_timeout, (cand.dial)()).await {
@@ -408,6 +494,7 @@ async fn candidate_loop(
             let mut t = table.lock().unwrap_or_else(|e| e.into_inner());
             t.subflow[idx] = Some(id);
             t.floor_closed[idx] = false;
+            t.moved[idx] = false;
         }
         emit(
             &events,
@@ -428,16 +515,32 @@ async fn candidate_loop(
                 return;
             }
         }
-        let by_floor = {
+        let (by_floor, by_move) = {
             let mut t = table.lock().unwrap_or_else(|e| e.into_inner());
             t.subflow[idx] = None;
-            std::mem::take(&mut t.floor_closed[idx])
+            // The last subflow of a kind is gone: the candidates on standby are needed again.
+            let kind = t.kinds[idx];
+            let alive = (0..t.subflow.len()).any(|j| t.subflow[j].is_some() && t.kinds[j] == kind);
+            if !alive && t.standby.iter().any(|&s| s) {
+                for j in 0..t.standby.len() {
+                    if t.kinds[j] != kind {
+                        t.standby[j] = false;
+                    }
+                }
+                t.wake.notify_waiters();
+            }
+            (
+                std::mem::take(&mut t.floor_closed[idx]),
+                std::mem::take(&mut t.moved[idx]),
+            )
         };
         emit(
             &events,
             PathEvent::Lost {
                 name: cand.name.clone(),
-                reason: if by_floor {
+                reason: if by_move {
+                    "moved"
+                } else if by_floor {
                     "below the floor"
                 } else {
                     "the subflow died"
@@ -445,7 +548,9 @@ async fn candidate_loop(
                 .into(),
             },
         );
-        if by_floor {
+        if by_move {
+            wait = cfg.redial_initial;
+        } else if by_floor {
             tokio::time::sleep(cfg.floor_backoff).await;
             wait = cfg.redial_initial;
         } else if up_since.elapsed() > Duration::from_secs(1) {
@@ -489,7 +594,13 @@ async fn measure_loop(
     probe_spent: Arc<AtomicU64>,
     cfg: ManagerConfig,
 ) {
-    let n = table.lock().unwrap_or_else(|e| e.into_inner()).names.len();
+    let (n, kinds) = {
+        let t = table.lock().unwrap_or_else(|e| e.into_inner());
+        (t.names.len(), t.kinds.clone())
+    };
+    // A move between kinds that waits for the new path to carry acknowledged traffic:
+    // (the new preferred candidate, the kind whose subflows close afterwards).
+    let mut moving: Option<(usize, PathKind)> = None;
     let mut policy = cfg.policy.clone();
     if let Some(floor) = cfg.floor {
         policy.floor = floor;
@@ -524,6 +635,7 @@ async fn measure_loop(
         };
         let mut views = Vec::with_capacity(n);
         let mut carried_now = 0u64;
+        let mut handed_over = false;
         for i in 0..n {
             let stat = subflow[i].and_then(|id| stats.iter().find(|s| s.id == id));
             let Some(stat) = stat else {
@@ -570,8 +682,14 @@ async fn measure_loop(
                     },
                 );
             }
-            if stat.acked_bytes > seen[i].filter(|p| p.id == stat.id).map_or(0, |p| p.acked) {
+            let prev = seen[i].filter(|p| p.id == stat.id);
+            if stat.acked_bytes > prev.map_or(0, |p| p.acked)
+                || stat.probe_acked_bytes > prev.map_or(0, |p| p.probe_acked)
+            {
                 selector.carried_acked(i);
+                if moving.is_some_and(|(to, _)| to == i) {
+                    handed_over = true;
+                }
             }
             seen[i] = Some(Seen {
                 id: stat.id,
@@ -587,6 +705,26 @@ async fn measure_loop(
             });
         }
         carried_log.push_back((now, carried_now));
+        if moving.is_some_and(|(to, _)| !views[to].alive) {
+            moving = None;
+        }
+        if handed_over && let Some((_, old_kind)) = moving.take() {
+            // The new path carried acknowledged traffic: close the subflows of the old kind and
+            // keep those candidates on standby.
+            let mut t = table.lock().unwrap_or_else(|e| e.into_inner());
+            let mut close = Vec::new();
+            for j in 0..n {
+                if t.kinds[j] == old_kind {
+                    t.standby[j] = true;
+                    if let Some(id) = t.subflow[j] {
+                        t.moved[j] = true;
+                        close.push(id);
+                    }
+                }
+            }
+            drop(t);
+            close.into_iter().for_each(|id| session.close_subflow(id));
+        }
 
         // Probe one idle subflow when the window's budget allows.
         if !cfg.probe_idle.is_zero() {
@@ -624,7 +762,14 @@ async fn measure_loop(
         drop(session);
 
         let before = selector.current();
-        if let Decision::Move { to, .. } = selector.observe(now.duration_since(origin), &views) {
+        if let Decision::Move { to, reason } = selector.observe(now.duration_since(origin), &views)
+        {
+            moving = match before {
+                Some(b) if reason == Reason::Faster && kinds[b] != kinds[to] => {
+                    Some((to, kinds[b]))
+                }
+                _ => None,
+            };
             emit(
                 &events,
                 PathEvent::Preferred {
