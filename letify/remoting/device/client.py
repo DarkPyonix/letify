@@ -29,7 +29,7 @@ from typing import Any
 import torch
 from blake3 import blake3
 
-from ...errors import RemoteError, RuntimeLost
+from ...errors import ConfigError, RemoteError, RuntimeLost
 from .executor import E_DEFINE, E_OP, E_REQUEST, E_STEP, E_STEP_DEFINE, UPLOAD_CACHE_BYTES
 from .frames import ChannelTransport, StreamTransport, Transport, TransportClosed
 from .guard import check_torch_version, check_worker_version
@@ -279,6 +279,7 @@ class Client:
         """Read the executor's first message, check its PyTorch, and start the threads."""
         head, _buffers = self._recv()
         self.hello = pickle.loads(head)
+        self._raise_fatal(self.hello)
         check_worker_version(local=torch.__version__, remote=str(self.hello["torch"]))
         self._sender = threading.Thread(
             target=self._send_loop, name=f"{self.name}-send", daemon=True
@@ -811,6 +812,7 @@ class Client:
         head, buffers = self._recv()
         consumers = self._replies.popleft()
         reply = pickle.loads(head)
+        self._raise_fatal(reply)
         results = reply["results"]
         failure = reply.get("failure")
         for note in reply.get("notes", ()):
@@ -1016,6 +1018,25 @@ class Client:
         detail = f"\n--- device worker stderr ---\n{tail}" if tail else ""
         return RuntimeLost(f"{self.name}: the device worker was lost: {reason}{detail}")
 
+    def _raise_fatal(self, message: dict) -> None:
+        """Raise the failure an executor sent as its last message, discarding the executor."""
+        fatal = message.get("fatal")
+        if fatal is None:
+            return
+        error = fatal["error"]
+        if fatal["started"] or fatal["missing"] is None:
+            where = "the device executor stopped" if fatal["started"] else "could not start"
+            lost = self._lose(f"{where}: {error}\n{fatal['traceback']}")
+            raise lost
+        self._lose(error)
+        hint = (
+            "; add torch to the project's dependencies (uv add torch) so the runtime's "
+            "environment has it"
+            if fatal["missing"] == "torch"
+            else "; add it to the project's dependencies"
+        )
+        raise ConfigError(f"{self.name}: the device executor could not start: {error}{hint}")
+
     def _check_open(self) -> None:
         if os.getpid() != self._pid:
             raise RuntimeLost(
@@ -1113,10 +1134,10 @@ def connect(
 
         transport.raw(count_line(source) + source)
         client.start()
-    except (TransportClosed, RuntimeLost) as exc:
+    except (TransportClosed, RuntimeLost, ConfigError) as exc:
         process.kill()
         process.wait()
-        if isinstance(exc, RuntimeLost):
+        if isinstance(exc, (RuntimeLost, ConfigError)):
             raise
         raise client._lose(str(exc)) from exc
     return client
@@ -1132,7 +1153,11 @@ def attach(
     channel.request(
         {"op": "device", "device": device, "source": worker_source(None).decode()}, timeout=600
     )
-    client.start()
+    try:
+        client.start()
+    except (RuntimeLost, ConfigError):
+        transport.close()
+        raise
     return client
 
 

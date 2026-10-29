@@ -2027,3 +2027,114 @@ def test_the_environment_variable_turns_the_automatic_behaviour_off(monkeypatch)
     monkeypatch.delenv("LETIFY_AUTO_FETCH")
     assert auto_fetch_enabled(False) is False
     assert auto_fetch_enabled(None) is True
+
+
+# -- Spec: Failure semantics ---------------------------------------------------------
+
+
+class _Loopback:
+    """The client's end of a pair of queues whose other end is ``serve_transport``."""
+
+    def __init__(self, incoming, outgoing):
+        self.incoming = incoming
+        self.outgoing = outgoing
+
+    def send(self, head, buffers) -> None:
+        self.outgoing.put((bytes(head), [bytes(b) for b in buffers]))
+
+    def recv(self):
+        message = self.incoming.get(timeout=20)
+        if message is None:
+            raise frames.TransportClosed("the loopback closed")
+        return message
+
+    def close(self) -> None:
+        self.outgoing.put(None)
+
+
+def _serve_in_thread(monkeypatch, make_executor):
+    """Run the real ``serve_transport`` in a thread and return the client on its other end."""
+    import queue
+    import threading
+
+    from letify.remoting.device import executor as executor_module
+
+    requests, replies = queue.Queue(), queue.Queue()
+    monkeypatch.setattr(executor_module, "Executor", make_executor)
+    server = _Loopback(requests, replies)
+    thread = threading.Thread(
+        target=executor_module.serve_transport,
+        args=("cpu", server),
+        daemon=True,
+    )
+    thread.start()
+    return forwarding.Client(_Loopback(replies, requests), name="loopback"), thread
+
+
+def test_a_device_executor_that_dies_mid_session_fails_the_waiting_read(monkeypatch) -> None:
+    from letify.remoting.device import executor as executor_module
+
+    real = executor_module.Executor
+
+    class Dying(real):
+        def run(self, message, buffers):
+            raise ValueError("the executor broke")
+
+    client, thread = _serve_in_thread(monkeypatch, Dying)
+    client.start()
+    with client.activate(), pytest.raises(letify.RuntimeLost, match="the executor broke"):
+        torch.ones(2, device="cuda").cpu()
+    thread.join(5)
+    assert not thread.is_alive()
+
+
+def test_a_device_executor_that_cannot_start_fails_the_hello_naming_the_cause(
+    monkeypatch,
+) -> None:
+    class Broken:
+        def __init__(self, device):
+            raise RuntimeError("no device to start on")
+
+    client, _thread = _serve_in_thread(monkeypatch, Broken)
+    with pytest.raises(letify.RuntimeLost, match="no device to start on"):
+        client.start()
+
+
+_WITHOUT_TORCH = (
+    "import sys\n"
+    "class _NoTorch:\n"
+    "    def find_spec(self, name, path=None, target=None):\n"
+    "        if name == 'torch':\n"
+    "            raise ModuleNotFoundError(\"No module named 'torch'\", name='torch')\n"
+    "sys.meta_path.insert(0, _NoTorch())\n"
+)
+
+
+def test_a_device_worker_that_cannot_import_torch_fails_the_call_naming_it(
+    let, cpu, monkeypatch
+) -> None:
+    from letify.remoting.device import client as client_module
+
+    real = client_module.worker_source
+    future_line = b"from __future__ import annotations\n"
+
+    def without_torch(device):
+        return real(device).replace(future_line, future_line + _WITHOUT_TORCH.encode(), 1)
+
+    monkeypatch.setattr(client_module, "worker_source", without_torch)
+
+    @let.function(device=cpu, host="local")
+    def step() -> float:
+        return float(torch.ones(2, device="cuda").sum().item())
+
+    # The call must fail at once instead of waiting for a reply that never comes.
+    import concurrent.futures
+
+    pool = concurrent.futures.ThreadPoolExecutor(1)
+    try:
+        future = pool.submit(step)
+        with pytest.raises(letify.ConfigError, match="No module named 'torch'") as caught:
+            future.result(timeout=60)
+    finally:
+        pool.shutdown(wait=False)
+    assert "add torch" in str(caught.value).lower() or "dependencies" in str(caught.value)
