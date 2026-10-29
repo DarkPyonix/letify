@@ -213,3 +213,33 @@ def test_the_environment_override_wins(monkeypatch, tmp_path):
     fake.write_text("")
     monkeypatch.setenv(linkd.ENV_BINARY, str(fake))
     assert linkd.binary_path() == fake
+
+
+def test_the_loopback_control_channel_sends_the_token_first(sidecar_binary, tmp_path):
+    daemon = linkd.LinkDaemon(tmp_path / "l.key", binary=sidecar_binary, loopback=True)
+    try:
+        assert daemon.control_address.startswith("tcp:127.0.0.1:")
+        # The channel works after the token, and answers a malformed request as usual.
+        with pytest.raises(linkd.LinkError) as refused:
+            daemon.request({"op": "no_such_op"})
+        assert refused.value.kind == "usage"
+        # The listener closed with the first authenticated connection.
+        with pytest.raises(OSError):
+            linkd._connect(daemon.control_address, timeout=2)
+    finally:
+        daemon.close()
+
+
+def test_a_stream_can_be_opened_as_bulk(pair):
+    a, b, _ = pair
+    listener = b.listen([a.node_id], bind="127.0.0.1:0")
+    session_a = a.open_session(b.node_id, [listener.address])
+    session_b = listener.accept_session(timeout=10)
+    sock = session_a.open_stream(priority="bulk")
+    sock.sendall(b"x")
+    peer = session_b.accept_stream(timeout=10)
+    assert peer.recv(1) == b"x"
+    sock.close()
+    peer.close()
+    with pytest.raises(linkd.LinkError):
+        session_a.open_stream(priority="urgent")
