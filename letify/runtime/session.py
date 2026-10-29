@@ -268,9 +268,38 @@ class Runtime:
                         # fail the session. Spec "Materializing into a runtime".
                         self._say(f"not caching the environment ({_reason_of(error)})")
         self.keep_blobs_on_disk()
+        self.register_worker()
         for volume in self.volumes:
             self.attach(volume)
         self.ready = True
+
+    def register_worker(self) -> None:
+        """Have the worker write its record on its host, for a provider that lists workers.
+
+        Spec "Workers on a shell host". A record that cannot be written costs the listing and
+        nothing else, so a failure is said and the session goes on.
+        """
+        provider = self.provider
+        if not (provider.records_workers and provider.prepares_workspace):
+            return
+        if not self.persistent_channel:
+            return
+        import os
+        import socket
+
+        try:
+            self.request(
+                {
+                    "op": "register",
+                    "workspace": self.workspace or provider.workspace_root,
+                    "runtime": self.name,
+                    "key": self.key,
+                    "owner": {"host": socket.gethostname(), "pid": os.getpid()},
+                },
+                timeout=120,
+            )
+        except (RuntimeFailure, RemoteError, ProtocolError) as error:
+            self._say(f"not recording this worker for 'letify sessions' ({_reason_of(error)})")
 
     def keep_blobs_on_disk(self) -> None:
         """Have the worker write argument blobs under the workspace root on a persistent disk.

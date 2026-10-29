@@ -138,6 +138,16 @@ and letify cannot know when that process ends.
 
 On a shared machine this usually means a colleague is computing on those cards. Check with `letify utilization`, then retry later or narrow `indices` in the devices table.
 
+**Cards held by a worker you cannot see.** A worker left behind when the local process died keeps its cards until its lease ends, 300 s after the last renewal. On a `Shell` machine, list the workers and stop one:
+
+```bash
+letify sessions
+letify stop --orphans --alias lab
+letify stop --alias lab --worker 4242
+```
+
+`letify sessions` prints one line per worker: pid, GPU indices, start time, runtime name, pool key, run id and the local process that owns it, marked `alive`, `gone` or `remote` (owned from another machine, so not judged). `--orphans` stops the workers whose lease has passed, and those whose owner is gone while no call runs. It never stops a worker whose owner is alive. A worker whose owner is gone but whose call still runs is listed by `letify runs` and can be taken over, so `--orphans` leaves it alone. `--worker` stops the one pid you name, whatever its owner, and refuses a pid that is not a letify worker. A stop sends `SIGTERM`, waits 30 s, then sends `SIGKILL`.
+
 ---
 
 ## `RemoteError`

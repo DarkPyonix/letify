@@ -517,6 +517,18 @@ class Launcher:
                 rows.append({"alias": name, "orphans": [], "unavailable": str(exc)})
         return rows
 
+    def stop_worker(self, alias: str, pid: str) -> dict[str, Any]:
+        """Stop one named worker on a provider that keeps worker records.
+
+        Spec "Workers on a shell host", stopping one. The provider refuses a pid that no
+        worker record names.
+        """
+        provider = self.provider(alias)
+        try:
+            return {"alias": alias, "ref": pid, "stopped": provider.stop_worker(pid)}
+        except LetifyError as exc:
+            return {"alias": alias, "ref": pid, "stopped": False, "error": str(exc)}
+
     def stop_orphans(self, alias: str | None = None) -> list[dict[str, Any]]:
         """Delete what ``orphans`` reported, one at a time, reporting each outcome."""
         done: list[dict[str, Any]] = []

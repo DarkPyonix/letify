@@ -20,6 +20,8 @@ class Tunnel(Shell):
     extra = "shell"
     default_persistence = "ephemeral"
     has_fast_path = True
+    #: Listing its workers would run the connection pipeline. Spec "Workers on a shell host".
+    discovers_sessions = False
 
 
 __all__ = ["Tunnel"]

@@ -49,6 +49,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="delete the sessions whose creating process is gone",
     )
     stop.add_argument("--alias", help="only this account")
+    stop.add_argument(
+        "--worker",
+        metavar="PID",
+        help="stop the letify worker with this pid on the machine --alias names",
+    )
     stop.add_argument("-y", "--yes", action="store_true", help="do not ask")
     stop.add_argument("--json", action="store_true", help="print the records unformatted")
 
@@ -947,6 +952,21 @@ def _dispatch(args: argparse.Namespace) -> int:
         return 0
 
     if args.command == "stop":
+        if args.worker is not None:
+            if not args.alias:
+                print("letify: --worker needs --alias, the machine it runs on", file=sys.stderr)
+                return 2
+            print(f"worker {args.worker} on {args.alias} gets SIGTERM, then SIGKILL after 30 s")
+            if not args.yes and not _confirmed("Stop it?"):
+                print("nothing was stopped")
+                return 0
+            row = let.stop_worker(args.alias, args.worker)
+            if args.json:
+                _json(row)
+                return 0 if row.get("stopped") else 1
+            mark = "stopped" if row.get("stopped") else f"failed{_detail(row)}"
+            print(f"{row['alias']}  {row['ref']}  {mark}")
+            return 0 if row.get("stopped") else 1
         if not args.orphans:
             # Spec "Kaggle", stopping what a dead process left behind: a bare stop reads as
             # ending everything, so it ends nothing, and says why rather than only that.

@@ -377,6 +377,7 @@ def _reply(stream, outcome):
     try:
         _send_outcome(_SENDER, stream, outcome)
     except OSError:
+        _drop_record()
         os._exit(0)
 
 
@@ -2677,6 +2678,7 @@ def _op_lease(request):
     """
     state = globals().setdefault("_LEASE", {})
     state["deadline"] = time.time() + float(request["grace"])
+    _record_update(lease_deadline=state["deadline"])
 
     def watch():
         while True:
@@ -2689,6 +2691,82 @@ def _op_lease(request):
         state["armed"] = True
         threading.Thread(target=watch, daemon=True).start()
     return {"ok": True, "value": state["deadline"]}
+
+
+# -- the worker's record on its host ---------------------------------------------------
+# Spec "Workers on a shell host": a file under the workspace root saying who this worker is,
+# written when the client registers it and removed when the worker ends.
+
+_RECORD = {"path": None, "data": None, "lock": threading.Lock()}
+
+
+def _proc_start():
+    """This process's start time in clock ticks since boot, or None where /proc is missing."""
+    try:
+        with open("/proc/self/stat") as handle:
+            return int(handle.read().rsplit(")", 1)[1].split()[19])
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+def _write_record():
+    """Replace the record file whole, so a reader never sees half of it."""
+    import json
+    path, data = _RECORD["path"], _RECORD["data"]
+    if path is None:
+        return
+    partial = "%s.%d.part" % (path, os.getpid())
+    try:
+        descriptor = os.open(partial, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(descriptor, "w") as handle:
+            json.dump(data, handle)
+        os.replace(partial, path)
+    except OSError as exc:
+        print("letify: the worker record was not written: %s" % exc, file=sys.stderr)
+
+
+def _record_update(**fields):
+    """Change fields of the record and write it again. Nothing when no record is kept."""
+    with _RECORD["lock"]:
+        if _RECORD["path"] is None:
+            return
+        _RECORD["data"].update(fields)
+        _write_record()
+
+
+def _drop_record():
+    """Remove the record. Called before every way this process ends."""
+    with _RECORD["lock"]:
+        path, _RECORD["path"] = _RECORD["path"], None
+    if path is not None:
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+
+
+def _op_register(request):
+    """Write ``<workspace>/.letify/workers/<pid>.json`` and keep it current until exit."""
+    root = os.path.expanduser(request["workspace"])
+    directory = os.path.join(root, ".letify", "workers")
+    os.makedirs(directory, exist_ok=True)
+    os.chmod(directory, 0o700)
+    data = {
+        "pid": os.getpid(),
+        "proc_start": _proc_start(),
+        "started": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "runtime": request["runtime"],
+        "key": request["key"],
+        "devices": os.environ.get("CUDA_VISIBLE_DEVICES"),
+        "owner": request["owner"],
+        "run": _TAKE["run"],
+        "lease_deadline": globals().get("_LEASE", {}).get("deadline"),
+    }
+    with _RECORD["lock"]:
+        _RECORD["path"] = os.path.join(directory, "%d.json" % os.getpid())
+        _RECORD["data"] = data
+        _write_record()
+    return {"ok": True, "value": None}
 
 
 # -- controlling a running call --------------------------------------------------------
@@ -2761,6 +2839,7 @@ def _run_exit_hooks(reason):
 
 def _exit_with_hooks(code, reason="the lease ended"):
     _run_exit_hooks(reason)
+    _drop_record()
     os._exit(code)
 
 
@@ -2875,6 +2954,7 @@ def _watch_sigterm(fd):
             return
         if signal.SIGTERM in data and signal.getsignal(signal.SIGTERM) is _on_sigterm:
             _run_exit_hooks("SIGTERM")
+            _drop_record()
             os._exit(128 + signal.SIGTERM)
 
 
@@ -3164,6 +3244,7 @@ _OPS = {
     "device": _op_device,
     "stat": _op_stat,
     "lease": _op_lease,
+    "register": _op_register,
     "interrupt": _op_interrupt,
     "inspect_exec": _op_inspect_exec,
     "reduce_peers": _op_reduce_peers,
@@ -3540,6 +3621,7 @@ def _orphan_output(kind, data):
 
 def _door_open(take):
     """Start listening on the call's door. A door that cannot open leaves the call as it was."""
+    _record_update(run=take["run"])
     with _TAKE_COND:
         _TAKE.update(
             run=take["run"], live=True, ended_input=False, finished=False, outcome=None,
@@ -3676,7 +3758,9 @@ def _deliver_call(stream, outcome):
         listener, path = _TAKE["listener"], _TAKE["path"]
         _TAKE.update(run=None, listener=None, path=None, finished=False, outcome=None)
     _door_close(listener, path)
+    _record_update(run=None)
     if failed and owner is None:
+        _drop_record()
         os._exit(0)
     if ended:
         _JOBS.put(None)
@@ -3717,6 +3801,7 @@ def _serve():
         _run(stream, request, True)
         request = None
     _release_output()
+    _drop_record()
 
 
 _serve()
