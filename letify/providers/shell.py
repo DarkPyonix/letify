@@ -335,6 +335,9 @@ class Shell(Provider):
 
     def close_link(self, runtime: Runtime | None = None) -> None:
         key = self._link_key(runtime)
+        remote = self.__dict__.get("_link_remotes", {}).pop(key, None)
+        if remote is not None:
+            remote.close()
         link = self.__dict__.get("_links", {}).pop(key, None)
         if link is not None:
             # Remembered so a later connection to the same key is printed as re-established.
@@ -548,6 +551,64 @@ class Shell(Provider):
         backend = self.config.option("store")
         return str(backend) if isinstance(backend, str) else "shell"
 
+    # -- letify-link ---------------------------------------------------------
+
+    @property
+    def uses_letify_link(self) -> bool:
+        """Whether the account carries the worker channel over letify-link instead of ssh.
+
+        Spec "Sidecar interface" item 7: ``link = "letify-link"`` opts in, and the default,
+        ``"ssh"``, keeps the ssh data path.
+        """
+        value = self.config.option("link", "ssh")
+        if value in (None, "ssh"):
+            return False
+        if value == "letify-link":
+            return True
+        raise ProviderUnavailable(
+            self.kind, f'{self.alias} sets link = {value!r}; use "ssh" or "letify-link"'
+        )
+
+    def link_remote(self, runtime: Runtime | None = None) -> Any:
+        """The connected letify-link session to this machine, bootstrapped over ssh once."""
+        remotes: dict[str, Any] = self.__dict__.setdefault("_link_remotes", {})
+        key = self._link_key(runtime)
+        remote = remotes.get(key)
+        if remote is not None and remote.alive:
+            return remote
+        if remote is not None:
+            remote.close()
+        import letify
+
+        from ..config.secrets import account_directory
+        from ..protocol.worker import BOOTSTRAP
+        from ..transport import linkchannel
+
+        address = self.address
+        if address is None:
+            raise ProviderUnavailable(
+                self.kind, f"{self.alias} sets link = \"letify-link\" but has no 'address'"
+            )
+        ssh_link = self.link(runtime)
+        directory = account_directory(self.alias)
+        directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+        floor = self.link_floor
+        binary = self.config.option("link_binary")
+        remotes[key] = linkchannel.connect(
+            self.alias,
+            ssh=lambda command: ssh_link.ssh_command(self.remote_command(command)),
+            address=address,
+            python=self.remote_python,
+            bootstrap=BOOTSTRAP,
+            key_path=directory / "link.key",
+            version=letify.__version__,
+            binary=binary if isinstance(binary, str) else None,
+            punch=bool(self.config.option("link_punch")),
+            max_rtt_ms=floor.max_rtt_ms,
+            min_bps=floor.min_bps,
+        )
+        return remotes[key]
+
     # -- sessions ------------------------------------------------------------
 
     def open_channel(self, runtime: Runtime) -> Channel:
@@ -555,6 +616,10 @@ class Shell(Provider):
         from ..protocol.worker import BOOTSTRAP
         from ..runtime.channel import OneShotChannel, PersistentChannel
 
+        if self.uses_letify_link:
+            from ..transport.linkchannel import LinkChannel
+
+            return LinkChannel(self.link_remote(runtime), name=runtime.name)
         link = self.link(runtime)
         if not link.persistent:
             return OneShotChannel(
@@ -587,6 +652,11 @@ class Shell(Provider):
         from ..errors import UnsupportedMode
         from ..runtime.channel import AttachedChannel, relay_program
 
+        if self.uses_letify_link:
+            raise UnsupportedMode(
+                f"{self.alias} carries its channel over letify-link, and a second process "
+                f'cannot yet attach to a worker through it. Set link = "ssh" to take over.'
+            )
         if self.takeover_refusal is not None or not self.persistent_channel:
             raise UnsupportedMode(
                 f"{self.alias} cannot hand a running call to another process: "
@@ -626,6 +696,11 @@ class Shell(Provider):
 
     def transfer_channel(self, runtime: Runtime | None) -> Channel:
         """One channel for one transfer stream, on a connection of its own."""
+        if self.uses_letify_link:
+            from ..transport.linkchannel import LinkChannel
+
+            # One more stream of the open session: no punch and no ssh connection.
+            return LinkChannel(self.link_remote(runtime), name=f"{self.alias}-transfer")
         from ..runtime.channel import PersistentChannel
 
         return PersistentChannel(self.transfer_command(runtime), name=f"{self.alias}-transfer")

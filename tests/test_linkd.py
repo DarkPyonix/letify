@@ -10,7 +10,6 @@ from __future__ import annotations
 import hashlib
 import os
 import secrets
-import shutil
 import signal
 import subprocess
 import sys
@@ -25,29 +24,6 @@ from letify.transport import linkd
 ROOT = Path(__file__).resolve().parent.parent
 CORE = ROOT / "letify-core"
 MIB = 1 << 20
-
-
-@pytest.fixture(scope="session")
-def sidecar_binary(tmp_path_factory) -> Path:
-    named = os.environ.get(linkd.ENV_BINARY)
-    if named:
-        return Path(named)
-    if shutil.which("cargo") is None:
-        pytest.skip(
-            "cargo is not installed and LETIFY_LINK_BIN is not set, so letify-link is not built"
-        )
-    # One build per worker; cargo serialises concurrent builds on its own lock.
-    result = subprocess.run(
-        ["cargo", "build", "-p", "letify-link", "--release", "--features", "letify-link/relay"],
-        cwd=CORE,
-        capture_output=True,
-        text=True,
-    )
-    if result.returncode != 0:
-        pytest.fail(f"cargo build -p letify-link failed:\n{result.stderr[-2000:]}")
-    binary = CORE / "target" / "release" / linkd.BINARY
-    assert binary.is_file(), binary
-    return binary
 
 
 class Relay:
