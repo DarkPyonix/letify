@@ -547,7 +547,7 @@ def test_torch_compile_returns_the_module_and_warns_that_the_runtime_compiles_st
     _forbid_local_cuda(monkeypatch)
     monkeypatch.setattr(mapping, "_COMPILE_WARNED", [False])
     model = torch.nn.Linear(4, 2).cuda()
-    with pytest.warns(UserWarning, match="host='local'.*on the runtime.*captured step"):
+    with pytest.warns(UserWarning, match="host='local'.*captured step.*on the runtime"):
         compiled = torch.compile(model)
     assert compiled is model
     with warnings.catch_warnings():

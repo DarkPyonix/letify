@@ -92,3 +92,42 @@ def test_a_step_whose_compilation_fails_runs_eagerly(run_loop, capsys) -> None:
     assert "could not be compiled" in capsys.readouterr().err
     assert torch.allclose(losses, eager_losses)
     assert torch.allclose(weight, eager_weight)
+
+
+def test_an_adamw_loop_with_its_bias_corrections_computes_what_eager_replay_computes(
+    inductor_cache, monkeypatch
+) -> None:
+    monkeypatch.setenv("TORCHINDUCTOR_CACHE_DIR", inductor_cache)
+
+    def train(compile_it: bool):
+        connected = forwarding.connect(forwarding.worker_command(sys.executable), device="cpu")
+        try:
+            with connected.activate(), warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                torch.manual_seed(0)
+                model = torch.nn.Sequential(
+                    torch.nn.Linear(6, 8), torch.nn.GELU(), torch.nn.Linear(8, 2)
+                ).cuda()
+                if compile_it:
+                    model.compile()
+                optimizer = torch.optim.AdamW(model.parameters(), lr=1e-2)
+                data = torch.randn(5, 6).cuda()
+                losses = []
+                for index in range(14):
+                    loss = model(data).pow(2).mean()
+                    optimizer.zero_grad()
+                    loss.backward()
+                    optimizer.step()
+                    losses.append(loss.detach())
+                    if index in (5, 8):
+                        connected.call("letify.compile_stats", True)
+                stats = connected.call("letify.compile_stats", True)
+                return torch.stack([loss.cpu() for loss in losses]), stats
+        finally:
+            connected.close()
+
+    eager, _ = train(False)
+    compiled, stats = train(True)
+    assert stats["runs"] > 0
+    assert stats["failed"] == 0
+    assert torch.allclose(compiled, eager, rtol=1e-4, atol=1e-6)
