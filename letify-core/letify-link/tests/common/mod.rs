@@ -358,3 +358,144 @@ pub fn spawn_server(
     });
     rx
 }
+
+/// A TCP forwarder on loopback that limits the rate of the client to server direction with a
+/// token bucket, and can pause both directions. It stands in for one path of a given speed.
+pub struct Throttle {
+    pub addr: std::net::SocketAddr,
+    paused: Arc<AtomicBool>,
+    resume: Arc<tokio::sync::Notify>,
+}
+
+impl Throttle {
+    /// Forward to `target` at `rate` bytes per second toward the target.
+    pub async fn to(target: std::net::SocketAddr, rate: f64) -> Throttle {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let paused = Arc::new(AtomicBool::new(false));
+        let resume = Arc::new(tokio::sync::Notify::new());
+        tokio::spawn({
+            let (paused, resume) = (paused.clone(), resume.clone());
+            async move {
+                while let Ok((front, _)) = listener.accept().await {
+                    let (paused, resume) = (paused.clone(), resume.clone());
+                    tokio::spawn(async move {
+                        let Ok(back) = TcpStream::connect(target).await else {
+                            return;
+                        };
+                        let _ = front.set_nodelay(true);
+                        let _ = back.set_nodelay(true);
+                        let (fr, fw) = front.into_split();
+                        let (br, bw) = back.into_split();
+                        tokio::join!(
+                            pump(fr, bw, Some(rate), paused.clone(), resume.clone()),
+                            pump(br, fw, None, paused, resume),
+                        );
+                    });
+                }
+            }
+        });
+        Throttle {
+            addr,
+            paused,
+            resume,
+        }
+    }
+
+    /// Stop forwarding in both directions until `resume`.
+    pub fn pause(&self) {
+        self.paused.store(true, Ordering::SeqCst);
+    }
+
+    pub fn resume(&self) {
+        self.paused.store(false, Ordering::SeqCst);
+        self.resume.notify_waiters();
+    }
+}
+
+async fn pump(
+    mut from: tokio::net::tcp::OwnedReadHalf,
+    mut to: tokio::net::tcp::OwnedWriteHalf,
+    rate: Option<f64>,
+    paused: Arc<AtomicBool>,
+    resume: Arc<tokio::sync::Notify>,
+) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut buf = vec![0u8; 16 * 1024];
+    let mut start = tokio::time::Instant::now();
+    let mut sent = 0f64;
+    loop {
+        // Wait while paused. The flag is checked again after registering for the wake up.
+        loop {
+            let woken = resume.notified();
+            tokio::pin!(woken);
+            woken.as_mut().enable();
+            if !paused.load(Ordering::SeqCst) {
+                break;
+            }
+            woken.await;
+            // Time spent paused does not count as credit.
+            start = tokio::time::Instant::now();
+            sent = 0.0;
+        }
+        let Ok(n) = from.read(&mut buf).await else {
+            break;
+        };
+        if n == 0 || to.write_all(&buf[..n]).await.is_err() {
+            break;
+        }
+        if let Some(rate) = rate {
+            sent += n as f64;
+            let due = start + std::time::Duration::from_secs_f64(sent / rate);
+            tokio::time::sleep_until(due).await;
+        }
+    }
+    let _ = to.shutdown().await;
+}
+
+/// A session over `rates.len()` TCP subflows on loopback; subflow `i` runs through a
+/// throttle of `rates[i]` bytes per second toward the responder. The first element of the
+/// result is the initiator.
+pub async fn throttled_session(
+    rates: &[f64],
+    client: Config,
+    server: Config,
+) -> (Session, Session, Vec<Throttle>) {
+    let a_id = Identity::generate();
+    let b_id = Identity::generate();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let target = listener.local_addr().unwrap();
+    let n = rates.len();
+    let responder = tokio::spawn({
+        let (b_id, a_node) = (b_id.clone(), a_id.node_id());
+        async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let b = Session::accept(tcp, &b_id, PeerPolicy::allow(vec![a_node]), server)
+                .await
+                .unwrap();
+            for _ in 1..n {
+                let (tcp, _) = listener.accept().await.unwrap();
+                b.add_subflow(tcp).await.unwrap();
+            }
+            b
+        }
+    });
+    let mut proxies = Vec::new();
+    for rate in rates {
+        proxies.push(Throttle::to(target, *rate).await);
+    }
+    let a = Session::connect(
+        TcpStream::connect(proxies[0].addr).await.unwrap(),
+        &a_id,
+        b_id.node_id(),
+        client,
+    )
+    .await
+    .unwrap();
+    for p in &proxies[1..] {
+        a.add_subflow(TcpStream::connect(p.addr).await.unwrap())
+            .await
+            .unwrap();
+    }
+    (a, responder.await.unwrap(), proxies)
+}
