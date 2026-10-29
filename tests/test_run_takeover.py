@@ -742,3 +742,53 @@ def test_detaching_a_persistent_channel_sends_no_shutdown(monkeypatch) -> None:
     channel.detach()
     assert wire.SHUTDOWN not in sent
     assert sent == []
+
+
+#: The old owner's channel closes while the worker is still adopting the call to the new owner.
+#: The adoption holds the call's lock, so the close has to wait for it and then see the move.
+RACE_PROBE = textwrap.dedent(
+    """
+    import json, sys, threading, time
+    from pathlib import Path
+
+    from letify.protocol import worker
+
+    out = sys.argv[1]
+    text = worker.SOURCE.rstrip()
+    assert text.endswith("_serve()")
+    space = {"__name__": "probe"}
+    exec(compile(text[: -len("_serve()")], "worker", "exec"), space)
+    hooks = []
+    space["_run_exit_hooks"] = lambda reason: hooks.append(reason)
+    take, cond = space["_TAKE"], space["_TAKE_COND"]
+    take.update(run="abcdef012345", live=True, moved=False)
+    new_owner = object()
+    with cond:
+        closing = threading.Thread(target=space["_reader_ended"], args=(None, False))
+        closing.start()
+        time.sleep(0.5)
+        # The adoption finishes under the lock, after the close began.
+        take.update(owner=new_owner, moved=True, live=True, ended_input=False)
+    closing.join(30)
+    Path(out).write_text(json.dumps({
+        "live": take["live"], "ended_input": take["ended_input"], "hooks": hooks,
+    }))
+    """
+)
+
+
+def test_the_old_owners_channel_closing_during_the_adoption_leaves_the_new_owner_live(
+    tmp_path,
+) -> None:
+    script = tmp_path / "race.py"
+    script.write_text(RACE_PROBE, encoding="utf-8")
+    out = tmp_path / "race.out"
+    root = str(Path(letify.__file__).resolve().parent.parent)
+    subprocess.run(
+        [sys.executable, str(script), str(out)],
+        check=True, timeout=60, env={**os.environ, "PYTHONPATH": root},
+        stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    )
+    assert json.loads(out.read_text(encoding="utf-8")) == {
+        "live": True, "ended_input": False, "hooks": [],
+    }
