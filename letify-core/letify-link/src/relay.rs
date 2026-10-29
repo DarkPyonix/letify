@@ -408,5 +408,6 @@ impl RelayDialer {
             let dialer = dialer.clone();
             async move { dialer.connect(peer, token).await }
         })
+        .with_kind(crate::PathKind::Relay)
     }
 }
