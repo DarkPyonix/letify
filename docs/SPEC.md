@@ -2130,11 +2130,40 @@ The library comes first and the sidecar second. This interface is how the pure-P
 
 The sidecar is a binary named `letify-link`, built for each wheel and installed in `letify/remoting/lib/` next to `letify-quic`. The package stays pure Python.
 
-1. **Control channel.** The sidecar listens on a Unix domain socket whose path is passed on its command line, and on Windows on a loopback TCP port chosen by the operating system. Messages are length-prefixed JSON: `open_session`, `rendezvous_message`, `paths`, `open_stream`, `close`. The sidecar sends `path_added`, `path_lost`, `path_probe` and `rendezvous_out` events.
-2. **Streams.** `open_stream` returns a local stream socket (a Unix domain socket, or a loopback port on Windows) that Python reads and writes as it does a pipe. An incoming stream is announced as an event with its own local socket. Python never sees a path.
-3. **Rendezvous.** The Python side implements the trait for the sidecar. `rendezvous_out` events carry the message and the bootstrap that delivers it. `rendezvous_message` carries what the bootstrap received.
+1. **Control channel.** `letify-link serve --control PATH --key PATH [--stream-dir DIR]` starts the sidecar. On Unix the sidecar binds a Unix domain socket at `PATH` with mode 0600. On Windows, or when `PATH` is the word `tcp`, it binds a loopback TCP port chosen by the operating system. It accepts exactly one connection, the control channel, and closes the listener. When the key file is missing it is created with mode 0600 as in [Relay](#link-relay) item 13. After binding, the sidecar prints one line of JSON on standard output: `{"event":"ready","node_id":"<64 hex>","control":"unix:<path>"}` or `"control":"tcp:127.0.0.1:<port>"`. Python reads that line, then connects.
+   - **Framing.** Each message is a 4-byte big-endian length followed by that many bytes of UTF-8 JSON, one object. The length is at most 1 MiB; a longer frame closes the control channel.
+   - **Requests** are objects with `id` (an integer chosen by Python) and `op`. Each request gets exactly one reply with the same `id`, in completion order, not request order: `{"id":1,"ok":true,...}` or `{"id":1,"ok":false,"error":"<text>","kind":"<kind>"}`. `kind` is `usage` for a malformed or unknown request, `infrastructure` for a failure a new attempt may cure (connection lost, handshake refused, no candidate answered, punch window closed) and `closed` for a session or stream that was closed on purpose.
+   - **Events** are objects with `event` and no `id`.
+   - **Operations.** Bytes in messages (rendezvous payloads) are lowercase hex. A node id is 64 hex characters. An address is `host:port`.
+
+     | `op` | Request fields | Reply fields |
+     |---|---|---|
+     | `listen` | `allow`: node ids that may start a session; `bind`: optional TCP address to listen on | `listener`: integer; `addr`: the bound address when `bind` was given |
+     | `open_session` | `peer`: node id; `candidates`: see below; `config`: optional `keepalive_ms`, `resume_window_s`, `handshake_timeout_ms`, `start_timeout_ms` (how long to wait for the first handshake, default 60000) | `session`: integer; `peer` |
+     | `punch` | `peer`: node id; `role`: `initiator` or `responder`; `sockets`: 1 to 8; `public_ip`: optional address reported as the mapping of every socket (default `127.0.0.1`); `lead_ms`, `window_ms`: optional; `listener`: required for the responder | initiator: `punched`: names usable as candidates; responder: `sockets`: how many connected |
+     | `rendezvous_message` | `from`: node id; `message`: hex | none besides `ok` |
+     | `paths` | `session` | `paths`: `[{"id","sent_bytes","received_bytes","acked_bytes","rtt_ms","srtt_ms","window","probe_rate"}]` |
+     | `open_stream` | `session` | `stream`: integer; `socket`: local stream socket |
+     | `close` | exactly one of `session`, `listener` | none besides `ok` |
+
+   - **Candidates.** Each is `{"name":"<label>","tcp":"host:port"}`, a TCP connection the sidecar dials and redials, or `{"name":"<label>","punched":"<name>"}`, a socket that `punch` returned. A punched socket is used once. Candidates are dialed together and the session starts on the first that completes the handshake, as [Paths and the path manager](#link-paths) item 1 says. The reply to `open_session` comes when the session has started. A session whose peer is not in the `allow` list of the other side fails with kind `infrastructure`.
+   - **Events sent by the sidecar.**
+
+     | `event` | Fields |
+     |---|---|
+     | `path_added` | `session`, `name` |
+     | `path_lost` | `session`, `name`, `reason` |
+     | `path_probe` | `session`, `name`, `throughput` (bytes per second), `rtt_ms` or null |
+     | `path_preferred` | `session`, `from` or null, `to` |
+     | `session_incoming` | `listener`, `session`, `peer` |
+     | `session_closed` | `session`, `reason` |
+     | `stream_incoming` | `session`, `stream`, `socket` |
+     | `rendezvous_out` | `to`: node id; `message`: hex |
+
+2. **Streams.** `open_stream` binds a local stream socket, replies with its address and waits up to 30 s for Python to connect to it. The address is `unix:<path>` or `tcp:127.0.0.1:<port>`. A Unix socket is `<stream-dir>/s<N>` with mode 0600, where `stream-dir` defaults to the directory of the control socket and `N` counts from 1; on the loopback fallback it is a port. After the connection the sidecar copies bytes both ways between the local socket and the session stream. End of file on one side ends that direction of the other with a shutdown, and the sidecar removes the socket file once the connection is made. An incoming stream is announced with `stream_incoming`, which carries its own local socket and is connected the same way. A stream that nobody connects to within 30 s is closed. Python never sees a path.
+3. **Rendezvous.** In the sidecar, `ControlRendezvous` implements the `Rendezvous` trait: `send` emits `rendezvous_out` and `recv` returns what `rendezvous_message` supplied. `rendezvous_out` carries the message and the node it is for, and Python delivers it through whichever bootstrap reaches that node. `punch` is the one operation that uses it: the initiator picks the socket count, binds that many TCP sockets, sends a `PunchOffer` with their mappings, `start_at_ms` = now + `lead_ms` (default 2000) and `until_ms` = `start_at_ms` + `window_ms` (default 20000), and waits for the `PunchAnswer`. The responder waits for the offer and answers with its own mappings. Both then run the TCP punch of [Rendezvous](#rendezvous) with the earlier `until_ms`. The responder hands each punched socket to the acceptor of `listener`, which routes it as a new session or as a subflow of a live one. STUN and the mapping discovery are not part of this operation: the mappings are the bound addresses with `public_ip` in place of the local IP, which is exact on a network without a NAT.
 4. **Remote start.** The bootstrap (ssh, `colab exec`, the Kaggle API) starts the remote sidecar with the local public key and the first rendezvous message, and gets the remote public key and its reply. After that, no frame uses the bootstrap.
-5. **Lifetime.** The sidecar exits when its control channel closes, so a crashed Python process leaves no sidecar and no billing path, as the lease rule in [Sessions](#sessions) requires.
+5. **Lifetime.** The sidecar exits when its control channel closes, so a crashed Python process leaves no sidecar and no billing path, as the lease rule in [Sessions](#sessions) requires. Closing the channel ends every session without a Close frame, so the peer sees a lost connection. The Python binding, `letify/transport/linkd.py`, finds the executable in `letify/remoting/lib/` next to `letify-quic`, then on `PATH`. The environment variable `LETIFY_LINK_BIN`, which tests use, names an executable that is tried before all of these.
 6. **Absence.** A platform whose wheel has no `letify-link` skips every letify-link path with the reason `letify-link is not in this wheel`. letify does not fall back to local execution.
 
 #### Identity <!-- id: link-identity -->
