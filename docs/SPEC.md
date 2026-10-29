@@ -2683,6 +2683,11 @@ The worker records the first failure and skips the operators after it until a sy
 
 A lost worker process or link raises `RuntimeLost`, and the session is discarded.
 
+An executor that ends because of an exception sends one last message, a failure naming the exception, before it stops, so the client stops waiting at once instead of waiting for a reply that cannot come. This holds at startup and in the middle of a session, on the call worker's channel and as a process of its own. The client discards the executor and raises:
+
+- `ConfigError` when the executor could not start because a module is missing from the runtime's environment, such as `torch`. The message names the exception, for example `ModuleNotFoundError: No module named 'torch'`, and for `torch` says to add it to the project's dependencies. It is not retried, because a fresh runtime builds the same environment from the same lock.
+- `RuntimeLost`, carrying the executor's exception and traceback, for any other exception.
+
 ### Version guards <!-- id: forwarding-versions -->
 
 > PyTorch 2.1 or newer is required locally and on the runtime.
