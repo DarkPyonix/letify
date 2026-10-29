@@ -2092,7 +2092,7 @@ TCP carries the networks that pass a simultaneous open, and UDP carries those th
 
 The path manager runs inside the sidecar. Its rules:
 
-1. **Start fast.** The session starts on the first path that completes the handshake, even if a better one is still being punched.
+1. **Start fast.** The session starts on the first path that completes the handshake, even if a better one is still being punched. A version refusal is plaintext and unauthenticated, so any path can forge one. It fails only the candidate that received it, which is dialed again, and the others go on. `PathManager::start` returns `VersionMismatch` only when every candidate has been refused that way and none has succeeded; otherwise it fails at the start timeout as before.
 2. **Probe in the background.** Every candidate path keeps being tried while the session runs. A candidate that completes the handshake is measured with the probe of [Choosing a link](#choosing-a-link): 30 round trips, a discarded warm-up, then 2 s of transfer in each direction.
 3. **Move when faster.** When a probed path beats the current ones by the 25% rule of [Choosing a link](#choosing-a-link), it is added as a subflow, or replaces the current path when the transport type differs and the current path is the slower. In-flight frames are never lost by a move, because the session retransmits after a path change. The hysteresis rules below keep the session from flapping. Each value is a caller setting, and the default is given.
    - **Dwell.** No move for 30 s after the last switch.
