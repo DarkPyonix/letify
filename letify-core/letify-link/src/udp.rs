@@ -248,6 +248,22 @@ impl UdpPath {
     pub fn peer_addr(&self) -> SocketAddr {
         self.conn.remote_address()
     }
+
+    /// A reader of the congestion window and round trip of the QUIC connection. The session
+    /// uses it to size the bulk cap of the subflow, see SPEC.md letify-link, Session item 7.
+    pub(crate) fn gauge(&self) -> crate::session::Gauge {
+        let conn = self.conn.clone();
+        Arc::new(move || {
+            let path = conn.stats().path;
+            crate::session::CongestionStats {
+                window: path.cwnd.min(usize::MAX as u64) as usize,
+                rtt: path.rtt,
+                min_rtt: path.min_rtt,
+                lost_packets: path.lost_packets,
+                sent_packets: path.sent_packets,
+            }
+        })
+    }
 }
 
 impl Drop for UdpPath {

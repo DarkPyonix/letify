@@ -157,6 +157,29 @@ def test_a_large_argument_transfers_over_link_streams(linked, ssh) -> None:
             channel.close()
 
 
+def test_transfers_open_bulk_streams_and_the_worker_channel_an_interactive_one(
+    linked, ssh, monkeypatch
+) -> None:
+    """Spec letify-link, Session item 7: transfers are bulk, the worker channel is not."""
+    opened: list[str] = []
+    real = linkd.LinkSession.open_stream
+
+    def recording(self, priority: str = "interactive"):
+        opened.append(priority)
+        return real(self, priority)
+
+    monkeypatch.setattr(linkd.LinkSession, "open_stream", recording)
+    worker = linked.open_channel(runtime())
+    transfer = linked.transfer_channel(runtime())
+    try:
+        worker.call(worker_pid(), (), {})
+        transfer.call(worker_pid(), (), {})
+    finally:
+        worker.close()
+        transfer.close()
+    assert opened == ["interactive", "bulk"]
+
+
 class CuttableProxy:
     """A TCP forwarder whose live connections can be cut while it keeps accepting."""
 

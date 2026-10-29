@@ -283,7 +283,7 @@ impl Mitm {
                     return;
                 }
                 loop {
-                    let mut rec = vec![0u8; 10];
+                    let mut rec = vec![0u8; 12];
                     if ar.read_exact(&mut rec).await.is_err() {
                         return;
                     }

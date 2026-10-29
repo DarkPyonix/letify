@@ -125,10 +125,13 @@ class LinkRemote:
             "local_node": self.daemon.node_id,
         }
 
-    def open_stream(self) -> socket.socket:
-        """One more stream of the session. No punch and no ssh connection."""
+    def open_stream(self, priority: str = "interactive") -> socket.socket:
+        """One more stream of the session. No punch and no ssh connection.
+
+        ``priority`` is the stream's class, ``"interactive"`` or ``"bulk"``.
+        """
         try:
-            return self.session.open_stream()
+            return self.session.open_stream(priority)
         except linkd.LinkError as error:
             raise RuntimeFailure(
                 f"{self.alias}: cannot open a letify-link stream: {error}"
@@ -441,8 +444,12 @@ class LinkChannel(FramedChannel):
         name: str = "runtime",
         door: str | None = None,
         owns_remote: bool = False,
+        priority: str = "interactive",
     ):
         self.remote = remote
+        #: The class of the stream's sends: "interactive" for the worker channel, "bulk" for a
+        #: transfer.
+        self.priority = priority
         self.name = name
         #: The path of a running worker's second door, for a channel that attaches to it.
         self.door = door
@@ -456,7 +463,7 @@ class LinkChannel(FramedChannel):
         with self._start_lock:
             if self._socket is not None:
                 return
-            sock = self.remote.open_stream()
+            sock = self.remote.open_stream(self.priority)
             self._socket = sock
             self._connection = None
             from ..runtime.channel import Connection

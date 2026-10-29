@@ -119,6 +119,7 @@ mod frame;
 mod handshake;
 pub mod hysteresis;
 mod identity;
+mod keys;
 pub mod observe;
 mod paths;
 pub mod policing;
@@ -136,10 +137,14 @@ pub mod tcp;
 pub mod udp;
 
 pub use acceptor::{Accepted, Acceptor};
-pub use config::{Config, PROTOCOL_VERSION};
+pub use config::{Config, PROTOCOL_VERSION, PowerState};
 pub use error::{Error, Result};
 pub use identity::{Identity, NodeId, PeerPolicy};
-pub use paths::{BoxTransport, Candidate, ManagerConfig, PathEvent, PathKind, PathManager};
+pub use paths::{
+    BoxTransport, Candidate, ManagerConfig, PathEvent, PathKind, PathManager, ProbePolicy,
+};
 pub use replay::REPLAY_WINDOW;
-pub use session::{Priority, Session, SessionId, SubflowId, SubflowStats, Transport, WeakSession};
+pub use session::{
+    CongestionStats, Priority, Session, SessionId, SubflowId, SubflowStats, Transport, WeakSession,
+};
 pub use stream::Stream;

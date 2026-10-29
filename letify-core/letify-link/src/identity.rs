@@ -1,9 +1,11 @@
 //! Node identity: an ed25519 key pair, its public key as the node id, and the X25519 static
 //! key that the Noise handshake uses, derived from the same key. It does not store keys.
 
+use std::collections::HashSet;
 use std::fmt;
 
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
+use tokio::sync::watch;
 
 use crate::error::{Error, Result};
 
@@ -118,10 +120,19 @@ impl fmt::Debug for Identity {
     }
 }
 
-/// Which initiators a responder accepts.
+/// The nodes revoked at run time, shared by every clone of a policy.
+struct Revoked {
+    set: std::sync::RwLock<HashSet<NodeId>>,
+    /// Counts every change, so a session can wait for one.
+    changes: watch::Sender<u64>,
+}
+
+/// Which initiators a responder accepts. The clones of a policy share one set of revoked
+/// nodes, which can change while sessions run: see [`PeerPolicy::revoke`].
 #[derive(Clone)]
 pub struct PeerPolicy {
     check: std::sync::Arc<dyn Fn(&NodeId) -> bool + Send + Sync>,
+    revoked: std::sync::Arc<Revoked>,
 }
 
 impl PeerPolicy {
@@ -134,10 +145,46 @@ impl PeerPolicy {
     pub fn from_fn(check: impl Fn(&NodeId) -> bool + Send + Sync + 'static) -> Self {
         PeerPolicy {
             check: std::sync::Arc::new(check),
+            revoked: std::sync::Arc::new(Revoked {
+                set: std::sync::RwLock::new(HashSet::new()),
+                changes: watch::channel(0).0,
+            }),
         }
     }
 
+    /// Refuse `id` from now on, whatever the allow list or callback says. A handshake from it
+    /// fails, a subflow that resumes one of its sessions is refused, and a session accepted
+    /// under this policy (or one of its clones) closes with the reason `revoked`.
+    pub fn revoke(&self, id: NodeId) {
+        let mut set = self.revoked.set.write().unwrap_or_else(|e| e.into_inner());
+        if set.insert(id) {
+            self.revoked.changes.send_modify(|n| *n += 1);
+        }
+    }
+
+    /// Remove `id` from the revoked set. The allow list or callback applies to it again.
+    pub fn reinstate(&self, id: NodeId) {
+        let mut set = self.revoked.set.write().unwrap_or_else(|e| e.into_inner());
+        if set.remove(&id) {
+            self.revoked.changes.send_modify(|n| *n += 1);
+        }
+    }
+
+    /// Whether `id` was revoked and not reinstated.
+    pub fn is_revoked(&self, id: &NodeId) -> bool {
+        self.revoked
+            .set
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains(id)
+    }
+
+    /// A counter that changes whenever the revoked set does.
+    pub(crate) fn changes(&self) -> watch::Receiver<u64> {
+        self.revoked.changes.subscribe()
+    }
+
     pub(crate) fn accepts(&self, id: &NodeId) -> bool {
-        (self.check)(id)
+        !self.is_revoked(id) && (self.check)(id)
     }
 }

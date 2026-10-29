@@ -17,29 +17,61 @@
 //! a subflow are capped to about two bandwidth delay products so interactive frames do not wait
 //! behind a deep queue.
 
+use std::any::Any;
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::task::Waker;
 use std::time::{Duration, Instant};
 
-use snow::StatelessTransportState;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::sync::{Notify, watch};
 use tokio::task::AbortHandle;
 
-use crate::config::Config;
+use crate::config::{Config, PowerState};
 use crate::error::{Error, Result};
 use crate::frame::{self, Frame, HDR, Kind, RECORD_HDR, TAG};
 use crate::handshake::{self, Established};
 use crate::identity::{Identity, NodeId, PeerPolicy};
-use crate::replay::{MAX_UNACKED_FRAMES, ReplayWindow};
+use crate::keys::Keys;
+use crate::replay::MAX_UNACKED_FRAMES;
 use crate::stream::Stream;
 
 /// A reliable, ordered byte transport that a session can use as a subflow: a TCP connection,
 /// a pipe, or anything else that implements `AsyncRead` and `AsyncWrite`.
-pub trait Transport: AsyncRead + AsyncWrite + Send + Unpin + 'static {}
+pub trait Transport: AsyncRead + AsyncWrite + Send + Unpin + Any {}
 impl<T: AsyncRead + AsyncWrite + Send + Unpin + 'static> Transport for T {}
+
+/// What a transport that runs its own congestion control reports about it.
+#[derive(Clone, Copy, Debug)]
+pub struct CongestionStats {
+    /// The congestion window in bytes: the most the transport puts in flight.
+    pub window: usize,
+    /// The transport's smoothed round trip, which a lost packet's recovery does not inflate.
+    pub rtt: Duration,
+    /// The lowest round trip the transport has seen.
+    pub min_rtt: Duration,
+    /// Packets the transport has declared lost so far.
+    pub lost_packets: u64,
+    /// Packets the transport has sent so far.
+    pub sent_packets: u64,
+}
+
+/// Reads the congestion statistics of one subflow's transport.
+pub(crate) type Gauge = Arc<dyn Fn() -> CongestionStats + Send + Sync>;
+
+/// The gauge of `transport` when it is a UDP path, directly or behind a [`crate::BoxTransport`].
+pub(crate) fn gauge_of<T: Transport>(transport: &T) -> Option<Gauge> {
+    let any: &dyn Any = transport;
+    if let Some(path) = any.downcast_ref::<crate::udp::UdpPath>() {
+        return Some(path.gauge());
+    }
+    let boxed = any.downcast_ref::<crate::BoxTransport>()?;
+    let inner: &dyn Any = &**boxed;
+    inner
+        .downcast_ref::<crate::udp::UdpPath>()
+        .map(crate::udp::UdpPath::gauge)
+}
 
 const SUBFLOW_MAGIC: &[u8; 4] = b"LLNS";
 
@@ -91,6 +123,21 @@ const RATE_KEEP: usize = 8;
 /// The lowest round trip of a subflow is taken over this span.
 const MIN_RTT_SPAN: Duration = Duration::from_secs(10);
 const CAP_HOLD: u32 = 6;
+/// A subflow whose transport lost a packet this recently is recovering from loss.
+const LOSS_HOLD: Duration = Duration::from_secs(1);
+/// The loss ratio of a transport is taken over intervals of this length.
+const LOSS_SPAN: Duration = Duration::from_millis(250);
+/// A path that loses more than this share of its packets is overflowing a queue. A larger cap
+/// would only add delay there, so the cap stays the probed one.
+const HEAVY_LOSS: f64 = 0.10;
+/// While a path recovers from loss, the cap holds at most this long a flight at the delivery
+/// rate, so a small message waits behind at most this much bulk.
+const LOSS_DELAY: Duration = Duration::from_millis(150);
+/// A transport's congestion window is read at most this often.
+const GAUGE_EVERY: Duration = Duration::from_millis(10);
+/// While both classes have frames queued, this many interactive frames are followed by one
+/// bulk frame, so bulk gets one stream frame in ten at least.
+const GUARD_RUN: u32 = 9;
 
 /// How the bulk cap of a subflow is moving.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -139,9 +186,21 @@ pub struct SubflowStats {
     pub bulk_cap: usize,
     /// The latest delivery rate sample of the subflow in bytes per second, if any.
     pub delivery_rate: Option<f64>,
+    /// What the subflow's transport reports about its congestion control, for a transport that
+    /// reports it (a UDP path), as read at most every 10 ms.
+    pub congestion: Option<CongestionStats>,
 }
 
 const NO_RTT: u64 = u64::MAX;
+
+/// The handles a subflow shares with its two tasks.
+struct SubShared {
+    sent: Arc<AtomicU64>,
+    received: Arc<AtomicU64>,
+    rtt_us: Arc<AtomicU64>,
+    notify: Arc<Notify>,
+    aborts: Vec<AbortHandle>,
+}
 
 pub(crate) struct Sub {
     /// Bytes of sequenced frames written to this subflow.
@@ -171,8 +230,19 @@ pub(crate) struct Sub {
     cap_ref: f64,
     cap_saved: usize,
     cap_mode: CapMode,
+    /// The keepalive interval in milliseconds that the peer knows through this subflow.
+    told_keepalive: u64,
     /// A bulk frame had to wait for the cap since the last sample.
     capped: bool,
+    /// Reads the transport's congestion window, and the latest reading with its time.
+    gauge: Option<Gauge>,
+    gauged: Option<(CongestionStats, Instant)>,
+    /// When the transport last reported more lost packets than before.
+    loss_at: Option<Instant>,
+    /// The start of the current loss interval with the counts then, and the share of packets
+    /// the transport lost in the last interval.
+    loss_base: Option<(Instant, u64, u64)>,
+    loss_ratio: f64,
     sent: Arc<AtomicU64>,
     received: Arc<AtomicU64>,
     acked: u64,
@@ -194,6 +264,49 @@ pub(crate) struct Sub {
 }
 
 impl Sub {
+    fn new(window: usize, gauge: Option<Gauge>, shared: SubShared) -> Sub {
+        Sub {
+            sent_seq: 0,
+            acked_seq: 0,
+            recv_seq: 0,
+            ack_dirty: false,
+            window,
+            last_penalty: None,
+            srtt: None,
+            marks: VecDeque::new(),
+            bulk_inflight: 0,
+            rate_from: Instant::now(),
+            rate_bytes: 0,
+            rates: VecDeque::new(),
+            min_rtt: None,
+            cap: START_BULK,
+            cap_ref: 0.0,
+            cap_saved: START_BULK,
+            cap_mode: CapMode::Grow,
+            told_keepalive: 0,
+            capped: false,
+            gauge,
+            gauged: None,
+            loss_at: None,
+            loss_base: None,
+            loss_ratio: 0.0,
+            sent: shared.sent,
+            received: shared.received,
+            acked: 0,
+            rtt_us: shared.rtt_us,
+            pong: None,
+            probe_request: None,
+            probe_answer: None,
+            probe_pending: None,
+            probe_sent: 0,
+            probe_received: 0,
+            probe_acked: 0,
+            probe_rate: None,
+            notify: shared.notify,
+            aborts: shared.aborts,
+        }
+    }
+
     /// The most bulk bytes this subflow may have in flight: the smallest cap found by probing
     /// that keeps the delivery rate, between two frames and half the window. See SPEC.md
     /// letify-link, Session item 7.
@@ -202,7 +315,59 @@ impl Sub {
         let rtt = self.min_rtt.map_or(RTT_FLOOR, |(r, _)| r).max(RTT_FLOOR);
         let bound = (CAP_BOUND * best * rtt.as_secs_f64()) as usize;
         let top = (self.window / 2).max(QUANTUM);
-        self.cap.min(bound).max(MIN_BULK).min(top)
+        let probed = self.cap.min(bound).max(MIN_BULK).min(top);
+        match self.gauged {
+            // A path whose transport recovers losses by itself holds back the acknowledgements
+            // for about one round trip of rate while it does, on top of what it has in flight.
+            Some((stats, at))
+                if self
+                    .loss_at
+                    .is_some_and(|l| at.saturating_duration_since(l) <= LOSS_HOLD)
+                    && self.loss_ratio <= HEAVY_LOSS =>
+            {
+                let stall = (best * rtt.as_secs_f64()) as usize;
+                let flight = stats.window.saturating_add(stall);
+                let allowed = (best * LOSS_DELAY.as_secs_f64()) as usize;
+                probed
+                    .max(flight.min(allowed))
+                    .min(self.window.max(QUANTUM))
+            }
+            _ => probed,
+        }
+    }
+
+    /// Read the transport's congestion window if the last reading is older than `GAUGE_EVERY`.
+    fn read_gauge(&mut self, now: Instant) {
+        let Some(gauge) = &self.gauge else {
+            return;
+        };
+        if self
+            .gauged
+            .is_none_or(|(_, at)| now.saturating_duration_since(at) >= GAUGE_EVERY)
+        {
+            let stats = gauge();
+            if self
+                .gauged
+                .is_some_and(|(old, _)| stats.lost_packets > old.lost_packets)
+            {
+                self.loss_at = Some(now);
+            }
+            match self.loss_base {
+                Some((from, lost, sent)) if now.saturating_duration_since(from) >= LOSS_SPAN => {
+                    let sent_now = stats.sent_packets.saturating_sub(sent);
+                    let lost_now = stats.lost_packets.saturating_sub(lost);
+                    self.loss_ratio = if sent_now == 0 {
+                        0.0
+                    } else {
+                        lost_now as f64 / sent_now as f64
+                    };
+                    self.loss_base = Some((now, stats.lost_packets, stats.sent_packets));
+                }
+                Some(_) => {}
+                None => self.loss_base = Some((now, stats.lost_packets, stats.sent_packets)),
+            }
+            self.gauged = Some((stats, now));
+        }
     }
 
     /// Judge the cap by one delivery rate sample `rate` (bytes per second). Only a sample in
@@ -293,6 +458,8 @@ pub(crate) struct State {
     ring_bulk: VecDeque<u32>,
     /// The Close frame is owed once every queue is empty.
     close_wanted: bool,
+    /// Interactive stream frames taken since the last bulk one while bulk had frames queued.
+    bulk_wait: u32,
     peer_next: u64,
     recv_next: u64,
     reorder: BTreeMap<u64, (Frame, usize)>,
@@ -309,6 +476,8 @@ pub(crate) struct State {
     pub failed: Option<String>,
     pub closing: bool,
     pub remote_closed: bool,
+    /// Why the session was closed, as the closing side gave it.
+    close_reason: Option<String>,
 }
 
 impl State {
@@ -430,12 +599,27 @@ impl State {
     /// The next fresh frame, without taking it, and its size. Deficit round robin: the stream
     /// at the front of its ring is served while its deficit covers its next frame, and
     /// otherwise gets a quantum and moves to the back. `None` when nothing may be sent now.
-    fn peek_fresh(&mut self) -> Option<(Fresh, usize, bool)> {
+    ///
+    /// Every `GUARD_RUN` interactive frames taken while bulk has frames queued, bulk goes first
+    /// (the starvation guard). `fits` says whether the writer's subflow can take a frame now,
+    /// so a bulk frame that does not fit never holds an interactive one back.
+    fn peek_fresh(
+        &mut self,
+        fits: &mut dyn FnMut(usize, bool) -> bool,
+    ) -> Option<(Fresh, usize, bool)> {
         let count_ok = |st: &State, reserve: usize| st.unacked.len() + reserve < MAX_UNACKED_FRAMES;
         if let Some(f) = self.ctl.front() {
             return count_ok(self, 0).then_some((Fresh::Ctl, f.len(), false));
         }
-        for bulk in [false, true] {
+        let guard_turn = self.bulk_wait >= GUARD_RUN
+            && !self.ring_bulk.is_empty()
+            && !self.ring_interactive.is_empty();
+        let order = if guard_turn {
+            [true, false]
+        } else {
+            [false, true]
+        };
+        for bulk in order {
             // Bulk frames leave an eighth of the retransmit buffer to interactive ones.
             let (bytes_cap, count_reserve) = if bulk {
                 (
@@ -471,6 +655,12 @@ impl State {
                 }
                 let ok = (self.unacked_bytes == 0 || self.unacked_bytes + len <= bytes_cap)
                     && count_ok(self, count_reserve);
+                if guard_turn && bulk {
+                    if ok && fits(len, true) {
+                        return Some((Fresh::Stream(id), len, true));
+                    }
+                    break;
+                }
                 return ok.then_some((Fresh::Stream(id), len, bulk));
             }
         }
@@ -482,7 +672,7 @@ impl State {
     fn take_fresh(&mut self, which: Fresh, bulk: bool, id: u64, now: Instant) -> Arc<Vec<u8>> {
         let mut bytes = match which {
             Fresh::Ctl => self.ctl.pop_front().expect("peeked"),
-            Fresh::Close => frame::encode_close(0),
+            Fresh::Close => frame::encode_close(0, self.close_reason.as_deref()),
             Fresh::Stream(stream) => {
                 let s = self.streams.get_mut(&stream).expect("peeked");
                 let bytes = s.queue.pop_front().expect("peeked");
@@ -501,6 +691,11 @@ impl State {
                     };
                     ring.retain(|i| *i != stream);
                     self.forget_if_done(stream);
+                }
+                if bulk || self.ring_bulk.is_empty() {
+                    self.bulk_wait = 0;
+                } else {
+                    self.bulk_wait += 1;
                 }
                 bytes
             }
@@ -697,7 +892,11 @@ impl State {
             }
             Frame::Hello { next } => self.apply_ack(next),
             // Keepalives are answered by the subflow's reader, which knows the subflow.
-            Frame::Ping { .. } | Frame::Pong { .. } | Frame::Probe | Frame::ProbeAck { .. } => {}
+            Frame::Ping { .. }
+            | Frame::Pong { .. }
+            | Frame::Probe
+            | Frame::ProbeAck { .. }
+            | Frame::Keepalive { .. } => {}
             Frame::Seq { seq, .. } => {
                 if let Some(sub) = self.subflows.get_mut(&id) {
                     sub.recv_seq += len as u64;
@@ -772,8 +971,11 @@ impl State {
                     }
                 }
             }
-            Kind::Close => {
+            Kind::Close(reason) => {
                 self.remote_closed = true;
+                if self.close_reason.is_none() {
+                    self.close_reason = reason;
+                }
                 self.closing = true;
                 self.wake_all_streams();
                 accept.notify_waiters();
@@ -786,10 +988,8 @@ impl State {
 pub(crate) struct Shared {
     pub state: Mutex<State>,
     accept: Notify,
-    crypto: Arc<StatelessTransportState>,
-    nonce: AtomicU64,
-    /// Nonces accepted from the peer, over all subflows and across resumption.
-    replay: Mutex<ReplayWindow>,
+    /// The keys of both directions, shared by every subflow and kept across resumption.
+    keys: Keys,
     dropped: AtomicU64,
     cfg: Config,
     peer: NodeId,
@@ -799,18 +999,45 @@ pub(crate) struct Shared {
     changes: watch::Sender<u64>,
     /// Origin of the keepalive stamps.
     origin: Instant,
-    /// A subflow with no record for this long is dead. `None` when neither side sends
-    /// keepalives, so only a transport error ends a subflow.
-    dead_after: Option<Duration>,
+    /// This side's keepalive interval in milliseconds (0 is off) and the peer's, as the
+    /// handshake or a later Keepalive frame advertised it. A subflow with no record for 3 x
+    /// the larger one is dead; with both off only a transport error ends a subflow.
+    keepalive_ms: AtomicU64,
+    peer_keepalive_ms: AtomicU64,
+    /// The interval this side's handshake advertised. A subflow tells the peer when the
+    /// current one differs.
+    handshake_keepalive_ms: u64,
+    /// Wakes the readers when either interval changed, so they recompute their dead time.
+    keepalive_changed: Notify,
+    /// Counts the calls of `resume_now`, so a path manager can redial at once.
+    hints: watch::Sender<u64>,
+}
+
+/// An interval in the milliseconds the wire carries: a nonzero interval is at least 1.
+fn interval_ms(interval: Duration) -> u64 {
+    match interval.as_millis().min(u32::MAX as u128) as u64 {
+        0 if !interval.is_zero() => 1,
+        ms => ms,
+    }
 }
 
 /// Closes the session when the last handle goes away.
 pub(crate) struct Guard {
     pub shared: Arc<Shared>,
+    /// The task that closes the session when its peer is revoked, see `Session::watch_policy`.
+    watcher: Mutex<Option<AbortHandle>>,
 }
 
 impl Drop for Guard {
     fn drop(&mut self) {
+        if let Some(task) = self
+            .watcher
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+        {
+            task.abort();
+        }
         let mut st = self.shared.lock();
         if !st.closing && st.failed.is_none() {
             st.closing = true;
@@ -835,6 +1062,21 @@ impl Shared {
         self.bump();
         st.wake_all_streams();
         self.accept.notify_waiters();
+    }
+
+    /// This side's keepalive interval, zero for off.
+    fn keepalive(&self) -> Duration {
+        Duration::from_millis(self.keepalive_ms.load(Ordering::Relaxed))
+    }
+
+    /// How long a subflow may stay silent before it is dead, or `None` when neither side
+    /// sends keepalives.
+    fn dead_after(&self) -> Option<Duration> {
+        let longer = self
+            .keepalive_ms
+            .load(Ordering::Relaxed)
+            .max(self.peer_keepalive_ms.load(Ordering::Relaxed));
+        (longer > 0).then(|| Duration::from_millis(longer) * 3)
     }
 
     fn bump(&self) {
@@ -884,46 +1126,27 @@ impl Shared {
         }
     }
 
-    fn next_nonce(&self) -> u64 {
-        self.nonce.fetch_add(1, Ordering::Relaxed)
-    }
-
-    /// Encrypt `plain` into a record: length, nonce, ciphertext.
+    /// Encrypt `plain` into a record: length, epoch, nonce, ciphertext.
     fn seal(&self, plain: &[u8]) -> Result<Vec<u8>> {
-        let nonce = self.next_nonce();
-        let mut out = vec![0u8; RECORD_HDR + plain.len() + TAG];
-        let n = self
-            .crypto
-            .write_message(nonce, plain, &mut out[RECORD_HDR..])
-            .map_err(|e| Error::ConnectionLost(format!("encrypt: {e}")))?;
-        out.truncate(RECORD_HDR + n);
-        out[..2].copy_from_slice(&(n as u16).to_be_bytes());
-        out[2..RECORD_HDR].copy_from_slice(&nonce.to_be_bytes());
-        Ok(out)
+        self.keys.seal(plain)
     }
 
-    /// Decrypt a record. `None` means the nonce was already accepted or is older than the
-    /// replay window; the record is dropped and counted, not an error.
-    fn open(&self, nonce: u64, ct: &[u8]) -> Result<Option<Vec<u8>>> {
-        let mut out = vec![0u8; ct.len()];
-        let n = self
-            .crypto
-            .read_message(nonce, ct, &mut out)
-            .map_err(|e| Error::ConnectionLost(format!("decrypt: {e}")))?;
-        out.truncate(n);
-        let fresh = self
-            .replay
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .accept(nonce);
-        if !fresh {
+    /// Decrypt a record. `None` means the record was dropped without an error: its nonce was
+    /// already accepted, it is older than the replay window, or its epoch is not kept. It is
+    /// counted.
+    fn open(&self, epoch: u16, nonce: u64, ct: &[u8]) -> Result<Option<Vec<u8>>> {
+        let opened = self.keys.open(epoch, nonce, ct)?;
+        if opened.is_none() {
             self.dropped.fetch_add(1, Ordering::Relaxed);
-            return Ok(None);
         }
-        Ok(Some(out))
+        Ok(opened)
     }
 
-    fn start_subflow<T: Transport>(self: &Arc<Self>, t: T) -> Result<SubflowId> {
+    fn start_subflow<T: Transport>(
+        self: &Arc<Self>,
+        t: T,
+        gauge: Option<Gauge>,
+    ) -> Result<SubflowId> {
         let (rd, wr) = tokio::io::split(t);
         let notify = Arc::new(Notify::new());
         let sent = Arc::new(AtomicU64::new(0));
@@ -952,41 +1175,21 @@ impl Shared {
         let aborts = vec![reader.abort_handle(), writer.abort_handle()];
         st.subflows.insert(
             id,
-            Sub {
-                sent_seq: 0,
-                acked_seq: 0,
-                recv_seq: 0,
-                ack_dirty: false,
-                window: self.cfg.subflow_window,
-                last_penalty: None,
-                srtt: None,
-                marks: VecDeque::new(),
-                bulk_inflight: 0,
-                rate_from: Instant::now(),
-                rate_bytes: 0,
-                rates: VecDeque::new(),
-                min_rtt: None,
-                cap: START_BULK,
-                cap_ref: 0.0,
-                cap_saved: START_BULK,
-                cap_mode: CapMode::Grow,
-                capped: false,
-                sent,
-                received,
-                acked: 0,
-                rtt_us,
-                pong: None,
-                probe_request: None,
-                probe_answer: None,
-                probe_pending: None,
-                probe_sent: 0,
-                probe_received: 0,
-                probe_acked: 0,
-                probe_rate: None,
-                notify,
-                aborts,
-            },
+            Sub::new(
+                self.cfg.subflow_window,
+                gauge,
+                SubShared {
+                    sent,
+                    received,
+                    rtt_us,
+                    notify,
+                    aborts,
+                },
+            ),
         );
+        if let Some(sub) = st.subflows.get_mut(&id) {
+            sub.told_keepalive = self.handshake_keepalive_ms;
+        }
         // A new subflow cancels any running resume timer.
         st.epoch += 1;
         self.bump();
@@ -994,15 +1197,16 @@ impl Shared {
     }
 }
 
-/// Read one record: its nonce and ciphertext.
-async fn read_record<R: AsyncRead + Unpin>(rd: &mut R) -> std::io::Result<(u64, Vec<u8>)> {
+/// Read one record: its epoch, nonce and ciphertext.
+async fn read_record<R: AsyncRead + Unpin>(rd: &mut R) -> std::io::Result<(u16, u64, Vec<u8>)> {
     let mut head = [0u8; RECORD_HDR];
     rd.read_exact(&mut head).await?;
     let len = u16::from_be_bytes([head[0], head[1]]) as usize;
-    let nonce = u64::from_be_bytes(head[2..].try_into().unwrap());
+    let epoch = u16::from_be_bytes([head[2], head[3]]);
+    let nonce = u64::from_be_bytes(head[4..].try_into().unwrap());
     let mut ct = vec![0u8; len];
     rd.read_exact(&mut ct).await?;
-    Ok((nonce, ct))
+    Ok((epoch, nonce, ct))
 }
 
 async fn reader_task<R: AsyncRead + Unpin>(
@@ -1013,20 +1217,40 @@ async fn reader_task<R: AsyncRead + Unpin>(
     rtt_us: Arc<AtomicU64>,
 ) {
     let mut rd = BufReader::with_capacity(128 * 1024, rd);
-    let limit = shared.dead_after.unwrap_or(Duration::ZERO);
     let result: Result<()> = async {
+        let mut last = tokio::time::Instant::now();
         loop {
-            let (nonce, ct) = if limit.is_zero() {
-                read_record(&mut rd).await?
-            } else {
-                tokio::time::timeout(limit, read_record(&mut rd))
-                    .await
-                    .map_err(|_| {
-                        Error::ConnectionLost("no record for 3 keepalive intervals".into())
-                    })??
+            let read = read_record(&mut rd);
+            tokio::pin!(read);
+            // The dead time follows the intervals, which can change while a record is awaited.
+            let (epoch, nonce, ct) = loop {
+                let changed = shared.keepalive_changed.notified();
+                tokio::pin!(changed);
+                changed.as_mut().enable();
+                let deadline = shared.dead_after().map(|limit| last + limit);
+                tokio::select! {
+                    record = &mut read => break record?,
+                    _ = async {
+                        match deadline {
+                            Some(at) => tokio::time::sleep_until(at).await,
+                            None => std::future::pending().await,
+                        }
+                    } => {
+                        let now = tokio::time::Instant::now();
+                        if shared.dead_after().is_some_and(|limit| last + limit <= now) {
+                            return Err(Error::ConnectionLost(
+                                "no record for 3 keepalive intervals".into(),
+                            ));
+                        }
+                    }
+                    // A new interval starts the silence over: a side that had keepalives off
+                    // has heard nothing for as long as it liked.
+                    _ = &mut changed => last = tokio::time::Instant::now(),
+                }
             };
+            last = tokio::time::Instant::now();
             received.fetch_add((RECORD_HDR + ct.len()) as u64, Ordering::Relaxed);
-            let Some(plain) = shared.open(nonce, &ct)? else {
+            let Some(plain) = shared.open(epoch, nonce, &ct)? else {
                 continue;
             };
             match frame::decode(plain)? {
@@ -1035,6 +1259,10 @@ async fn reader_task<R: AsyncRead + Unpin>(
                         sub.pong = Some(stamp);
                         sub.notify.notify_one();
                     }
+                }
+                Frame::Keepalive { ms } => {
+                    shared.peer_keepalive_ms.store(ms, Ordering::Relaxed);
+                    shared.keepalive_changed.notify_waiters();
                 }
                 Frame::Pong { stamp } => {
                     let rtt = shared.stamp().saturating_sub(stamp);
@@ -1076,6 +1304,7 @@ async fn reader_task<R: AsyncRead + Unpin>(
 }
 
 enum Work {
+    Keepalive(u64),
     Pong(u64),
     ProbeAck(u64),
     Probe(usize),
@@ -1093,7 +1322,6 @@ async fn writer_task<W: AsyncWrite + Unpin>(
     notify: Arc<Notify>,
     sent: Arc<AtomicU64>,
 ) {
-    let keepalive = shared.cfg.keepalive_interval;
     let mut last_write = tokio::time::Instant::now();
     let result: Result<()> = async {
         loop {
@@ -1115,6 +1343,16 @@ async fn writer_task<W: AsyncWrite + Unpin>(
                     Work::Gone
                 } else if st.failed.is_some() {
                     Work::Done
+                } else if let Some(ms) = {
+                    let now_ms = shared.keepalive_ms.load(Ordering::Relaxed);
+                    st.subflows.get_mut(&id).and_then(|s| {
+                        (s.told_keepalive != now_ms).then(|| {
+                            s.told_keepalive = now_ms;
+                            now_ms
+                        })
+                    })
+                } {
+                    Work::Keepalive(ms)
                 } else if let Some(owed) = {
                     let next = st.recv_next;
                     st.subflows.get_mut(&id).and_then(|s| {
@@ -1132,6 +1370,9 @@ async fn writer_task<W: AsyncWrite + Unpin>(
                 } else {
                     let now = Instant::now();
                     st.maybe_reinject(now);
+                    if let Some(s) = st.subflows.get_mut(&id) {
+                        s.read_gauge(now);
+                    }
                     let (window, inflight, bulk_cap, bulk_inflight) =
                         st.subflows.get(&id).map_or((0, 0, 0, 0), |s| {
                             (
@@ -1168,7 +1409,7 @@ async fn writer_task<W: AsyncWrite + Unpin>(
                         } else {
                             None
                         }
-                    } else if let Some((which, len, bulk)) = st.peek_fresh() {
+                    } else if let Some((which, len, bulk)) = st.peek_fresh(&mut fits) {
                         fits(len, bulk).then(|| (st.take_fresh(which, bulk, id, now), bulk))
                     } else {
                         None
@@ -1195,6 +1436,12 @@ async fn writer_task<W: AsyncWrite + Unpin>(
                 }
             };
             match work {
+                Work::Keepalive(ms) => {
+                    let record = shared.seal(&frame::encode_keepalive(ms))?;
+                    wr.write_all(&record).await?;
+                    wr.flush().await?;
+                    last_write = tokio::time::Instant::now();
+                }
                 Work::Pong(stamp) => {
                     let record = shared.seal(&frame::encode_pong(stamp))?;
                     wr.write_all(&record).await?;
@@ -1227,6 +1474,7 @@ async fn writer_task<W: AsyncWrite + Unpin>(
                 }
                 Work::Idle => {
                     wr.flush().await?;
+                    let keepalive = shared.keepalive();
                     // With several subflows and frames in flight, wake every tick to look for a
                     // frame that blocks delivery.
                     let ticking = {
@@ -1296,20 +1544,35 @@ impl Session {
         remote: NodeId,
         config: Config,
     ) -> Result<Session> {
+        let gauge = gauge_of(&transport);
         let est = handshake::initiate(&mut transport, identity, remote, &config).await?;
-        Self::establish(transport, est, config, true)
+        Self::establish(transport, est, config, true, gauge)
     }
 
     /// Accept as the responder over `transport`. An initiator the policy does not accept is
     /// refused with `Error::UnknownPeer`.
     pub async fn accept<T: Transport>(
-        mut transport: T,
+        transport: T,
         identity: &Identity,
         policy: PeerPolicy,
         config: Config,
     ) -> Result<Session> {
+        let gauge = gauge_of(&transport);
+        Self::accept_gauged(transport, identity, policy, config, gauge).await
+    }
+
+    /// `accept` for a transport that the caller wrapped, with the gauge of the transport inside.
+    pub(crate) async fn accept_gauged<T: Transport>(
+        mut transport: T,
+        identity: &Identity,
+        policy: PeerPolicy,
+        config: Config,
+        gauge: Option<Gauge>,
+    ) -> Result<Session> {
         let est = handshake::respond(&mut transport, identity, &policy, &config).await?;
-        Self::establish(transport, est, config, false)
+        let session = Self::establish(transport, est, config, false, gauge)?;
+        session.watch_policy(policy);
+        Ok(session)
     }
 
     fn establish<T: Transport>(
@@ -1317,12 +1580,9 @@ impl Session {
         est: Established,
         cfg: Config,
         initiator: bool,
+        gauge: Option<Gauge>,
     ) -> Result<Session> {
-        let dead_after = {
-            let (own, peer) = (cfg.keepalive_interval, est.peer_keepalive);
-            let longer = own.max(peer);
-            (!longer.is_zero()).then(|| longer * 3)
-        };
+        let own_keepalive_ms = interval_ms(cfg.keepalive_interval);
         let state = State {
             window: cfg.stream_window,
             peer_window: est.peer_window,
@@ -1336,6 +1596,7 @@ impl Session {
             ring_interactive: VecDeque::new(),
             ring_bulk: VecDeque::new(),
             close_wanted: false,
+            bulk_wait: 0,
             peer_next: 0,
             recv_next: 0,
             reorder: BTreeMap::new(),
@@ -1352,13 +1613,18 @@ impl Session {
             failed: None,
             closing: false,
             remote_closed: false,
+            close_reason: None,
         };
         let shared = Arc::new(Shared {
             state: Mutex::new(state),
             accept: Notify::new(),
-            crypto: est.crypto,
-            nonce: AtomicU64::new(0),
-            replay: Mutex::new(ReplayWindow::new()),
+            keys: Keys::new(
+                est.crypto,
+                est.rekey_secret,
+                initiator,
+                cfg.rekey_after_records,
+                cfg.rekey_after,
+            ),
             dropped: AtomicU64::new(0),
             cfg,
             peer: est.peer,
@@ -1366,12 +1632,41 @@ impl Session {
             session_id: est.session_id,
             changes: watch::channel(0).0,
             origin: Instant::now(),
-            dead_after,
+            keepalive_ms: AtomicU64::new(own_keepalive_ms),
+            peer_keepalive_ms: AtomicU64::new(interval_ms(est.peer_keepalive)),
+            handshake_keepalive_ms: own_keepalive_ms,
+            keepalive_changed: Notify::new(),
+            hints: watch::channel(0).0,
         });
-        shared.start_subflow(transport)?;
+        shared.start_subflow(transport, gauge)?;
         Ok(Session {
-            guard: Arc::new(Guard { shared }),
+            guard: Arc::new(Guard {
+                shared,
+                watcher: Mutex::new(None),
+            }),
         })
+    }
+
+    /// Close the session with the reason `revoked` as soon as `policy` stops accepting the
+    /// peer. SPEC.md letify-link, Session item 9.
+    fn watch_policy(&self, policy: PeerPolicy) {
+        let peer = self.shared().peer;
+        let weak = self.downgrade();
+        let mut changes = policy.changes();
+        let task = tokio::spawn(async move {
+            loop {
+                if !policy.accepts(&peer) {
+                    if let Some(session) = weak.upgrade() {
+                        session.begin_close(Some("revoked"));
+                    }
+                    return;
+                }
+                if changes.changed().await.is_err() {
+                    return;
+                }
+            }
+        });
+        *self.guard.watcher.lock().unwrap_or_else(|e| e.into_inner()) = Some(task.abort_handle());
     }
 
     pub(crate) fn from_guard(guard: Arc<Guard>) -> Session {
@@ -1462,6 +1757,7 @@ impl Session {
         preamble_read: bool,
     ) -> Result<SubflowId> {
         let shared = self.shared().clone();
+        let gauge = gauge_of(&transport);
         {
             let st = shared.lock();
             if let Some(why) = &st.failed {
@@ -1491,11 +1787,12 @@ impl Session {
             let mut rec = [0u8; RECORD_HDR];
             transport.read_exact(&mut rec).await?;
             let len = u16::from_be_bytes([rec[0], rec[1]]) as usize;
-            let nonce = u64::from_be_bytes(rec[2..].try_into().unwrap());
+            let epoch = u16::from_be_bytes([rec[2], rec[3]]);
+            let nonce = u64::from_be_bytes(rec[4..].try_into().unwrap());
             let mut ct = vec![0u8; len];
             transport.read_exact(&mut ct).await?;
             let plain = shared
-                .open(nonce, &ct)
+                .open(epoch, nonce, &ct)
                 .map_err(|e| Error::Subflow(e.to_string()))?
                 .ok_or_else(|| Error::Subflow("the hello was replayed".into()))?;
             match frame::decode(plain)? {
@@ -1506,20 +1803,39 @@ impl Session {
         .await
         .map_err(|_| Error::Subflow("timed out".into()))??;
         shared.lock().apply_ack(peer_next);
-        shared.start_subflow(transport)
+        shared.start_subflow(transport, gauge)
     }
 
     /// Close the session. Frames already queued are written first; the peer's streams then end
     /// as they would after a clean close.
     pub async fn close(&self) {
-        let shared = self.shared();
-        {
-            let mut st = shared.lock();
-            if !st.closing && st.failed.is_none() {
-                st.closing = true;
-                st.want_close();
-            }
+        self.close_inner(None).await;
+    }
+
+    /// Close the session as [`Session::close`] does, and tell the peer why. The reason is UTF-8
+    /// and is cut to 256 bytes. Both sides can read it with [`Session::close_reason`].
+    pub async fn close_with_reason(&self, reason: &str) {
+        self.close_inner(Some(reason)).await;
+    }
+
+    /// Mark the session as closing with `reason`, without waiting for the Close frame to leave.
+    pub(crate) fn begin_close(&self, reason: Option<&str>) {
+        let mut st = self.shared().lock();
+        if !st.closing && st.failed.is_none() {
+            st.closing = true;
+            st.close_reason = reason.map(|r| frame::cut_reason(r).to_string());
+            st.want_close();
         }
+    }
+
+    /// Why the session was closed, if the side that closed it gave a reason.
+    pub fn close_reason(&self) -> Option<String> {
+        self.shared().lock().close_reason.clone()
+    }
+
+    async fn close_inner(&self, reason: Option<&str>) {
+        let shared = self.shared();
+        self.begin_close(reason);
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
         loop {
             {
@@ -1553,6 +1869,60 @@ impl Session {
         st.closing || st.failed.is_some()
     }
 
+    /// The epoch this side seals its records in. It starts at 0 and rises when the sending
+    /// keys rotate, see SPEC.md letify-link, Session item 8.
+    pub fn send_epoch(&self) -> u16 {
+        self.shared().keys.send_epoch()
+    }
+
+    /// The newest epoch of the peer's keys that a record opened in.
+    pub fn receive_epoch(&self) -> u16 {
+        self.shared().keys.receive_epoch()
+    }
+
+    /// Change this side's keepalive interval at once. Zero turns this side's keepalives off.
+    /// Every subflow tells the peer, which then computes its dead time from the new value, so a
+    /// longer interval does not get the subflows declared dead. SPEC.md letify-link, Mobile and
+    /// power states item 2.
+    pub fn set_keepalive_interval(&self, interval: Duration) {
+        let shared = self.shared();
+        shared
+            .keepalive_ms
+            .store(interval_ms(interval), Ordering::Relaxed);
+        shared.keepalive_changed.notify_waiters();
+        shared.lock().wake_subflows();
+    }
+
+    /// This side's keepalive interval now, zero when off.
+    pub fn keepalive_interval(&self) -> Duration {
+        self.shared().keepalive()
+    }
+
+    /// Set the keepalive interval of a power state from the session's [`Config`].
+    pub fn set_power_state(&self, state: PowerState) {
+        self.set_keepalive_interval(self.shared().cfg.keepalive_for(state));
+    }
+
+    /// Drop every subflow and tell the path manager to dial again at once. A client calls it
+    /// when the application returns to the foreground, because a session that was suspended
+    /// cannot tell which of its subflows still reach the peer. What the peer has not
+    /// acknowledged goes out again on the first new subflow. SPEC.md letify-link, Mobile and
+    /// power states item 4.
+    pub fn resume_now(&self) {
+        let shared = self.shared();
+        let ids: Vec<SubflowId> = shared.lock().subflows.keys().copied().collect();
+        for id in ids {
+            shared.subflow_died(id);
+        }
+        shared.hints.send_modify(|n| *n += 1);
+    }
+
+    /// A counter that changes on every [`Session::resume_now`], for a path manager that waits
+    /// to redial.
+    pub fn resume_hints(&self) -> watch::Receiver<u64> {
+        self.shared().hints.subscribe()
+    }
+
     /// A counter that changes whenever a subflow is added or dies.
     pub fn subflow_changes(&self) -> watch::Receiver<u64> {
         self.shared().changes.subscribe()
@@ -1581,6 +1951,7 @@ impl Session {
                     probe_rate: sub.probe_rate,
                     bulk_cap: sub.bulk_cap(),
                     delivery_rate: sub.rates.back().copied(),
+                    congestion: sub.gauged.map(|(g, _)| g),
                 }
             })
             .collect()
@@ -1657,5 +2028,197 @@ impl WeakSession {
     /// The session, unless every handle to it was dropped.
     pub fn upgrade(&self) -> Option<Session> {
         self.guard.upgrade().map(Session::from_guard)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sub(gauge: Option<Gauge>) -> Sub {
+        Sub::new(
+            2 << 20,
+            gauge,
+            SubShared {
+                sent: Arc::new(AtomicU64::new(0)),
+                received: Arc::new(AtomicU64::new(0)),
+                rtt_us: Arc::new(AtomicU64::new(NO_RTT)),
+                notify: Arc::new(Notify::new()),
+                aborts: Vec::new(),
+            },
+        )
+    }
+
+    /// A subflow that carried 10 MB/s with a lowest round trip of 50 ms.
+    fn busy(gauge: Option<Gauge>) -> Sub {
+        let mut s = sub(gauge);
+        s.rates.push_back(10e6);
+        s.min_rtt = Some((Duration::from_millis(50), Instant::now()));
+        s
+    }
+
+    fn reading(window: usize, lost: u64) -> Gauge {
+        Arc::new(move || CongestionStats {
+            window,
+            rtt: Duration::from_millis(50),
+            min_rtt: Duration::from_millis(50),
+            lost_packets: lost,
+            sent_packets: 0,
+        })
+    }
+
+    #[test]
+    fn a_subflow_without_loss_keeps_the_probed_cap_whatever_its_congestion_window() {
+        let mut s = busy(Some(reading(1900 << 10, 0)));
+        let probed = busy(None).bulk_cap();
+        s.read_gauge(Instant::now());
+        assert_eq!(s.bulk_cap(), probed);
+        assert!(s.bulk_cap() < 1900 << 10);
+    }
+
+    #[test]
+    fn a_subflow_recovering_from_loss_sizes_its_bulk_cap_from_the_window_and_one_stall() {
+        let lost = Arc::new(AtomicU64::new(0));
+        let gauge: Gauge = {
+            let lost = lost.clone();
+            Arc::new(move || CongestionStats {
+                window: 600 << 10,
+                rtt: Duration::from_millis(50),
+                min_rtt: Duration::from_millis(50),
+                lost_packets: lost.load(Ordering::Relaxed),
+                sent_packets: 0,
+            })
+        };
+        let mut s = busy(Some(gauge));
+        let t0 = Instant::now();
+        s.read_gauge(t0);
+        lost.store(3, Ordering::Relaxed);
+        s.read_gauge(t0 + GAUGE_EVERY);
+        // The window and 10 MB/s x 50 ms of rate: 600 KiB + 500 kB.
+        let want = (600 << 10) + 500_000;
+        assert_eq!(s.bulk_cap(), want);
+        assert!(s.bulk_cap() > busy(None).bulk_cap());
+    }
+
+    #[test]
+    fn the_cap_of_a_subflow_recovering_from_loss_holds_at_most_150_ms_at_the_delivery_rate() {
+        let mut s = busy(Some(reading(8 << 20, 0)));
+        let now = Instant::now();
+        s.gauged = Some((
+            CongestionStats {
+                window: 8 << 20,
+                rtt: Duration::from_millis(50),
+                min_rtt: Duration::from_millis(50),
+                lost_packets: 9,
+                sent_packets: 1000,
+            },
+            now,
+        ));
+        s.loss_at = Some(now);
+        // 10 MB/s for 150 ms.
+        assert_eq!(s.bulk_cap(), 1_500_000);
+    }
+
+    #[test]
+    fn a_path_that_loses_more_than_a_tenth_of_its_packets_keeps_the_probed_cap() {
+        let mut s = busy(Some(reading(600 << 10, 0)));
+        let now = Instant::now();
+        s.gauged = Some((
+            CongestionStats {
+                window: 600 << 10,
+                rtt: Duration::from_millis(50),
+                min_rtt: Duration::from_millis(50),
+                lost_packets: 9,
+                sent_packets: 1000,
+            },
+            now,
+        ));
+        s.loss_at = Some(now);
+        s.loss_ratio = 0.25;
+        assert_eq!(s.bulk_cap(), busy(None).bulk_cap());
+    }
+
+    #[test]
+    fn the_loss_ratio_is_the_share_of_packets_lost_in_the_last_interval() {
+        let counts = Arc::new((AtomicU64::new(0), AtomicU64::new(0)));
+        let gauge: Gauge = {
+            let counts = counts.clone();
+            Arc::new(move || CongestionStats {
+                window: 1 << 20,
+                rtt: Duration::from_millis(50),
+                min_rtt: Duration::from_millis(50),
+                lost_packets: counts.0.load(Ordering::Relaxed),
+                sent_packets: counts.1.load(Ordering::Relaxed),
+            })
+        };
+        let mut s = sub(Some(gauge));
+        let t0 = Instant::now();
+        s.read_gauge(t0);
+        counts.0.store(30, Ordering::Relaxed);
+        counts.1.store(1000, Ordering::Relaxed);
+        s.read_gauge(t0 + LOSS_SPAN);
+        assert!((s.loss_ratio - 0.03).abs() < 1e-9, "{}", s.loss_ratio);
+    }
+
+    #[test]
+    fn the_cap_of_a_subflow_recovering_from_loss_stays_inside_the_subflow_window() {
+        let mut s = busy(Some(reading(8 << 20, 0)));
+        // 20 MB/s for 150 ms is 3 MB, more than the 2 MiB window.
+        s.rates.push_back(20e6);
+        s.gauged = Some((
+            CongestionStats {
+                window: 8 << 20,
+                rtt: Duration::from_millis(50),
+                min_rtt: Duration::from_millis(50),
+                lost_packets: 9,
+                sent_packets: 0,
+            },
+            Instant::now(),
+        ));
+        s.loss_at = Some(Instant::now());
+        assert_eq!(s.bulk_cap(), 2 << 20);
+    }
+
+    #[test]
+    fn a_loss_forgotten_after_a_second_returns_the_cap_to_the_probed_one() {
+        let mut s = busy(Some(reading(600 << 10, 0)));
+        let t0 = Instant::now();
+        s.gauged = Some((
+            CongestionStats {
+                window: 600 << 10,
+                rtt: Duration::from_millis(50),
+                min_rtt: Duration::from_millis(50),
+                lost_packets: 3,
+                sent_packets: 0,
+            },
+            t0 + Duration::from_secs(2),
+        ));
+        s.loss_at = Some(t0);
+        assert_eq!(s.bulk_cap(), busy(None).bulk_cap());
+    }
+
+    #[test]
+    fn the_congestion_window_is_read_at_most_every_ten_milliseconds() {
+        let reads = Arc::new(AtomicU64::new(0));
+        let gauge: Gauge = {
+            let reads = reads.clone();
+            Arc::new(move || {
+                reads.fetch_add(1, Ordering::Relaxed);
+                CongestionStats {
+                    window: 1 << 20,
+                    rtt: Duration::from_millis(50),
+                    min_rtt: Duration::from_millis(50),
+                    lost_packets: 0,
+                    sent_packets: 0,
+                }
+            })
+        };
+        let mut s = sub(Some(gauge));
+        let t0 = Instant::now();
+        s.read_gauge(t0);
+        s.read_gauge(t0 + Duration::from_millis(5));
+        assert_eq!(reads.load(Ordering::Relaxed), 1);
+        s.read_gauge(t0 + GAUGE_EVERY);
+        assert_eq!(reads.load(Ordering::Relaxed), 2);
     }
 }

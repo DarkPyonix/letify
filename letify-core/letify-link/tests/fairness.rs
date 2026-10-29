@@ -61,14 +61,12 @@ async fn bulk_tagged(a: &Session, tag: u8, stop: Arc<AtomicBool>) -> tokio::task
     })
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn a_small_message_is_not_queued_behind_a_bulk_stream() {
-    let rate = 8.0 * MIB;
-    let (a, b, _p) = throttled_session(&[rate], Config::default(), Config::default()).await;
+/// p50 and p99 of a 64 byte echo sent every 20 ms beside a saturating bulk stream on `a`.
+async fn small_message_rtts(a: &Session, b: Session) -> (Duration, Duration) {
     let counters = vec![Arc::new(AtomicU64::new(0))];
     let server = spawn_server(b, counters.clone());
     let stop = Arc::new(AtomicBool::new(false));
-    let bulk = bulk_tagged(&a, 0, stop.clone()).await;
+    let bulk = bulk_tagged(a, 0, stop.clone()).await;
     let mut s = a.open_stream().await.unwrap();
     s.write_all(&[1, 0]).await.unwrap();
     // Let the bulk stream saturate the link before measuring.
@@ -88,7 +86,14 @@ async fn a_small_message_is_not_queued_behind_a_bulk_stream() {
     server.abort();
     rtts.sort();
     let p99 = rtts[((rtts.len() - 1) as f64 * 0.99).round() as usize];
-    let p50 = rtts[rtts.len() / 2];
+    (rtts[rtts.len() / 2], p99)
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_small_message_is_not_queued_behind_a_bulk_stream() {
+    let rate = 8.0 * MIB;
+    let (a, b, _p) = throttled_session(&[rate], Config::default(), Config::default()).await;
+    let (p50, p99) = small_message_rtts(&a, b).await;
     eprintln!("small message under a saturating bulk stream: p50 {p50:?}, p99 {p99:?}");
     // 4 x R + one frame time + margin, as the spec states: 80 ms + 6 ms + 14 ms.
     assert!(
@@ -146,4 +151,48 @@ async fn bulk_throughput_is_not_reduced_by_more_than_10_percent_by_fairness() {
         rate / MIB
     );
     assert!(got >= 0.9 * rate / MIB, "{got:.2} MiB/s");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn bulk_is_not_starved_by_an_interactive_stream_that_keeps_its_queue_full() {
+    let rate = 8.0 * MIB;
+    let (a, b, _p) = throttled_session(&[rate], Config::default(), Config::default()).await;
+    // Tag 0 is the bulk stream, tag 1 the interactive one that never lets its queue empty.
+    let counters: Vec<_> = (0..2).map(|_| Arc::new(AtomicU64::new(0))).collect();
+    let server = spawn_server(b, counters.clone());
+    let stop = Arc::new(AtomicBool::new(false));
+    let bulk = bulk_tagged(&a, 0, stop.clone()).await;
+    let mut hog = a.open_stream().await.unwrap();
+    let hog_task = tokio::spawn({
+        let stop = stop.clone();
+        async move {
+            let _ = hog.write_all(&[0, 1]).await;
+            let chunk = vec![0x44u8; 64 << 10];
+            while !stop.load(Ordering::Relaxed) {
+                if hog.write_all(&chunk).await.is_err() {
+                    break;
+                }
+            }
+        }
+    });
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    let before: Vec<u64> = counters.iter().map(|c| c.load(Ordering::Relaxed)).collect();
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    let got: Vec<f64> = counters
+        .iter()
+        .zip(&before)
+        .map(|(c, b)| (c.load(Ordering::Relaxed) - b) as f64 / 5.0 / MIB)
+        .collect();
+    stop.store(true, Ordering::Relaxed);
+    bulk.abort();
+    hog_task.abort();
+    server.abort();
+    let share = got[0] / (got[0] + got[1]);
+    eprintln!(
+        "bulk {:.2} MiB/s, interactive {:.2} MiB/s, bulk share {:.1}%",
+        got[0],
+        got[1],
+        share * 100.0
+    );
+    assert!(share >= 0.08, "bulk share {share:.3} of {got:?}");
 }

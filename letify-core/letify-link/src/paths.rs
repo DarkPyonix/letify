@@ -20,11 +20,11 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use tokio::sync::{Notify, mpsc};
+use tokio::sync::{Notify, mpsc, watch};
 use tokio::task::AbortHandle;
 use tokio::time::Instant;
 
-use crate::config::Config;
+use crate::config::{Config, PowerState};
 use crate::error::{Error, Result};
 use crate::hysteresis::{
     Decision, FloorWatch, PathView, Policy, Reason, Selector, probe_may_start,
@@ -164,6 +164,41 @@ pub struct ManagerConfig {
     /// A subflow that carried no data for this long is probed. Zero turns probes off.
     /// Default 5 s.
     pub probe_idle: Duration,
+    /// The idle time of the `Background` power state. Zero turns probes off. Default 60 s.
+    pub background_probe_idle: Duration,
+}
+
+/// When the manager probes idle subflows. The manager starts with the values of its
+/// [`ManagerConfig`] and [`PathManager::set_probe_policy`] replaces them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ProbePolicy {
+    /// A subflow that carried no data for this long is probed. Zero turns probes off.
+    pub idle: Duration,
+    /// The sliding window of the probe budget.
+    pub window: Duration,
+    /// Size of one probe record in bytes, and the least budget a window gets.
+    pub min_bytes: usize,
+}
+
+impl ProbePolicy {
+    /// No probes.
+    pub fn off() -> ProbePolicy {
+        ProbePolicy {
+            idle: Duration::ZERO,
+            ..ProbePolicy::from(&ManagerConfig::default())
+        }
+    }
+}
+
+impl From<&ManagerConfig> for ProbePolicy {
+    /// The foreground policy of a configuration.
+    fn from(cfg: &ManagerConfig) -> Self {
+        ProbePolicy {
+            idle: cfg.probe_idle,
+            window: cfg.probe_window,
+            min_bytes: cfg.probe_min_bytes,
+        }
+    }
 }
 
 impl Default for ManagerConfig {
@@ -181,6 +216,7 @@ impl Default for ManagerConfig {
             probe_window: Duration::from_secs(30),
             probe_min_bytes: 16 << 10,
             probe_idle: Duration::from_secs(5),
+            background_probe_idle: Duration::from_secs(60),
         }
     }
 }
@@ -288,6 +324,9 @@ pub struct PathManager {
     unread_measured: Arc<AtomicUsize>,
     probe_spent: Arc<AtomicU64>,
     tasks: Vec<AbortHandle>,
+    table: Arc<Mutex<Table>>,
+    probe: Arc<Mutex<ProbePolicy>>,
+    cfg: ManagerConfig,
 }
 
 impl Drop for PathManager {
@@ -396,6 +435,7 @@ impl PathManager {
             cap: cfg.event_capacity.max(1),
         };
         let probe_spent = Arc::new(AtomicU64::new(0));
+        let probe = Arc::new(Mutex::new(ProbePolicy::from(&cfg)));
         let mut tasks = Vec::new();
         for (i, (cand, begin)) in candidates.into_iter().zip(begin).enumerate() {
             let task = tokio::spawn(candidate_loop(
@@ -411,10 +451,11 @@ impl PathManager {
         }
         let measure = tokio::spawn(measure_loop(
             session.downgrade(),
-            table,
+            table.clone(),
             events_tx,
             probe_spent.clone(),
-            cfg,
+            probe.clone(),
+            cfg.clone(),
         ));
         tasks.push(measure.abort_handle());
         Ok(PathManager {
@@ -423,6 +464,9 @@ impl PathManager {
             unread_measured,
             probe_spent,
             tasks,
+            table,
+            probe,
+            cfg,
         })
     }
 
@@ -440,13 +484,74 @@ impl PathManager {
         Some(ev)
     }
 
+    /// Replace the policy of the background probes. It applies from the next measurement; a
+    /// probe in flight completes. [`ProbePolicy::off`] stops probing.
+    pub fn set_probe_policy(&self, policy: ProbePolicy) {
+        *self.probe.lock().unwrap_or_else(|e| e.into_inner()) = policy;
+    }
+
+    /// Move to a power state: set the session's keepalive interval and the probe policy of the
+    /// state. `Foreground` probes as the manager's configuration says, `Background` after
+    /// `background_probe_idle` and `PowerSave` never. SPEC.md letify-link, Mobile and power
+    /// states item 1.
+    pub fn set_power_state(&self, state: PowerState) {
+        self.session.set_power_state(state);
+        let foreground = ProbePolicy::from(&self.cfg);
+        self.set_probe_policy(match state {
+            PowerState::Foreground => foreground,
+            PowerState::Background => ProbePolicy {
+                idle: self.cfg.background_probe_idle,
+                ..foreground
+            },
+            PowerState::PowerSave => ProbePolicy {
+                idle: Duration::ZERO,
+                ..foreground
+            },
+        });
+    }
+
+    /// A hint that the network changed. It does what [`Session::resume_now`] does, and also
+    /// puts every candidate off standby and ends the floor back-off, because a new network may
+    /// reach a candidate that the old one did not. SPEC.md letify-link, Mobile and power states
+    /// item 4.
+    pub fn invalidate_paths(&self) {
+        {
+            let mut t = self.table.lock().unwrap_or_else(|e| e.into_inner());
+            t.standby.iter_mut().for_each(|s| *s = false);
+            t.wake.notify_waiters();
+        }
+        self.session.resume_now();
+    }
+
     /// Bytes of probe records this manager has started so far.
     pub fn probe_bytes_spent(&self) -> u64 {
         self.probe_spent.load(Ordering::Relaxed)
     }
 }
 
-/// Keep one subflow per candidate: dial, add, wait for its death, redial with backoff.
+/// Wait `wait`, or until the session asks to resume. Returns whether it was asked to.
+async fn pause(wait: Duration, hints: &mut watch::Receiver<u64>) -> bool {
+    tokio::select! {
+        _ = tokio::time::sleep(wait) => false,
+        asked = hints.changed() => asked.is_ok(),
+    }
+}
+
+/// Dial `cand` once within `limit`. A resume request during the dial ends it, because the
+/// route it was using may be the one that went away.
+async fn dial_once(
+    cand: &Candidate,
+    limit: Duration,
+    hints: &mut watch::Receiver<u64>,
+) -> Option<BoxTransport> {
+    tokio::select! {
+        dialed = tokio::time::timeout(limit, (cand.dial)()) => dialed.ok()?.ok(),
+        _ = hints.changed() => None,
+    }
+}
+
+/// Keep one subflow per candidate: dial, add, wait for its death, redial with backoff. A
+/// resume request (`Session::resume_now`) cuts every wait short and resets the backoff.
 async fn candidate_loop(
     idx: usize,
     cand: Candidate,
@@ -461,6 +566,10 @@ async fn candidate_loop(
         Begin::Dial => (None, None),
         Begin::Transport(t) => (None, Some(t)),
         Begin::Attached(id) => (Some(id), None),
+    };
+    let mut hints = match weak.upgrade() {
+        Some(s) => s.resume_hints(),
+        None => return,
     };
     loop {
         let Some(session) = weak.upgrade() else {
@@ -478,11 +587,14 @@ async fn candidate_loop(
                 }
                 let t = match transport.take() {
                     Some(t) => t,
-                    None => match tokio::time::timeout(cfg.dial_timeout, (cand.dial)()).await {
-                        Ok(Ok(t)) => t,
-                        _ => {
-                            tokio::time::sleep(wait).await;
-                            wait = (wait * 2).min(cfg.redial_max);
+                    None => match dial_once(&cand, cfg.dial_timeout, &mut hints).await {
+                        Some(t) => t,
+                        None => {
+                            if pause(wait, &mut hints).await {
+                                wait = cfg.redial_initial;
+                            } else {
+                                wait = (wait * 2).min(cfg.redial_max);
+                            }
                             continue;
                         }
                     },
@@ -495,8 +607,11 @@ async fn candidate_loop(
                     Err(Error::ConnectionLost(_) | Error::Closed) => return,
                     Err(_) => {
                         drop(session);
-                        tokio::time::sleep(wait).await;
-                        wait = (wait * 2).min(cfg.redial_max);
+                        if pause(wait, &mut hints).await {
+                            wait = cfg.redial_initial;
+                        } else {
+                            wait = (wait * 2).min(cfg.redial_max);
+                        }
                         continue;
                     }
                 }
@@ -575,12 +690,11 @@ async fn candidate_loop(
         if by_move {
             wait = cfg.redial_initial;
         } else if by_floor {
-            tokio::time::sleep(cfg.floor_backoff).await;
+            pause(cfg.floor_backoff, &mut hints).await;
             wait = cfg.redial_initial;
-        } else if up_since.elapsed() > Duration::from_secs(1) {
+        } else if up_since.elapsed() > Duration::from_secs(1) || pause(wait, &mut hints).await {
             wait = cfg.redial_initial;
         } else {
-            tokio::time::sleep(wait).await;
             wait = (wait * 2).min(cfg.redial_max);
         }
     }
@@ -616,6 +730,7 @@ async fn measure_loop(
     table: Arc<Mutex<Table>>,
     events: Events,
     probe_spent: Arc<AtomicU64>,
+    probe_policy: Arc<Mutex<ProbePolicy>>,
     cfg: ManagerConfig,
 ) {
     let (n, kinds) = {
@@ -773,26 +888,26 @@ async fn measure_loop(
         }
 
         // Probe one idle subflow when the window's budget allows.
-        if !cfg.probe_idle.is_zero() {
-            let carried = window_sum(&mut carried_log, now, cfg.probe_window);
-            let spent = window_sum(&mut probe_log, now, cfg.probe_window);
-            if probe_may_start(&policy, spent, carried, cfg.probe_min_bytes as u64) {
+        let probing = *probe_policy.lock().unwrap_or_else(|e| e.into_inner());
+        if !probing.idle.is_zero() {
+            let carried = window_sum(&mut carried_log, now, probing.window);
+            let spent = window_sum(&mut probe_log, now, probing.window);
+            if probe_may_start(&policy, spent, carried, probing.min_bytes as u64) {
                 let pick = (0..n)
                     .filter(|&i| {
                         subflow[i].is_some()
                             && seen[i].is_some()
-                            && now.duration_since(last_data[i]) >= cfg.probe_idle
-                            && last_probe[i]
-                                .is_none_or(|at| now.duration_since(at) >= cfg.probe_idle)
+                            && now.duration_since(last_data[i]) >= probing.idle
+                            && last_probe[i].is_none_or(|at| now.duration_since(at) >= probing.idle)
                     })
                     .min_by_key(|&i| last_probe[i]);
                 if let Some(i) = pick
                     && let Some(id) = subflow[i]
-                    && session.send_probe(id, cfg.probe_min_bytes).is_ok()
+                    && session.send_probe(id, probing.min_bytes).is_ok()
                 {
                     last_probe[i] = Some(now);
-                    probe_log.push_back((now, cfg.probe_min_bytes as u64));
-                    probe_spent.fetch_add(cfg.probe_min_bytes as u64, Ordering::Relaxed);
+                    probe_log.push_back((now, probing.min_bytes as u64));
+                    probe_spent.fetch_add(probing.min_bytes as u64, Ordering::Relaxed);
                 }
             }
         }
