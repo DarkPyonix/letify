@@ -3,9 +3,12 @@
 //! not own stream reads and writes (see `stream`) or path discovery.
 //!
 //! Scheduling: pull based. Every subflow has a writer task that takes the next pending frame
-//! when its previous write completed and its in-flight bytes are below `subflow_window`. A
-//! faster subflow completes writes sooner and so takes proportionally more frames, without a
-//! rate estimate. The receiver reorders by sequence number.
+//! when its previous write completed and its in-flight bytes are below its window. In-flight
+//! bytes are freed by the subflow ack (the bytes the receiver counted on that subflow), so a
+//! faster subflow takes proportionally more frames without a rate estimate. The session ack
+//! alone frees the retransmit buffer. A frame that blocks delivery behind a slow or stalled
+//! subflow is reinjected on another subflow, and the slow one's window is halved. The receiver
+//! reorders by sequence number in a buffer bounded in bytes.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -35,8 +38,27 @@ const SUBFLOW_MAGIC: &[u8; 4] = b"LLNS";
 
 pub(crate) struct Sent {
     bytes: Arc<Vec<u8>>,
+    /// The subflow that carries the latest copy.
     on: Option<u64>,
+    /// When the latest copy was taken by a writer.
+    at: Option<Instant>,
+    /// A subflow that must not take this frame again, because it was reinjected away from it.
+    avoid: Option<u64>,
 }
+
+/// A subflow that has not answered yet is assumed to have this round trip, and no round trip
+/// counts as shorter.
+const RTT_FLOOR: Duration = Duration::from_millis(20);
+/// Reinjection waits for this many round trips.
+const REINJECT_K: u32 = 2;
+/// How often a session with several subflows checks for a blocking frame.
+const TICK: Duration = Duration::from_millis(25);
+/// The window of a subflow is halved at most this often.
+const PENALTY_GAP: Duration = Duration::from_millis(100);
+/// A penalised window never falls below this: two full frames.
+const MIN_WINDOW: usize = 2 * (HDR + frame::CHUNK);
+/// Most frames one reinjection moves.
+const REINJECT_MAX: usize = 256;
 
 /// Identifies a subflow within its session. Ids are never reused.
 pub type SubflowId = u64;
@@ -61,6 +83,10 @@ pub struct SubflowStats {
     pub probe_sent_bytes: u64,
     /// Bytes of probe records read from this subflow.
     pub probe_received_bytes: u64,
+    /// The subflow's current window in bytes: the configured window, less any penalty.
+    pub window: usize,
+    /// The smoothed time from writing a frame to the subflow ack that covers it, if any.
+    pub srtt: Option<Duration>,
     /// Bytes of probe records this side sent that the peer answered.
     pub probe_acked_bytes: u64,
     /// The latest probe's size divided by the time to its answer, in bytes per second. A lower
@@ -71,7 +97,19 @@ pub struct SubflowStats {
 const NO_RTT: u64 = u64::MAX;
 
 pub(crate) struct Sub {
-    inflight: usize,
+    /// Bytes of sequenced frames written to this subflow.
+    sent_seq: u64,
+    /// The count the peer's subflow ack returned: bytes of sequenced frames it received here.
+    acked_seq: u64,
+    /// Bytes of sequenced frames received on this subflow, duplicates included.
+    recv_seq: u64,
+    /// A subflow ack is owed on this subflow.
+    ack_dirty: bool,
+    window: usize,
+    last_penalty: Option<Instant>,
+    srtt: Option<Duration>,
+    /// For each frame written: the value of `sent_seq` after it and when, to time its ack.
+    marks: VecDeque<(u64, Instant)>,
     sent: Arc<AtomicU64>,
     received: Arc<AtomicU64>,
     acked: u64,
@@ -115,8 +153,11 @@ pub(crate) struct State {
     pending: BTreeSet<u64>,
     peer_next: u64,
     recv_next: u64,
-    reorder: BTreeMap<u64, Frame>,
-    ack_dirty: bool,
+    reorder: BTreeMap<u64, (Frame, usize)>,
+    reorder_bytes: usize,
+    max_reorder: usize,
+    pub reorder_peak: usize,
+    pub reinjected: u64,
     pub streams: HashMap<u32, StreamState>,
     accept_queue: VecDeque<u32>,
     next_stream_id: u32,
@@ -172,6 +213,8 @@ impl State {
             Sent {
                 bytes: Arc::new(bytes),
                 on: None,
+                at: None,
+                avoid: None,
             },
         );
         self.pending.insert(seq);
@@ -216,7 +259,6 @@ impl State {
         for (_, sent) in done {
             self.unacked_bytes -= sent.bytes.len();
             if let Some(sub) = sent.on.and_then(|id| self.subflows.get_mut(&id)) {
-                sub.inflight = sub.inflight.saturating_sub(sent.bytes.len());
                 sub.acked += sent.bytes.len() as u64;
             }
         }
@@ -225,27 +267,152 @@ impl State {
         self.wake_subflows();
     }
 
-    fn handle(&mut self, frame: Frame, accept: &Notify) {
+    /// The subflow ack: the peer received `n` bytes of sequenced frames on subflow `id`.
+    fn apply_sub_ack(&mut self, id: u64, n: u64) {
+        let cap = self.subflow_window;
+        let Some(sub) = self.subflows.get_mut(&id) else {
+            return;
+        };
+        let n = n.min(sub.sent_seq);
+        if n <= sub.acked_seq {
+            return;
+        }
+        let delta = n - sub.acked_seq;
+        sub.acked_seq = n;
+        let now = Instant::now();
+        let mut covered = None;
+        while sub.marks.front().is_some_and(|(after, _)| *after <= n) {
+            covered = sub.marks.pop_front();
+        }
+        if let Some((_, at)) = covered {
+            let sample = now.saturating_duration_since(at);
+            sub.srtt = Some(match sub.srtt {
+                None => sample,
+                Some(old) => old.mul_f64(7.0 / 8.0) + sample.mul_f64(1.0 / 8.0),
+            });
+        }
+        // A penalised window regains an eighth of what the subflow got acknowledged.
+        sub.window = (sub.window + (delta / 8) as usize).min(cap);
+        sub.notify.notify_one();
+    }
+
+    /// Reinject the frame that blocks delivery when it sits on a stalled or slower subflow.
+    /// See SPEC.md letify-link, Session item 4.
+    fn maybe_reinject(&mut self, now: Instant) {
+        if self.subflows.len() < 2 {
+            return;
+        }
+        let Some((&head, sent)) = self.unacked.iter().next() else {
+            return;
+        };
+        if self.pending.contains(&head) {
+            return;
+        }
+        let (Some(on), Some(at)) = (sent.on, sent.at) else {
+            return;
+        };
+        let Some(owner) = self.subflows.get(&on) else {
+            return;
+        };
+        let age = now.saturating_duration_since(at);
+        let owner_rtt = owner.srtt.unwrap_or(RTT_FLOOR).max(RTT_FLOOR);
+        let mut threshold = None;
+        if age > owner_rtt * REINJECT_K {
+            threshold = Some(owner_rtt * REINJECT_K);
+        } else if !self.has_room(frame::CHUNK)
+            || self.streams.values().any(|s| s.write_waker.is_some())
+        {
+            let fastest = self
+                .subflows
+                .iter()
+                .filter(|(id, s)| {
+                    **id != on
+                        && s.srtt.unwrap_or(RTT_FLOOR) < owner.srtt.unwrap_or(RTT_FLOOR)
+                        && (s.sent_seq - s.acked_seq) as usize + HDR + frame::CHUNK <= s.window
+                })
+                .map(|(_, s)| s.srtt.unwrap_or(RTT_FLOOR).max(RTT_FLOOR))
+                .min();
+            if let Some(rtt) = fastest
+                && age > rtt * REINJECT_K
+            {
+                threshold = Some(rtt * REINJECT_K);
+            }
+        }
+        let Some(threshold) = threshold else {
+            return;
+        };
+        let moved: Vec<u64> = self
+            .unacked
+            .iter()
+            .filter(|(q, s)| {
+                s.on == Some(on)
+                    && !self.pending.contains(q)
+                    && s.at
+                        .is_some_and(|t| now.saturating_duration_since(t) > threshold)
+            })
+            .map(|(q, _)| *q)
+            .take(REINJECT_MAX)
+            .collect();
+        for seq in &moved {
+            if let Some(s) = self.unacked.get_mut(seq) {
+                s.avoid = Some(on);
+            }
+            self.pending.insert(*seq);
+        }
+        self.reinjected += moved.len() as u64;
+        if let Some(sub) = self.subflows.get_mut(&on)
+            && sub
+                .last_penalty
+                .is_none_or(|t| now.saturating_duration_since(t) >= PENALTY_GAP)
+        {
+            sub.window = (sub.window / 2).max(MIN_WINDOW);
+            sub.last_penalty = Some(now);
+        }
+        self.wake_subflows();
+    }
+
+    /// Handle a record read from subflow `id`. `len` is the size of its plaintext. An error
+    /// ends the session.
+    fn handle(
+        &mut self,
+        id: u64,
+        len: usize,
+        frame: Frame,
+        accept: &Notify,
+    ) -> std::result::Result<(), String> {
         match frame {
-            Frame::Ack { next } | Frame::Hello { next } => self.apply_ack(next),
+            Frame::Ack { next, sub } => {
+                self.apply_ack(next);
+                self.apply_sub_ack(id, sub);
+            }
+            Frame::Hello { next } => self.apply_ack(next),
             // Keepalives are answered by the subflow's reader, which knows the subflow.
             Frame::Ping { .. } | Frame::Pong { .. } | Frame::Probe | Frame::ProbeAck { .. } => {}
-            Frame::Seq { seq, .. } if seq < self.recv_next => {
-                self.ack_dirty = true;
-                self.wake_subflows();
-            }
-            f @ Frame::Seq { .. } => {
-                if let Frame::Seq { seq, .. } = &f {
-                    self.reorder.entry(*seq).or_insert(f);
+            Frame::Seq { seq, .. } => {
+                if let Some(sub) = self.subflows.get_mut(&id) {
+                    sub.recv_seq += len as u64;
+                    sub.ack_dirty = true;
                 }
-                while let Some(f) = self.reorder.remove(&self.recv_next) {
-                    self.recv_next += 1;
-                    self.deliver(f, accept);
+                if seq >= self.recv_next && !self.reorder.contains_key(&seq) {
+                    if seq != self.recv_next && self.reorder_bytes + len > self.max_reorder {
+                        return Err(format!(
+                            "the peer exceeded the receive buffer bound of {} bytes",
+                            self.max_reorder
+                        ));
+                    }
+                    self.reorder_bytes += len;
+                    self.reorder.insert(seq, (frame, len));
+                    while let Some((f, l)) = self.reorder.remove(&self.recv_next) {
+                        self.recv_next += 1;
+                        self.reorder_bytes -= l;
+                        self.deliver(f, accept);
+                    }
+                    self.reorder_peak = self.reorder_peak.max(self.reorder_bytes);
                 }
-                self.ack_dirty = true;
                 self.wake_subflows();
             }
         }
+        Ok(())
     }
 
     fn deliver(&mut self, frame: Frame, accept: &Notify) {
@@ -476,7 +643,14 @@ impl Shared {
         st.subflows.insert(
             id,
             Sub {
-                inflight: 0,
+                sent_seq: 0,
+                acked_seq: 0,
+                recv_seq: 0,
+                ack_dirty: false,
+                window: self.cfg.subflow_window,
+                last_penalty: None,
+                srtt: None,
+                marks: VecDeque::new(),
                 sent,
                 received,
                 acked: 0,
@@ -565,7 +739,14 @@ async fn reader_task<R: AsyncRead + Unpin>(
                         sub.probe_rate = Some(bytes as f64 / secs);
                     }
                 }
-                frame => shared.lock().handle(frame, &shared.accept),
+                frame => {
+                    let len = ct.len() - TAG;
+                    let mut st = shared.lock();
+                    if let Err(why) = st.handle(id, len, frame, &shared.accept) {
+                        shared.fail(&mut st, why.clone());
+                        return Err(Error::ConnectionLost(why));
+                    }
+                }
             }
         }
     }
@@ -578,7 +759,7 @@ enum Work {
     Pong(u64),
     ProbeAck(u64),
     Probe(usize),
-    Ack(u64),
+    Ack(u64, u64),
     Frame(Arc<Vec<u8>>),
     Idle,
     Done,
@@ -614,9 +795,13 @@ async fn writer_task<W: AsyncWrite + Unpin>(
                     Work::Gone
                 } else if st.failed.is_some() {
                     Work::Done
-                } else if st.ack_dirty {
-                    st.ack_dirty = false;
-                    Work::Ack(st.recv_next)
+                } else if let Some(owed) = {
+                    let next = st.recv_next;
+                    st.subflows.get_mut(&id).and_then(|s| {
+                        std::mem::take(&mut s.ack_dirty).then_some((next, s.recv_seq))
+                    })
+                } {
+                    Work::Ack(owed.0, owed.1)
                 } else if let Some(size) = st.subflows.get_mut(&id).and_then(|s| {
                     let size = s.probe_request.take()?;
                     s.probe_pending = Some((Instant::now(), size));
@@ -625,9 +810,20 @@ async fn writer_task<W: AsyncWrite + Unpin>(
                 }) {
                     Work::Probe(size)
                 } else {
-                    let window = st.subflow_window;
-                    let inflight = st.subflows.get(&id).map_or(0, |s| s.inflight);
-                    let next = st.pending.iter().next().copied();
+                    let now = Instant::now();
+                    st.maybe_reinject(now);
+                    let (window, inflight) = st
+                        .subflows
+                        .get(&id)
+                        .map_or((0, 0), |s| (s.window, (s.sent_seq - s.acked_seq) as usize));
+                    // A frame reinjected away from this subflow is skipped, unless it is the
+                    // only subflow left.
+                    let sole = st.subflows.len() == 1;
+                    let next = st
+                        .pending
+                        .iter()
+                        .copied()
+                        .find(|q| sole || st.unacked[q].avoid != Some(id));
                     match next {
                         Some(seq) => {
                             let len = st.unacked[&seq].bytes.len();
@@ -635,16 +831,18 @@ async fn writer_task<W: AsyncWrite + Unpin>(
                                 st.pending.remove(&seq);
                                 let entry = st.unacked.get_mut(&seq).expect("pending is unacked");
                                 entry.on = Some(id);
+                                entry.at = Some(now);
                                 let bytes = entry.bytes.clone();
                                 if let Some(s) = st.subflows.get_mut(&id) {
-                                    s.inflight += len;
+                                    s.sent_seq += len as u64;
+                                    s.marks.push_back((s.sent_seq, now));
                                 }
                                 Work::Frame(bytes)
                             } else {
                                 Work::Idle
                             }
                         }
-                        None if st.closing => Work::Done,
+                        None if st.closing && st.pending.is_empty() => Work::Done,
                         None => Work::Idle,
                     }
                 }
@@ -669,8 +867,8 @@ async fn writer_task<W: AsyncWrite + Unpin>(
                     sent.fetch_add(record.len() as u64, Ordering::Relaxed);
                     last_write = tokio::time::Instant::now();
                 }
-                Work::Ack(next) => {
-                    let record = shared.seal(&frame::encode_ack(next))?;
+                Work::Ack(next, sub) => {
+                    let record = shared.seal(&frame::encode_ack(next, sub))?;
                     wr.write_all(&record).await?;
                     last_write = tokio::time::Instant::now();
                 }
@@ -682,12 +880,30 @@ async fn writer_task<W: AsyncWrite + Unpin>(
                 }
                 Work::Idle => {
                     wr.flush().await?;
-                    if keepalive.is_zero() {
-                        notify.notified().await;
-                    } else if tokio::time::timeout_at(last_write + keepalive, notify.notified())
-                        .await
-                        .is_err()
-                    {
+                    // With several subflows and frames in flight, wake every tick to look for a
+                    // frame that blocks delivery.
+                    let ticking = {
+                        let st = shared.lock();
+                        st.subflows.len() > 1 && !st.unacked.is_empty()
+                    };
+                    let now = tokio::time::Instant::now();
+                    let ka_due = (!keepalive.is_zero()).then(|| last_write + keepalive);
+                    let wake = match (ka_due, ticking) {
+                        (Some(d), true) => Some(d.min(now + TICK)),
+                        (Some(d), false) => Some(d),
+                        (None, true) => Some(now + TICK),
+                        (None, false) => None,
+                    };
+                    let timed_out = match wake {
+                        None => {
+                            notify.notified().await;
+                            false
+                        }
+                        Some(at) => tokio::time::timeout_at(at, notify.notified())
+                            .await
+                            .is_err(),
+                    };
+                    if timed_out && ka_due.is_some_and(|d| tokio::time::Instant::now() >= d) {
                         // Idle for a whole interval: keep the path and its NAT mapping alive.
                         let record = shared.seal(&frame::encode_ping(shared.stamp()))?;
                         wr.write_all(&record).await?;
@@ -753,7 +969,7 @@ impl Session {
         let state = State {
             window: cfg.stream_window,
             peer_window: est.peer_window,
-            max_unacked: cfg.max_unacked_bytes,
+            max_unacked: cfg.max_unacked_bytes.min(est.peer_reorder),
             subflow_window: cfg.subflow_window,
             next_seq: 0,
             unacked: BTreeMap::new(),
@@ -762,7 +978,10 @@ impl Session {
             peer_next: 0,
             recv_next: 0,
             reorder: BTreeMap::new(),
-            ack_dirty: false,
+            reorder_bytes: 0,
+            max_reorder: (cfg.reorder_kib() as usize) << 10,
+            reorder_peak: 0,
+            reinjected: 0,
             streams: HashMap::new(),
             accept_queue: VecDeque::new(),
             next_stream_id: if initiator { 1 } else { 2 },
@@ -989,6 +1208,8 @@ impl Session {
                     rtt: (rtt != NO_RTT).then(|| Duration::from_micros(rtt)),
                     probe_sent_bytes: sub.probe_sent,
                     probe_received_bytes: sub.probe_received,
+                    window: sub.window,
+                    srtt: sub.srtt,
                     probe_acked_bytes: sub.probe_acked,
                     probe_rate: sub.probe_rate,
                 }
@@ -1039,6 +1260,16 @@ impl Session {
     /// window ([`crate::REPLAY_WINDOW`]).
     pub fn dropped_records(&self) -> u64 {
         self.shared().dropped.load(Ordering::Relaxed)
+    }
+
+    /// The most bytes the reorder buffer held at once: frames that arrived ahead of a gap.
+    pub fn reorder_peak_bytes(&self) -> usize {
+        self.shared().lock().reorder_peak
+    }
+
+    /// Frames sent again on another subflow because they blocked delivery.
+    pub fn reinjected_frames(&self) -> u64 {
+        self.shared().lock().reinjected
     }
 
     /// Bytes of frames sent and not yet acknowledged.

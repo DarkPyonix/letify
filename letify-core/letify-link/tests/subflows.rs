@@ -57,7 +57,11 @@ async fn measure(label: &str, rates: &[f64], total: usize) -> f64 {
 async fn aggregate_throughput_is_close_to_the_sum_of_the_subflows_not_the_slowest() {
     let rates = [2.0 * MIB, 20.0 * MIB, 20.0 * MIB, 20.0 * MIB];
     let share = measure("3 fast + 1 slow", &rates, 64).await;
-    assert!(share >= 0.7, "aggregate is {:.0}% of the sum", share * 100.0);
+    assert!(
+        share >= 0.7,
+        "aggregate is {:.0}% of the sum",
+        share * 100.0
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -107,7 +111,10 @@ async fn a_stalled_subflow_does_not_stall_delivery() {
     proxies[0].resume();
     // 3 subflows at 20 MiB/s would give about 120 MiB in 2 s. Anything near the 8 MiB of the
     // retransmit buffer would mean delivery waited for the stalled subflow.
-    assert!(during >= 40, "only {during} MiB arrived while a subflow was paused");
+    assert!(
+        during >= 40,
+        "only {during} MiB arrived while a subflow was paused"
+    );
     // The stalled subflow's window bounds what it was handed.
     assert!(
         sent_during <= 2 * 1024 * 1024 + 128 * 1024,

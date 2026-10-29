@@ -39,8 +39,9 @@ pub(crate) enum Kind {
 pub(crate) enum Frame {
     /// Delivered in order, kept by the sender until acknowledged.
     Seq { seq: u64, stream: u32, kind: Kind },
-    /// All frames below `next` have been delivered.
-    Ack { next: u64 },
+    /// All frames below `next` have been delivered (the session ack), and `sub` bytes of
+    /// sequenced frames arrived on the subflow that carries this frame (the subflow ack).
+    Ack { next: u64, sub: u64 },
     /// The first record of a subflow added to a running session: same meaning as `Ack`.
     Hello { next: u64 },
     /// Keepalive. `stamp` is the sender's clock in microseconds, returned by the `Pong`.
@@ -85,9 +86,10 @@ pub(crate) fn encode_close(seq: u64) -> Vec<u8> {
     head(T_CLOSE, seq, 0, 0)
 }
 
-pub(crate) fn encode_ack(next: u64) -> Vec<u8> {
+pub(crate) fn encode_ack(next: u64, sub: u64) -> Vec<u8> {
     let mut out = vec![T_ACK];
     out.extend_from_slice(&next.to_be_bytes());
+    out.extend_from_slice(&sub.to_be_bytes());
     out
 }
 
@@ -131,7 +133,22 @@ pub(crate) fn decode(buf: Vec<u8>) -> Result<Frame> {
     if t == T_PROBE {
         return Ok(Frame::Probe);
     }
-    if t == T_ACK || t == T_HELLO || t == T_PING || t == T_PONG || t == T_PROBE_ACK {
+    if t == T_ACK {
+        let next = u64::from_be_bytes(
+            buf.get(1..9)
+                .ok_or_else(|| bad("short ack"))?
+                .try_into()
+                .unwrap(),
+        );
+        let sub = u64::from_be_bytes(
+            buf.get(9..17)
+                .ok_or_else(|| bad("short ack"))?
+                .try_into()
+                .unwrap(),
+        );
+        return Ok(Frame::Ack { next, sub });
+    }
+    if t == T_HELLO || t == T_PING || t == T_PONG || t == T_PROBE_ACK {
         let raw: [u8; 8] = buf
             .get(1..9)
             .ok_or_else(|| bad("short ack"))?
@@ -139,7 +156,6 @@ pub(crate) fn decode(buf: Vec<u8>) -> Result<Frame> {
             .unwrap();
         let next = u64::from_be_bytes(raw);
         return Ok(match t {
-            T_ACK => Frame::Ack { next },
             T_HELLO => Frame::Hello { next },
             T_PING => Frame::Ping { stamp: next },
             T_PROBE_ACK => Frame::ProbeAck { bytes: next },

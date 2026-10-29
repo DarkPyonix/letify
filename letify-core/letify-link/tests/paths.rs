@@ -329,6 +329,60 @@ async fn a_subflow_below_the_floor_is_closed_while_another_is_above_it() {
     assert_eq!(&got, b"ok");
 }
 
+/// The same rule with the session under heavy traffic, so the rates come from data and not
+/// from probes. The slow subflow carries only what its throttle lets through, and the fast one
+/// carries the rest, so the slow one is measured below the floor and closed.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_throttled_subflow_under_heavy_traffic_is_measured_below_the_floor_and_closed() {
+    let mut rig = rig(Config::default()).await;
+    let slow = throttled(rig.target, 4096, Duration::from_millis(20)).await;
+    let candidates = vec![
+        Candidate::tcp("slow", slow),
+        Candidate::tcp("fast", rig.target),
+    ];
+    let mut pm = PathManager::start(
+        rig.client.clone(),
+        rig.server.node_id(),
+        candidates,
+        Config::default(),
+        floor_cfg(),
+    )
+    .await
+    .unwrap();
+    let server_session = rig.sessions.recv().await.unwrap();
+    let mut stream = pm.session().open_stream().await.unwrap();
+    let writer = tokio::spawn(async move {
+        let chunk = pattern(1 << 20, 11);
+        while stream.write_all(&chunk).await.is_ok() {}
+    });
+    let reader = tokio::spawn(async move {
+        let mut sb = server_session.accept_stream().await.unwrap();
+        let mut buf = vec![0u8; 1 << 20];
+        while let Ok(n) = sb.read(&mut buf).await {
+            if n == 0 {
+                break;
+            }
+        }
+        sb
+    });
+    let mut lost = None;
+    timeout(Duration::from_secs(30), async {
+        while lost.is_none() {
+            if let PathEvent::Lost { name, reason } = pm.next_event().await.unwrap() {
+                lost = Some((name, reason));
+            }
+        }
+    })
+    .await
+    .expect("the slow subflow is closed while the session is busy");
+    let (name, reason) = lost.unwrap();
+    assert_eq!(name, "slow");
+    assert_eq!(reason, "below the floor");
+    assert_eq!(pm.session().subflow_count(), 1);
+    writer.abort();
+    reader.abort();
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn a_sole_slow_subflow_is_never_closed_for_being_slow() {
     let mut rig = rig(Config::default()).await;

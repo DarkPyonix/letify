@@ -37,7 +37,10 @@ async fn the_receive_buffer_stays_within_its_bound() {
     assert!(all == data);
     let peak = b.reorder_peak_bytes();
     assert!(peak > 0, "the slow subflow should have caused reordering");
-    assert!(peak <= bound, "the reorder buffer held {peak} bytes, bound {bound}");
+    assert!(
+        peak <= bound,
+        "the reorder buffer held {peak} bytes, bound {bound}"
+    );
     // The sender took the peer's bound as its own limit on unacknowledged bytes.
     assert!(a.unacked_bytes() <= bound);
 }

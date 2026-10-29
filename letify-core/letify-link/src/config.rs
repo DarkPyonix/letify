@@ -17,9 +17,13 @@ pub struct Config {
     /// Bytes a stream may receive before its reader consumes them, advertised to the peer.
     /// Default 4 MiB.
     pub stream_window: u32,
-    /// Bytes that may be in flight on one subflow, sent and not yet acknowledged. Default
-    /// 2 MiB.
+    /// Bytes that may be in flight on one subflow, sent and not yet acknowledged on that
+    /// subflow. Default 2 MiB.
     pub subflow_window: usize,
+    /// Bytes of frames the receiver holds ahead of a gap, advertised to the peer, which limits
+    /// its unacknowledged bytes to the smaller of this and its own `max_unacked_bytes`. Values
+    /// below 128 KiB are raised to 128 KiB. Default 16 MiB.
+    pub max_reorder_bytes: usize,
     /// How long a session without any subflow waits for a new one before its streams fail
     /// with `Error::ConnectionLost`. Default 24 h.
     pub resume_window: Duration,
@@ -33,6 +37,13 @@ pub struct Config {
     pub handshake_timeout: Duration,
 }
 
+impl Config {
+    /// The reorder bound in KiB as the handshake carries it, after the 128 KiB least.
+    pub(crate) fn reorder_kib(&self) -> u32 {
+        (self.max_reorder_bytes.max(128 << 10) >> 10).min(u32::MAX as usize) as u32
+    }
+}
+
 impl Default for Config {
     fn default() -> Self {
         Config {
@@ -40,6 +51,7 @@ impl Default for Config {
             max_unacked_bytes: 8 << 20,
             stream_window: 4 << 20,
             subflow_window: 2 << 20,
+            max_reorder_bytes: 16 << 20,
             resume_window: Duration::from_secs(24 * 3600),
             keepalive_interval: Duration::from_secs(15),
             handshake_timeout: Duration::from_secs(30),

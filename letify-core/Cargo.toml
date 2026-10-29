@@ -12,3 +12,8 @@ version = "2.10.1"
 edition = "2024"
 license = "MIT"
 repository = "https://github.com/DarkPyonix/letify"
+
+# The letify-link tests move hundreds of MiB through ChaCha20-Poly1305. Optimised dependencies
+# keep them measuring the session and not the debug build of the cipher.
+[profile.dev.package."*"]
+opt-level = 3

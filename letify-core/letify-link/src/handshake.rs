@@ -5,11 +5,11 @@
 //!
 //! - Initiator: `"LLNK"`, lowest version (2), highest version (2), length (2), Noise message 1.
 //!   The first eight bytes are the Noise prologue, so a tampered header fails the handshake.
-//!   Message 1 carries the initiator's ed25519 node id (32), its stream window (4) and its
-//!   keepalive interval in milliseconds (4, 0 means off).
+//!   Message 1 carries the initiator's ed25519 node id (32), its stream window (4), its
+//!   keepalive interval in milliseconds (4, 0 means off) and its reorder bound in KiB (4).
 //! - Responder, accepted: `"LLNK"`, 0, chosen version (2), length (2), Noise message 2.
-//!   Message 2 carries the chosen version again (2), the responder's stream window (4) and
-//!   its keepalive interval (4).
+//!   Message 2 carries the chosen version again (2), the responder's stream window (4), its
+//!   keepalive interval (4) and its reorder bound in KiB (4).
 //! - Responder, refused for versions: `"LLNK"`, 1, lowest (2), highest (2), text length (2),
 //!   text. A refusal for a key it does not accept is a closed transport and nothing else.
 
@@ -34,6 +34,8 @@ pub(crate) struct Established {
     pub peer_window: u32,
     /// The keepalive interval the peer advertised; zero means the peer sends none.
     pub peer_keepalive: Duration,
+    /// The reorder bound the peer advertised, in bytes.
+    pub peer_reorder: usize,
     pub session_id: [u8; 16],
 }
 
@@ -101,6 +103,7 @@ async fn initiate_inner<T: AsyncRead + AsyncWrite + Unpin>(
     payload.extend_from_slice(id.node_id().as_bytes());
     payload.extend_from_slice(&cfg.stream_window.to_be_bytes());
     payload.extend_from_slice(&keepalive_ms(cfg).to_be_bytes());
+    payload.extend_from_slice(&cfg.reorder_kib().to_be_bytes());
     let mut msg = vec![0u8; 1024];
     let n = hs.write_message(&payload, &mut msg).map_err(hs_err)?;
     let mut out = pro.to_vec();
@@ -137,7 +140,7 @@ async fn initiate_inner<T: AsyncRead + AsyncWrite + Unpin>(
     read_exact(t, &mut reply).await?;
     let mut body = vec![0u8; 1024];
     let n = hs.read_message(&reply, &mut body).map_err(hs_err)?;
-    if n != 10
+    if n != 14
         || u16::from_be_bytes([body[0], body[1]]) != chosen
         || !cfg.versions.contains(&chosen)
     {
@@ -146,7 +149,15 @@ async fn initiate_inner<T: AsyncRead + AsyncWrite + Unpin>(
     let peer_window = u32::from_be_bytes([body[2], body[3], body[4], body[5]]);
     let peer_keepalive =
         Duration::from_millis(u32::from_be_bytes([body[6], body[7], body[8], body[9]]).into());
-    finish(hs, remote, chosen, peer_window, peer_keepalive)
+    let peer_reorder = u32::from_be_bytes(body[10..14].try_into().unwrap()) as usize;
+    finish(
+        hs,
+        remote,
+        chosen,
+        peer_window,
+        peer_keepalive,
+        peer_reorder << 10,
+    )
 }
 
 /// Run the responder side over `t`.
@@ -207,13 +218,14 @@ async fn respond_inner<T: AsyncRead + AsyncWrite + Unpin>(
     let mut hs = builder(&secret, &pro).build_responder().map_err(hs_err)?;
     let mut body = vec![0u8; 1024];
     let n = hs.read_message(&first, &mut body).map_err(hs_err)?;
-    if n != 40 {
+    if n != 44 {
         return Err(hs_err("the first message carries an unexpected payload"));
     }
     let peer = NodeId::from_bytes(body[..32].try_into().unwrap());
     let peer_window = u32::from_be_bytes(body[32..36].try_into().unwrap());
     let peer_keepalive =
         Duration::from_millis(u32::from_be_bytes(body[36..40].try_into().unwrap()).into());
+    let peer_reorder = u32::from_be_bytes(body[40..44].try_into().unwrap()) as usize;
     let proven = hs
         .get_remote_static()
         .ok_or_else(|| hs_err("no remote static key"))?;
@@ -230,6 +242,7 @@ async fn respond_inner<T: AsyncRead + AsyncWrite + Unpin>(
     let mut payload = chosen.to_be_bytes().to_vec();
     payload.extend_from_slice(&cfg.stream_window.to_be_bytes());
     payload.extend_from_slice(&keepalive_ms(cfg).to_be_bytes());
+    payload.extend_from_slice(&cfg.reorder_kib().to_be_bytes());
     let mut msg = vec![0u8; 1024];
     let n = hs.write_message(&payload, &mut msg).map_err(hs_err)?;
     let mut out = MAGIC.to_vec();
@@ -239,7 +252,14 @@ async fn respond_inner<T: AsyncRead + AsyncWrite + Unpin>(
     out.extend_from_slice(&msg[..n]);
     t.write_all(&out).await?;
     t.flush().await?;
-    finish(hs, peer, chosen, peer_window, peer_keepalive)
+    finish(
+        hs,
+        peer,
+        chosen,
+        peer_window,
+        peer_keepalive,
+        peer_reorder << 10,
+    )
 }
 
 fn finish(
@@ -248,6 +268,7 @@ fn finish(
     version: u16,
     peer_window: u32,
     peer_keepalive: Duration,
+    peer_reorder: usize,
 ) -> Result<Established> {
     let mut session_id = [0u8; 16];
     session_id.copy_from_slice(&hs.get_handshake_hash()[..16]);
@@ -258,6 +279,7 @@ fn finish(
         version,
         peer_window,
         peer_keepalive,
+        peer_reorder,
         session_id,
     })
 }
