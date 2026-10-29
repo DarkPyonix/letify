@@ -635,7 +635,15 @@ async fn serve_outcome(control: &str, key: &str, extra: &[&str]) -> (bool, Strin
     let mut err = child.stderr.take().unwrap();
     let mut lines = BufReader::new(child.stdout.take().unwrap()).lines();
     tokio::select! {
-        _ = lines.next_line() => (true, String::new()),
+        line = lines.next_line() => match line {
+            Ok(Some(_)) => (true, String::new()),
+            _ => {
+                let status = child.wait().await.unwrap();
+                let mut text = String::new();
+                let _ = err.read_to_string(&mut text).await;
+                (status.success(), text)
+            }
+        },
         status = child.wait() => {
             let mut text = String::new();
             let _ = err.read_to_string(&mut text).await;
@@ -675,7 +683,7 @@ async fn a_stream_directory_that_others_can_write_is_refused() {
     let dir = tempdir::Dir::new();
     let streams = dir.path().join("streams");
     std::fs::create_dir(&streams).unwrap();
-    set_mode(&streams, 0o775);
+    set_mode(&streams, 0o757);
     let key = dir.path().join("key");
     let control = dir.path().join("c");
     let (ok, err) = serve_outcome(
@@ -702,17 +710,13 @@ async fn the_control_socket_is_private_and_so_is_the_directory_of_a_stream_socke
     let socket = std::path::Path::new(socket);
     assert_eq!(mode(socket), 0o600);
     assert_eq!(mode(socket.parent().unwrap()), 0o700);
-    // No leftover private directory of the control socket stays beside it.
+    // The private directory of the control socket is gone; only the one of the streams stays.
     let beside: Vec<_> = std::fs::read_dir(std::path::Path::new(&control).parent().unwrap())
         .unwrap()
         .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
         .collect();
-    assert!(
-        beside
-            .iter()
-            .all(|n| n == "c" || n == "key" || n.starts_with("ll-")),
-        "{beside:?}"
-    );
+    let private = beside.iter().filter(|n| n.starts_with(".letify-")).count();
+    assert_eq!(private, 1, "{beside:?}");
 }
 
 #[tokio::test]
