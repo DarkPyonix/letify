@@ -10,7 +10,7 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 use crate::error::Error;
 use crate::frame::{self, CHUNK};
-use crate::session::Guard;
+use crate::session::{Guard, Priority};
 
 /// One ordered byte stream inside a session. Closing it with `shutdown` ends the stream and
 /// leaves the session open.
@@ -22,6 +22,14 @@ pub struct Stream {
 impl Stream {
     pub(crate) fn new(guard: Arc<Guard>, id: u32) -> Stream {
         Stream { guard, id }
+    }
+
+    /// Set the class of this side's sends on the stream. See [`Priority`].
+    pub fn set_priority(&self, priority: Priority) {
+        self.guard
+            .shared
+            .lock()
+            .set_bulk(self.id, priority == Priority::Bulk);
     }
 
     /// The stream id. Odd ids are opened by the initiator and even ids by the responder.
@@ -93,7 +101,7 @@ impl AsyncWrite for Stream {
             .len()
             .min(CHUNK)
             .min(credit.min(usize::MAX as u64) as usize);
-        if n == 0 || !st.has_room(n) {
+        if n == 0 || !st.queue_room(id, n) {
             if let Some(s) = st.streams.get_mut(&id) {
                 s.write_waker = Some(cx.waker().clone());
             }
@@ -102,7 +110,7 @@ impl AsyncWrite for Stream {
         if let Some(s) = st.streams.get_mut(&id) {
             s.send_credit -= n as u64;
         }
-        st.enqueue(|seq| frame::encode_data(seq, id, &buf[..n]));
+        st.enqueue_stream(id, frame::encode_data(0, id, &buf[..n]));
         Poll::Ready(Ok(n))
     }
 

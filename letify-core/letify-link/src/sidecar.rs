@@ -30,7 +30,7 @@ use crate::identity::{Identity, NodeId, PeerPolicy};
 use crate::paths::{Candidate, ManagerConfig, PathEvent, PathManager};
 use crate::punch::{self, Plan};
 use crate::rendezvous::{Message, Proto, Punch, Rendezvous, recv_message, send_message};
-use crate::session::Session;
+use crate::session::{Priority, Session};
 
 /// The longest control message accepted, in bytes.
 pub const MAX_CONTROL_MESSAGE: usize = 1 << 20;
@@ -500,7 +500,16 @@ async fn handle(shared: &Arc<Shared>, req: &Value) -> OpResult {
         }
         "open_stream" => {
             let session = session_of(shared, req)?;
-            let stream = session.open_stream().await?;
+            let priority = match req.get("priority").and_then(Value::as_str) {
+                None | Some("interactive") => Priority::Interactive,
+                Some("bulk") => Priority::Bulk,
+                Some(other) => {
+                    return Err(usage(format!(
+                        "priority must be interactive or bulk, not {other}"
+                    )));
+                }
+            };
+            let stream = session.open_stream_with(priority).await?;
             let sid = stream.id();
             let socket = shared
                 .bridge(stream)
@@ -839,7 +848,7 @@ pub async fn serve(opts: ServeOptions, identity: Identity) -> io::Result<()> {
                 let _ = std::fs::remove_file(&path);
                 let listener = tokio::net::UnixListener::bind(&path)?;
                 restrict(&path)?;
-                announce(&node, &format!("unix:{}", path.display()));
+                announce(&node, &format!("unix:{}", path.display()), None);
                 let (conn, _) = listener.accept().await?;
                 drop(listener);
                 let dir = opts
@@ -854,9 +863,22 @@ pub async fn serve(opts: ServeOptions, identity: Identity) -> io::Result<()> {
         } else {
             let listener = TcpListener::bind("127.0.0.1:0").await?;
             let text = format!("tcp:{}", listener.local_addr()?);
-            announce(&node, &text);
-            let (conn, _) = listener.accept().await?;
-            conn.set_nodelay(true)?;
+            let token = new_token()?;
+            announce(&node, &text, Some(&token));
+            // Any local process can connect to a loopback port, so the first message of a
+            // connection must carry the token. A connection that fails that is closed and the
+            // listener stays open for the right one.
+            let conn = loop {
+                let (mut conn, _) = listener.accept().await?;
+                conn.set_nodelay(true)?;
+                if tokio::time::timeout(AUTH_TIMEOUT, authenticate(&mut conn, &token))
+                    .await
+                    .unwrap_or(false)
+                {
+                    break conn;
+                }
+            };
+            drop(listener);
             (Box::new(conn), None)
         }
     };
@@ -881,10 +903,49 @@ pub async fn serve(opts: ServeOptions, identity: Identity) -> io::Result<()> {
     Ok(())
 }
 
-fn announce(node: &NodeId, control: &str) {
-    println!(
-        "{}",
-        json!({"event": "ready", "node_id": node.to_string(), "control": control})
-    );
+/// Time a loopback connection has to send its `auth` message.
+const AUTH_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// 32 random bytes from the operating system as 64 lowercase hex characters.
+fn new_token() -> io::Result<String> {
+    let mut bytes = [0u8; 32];
+    getrandom::getrandom(&mut bytes).map_err(|e| io::Error::other(e.to_string()))?;
+    Ok(hex(&bytes))
+}
+
+/// Compare without stopping at the first difference.
+fn same_token(a: &str, b: &str) -> bool {
+    a.len() == b.len()
+        && a.bytes()
+            .zip(b.bytes())
+            .fold(0u8, |diff, (x, y)| diff | (x ^ y))
+            == 0
+}
+
+/// Read the first message of a loopback connection. It must be `auth` with the right token;
+/// the reply is sent here, before the connection becomes the control channel.
+async fn authenticate(conn: &mut TcpStream, token: &str) -> bool {
+    let Ok(req) = read_frame(conn).await else {
+        return false;
+    };
+    let given = req.get("token").and_then(Value::as_str).unwrap_or("");
+    if req.get("op").and_then(Value::as_str) != Some("auth") || !same_token(given, token) {
+        return false;
+    }
+    let reply = json!({"id": req.get("id").cloned().unwrap_or(Value::Null), "ok": true});
+    let Ok(body) = serde_json::to_vec(&reply) else {
+        return false;
+    };
+    let mut frame = (body.len() as u32).to_be_bytes().to_vec();
+    frame.extend(body);
+    conn.write_all(&frame).await.is_ok()
+}
+
+fn announce(node: &NodeId, control: &str, token: Option<&str>) {
+    let mut line = json!({"event": "ready", "node_id": node.to_string(), "control": control});
+    if let Some(token) = token {
+        line["token"] = json!(token);
+    }
+    println!("{line}");
     let _ = io::Write::flush(&mut io::stdout());
 }

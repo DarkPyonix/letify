@@ -45,6 +45,16 @@ pub enum PathKind {
     Tcp,
     /// A UDP path, see [`crate::udp`].
     Udp,
+    /// A path through a relay, see `crate::relay`. It is used only while no direct path (TCP or
+    /// UDP) is live, and a direct path that carries acknowledged traffic replaces it at once.
+    Relay,
+}
+
+impl PathKind {
+    /// Whether the path reaches the peer without a relay.
+    pub fn is_direct(self) -> bool {
+        self != PathKind::Relay
+    }
 }
 
 /// One way to reach the peer: a name and an async function that returns a new transport.
@@ -103,6 +113,12 @@ impl Candidate {
     /// A TCP connection to `addr`, tuned by [`crate::tcp::tune`].
     pub fn tcp(name: impl Into<String>, addr: SocketAddr) -> Self {
         Self::new(name, move || crate::tcp::connect(addr))
+    }
+
+    /// The same candidate with another kind. The relay dialer tags its candidates `Relay`.
+    pub fn with_kind(mut self, kind: PathKind) -> Self {
+        self.kind = kind;
+        self
     }
 
     /// The candidate's name, as path events report it.
@@ -521,9 +537,17 @@ async fn candidate_loop(
             // The last subflow of a kind is gone: the candidates on standby are needed again.
             let kind = t.kinds[idx];
             let alive = (0..t.subflow.len()).any(|j| t.subflow[j].is_some() && t.kinds[j] == kind);
+            let direct_alive =
+                (0..t.subflow.len()).any(|j| t.subflow[j].is_some() && t.kinds[j].is_direct());
             if !alive && t.standby.iter().any(|&s| s) {
                 for j in 0..t.standby.len() {
-                    if t.kinds[j] != kind {
+                    // A relayed candidate waits for the last direct subflow, of any kind.
+                    let release = if t.kinds[j] == PathKind::Relay {
+                        !direct_alive
+                    } else {
+                        t.kinds[j] != kind
+                    };
+                    if release {
                         t.standby[j] = false;
                     }
                 }
@@ -636,6 +660,8 @@ async fn measure_loop(
         let mut views = Vec::with_capacity(n);
         let mut carried_now = 0u64;
         let mut handed_over = false;
+        // A direct subflow carried acknowledged traffic in this interval.
+        let mut direct_acked = false;
         for i in 0..n {
             let stat = subflow[i].and_then(|id| stats.iter().find(|s| s.id == id));
             let Some(stat) = stat else {
@@ -687,6 +713,7 @@ async fn measure_loop(
                 || stat.probe_acked_bytes > prev.map_or(0, |p| p.probe_acked)
             {
                 selector.carried_acked(i);
+                direct_acked |= kinds[i].is_direct();
                 if moving.is_some_and(|(to, _)| to == i) {
                     handed_over = true;
                 }
@@ -715,6 +742,25 @@ async fn measure_loop(
             let mut close = Vec::new();
             for j in 0..n {
                 if t.kinds[j] == old_kind {
+                    t.standby[j] = true;
+                    if let Some(id) = t.subflow[j] {
+                        t.moved[j] = true;
+                        close.push(id);
+                    }
+                }
+            }
+            drop(t);
+            close.into_iter().for_each(|id| session.close_subflow(id));
+        }
+
+        if direct_acked {
+            // A relayed path is a last resort: once a direct path carries acknowledged traffic
+            // the relayed subflows close at once, with no dwell and no threshold, and their
+            // candidates wait on standby until the last direct subflow dies.
+            let mut t = table.lock().unwrap_or_else(|e| e.into_inner());
+            let mut close = Vec::new();
+            for (j, kind) in kinds.iter().enumerate() {
+                if *kind == PathKind::Relay {
                     t.standby[j] = true;
                     if let Some(id) = t.subflow[j] {
                         t.moved[j] = true;
@@ -761,6 +807,15 @@ async fn measure_loop(
         }
         drop(session);
 
+        // The selector does not see a relayed path while a direct one is live.
+        let direct_live = (0..n).any(|i| views[i].alive && kinds[i].is_direct());
+        if direct_live {
+            for i in 0..n {
+                if kinds[i] == PathKind::Relay {
+                    views[i].alive = false;
+                }
+            }
+        }
         let before = selector.current();
         if let Decision::Move { to, reason } = selector.observe(now.duration_since(origin), &views)
         {
