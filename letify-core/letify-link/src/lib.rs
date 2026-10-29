@@ -26,11 +26,14 @@
 //!   open over several sockets, UDP probing, port prediction, the many-port attempt) and the
 //!   [`policing`] check.
 //!
+//! - The [`sidecar`], the control protocol that the `letify-link serve` executable speaks to
+//!   the pure-Python package.
+//!
 //! A subflow is any reliable byte transport: a TCP connection, a pipe or an in-memory duplex.
 //!
 //! # What it does not own yet
 //!
-//! UDP paths, the `letify-link` sidecar control protocol and the Python binding. The relay
+//! UDP paths. The relay
 //! role is the Cargo feature `relay` ([`relay`]). The caller supplies the candidate dialers.
 //!
 //! # Errors
@@ -55,6 +58,7 @@ pub mod relay;
 pub mod rendezvous;
 mod replay;
 mod session;
+pub mod sidecar;
 mod stream;
 pub mod stun;
 pub mod tcp;
