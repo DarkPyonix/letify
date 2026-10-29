@@ -169,7 +169,9 @@ async fn udp_punch_over_loopback() {
     assert_eq!((from_a, from_b), (ab, aa));
     // The returned sockets are the punched ones and carry data.
     sa.send_to(b"ping", ab).await.unwrap();
-    let mut buf = [0u8; 16];
+    // Larger than a probe (26 bytes): Windows fails a receive into a short buffer, where Unix
+    // truncates the datagram.
+    let mut buf = [0u8; 64];
     loop {
         let (n, _) = sb.recv_from(&mut buf).await.unwrap();
         if &buf[..n] == b"ping" {
@@ -181,12 +183,14 @@ async fn udp_punch_over_loopback() {
 #[tokio::test]
 async fn a_udp_spray_finds_the_one_right_pair_among_wrong_ports() {
     // Side A has four sockets and aims each at a window of ports, only one of which is B's.
-    let b = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-    let ab = b.local_addr().unwrap();
     let mut a_socks = Vec::new();
     for _ in 0..4 {
         a_socks.push(UdpSocket::bind("127.0.0.1:0").await.unwrap());
     }
+    // B binds last: Windows hands out ascending ports, and the wrong window starts above B's
+    // port, so it must not cover A's own sockets.
+    let b = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let ab = b.local_addr().unwrap();
     let a_addr = a_socks[2].local_addr().unwrap();
     let wrong = punch::predicted_destinations(ab, NatType::Symmetric { step: 1 }, 5);
     let now = now_ms();
