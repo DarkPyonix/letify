@@ -2082,9 +2082,8 @@ def test_a_device_executor_that_dies_mid_session_fails_the_waiting_read(monkeypa
 
     client, thread = _serve_in_thread(monkeypatch, Dying)
     client.start()
-    with client.activate():
-        with pytest.raises(letify.RuntimeLost, match="the executor broke"):
-            torch.ones(2, device="cuda").cpu()
+    with client.activate(), pytest.raises(letify.RuntimeLost, match="the executor broke"):
+        torch.ones(2, device="cuda").cpu()
     thread.join(5)
     assert not thread.is_alive()
 
