@@ -449,5 +449,9 @@ async fn a_relay_path_is_dropped_as_soon_as_a_direct_path_carries_traffic() {
     assert!(direct_added, "the direct path joined before the relay left");
     assert_eq!(reason.as_deref(), Some("moved"));
     // The first direct dial waits out the redial back-off at most, then one measurement tick.
-    assert!(started.elapsed() < Duration::from_secs(5), "{:?}", started.elapsed());
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "{:?}",
+        started.elapsed()
+    );
 }

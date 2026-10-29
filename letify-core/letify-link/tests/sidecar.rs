@@ -449,7 +449,13 @@ async fn start_unconnected(control: &str) -> (Child, Value, tempdir::Dir) {
     let dir = tempdir::Dir::new();
     let key = dir.path().join("key");
     let mut child = Command::new(BIN)
-        .args(["serve", "--control", control, "--key", key.to_str().unwrap()])
+        .args([
+            "serve",
+            "--control",
+            control,
+            "--key",
+            key.to_str().unwrap(),
+        ])
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
@@ -471,8 +477,17 @@ async fn the_loopback_control_channel_requires_the_token_in_its_first_message() 
     let (_child, ready, _dir) = start_unconnected("tcp").await;
     let token = ready["token"].as_str().expect("a token in the ready line");
     assert_eq!(token.len(), 64);
-    assert!(token.bytes().all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase()));
-    let addr = ready["control"].as_str().unwrap().strip_prefix("tcp:").unwrap().to_string();
+    assert!(
+        token
+            .bytes()
+            .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+    );
+    let addr = ready["control"]
+        .as_str()
+        .unwrap()
+        .strip_prefix("tcp:")
+        .unwrap()
+        .to_string();
 
     // A first message that is not `auth` closes the connection.
     let mut early = TcpStream::connect(&addr).await.unwrap();
@@ -480,7 +495,10 @@ async fn the_loopback_control_channel_requires_the_token_in_its_first_message() 
         .write_all(&frame(&json!({"op": "no_such_op", "id": 1})))
         .await
         .unwrap();
-    assert!(read_frame(&mut early).await.is_none(), "answered without auth");
+    assert!(
+        read_frame(&mut early).await.is_none(),
+        "answered without auth"
+    );
 
     // So does an `auth` with the wrong token, even one that differs in the last character.
     let mut wrong = format!("{}0", &token[..63]);
@@ -491,7 +509,10 @@ async fn the_loopback_control_channel_requires_the_token_in_its_first_message() 
     bad.write_all(&frame(&json!({"op": "auth", "token": wrong, "id": 1})))
         .await
         .unwrap();
-    assert!(read_frame(&mut bad).await.is_none(), "accepted a wrong token");
+    assert!(
+        read_frame(&mut bad).await.is_none(),
+        "accepted a wrong token"
+    );
 
     // The sidecar kept listening, and the right token opens the channel.
     let mut good = TcpStream::connect(&addr).await.unwrap();
