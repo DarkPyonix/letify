@@ -19,7 +19,11 @@
 //! - The [`Acceptor`], which routes incoming transports to a live session or to a new one.
 //! - The [`PathManager`], which dials candidate paths, starts the session on the first that
 //!   answers, adds the others as subflows and redials when every subflow died, and the pure
-//!   switching rules in [`hysteresis`].
+//!   switching rules in [`hysteresis`]. It moves a session between path kinds: when the
+//!   switching rules prefer a UDP path over TCP ones (or the reverse), it closes the old kind
+//!   once the new path carried acknowledged traffic.
+//! - UDP paths ([`udp`]): a QUIC connection with BBR over a punched UDP socket, whose one stream
+//!   is a subflow transport.
 //!
 //! - The [`rendezvous`] trait with its messages and an in-memory implementation, the signed
 //!   address [`record`], the [`stun`] client and NAT classification, [`punch`] (TCP simultaneous
@@ -29,12 +33,13 @@
 //! - The [`sidecar`], the control protocol that the `letify-link serve` executable speaks to
 //!   the pure-Python package.
 //!
-//! A subflow is any reliable byte transport: a TCP connection, a pipe or an in-memory duplex.
+//! A subflow is any reliable byte transport: a TCP connection, a UDP path, a pipe or an
+//! in-memory duplex.
 //!
 //! # What it does not own yet
 //!
-//! UDP paths. The relay
-//! role is the Cargo feature `relay` ([`relay`]). The caller supplies the candidate dialers.
+//! The relay role is the Cargo feature `relay` ([`relay`]). The caller supplies the candidate
+//! dialers.
 //!
 //! # Errors
 //!
@@ -62,12 +67,13 @@ pub mod sidecar;
 mod stream;
 pub mod stun;
 pub mod tcp;
+pub mod udp;
 
 pub use acceptor::{Accepted, Acceptor};
 pub use config::{Config, PROTOCOL_VERSION};
 pub use error::{Error, Result};
 pub use identity::{Identity, NodeId, PeerPolicy};
-pub use paths::{BoxTransport, Candidate, ManagerConfig, PathEvent, PathManager};
+pub use paths::{BoxTransport, Candidate, ManagerConfig, PathEvent, PathKind, PathManager};
 pub use replay::REPLAY_WINDOW;
 pub use session::{Session, SessionId, SubflowId, SubflowStats, Transport, WeakSession};
 pub use stream::Stream;

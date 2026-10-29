@@ -2,16 +2,21 @@
 //! TCP forwarder that can be cut, and deterministic test data.
 #![allow(dead_code)]
 
+use std::collections::HashMap;
 use std::io;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Waker};
+use std::time::Duration;
 
-use letify_link::{Config, Identity, PeerPolicy, Session};
+use letify_link::udp::{UdpConfig, UdpListener, UdpPath};
+use letify_link::{Accepted, Acceptor, Config, Identity, PeerPolicy, Session};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
+use tokio::time::timeout;
 
 /// Pseudo random bytes from a seed, so a test can compare what arrived with what was sent.
 pub fn pattern(len: usize, seed: u64) -> Vec<u8> {
@@ -498,4 +503,336 @@ pub async fn throttled_session(
             .unwrap();
     }
     (a, responder.await.unwrap(), proxies)
+}
+
+/// Knobs of a [`UdpProxy`] that a test can change while it runs.
+#[derive(Clone)]
+pub struct UdpKnobs {
+    /// Loss probability per datagram in parts per million, both directions.
+    loss_ppm: Arc<std::sync::atomic::AtomicU32>,
+    rng: Arc<Mutex<u64>>,
+}
+
+impl UdpKnobs {
+    /// Drop this share (0.0 to 1.0) of the datagrams from now on.
+    pub fn set_loss(&self, loss: f64) {
+        self.loss_ppm
+            .store((loss * 1_000_000.0) as u32, Ordering::SeqCst);
+    }
+
+    fn drops(&self) -> bool {
+        let ppm = self.loss_ppm.load(Ordering::SeqCst);
+        if ppm == 0 {
+            return false;
+        }
+        let mut x = self.rng.lock().unwrap();
+        *x ^= *x << 13;
+        *x ^= *x >> 7;
+        *x ^= *x << 17;
+        ((*x >> 11) % 1_000_000) < ppm as u64
+    }
+}
+
+/// A UDP forwarder on loopback that delays every datagram by a fixed time and drops a share
+/// of them at random, in both directions. It stands in for a lossy path with a round trip.
+/// Every client address gets its own socket toward the target, so a path that redials from a
+/// new port still works.
+pub struct UdpProxy {
+    pub addr: std::net::SocketAddr,
+    pub knobs: UdpKnobs,
+    tasks: Vec<JoinHandle<()>>,
+}
+
+impl Drop for UdpProxy {
+    fn drop(&mut self) {
+        self.tasks.iter().for_each(JoinHandle::abort);
+    }
+}
+
+impl UdpProxy {
+    /// Forward to `target`; each direction waits `one_way` and drops `loss` of the datagrams.
+    pub async fn to(target: std::net::SocketAddr, one_way: Duration, loss: f64) -> UdpProxy {
+        Self::limited(target, one_way, loss, None).await
+    }
+
+    /// As [`UdpProxy::to`], and each direction carries at most `rate` bytes per second when
+    /// given. A datagram that would wait more than 50 ms in the proxy's queue is dropped, as a
+    /// router with a short buffer would drop it.
+    pub async fn limited(
+        target: std::net::SocketAddr,
+        one_way: Duration,
+        loss: f64,
+        rate: Option<f64>,
+    ) -> UdpProxy {
+        use tokio::net::UdpSocket;
+        // The time at which each direction has sent everything queued so far.
+        let free = Arc::new(Mutex::new([tokio::time::Instant::now(); 2]));
+        let shape = move |dir: usize, len: usize| -> Option<Duration> {
+            let Some(rate) = rate else {
+                return Some(one_way);
+            };
+            let now = tokio::time::Instant::now();
+            let mut free = free.lock().unwrap();
+            let start = free[dir].max(now);
+            if start - now > Duration::from_millis(50) {
+                return None;
+            }
+            free[dir] = start + Duration::from_secs_f64(len as f64 / rate);
+            Some(free[dir] - now + one_way)
+        };
+        let shape = Arc::new(shape);
+        let front = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let addr = front.local_addr().unwrap();
+        let knobs = UdpKnobs {
+            loss_ppm: Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            rng: Arc::new(Mutex::new(0x9e37_79b9_7f4a_7c15)),
+        };
+        knobs.set_loss(loss);
+        type Out = (
+            tokio::time::Instant,
+            Arc<UdpSocket>,
+            Option<std::net::SocketAddr>,
+            Vec<u8>,
+        );
+        let (out_tx, mut out_rx) = tokio::sync::mpsc::unbounded_channel::<Out>();
+        let mut tasks = Vec::new();
+        // One sender keeps the order of datagrams, because every delay is the same.
+        tasks.push(tokio::spawn(async move {
+            while let Some((due, socket, to, data)) = out_rx.recv().await {
+                if due > tokio::time::Instant::now() {
+                    tokio::time::sleep_until(due).await;
+                }
+                let _ = match to {
+                    Some(to) => socket.send_to(&data, to).await,
+                    None => socket.send(&data).await,
+                };
+            }
+        }));
+        let clients: Arc<Mutex<HashMap<std::net::SocketAddr, Arc<UdpSocket>>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+        tasks.push(tokio::spawn({
+            let (front, knobs, out_tx) = (front.clone(), knobs.clone(), out_tx);
+            let shape = shape.clone();
+            async move {
+                let mut buf = vec![0u8; 65536];
+                while let Ok((n, client)) = front.recv_from(&mut buf).await {
+                    let known = clients.lock().unwrap().get(&client).cloned();
+                    let back = match known {
+                        Some(b) => b,
+                        None => {
+                            let b = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+                            b.connect(target).await.unwrap();
+                            clients.lock().unwrap().insert(client, b.clone());
+                            let (b2, front, knobs, out_tx) =
+                                (b.clone(), front.clone(), knobs.clone(), out_tx.clone());
+                            let shape = shape.clone();
+                            tokio::spawn(async move {
+                                let mut buf = vec![0u8; 65536];
+                                while let Ok(n) = b2.recv(&mut buf).await {
+                                    if knobs.drops() {
+                                        continue;
+                                    }
+                                    let Some(wait) = shape(1, n) else {
+                                        continue;
+                                    };
+                                    let due = tokio::time::Instant::now() + wait;
+                                    let _ = out_tx.send((
+                                        due,
+                                        front.clone(),
+                                        Some(client),
+                                        buf[..n].to_vec(),
+                                    ));
+                                }
+                            });
+                            b
+                        }
+                    };
+                    if knobs.drops() {
+                        continue;
+                    }
+                    let Some(wait) = shape(0, n) else {
+                        continue;
+                    };
+                    let due = tokio::time::Instant::now() + wait;
+                    let _ = out_tx.send((due, back, None, buf[..n].to_vec()));
+                }
+            }
+        }));
+        UdpProxy { addr, knobs, tasks }
+    }
+}
+
+/// A TCP forwarder on loopback that models a long, lossy path, because loss cannot be
+/// injected into a kernel TCP flow without privileges. Each direction delays bytes by
+/// `one_way`. With a loss rate p above zero, each direction also caps its rate at the
+/// Mathis estimate of a Reno flow, MSS / RTT * 1.22 / sqrt(p), and stalls for one round trip
+/// per lost segment, which is what a fast retransmit costs. The numbers are a model, and a
+/// kernel running CUBIC would do better than Reno.
+pub struct TcpModel {
+    pub addr: std::net::SocketAddr,
+    accept: JoinHandle<()>,
+}
+
+impl Drop for TcpModel {
+    fn drop(&mut self) {
+        self.accept.abort();
+    }
+}
+
+impl TcpModel {
+    pub async fn to(target: std::net::SocketAddr, one_way: Duration, loss: f64) -> TcpModel {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let seed = Arc::new(Mutex::new(0x2545_f491_4f6c_dd1d_u64));
+        let accept = tokio::spawn(async move {
+            while let Ok((front, _)) = listener.accept().await {
+                let seed = seed.clone();
+                tokio::spawn(async move {
+                    let Ok(back) = TcpStream::connect(target).await else {
+                        return;
+                    };
+                    let _ = front.set_nodelay(true);
+                    let _ = back.set_nodelay(true);
+                    let (fr, fw) = front.into_split();
+                    let (br, bw) = back.into_split();
+                    tokio::join!(
+                        model_pump(fr, bw, one_way, loss, seed.clone()),
+                        model_pump(br, fw, one_way, loss, seed),
+                    );
+                });
+            }
+        });
+        TcpModel { addr, accept }
+    }
+}
+
+async fn model_pump(
+    mut from: tokio::net::tcp::OwnedReadHalf,
+    mut to: tokio::net::tcp::OwnedWriteHalf,
+    one_way: Duration,
+    loss: f64,
+    seed: Arc<Mutex<u64>>,
+) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    const MSS: f64 = 1448.0;
+    let rtt = (one_way * 2).as_secs_f64().max(0.001);
+    let rate = if loss > 0.0 {
+        MSS / rtt * 1.22 / loss.sqrt()
+    } else {
+        f64::INFINITY
+    };
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<(tokio::time::Instant, Vec<u8>)>();
+    let writer = tokio::spawn(async move {
+        while let Some((due, data)) = rx.recv().await {
+            if due > tokio::time::Instant::now() {
+                tokio::time::sleep_until(due).await;
+            }
+            if to.write_all(&data).await.is_err() {
+                break;
+            }
+        }
+        let _ = to.shutdown().await;
+    });
+    let mut buf = vec![0u8; 16 * 1024];
+    // The time at which the modelled link has finished sending everything so far.
+    let mut free = tokio::time::Instant::now();
+    while let Ok(n) = from.read(&mut buf).await {
+        if n == 0 {
+            break;
+        }
+        // Reading only as fast as the model drains keeps a sender's backlog in its own
+        // socket buffer, as a slow link would.
+        let now = tokio::time::Instant::now();
+        free = free.max(now);
+        if rate.is_finite() {
+            free += Duration::from_secs_f64(n as f64 / rate);
+            let segments = (n as f64 / MSS).ceil() as u32;
+            let mut x = seed.lock().unwrap();
+            for _ in 0..segments {
+                *x ^= *x << 13;
+                *x ^= *x >> 7;
+                *x ^= *x << 17;
+                if ((*x >> 11) % 1_000_000) as f64 / 1e6 < loss {
+                    free += Duration::from_secs_f64(rtt);
+                }
+            }
+        }
+        let _ = tx.send((free + one_way, buf[..n].to_vec()));
+        // A timer rounds up to a millisecond, so a wait that is already over must not sleep.
+        if free > tokio::time::Instant::now() {
+            tokio::time::sleep_until(free).await;
+        }
+    }
+    drop(tx);
+    let _ = writer.await;
+}
+
+pub fn udp_socket() -> std::net::UdpSocket {
+    std::net::UdpSocket::bind("127.0.0.1:0").unwrap()
+}
+
+/// Accepts TCP connections and UDP paths of one node into one acceptor. New sessions arrive
+/// on the returned channel.
+pub fn serve(
+    acceptor: Acceptor,
+    tcp: Option<TcpListener>,
+    udp: Option<UdpListener>,
+) -> mpsc::Receiver<Session> {
+    let (tx, rx) = mpsc::channel(8);
+    let acceptor = Arc::new(acceptor);
+    if let Some(tcp) = tcp {
+        let (acceptor, tx) = (acceptor.clone(), tx.clone());
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = tcp.accept().await {
+                let (acceptor, tx) = (acceptor.clone(), tx.clone());
+                tokio::spawn(async move {
+                    if let Ok(Accepted::Session(s)) = acceptor.accept_tcp(stream).await {
+                        let _ = tx.send(s).await;
+                    }
+                });
+            }
+        });
+    }
+    if let Some(mut udp) = udp {
+        tokio::spawn(async move {
+            while let Ok(path) = udp.accept().await {
+                let (acceptor, tx) = (acceptor.clone(), tx.clone());
+                tokio::spawn(async move {
+                    if let Ok(Accepted::Session(s)) = acceptor.accept(path).await {
+                        let _ = tx.send(s).await;
+                    }
+                });
+            }
+        });
+    }
+    rx
+}
+
+/// A session over one UDP path through a proxy with a one way delay and a loss rate.
+pub async fn udp_session(
+    config: Config,
+    one_way: Duration,
+    loss: f64,
+    rate: Option<f64>,
+) -> (Session, Session, UdpProxy) {
+    let (a_id, b_id) = (Identity::generate(), Identity::generate());
+    let server = udp_socket();
+    let server_addr = server.local_addr().unwrap();
+    let proxy = UdpProxy::limited(server_addr, one_way, loss, rate).await;
+    let listener = UdpListener::new(server, None, &UdpConfig::default()).unwrap();
+    let acceptor = Acceptor::new(
+        b_id.clone(),
+        PeerPolicy::allow(vec![a_id.node_id()]),
+        config.clone(),
+    );
+    let mut sessions = serve(acceptor, None, Some(listener));
+    let path = UdpPath::connect(udp_socket(), proxy.addr).await.unwrap();
+    let a = Session::connect(path, &a_id, b_id.node_id(), config)
+        .await
+        .unwrap();
+    let b = timeout(Duration::from_secs(10), sessions.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    (a, b, proxy)
 }
