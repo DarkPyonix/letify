@@ -278,3 +278,20 @@ async fn bench_head_of_line_32_streams_at_2_percent_loss() {
         report("1 UDP path (quinn, BBR)   ", r);
     }
 }
+
+/// The two bulk cases of the head-of-line bench alone: one bulk stream beside 32 small ones,
+/// over 4 modelled TCP subflows and over one UDP path, both at 2% loss and 20 ms round trip.
+/// A shorter run than the full bench, for tuning the bulk cap.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "a measurement, about 30 s"]
+async fn bench_bulk_beside_32_streams_at_2_percent_loss() {
+    let one_way = Duration::from_millis(10);
+    let run = Duration::from_secs(10);
+    let (a, b, _model) = tcp_session(4, one_way, 0.02, Config::default()).await;
+    let r = latencies(Arc::new(a), Arc::new(b), run, true).await;
+    report("4 TCP subflows (modelled)", r);
+    let rate = Some(20.0 * 1048576.0);
+    let (a, b, _proxy) = udp_session(Config::default(), one_way, 0.02, rate).await;
+    let r = latencies(Arc::new(a), Arc::new(b), run, true).await;
+    report("1 UDP path (quinn, BBR)   ", r);
+}
