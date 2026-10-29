@@ -548,3 +548,82 @@ class _Measured:
     def __init__(self, rtt_ms: float, upload_bps: float) -> None:
         self.rtt_ms = rtt_ms
         self.upload_bps = upload_bps
+
+
+def test_spare_sockets_let_a_transfer_open_streams_without_paying_a_punch() -> None:
+    """Spec "Several connections at once": streams covered by spares cost no rendezvous.
+
+    128 MiB at 56.8 MiB/s takes 2.3 s, so a 10 s punch keeps one stream. With three
+    spares the three extra streams of a four stream split need no punch and are kept.
+    """
+    from letify.store.pathdata import streams_for
+
+    MIB = 1 << 20
+    near = dict(streams=4, threshold_mib=64, rtt_ms=44.7, size=128 * MIB, rate_bps=56.8 * MIB)
+    assert streams_for(**near, cost_s=10.0, spares=0) == 1
+    assert streams_for(**near, cost_s=10.0, spares=3) == 4
+    assert streams_for(**near, cost_s=10.0, spares=4) == 4
+
+
+def test_streams_beyond_the_spares_pay_the_connection_cost() -> None:
+    """Spec: with fewer spares than extra streams, one punch is paid, once, for all of them."""
+    from letify.store.pathdata import streams_for
+
+    MIB = 1 << 20
+    near = dict(streams=4, threshold_mib=64, rtt_ms=44.7, size=128 * MIB, rate_bps=56.8 * MIB)
+    assert streams_for(**near, cost_s=10.0, spares=2) == 1
+    far = dict(streams=4, threshold_mib=64, rtt_ms=193.0, size=1024 * MIB, rate_bps=12.8 * MIB)
+    assert streams_for(**far, cost_s=10.0, spares=2) == 4
+
+
+def test_a_punched_link_reports_the_spare_sockets_it_still_holds() -> None:
+    """Spec: a punched link holds the spares of its punch; any other link holds none."""
+    import socket
+
+    from letify.transport.link import Link, PunchedLink
+
+    assert Link("x", 0).spare_connections() == 0
+    pairs = [socket.socketpair() for _ in range(4)]
+    socks = [a for a, _ in pairs]
+    link = PunchedLink("tcp_punch", 0, socks[0], lambda port, cmd: [], lambda: socks[0], socks[1:])
+    try:
+        assert link.spare_connections() == 3
+        link._take()  # the punched connection itself
+        assert link.spare_connections() == 3
+        link._take()  # first spare
+        assert link.spare_connections() == 2
+    finally:
+        link.close()
+        for _, b in pairs:
+            b.close()
+
+
+def test_the_placement_reads_the_spares_from_the_link(monkeypatch) -> None:
+    """Spec: `_streams_for` passes the link's spare count, so a Kaggle shard splits for free."""
+    from conftest import provider_of
+
+    from letify.providers import Kaggle
+    from letify.store.pathdata import _streams_for
+
+    MIB = 1 << 20
+    provider = provider_of(Kaggle, "kaggle_a")
+
+    class Runtime:
+        name = "letify-t4-cd14ab"
+
+    def make(spares: int):
+        class Link:
+            strategy = "tcp_punch"
+            rtt_ms = 44.7
+            upload_bps = 56.8 * MIB
+
+            def spare_connections(self) -> int:
+                return spares
+
+        return Link()
+
+    Runtime.provider = provider
+    provider._links[Runtime.name] = make(0)
+    assert _streams_for(Runtime(), 128 * MIB) == 1
+    provider._links[Runtime.name] = make(3)
+    assert _streams_for(Runtime(), 128 * MIB) == 4
