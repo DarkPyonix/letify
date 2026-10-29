@@ -531,3 +531,72 @@ async fn an_idle_subflow_is_measured_by_probes_within_the_budget() {
     assert_eq!(&got, b"ok");
     assert_eq!(server_session.dropped_records(), 0);
 }
+
+/// A TCP server that answers every handshake with a version refusal, as a forger on the path
+/// could.
+async fn version_forger() -> std::net::SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut s, _)) = listener.accept().await else {
+                return;
+            };
+            tokio::spawn(async move {
+                let mut buf = [0u8; 4096];
+                let _ = s.read(&mut buf).await;
+                let mut reply = b"LLNK".to_vec();
+                reply.push(1);
+                reply.extend_from_slice(&[0, 9, 0, 9, 0, 0]);
+                let _ = s.write_all(&reply).await;
+                let _ = s.flush().await;
+                tokio::time::sleep(Duration::from_secs(2)).await;
+            });
+        }
+    });
+    addr
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_forged_version_refusal_on_one_path_does_not_abort_the_start() {
+    let rig = rig(Config::default()).await;
+    let forger = version_forger().await;
+    let target = rig.target;
+    let candidates = vec![
+        Candidate::tcp("forged", forger),
+        Candidate::new("real", move || async move {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            letify_link::tcp::connect(target).await
+        }),
+    ];
+    let mut pm = PathManager::start(
+        rig.client.clone(),
+        rig.server.node_id(),
+        candidates,
+        Config::default(),
+        quick(),
+    )
+    .await
+    .expect("the real path starts the session");
+    assert_eq!(next_added(&mut pm).await, "real");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_version_mismatch_is_reported_when_every_path_refuses() {
+    let rig = rig(Config::default()).await;
+    let (f1, f2) = (version_forger().await, version_forger().await);
+    let err = PathManager::start(
+        rig.client.clone(),
+        rig.server.node_id(),
+        vec![Candidate::tcp("f1", f1), Candidate::tcp("f2", f2)],
+        Config::default(),
+        quick(),
+    )
+    .await
+    .err()
+    .expect("no path can start the session");
+    assert!(
+        matches!(err, letify_link::Error::VersionMismatch { .. }),
+        "{err:?}"
+    );
+}
