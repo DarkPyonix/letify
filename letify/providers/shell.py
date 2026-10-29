@@ -741,7 +741,9 @@ class Shell(Provider):
             from ..transport.linkchannel import LinkChannel
 
             # One more stream of the open session: no punch and no ssh connection.
-            return LinkChannel(self.link_remote(runtime), name=f"{self.alias}-transfer")
+            return LinkChannel(
+                self.link_remote(runtime), name=f"{self.alias}-transfer", priority="bulk"
+            )
         from ..runtime.channel import PersistentChannel
 
         return PersistentChannel(self.transfer_command(runtime), name=f"{self.alias}-transfer")
