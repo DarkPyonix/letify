@@ -3,7 +3,7 @@
 
 use std::fmt;
 
-use ed25519_dalek::{SigningKey, VerifyingKey};
+use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 
 use crate::error::{Error, Result};
 
@@ -20,6 +20,16 @@ impl NodeId {
     /// The 32 bytes of the public key.
     pub fn as_bytes(&self) -> &[u8; 32] {
         &self.0
+    }
+
+    /// Check an ed25519 signature by this node over `message`.
+    pub(crate) fn verify(&self, message: &[u8], signature: &[u8; 64]) -> bool {
+        VerifyingKey::from_bytes(&self.0)
+            .map(|key| {
+                key.verify(message, &Signature::from_bytes(signature))
+                    .is_ok()
+            })
+            .unwrap_or(false)
     }
 
     /// The X25519 public key that corresponds to this node id, by the standard conversion of
@@ -72,6 +82,11 @@ impl Identity {
     /// The node id: the public key.
     pub fn node_id(&self) -> NodeId {
         NodeId(self.key.verifying_key().to_bytes())
+    }
+
+    /// Sign `message` with the node key.
+    pub(crate) fn sign(&self, message: &[u8]) -> [u8; 64] {
+        self.key.sign(message).to_bytes()
     }
 
     /// The X25519 static secret key, derived from the ed25519 key.
