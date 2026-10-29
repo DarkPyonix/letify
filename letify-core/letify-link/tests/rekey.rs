@@ -82,7 +82,9 @@ async fn records_in_flight_across_a_rekey_are_accepted() {
     let (a, b, mitm) = session_pair_through_mitm(tiny_limit(4)).await;
     mitm.withhold.store(true, Ordering::SeqCst);
     let mut s = a.open_stream().await.unwrap();
-    for part in [b"aa", b"bb", b"cc", b"dd", b"ee", b"ff", b"gg", b"hh", b"ii"] {
+    for part in [
+        b"aa", b"bb", b"cc", b"dd", b"ee", b"ff", b"gg", b"hh", b"ii",
+    ] {
         s.write_all(part).await.unwrap();
         sleep(Duration::from_millis(30)).await;
     }

@@ -7,8 +7,8 @@ use crate::error::{Error, Result};
 pub(crate) const HDR: usize = 13;
 /// Largest payload of one data frame.
 pub(crate) const CHUNK: usize = 48 * 1024;
-/// Record header on a subflow: ciphertext length (2) and nonce (8).
-pub(crate) const RECORD_HDR: usize = 10;
+/// Record header on a subflow: ciphertext length (2), key epoch (2) and nonce (8).
+pub(crate) const RECORD_HDR: usize = 12;
 /// Size of the Noise authentication tag.
 pub(crate) const TAG: usize = 16;
 

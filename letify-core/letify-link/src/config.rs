@@ -35,6 +35,12 @@ pub struct Config {
     pub keepalive_interval: Duration,
     /// Time limit for a handshake or for adding a subflow. Default 30 s.
     pub handshake_timeout: Duration,
+    /// This side moves its sending keys to the next epoch after sealing this many records in
+    /// one epoch. Zero turns the count limit off. Default 2^32.
+    pub rekey_after_records: u64,
+    /// This side moves its sending keys to the next epoch when the epoch is this old and a
+    /// record is sealed. Zero turns the age limit off. Default 24 h.
+    pub rekey_after: Duration,
 }
 
 impl Config {
@@ -55,6 +61,8 @@ impl Default for Config {
             resume_window: Duration::from_secs(24 * 3600),
             keepalive_interval: Duration::from_secs(15),
             handshake_timeout: Duration::from_secs(30),
+            rekey_after_records: 1 << 32,
+            rekey_after: Duration::from_secs(24 * 3600),
         }
     }
 }

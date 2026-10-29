@@ -54,6 +54,7 @@ mod frame;
 mod handshake;
 pub mod hysteresis;
 mod identity;
+mod keys;
 mod paths;
 pub mod policing;
 pub mod punch;

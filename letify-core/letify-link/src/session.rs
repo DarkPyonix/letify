@@ -24,7 +24,6 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::task::Waker;
 use std::time::{Duration, Instant};
 
-use snow::StatelessTransportState;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::sync::{Notify, watch};
 use tokio::task::AbortHandle;
@@ -34,7 +33,8 @@ use crate::error::{Error, Result};
 use crate::frame::{self, Frame, HDR, Kind, RECORD_HDR, TAG};
 use crate::handshake::{self, Established};
 use crate::identity::{Identity, NodeId, PeerPolicy};
-use crate::replay::{MAX_UNACKED_FRAMES, ReplayWindow};
+use crate::keys::Keys;
+use crate::replay::MAX_UNACKED_FRAMES;
 use crate::stream::Stream;
 
 /// A reliable, ordered byte transport that a session can use as a subflow: a TCP connection,
@@ -941,10 +941,8 @@ impl State {
 pub(crate) struct Shared {
     pub state: Mutex<State>,
     accept: Notify,
-    crypto: Arc<StatelessTransportState>,
-    nonce: AtomicU64,
-    /// Nonces accepted from the peer, over all subflows and across resumption.
-    replay: Mutex<ReplayWindow>,
+    /// The keys of both directions, shared by every subflow and kept across resumption.
+    keys: Keys,
     dropped: AtomicU64,
     cfg: Config,
     peer: NodeId,
@@ -1039,43 +1037,20 @@ impl Shared {
         }
     }
 
-    fn next_nonce(&self) -> u64 {
-        self.nonce.fetch_add(1, Ordering::Relaxed)
-    }
-
-    /// Encrypt `plain` into a record: length, nonce, ciphertext.
+    /// Encrypt `plain` into a record: length, epoch, nonce, ciphertext.
     fn seal(&self, plain: &[u8]) -> Result<Vec<u8>> {
-        let nonce = self.next_nonce();
-        let mut out = vec![0u8; RECORD_HDR + plain.len() + TAG];
-        let n = self
-            .crypto
-            .write_message(nonce, plain, &mut out[RECORD_HDR..])
-            .map_err(|e| Error::ConnectionLost(format!("encrypt: {e}")))?;
-        out.truncate(RECORD_HDR + n);
-        out[..2].copy_from_slice(&(n as u16).to_be_bytes());
-        out[2..RECORD_HDR].copy_from_slice(&nonce.to_be_bytes());
-        Ok(out)
+        self.keys.seal(plain)
     }
 
-    /// Decrypt a record. `None` means the nonce was already accepted or is older than the
-    /// replay window; the record is dropped and counted, not an error.
-    fn open(&self, nonce: u64, ct: &[u8]) -> Result<Option<Vec<u8>>> {
-        let mut out = vec![0u8; ct.len()];
-        let n = self
-            .crypto
-            .read_message(nonce, ct, &mut out)
-            .map_err(|e| Error::ConnectionLost(format!("decrypt: {e}")))?;
-        out.truncate(n);
-        let fresh = self
-            .replay
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .accept(nonce);
-        if !fresh {
+    /// Decrypt a record. `None` means the record was dropped without an error: its nonce was
+    /// already accepted, it is older than the replay window, or its epoch is not kept. It is
+    /// counted.
+    fn open(&self, epoch: u16, nonce: u64, ct: &[u8]) -> Result<Option<Vec<u8>>> {
+        let opened = self.keys.open(epoch, nonce, ct)?;
+        if opened.is_none() {
             self.dropped.fetch_add(1, Ordering::Relaxed);
-            return Ok(None);
         }
-        Ok(Some(out))
+        Ok(opened)
     }
 
     fn start_subflow<T: Transport>(
@@ -1130,15 +1105,16 @@ impl Shared {
     }
 }
 
-/// Read one record: its nonce and ciphertext.
-async fn read_record<R: AsyncRead + Unpin>(rd: &mut R) -> std::io::Result<(u64, Vec<u8>)> {
+/// Read one record: its epoch, nonce and ciphertext.
+async fn read_record<R: AsyncRead + Unpin>(rd: &mut R) -> std::io::Result<(u16, u64, Vec<u8>)> {
     let mut head = [0u8; RECORD_HDR];
     rd.read_exact(&mut head).await?;
     let len = u16::from_be_bytes([head[0], head[1]]) as usize;
-    let nonce = u64::from_be_bytes(head[2..].try_into().unwrap());
+    let epoch = u16::from_be_bytes([head[2], head[3]]);
+    let nonce = u64::from_be_bytes(head[4..].try_into().unwrap());
     let mut ct = vec![0u8; len];
     rd.read_exact(&mut ct).await?;
-    Ok((nonce, ct))
+    Ok((epoch, nonce, ct))
 }
 
 async fn reader_task<R: AsyncRead + Unpin>(
@@ -1152,7 +1128,7 @@ async fn reader_task<R: AsyncRead + Unpin>(
     let limit = shared.dead_after.unwrap_or(Duration::ZERO);
     let result: Result<()> = async {
         loop {
-            let (nonce, ct) = if limit.is_zero() {
+            let (epoch, nonce, ct) = if limit.is_zero() {
                 read_record(&mut rd).await?
             } else {
                 tokio::time::timeout(limit, read_record(&mut rd))
@@ -1162,7 +1138,7 @@ async fn reader_task<R: AsyncRead + Unpin>(
                     })??
             };
             received.fetch_add((RECORD_HDR + ct.len()) as u64, Ordering::Relaxed);
-            let Some(plain) = shared.open(nonce, &ct)? else {
+            let Some(plain) = shared.open(epoch, nonce, &ct)? else {
                 continue;
             };
             match frame::decode(plain)? {
@@ -1510,9 +1486,13 @@ impl Session {
         let shared = Arc::new(Shared {
             state: Mutex::new(state),
             accept: Notify::new(),
-            crypto: est.crypto,
-            nonce: AtomicU64::new(0),
-            replay: Mutex::new(ReplayWindow::new()),
+            keys: Keys::new(
+                est.crypto,
+                est.rekey_secret,
+                initiator,
+                cfg.rekey_after_records,
+                cfg.rekey_after,
+            ),
             dropped: AtomicU64::new(0),
             cfg,
             peer: est.peer,
@@ -1646,11 +1626,12 @@ impl Session {
             let mut rec = [0u8; RECORD_HDR];
             transport.read_exact(&mut rec).await?;
             let len = u16::from_be_bytes([rec[0], rec[1]]) as usize;
-            let nonce = u64::from_be_bytes(rec[2..].try_into().unwrap());
+            let epoch = u16::from_be_bytes([rec[2], rec[3]]);
+            let nonce = u64::from_be_bytes(rec[4..].try_into().unwrap());
             let mut ct = vec![0u8; len];
             transport.read_exact(&mut ct).await?;
             let plain = shared
-                .open(nonce, &ct)
+                .open(epoch, nonce, &ct)
                 .map_err(|e| Error::Subflow(e.to_string()))?
                 .ok_or_else(|| Error::Subflow("the hello was replayed".into()))?;
             match frame::decode(plain)? {
@@ -1706,6 +1687,17 @@ impl Session {
     pub fn is_closed(&self) -> bool {
         let st = self.shared().lock();
         st.closing || st.failed.is_some()
+    }
+
+    /// The epoch this side seals its records in. It starts at 0 and rises when the sending
+    /// keys rotate, see SPEC.md letify-link, Session item 8.
+    pub fn send_epoch(&self) -> u16 {
+        self.shared().keys.send_epoch()
+    }
+
+    /// The newest epoch of the peer's keys that a record opened in.
+    pub fn receive_epoch(&self) -> u16 {
+        self.shared().keys.receive_epoch()
     }
 
     /// A counter that changes whenever a subflow is added or dies.
