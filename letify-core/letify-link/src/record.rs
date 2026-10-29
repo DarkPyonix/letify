@@ -698,4 +698,55 @@ mod tests {
         txt[0].replace_range(10..11, &flipped.to_string());
         assert!(AddressRecord::decode_txt(&txt, r.timestamp).is_err());
     }
+
+    #[test]
+    fn an_older_record_than_the_one_held_is_refused_as_stale() {
+        let id = Identity::generate();
+        let cache = RecordCache::new();
+        let at = |version, ts| {
+            let mut r = AddressRecord::new(id.node_id(), version);
+            r.timestamp = ts;
+            r.encode(&id)
+        };
+        let now = unix_now();
+        assert!(cache.accept(&at(5, now), now).is_ok());
+        assert_eq!(cache.accept(&at(4, now), now), Err(RecordError::Stale));
+        // The same version with an older timestamp is also a rollback.
+        assert_eq!(cache.accept(&at(5, now - 10), now), Err(RecordError::Stale));
+        // The same record again, and a newer one, are taken.
+        assert!(cache.accept(&at(5, now), now).is_ok());
+        assert_eq!(cache.accept(&at(6, now), now).unwrap().version, 6);
+        assert_eq!(cache.get(&id.node_id()).unwrap().version, 6);
+        // Another node has its own entry.
+        let other = Identity::generate();
+        let r = AddressRecord::new(other.node_id(), 1);
+        assert!(cache.accept(&r.encode(&other), now).is_ok());
+    }
+
+    #[test]
+    fn a_record_that_fails_the_signature_does_not_enter_the_cache() {
+        let id = Identity::generate();
+        let cache = RecordCache::new();
+        let mut bytes = AddressRecord::new(id.node_id(), 9).encode(&id);
+        let n = bytes.len();
+        bytes[n - 1] ^= 1;
+        assert!(cache.accept(&bytes, unix_now()).is_err());
+        assert!(cache.get(&id.node_id()).is_none());
+    }
+
+    #[test]
+    fn the_cache_is_bounded_and_drops_the_oldest_entry() {
+        let cache = RecordCache::with_capacity(2);
+        let now = unix_now();
+        let mut ids = Vec::new();
+        for age in [30u32, 20, 10] {
+            let id = Identity::generate();
+            let mut r = AddressRecord::new(id.node_id(), 1);
+            r.timestamp = now - age;
+            cache.accept(&r.encode(&id), now).unwrap();
+            ids.push(id.node_id());
+        }
+        assert!(cache.get(&ids[0]).is_none());
+        assert!(cache.get(&ids[1]).is_some() && cache.get(&ids[2]).is_some());
+    }
 }
