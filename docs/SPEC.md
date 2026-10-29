@@ -125,7 +125,7 @@ The distributed placement is supported on a pair of runtimes that can reach each
 else. Two Kaggle runtimes cannot: measured on 2026-10-13, both NATs preserved the port and every TCP
 SYN was dropped for 45 s, and a UDP punch on the same pair sent for 30 s each way without a datagram
 arriving. letify therefore refuses such a pair rather than routing the reduction through the client
-or a relay, which is the decision `docs/INTENT.md` records against claim N10. A declaration naming
+or a relay the user did not register, which is the decision `docs/INTENT.md` records against claim N10. A declaration naming
 two runtimes that cannot connect fails, and the measurement to make before using a provider pair is
 whether they punch at all.
 
@@ -1841,7 +1841,7 @@ Every connection decision is printed, one line per event, on stderr with the `le
 
 > A slow link is a failure, not a fallback. A probe below the account's floor fails the connection rather than being used.
 
-No relay path is offered as a connection strategy: [Connection strategies](#connection-strategies) lists only forward SSH, TCP hole punching, UDP hole punching with Tailcat, reverse SSH and the provider's own path, none of which is a relay by design. Tailcat itself falls back to a relay of its own, a DERP-style relay server, when the direct UDP punch between the two sides fails; letify does not detect that fallback by name, because Tailcat gives no signal that names it. Instead every strategy's probe is held to the same floor, so a relayed Tailcat path is caught by what it measures rather than by what it is.
+No relay path is offered as a built-in connection strategy: [Connection strategies](#connection-strategies) lists only forward SSH, TCP hole punching, UDP hole punching with Tailcat, reverse SSH and the provider's own path, none of which is a relay by design. Tailcat itself falls back to a relay of its own, a DERP-style relay server, when the direct UDP punch between the two sides fails; letify does not detect that fallback by name, because Tailcat gives no signal that names it. Instead every strategy's probe is held to the same floor, so a relayed Tailcat path is caught by what it measures rather than by what it is. A relay the user registers for letify-link is held to the same floor, as [Relay](#link-relay) says.
 
 The floor is two numbers: a minimum throughput in each direction and a maximum round trip. The single default for every account in this pipeline is 10 MiB/s in each direction and 300 ms, `letify.transport.pipeline.LinkFloor.default`. There are no per-provider floor defaults. An account overrides either number with `min_mib_per_s` and `max_rtt_ms` in its configuration.
 
@@ -1999,7 +1999,7 @@ A platform with no `letify-quic` in its wheel skips the strategy with the reason
 
 This section is a hypothesis on a branch, to be adopted or rejected by the experiments in [ROADMAP-3.0.md](ROADMAP-3.0.md) (milestones M2 to M4). When it lands, it replaces the Tailcat strategy of [Connection strategies](#connection-strategies), [QUIC over a punched UDP pair](#quic) and the ssh data path of `PersistentChannel` in [Channels](#channels). Until then those sections describe what 2.x does. [Link floor](#link-floor), [Choosing a link](#choosing-a-link) and [Link cache](#link-cache) stay in force.
 
-`letify-link` is a Rust crate in `letify-core/` with a Rust API that an application links directly and runs in its own process. In-process use is required because iOS cannot spawn a second process. The `letify-link` sidecar binary is letify's binding of that crate for the pure-Python package, described in [Sidecar interface](#link-sidecar). The crate owns four things: rendezvous, path discovery and punching, path management, and the secure session. The letify protocol above it (frames, the worker channel, transfers, takeover) sees one reliable, ordered, encrypted stream per channel and does not know which path carries it.
+`letify-link` is a Rust crate in `letify-core/` with a Rust API that an application links directly and runs in its own process. In-process use is required because iOS cannot spawn a second process. The `letify-link` sidecar binary is letify's binding of that crate for the pure-Python package, described in [Sidecar interface](#link-sidecar). The crate is a user-space overlay with no TUN device, because Kaggle and Backend.AI containers lack `CAP_NET_ADMIN`: nodes have stable identities and open streams to each other, and an existing service such as sshd is reached by forwarding a stream to a local port. The crate owns four things: rendezvous, path discovery and punching, path management, and the secure session. The letify protocol above it (frames, the worker channel, transfers, takeover) sees one reliable, ordered, encrypted stream per channel and does not know which path carries it.
 
 Terms used below. A **path** is one transport route between two nodes: one TCP connection or one UDP address pair. A **subflow** is a path that the session uses at this moment. A **session** is the encrypted, multiplexed connection between two nodes. A **node** is one end, identified by a key. A **sidecar** is the `letify-link` executable that the Python package starts. The **resume window** is how long a session waits for a new path before it ends.
 
@@ -2055,7 +2055,7 @@ trait Rendezvous {
 }
 ```
 
-The library uses it to exchange public keys on first contact, address records, STUN mappings and punch timing. A message is small (under 4 KiB) and may be delayed by seconds. letify-link defines the **address record** in one documented binary format, so an implementation only transports it. The record holds the node id, a record version, a timestamp, a list of TCP candidates (`ip:port`), a list of UDP candidates, the NAT type of [NAT traversal](#link-nat), and optionally a relay URL, and an ed25519 signature by the node key over all other fields. The signature is required, because not every Rendezvous signs. A transport that already signs, such as a pkarr signed packet, carries it anyway. The binary record is about 85 bytes plus 6 bytes per IPv4 candidate and 18 bytes per IPv6 candidate, so 8 TCP and 8 UDP IPv6 candidates fit in about 400 bytes, under the 1000-byte payload of pkarr. The trait gives no secrecy guarantee: the session handshake authenticates every peer, and the messages carry no secret.
+The library uses it to exchange public keys on first contact, address records, STUN mappings and punch timing. A message is small (under 4 KiB) and may be delayed by seconds. letify-link defines the **address record** in one documented binary format, so an implementation only transports it. The record holds the node id, a record version, a timestamp, a list of TCP candidates (`ip:port`), a list of UDP candidates, the NAT type of [NAT traversal](#link-nat), and optionally the address of a relay, and an ed25519 signature by the node key over all other fields. The signature is required, because not every Rendezvous signs. A transport that already signs, such as a pkarr signed packet, carries it anyway. The binary record is about 85 bytes plus 6 bytes per IPv4 candidate and 18 bytes per IPv6 candidate, so 8 TCP and 8 UDP IPv6 candidates fit in about 400 bytes, under the 1000-byte payload of pkarr. The trait gives no secrecy guarantee: the session handshake authenticates every peer, and the messages carry no secret.
 
 letify implements the trait with its provider bootstraps: ssh, `colab exec`, the Kaggle API and the Drive mailbox. Another program implements it with its own signalling. darkpyonix Ember, for example, would use a hub that publishes pkarr signed packets. The library holds no provider-specific code.
 
@@ -2071,11 +2071,16 @@ letify implements the trait with its provider bootstraps: ssh, `colab exec`, the
 
 #### Relay <!-- id: link-relay -->
 
-> An optional library feature that is off by default. letify never enables it.
+> A relay is a role any node can take. letify runs none and uses only a relay the user registers.
 
-The library can forward frames through a third host when no direct path exists. It is a Cargo feature, `relay`, and a runtime setting that is off unless the caller sets it. The feature defines the relay protocol, which is not wire compatible with iroh-relay: a node dials the relay URL from its address record, and the relay forwards session ciphertext between two nodes by node id. Public address discovery does not need a relay. It uses STUN, as [NAT traversal](#link-nat) says. The session keys are end to end, so a relay sees only ciphertext.
+The library can forward frames through a third node when no direct path exists. It is the Cargo feature `relay`, and the sidecar letify builds includes it. The relay protocol is not wire compatible with iroh-relay: a node dials the relay, and the relay forwards session ciphertext between two node ids that have authenticated with it. The session keys are end to end, so a relay sees only ciphertext. Public address discovery does not need a relay. It uses STUN, as [NAT traversal](#link-nat) says.
 
-letify builds the sidecar without the feature. A slow or relayed link stays a failure in letify, as [Link floor](#link-floor) says. That is letify's policy about GPU hours billed during a slow transfer. It is not a limit of the library. Whether letify-link ships a relay server binary is an open decision of the owner.
+1. **A role, not a product.** Any node running letify-link can offer to relay for the peers that have authenticated with it. A dedicated relay server is the same code run as a standalone node with `letify-link relay`. There is no separate server product, and letify operates no service.
+2. **Star topology.** A fixed, managed hub node that every device punches to can forward between two devices that cannot reach each other directly. Ember's main server is the intended hub.
+3. **Registration.** A relay is used only when the user names it in `~/.letify/config.toml` in a top-level array of tables, one per relay: `[[relays]]` with `address = "relay.example.org:443"` and `key = "<node id>"`. The key is the relay's node id, and the session uses it to authenticate the relay. With none registered, letify behaves as if relays did not exist: a pair that cannot connect directly fails with its reason.
+4. **No other relay.** letify never falls back to a relay the user did not register, and never to a public relay.
+5. **Same policy as any path.** A relayed path is held to [Link floor](#link-floor) and the 25% rule like every other path, so a slow relayed path is rejected as a failure. A relay's throughput is bounded by the link of the node that relays.
+6. **Promotion.** While a session runs over a relayed path, the path manager keeps trying direct paths. A direct path that beats the relayed one under the rules of [Paths and the path manager](#link-paths) (dwell, confirmation, 25% threshold) replaces it, and the relayed path then closes.
 
 #### Sidecar interface <!-- id: link-sidecar -->
 
@@ -2102,7 +2107,7 @@ The embedding application may supply its own ed25519 secret key, and the library
 
 The session resumption of Session item 5 also serves a client whose process was suspended, as a phone app is: keys are kept, and the streams resume after the path manager reconnects or fail with a connection error when the resume window ends. Nothing in the library may require a desktop operating system, so iOS and Android clients are not precluded. Browsers are out of scope.
 
-The library does not assume a topology. A star of one server and about 10 nodes and clients per account, with long-lived connections and many streams, is the intended case for Ember. It requires only the Rendezvous trait, node ids and the optional relay, and letify does not depend on it.
+The library does not assume a topology. A star of one server and about 10 nodes and clients per account, with long-lived connections and many streams, is the intended case for Ember. It requires only the Rendezvous trait, node ids and the relay role of [Relay](#link-relay), and letify does not depend on it.
 
 ### Reverse SSH <!-- id: reverse-ssh -->
 
