@@ -91,6 +91,9 @@ const RATE_KEEP: usize = 8;
 /// The lowest round trip of a subflow is taken over this span.
 const MIN_RTT_SPAN: Duration = Duration::from_secs(10);
 const CAP_HOLD: u32 = 6;
+/// While both classes have frames queued, this many interactive frames are followed by one
+/// bulk frame, so bulk gets one stream frame in ten at least.
+const GUARD_RUN: u32 = 9;
 
 /// How the bulk cap of a subflow is moving.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -293,6 +296,8 @@ pub(crate) struct State {
     ring_bulk: VecDeque<u32>,
     /// The Close frame is owed once every queue is empty.
     close_wanted: bool,
+    /// Interactive stream frames taken since the last bulk one while bulk had frames queued.
+    bulk_wait: u32,
     peer_next: u64,
     recv_next: u64,
     reorder: BTreeMap<u64, (Frame, usize)>,
@@ -430,12 +435,27 @@ impl State {
     /// The next fresh frame, without taking it, and its size. Deficit round robin: the stream
     /// at the front of its ring is served while its deficit covers its next frame, and
     /// otherwise gets a quantum and moves to the back. `None` when nothing may be sent now.
-    fn peek_fresh(&mut self) -> Option<(Fresh, usize, bool)> {
+    ///
+    /// Every `GUARD_RUN` interactive frames taken while bulk has frames queued, bulk goes first
+    /// (the starvation guard). `fits` says whether the writer's subflow can take a frame now,
+    /// so a bulk frame that does not fit never holds an interactive one back.
+    fn peek_fresh(
+        &mut self,
+        fits: &mut dyn FnMut(usize, bool) -> bool,
+    ) -> Option<(Fresh, usize, bool)> {
         let count_ok = |st: &State, reserve: usize| st.unacked.len() + reserve < MAX_UNACKED_FRAMES;
         if let Some(f) = self.ctl.front() {
             return count_ok(self, 0).then_some((Fresh::Ctl, f.len(), false));
         }
-        for bulk in [false, true] {
+        let guard_turn = self.bulk_wait >= GUARD_RUN
+            && !self.ring_bulk.is_empty()
+            && !self.ring_interactive.is_empty();
+        let order = if guard_turn {
+            [true, false]
+        } else {
+            [false, true]
+        };
+        for bulk in order {
             // Bulk frames leave an eighth of the retransmit buffer to interactive ones.
             let (bytes_cap, count_reserve) = if bulk {
                 (
@@ -471,6 +491,12 @@ impl State {
                 }
                 let ok = (self.unacked_bytes == 0 || self.unacked_bytes + len <= bytes_cap)
                     && count_ok(self, count_reserve);
+                if guard_turn && bulk {
+                    if ok && fits(len, true) {
+                        return Some((Fresh::Stream(id), len, true));
+                    }
+                    break;
+                }
                 return ok.then_some((Fresh::Stream(id), len, bulk));
             }
         }
@@ -501,6 +527,11 @@ impl State {
                     };
                     ring.retain(|i| *i != stream);
                     self.forget_if_done(stream);
+                }
+                if bulk || self.ring_bulk.is_empty() {
+                    self.bulk_wait = 0;
+                } else {
+                    self.bulk_wait += 1;
                 }
                 bytes
             }
@@ -1168,7 +1199,7 @@ async fn writer_task<W: AsyncWrite + Unpin>(
                         } else {
                             None
                         }
-                    } else if let Some((which, len, bulk)) = st.peek_fresh() {
+                    } else if let Some((which, len, bulk)) = st.peek_fresh(&mut fits) {
                         fits(len, bulk).then(|| (st.take_fresh(which, bulk, id, now), bulk))
                     } else {
                         None
@@ -1336,6 +1367,7 @@ impl Session {
             ring_interactive: VecDeque::new(),
             ring_bulk: VecDeque::new(),
             close_wanted: false,
+            bulk_wait: 0,
             peer_next: 0,
             recv_next: 0,
             reorder: BTreeMap::new(),
