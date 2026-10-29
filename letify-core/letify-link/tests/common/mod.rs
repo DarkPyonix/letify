@@ -328,3 +328,33 @@ pub async fn session_pair_through_mitm(config: Config) -> (Session, Session, Mit
     let initiator = Session::connect(ta, &a, b.node_id(), config).await.unwrap();
     (initiator, responder.await.unwrap().unwrap(), mitm)
 }
+
+impl Proxy {
+    /// Drop every open connection but keep accepting new ones.
+    pub fn drop_connections(&self) {
+        for handle in self.conns.lock().unwrap().drain(..) {
+            handle.abort();
+        }
+    }
+}
+
+/// A listener that runs an `Acceptor` on every incoming TCP connection. New sessions arrive on
+/// the returned channel; subflows are routed to their sessions by the acceptor.
+pub fn spawn_server(
+    listener: TcpListener,
+    acceptor: letify_link::Acceptor,
+) -> tokio::sync::mpsc::Receiver<Session> {
+    let (tx, rx) = tokio::sync::mpsc::channel(8);
+    let acceptor = Arc::new(acceptor);
+    tokio::spawn(async move {
+        while let Ok((tcp, _)) = listener.accept().await {
+            let (acceptor, tx) = (acceptor.clone(), tx.clone());
+            tokio::spawn(async move {
+                if let Ok(letify_link::Accepted::Session(s)) = acceptor.accept_tcp(tcp).await {
+                    let _ = tx.send(s).await;
+                }
+            });
+        }
+    });
+    rx
+}
