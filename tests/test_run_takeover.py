@@ -165,7 +165,14 @@ def gone(pid: int) -> bool:
 class Owner:
     """The old owner process and the files the test uses to talk to its body."""
 
-    def __init__(self, tmp_path: Path, mode: str = "return", grace: float = 0.0) -> None:
+    def __init__(
+        self,
+        tmp_path: Path,
+        mode: str = "return",
+        grace: float = 0.0,
+        config: str = "config",
+        source: str = OWNER,
+    ) -> None:
         self.ready = tmp_path / "ready"
         self.stop = tmp_path / "stop"
         self.result = tmp_path / "owner-result.json"
@@ -174,8 +181,8 @@ class Owner:
         self.log = tmp_path / "owner.log"
         self.stdout = open(self.log, "w", encoding="utf-8")  # noqa: SIM115
         script = tmp_path / "owner.py"
-        script.write_text(OWNER, encoding="utf-8")
-        config = tmp_path / "config"
+        script.write_text(source, encoding="utf-8")
+        config = tmp_path / config
         self.process = subprocess.Popen(
             [
                 sys.executable, str(script), str(config), str(self.ready), str(self.stop),
@@ -630,6 +637,74 @@ def test_a_shell_runtime_is_taken_over_through_the_relay_program(
     assert taking.error is None
     assert taking.value == 42
     until(lambda: gone(owner.worker), "the new owner to end the session")
+
+
+#: The old owner of a link run: a Shell account whose ssh hop is a local shell and whose
+#: workspace and environment are this machine's, so only the ssh hop is not real.
+LINK_PRELUDE = textwrap.dedent(
+    """
+    import sys
+    from letify.declare.instance import Instance
+    from letify.providers.shell import Shell
+
+    Shell.remote_python = property(lambda self: sys.executable)
+    Shell.ssh_command = lambda self, remote=None: ["sh", "-c", remote or "true"]
+    Shell.prepares_workspace = False
+    Shell.remote_env = False
+    Shell.discover = lambda self: {"CPU": Instance(self, gpu=None)}
+    """
+)
+LINK_OWNER = OWNER.replace(
+    "let = letify.Launcher(", LINK_PRELUDE + "let = letify.Launcher(", 1
+)
+
+
+def test_a_link_run_is_taken_over_by_a_second_process(
+    world, owners, tmp_path, monkeypatch, config_file, sidecar_binary
+) -> None:
+    """Spec "Sidecar interface" item 7, taking over a call: a second session and a door stream."""
+    from letify.transport import linkd
+
+    monkeypatch.setenv(linkd.ENV_BINARY, str(sidecar_binary))
+    text = (
+        '[a]\nkind = "shell"\naddress = "127.0.0.1"\nlink = "letify-link"\n'
+        f'link_binary = "{sidecar_binary}"\n'
+    )
+    link_dir = config_file(text, name="link-config")
+    taker = letify.Launcher(link_dir, home=False, announce=False)
+    owner = owners(config="link-config", source=LINK_OWNER)
+    record = control.find(owner.run)
+    assert record["link"]["endpoint"].startswith("127.0.0.1:")
+    assert len(record["link"]["node_id"]) == 64
+    assert record["link"]["local_node"] != record["link"]["node_id"]
+    taking = Running(lambda: letify.takeover(owner.run, launcher=taker))
+    owner.answer()
+    assert not gone(owner.worker)
+    owner.finish_body()
+    taking.join()
+    assert taking.error is None
+    assert taking.value == 42
+    until(lambda: gone(owner.worker), "the new owner to end the session")
+
+
+def test_a_link_run_is_not_taken_over_by_another_node(
+    isolated_home, tmp_path, monkeypatch, sidecar_binary
+) -> None:
+    """A new owner with another key is refused, because the shim's allow list lacks it."""
+    from conftest import provider_of
+
+    from letify.providers.shell import Shell
+    from letify.transport import linkd
+
+    monkeypatch.setenv(linkd.ENV_BINARY, str(sidecar_binary))
+
+    provider = provider_of(Shell, "lab", address="127.0.0.1", link="letify-link")
+    record = {
+        "door": "/x",
+        "link": {"node_id": "a" * 64, "endpoint": "127.0.0.1:1", "local_node": "b" * 64},
+    }
+    with pytest.raises(letify.UnsupportedMode, match="allow"):
+        provider.attach_channel("r1", record)
 
 
 # -- a deliberate shutdown ----------------------------------------------------------

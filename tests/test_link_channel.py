@@ -34,15 +34,13 @@ class LocalShell(Shell):
 
     remote_python = sys.executable
 
+    def ssh_command(self, remote_command: str | None = None) -> list[str]:
+        """The account's plain ssh command, run on this machine under ``sh -c``."""
+        return self.__dict__["fake_ssh"].ssh_command(remote_command)
 
-class FakeSshLink:
-    """Stands in for the pipeline's link: ssh commands run on this machine under ``sh -c``."""
 
-    persistent = True
-    strategy = "direct_ssh"
-
-    def close(self) -> None:
-        pass
+class FakeSsh:
+    """Records the commands the bootstrap would send over ssh and runs them locally."""
 
     def __init__(self) -> None:
         self.commands: list[str] = []
@@ -52,11 +50,14 @@ class FakeSshLink:
         return ["sh", "-c", remote or "true"]
 
 
+FakeSshLink = FakeSsh
+
+
 def machine(tmp_path: Path, fake: FakeSshLink, **options: Any) -> LocalShell:
     provider = provider_of(
         LocalShell, "lab", address="127.0.0.1", workspace=str(tmp_path / "ws"), **options
     )
-    provider.__dict__["_links"] = {"": fake}
+    provider.__dict__["fake_ssh"] = fake
     return provider
 
 
@@ -293,7 +294,7 @@ def test_a_missing_sidecar_binary_on_the_remote_fails_the_connect_naming_it(
     assert len(ssh.commands) == 1
 
 
-def test_a_link_account_does_not_hand_a_call_to_another_process_over_ssh(
+def test_a_link_run_record_without_the_link_section_is_refused(
     isolated_home, tmp_path, ssh
 ) -> None:
     provider = machine(tmp_path, ssh, link="letify-link")
@@ -337,3 +338,208 @@ def test_the_wheel_extraction_names_the_sidecar_binary() -> None:
     assert "letify/remoting/lib/letify-link" in source and "LETIFY-LINK" in source
     assert "letify-quic" not in source and "LETIFY-QUIC" not in source
     assert "LETIFY-QUIC" in install.remote_quic_source("2.10.2")
+
+
+# -- Gap 1: the transfer decision reads the session ---------------------------------
+
+
+class SessionStub:
+    def __init__(self, paths: list[dict[str, Any]]) -> None:
+        self._paths = paths
+        self.closed = threading.Event()
+
+    def paths(self) -> list[dict[str, Any]]:
+        return self._paths
+
+
+def test_the_session_reports_its_smallest_round_trip_and_largest_rate() -> None:
+    session = SessionStub(
+        [
+            {"srtt_ms": 90.0, "probe_rate": 4.0 * MIB},
+            {"srtt_ms": 60.0, "probe_rate": 9.0 * MIB},
+            {"srtt_ms": None, "probe_rate": None},
+        ]
+    )
+    remote = linkchannel.LinkRemote(None, session, "lab")  # type: ignore[arg-type]
+    assert remote.rtt_ms == 60.0
+    assert remote.upload_bps == 9.0 * MIB
+    empty = linkchannel.LinkRemote(None, SessionStub([]), "lab")  # type: ignore[arg-type]
+    assert empty.rtt_ms is None and empty.upload_bps is None
+
+
+def with_session(provider: Any, paths: list[dict[str, Any]]) -> Any:
+    remote = linkchannel.LinkRemote(None, SessionStub(paths), "lab")  # type: ignore[arg-type]
+    provider.__dict__["_link_remotes"] = {"": remote}
+    return runtime_of(provider)
+
+
+def runtime_of(provider: Any) -> Any:
+    return SimpleNamespace(name="r1", external_id=None, provider=provider)
+
+
+def test_the_transfer_decision_on_a_link_account_reads_the_session_not_an_ssh_probe(
+    isolated_home, tmp_path, ssh, monkeypatch
+) -> None:
+    from letify.store import pathdata
+    from letify.transport import pipeline
+
+    monkeypatch.setattr(
+        pipeline.Pipeline, "connect", lambda self: pytest.fail("the strategy race ran")
+    )
+    provider = machine(tmp_path, ssh, link="letify-link")
+    runtime_ = with_session(provider, [{"srtt_ms": 150.0, "probe_rate": 20.0 * MIB}])
+    assert pathdata._measured_rtt(provider, runtime_) == 150.0
+    assert pathdata._streams_for(runtime_, 512 * MIB) == pathdata.STREAMS
+
+
+def test_a_link_stream_costs_nothing_even_when_the_account_sets_a_cost(
+    isolated_home, tmp_path, ssh
+) -> None:
+    from letify.store import pathdata
+
+    # At 500 MiB/s a cost of 10 s would keep one stream, if it were charged.
+    paths = [{"srtt_ms": 150.0, "probe_rate": 500.0 * MIB}]
+    linked_ = machine(tmp_path, ssh, link="letify-link", transfer_connection_cost_s=10)
+    assert linked_.transfer_connection_cost_s == 0.0
+    assert pathdata._streams_for(with_session(linked_, paths), 512 * MIB) == pathdata.STREAMS
+    costly = machine(tmp_path, ssh, transfer_connection_cost_s=10)
+    assert costly.transfer_connection_cost_s == 10.0
+
+
+def test_a_link_account_reports_no_measurement_before_the_session_exists(
+    isolated_home, tmp_path, ssh
+) -> None:
+    provider = machine(tmp_path, ssh, link="letify-link")
+    link = provider.link(runtime())
+    assert link.rtt_ms is None and link.upload_bps is None
+    assert link.spare_connections() == 0
+
+
+# -- Gap 2: a lean bootstrap -------------------------------------------------------
+
+
+def test_a_link_account_bootstraps_over_plain_ssh_without_the_strategy_race(
+    linked, ssh, monkeypatch
+) -> None:
+    from letify.transport import pipeline
+
+    monkeypatch.setattr(
+        pipeline.Pipeline, "connect", lambda self: pytest.fail("the strategy race ran")
+    )
+    channel = linked.open_channel(runtime())
+    try:
+        assert channel.call(worker_pid(), (), {})[0] != os.getpid()
+        assert len(ssh.commands) == 1
+    finally:
+        channel.close()
+
+
+def test_a_link_account_with_no_address_names_the_missing_rendezvous(
+    isolated_home, tmp_path, ssh
+) -> None:
+    provider = provider_of(
+        LocalShell, "lab", tailcat="100.64.0.9", tailcat_port=7001, link="letify-link"
+    )
+    provider.__dict__["fake_ssh"] = ssh
+    with pytest.raises(ProviderUnavailable) as raised:
+        provider.open_channel(runtime())
+    assert "lab" in str(raised.value)
+    assert "letify-link needs an address until the NAT rendezvous lands" in str(raised.value)
+    assert ssh.commands == []
+
+
+# -- Gap 3: the resume window is the lease -------------------------------------------
+
+
+def test_the_local_session_and_the_shim_use_the_lease_as_the_resume_window(
+    linked, ssh, monkeypatch
+) -> None:
+    from letify.runtime import lease
+
+    seen: list[Any] = []
+    original = linkd.LinkDaemon.open_session
+
+    def spy(self, peer, candidates, rendezvous=None, *, config=None):
+        seen.append(config)
+        return original(self, peer, candidates, rendezvous, config=config)
+
+    monkeypatch.setattr(linkd.LinkDaemon, "open_session", spy)
+    channel = linked.open_channel(runtime())
+    try:
+        assert seen[0]["resume_window_s"] == int(lease.GRACE)
+        shim = load_shim()
+        configured = shim.Shim({"resume_s": int(lease.GRACE), "allow": "n", "bind": "x"})
+        assert configured.listen_request()["config"] == {"resume_window_s": int(lease.GRACE)}
+        assert int(lease.GRACE) == linkchannel.RESUME_S
+    finally:
+        channel.close()
+
+
+def load_shim() -> Any:
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location("linkshim_under_test", linkchannel.shim_path())
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_the_shim_leaves_when_no_session_has_a_path_for_the_resume_window() -> None:
+    shim = load_shim().Shim({"resume_s": 10, "wait_s": 60})
+    shim.started = time.monotonic()
+    shim.handed_over = True
+    shim.on_event({"event": "session_incoming", "session": 1})
+    shim.on_event({"event": "session_incoming", "session": 2})
+    shim.on_event({"event": "path_added", "session": 1, "name": "a"})
+    shim.on_event({"event": "path_added", "session": 2, "name": "b"})
+    shim.on_event({"event": "path_lost", "session": 1, "name": "a"})
+    shim.last_path = time.monotonic() - 100
+    # Session 2 still has a path, so the shim stays.
+    shim.check_idle()
+    shim.on_event({"event": "path_lost", "session": 2, "name": "b"})
+    shim.last_path = time.monotonic() - 100
+    with pytest.raises(SystemExit):
+        shim.check_idle()
+
+
+# -- Gap 5: the worker's standard error -----------------------------------------------
+
+
+def test_a_worker_that_dies_before_speaking_shows_the_tail_of_its_standard_error(
+    linked, ssh, monkeypatch
+) -> None:
+    from letify.errors import RuntimeFailure
+    from letify.protocol import worker
+
+    noisy = (
+        "import sys\nfor i in range(60):\n    sys.stderr.write('row-%03d\\n' % i)\nsys.exit(3)\n"
+    )
+    monkeypatch.setattr(worker, "BOOTSTRAP", noisy)
+    channel = linked.open_channel(runtime())
+    try:
+        with pytest.raises(RuntimeFailure) as raised:
+            channel.start()
+        text = str(raised.value)
+        assert "row-059" in text and "row-020" in text
+        assert "row-019" not in text
+    finally:
+        channel.close()
+
+
+def test_a_stream_with_a_bad_first_line_is_closed() -> None:
+    shim = load_shim().Shim({"resume_s": 10, "wait_s": 60, "python": sys.executable})
+    lines = (
+        b"not json\n",
+        b'{"kind":"nope","token":"ab"}\n',
+        b'{"kind":"worker","token":"../x"}\n',
+    )
+    for line in lines:
+        near, far = socket.socketpair()
+        far.settimeout(10)
+        thread = threading.Thread(target=shim.serve_socket, args=(near,), daemon=True)
+        thread.start()
+        far.sendall(line)
+        assert far.recv(10) == b""
+        thread.join(10)
+        far.close()
