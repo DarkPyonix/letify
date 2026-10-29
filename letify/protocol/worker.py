@@ -2915,6 +2915,7 @@ def _end_by_owner():
     import signal
     _run_exit_hooks("the owner shut down")
     _end_descendants()
+    _drop_record()
     os._exit(128 + signal.SIGTERM)
 
 
