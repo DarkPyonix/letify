@@ -41,6 +41,71 @@
 //! The relay role is the Cargo feature `relay` ([`relay`]). The caller supplies the candidate
 //! dialers.
 //!
+//! # Embedding
+//!
+//! The crate is a library first. An application links it and runs it in its own process. The
+//! `letify-link` executable is one embedder of it, for the Python package. There is no `Node`
+//! object: a node is the pieces below, owned by the embedder.
+//!
+//! **Who owns the runtime.** The caller does. The crate never creates a tokio runtime and
+//! never blocks a thread. Every function is async, and the tasks that a [`Session`], a
+//! [`PathManager`] or a relay start are spawned with `tokio::spawn`, so they land on the runtime
+//! that is current when the function is called. An embedder with its own runtime calls the
+//! crate from inside it, with `handle.spawn(..)` or inside `handle.enter()`. An embedder with
+//! no runtime (a C caller, an iOS app) builds one and keeps it alive for as long as it holds a
+//! session: a multi-thread runtime with `enable_all()` when the `relay` feature is on, a
+//! current-thread one otherwise. The `letify-link` binary does exactly that. A later
+//! `letify-link-ffi` crate will own a runtime for C callers; this crate does not.
+//!
+//! **Lifecycle.**
+//!
+//! 1. *Start.* Load or generate an [`Identity`]. The node id is `identity.node_id()`. Build an
+//!    [`Acceptor`] with it to take incoming transports, and call [`PathManager::start`] (or
+//!    [`Session::connect`] on a transport of your own) to reach a peer.
+//! 2. *Run.* Feed incoming TCP connections and UDP paths to [`Acceptor::accept_tcp`]. It returns
+//!    [`Accepted::Session`] for a new peer and adds a subflow to a live session otherwise. Open
+//!    and accept streams on the [`Session`]. Watch [`Session::subflow_changes`] and the
+//!    [`PathManager`] events for paths.
+//! 3. *Stop.* Call [`Session::close`], which writes the queued frames first, then drop the
+//!    [`PathManager`], which aborts its dialers. Dropping every handle of a session ends it.
+//!    Shut the runtime down last. A relay stops when its `run` task is dropped.
+//!
+//! ```no_run
+//! use letify_link::{Acceptor, Accepted, Config, Identity, PeerPolicy};
+//! use tokio::io::AsyncWriteExt;
+//! use tokio::net::TcpListener;
+//!
+//! # async fn demo(rt: tokio::runtime::Handle) -> std::io::Result<()> {
+//! let identity = Identity::generate();
+//! let acceptor = std::sync::Arc::new(Acceptor::new(
+//!     identity,
+//!     PeerPolicy::from_fn(|_| true),
+//!     Config::default(),
+//! ));
+//! let listener = TcpListener::bind("0.0.0.0:0").await?;
+//! // The caller's handle decides which runtime runs the session.
+//! rt.spawn(async move {
+//!     while let Ok((tcp, _)) = listener.accept().await {
+//!         let acceptor = acceptor.clone();
+//!         tokio::spawn(async move {
+//!             if let Ok(Accepted::Session(session)) = acceptor.accept_tcp(tcp).await {
+//!                 if let Ok(mut stream) = session.accept_stream().await {
+//!                     let _ = stream.write_all(b"hello").await;
+//!                 }
+//!                 session.close().await;
+//!             }
+//!         });
+//!     }
+//! });
+//! # Ok(()) }
+//! ```
+//!
+//! **Build targets.** The crate is pure Rust (rustls uses the ring backend) and is checked in
+//! CI on Linux, macOS and Windows, and for `aarch64-apple-ios` and `aarch64-linux-android`. It
+//! builds as an `rlib` only. A C ABI needs `extern "C"` exports and a header, which belong in a
+//! separate `letify-link-ffi` crate with `staticlib` and `cdylib` outputs; adding those
+//! crate types here would build artifacts that export nothing.
+//!
 //! # Errors
 //!
 //! A stream whose session lost every subflow for longer than the resume window fails with an
@@ -54,6 +119,7 @@ mod frame;
 mod handshake;
 pub mod hysteresis;
 mod identity;
+pub mod observe;
 mod paths;
 pub mod policing;
 pub mod punch;

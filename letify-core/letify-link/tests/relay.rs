@@ -455,3 +455,164 @@ async fn a_relay_path_is_dropped_as_soon_as_a_direct_path_carries_traffic() {
         started.elapsed()
     );
 }
+
+/// Pair `a` with `b` through the relay and return their ends.
+async fn pair(
+    relay_id: &Identity,
+    addr: std::net::SocketAddr,
+    a: &Identity,
+    b: &Identity,
+) -> (TcpStream, TcpStream) {
+    let token = new_token();
+    let da = RelayDialer::new(addr.to_string(), relay_id.node_id(), a.clone());
+    let db = RelayDialer::new(addr.to_string(), relay_id.node_id(), b.clone());
+    let (ra, rb) = tokio::join!(
+        da.connect(b.node_id(), token),
+        db.connect(a.node_id(), token)
+    );
+    (ra.unwrap(), rb.unwrap())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_revoked_node_is_disconnected_from_the_relay_at_once() {
+    let a = Identity::generate();
+    let b = Identity::generate();
+    let id = Identity::generate();
+    let relay = Relay::bind("127.0.0.1:0", id.clone(), open(), RelayConfig::default())
+        .await
+        .unwrap();
+    let addr = relay.local_addr();
+    let handle = relay.handle();
+    tokio::spawn(relay.run());
+    let (mut ta, mut tb) = pair(&id, addr, &a, &b).await;
+    ta.write_all(b"ping").await.unwrap();
+    let mut buf = [0u8; 4];
+    tb.read_exact(&mut buf).await.unwrap();
+
+    handle.revoke(a.node_id());
+    // Both ends of the splice see the close well inside a second.
+    let mut rest = Vec::new();
+    let closed = timeout(Duration::from_millis(500), tb.read_to_end(&mut rest)).await;
+    assert!(closed.is_ok(), "the other end of the splice was not closed");
+    let mut sink = [0u8; 8];
+    let end = timeout(Duration::from_millis(500), ta.read(&mut sink))
+        .await
+        .expect("the revoked end was not closed");
+    assert!(matches!(end, Ok(0) | Err(_)));
+
+    // New pairings of the revoked node are refused, and allow admits it again.
+    let d = RelayDialer::new(addr.to_string(), id.node_id(), a.clone());
+    assert!(d.connect(b.node_id(), new_token()).await.is_err());
+    handle.allow(a.node_id());
+    let (mut ta, mut tb) = pair(&id, addr, &a, &b).await;
+    ta.write_all(b"back").await.unwrap();
+    tb.read_exact(&mut buf).await.unwrap();
+    assert_eq!(&buf, b"back");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn per_pair_rate_shares_are_fair() {
+    // Client a holds two pairs, with b and with c, under one 128 KiB/s budget. Each pair gets
+    // 64 KiB/s, so 96 KiB takes about 1.5 s on both at once, not 3 s on one of them.
+    let (relay_id, relay_addr) = start_relay(
+        open(),
+        RelayConfig {
+            rate_limit: Some(128 * 1024),
+            ..RelayConfig::default()
+        },
+    )
+    .await;
+    let (a, b, c) = (
+        Identity::generate(),
+        Identity::generate(),
+        Identity::generate(),
+    );
+    let (mut tab, tba) = pair(&relay_id, relay_addr, &a, &b).await;
+    let (mut tac, tca) = pair(&relay_id, relay_addr, &a, &c).await;
+    let size = 96 * 1024;
+    let start = Instant::now();
+    let w1 = tokio::spawn(async move {
+        tab.write_all(&pattern(size, 1)).await.unwrap();
+        tab
+    });
+    let w2 = tokio::spawn(async move {
+        tac.write_all(&pattern(size, 2)).await.unwrap();
+        tac
+    });
+    let read = |mut t: TcpStream| async move {
+        let mut got = vec![0u8; size];
+        timeout(Duration::from_secs(20), t.read_exact(&mut got))
+            .await
+            .unwrap()
+            .unwrap();
+        (start.elapsed(), t)
+    };
+    let ((t1, _k1), (t2, _k2)) = tokio::join!(read(tba), read(tca));
+    let _ = (w1.await, w2.await);
+    // Both finish near 1.5 s. Neither is much ahead of the other.
+    for t in [t1, t2] {
+        assert!(t >= Duration::from_millis(1000), "took {t:?}");
+        assert!(t < Duration::from_millis(2600), "took {t:?}");
+    }
+    let gap = t1.abs_diff(t2);
+    assert!(gap < Duration::from_millis(700), "gap {gap:?}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_pair_rate_cap_holds_one_pair_below_the_client_budget() {
+    let (relay_id, relay_addr) = start_relay(
+        open(),
+        RelayConfig {
+            rate_limit: Some(1 << 20),
+            pair_rate_limit: Some(64 * 1024),
+            ..RelayConfig::default()
+        },
+    )
+    .await;
+    let (a, b) = (Identity::generate(), Identity::generate());
+    let (mut ta, mut tb) = pair(&relay_id, relay_addr, &a, &b).await;
+    let start = Instant::now();
+    let w = tokio::spawn(async move {
+        ta.write_all(&pattern(128 * 1024, 3)).await.unwrap();
+        ta
+    });
+    let mut got = vec![0u8; 128 * 1024];
+    timeout(Duration::from_secs(20), tb.read_exact(&mut got))
+        .await
+        .unwrap()
+        .unwrap();
+    let _ = w.await;
+    assert!(start.elapsed() >= Duration::from_millis(1400));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn many_pending_pairings_on_a_hub() {
+    let (relay_id, relay_addr) = start_relay(open(), RelayConfig::default()).await;
+    assert_eq!(RelayConfig::default().max_pending, 64);
+    let hub_client = Identity::generate();
+    // One device waits on 40 peers at once, more than the old limit of 8.
+    let mut waits = Vec::new();
+    let mut peers = Vec::new();
+    for _ in 0..40 {
+        let peer = Identity::generate();
+        let token = new_token();
+        let d = RelayDialer::new(
+            relay_addr.to_string(),
+            relay_id.node_id(),
+            hub_client.clone(),
+        );
+        let peer_id = peer.node_id();
+        waits.push(tokio::spawn(async move { d.connect(peer_id, token).await }));
+        peers.push((peer, token));
+    }
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    for (peer, token) in peers {
+        let d = RelayDialer::new(relay_addr.to_string(), relay_id.node_id(), peer);
+        let hub = hub_client.node_id();
+        tokio::spawn(async move { d.connect(hub, token).await });
+    }
+    for w in waits {
+        let r = timeout(Duration::from_secs(20), w).await.unwrap().unwrap();
+        assert!(r.is_ok(), "{:?}", r.err());
+    }
+}

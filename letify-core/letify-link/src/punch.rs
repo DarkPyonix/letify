@@ -82,14 +82,19 @@ pub fn pair_token(token: &[u8; 16], index: u8) -> Vec<u8> {
     out
 }
 
-/// A TCP socket bound to `local` with `SO_REUSEADDR` and `SO_REUSEPORT`, so one port can hold a
-/// listener and a dialer at the same time.
+/// A TCP socket bound to `local` with `SO_REUSEADDR` and, where it exists, `SO_REUSEPORT`, so
+/// one port can hold a listener and a dialer at the same time.
+///
+/// Windows has no `SO_REUSEPORT`. There `SO_REUSEADDR` alone lets sockets share a port, and
+/// `SO_EXCLUSIVEADDRUSE` is left off because it would refuse the second bind. A crossing SYN may
+/// then complete on the dialer or on the listener, and the punch takes whichever completes.
 pub fn reusable_socket(local: SocketAddr) -> io::Result<TcpSocket> {
     let sock = if local.is_ipv4() {
         TcpSocket::new_v4()?
     } else {
         TcpSocket::new_v6()?
     };
+    // On Windows this is the whole of the sharing, see the doc comment above.
     sock.set_reuseaddr(true)?;
     #[cfg(all(unix, not(any(target_os = "solaris", target_os = "illumos"))))]
     sock.set_reuseport(true)?;
@@ -396,6 +401,16 @@ pub fn birthday_hit_probability(mappings: usize, dests: usize) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn a_listener_and_a_dialer_can_share_one_local_port_on_every_platform() {
+        let first = reusable_socket("127.0.0.1:0".parse().unwrap()).unwrap();
+        let addr = first.local_addr().unwrap();
+        let _listener = first.listen(8).unwrap();
+        // The second socket binds the port the listener holds, as the punch does to dial out.
+        let second = reusable_socket(addr).unwrap();
+        assert_eq!(second.local_addr().unwrap(), addr);
+    }
 
     fn plan_in(start: u64, window: u64) -> Plan {
         let now = now_ms();

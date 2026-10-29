@@ -12,17 +12,17 @@
 //!   direction) of a status byte, 0 paired or 1 refused, then a short English reason.
 //! - After status 0 both connections carry the session bytes verbatim.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use snow::StatelessTransportState;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::Semaphore;
+use tokio::sync::{Notify, Semaphore};
 use tokio::time::Instant;
 
 use crate::config::Config;
@@ -47,13 +47,18 @@ pub struct RelayConfig {
     pub handshake_timeout: Duration,
     /// Time a request waits for its counterpart. Default 30 s.
     pub pair_timeout: Duration,
-    /// Waiting requests one client may hold. Default 8.
+    /// Waiting requests one client may hold. Default 64, sized for a hub that serves many
+    /// devices; an operator of a small relay lowers it.
     pub max_pending: usize,
     /// Size of the buffer of one direction of a pair. Default 16 KiB.
     pub buffer_bytes: usize,
-    /// Bytes per second the relay forwards from one client, summed over its pairs. Default
-    /// none.
+    /// Bytes per second the relay forwards from one client. The budget is shared per pair: each
+    /// live pair of the client gets `rate_limit / n` in the direction the client writes, where
+    /// `n` is the number of live pairs of that client. Default none.
     pub rate_limit: Option<u64>,
+    /// Bytes per second one pair may carry in the direction one client writes, whatever the
+    /// client budget. A pair is held to the smaller of this and its share. Default none.
+    pub pair_rate_limit: Option<u64>,
     /// Connections the relay serves at once. Default 1024.
     pub max_connections: usize,
 }
@@ -63,30 +68,73 @@ impl Default for RelayConfig {
         RelayConfig {
             handshake_timeout: Duration::from_secs(10),
             pair_timeout: Duration::from_secs(30),
-            max_pending: 8,
+            max_pending: 64,
             buffer_bytes: 16 << 10,
             rate_limit: None,
+            pair_rate_limit: None,
             max_connections: 1024,
         }
     }
 }
 
-/// Spreads a byte rate over time: a caller waits until its bytes fit under the rate.
+/// The live pairs of one client, which divide the client's rate budget between them.
+#[derive(Default)]
+struct ClientShare {
+    live: AtomicUsize,
+}
+
+/// Spreads the bytes one client writes into one pair over time: a caller waits until its bytes
+/// fit under the pair's current rate. The rate is read at each call, so it follows the number
+/// of live pairs of the client. Dropping the limiter releases the pair's share.
 struct Limiter {
-    rate: f64,
+    client: Arc<ClientShare>,
+    budget: Option<u64>,
+    cap: Option<u64>,
     next: tokio::sync::Mutex<Instant>,
 }
 
 impl Limiter {
+    fn new(client: Arc<ClientShare>, budget: Option<u64>, cap: Option<u64>) -> Limiter {
+        client.live.fetch_add(1, Ordering::SeqCst);
+        Limiter {
+            client,
+            budget,
+            cap,
+            next: tokio::sync::Mutex::new(Instant::now()),
+        }
+    }
+
+    fn rate(&self) -> f64 {
+        let live = self.client.live.load(Ordering::SeqCst).max(1) as f64;
+        let share = self.budget.map(|b| b as f64 / live);
+        let cap = self.cap.map(|c| c as f64);
+        let rate = match (share, cap) {
+            (Some(s), Some(c)) => s.min(c),
+            (Some(r), None) | (None, Some(r)) => r,
+            (None, None) => f64::INFINITY,
+        };
+        rate.max(1.0)
+    }
+
     async fn acquire(&self, n: usize) {
+        let rate = self.rate();
+        if !rate.is_finite() {
+            return;
+        }
         let wake = {
             let mut next = self.next.lock().await;
             let now = Instant::now();
             let start = (*next).max(now);
-            *next = start + Duration::from_secs_f64(n as f64 / self.rate);
+            *next = start + Duration::from_secs_f64(n as f64 / rate);
             start
         };
         tokio::time::sleep_until(wake).await;
+    }
+}
+
+impl Drop for Limiter {
+    fn drop(&mut self) {
+        self.client.live.fetch_sub(1, Ordering::SeqCst);
     }
 }
 
@@ -103,13 +151,29 @@ struct Waiting {
 
 type PairKey = (NodeId, NodeId, [u8; TOKEN_LEN]);
 
+/// A running splice, kept so that a revoke can close it.
+struct Live {
+    ends: [NodeId; 2],
+    close: Arc<Notify>,
+}
+
+/// The allow list edits made while the relay runs, on top of the policy it started with.
+#[derive(Default)]
+struct Edits {
+    allowed: HashSet<NodeId>,
+    revoked: HashSet<NodeId>,
+}
+
 struct Inner {
     identity: Identity,
+    /// The startup policy combined with the edits.
     policy: PeerPolicy,
+    edits: Arc<Mutex<Edits>>,
+    live: Mutex<HashMap<u64, Live>>,
     cfg: RelayConfig,
     link: Config,
     waiting: Mutex<HashMap<PairKey, Waiting>>,
-    limiters: Mutex<HashMap<NodeId, Arc<Limiter>>>,
+    shares: Mutex<HashMap<NodeId, Arc<ClientShare>>>,
     serial: AtomicU64,
 }
 
@@ -129,6 +193,14 @@ impl Relay {
         cfg: RelayConfig,
     ) -> io::Result<Relay> {
         let listener = TcpListener::bind(addr).await?;
+        let edits = Arc::new(Mutex::new(Edits::default()));
+        let gate = {
+            let edits = edits.clone();
+            PeerPolicy::from_fn(move |id| {
+                let e = edits.lock().unwrap();
+                !e.revoked.contains(id) && (e.allowed.contains(id) || policy.accepts(id))
+            })
+        };
         let link = Config {
             handshake_timeout: cfg.handshake_timeout,
             ..Config::default()
@@ -137,11 +209,13 @@ impl Relay {
             listener,
             inner: Arc::new(Inner {
                 identity,
-                policy,
+                policy: gate,
+                edits,
+                live: Mutex::new(HashMap::new()),
                 cfg,
                 link,
                 waiting: Mutex::new(HashMap::new()),
-                limiters: Mutex::new(HashMap::new()),
+                shares: Mutex::new(HashMap::new()),
                 serial: AtomicU64::new(0),
             }),
         })
@@ -157,6 +231,24 @@ impl Relay {
     /// The node id clients must register for this relay.
     pub fn node_id(&self) -> NodeId {
         self.inner.identity.node_id()
+    }
+
+    /// Admit `node` from now on, whatever the startup policy says. See [`RelayHandle::allow`].
+    pub fn allow(&self, node: NodeId) {
+        self.inner.allow(node);
+    }
+
+    /// Refuse `node` and close its live splices at once. See [`RelayHandle::revoke`].
+    pub fn revoke(&self, node: NodeId) {
+        self.inner.revoke(node);
+    }
+
+    /// A cloneable handle for `allow` and `revoke` that outlives [`Relay::run`], which consumes
+    /// the relay.
+    pub fn handle(&self) -> RelayHandle {
+        RelayHandle {
+            inner: self.inner.clone(),
+        }
     }
 
     /// Serve until the task is dropped.
@@ -177,6 +269,53 @@ impl Relay {
                 drop(permit);
             });
         }
+    }
+}
+
+/// Changes the allow list of a running relay.
+#[derive(Clone)]
+pub struct RelayHandle {
+    inner: Arc<Inner>,
+}
+
+impl RelayHandle {
+    /// Admit `node` from now on, whatever the startup policy says, and undo an earlier revoke.
+    pub fn allow(&self, node: NodeId) {
+        self.inner.allow(node);
+    }
+
+    /// Refuse the new handshakes of `node`, drop its waiting requests and close every live
+    /// splice that has it on either end, at once. It overrides the startup policy until
+    /// [`RelayHandle::allow`] is called for the node.
+    pub fn revoke(&self, node: NodeId) {
+        self.inner.revoke(node);
+    }
+}
+
+impl Inner {
+    fn allow(&self, node: NodeId) {
+        let mut e = self.edits.lock().unwrap();
+        e.revoked.remove(&node);
+        e.allowed.insert(node);
+    }
+
+    fn revoke(&self, node: NodeId) {
+        {
+            let mut e = self.edits.lock().unwrap();
+            e.allowed.remove(&node);
+            e.revoked.insert(node);
+        }
+        // Dropping a waiting request closes its connection.
+        self.waiting.lock().unwrap().retain(|k, _| k.0 != node);
+        for live in self.live.lock().unwrap().values() {
+            if live.ends.contains(&node) {
+                live.close.notify_one();
+            }
+        }
+    }
+
+    fn is_revoked(&self, node: &NodeId) -> bool {
+        self.edits.lock().unwrap().revoked.contains(node)
     }
 }
 
@@ -230,6 +369,9 @@ async fn serve(inner: Arc<Inner>, mut tcp: TcpStream) -> io::Result<()> {
     let want = NodeId::from_bytes(request[..32].try_into().unwrap());
     let token: [u8; TOKEN_LEN] = request[32..].try_into().unwrap();
     let me = est.peer;
+    if inner.is_revoked(&me) {
+        return Err(io_err("revoked"));
+    }
     let mine = Conn {
         tcp,
         crypto,
@@ -285,22 +427,14 @@ async fn serve(inner: Arc<Inner>, mut tcp: TcpStream) -> io::Result<()> {
     Ok(())
 }
 
-fn limiter_for(inner: &Inner, node: NodeId) -> Option<Arc<Limiter>> {
-    let rate = inner.cfg.rate_limit?;
-    let mut limiters = inner.limiters.lock().unwrap();
-    // Forget the nodes that have no pair running, so an open relay does not grow without bound.
-    limiters.retain(|_, l| Arc::strong_count(l) > 1);
-    Some(
-        limiters
-            .entry(node)
-            .or_insert_with(|| {
-                Arc::new(Limiter {
-                    rate: rate.max(1) as f64,
-                    next: tokio::sync::Mutex::new(Instant::now()),
-                })
-            })
-            .clone(),
-    )
+fn limiter_for(inner: &Inner, node: NodeId) -> Limiter {
+    let share = {
+        let mut shares = inner.shares.lock().unwrap();
+        // Forget the nodes that have no pair running, so an open relay does not grow without bound.
+        shares.retain(|_, s| Arc::strong_count(s) > 1);
+        shares.entry(node).or_default().clone()
+    };
+    Limiter::new(share, inner.cfg.rate_limit, inner.cfg.pair_rate_limit)
 }
 
 /// Copy `from` to `to` through one buffer, waiting for the sender's rate limit before each write.
@@ -308,7 +442,7 @@ async fn pump(
     mut from: tokio::net::tcp::OwnedReadHalf,
     mut to: tokio::net::tcp::OwnedWriteHalf,
     buffer: usize,
-    limiter: Option<Arc<Limiter>>,
+    limiter: Limiter,
 ) {
     let mut buf = vec![0u8; buffer.max(1)];
     loop {
@@ -316,17 +450,28 @@ async fn pump(
             Ok(0) | Err(_) => return,
             Ok(n) => n,
         };
-        if let Some(l) = &limiter {
-            l.acquire(n).await;
-        }
+        limiter.acquire(n).await;
         if to.write_all(&buf[..n]).await.is_err() {
             return;
         }
     }
 }
 
-/// Copy both directions until either ends, then close both connections.
+/// Copy both directions until either ends or the splice is revoked, then close both connections.
 async fn splice(inner: &Inner, a: Conn, b: Conn) {
+    let close = Arc::new(Notify::new());
+    let id = inner.serial.fetch_add(1, Ordering::Relaxed);
+    inner.live.lock().unwrap().insert(
+        id,
+        Live {
+            ends: [a.node, b.node],
+            close: close.clone(),
+        },
+    );
+    // A revoke between pairing and registration found no splice to close; it left the mark.
+    if inner.is_revoked(&a.node) || inner.is_revoked(&b.node) {
+        close.notify_one();
+    }
     let (la, lb) = (limiter_for(inner, a.node), limiter_for(inner, b.node));
     let (ar, aw) = a.tcp.into_split();
     let (br, bw) = b.tcp.into_split();
@@ -334,7 +479,9 @@ async fn splice(inner: &Inner, a: Conn, b: Conn) {
     tokio::select! {
         _ = pump(ar, bw, buffer, la) => {}
         _ = pump(br, aw, buffer, lb) => {}
+        _ = close.notified() => {}
     }
+    inner.live.lock().unwrap().remove(&id);
 }
 
 /// Reaches a peer through a relay the user registered.
