@@ -24,6 +24,12 @@ Read this table first. Most confusion about letify is one of these words meaning
 | **persistence** | Whether a provider's storage outlives a session: `persistent` or `ephemeral`. |
 | **RemoteTensor** | Under `host="local"`, the local stand-in for a tensor on the runtime's GPU: a meta tensor for shape and dtype plus a handle. Reports its device as `cuda:0`. |
 | **device worker** | The process on the runtime that runs PyTorch operators on real tensors keyed by handle, one per session. |
+| **link session** | The encrypted, multiplexed connection between two nodes, owned by letify-link. Not a runtime session. |
+| **subflow** | A path the link session uses at this moment. A session may have several TCP subflows. |
+| **path** | One transport route between two nodes: a TCP connection or a UDP address pair. |
+| **path manager** | The part of letify-link that probes paths, moves the session to a faster one and reconnects when one dies. |
+| **Rendezvous trait** | The interface letify-link calls to carry small messages between two nodes before a path exists. letify implements it with provider bootstraps. |
+| **sidecar** | The `letify-link` executable the Python package starts and talks to over local sockets. |
 | **letify-core** | The Rust workspace in `letify-core/`: the `letify` crate and the `letify-quic` binary. The CUDA driver stand-in it once held is removed. |
 
 ## The shape of the thing

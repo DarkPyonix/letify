@@ -96,6 +96,10 @@ object storage in one of their clouds, which letify already reaches with the `bu
 and the GCS backend. The second needs no inbound anywhere, which is the property the measurements
 above say is missing.
 
+### N11. A session that survives path changes makes a dropped path cost the call nothing
+
+A call that is running when its path dies, or when a faster path replaces it, finishes with the same result and no more than the reconnect time added to its wall time. The session retransmits unacknowledged frames after the change and the streams above see a pause, not an error. Where TCP passes and UDP does not, or the reverse, one session design carries both, and the measured link floor decides what is accepted, as [letify-link](SPEC.md#letify-link) specifies. An experiment refutes it by killing the path mid-call and comparing the result and the wall time with an undisturbed run.
+
 ## How an experiment reports efficiency
 
 This standard sits here rather than in `docs/SPEC.md` because it governs how a claim is tested, not what the system does. The spec records the design; this records what a report has to show before a claim above may be called supported. Every experiment pull request follows it.
@@ -114,7 +118,7 @@ A report that omits one of the four is incomplete, and its claim stays open.
 - **The local process stays alive for the duration of a run.** letify does not offer detached execution. A detached run whose remote side is evicted loses its results, so the local process stays the owner and the durable artifacts are checkpoints in the store.
 - **Nothing is torn down by hand.** No release call and no shutdown call on the public surface. A call ends its own session, an idle one is reaped, and the lease covers a crash.
 - **No credential in a tracked file.** Accounts live in `~/.letify/config.toml`, and credentials live in the environment or in `~/.letify/accounts`.
-- **A slow link is a failure, not a fallback.** letify connects over a link fast enough for the work, or it refuses to connect and says why. A relayed or otherwise degraded path that merely completes is worse than no connection: it bills GPU hours while the transfer dominates the run, and the user cannot see that from the result. So no relay path is offered, and a measured link below the floor the account declares fails the connection.
+- **A slow link is a failure, not a fallback.** letify connects over a link fast enough for the work, or it refuses to connect and says why. A relayed or otherwise degraded path that merely completes is worse than no connection: it bills GPU hours while the transfer dominates the run, and the user cannot see that from the result. This is letify's policy, not a limit of the connection library: letify-link can relay, and letify builds it without that feature and never enables it. So no relay path is offered, and a measured link below the floor the account declares fails the connection.
 - **Colab accelerators require a paid entitlement.** The remote control features letify uses are permitted on paid plans while the compute unit balance is positive.
 
 ## Non-goals

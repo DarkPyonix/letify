@@ -1993,6 +1993,110 @@ The remote side needs the same binary. It is not downloaded from a release with 
 
 A platform with no `letify-quic` in its wheel skips the strategy with the reason `letify-quic is not in this wheel`, and a remote whose download fails skips it with what the download said.
 
+### letify-link <!-- id: letify-link -->
+
+> The 3.0 connection layer: one Rust library that rendezvouses, punches, manages paths and runs an encrypted session, so frames never depend on which path carries them.
+
+This section is a hypothesis on a branch, to be adopted or rejected by the experiments in [ROADMAP-3.0.md](ROADMAP-3.0.md) (milestones M2 to M4). When it lands, it replaces the Tailcat strategy of [Connection strategies](#connection-strategies), [QUIC over a punched UDP pair](#quic) and the ssh data path of `PersistentChannel` in [Channels](#channels). Until then those sections describe what 2.x does. [Link floor](#link-floor), [Choosing a link](#choosing-a-link) and [Link cache](#link-cache) stay in force.
+
+`letify-link` is a crate in `letify-core/`. It owns four things: rendezvous, path discovery and punching, path management, and the secure session. The letify protocol above it (frames, the worker channel, transfers, takeover) sees one reliable, ordered, encrypted stream per channel and does not know which path carries it.
+
+Terms used below. A **path** is one transport route between two nodes: one TCP connection or one UDP address pair. A **subflow** is a path that the session uses at this moment. A **session** is the encrypted, multiplexed connection between two nodes. A **node** is one end, identified by a key. A **sidecar** is the `letify-link` executable that the Python package starts.
+
+#### Why a session of our own <!-- id: link-why -->
+
+> No single transport carries every network measured, so the session sits above the transports.
+
+| Observation | Source |
+|---|---|
+| A TCP punch to Colab Pro measured 31 MiB/s up and 31 MiB/s down at 84 ms. The UDP path through Tailcat measured 1.5 MiB/s up and 0.1 MiB/s down and was rejected (2026-10-29). | [NETWORK.md](NETWORK.md) |
+| Two Kaggle VMs dropped every TCP SYN for 45 s and passed no UDP datagram in 30 s (2026-10-13). Neither transport reaches that pair. | INTENT, N10 |
+| One TCP flow on a Backend.AI container caps near 2 MiB/s from loss at 185 ms. Four punched sockets raised Colab Pro upload from 5.1 to 12.6 MiB/s. | [Rendezvous](#rendezvous) |
+
+TCP carries the networks that pass a simultaneous open, and UDP carries those that pass only datagrams. QUIC migrates a connection only between UDP paths and cannot carry TCP subflows, so a QUIC connection cannot be the session. The session is a Noise session that runs over either transport and over several paths at once.
+
+#### Session <!-- id: link-session -->
+
+> Noise IK, then encrypted frames with their own stream multiplexing, independent of the transport.
+
+1. **Handshake.** Noise_IK with X25519, ChaCha20-Poly1305 and BLAKE2s. The first handshake message carries a protocol version, a 16-bit integer. The responder accepts the highest version both support. When none is common, it refuses with a message that names both versions, so mixed versions coexist during a rollout. The initiator knows the responder's static key before it connects, because the bootstrap exchanged both public keys. A node that does not hold a peer's key refuses the handshake. There is no certificate and no token: the key is the peer's identity.
+2. **Streams.** Each stream has an id, ordered delivery, its own flow-control window and a close that is separate from the session's. The worker channel, a transfer and a probe each use their own stream. A stream can be opened by either side.
+3. **Sequencing.** Every session frame carries a 64-bit sequence number. The receiver delivers in order and holds frames that arrive early. A frame is kept by the sender until the receiver acknowledges it.
+4. **Subflows.** The sender schedules frames across the subflows in proportion to each subflow's measured rate and keeps a per-subflow window, as MPTCP does. The receiver reorders by sequence number. The multi-socket punch of [Rendezvous](#rendezvous) becomes several TCP subflows of one session instead of several SSH connections.
+5. **Path change.** When the last subflow dies, the session keeps its keys and its unacknowledged frames, waits for the path manager to supply a new path (TCP or UDP), runs a short resume exchange that names the highest sequence number received, and retransmits everything after it. Streams above see a pause, not an error. A session that finds no path within 60 s ends, and the streams fail with a connection error that tells infrastructure failure from user code failure, as [Channels](#channels) requires.
+6. **UDP paths.** Loss recovery and congestion control (BBR) of a UDP path belong to the path layer under the session, which hands the session a reliable datagram pipe. Whether that layer reuses a QUIC implementation such as quinn is an implementation choice and not part of this specification.
+
+#### Paths and the path manager <!-- id: link-paths -->
+
+> Start on the first path that answers, keep probing, move to a faster path, reconnect when a path dies.
+
+The path manager runs inside the sidecar. Its rules:
+
+1. **Start fast.** The session starts on the first path that completes the handshake, even if a better one is still being punched.
+2. **Probe in the background.** Every candidate path keeps being tried while the session runs. A candidate that completes the handshake is measured with the probe of [Choosing a link](#choosing-a-link): 30 round trips, a discarded warm-up, then 2 s of transfer in each direction.
+3. **Move when faster.** When a probed path beats the current ones by the 25% rule of [Choosing a link](#choosing-a-link), it is added as a subflow, or replaces the current path when the transport type differs and the current path is the slower. In-flight frames are never lost by a move, because the session retransmits after a path change.
+4. **Reconnect on death.** A path dies when its transport closes or when no frame or keepalive arrives for 3 keepalive intervals. The manager then restarts rendezvous for the paths that remain unknown and keeps the session alive as the Session item 5 describes.
+5. **Keepalive.** Each path sends a session keepalive every 15 s when it is idle, so a NAT mapping does not expire. TCP subflows also set `SO_KEEPALIVE` with `TCP_KEEPIDLE` 20 s and `TCP_KEEPINTVL` 10 s, as the TCP punch does today.
+6. **Policy stays with the caller.** The manager reports each path's measured rate and round trip. Whether a path is acceptable is the caller's decision. letify applies [Link floor](#link-floor) and the 25% rule, so a path below the floor is closed and never carries frames.
+
+#### Rendezvous trait <!-- id: link-rendezvous -->
+
+> The library asks a trait to carry small messages between the two nodes before any path exists.
+
+```rust
+trait Rendezvous {
+    async fn send(&self, to: NodeId, msg: Bytes) -> Result<()>;
+    async fn recv(&self) -> Result<(NodeId, Bytes)>;
+}
+```
+
+The library uses it to exchange public keys on first contact, address records, STUN mappings and punch timing. A message is small (under 4 KiB) and may be delayed by seconds. letify-link defines the **address record** in one documented binary format, so an implementation only transports it. The record holds the node id, a record version, a timestamp, a list of TCP candidates (`ip:port`), a list of UDP candidates, the NAT type of [NAT traversal](#link-nat), and optionally a relay URL. A pkarr signed packet is one way to carry it. The trait gives no secrecy guarantee: the session handshake authenticates every peer, and the messages carry no secret.
+
+letify implements the trait with its provider bootstraps: ssh, `colab exec`, the Kaggle API and the Drive mailbox. Another program implements it with its own signalling. darkpyonix Ember, for example, would use a hub that publishes pkarr signed packets. The library holds no provider-specific code.
+
+#### NAT traversal <!-- id: link-nat -->
+
+> The library classifies the NAT, predicts ports, sprays where prediction fails, and detects a network that drops a punched flow after it opens.
+
+1. **NAT type.** The node asks several STUN servers (at least 3) for its mapping and compares the results. The same mapped port from every server means an endpoint-independent mapping. A port that differs per server means a symmetric NAT, and the node reports the step between consecutive ports. Types are reported to the peer through the rendezvous.
+2. **Port prediction.** When one side is symmetric and the other is not, the symmetric side's next mapped ports are predicted from the observed step, and the other side sends to a small window of them.
+3. **Many-port attempts.** When both sides are symmetric, or prediction fails, each side opens up to 256 ports and sends to up to 256 destination ports (the birthday attempt). The limit is a library setting and the sidecar rate-limits the burst.
+4. **Policing detection.** After a path is established, the library sends a bulk burst on it before declaring it usable. A path that answers 30 round trips and then delivers under a twentieth of the floor, as [Link floor](#link-floor) describes, is reported as `policed` with the measured rates. The caller then rejects it as a failure.
+5. **Tailcat replacement.** The UDP address exchange that Tailcat does moves to the Rendezvous trait and the STUN step above. letify removes Tailcat in 3.0, together with `letify setup tailcat` and the Tunnel account's `tailcat` and `tailcat_port` fields. A Tunnel account then names an address or a bootstrap that can start the sidecar.
+
+#### Relay <!-- id: link-relay -->
+
+> An optional library feature that is off by default. letify never enables it.
+
+The library can forward frames through a third host when no direct path exists. It is a Cargo feature, `relay`, and a runtime setting that is off unless the caller sets it. The feature defines the relay protocol: a node dials the relay URL from its address record, and the relay forwards session ciphertext between two nodes by node id. Public address discovery does not need a relay. It uses STUN, as [NAT traversal](#link-nat) says. The session keys are end to end, so a relay sees only ciphertext.
+
+letify builds the sidecar without the feature. A slow or relayed link stays a failure in letify, as [Link floor](#link-floor) says. That is letify's policy about GPU hours billed during a slow transfer. It is not a limit of the library.
+
+#### Sidecar interface <!-- id: link-sidecar -->
+
+> Python starts one executable per node and talks to it over local sockets. No Python extension is linked.
+
+The sidecar is a binary named `letify-link`, built for each wheel and installed in `letify/remoting/lib/` next to `letify-quic`. The package stays pure Python.
+
+1. **Control channel.** The sidecar listens on a Unix domain socket whose path is passed on its command line, and on Windows on a loopback TCP port chosen by the operating system. Messages are length-prefixed JSON: `open_session`, `rendezvous_message`, `paths`, `open_stream`, `close`. The sidecar sends `path_added`, `path_lost`, `path_probe` and `rendezvous_out` events.
+2. **Streams.** `open_stream` returns a local stream socket (a Unix domain socket, or a loopback port on Windows) that Python reads and writes as it does a pipe. An incoming stream is announced as an event with its own local socket. Python never sees a path.
+3. **Rendezvous.** The Python side implements the trait for the sidecar. `rendezvous_out` events carry the message and the bootstrap that delivers it. `rendezvous_message` carries what the bootstrap received.
+4. **Remote start.** The bootstrap (ssh, `colab exec`, the Kaggle API) starts the remote sidecar with the local public key and the first rendezvous message, and gets the remote public key and its reply. After that, no frame uses the bootstrap.
+5. **Lifetime.** The sidecar exits when its control channel closes, so a crashed Python process leaves no sidecar and no billing path, as the lease rule in [Sessions](#sessions) requires.
+6. **Absence.** A platform whose wheel has no `letify-link` skips every letify-link path with the reason `letify-link is not in this wheel`. letify does not fall back to local execution.
+
+#### Identity <!-- id: link-identity -->
+
+> Nodes are ed25519 keys. The Noise static key is derived from the node key.
+
+A node holds an ed25519 key pair. Its node id is the public key. The X25519 static key used by the handshake is derived from the ed25519 key by the standard conversion, so one identity serves both signatures and the handshake. letify keeps its node key in `~/.letify/accounts` and never in a tracked file. The remote key lives for one session.
+
+The embedding application may supply its own ed25519 secret key, and the library derives the Noise static key from it. Ember, for example, registers a device by an iroh NodeId, which is an ed25519 public key. letify generates its own key and supplies none.
+
+The session resumption of Session item 5 also serves a client whose process was suspended, as a phone app is: keys are kept, and the streams resume after the path manager reconnects or fail with a connection error after the bounded wait. Nothing in the library may require a desktop operating system, so iOS and Android clients are not precluded. Browsers are out of scope.
+
+The library does not assume a topology. A star of one server and about 10 nodes and clients per account, with long-lived connections and many streams, is the intended case for Ember. It requires only the Rendezvous trait, node ids and the optional relay, and letify does not depend on it.
+
 ### Reverse SSH <!-- id: reverse-ssh -->
 
 > An opt-in strategy for a remote machine that can reach the user's machine over SSH. It is not raced by default.
