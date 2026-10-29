@@ -1,8 +1,10 @@
-"""Build letify-quic and put it where letify looks.
+"""Build letify-quic and letify-link and put them where letify looks.
 
 The wheels carry the QUIC carrier binary in ``letify/remoting/lib/``. The spec's "QUIC over a
 punched UDP pair" describes what it does, and ``letify/transport/quic.py`` finds it there.
-This script builds the workspace and copies the binary into place.
+The letify-link sidecar of the spec's "Sidecar interface" sits beside it, built with the Cargo
+feature ``relay``, and ``letify/transport/linkd.py`` finds it there. This script builds the
+workspace and copies both binaries into place.
 
 Run it from the repository root or from here:
 
@@ -30,6 +32,13 @@ CARRIERS = {
     "Darwin": "letify-quic",
 }
 
+#: The letify-link sidecar each platform's wheel ships, beside the carrier.
+SIDECARS = {
+    "Windows": "letify-link.exe",
+    "Linux": "letify-link",
+    "Darwin": "letify-link",
+}
+
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
@@ -53,7 +62,9 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     profile = "debug" if args.debug else "release"
-    command = ["cargo", "build"] + ([] if args.debug else ["--release"])
+    command = ["cargo", "build", "--workspace", "--features", "letify-link/relay"] + (
+        [] if args.debug else ["--release"]
+    )
     result = subprocess.run(command, cwd=HERE)
     if result.returncode != 0:
         return result.returncode
@@ -68,6 +79,13 @@ def main(argv: list[str] | None = None) -> int:
         return 1
     shutil.copy2(carrier, destination / carrier.name)
     print(f"letify: QUIC carrier installed at {destination / carrier.name}")
+
+    sidecar = built / SIDECARS[system]
+    if not sidecar.is_file():
+        print(f"letify: cargo did not produce {sidecar}", file=sys.stderr)
+        return 1
+    shutil.copy2(sidecar, destination / sidecar.name)
+    print(f"letify: letify-link installed at {destination / sidecar.name}")
     return 0
 
 
