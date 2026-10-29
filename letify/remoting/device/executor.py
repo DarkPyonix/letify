@@ -946,14 +946,37 @@ class Executor:
 
 
 def serve_transport(device: str, transport) -> None:
-    """Announce the executor on ``transport`` and answer its messages until it closes."""
-    executor = Executor(device)
-    transport.send(pickle.dumps(executor.hello(), protocol=5), [])
-    while True:
+    """Announce the executor on ``transport`` and answer its messages until it closes.
+
+    An exception that ends the executor is sent as a last message, so the client stops
+    waiting for a reply that cannot come, as spec "Failure semantics" describes.
+    """
+    started = False
+    try:
+        executor = Executor(device)
+        transport.send(pickle.dumps(executor.hello(), protocol=5), [])
+        started = True
+        _answer(executor, transport)
+    except TransportClosed:
+        return
+    except BaseException as exc:
+        detail = traceback.format_exc()
+        print(detail, file=sys.stderr, flush=True)
+        fatal = {
+            "error": f"{type(exc).__name__}: {exc}",
+            "traceback": detail,
+            "started": started,
+            "missing": exc.name if isinstance(exc, ImportError) else None,
+        }
         try:
-            head, buffers = transport.recv()
-        except TransportClosed:
-            return
+            transport.send(pickle.dumps({"fatal": fatal}, protocol=5), [])
+        except Exception:  # pragma: no cover - the link is gone as well
+            pass
+
+
+def _answer(executor: Executor, transport) -> None:
+    while True:
+        head, buffers = transport.recv()
         message = pickle.loads(head)
         head = None
         if message.get("close"):
@@ -962,10 +985,7 @@ def serve_transport(device: str, transport) -> None:
         buffers = None
         if reply is not None:
             reply_head, views, keep = reply
-            try:
-                transport.send(reply_head, views)
-            except TransportClosed:
-                return
+            transport.send(reply_head, views)
             del keep
 
 

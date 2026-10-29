@@ -5,10 +5,10 @@
 # wheels carry. A user who only ships functions to remote machines over SSH never needs it.
 [workspace]
 resolver = "3"
-members = ["letify", "letify-quic"]
+members = ["letify", "letify-quic", "letify-link"]
 
 [workspace.package]
-version = "2.10.0"
+version = "2.10.1"
 edition = "2024"
 license = "MIT"
 repository = "https://github.com/DarkPyonix/letify"
