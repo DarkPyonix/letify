@@ -76,6 +76,24 @@ fn frame(v: &Value) -> Vec<u8> {
     out
 }
 
+/// Send the `auth` message of the loopback control channel and check the reply.
+async fn authenticate(tcp: &mut TcpStream, token: &str) {
+    tcp.write_all(&frame(&json!({"op": "auth", "token": token, "id": 0})))
+        .await
+        .unwrap();
+    let reply = read_frame(tcp).await.expect("an auth reply");
+    assert_eq!(reply["ok"], true, "{reply}");
+}
+
+/// One control frame, or `None` when the connection ends first.
+async fn read_frame(tcp: &mut TcpStream) -> Option<Value> {
+    let mut len = [0u8; 4];
+    tcp.read_exact(&mut len).await.ok()?;
+    let mut body = vec![0u8; u32::from_be_bytes(len) as usize];
+    tcp.read_exact(&mut body).await.ok()?;
+    serde_json::from_slice(&body).ok()
+}
+
 impl Sidecar {
     async fn start(control_arg: Option<&str>) -> Sidecar {
         let dir = tempdir::Dir::new();
@@ -115,7 +133,9 @@ impl Sidecar {
             (Box::new(r), Box::new(w))
         } else {
             let addr = control.strip_prefix("tcp:").unwrap();
-            let (r, w) = TcpStream::connect(addr).await.unwrap().into_split();
+            let mut tcp = TcpStream::connect(addr).await.unwrap();
+            authenticate(&mut tcp, ready["token"].as_str().unwrap()).await;
+            let (r, w) = tcp.into_split();
             (Box::new(r), Box::new(w))
         };
         let (out, mut out_rx) = mpsc::unbounded_channel::<Vec<u8>>();
@@ -421,4 +441,97 @@ async fn a_punch_through_the_control_rendezvous_gives_a_session() {
     let mut buf = [0u8; 2];
     other.read_exact(&mut buf).await.unwrap();
     assert_eq!(&buf, b"hi");
+}
+
+/// Start a sidecar on the loopback channel and return it with its ready line, without
+/// connecting.
+async fn start_unconnected(control: &str) -> (Child, Value, tempdir::Dir) {
+    let dir = tempdir::Dir::new();
+    let key = dir.path().join("key");
+    let mut child = Command::new(BIN)
+        .args(["serve", "--control", control, "--key", key.to_str().unwrap()])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    let mut lines = BufReader::new(child.stdout.take().unwrap()).lines();
+    let line = tokio::time::timeout(Duration::from_secs(10), lines.next_line())
+        .await
+        .expect("the sidecar printed no ready line")
+        .unwrap()
+        .unwrap();
+    tokio::spawn(async move { while let Ok(Some(_)) = lines.next_line().await {} });
+    (child, serde_json::from_str(&line).unwrap(), dir)
+}
+
+#[tokio::test]
+async fn the_loopback_control_channel_requires_the_token_in_its_first_message() {
+    let (_child, ready, _dir) = start_unconnected("tcp").await;
+    let token = ready["token"].as_str().expect("a token in the ready line");
+    assert_eq!(token.len(), 64);
+    assert!(token.bytes().all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase()));
+    let addr = ready["control"].as_str().unwrap().strip_prefix("tcp:").unwrap().to_string();
+
+    // A first message that is not `auth` closes the connection.
+    let mut early = TcpStream::connect(&addr).await.unwrap();
+    early
+        .write_all(&frame(&json!({"op": "no_such_op", "id": 1})))
+        .await
+        .unwrap();
+    assert!(read_frame(&mut early).await.is_none(), "answered without auth");
+
+    // So does an `auth` with the wrong token, even one that differs in the last character.
+    let mut wrong = format!("{}0", &token[..63]);
+    if wrong == token {
+        wrong = format!("{}1", &token[..63]);
+    }
+    let mut bad = TcpStream::connect(&addr).await.unwrap();
+    bad.write_all(&frame(&json!({"op": "auth", "token": wrong, "id": 1})))
+        .await
+        .unwrap();
+    assert!(read_frame(&mut bad).await.is_none(), "accepted a wrong token");
+
+    // The sidecar kept listening, and the right token opens the channel.
+    let mut good = TcpStream::connect(&addr).await.unwrap();
+    authenticate(&mut good, token).await;
+    good.write_all(&frame(&json!({"op": "no_such_op", "id": 2})))
+        .await
+        .unwrap();
+    let reply = read_frame(&mut good).await.unwrap();
+    assert_eq!(reply["kind"], "usage");
+
+    // The listener closed with the first authenticated connection.
+    assert!(
+        TcpStream::connect(&addr).await.is_err(),
+        "the control listener is still open"
+    );
+}
+
+#[tokio::test]
+async fn a_unix_control_socket_has_no_token() {
+    let dir = tempdir::Dir::new();
+    let path = dir.path().join("c");
+    let (_child, ready, _d) = start_unconnected(path.to_str().unwrap()).await;
+    assert!(ready.get("token").is_none(), "{ready}");
+    assert!(ready["control"].as_str().unwrap().starts_with("unix:"));
+}
+
+#[tokio::test]
+async fn open_stream_takes_a_priority_and_refuses_an_unknown_one() {
+    let (mut a, _b, sa, _sb) = pair_over_tcp(None).await;
+    let bulk = a
+        .call(json!({"op": "open_stream", "session": sa, "priority": "bulk"}))
+        .await;
+    assert_eq!(bulk["ok"], true, "{bulk}");
+    let interactive = a
+        .call(json!({"op": "open_stream", "session": sa, "priority": "interactive"}))
+        .await;
+    assert_eq!(interactive["ok"], true, "{interactive}");
+    let bad = a
+        .call(json!({"op": "open_stream", "session": sa, "priority": "urgent"}))
+        .await;
+    assert_eq!(bad["ok"], false);
+    assert_eq!(bad["kind"], "usage");
 }
