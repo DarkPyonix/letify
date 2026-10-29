@@ -216,3 +216,106 @@ impl Proxy {
         }
     }
 }
+
+/// What precedes the records on the initiator's side of a transport.
+pub enum Prefix {
+    /// A session handshake: the header, then the first Noise message.
+    Handshake,
+    /// A subflow added to a running session: the magic and session id.
+    Subflow,
+}
+
+/// An on-path attacker between two ends. It records every record the initiator sends, can
+/// withhold them and can inject bytes toward the responder.
+pub struct Mitm {
+    pub records: Arc<Mutex<Vec<Vec<u8>>>>,
+    pub withhold: Arc<AtomicBool>,
+    pub prefix: Arc<Mutex<Vec<u8>>>,
+    to_b: Arc<tokio::sync::Mutex<tokio::io::WriteHalf<tokio::io::DuplexStream>>>,
+}
+
+impl Mitm {
+    pub fn new(
+        a_end: tokio::io::DuplexStream,
+        b_end: tokio::io::DuplexStream,
+        prefix: Prefix,
+    ) -> Mitm {
+        use tokio::io::AsyncReadExt;
+        use tokio::io::AsyncWriteExt;
+        let (mut ar, mut aw) = tokio::io::split(a_end);
+        let (mut br, bw) = tokio::io::split(b_end);
+        let to_b = Arc::new(tokio::sync::Mutex::new(bw));
+        let records = Arc::new(Mutex::new(Vec::new()));
+        let withhold = Arc::new(AtomicBool::new(false));
+        let prefix_seen = Arc::new(Mutex::new(Vec::new()));
+        tokio::spawn(async move {
+            let _ = tokio::io::copy(&mut br, &mut aw).await;
+        });
+        tokio::spawn({
+            let (to_b, records, withhold, prefix_seen) =
+                (to_b.clone(), records.clone(), withhold.clone(), prefix_seen.clone());
+            async move {
+                let mut head = match prefix {
+                    Prefix::Handshake => vec![0u8; 10],
+                    Prefix::Subflow => vec![0u8; 20],
+                };
+                if ar.read_exact(&mut head).await.is_err() {
+                    return;
+                }
+                if let Prefix::Handshake = prefix {
+                    let mut body = vec![0u8; u16::from_be_bytes([head[8], head[9]]) as usize];
+                    if ar.read_exact(&mut body).await.is_err() {
+                        return;
+                    }
+                    head.extend_from_slice(&body);
+                }
+                *prefix_seen.lock().unwrap() = head.clone();
+                if to_b.lock().await.write_all(&head).await.is_err() {
+                    return;
+                }
+                loop {
+                    let mut rec = vec![0u8; 10];
+                    if ar.read_exact(&mut rec).await.is_err() {
+                        return;
+                    }
+                    let mut ct = vec![0u8; u16::from_be_bytes([rec[0], rec[1]]) as usize];
+                    if ar.read_exact(&mut ct).await.is_err() {
+                        return;
+                    }
+                    rec.extend_from_slice(&ct);
+                    records.lock().unwrap().push(rec.clone());
+                    if !withhold.load(Ordering::SeqCst)
+                        && to_b.lock().await.write_all(&rec).await.is_err()
+                    {
+                        return;
+                    }
+                }
+            }
+        });
+        Mitm { records, withhold, prefix: prefix_seen, to_b }
+    }
+
+    pub async fn inject(&self, bytes: &[u8]) {
+        use tokio::io::AsyncWriteExt;
+        self.to_b.lock().await.write_all(bytes).await.unwrap();
+    }
+
+    pub fn recorded(&self) -> Vec<Vec<u8>> {
+        self.records.lock().unwrap().clone()
+    }
+}
+
+/// Two sessions whose initiator side runs through an on-path attacker.
+pub async fn session_pair_through_mitm(config: Config) -> (Session, Session, Mitm) {
+    let a = Identity::generate();
+    let b = Identity::generate();
+    let (ta, m_a) = duplex_pair();
+    let (m_b, tb) = duplex_pair();
+    let mitm = Mitm::new(m_a, m_b, Prefix::Handshake);
+    let responder = tokio::spawn({
+        let (b, a_id, config) = (b.clone(), a.node_id(), config.clone());
+        async move { Session::accept(tb, &b, PeerPolicy::allow(vec![a_id]), config).await }
+    });
+    let initiator = Session::connect(ta, &a, b.node_id(), config).await.unwrap();
+    (initiator, responder.await.unwrap().unwrap(), mitm)
+}
