@@ -16,6 +16,7 @@ import base64
 import contextlib
 import json
 import os
+import shutil
 import socket
 import subprocess
 import sys
@@ -136,9 +137,7 @@ class NoBlake3Local(Local):
         from letify.runtime.channel import PersistentChannel
 
         hide = "import sys; sys.modules['blake3'] = None\n"
-        return PersistentChannel(
-            [sys.executable, "-u", "-c", hide + BOOTSTRAP], name=runtime.name
-        )
+        return PersistentChannel([sys.executable, "-u", "-c", hide + BOOTSTRAP], name=runtime.name)
 
 
 @pytest.fixture
@@ -235,7 +234,8 @@ def patch_run(monkeypatch):
         monkeypatch.setattr(module.subprocess, "run", recorder)
         if module.__name__ == "letify.providers.colab":
             monkeypatch.setattr(
-                module.subprocess, "Popen",
+                module.subprocess,
+                "Popen",
                 lambda command, **options: FakeProcess(
                     list(command), ["LETIFY-KEEP-ALIVE ready\n"], **options
                 ),
@@ -1201,7 +1201,9 @@ class FakeDriveServer:
         )
 
         def answer(
-            status: int, payload: bytes = b"", extra: dict[str, str] | None = None,
+            status: int,
+            payload: bytes = b"",
+            extra: dict[str, str] | None = None,
             kind: str = "application/json",
         ) -> None:
             handler.send_response(status)
@@ -1236,8 +1238,11 @@ class FakeDriveServer:
                 return answer(308, extra={"Range": f"bytes=0-{len(session['body']) - 1}"})
             identifier = self._new_id()
             self.files[identifier] = {
-                **session["meta"], "id": identifier, "content": session["body"],
-                "folder": False, "trashed": False,
+                **session["meta"],
+                "id": identifier,
+                "content": session["body"],
+                "folder": False,
+                "trashed": False,
             }
             return reply({"id": identifier, "name": session["meta"]["name"]})
 
@@ -1263,7 +1268,10 @@ class FakeDriveServer:
             meta = json.loads(body)
             identifier = self._new_id()
             self.files[identifier] = {
-                "id": identifier, "name": meta["name"], "content": b"", "trashed": False,
+                "id": identifier,
+                "name": meta["name"],
+                "content": b"",
+                "trashed": False,
                 "parent": (meta.get("parents") or ["root"])[0],
                 "folder": meta.get("mimeType") == "application/vnd.google-apps.folder",
             }
@@ -1274,7 +1282,8 @@ class FakeDriveServer:
                 meta.setdefault("parent", (meta.get("parents") or ["root"])[0])
                 number = str(len(self.sessions) + 1)
                 self.sessions[number] = {
-                    "meta": meta, "body": b"",
+                    "meta": meta,
+                    "body": b"",
                     "size": int(headers["x-upload-content-length"]),
                 }
                 return answer(200, extra={"Location": f"{self.endpoint}{session_prefix}{number}"})
@@ -1285,8 +1294,12 @@ class FakeDriveServer:
             content = tail.split(b"\r\n\r\n", 1)[1].rsplit(b"\r\n--" + boundary, 1)[0]
             identifier = self._new_id()
             self.files[identifier] = {
-                "id": identifier, "name": meta["name"], "content": content, "trashed": False,
-                "parent": (meta.get("parents") or ["root"])[0], "folder": False,
+                "id": identifier,
+                "name": meta["name"],
+                "content": content,
+                "trashed": False,
+                "parent": (meta.get("parents") or ["root"])[0],
+                "folder": False,
             }
             return reply({"id": identifier, "name": meta["name"]})
         if method == "PATCH" and parsed.path.startswith("/upload/drive/v3/files/"):
@@ -1716,8 +1729,6 @@ def patch_popen(monkeypatch):
     return patch
 
 
-
-
 # -- a Kaggle session, and the cloud that hands out its URL ---------------------
 
 
@@ -2004,12 +2015,24 @@ class FakeKaggleCLI:
             "irack000/letify-runtime-2,notebook77c1a2,irack000,2026-10-10 06:00:00,0\n"
         )
         #: Standard output a ``quota`` call answers with, as JSON text.
-        self.quota_json = json.dumps([
-            {"resource": "GPU", "used": "0.00h", "remaining": "60.00h", "total": "60.00h",
-             "refreshAt": "2026-10-10T00:00:00"},
-            {"resource": "TPU", "used": "0.00h", "remaining": "20.00h", "total": "20.00h",
-             "refreshAt": "2026-10-10T00:00:00"},
-        ])
+        self.quota_json = json.dumps(
+            [
+                {
+                    "resource": "GPU",
+                    "used": "0.00h",
+                    "remaining": "60.00h",
+                    "total": "60.00h",
+                    "refreshAt": "2026-10-10T00:00:00",
+                },
+                {
+                    "resource": "TPU",
+                    "used": "0.00h",
+                    "remaining": "20.00h",
+                    "total": "20.00h",
+                    "refreshAt": "2026-10-10T00:00:00",
+                },
+            ]
+        )
 
     def run(self, command: list[str], **kwargs: Any) -> FakeCompleted:
         self.calls.append(list(command))
@@ -2049,7 +2072,6 @@ def kaggle_api_token(isolated_home):
     return write_secret("kaggle_a", "access_token", "KGAT_" + "a" * 32)
 
 
-
 class FakeColabCli:
     """A Colab CLI that holds assignments, for ``patch_run`` as the ``result`` callable.
 
@@ -2086,3 +2108,29 @@ class FakeColabCli:
             if self.new_fails:
                 return FakeCompleted(returncode=1, stderr="ReadTimeout: Read timed out")
         return FakeCompleted()
+
+
+@pytest.fixture(scope="session")
+def sidecar_binary(tmp_path_factory) -> Path:
+    from letify.transport import linkd
+
+    core = Path(__file__).resolve().parent.parent / "letify-core"
+    named = os.environ.get(linkd.ENV_BINARY)
+    if named:
+        return Path(named)
+    if shutil.which("cargo") is None:
+        pytest.skip(
+            "cargo is not installed and LETIFY_LINK_BIN is not set, so letify-link is not built"
+        )
+    # One build per worker; cargo serialises concurrent builds on its own lock.
+    result = subprocess.run(
+        ["cargo", "build", "-p", "letify-link", "--release", "--features", "letify-link/relay"],
+        cwd=core,
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        pytest.fail(f"cargo build -p letify-link failed:\n{result.stderr[-2000:]}")
+    binary = core / "target" / "release" / linkd.BINARY
+    assert binary.is_file(), binary
+    return binary

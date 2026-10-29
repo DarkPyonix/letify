@@ -313,9 +313,22 @@ class Shell(Provider):
         return ""
 
     def link(self, runtime: Runtime | None = None) -> Link:
-        """The chosen link, connecting through the pipeline the first time it is asked for."""
+        """The chosen link, connecting through the pipeline the first time it is asked for.
+
+        On an account with ``link = "letify-link"`` it is the plain ssh command with the
+        session's measurements and no pipeline: the data path is the session, so no strategy
+        is raced and no probe runs. Spec "Sidecar interface" item 7.
+        """
         links: dict[str, Link] = self.__dict__.setdefault("_links", {})
         key = self._link_key(runtime)
+        if key not in links and self.uses_letify_link:
+            from ..transport.linkchannel import PlainSshLink
+
+            remotes = self.__dict__.setdefault("_link_remotes", {})
+            links[key] = PlainSshLink(  # type: ignore[assignment]
+                lambda command: self.ssh_command(command and self.remote_command(command)),
+                lambda: remotes.get(key),
+            )
         if key not in links:
             from ..transport.announce import printer
             from ..transport.pipeline import LinkCache, Pipeline, network_fingerprint
@@ -335,6 +348,9 @@ class Shell(Provider):
 
     def close_link(self, runtime: Runtime | None = None) -> None:
         key = self._link_key(runtime)
+        remote = self.__dict__.get("_link_remotes", {}).pop(key, None)
+        if remote is not None:
+            remote.close()
         link = self.__dict__.get("_links", {}).pop(key, None)
         if link is not None:
             # Remembered so a later connection to the same key is printed as re-established.
@@ -548,6 +564,65 @@ class Shell(Provider):
         backend = self.config.option("store")
         return str(backend) if isinstance(backend, str) else "shell"
 
+    # -- letify-link ---------------------------------------------------------
+
+    @property
+    def uses_letify_link(self) -> bool:
+        """Whether the account carries the worker channel over letify-link instead of ssh.
+
+        Spec "Sidecar interface" item 7: ``link = "letify-link"`` opts in, and the default,
+        ``"ssh"``, keeps the ssh data path.
+        """
+        value = self.config.option("link", "ssh")
+        if value in (None, "ssh"):
+            return False
+        if value == "letify-link":
+            return True
+        raise ProviderUnavailable(
+            self.kind, f'{self.alias} sets link = {value!r}; use "ssh" or "letify-link"'
+        )
+
+    def link_remote(self, runtime: Runtime | None = None) -> Any:
+        """The connected letify-link session to this machine, bootstrapped over ssh once."""
+        remotes: dict[str, Any] = self.__dict__.setdefault("_link_remotes", {})
+        key = self._link_key(runtime)
+        remote = remotes.get(key)
+        if remote is not None and remote.alive:
+            return remote
+        if remote is not None:
+            remote.close()
+        import letify
+
+        from ..config.secrets import account_directory
+        from ..protocol.worker import BOOTSTRAP
+        from ..transport import linkchannel
+
+        address = self.address
+        if address is None:
+            raise ProviderUnavailable(
+                self.kind,
+                f'{self.alias} sets link = "letify-link" and has no address: letify-link '
+                f"needs an address until the NAT rendezvous lands",
+            )
+        directory = account_directory(self.alias)
+        directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+        floor = self.link_floor
+        binary = self.config.option("link_binary")
+        remotes[key] = linkchannel.connect(
+            self.alias,
+            ssh=lambda command: sshopts.unshared(self.ssh_command(self.remote_command(command))),
+            address=address,
+            python=self.remote_python,
+            bootstrap=BOOTSTRAP,
+            key_path=directory / "link.key",
+            version=letify.__version__,
+            binary=binary if isinstance(binary, str) else None,
+            punch=bool(self.config.option("link_punch")),
+            max_rtt_ms=floor.max_rtt_ms,
+            min_bps=floor.min_bps,
+        )
+        return remotes[key]
+
     # -- sessions ------------------------------------------------------------
 
     def open_channel(self, runtime: Runtime) -> Channel:
@@ -555,6 +630,10 @@ class Shell(Provider):
         from ..protocol.worker import BOOTSTRAP
         from ..runtime.channel import OneShotChannel, PersistentChannel
 
+        if self.uses_letify_link:
+            from ..transport.linkchannel import LinkChannel
+
+            return LinkChannel(self.link_remote(runtime), name=runtime.name)
         link = self.link(runtime)
         if not link.persistent:
             return OneShotChannel(
@@ -575,6 +654,13 @@ class Shell(Provider):
 
     takeover_refusal = None
 
+    @property
+    def transfer_connection_cost_s(self) -> float:  # type: ignore[override]
+        """Zero on a letify-link account, where one more connection is one more stream."""
+        if self.uses_letify_link:
+            return 0.0
+        return float(super().transfer_connection_cost_s)
+
     def attach_channel(self, name: str, record: Mapping[str, Any]) -> Channel:
         """A relay on the machine, reached by the same link as a worker, to the worker's door.
 
@@ -587,6 +673,8 @@ class Shell(Provider):
         from ..errors import UnsupportedMode
         from ..runtime.channel import AttachedChannel, relay_program
 
+        if self.uses_letify_link:
+            return self._attach_link(name, record)
         if self.takeover_refusal is not None or not self.persistent_channel:
             raise UnsupportedMode(
                 f"{self.alias} cannot hand a running call to another process: "
@@ -604,6 +692,29 @@ class Shell(Provider):
         command = f"{self.remote_python} -c {program} {door}"
         return AttachedChannel(
             sshopts.unshared(link.ssh_command(self.remote_command(command))), name=name
+        )
+
+    def _attach_link(self, name: str, record: Mapping[str, Any]) -> Channel:
+        """A door stream of a new session to the shim that serves the run's worker.
+
+        Spec "Sidecar interface" item 7, taking over a call. The new owner uses the account's
+        own key, so it is the node the shim already allows, and it uses no ssh.
+        """
+        from ..config.secrets import account_directory
+        from ..errors import UnsupportedMode
+        from ..transport import linkchannel
+
+        info = record.get("link")
+        if not isinstance(info, Mapping) or not record.get("door"):
+            raise UnsupportedMode(
+                f"{self.alias} carries its channel over letify-link, and the record of this "
+                f"run names no letify-link endpoint to attach to"
+            )
+        directory = account_directory(self.alias)
+        directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+        remote = linkchannel.attach(self.alias, dict(info), key_path=directory / "link.key")
+        return linkchannel.LinkChannel(
+            remote, name=name, door=str(record["door"]), owns_remote=True
         )
 
     def transfer_command(self, runtime: Runtime | None) -> list[str]:
@@ -626,6 +737,13 @@ class Shell(Provider):
 
     def transfer_channel(self, runtime: Runtime | None) -> Channel:
         """One channel for one transfer stream, on a connection of its own."""
+        if self.uses_letify_link:
+            from ..transport.linkchannel import LinkChannel
+
+            # One more stream of the open session: no punch and no ssh connection.
+            return LinkChannel(
+                self.link_remote(runtime), name=f"{self.alias}-transfer", priority="bulk"
+            )
         from ..runtime.channel import PersistentChannel
 
         return PersistentChannel(self.transfer_command(runtime), name=f"{self.alias}-transfer")
