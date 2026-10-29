@@ -137,7 +137,14 @@ async fn a_tcp_punch_to_a_peer_that_never_dials_times_out_and_names_the_dials() 
     .await
     .unwrap_err();
     assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
-    assert!(err.to_string().contains("ConnectionRefused"), "{err}");
+    // Linux and macOS refuse a dial to a closed port at once. Windows retries the SYN for
+    // seconds, so the dial is still in flight when the window closes and the message names it.
+    let named = if cfg!(windows) {
+        "still dialing"
+    } else {
+        "ConnectionRefused"
+    };
+    assert!(err.to_string().contains(named), "{err}");
 }
 
 #[tokio::test]
