@@ -304,4 +304,71 @@ mod tests {
         let got = timeout(Duration::from_millis(200), socket.recv_from(&mut buf)).await;
         assert!(got.is_err());
     }
+
+    async fn limited(limits: QadLimits) -> SocketAddr {
+        let r = QadResponder::bind("127.0.0.1:0", Identity::generate())
+            .await
+            .unwrap()
+            .with_limits(limits);
+        let addr = r.local_addr();
+        tokio::spawn(r.run());
+        addr
+    }
+
+    /// Send `n` requests from `socket` and count the replies that arrive.
+    async fn replies(socket: &UdpSocket, addr: SocketAddr, n: usize) -> usize {
+        let mut request = [0u8; REQUEST_LEN];
+        request[..4].copy_from_slice(MAGIC);
+        request[4] = VERSION;
+        for _ in 0..n {
+            socket.send_to(&request, addr).await.unwrap();
+        }
+        let mut got = 0;
+        let mut buf = [0u8; 256];
+        while timeout(Duration::from_millis(300), socket.recv_from(&mut buf))
+            .await
+            .is_ok()
+        {
+            got += 1;
+        }
+        got
+    }
+
+    #[tokio::test]
+    async fn a_source_that_floods_gets_only_its_burst_answered() {
+        let addr = limited(QadLimits {
+            source_burst: 3,
+            source_per_s: 0.001,
+            ..QadLimits::default()
+        })
+        .await;
+        let flood = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        assert_eq!(replies(&flood, addr, 12).await, 3);
+    }
+
+    #[tokio::test]
+    async fn all_sources_together_are_held_to_the_global_burst() {
+        let addr = limited(QadLimits {
+            global_burst: 4,
+            global_per_s: 0.001,
+            ..QadLimits::default()
+        })
+        .await;
+        let mut total = 0;
+        for _ in 0..3 {
+            // Each socket has its own port, but one IP address, so the global bucket is the one
+            // that stops them.
+            let s = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            total += replies(&s, addr, 3).await;
+        }
+        assert_eq!(total, 4);
+    }
+
+    #[test]
+    fn a_bucket_refills_with_time() {
+        let mut b = TokenBucket::new(2, 10.0);
+        let t0 = Instant::now();
+        assert!(b.take(t0) && b.take(t0) && !b.take(t0));
+        assert!(b.take(t0 + Duration::from_millis(150)));
+    }
 }
