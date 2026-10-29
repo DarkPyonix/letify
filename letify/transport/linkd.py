@@ -108,6 +108,32 @@ def _connect(address: str, timeout: float | None = 10.0) -> socket.socket:
     return sock
 
 
+def _authenticate(sock: socket.socket, token: str, timeout: float = 10.0) -> None:
+    """Send the ``auth`` message the loopback control channel requires and check the reply."""
+    body = json.dumps({"op": "auth", "token": token, "id": 0}).encode()
+    sock.settimeout(timeout)
+    try:
+        sock.sendall(struct.pack(">I", len(body)) + body)
+        head = b""
+        while len(head) < 4:
+            chunk = sock.recv(4 - len(head))
+            if not chunk:
+                raise LinkError("the sidecar closed the control channel at the token")
+            head += chunk
+        (length,) = struct.unpack(">I", head)
+        data = b""
+        while len(data) < length:
+            chunk = sock.recv(length - len(data))
+            if not chunk:
+                raise LinkError("the sidecar closed the control channel at the token")
+            data += chunk
+    except OSError as error:
+        raise LinkError(f"the control token was not accepted: {error}") from error
+    if not json.loads(data).get("ok"):
+        raise LinkError("the sidecar refused the control token")
+    sock.settimeout(None)
+
+
 class LinkSession:
     """One encrypted session to a peer. Streams are sockets; paths are not visible."""
 
@@ -120,9 +146,15 @@ class LinkSession:
         self.closed = threading.Event()
         self.close_reason = ""
 
-    def open_stream(self) -> socket.socket:
-        """Open a stream to the peer and return the local socket that carries it."""
-        reply = self._daemon.request({"op": "open_stream", "session": self.number})
+    def open_stream(self, priority: str = "interactive") -> socket.socket:
+        """Open a stream to the peer and return the local socket that carries it.
+
+        ``priority`` is ``"interactive"`` (control frames and small messages, served first) or
+        ``"bulk"`` (transfers, which share what interactive streams leave).
+        """
+        reply = self._daemon.request(
+            {"op": "open_stream", "session": self.number, "priority": priority}
+        )
         return _connect(reply["socket"])
 
     def accept_stream(self, timeout: float | None = None) -> socket.socket:
@@ -204,6 +236,7 @@ class LinkDaemon:
         binary: str | os.PathLike[str] | None = None,
         rendezvous: Rendezvous | None = None,
         start_timeout: float = 20.0,
+        loopback: bool = False,
     ):
         self._binary = Path(binary) if binary else require_binary()
         self.rendezvous = rendezvous
@@ -216,7 +249,7 @@ class LinkDaemon:
         self._backlog: dict[int, list[dict[str, Any]]] = {}
         self._outbox: queue.Queue[tuple[str, bytes] | None] = queue.Queue()
         self._closed = False
-        control = "tcp" if sys.platform == "win32" else str(self._dir / "c")
+        control = "tcp" if loopback or sys.platform == "win32" else str(self._dir / "c")
         self._stderr_path = self._dir / "stderr"
         try:
             with open(self._stderr_path, "wb") as stderr:
@@ -232,7 +265,10 @@ class LinkDaemon:
         ready = self._read_ready(start_timeout)
         self.node_id: str = ready["node_id"]
         try:
-            self._sock = _connect(ready["control"])
+            self.control_address: str = ready["control"]
+            self._sock = _connect(self.control_address)
+            if ready.get("token"):
+                _authenticate(self._sock, ready["token"])
         except (OSError, LinkError) as error:
             self.close()
             raise LinkError(f"cannot reach the sidecar control channel: {error}") from error
