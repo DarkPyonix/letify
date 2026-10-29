@@ -351,3 +351,103 @@ fn spawn_server_into(
         }
     })
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_relay_path_is_dropped_as_soon_as_a_direct_path_carries_traffic() {
+    let (relay_id, relay_addr) = start_relay(open(), RelayConfig::default()).await;
+    let a = Identity::generate();
+    let b = Identity::generate();
+    let token = new_token();
+    let acceptor = Arc::new(Acceptor::new(
+        b.clone(),
+        PeerPolicy::allow(vec![a.node_id()]),
+        Config::default(),
+    ));
+    let reserved = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let direct = reserved.local_addr().unwrap();
+    drop(reserved);
+
+    let (tx, mut sessions) = tokio::sync::mpsc::channel(4);
+    {
+        let (acceptor, tx) = (acceptor.clone(), tx.clone());
+        let db = RelayDialer::new(relay_addr.to_string(), relay_id.node_id(), b.clone());
+        let a_id = a.node_id();
+        tokio::spawn(async move {
+            let t = db.connect(a_id, token).await.unwrap();
+            if let Ok(Accepted::Session(s)) = acceptor.accept(t).await {
+                let _ = tx.send(s).await;
+            }
+        });
+    }
+    let da = RelayDialer::new(relay_addr.to_string(), relay_id.node_id(), a.clone());
+    let candidates = vec![
+        da.candidate("relay", b.node_id(), token),
+        Candidate::tcp("direct", direct),
+    ];
+    // The switching rules would need a 60 s dwell and 100 confirmations, so only the relay
+    // rule can drop the relayed path within the test.
+    let cfg = ManagerConfig {
+        measure_interval: Duration::from_millis(100),
+        redial_initial: Duration::from_millis(50),
+        redial_max: Duration::from_millis(200),
+        policy: letify_link::hysteresis::Policy {
+            dwell: Duration::from_secs(60),
+            confirmations: 100,
+            spacing: Duration::from_secs(60),
+            ..Default::default()
+        },
+        ..ManagerConfig::default()
+    };
+    let mut pm = PathManager::start(a.clone(), b.node_id(), candidates, Config::default(), cfg)
+        .await
+        .unwrap();
+    let server_session = sessions.recv().await.unwrap();
+    let mut stream = pm.session().open_stream().await.unwrap();
+    tokio::spawn(async move {
+        let chunk = pattern(1 << 16, 3);
+        while stream.write_all(&chunk).await.is_ok() {}
+    });
+    tokio::spawn(async move {
+        let mut sb = server_session.accept_stream().await.unwrap();
+        let mut buf = vec![0u8; 1 << 16];
+        while let Ok(n) = sb.read(&mut buf).await {
+            if n == 0 {
+                break;
+            }
+        }
+    });
+    // With no direct path, the relayed path stays for as long as we look.
+    let early = timeout(Duration::from_millis(1200), async {
+        loop {
+            if let Some(PathEvent::Lost { name, .. }) = pm.next_event().await
+                && name == "relay"
+            {
+                return;
+            }
+        }
+    })
+    .await;
+    assert!(early.is_err(), "the relay was dropped with no direct path");
+    let listener = TcpListener::bind(direct).await.unwrap();
+    let _direct_sessions = spawn_server_into(listener, acceptor);
+    let started = Instant::now();
+    let (mut direct_added, mut reason) = (false, None);
+    timeout(Duration::from_secs(10), async {
+        loop {
+            match pm.next_event().await {
+                Some(PathEvent::Added { name }) if name == "direct" => direct_added = true,
+                Some(PathEvent::Lost { name, reason: r }) if name == "relay" => {
+                    reason = Some(r);
+                    return;
+                }
+                _ => {}
+            }
+        }
+    })
+    .await
+    .expect("the relayed path is dropped once the direct path carries traffic");
+    assert!(direct_added, "the direct path joined before the relay left");
+    assert_eq!(reason.as_deref(), Some("moved"));
+    // The first direct dial waits out the redial back-off at most, then one measurement tick.
+    assert!(started.elapsed() < Duration::from_secs(5), "{:?}", started.elapsed());
+}
