@@ -65,6 +65,8 @@ pub enum RecordError {
     Expired,
     /// The timestamp is more than [`MAX_SKEW`] ahead of the receiver's clock.
     FromTheFuture,
+    /// The cache holds a newer record of the same node.
+    Stale,
 }
 
 impl fmt::Display for RecordError {
@@ -74,6 +76,7 @@ impl fmt::Display for RecordError {
             RecordError::BadSignature => write!(f, "address record signature does not verify"),
             RecordError::Expired => write!(f, "address record is older than {MAX_AGE:?}"),
             RecordError::FromTheFuture => write!(f, "address record is dated in the future"),
+            RecordError::Stale => write!(f, "a newer address record of this node is held"),
         }
     }
 }
@@ -397,6 +400,72 @@ pub fn from_pkarr_txt<S: AsRef<str>>(strings: &[S]) -> Result<Vec<u8>, RecordErr
         return Err(bad);
     }
     Ok(out)
+}
+
+/// Most nodes a [`RecordCache`] holds by default.
+pub const CACHE_CAPACITY: usize = 4096;
+
+/// The newest record seen of each node, so that a replayed old record cannot roll a node's
+/// addresses back. It owns the comparison and the bound on its size; it does not fetch records.
+pub struct RecordCache {
+    capacity: usize,
+    held: std::sync::Mutex<std::collections::HashMap<NodeId, AddressRecord>>,
+}
+
+impl Default for RecordCache {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl RecordCache {
+    /// A cache of [`CACHE_CAPACITY`] nodes.
+    pub fn new() -> Self {
+        Self::with_capacity(CACHE_CAPACITY)
+    }
+
+    /// A cache of at most `capacity` nodes (at least 1).
+    pub fn with_capacity(capacity: usize) -> Self {
+        RecordCache {
+            capacity: capacity.max(1),
+            held: std::sync::Mutex::new(std::collections::HashMap::new()),
+        }
+    }
+
+    /// Decode and verify `bytes` as [`AddressRecord::decode`] does, then keep the record when
+    /// it is not older than the one held for its node, by record version and then timestamp.
+    /// An older record is refused with [`RecordError::Stale`]. The entries are keyed on the
+    /// canonical node id.
+    pub fn accept(&self, bytes: &[u8], now: u32) -> Result<AddressRecord, RecordError> {
+        let record = AddressRecord::decode(bytes, now)?;
+        let key = record.node.canonical();
+        let mut held = self.held.lock().unwrap_or_else(|e| e.into_inner());
+        // A record past its age is refused by decode whatever the cache says, so an entry
+        // that old protects nothing.
+        held.retain(|_, r| (now as i64 - r.timestamp as i64) <= MAX_AGE.as_secs() as i64);
+        if let Some(old) = held.get(&key)
+            && (record.version, record.timestamp) < (old.version, old.timestamp)
+        {
+            return Err(RecordError::Stale);
+        }
+        if !held.contains_key(&key)
+            && held.len() >= self.capacity
+            && let Some(oldest) = held
+                .iter()
+                .min_by_key(|(_, r)| r.timestamp)
+                .map(|(k, _)| *k)
+        {
+            held.remove(&oldest);
+        }
+        held.insert(key, record.clone());
+        Ok(record)
+    }
+
+    /// The record held for `node`.
+    pub fn get(&self, node: &NodeId) -> Option<AddressRecord> {
+        let held = self.held.lock().unwrap_or_else(|e| e.into_inner());
+        held.get(&node.canonical()).cloned()
+    }
 }
 
 fn short_err() -> RecordError {
