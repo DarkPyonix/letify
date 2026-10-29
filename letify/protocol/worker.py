@@ -3549,11 +3549,12 @@ def _reader_ended(door, shutdown=False):
     Spec "A deliberate shutdown": a shutdown frame on the channel that owns a running call
     ends the body and the worker. End of input alone leaves the body for a takeover.
     """
-    if door is None and _TAKE["moved"]:
-        # The call was adopted away; this channel closing is the old owner leaving.
-        return
     during = False
     with _TAKE_COND:
+        if door is None and _TAKE["moved"]:
+            # The call was adopted away; this channel closing is the old owner leaving. Read
+            # under the lock, because an adoption in progress holds it until it has moved.
+            return
         if door is None or (_TAKE["owner"] is door and _TAKE["live"]):
             during = _TAKE["run"] is not None
             if door is not None or during:
