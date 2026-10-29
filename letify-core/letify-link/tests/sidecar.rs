@@ -250,16 +250,27 @@ impl Sidecar {
     }
 }
 
-async fn local_connect(socket: &str) -> Box<dyn Conn> {
+/// Connect to the stream socket named by an `open_stream` reply or a `stream_incoming` event,
+/// sending its secret first when it has one.
+async fn local_connect(reply: &Value) -> Box<dyn Conn> {
+    let socket = reply["socket"].as_str().unwrap();
     if let Some(p) = socket.strip_prefix("unix:") {
         Box::new(UnixStream::connect(PathBuf::from(p)).await.unwrap())
     } else {
-        Box::new(
-            TcpStream::connect(socket.strip_prefix("tcp:").unwrap())
-                .await
-                .unwrap(),
-        )
+        let mut tcp = TcpStream::connect(socket.strip_prefix("tcp:").unwrap())
+            .await
+            .unwrap();
+        if let Some(secret) = reply["secret"].as_str() {
+            tcp.write_all(&unhex(secret)).await.unwrap();
+        }
+        Box::new(tcp)
     }
+}
+
+fn unhex(text: &str) -> Vec<u8> {
+    (0..text.len() / 2)
+        .map(|i| u8::from_str_radix(&text[2 * i..2 * i + 2], 16).unwrap())
+        .collect()
 }
 
 trait Conn: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + Unpin {}
@@ -316,11 +327,11 @@ async fn pair_over_tcp(control_arg: Option<&str>) -> (Sidecar, Sidecar, u64, u64
 async fn a_stream_carries_bytes_both_ways_between_two_sidecars() {
     let (mut a, mut b, sa, sb) = pair_over_tcp(None).await;
     let st = a.ok(json!({"op": "open_stream", "session": sa})).await;
-    let mut local_a = local_connect(st["socket"].as_str().unwrap()).await;
+    let mut local_a = local_connect(&st).await;
     local_a.write_all(b"x").await.unwrap();
     let inc = b.event("stream_incoming").await;
     assert_eq!(inc["session"], json!(sb));
-    let mut local_b = local_connect(inc["socket"].as_str().unwrap()).await;
+    let mut local_b = local_connect(&inc).await;
     let mut first = [0u8; 1];
     local_b.read_exact(&mut first).await.unwrap();
     assert_eq!(&first, b"x");
@@ -434,10 +445,10 @@ async fn a_punch_through_the_control_rendezvous_gives_a_session() {
     let st = a
         .ok(json!({"op": "open_stream", "session": s["session"]}))
         .await;
-    let mut conn = local_connect(st["socket"].as_str().unwrap()).await;
+    let mut conn = local_connect(&st).await;
     conn.write_all(b"hi").await.unwrap();
     let ev = b.event("stream_incoming").await;
-    let mut other = local_connect(ev["socket"].as_str().unwrap()).await;
+    let mut other = local_connect(&ev).await;
     let mut buf = [0u8; 2];
     other.read_exact(&mut buf).await.unwrap();
     assert_eq!(&buf, b"hi");
@@ -555,4 +566,38 @@ async fn open_stream_takes_a_priority_and_refuses_an_unknown_one() {
         .await;
     assert_eq!(bad["ok"], false);
     assert_eq!(bad["kind"], "usage");
+}
+
+#[tokio::test]
+async fn a_tcp_stream_socket_needs_its_secret_and_ignores_a_stray_connection() {
+    let (mut a, mut b, sa, sb) = pair_over_tcp(Some("tcp")).await;
+    let st = a.ok(json!({"op": "open_stream", "session": sa})).await;
+    let secret = st["secret"].as_str().expect("a secret for a tcp socket");
+    assert_eq!(secret.len(), 64);
+    let addr = st["socket"].as_str().unwrap().strip_prefix("tcp:").unwrap();
+
+    // A local process that sends nothing is not served, and does not block the right one.
+    let _silent = TcpStream::connect(addr).await.unwrap();
+    // One that sends 32 wrong bytes is closed.
+    let mut wrong = TcpStream::connect(addr).await.unwrap();
+    let mut bytes = unhex(secret);
+    bytes[31] ^= 1;
+    wrong.write_all(&bytes).await.unwrap();
+    let mut buf = [0u8; 1];
+    let n = tokio::time::timeout(Duration::from_secs(5), wrong.read(&mut buf))
+        .await
+        .expect("the wrong secret was not closed");
+    assert!(matches!(n, Ok(0) | Err(_)), "a wrong secret got data");
+
+    // The right secret still gets the stream.
+    let mut local_a = local_connect(&st).await;
+    local_a.write_all(b"x").await.unwrap();
+    let inc = b.event("stream_incoming").await;
+    assert_eq!(inc["session"], json!(sb));
+    assert_eq!(inc["secret"].as_str().unwrap().len(), 64);
+    assert_ne!(inc["secret"], st["secret"]);
+    let mut local_b = local_connect(&inc).await;
+    let mut first = [0u8; 1];
+    local_b.read_exact(&mut first).await.unwrap();
+    assert_eq!(&first, b"x");
 }
