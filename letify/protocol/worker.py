@@ -3549,11 +3549,12 @@ def _reader_ended(door, shutdown=False):
     Spec "A deliberate shutdown": a shutdown frame on the channel that owns a running call
     ends the body and the worker. End of input alone leaves the body for a takeover.
     """
-    if door is None and _TAKE["moved"]:
-        # The call was adopted away; this channel closing is the old owner leaving.
-        return
     during = False
     with _TAKE_COND:
+        if door is None and _TAKE["moved"]:
+            # The call was adopted away; this channel closing is the old owner leaving. Read
+            # under the lock, because an adoption in progress holds it until it has moved.
+            return
         if door is None or (_TAKE["owner"] is door and _TAKE["live"]):
             during = _TAKE["run"] is not None
             if door is not None or during:
@@ -3702,12 +3703,6 @@ def _door_adopt(door, stream, request):
         moved = _moved_outcome()
         if _TAKE["owner"] is not None:
             moved["last"] = True
-        # Told on a thread, because a former owner that has stopped reading can block the write.
-        told = threading.Thread(
-            target=_answer, args=(former, former_stream, moved), daemon=True
-        )
-        told.start()
-        told.join(2.0)
         state = {
             "run": run,
             "state": "finished" if _TAKE["finished"] else "running",
@@ -3728,6 +3723,14 @@ def _door_adopt(door, stream, request):
         )
         _SENDER = door.sender
         _TAKE_COND.notify_all()
+        # Told last, after the output has been switched, so that nothing the body prints from
+        # the moment the former owner learns of the move is sent to a channel that has stopped
+        # reading. A thread, because a former owner that has stopped reading can block the write.
+        told = threading.Thread(
+            target=_answer, args=(former, former_stream, moved), daemon=True
+        )
+        told.start()
+        told.join(2.0)
 
 
 def _deliver_call(stream, outcome):

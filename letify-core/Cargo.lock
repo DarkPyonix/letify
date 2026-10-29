@@ -396,7 +396,7 @@ dependencies = [
 
 [[package]]
 name = "letify"
-version = "2.10.1"
+version = "2.10.2"
 
 [[package]]
 name = "letify-link"
@@ -412,7 +412,7 @@ dependencies = [
 
 [[package]]
 name = "letify-quic"
-version = "2.10.1"
+version = "2.10.2"
 dependencies = [
  "quinn",
  "rcgen",
