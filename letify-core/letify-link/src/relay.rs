@@ -198,7 +198,8 @@ impl Relay {
             let edits = edits.clone();
             PeerPolicy::from_fn(move |id| {
                 let e = edits.lock().unwrap();
-                !e.revoked.contains(id) && (e.allowed.contains(id) || policy.accepts(id))
+                let id = id.canonical();
+                !e.revoked.contains(&id) && (e.allowed.contains(&id) || policy.accepts(&id))
             })
         };
         let link = Config {
@@ -294,12 +295,14 @@ impl RelayHandle {
 
 impl Inner {
     fn allow(&self, node: NodeId) {
+        let node = node.canonical();
         let mut e = self.edits.lock().unwrap();
         e.revoked.remove(&node);
         e.allowed.insert(node);
     }
 
     fn revoke(&self, node: NodeId) {
+        let node = node.canonical();
         {
             let mut e = self.edits.lock().unwrap();
             e.allowed.remove(&node);
@@ -315,7 +318,7 @@ impl Inner {
     }
 
     fn is_revoked(&self, node: &NodeId) -> bool {
-        self.edits.lock().unwrap().revoked.contains(node)
+        self.edits.lock().unwrap().revoked.contains(&node.canonical())
     }
 }
 
@@ -366,9 +369,11 @@ async fn serve(inner: Arc<Inner>, mut tcp: TcpStream) -> io::Result<()> {
     if request.len() != 32 + TOKEN_LEN {
         return Err(io_err("malformed request"));
     }
-    let want = NodeId::from_bytes(request[..32].try_into().unwrap());
+    let want = NodeId::try_from_bytes(request[..32].try_into().unwrap())
+        .map_err(io_err)?
+        .canonical();
     let token: [u8; TOKEN_LEN] = request[32..].try_into().unwrap();
-    let me = est.peer;
+    let me = est.peer.canonical();
     if inner.is_revoked(&me) {
         return Err(io_err("revoked"));
     }

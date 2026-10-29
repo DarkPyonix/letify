@@ -373,7 +373,7 @@ async fn a_bad_request_gets_a_usage_error_and_the_channel_stays_open() {
 async fn a_peer_outside_the_allow_list_is_refused() {
     let mut a = Sidecar::start(None).await;
     let mut b = Sidecar::start(None).await;
-    let stranger = "11".repeat(32);
+    let stranger = letify_link::Identity::generate().node_id().to_string();
     let l = b
         .ok(json!({"op": "listen", "allow": [stranger], "bind": "127.0.0.1:0"}))
         .await;

@@ -127,7 +127,7 @@ def test_a_punch_through_the_python_rendezvous_gives_a_session(pair):
 
 def test_a_peer_outside_the_allow_list_is_an_infrastructure_failure(pair):
     a, b, _ = pair
-    listener = b.listen(["11" * 32], bind="127.0.0.1:0")
+    listener = b.listen([b.node_id], bind="127.0.0.1:0")
     with pytest.raises(linkd.LinkInfrastructureError):
         a.open_session(
             b.node_id,

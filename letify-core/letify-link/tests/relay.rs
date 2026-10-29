@@ -616,3 +616,27 @@ async fn many_pending_pairings_on_a_hub() {
         assert!(r.is_ok(), "{:?}", r.err());
     }
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn revoking_an_alternate_encoding_of_a_node_refuses_the_node_at_the_relay() {
+    // A node whose key has the sign bit set, so the other encoding differs from its id.
+    let a = loop {
+        let i = Identity::generate();
+        if i.node_id().as_bytes()[31] & 0x80 != 0 {
+            break i;
+        }
+    };
+    let b = Identity::generate();
+    let id = Identity::generate();
+    let relay = Relay::bind("127.0.0.1:0", id.clone(), open(), RelayConfig::default())
+        .await
+        .unwrap();
+    let addr = relay.local_addr();
+    let handle = relay.handle();
+    tokio::spawn(relay.run());
+    let mut other = *a.node_id().as_bytes();
+    other[31] ^= 0x80;
+    handle.revoke(letify_link::NodeId::from_bytes(other));
+    let d = RelayDialer::new(addr.to_string(), id.node_id(), a.clone());
+    assert!(d.connect(b.node_id(), new_token()).await.is_err());
+}
