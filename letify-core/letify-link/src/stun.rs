@@ -10,6 +10,8 @@ use std::time::Duration;
 use tokio::net::UdpSocket;
 use tokio::time::timeout;
 
+use crate::observe::{AddressObserver, ObserveFuture};
+
 /// The magic cookie of RFC 5389, which starts every message after the type and the length.
 const MAGIC_COOKIE: u32 = 0x2112_A442;
 const BINDING_REQUEST: u16 = 0x0001;
@@ -212,30 +214,52 @@ pub fn classify_ports(ports: &[u16]) -> NatType {
     NatType::Symmetric { step }
 }
 
-/// Ask each of `servers` in turn from `socket` and classify the mapping. The servers are asked
-/// one after another, because concurrent requests would take consecutive ports in an order
-/// nobody controls and hide the step. It fails unless at least [`MIN_SERVERS`] answer.
-pub async fn classify(
-    socket: &UdpSocket,
-    servers: &[SocketAddr],
+/// An STUN server as an [`AddressObserver`].
+#[derive(Clone, Copy, Debug)]
+pub struct StunObserver {
+    server: SocketAddr,
     wait: Duration,
+}
+
+impl StunObserver {
+    /// An observer for `server`, waiting `wait` in total for its reply.
+    pub fn new(server: SocketAddr, wait: Duration) -> Self {
+        StunObserver { server, wait }
+    }
+}
+
+impl AddressObserver for StunObserver {
+    fn observe<'a>(&'a self, socket: &'a UdpSocket) -> ObserveFuture<'a> {
+        Box::pin(async move {
+            let mapped = binding(socket, self.server, self.wait).await?;
+            Ok(Mapping {
+                server: self.server,
+                mapped,
+            })
+        })
+    }
+}
+
+/// Ask each of `observers` in turn from `socket` and classify the mapping. They are asked one
+/// after another, because concurrent requests would take consecutive ports in an order nobody
+/// controls and hide the step. It fails unless at least [`MIN_SERVERS`] answer.
+pub async fn classify_with(
+    socket: &UdpSocket,
+    observers: &[&dyn AddressObserver],
 ) -> io::Result<Classification> {
     let mut mappings = Vec::new();
-    for server in servers {
-        if let Ok(mapped) = binding(socket, *server, wait).await {
-            mappings.push(Mapping {
-                server: *server,
-                mapped,
-            });
+    for observer in observers {
+        if let Ok(mapping) = observer.observe(socket).await {
+            mappings.push(mapping);
         }
     }
     if mappings.len() < MIN_SERVERS {
         return Err(io::Error::new(
             io::ErrorKind::TimedOut,
             format!(
-                "{} of {} STUN servers answered, {MIN_SERVERS} are needed to classify the NAT",
+                "{} of {} address observers answered, {MIN_SERVERS} are needed to classify the NAT",
                 mappings.len(),
-                servers.len()
+                observers.len()
             ),
         ));
     }
@@ -244,6 +268,23 @@ pub async fn classify(
         nat: classify_ports(&ports),
         mappings,
     })
+}
+
+/// [`classify_with`] over STUN servers, each given `wait` to answer.
+pub async fn classify(
+    socket: &UdpSocket,
+    servers: &[SocketAddr],
+    wait: Duration,
+) -> io::Result<Classification> {
+    let observers: Vec<StunObserver> = servers
+        .iter()
+        .map(|s| StunObserver::new(*s, wait))
+        .collect();
+    let refs: Vec<&dyn AddressObserver> = observers
+        .iter()
+        .map(|o| o as &dyn AddressObserver)
+        .collect();
+    classify_with(socket, &refs).await
 }
 
 #[cfg(test)]
@@ -384,6 +425,64 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::TimedOut);
+    }
+
+    /// An observer that answers from a script, with no socket traffic at all.
+    struct Scripted(Option<SocketAddr>, SocketAddr);
+
+    impl AddressObserver for Scripted {
+        fn observe<'a>(&'a self, _socket: &'a UdpSocket) -> ObserveFuture<'a> {
+            Box::pin(async move {
+                self.0
+                    .map(|mapped| Mapping {
+                        server: self.1,
+                        mapped,
+                    })
+                    .ok_or_else(|| io::Error::from(io::ErrorKind::TimedOut))
+            })
+        }
+    }
+
+    fn scripted(port: Option<u16>, n: u8) -> Scripted {
+        Scripted(
+            port.map(|p| SocketAddr::from(([203, 0, 113, 5], p))),
+            SocketAddr::from(([198, 51, 100, n], 3478)),
+        )
+    }
+
+    #[tokio::test]
+    async fn classification_runs_over_in_process_observers() {
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let list = [
+            scripted(Some(5000), 1),
+            scripted(Some(5004), 2),
+            scripted(None, 3),
+            scripted(Some(5008), 4),
+        ];
+        let refs: Vec<&dyn AddressObserver> =
+            list.iter().map(|o| o as &dyn AddressObserver).collect();
+        let found = classify_with(&socket, &refs).await.unwrap();
+        assert_eq!(found.nat, NatType::Symmetric { step: 4 });
+        assert_eq!(found.mappings.len(), 3);
+        let err = classify_with(&socket, &refs[..2]).await.unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut);
+    }
+
+    #[tokio::test]
+    async fn stun_and_qad_observers_classify_together() {
+        let nat = FakeNat::new(Nat::EndpointIndependent);
+        let stun = StunObserver::new(nat.server().await, Duration::from_secs(2));
+        let id = crate::Identity::generate();
+        let qad = crate::observe::QadResponder::bind("127.0.0.1:0", id.clone())
+            .await
+            .unwrap();
+        let qad_addr = qad.local_addr();
+        tokio::spawn(qad.run());
+        let q1 = crate::observe::QadObserver::new(qad_addr, Some(id.node_id()));
+        let q2 = crate::observe::QadObserver::new(qad_addr, None);
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let found = classify_with(&socket, &[&stun, &q1, &q2]).await.unwrap();
+        assert_eq!(found.nat, NatType::EndpointIndependent);
     }
 
     #[test]
