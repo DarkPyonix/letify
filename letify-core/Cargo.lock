@@ -400,7 +400,7 @@ version = "2.10.2"
 
 [[package]]
 name = "letify-link"
-version = "2.10.1"
+version = "2.10.2"
 dependencies = [
  "ed25519-dalek",
  "getrandom 0.2.17",
