@@ -66,6 +66,15 @@ OWNER = textwrap.dedent(
         import time
         from pathlib import Path
 
+        if mode == "hook":
+            import letify
+
+            letify.on_exit(lambda: Path(ready_file + ".hook").write_text("the hook ran"))
+        if mode == "child":
+            import subprocess
+
+            child = subprocess.Popen(["sleep", "600"])
+            Path(ready_file + ".child").write_text(str(child.pid))
         print("step 1", flush=True)
         Path(ready_file + ".pid").write_text(str(os.getpid()))
         Path(ready_file).touch()
@@ -619,3 +628,117 @@ def test_a_shell_runtime_is_taken_over_through_the_relay_program(
     assert taking.error is None
     assert taking.value == 42
     until(lambda: gone(owner.worker), "the new owner to end the session")
+
+
+# -- a deliberate shutdown ----------------------------------------------------------
+# Spec "A deliberate shutdown".
+
+
+def test_a_shutdown_during_a_call_ends_the_body_and_runs_the_exit_hooks(world, owners) -> None:
+    owner = owners(mode="hook", grace=120.0)
+    owner.process.terminate()
+    until(lambda: gone(owner.worker), "the worker to end after the owner shut down", 20)
+    assert Path(f"{owner.ready}.hook").read_text(encoding="utf-8") == "the hook ran"
+
+
+def test_a_shutdown_ends_the_processes_the_body_started(world, owners) -> None:
+    owner = owners(mode="child", grace=120.0)
+    child = int(Path(f"{owner.ready}.child").read_text(encoding="utf-8"))
+    assert not gone(child)
+    owner.process.terminate()
+    until(lambda: gone(owner.worker), "the worker to end after the owner shut down", 20)
+    until(lambda: gone(child), "the body's subprocess to end", 20)
+
+
+def test_a_lost_owner_without_shutdown_leaves_the_body_for_a_takeover(
+    world, owners, capsys, monkeypatch
+) -> None:
+    owner = owners(mode="hook", grace=120.0)
+    owner.process.kill()
+    owner.process.wait(10)
+    time.sleep(1.0)
+    assert not gone(owner.worker), "an owner that vanished is not a shutdown"
+    owner.finish_body()
+    monkeypatch.setattr(Local, "needs_lease", True)
+    assert main(["takeover", owner.run, "--json"]) == 0
+    assert json.loads(capsys.readouterr().out.strip().splitlines()[-1])["value_repr"] == "42"
+
+
+def test_pool_shutdown_leaves_no_worker_running(world, owners) -> None:
+    owner = owners(grace=120.0)
+    owner.process.terminate()
+    owner.process.wait(20)
+    until(lambda: gone(owner.worker), "no worker to be left running", 10)
+
+
+#: Runs the worker program without serving, then the probe, in a process of its own: the
+#: worker takes over the process's output descriptors, so it cannot run in the test process.
+PROBE = textwrap.dedent(
+    """
+    import sys
+    from pathlib import Path
+
+    from letify.protocol import worker
+
+    out, moved = sys.argv[1], sys.argv[2] == "1"
+    text = worker.SOURCE.rstrip()
+    assert text.endswith("_serve()")
+    space = {"__name__": "probe"}
+    exec(compile(text[: -len("_serve()")], "worker", "exec"), space)
+    ended = []
+    space["_end_by_owner"] = lambda: ended.append("ended")
+    space["_run_exit_hooks"] = lambda reason: None
+    space["_TAKE"].update(moved=moved, run="abcdef012345", live=True)
+    space["_reader_ended"](None, True)
+    space["_TAKE"].update(live=True)
+    space["_reader_ended"](None, False)
+    Path(out).write_text(",".join(ended))
+    """
+)
+
+
+def probe_reader_ended(tmp_path: Path, *, moved: bool) -> str:
+    script = tmp_path / "probe.py"
+    script.write_text(PROBE, encoding="utf-8")
+    out = tmp_path / "probe.out"
+    root = str(Path(letify.__file__).resolve().parent.parent)
+    subprocess.run(
+        [sys.executable, str(script), str(out), "1" if moved else "0"],
+        check=True, timeout=60, env={**os.environ, "PYTHONPATH": root},
+        stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    )
+    return out.read_text(encoding="utf-8")
+
+
+def test_a_shutdown_on_a_channel_the_call_moved_from_does_not_end_it(tmp_path) -> None:
+    assert probe_reader_ended(tmp_path, moved=True) == ""
+
+
+def test_a_shutdown_while_a_call_runs_on_its_channel_ends_it(tmp_path) -> None:
+    assert probe_reader_ended(tmp_path, moved=False) == "ended"
+
+
+def test_detaching_a_persistent_channel_sends_no_shutdown(monkeypatch) -> None:
+    from letify.runtime.channel import PersistentChannel
+
+    sent: list[int] = []
+
+    class Sender:
+        def frame(self, kind: int, stream: int) -> None:
+            sent.append(kind)
+
+    class Pipe:
+        def close(self) -> None:
+            pass
+
+    class Process:
+        stdin = Pipe()
+        stdout = Pipe()
+
+    channel = PersistentChannel.__new__(PersistentChannel)
+    channel._process = Process()
+    channel._connection = type("C", (), {"sender": Sender()})()
+    channel._drop_ssh_log = lambda: None
+    channel.detach()
+    assert wire.SHUTDOWN not in sent
+    assert sent == []

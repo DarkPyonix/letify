@@ -2764,6 +2764,81 @@ def _exit_with_hooks(code, reason="the lease ended"):
     os._exit(code)
 
 
+#: Seconds the body's descendants get to end after SIGTERM before they are killed.
+CHILD_GRACE_S = 5.0
+
+
+def _descendants():
+    """Pids of every descendant of this process, from /proc, or None where /proc is missing."""
+    try:
+        names = [n for n in os.listdir("/proc") if n.isdigit()]
+    except OSError:
+        return None
+    children = {}
+    for name in names:
+        try:
+            with open("/proc/%s/stat" % name) as handle:
+                fields = handle.read().rsplit(")", 1)[1].split()
+        except (OSError, IndexError):
+            continue
+        children.setdefault(int(fields[1]), []).append(int(name))
+    found, queue = [], [os.getpid()]
+    while queue:
+        for pid in children.get(queue.pop(), ()):
+            found.append(pid)
+            queue.append(pid)
+    return found
+
+
+def _alive(pid):
+    try:
+        with open("/proc/%d/stat" % pid) as handle:
+            return handle.read().rsplit(")", 1)[1].split()[0] != "Z"
+    except (OSError, IndexError):
+        return False
+
+
+def _end_descendants():
+    """SIGTERM the processes the body started, wait CHILD_GRACE_S, then SIGKILL survivors."""
+    import signal
+    pids = _descendants()
+    if pids is None:
+        # No /proc: the group is signalled only when this worker leads it.
+        if hasattr(os, "killpg") and os.getpgrp() == os.getpid():
+            try:
+                os.killpg(os.getpgrp(), signal.SIGTERM)
+                time.sleep(2.0)
+            except OSError:
+                pass
+        return
+    for pid in pids:
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except OSError:
+            pass
+    end = time.monotonic() + CHILD_GRACE_S
+    while time.monotonic() < end and any(_alive(pid) for pid in pids):
+        time.sleep(0.05)
+    for pid in pids:
+        if _alive(pid):
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except OSError:
+                pass
+
+
+def _end_by_owner():
+    """The owner shut down on purpose: run the hooks, then end the body and the worker.
+
+    Spec "A deliberate shutdown". The exit status is the one a received SIGTERM gives. The
+    processes the body started are ended first.
+    """
+    import signal
+    _run_exit_hooks("the owner shut down")
+    _end_descendants()
+    os._exit(128 + signal.SIGTERM)
+
+
 def _on_sigint(signum, frame):
     """Raise KeyboardInterrupt, as the default handler does, except for a stale interrupt.
 
@@ -3310,6 +3385,7 @@ def _read(readinto=None, door=None):
     channel the call's output and reply go to.
     """
     receiver = Receiver(readinto or sys.stdin.buffer.readinto)
+    shutdown = False
     while True:
         try:
             event = receiver.next_event()
@@ -3323,6 +3399,7 @@ def _read(readinto=None, door=None):
             continue
         kind, stream, value = event
         if kind == SHUTDOWN:
+            shutdown = True
             break
         if kind != REQUEST:
             continue
@@ -3381,11 +3458,15 @@ def _read(readinto=None, door=None):
         _JOBS.put((stream, request))
         if op == "reexec":
             return
-    _reader_ended(door)
+    _reader_ended(door, shutdown)
 
 
-def _reader_ended(door):
-    """A channel's reader stopped: it was closed, or sent a shutdown."""
+def _reader_ended(door, shutdown=False):
+    """A channel's reader stopped: it was closed, or sent a shutdown.
+
+    Spec "A deliberate shutdown": a shutdown frame on the channel that owns a running call
+    ends the body and the worker. End of input alone leaves the body for a takeover.
+    """
     if door is None and _TAKE["moved"]:
         # The call was adopted away; this channel closing is the old owner leaving.
         return
@@ -3404,6 +3485,9 @@ def _reader_ended(door):
     inbox = _DEVICE.get("inbox")
     if inbox is not None:
         inbox.put(None)
+    if shutdown and during:
+        _end_by_owner()
+        return
     # Spec "Exit hooks": a channel that closes while a body runs is a reason to end, and
     # the hooks run before the main thread is told there is nothing more to serve. Spec
     # "Taking over a running call": the body keeps running, and the worker ends when the
