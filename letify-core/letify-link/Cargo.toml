@@ -1,0 +1,17 @@
+[package]
+name = "letify-link"
+description = "The letify connection layer: an encrypted, multiplexed session that survives the loss of its transport."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+# snow is the Noise implementation, with its pure Rust default crypto resolver.
+snow = "0.9"
+ed25519-dalek = { version = "2", features = ["hazmat"] }
+tokio = { version = "1", features = ["rt", "net", "io-util", "macros", "time", "sync"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full"] }

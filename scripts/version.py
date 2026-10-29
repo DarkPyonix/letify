@@ -21,7 +21,7 @@ import tomllib
 from pathlib import Path
 
 SEMVER = re.compile(r"^\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.+-]+)?$")
-CRATES = ("letify", "letify-quic")
+CRATES = ("letify", "letify-quic", "letify-link")
 INIT_RE = re.compile(r'^__version__ = "([^"]*)"$', re.MULTILINE)
 PYPROJECT_RE = re.compile(r'(\[project\][^\[]*?^version = ")([^"]*)(")', re.MULTILINE | re.DOTALL)
 CARGO_RE = re.compile(
