@@ -678,6 +678,17 @@ def remote_quic_source(version: str) -> str:
     )
 
 
+def remote_link_source(version: str) -> str:
+    """Prepare ``letify-link`` on the remote from the letify wheel of this version.
+
+    Spec "Sidecar interface" item 7: the same extraction as ``remote_quic_source``, for the
+    sidecar binary that sits beside ``letify-quic`` in the wheel.
+    """
+    return remote_quic_source(version).replace("letify-quic", "letify-link").replace(
+        "LETIFY-QUIC", "LETIFY-LINK"
+    )
+
+
 def _remote_quic(version):
     """Take letify-quic out of the letify wheel for this machine, standard library only."""
     import json
