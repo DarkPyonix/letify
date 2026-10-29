@@ -374,7 +374,7 @@ async fn serve(inner: Arc<Inner>, mut tcp: TcpStream) -> io::Result<()> {
     }
     let mine = Conn {
         tcp,
-        crypto,
+        crypto: Arc::new(crypto),
         node: me,
     };
 
