@@ -212,8 +212,9 @@ class Client:
         process: subprocess.Popen | None = None,
         name: str = "device",
         auto_fetch: bool | None = None,
+        compile_steps: bool | None = None,
     ):
-        from .value import auto_fetch_enabled
+        from .value import auto_fetch_enabled, compile_steps_enabled
 
         self.transport = transport
         self.process = process
@@ -221,6 +222,8 @@ class Client:
         self.stats = Stats()
         #: Whether this session asked the runtime to compile captured steps.
         self.compile_requested = False
+        #: Whether ``torch.compile`` may ask the runtime to compile captured steps.
+        self.compile_steps = compile_steps_enabled(compile_steps)
         #: Whether a single value read returns a deferred value instead of synchronizing.
         self.auto_fetch = auto_fetch_enabled(auto_fetch)
         #: The process that connected, the only one that may write to the transport.

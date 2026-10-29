@@ -42,6 +42,27 @@ def _home_setting() -> bool:
     return settings.get("auto_fetch") is not False
 
 
+def compile_steps_enabled(configured: bool | None) -> bool:
+    """``LETIFY_COMPILE_STEPS`` when set, else the account's ``compile_steps``, else off."""
+    value = os.environ.get("LETIFY_COMPILE_STEPS")
+    if value is not None:
+        return value.strip().lower() in ("1", "true", "yes", "on")
+    if configured is None:
+        return _home_compile_steps()
+    return configured is True
+
+
+def _home_compile_steps() -> bool:
+    """``compile_steps`` at the top level of ``~/.letify/config.toml``, off when absent."""
+    from ...paths import config_path
+
+    try:
+        settings = tomllib.loads(config_path().read_text(encoding="utf-8"))
+    except (OSError, tomllib.TOMLDecodeError):
+        return False
+    return settings.get("compile_steps") is True
+
+
 class Deferred:
     """One value read that has been queued but not waited for.
 
@@ -249,4 +270,4 @@ def resolve(value: Any, _seen: set[int] | None = None) -> Any:
     return value
 
 
-__all__ = ["Deferred", "auto_fetch_enabled", "resolve"]
+__all__ = ["Deferred", "auto_fetch_enabled", "compile_steps_enabled", "resolve"]

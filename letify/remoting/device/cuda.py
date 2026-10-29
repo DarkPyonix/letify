@@ -664,20 +664,27 @@ _COMPILE_WARNED = [False]
 
 
 def _request_compile(kwargs: dict) -> None:
-    """Warn once and ask the runtime to compile captured steps, as spec "Compilation" says."""
+    """Warn once and, when step compilation is enabled, ask the runtime to compile steps."""
     if kwargs.get("disable") or kwargs.get("backend", "inductor") != "inductor":
         return
+    client = current_client()
+    enabled = client is not None and client.compile_steps
     if not _COMPILE_WARNED[0]:
         _COMPILE_WARNED[0] = True
-        warnings.warn(
-            "torch.compile under host='local' returns the model unchanged: each captured step "
-            "is compiled on the runtime with Inductor, because compilation needs a CUDA driver "
-            "this process does not have",
-            UserWarning,
-            stacklevel=4,
-        )
-    client = current_client()
-    if client is not None and not client.compile_requested:
+        if enabled:
+            message = (
+                "torch.compile under host='local' returns the model unchanged: each captured "
+                "step is compiled on the runtime with Inductor, because compilation needs a "
+                "CUDA driver this process does not have"
+            )
+        else:
+            message = (
+                "torch.compile under host='local' returns the model unchanged and it runs "
+                "eagerly; LETIFY_COMPILE_STEPS=1 or compile_steps = true in "
+                "~/.letify/config.toml compiles captured steps on the runtime instead"
+            )
+        warnings.warn(message, UserWarning, stacklevel=4)
+    if enabled and not client.compile_requested:
         client.compile_requested = True
         client.call(
             "letify.compile", kwargs.get("mode"), dict(kwargs.get("options") or {}), reply=False

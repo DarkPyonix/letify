@@ -30,6 +30,7 @@ def inductor_cache(tmp_path_factory):
 def run_loop(inductor_cache, monkeypatch):
     """Train a tiny model on a fresh worker and return ``(losses, weights, stats)``."""
     monkeypatch.setenv("TORCHINDUCTOR_CACHE_DIR", inductor_cache)
+    monkeypatch.setenv("LETIFY_COMPILE_STEPS", "1")
 
     def run(compile_it: bool, **compile_arguments):
         connected = forwarding.connect(forwarding.worker_command(sys.executable), device="cpu")
@@ -98,6 +99,7 @@ def test_an_adamw_loop_with_its_bias_corrections_computes_what_eager_replay_comp
     inductor_cache, monkeypatch
 ) -> None:
     monkeypatch.setenv("TORCHINDUCTOR_CACHE_DIR", inductor_cache)
+    monkeypatch.setenv("LETIFY_COMPILE_STEPS", "1")
 
     def train(compile_it: bool):
         connected = forwarding.connect(forwarding.worker_command(sys.executable), device="cpu")
