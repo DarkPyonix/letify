@@ -17,5 +17,10 @@ tokio = { version = "1", features = ["rt", "net", "io-util", "macros", "time", "
 # socket2 sets the TCP keepalive options that tokio does not expose.
 socket2 = { version = "0.5", features = ["all"] }
 
+[features]
+# The relay role: a node that forwards session ciphertext between two authenticated nodes, and
+# the dialer that reaches a peer through one. The sidecar is built with it.
+relay = ["tokio/rt-multi-thread"]
+
 [dev-dependencies]
 tokio = { version = "1", features = ["full"] }

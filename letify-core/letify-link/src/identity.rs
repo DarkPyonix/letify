@@ -47,6 +47,23 @@ impl fmt::Display for NodeId {
     }
 }
 
+impl std::str::FromStr for NodeId {
+    type Err = Error;
+
+    /// Parse the 64 hex characters that `Display` writes.
+    fn from_str(s: &str) -> Result<Self> {
+        let bad = || Error::Handshake(format!("not a node id: {s:?}"));
+        if s.len() != 64 || !s.is_ascii() {
+            return Err(bad());
+        }
+        let mut out = [0u8; 32];
+        for (i, byte) in out.iter_mut().enumerate() {
+            *byte = u8::from_str_radix(&s[2 * i..2 * i + 2], 16).map_err(|_| bad())?;
+        }
+        Ok(NodeId(out))
+    }
+}
+
 impl fmt::Debug for NodeId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "NodeId({self})")

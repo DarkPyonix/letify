@@ -1,0 +1,353 @@
+//! Pins SPEC.md letify-link, Relay items 7 to 13: the relay handshake and policy, the pairing
+//! request, the splice, the limits, the dialer and promotion to a direct path.
+#![cfg(feature = "relay")]
+
+mod common;
+
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+use common::*;
+use letify_link::relay::{Relay, RelayConfig, RelayDialer, new_token};
+use letify_link::{
+    Accepted, Acceptor, Candidate, Config, Identity, ManagerConfig, PathEvent, PathManager,
+    PeerPolicy,
+};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{TcpListener, TcpStream};
+use tokio::time::timeout;
+
+async fn start_relay(policy: PeerPolicy, cfg: RelayConfig) -> (Identity, std::net::SocketAddr) {
+    let id = Identity::generate();
+    let relay = Relay::bind("127.0.0.1:0", id.clone(), policy, cfg)
+        .await
+        .unwrap();
+    let addr = relay.local_addr();
+    tokio::spawn(relay.run());
+    (id, addr)
+}
+
+fn open() -> PeerPolicy {
+    PeerPolicy::from_fn(|_| true)
+}
+
+/// A TCP forwarder that records every byte that passes toward the relay and back.
+async fn recorder(target: std::net::SocketAddr) -> (std::net::SocketAddr, Arc<Mutex<Vec<u8>>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    tokio::spawn({
+        let seen = seen.clone();
+        async move {
+            while let Ok((front, _)) = listener.accept().await {
+                let seen = seen.clone();
+                tokio::spawn(async move {
+                    let Ok(back) = TcpStream::connect(target).await else {
+                        return;
+                    };
+                    let (mut fr, mut fw) = front.into_split();
+                    let (mut br, mut bw) = back.into_split();
+                    let up = {
+                        let seen = seen.clone();
+                        async move {
+                            let mut buf = vec![0u8; 16 << 10];
+                            while let Ok(n) = fr.read(&mut buf).await {
+                                if n == 0 || bw.write_all(&buf[..n]).await.is_err() {
+                                    break;
+                                }
+                                seen.lock().unwrap().extend_from_slice(&buf[..n]);
+                            }
+                        }
+                    };
+                    let down = async move {
+                        let mut buf = vec![0u8; 16 << 10];
+                        while let Ok(n) = br.read(&mut buf).await {
+                            if n == 0 || fw.write_all(&buf[..n]).await.is_err() {
+                                break;
+                            }
+                            seen.lock().unwrap().extend_from_slice(&buf[..n]);
+                        }
+                    };
+                    tokio::join!(up, down);
+                });
+            }
+        }
+    });
+    (addr, seen)
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_session_runs_through_a_relay_and_the_relay_sees_only_ciphertext() {
+    let (relay_id, relay_addr) = start_relay(open(), RelayConfig::default()).await;
+    let (tap, seen) = recorder(relay_addr).await;
+    let a = Identity::generate();
+    let b = Identity::generate();
+    let token = new_token();
+    let da = RelayDialer::new(tap.to_string(), relay_id.node_id(), a.clone());
+    let db = RelayDialer::new(tap.to_string(), relay_id.node_id(), b.clone());
+
+    let server = tokio::spawn({
+        let (b, a_id) = (b.clone(), a.node_id());
+        async move {
+            let t = db.connect(a_id, token).await.unwrap();
+            let acceptor = Acceptor::new(b, PeerPolicy::allow(vec![a_id]), Config::default());
+            let Accepted::Session(s) = acceptor.accept(t).await.unwrap() else {
+                panic!("expected a new session");
+            };
+            let mut stream = s.accept_stream().await.unwrap();
+            let mut got = Vec::new();
+            let mut buf = vec![0u8; 64 << 10];
+            while got.len() < (1 << 20) {
+                let n = stream.read(&mut buf).await.unwrap();
+                assert!(n > 0);
+                got.extend_from_slice(&buf[..n]);
+            }
+            (got, s)
+        }
+    });
+    let t = da.connect(b.node_id(), token).await.unwrap();
+    let session = letify_link::Session::connect(t, &a, b.node_id(), Config::default())
+        .await
+        .unwrap();
+    let mut stream = session.open_stream().await.unwrap();
+    // The payload repeats a known marker, so any plaintext leak would be found.
+    let marker = b"PLAINTEXT-MARKER-0123456789-abcdef";
+    let mut payload = Vec::new();
+    while payload.len() < (1 << 20) {
+        payload.extend_from_slice(marker);
+    }
+    payload.truncate(1 << 20);
+    stream.write_all(&payload).await.unwrap();
+    let (got, _s) = timeout(Duration::from_secs(20), server)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(got, payload);
+
+    let seen = seen.lock().unwrap();
+    assert!(seen.len() > payload.len(), "the relay carried the payload");
+    assert!(
+        !seen.windows(8).any(|w| w == &marker[..8]),
+        "the relay saw a plaintext pattern"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_unauthenticated_client_is_refused_by_the_relay() {
+    let (relay_id, relay_addr) = start_relay(
+        open(),
+        RelayConfig {
+            handshake_timeout: Duration::from_millis(500),
+            ..RelayConfig::default()
+        },
+    )
+    .await;
+    // Bytes that are not a handshake are closed without a reply.
+    let mut raw = TcpStream::connect(relay_addr).await.unwrap();
+    raw.write_all(&[7u8; 200]).await.unwrap();
+    let mut buf = [0u8; 16];
+    let n = timeout(Duration::from_secs(5), raw.read(&mut buf))
+        .await
+        .unwrap()
+        .unwrap_or(0);
+    assert_eq!(n, 0, "the relay answers garbage with a closed connection");
+
+    // A client that holds a different key for the relay cannot complete the handshake.
+    let wrong = Identity::generate().node_id();
+    let client = Identity::generate();
+    let dialer = RelayDialer::new(relay_addr.to_string(), wrong, client);
+    let err = dialer
+        .connect(Identity::generate().node_id(), new_token())
+        .await
+        .expect_err("the handshake fails");
+    assert!(!err.to_string().is_empty());
+    let _ = relay_id;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_relay_with_an_allow_list_refuses_other_nodes() {
+    let allowed = Identity::generate();
+    let stranger = Identity::generate();
+    let peer = Identity::generate();
+    let (relay_id, relay_addr) = start_relay(
+        PeerPolicy::allow(vec![allowed.node_id(), peer.node_id()]),
+        RelayConfig::default(),
+    )
+    .await;
+    let d = RelayDialer::new(relay_addr.to_string(), relay_id.node_id(), stranger);
+    assert!(d.connect(peer.node_id(), new_token()).await.is_err());
+
+    // An allowed pair still pairs on the same relay.
+    let token = new_token();
+    let da = RelayDialer::new(relay_addr.to_string(), relay_id.node_id(), allowed.clone());
+    let dp = RelayDialer::new(relay_addr.to_string(), relay_id.node_id(), peer.clone());
+    let (ra, rp) = tokio::join!(
+        da.connect(peer.node_id(), token),
+        dp.connect(allowed.node_id(), token)
+    );
+    let (mut ta, mut tp) = (ra.unwrap(), rp.unwrap());
+    ta.write_all(b"hello").await.unwrap();
+    let mut buf = [0u8; 5];
+    tp.read_exact(&mut buf).await.unwrap();
+    assert_eq!(&buf, b"hello");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn requests_with_different_tokens_do_not_pair() {
+    let (relay_id, relay_addr) = start_relay(
+        open(),
+        RelayConfig {
+            pair_timeout: Duration::from_millis(600),
+            ..RelayConfig::default()
+        },
+    )
+    .await;
+    let a = Identity::generate();
+    let b = Identity::generate();
+    let da = RelayDialer::new(relay_addr.to_string(), relay_id.node_id(), a.clone());
+    let db = RelayDialer::new(relay_addr.to_string(), relay_id.node_id(), b.clone());
+    let (ra, rb) = tokio::join!(
+        da.connect(b.node_id(), new_token()),
+        db.connect(a.node_id(), new_token())
+    );
+    assert!(ra.is_err() && rb.is_err(), "no pair without the same token");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn per_client_rate_limit_is_enforced() {
+    let (relay_id, relay_addr) = start_relay(
+        open(),
+        RelayConfig {
+            rate_limit: Some(64 * 1024),
+            ..RelayConfig::default()
+        },
+    )
+    .await;
+    let a = Identity::generate();
+    let b = Identity::generate();
+    let token = new_token();
+    let da = RelayDialer::new(relay_addr.to_string(), relay_id.node_id(), a.clone());
+    let db = RelayDialer::new(relay_addr.to_string(), relay_id.node_id(), b.clone());
+    let (ra, rb) = tokio::join!(
+        da.connect(b.node_id(), token),
+        db.connect(a.node_id(), token)
+    );
+    let (mut ta, mut tb) = (ra.unwrap(), rb.unwrap());
+    let data = pattern(128 * 1024, 5);
+    let start = Instant::now();
+    let writer = tokio::spawn(async move {
+        ta.write_all(&data).await.unwrap();
+        ta
+    });
+    let mut got = vec![0u8; 128 * 1024];
+    timeout(Duration::from_secs(20), tb.read_exact(&mut got))
+        .await
+        .unwrap()
+        .unwrap();
+    let took = start.elapsed();
+    let _ = writer.await;
+    assert_eq!(got, pattern(128 * 1024, 5));
+    // 128 KiB at 64 KiB/s takes about 2 s. The limiter allows a first chunk without delay.
+    assert!(took >= Duration::from_millis(1400), "took {took:?}");
+    assert!(took < Duration::from_secs(8), "took {took:?}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_relayed_path_is_promoted_to_a_direct_path_when_one_appears() {
+    let (relay_id, relay_addr) = start_relay(open(), RelayConfig::default()).await;
+    // The client reaches the relay through a slow link, so the relayed path is slow.
+    let slow = Throttle::to(relay_addr, 150_000.0).await;
+    let a = Identity::generate();
+    let b = Identity::generate();
+    let token = new_token();
+    let acceptor = Arc::new(Acceptor::new(
+        b.clone(),
+        PeerPolicy::allow(vec![a.node_id()]),
+        Config::default(),
+    ));
+
+    // The direct port is reserved now and listens only after the relayed path is running.
+    let reserved = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let direct = reserved.local_addr().unwrap();
+    drop(reserved);
+
+    let (tx, mut sessions) = tokio::sync::mpsc::channel(4);
+    {
+        let (acceptor, tx) = (acceptor.clone(), tx.clone());
+        let db = RelayDialer::new(relay_addr.to_string(), relay_id.node_id(), b.clone());
+        let a_id = a.node_id();
+        tokio::spawn(async move {
+            let t = db.connect(a_id, token).await.unwrap();
+            if let Ok(Accepted::Session(s)) = acceptor.accept(t).await {
+                let _ = tx.send(s).await;
+            }
+        });
+    }
+    let da = RelayDialer::new(slow.addr.to_string(), relay_id.node_id(), a.clone());
+    let candidates = vec![
+        da.candidate("relay", b.node_id(), token),
+        Candidate::tcp("direct", direct),
+    ];
+    let cfg = ManagerConfig {
+        measure_interval: Duration::from_millis(100),
+        redial_initial: Duration::from_millis(50),
+        redial_max: Duration::from_millis(200),
+        policy: letify_link::hysteresis::Policy {
+            dwell: Duration::ZERO,
+            confirmations: 2,
+            spacing: Duration::from_millis(100),
+            ..Default::default()
+        },
+        ..ManagerConfig::default()
+    };
+    let mut pm = PathManager::start(a.clone(), b.node_id(), candidates, Config::default(), cfg)
+        .await
+        .unwrap();
+    let server_session = sessions.recv().await.unwrap();
+    let mut stream = pm.session().open_stream().await.unwrap();
+    tokio::spawn(async move {
+        let chunk = pattern(1 << 20, 3);
+        while stream.write_all(&chunk).await.is_ok() {}
+    });
+    tokio::spawn(async move {
+        let mut sb = server_session.accept_stream().await.unwrap();
+        let mut buf = vec![0u8; 1 << 20];
+        while let Ok(n) = sb.read(&mut buf).await {
+            if n == 0 {
+                break;
+            }
+        }
+    });
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let listener = TcpListener::bind(direct).await.unwrap();
+    let _direct_sessions = spawn_server_into(listener, acceptor);
+
+    let moved = timeout(Duration::from_secs(40), async {
+        loop {
+            if let Some(PathEvent::Preferred { from, to }) = pm.next_event().await
+                && to == "direct"
+            {
+                return from;
+            }
+        }
+    })
+    .await
+    .expect("the direct path becomes preferred");
+    assert!(moved.is_none() || moved.as_deref() == Some("relay"));
+}
+
+/// Route connections that arrive on `listener` through an acceptor that already holds the
+/// session, so they join it as subflows.
+fn spawn_server_into(
+    listener: TcpListener,
+    acceptor: Arc<Acceptor>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        while let Ok((tcp, _)) = listener.accept().await {
+            let acceptor = acceptor.clone();
+            tokio::spawn(async move {
+                let _ = acceptor.accept_tcp(tcp).await;
+            });
+        }
+    })
+}
