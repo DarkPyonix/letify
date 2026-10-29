@@ -1096,6 +1096,7 @@ def streams_for(
     size: int,
     rate_bps: float | None = None,
     cost_s: float = 0.0,
+    spares: int = 0,
 ) -> int:
     """How many connections this blob is worth splitting across.
 
@@ -1103,14 +1104,16 @@ def streams_for(
     connections to send a few megabytes costs more than it saves; one on a short link,
     because there a single stream already carries everything the link will carry; never
     more streams than there are chunks to send; and, when a connection costs something to
-    open, only as many as finish the transfer sooner than one would.
+    open, only as many as finish the transfer sooner than one would. The extra streams
+    (all but one) that the link's ``spares`` cover cost nothing, so the cost applies only
+    when ``count - 1`` exceeds them.
     """
     if streams <= 1 or size < threshold_mib * (1 << 20):
         return 1
     if rtt_ms is None or rtt_ms < PARALLEL_RTT_MS:
         return 1
     count = max(1, min(streams, (size + CHUNK - 1) // CHUNK))
-    if cost_s > 0 and count > 1:
+    if cost_s > 0 and count - 1 > max(0, spares):
         if not rate_bps or rate_bps <= 0:
             # Nothing to weigh the cost against, and the cost is real, so do not pay it.
             return 1
@@ -1147,6 +1150,15 @@ def _measured_rtt(provider: Any, runtime: Any) -> float | None:
     return getattr(_measured_link(provider, runtime), "rtt_ms", None)
 
 
+def _spares_of(link: Any) -> int:
+    """The spare connections ``link`` still holds, 0 where it has no such query."""
+    query = getattr(link, "spare_connections", None)
+    try:
+        return max(0, int(query())) if callable(query) else 0
+    except Exception:
+        return 0
+
+
 def _streams_for(runtime: Any, size: int, *, warm: bool = False) -> int:
     """``streams_for`` with the account's settings and the link's measured round trip.
 
@@ -1167,6 +1179,7 @@ def _streams_for(runtime: Any, size: int, *, warm: bool = False) -> int:
         threshold_mib=int(getattr(provider, "transfer_parallel_mib", PARALLEL_MIB) or 0),
         rate_bps=rate,
         cost_s=cost_s,
+        spares=_spares_of(link),
         rtt_ms=rtt,
         size=size,
     )
