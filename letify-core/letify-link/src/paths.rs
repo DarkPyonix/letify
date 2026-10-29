@@ -759,8 +759,8 @@ async fn measure_loop(
             // candidates wait on standby until the last direct subflow dies.
             let mut t = table.lock().unwrap_or_else(|e| e.into_inner());
             let mut close = Vec::new();
-            for j in 0..n {
-                if kinds[j] == PathKind::Relay {
+            for (j, kind) in kinds.iter().enumerate() {
+                if *kind == PathKind::Relay {
                     t.standby[j] = true;
                     if let Some(id) = t.subflow[j] {
                         t.moved[j] = true;
