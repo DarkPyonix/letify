@@ -57,6 +57,15 @@ pub struct SubflowStats {
     pub acked_bytes: u64,
     /// Round trip of the latest keepalive answered on this subflow, if any.
     pub rtt: Option<Duration>,
+    /// Bytes of probe records written to this subflow.
+    pub probe_sent_bytes: u64,
+    /// Bytes of probe records read from this subflow.
+    pub probe_received_bytes: u64,
+    /// Bytes of probe records this side sent that the peer answered.
+    pub probe_acked_bytes: u64,
+    /// The latest probe's size divided by the time to its answer, in bytes per second. A lower
+    /// bound of the subflow's rate, because one small probe does not fill the path.
+    pub probe_rate: Option<f64>,
 }
 
 const NO_RTT: u64 = u64::MAX;
@@ -69,6 +78,16 @@ pub(crate) struct Sub {
     rtt_us: Arc<AtomicU64>,
     /// A Ping stamp waiting to be answered by this subflow's writer.
     pong: Option<u64>,
+    /// The size of a probe record this subflow's writer should send.
+    probe_request: Option<usize>,
+    /// The size of a probe record received and not yet answered.
+    probe_answer: Option<u64>,
+    /// The probe in flight: when it was sent and how big it was.
+    probe_pending: Option<(Instant, usize)>,
+    probe_sent: u64,
+    probe_received: u64,
+    probe_acked: u64,
+    probe_rate: Option<f64>,
     notify: Arc<Notify>,
     aborts: Vec<AbortHandle>,
 }
@@ -210,7 +229,7 @@ impl State {
         match frame {
             Frame::Ack { next } | Frame::Hello { next } => self.apply_ack(next),
             // Keepalives are answered by the subflow's reader, which knows the subflow.
-            Frame::Ping { .. } | Frame::Pong { .. } => {}
+            Frame::Ping { .. } | Frame::Pong { .. } | Frame::Probe | Frame::ProbeAck { .. } => {}
             Frame::Seq { seq, .. } if seq < self.recv_next => {
                 self.ack_dirty = true;
                 self.wake_subflows();
@@ -303,6 +322,9 @@ pub(crate) struct Shared {
     changes: watch::Sender<u64>,
     /// Origin of the keepalive stamps.
     origin: Instant,
+    /// A subflow with no record for this long is dead. `None` when neither side sends
+    /// keepalives, so only a transport error ends a subflow.
+    dead_after: Option<Duration>,
 }
 
 /// Closes the session when the last handle goes away.
@@ -460,6 +482,13 @@ impl Shared {
                 acked: 0,
                 rtt_us,
                 pong: None,
+                probe_request: None,
+                probe_answer: None,
+                probe_pending: None,
+                probe_sent: 0,
+                probe_received: 0,
+                probe_acked: 0,
+                probe_rate: None,
                 notify,
                 aborts,
             },
@@ -490,8 +519,7 @@ async fn reader_task<R: AsyncRead + Unpin>(
     rtt_us: Arc<AtomicU64>,
 ) {
     let mut rd = BufReader::with_capacity(128 * 1024, rd);
-    // A subflow that delivers no record for three keepalive intervals is dead.
-    let limit = shared.cfg.keepalive_interval * 3;
+    let limit = shared.dead_after.unwrap_or(Duration::ZERO);
     let result: Result<()> = async {
         loop {
             let (nonce, ct) = if limit.is_zero() {
@@ -518,6 +546,25 @@ async fn reader_task<R: AsyncRead + Unpin>(
                     let rtt = shared.stamp().saturating_sub(stamp);
                     rtt_us.store(rtt, Ordering::Relaxed);
                 }
+                Frame::Probe => {
+                    // The filler is discarded here. Only its size is answered.
+                    let bytes = (RECORD_HDR + ct.len()) as u64;
+                    if let Some(sub) = shared.lock().subflows.get_mut(&id) {
+                        sub.probe_received += bytes;
+                        sub.probe_answer = Some(bytes);
+                        sub.notify.notify_one();
+                    }
+                }
+                Frame::ProbeAck { bytes } => {
+                    if let Some(sub) = shared.lock().subflows.get_mut(&id)
+                        && let Some((at, size)) = sub.probe_pending.take()
+                        && size as u64 == bytes
+                    {
+                        sub.probe_acked += bytes;
+                        let secs = at.elapsed().as_secs_f64().max(1e-6);
+                        sub.probe_rate = Some(bytes as f64 / secs);
+                    }
+                }
                 frame => shared.lock().handle(frame, &shared.accept),
             }
         }
@@ -529,6 +576,8 @@ async fn reader_task<R: AsyncRead + Unpin>(
 
 enum Work {
     Pong(u64),
+    ProbeAck(u64),
+    Probe(usize),
     Ack(u64),
     Frame(Arc<Vec<u8>>),
     Idle,
@@ -550,8 +599,15 @@ async fn writer_task<W: AsyncWrite + Unpin>(
             let work = {
                 let mut st = shared.lock();
                 let pong = st.subflows.get_mut(&id).and_then(|s| s.pong.take());
+                let answer = if pong.is_some() {
+                    None
+                } else {
+                    st.subflows.get_mut(&id).and_then(|s| s.probe_answer.take())
+                };
                 if let Some(stamp) = pong {
                     Work::Pong(stamp)
+                } else if let Some(bytes) = answer {
+                    Work::ProbeAck(bytes)
                 } else if !st.subflows.contains_key(&id) {
                     // The subflow was declared dead while this task ran. Taking a frame now
                     // would assign it to a subflow that no longer exists and lose it.
@@ -561,6 +617,13 @@ async fn writer_task<W: AsyncWrite + Unpin>(
                 } else if st.ack_dirty {
                     st.ack_dirty = false;
                     Work::Ack(st.recv_next)
+                } else if let Some(size) = st.subflows.get_mut(&id).and_then(|s| {
+                    let size = s.probe_request.take()?;
+                    s.probe_pending = Some((Instant::now(), size));
+                    s.probe_sent += size as u64;
+                    Some(size)
+                }) {
+                    Work::Probe(size)
                 } else {
                     let window = st.subflow_window;
                     let inflight = st.subflows.get(&id).map_or(0, |s| s.inflight);
@@ -593,6 +656,18 @@ async fn writer_task<W: AsyncWrite + Unpin>(
                     wr.flush().await?;
                     // An answer is not activity of this side: each side still pings on its
                     // own schedule, so both get a round trip estimate.
+                }
+                Work::ProbeAck(bytes) => {
+                    let record = shared.seal(&frame::encode_probe_ack(bytes))?;
+                    wr.write_all(&record).await?;
+                    wr.flush().await?;
+                }
+                Work::Probe(size) => {
+                    let record = shared.seal(&frame::encode_probe(size))?;
+                    wr.write_all(&record).await?;
+                    wr.flush().await?;
+                    sent.fetch_add(record.len() as u64, Ordering::Relaxed);
+                    last_write = tokio::time::Instant::now();
                 }
                 Work::Ack(next) => {
                     let record = shared.seal(&frame::encode_ack(next))?;
@@ -670,6 +745,11 @@ impl Session {
         cfg: Config,
         initiator: bool,
     ) -> Result<Session> {
+        let dead_after = {
+            let (own, peer) = (cfg.keepalive_interval, est.peer_keepalive);
+            let longer = own.max(peer);
+            (!longer.is_zero()).then(|| longer * 3)
+        };
         let state = State {
             window: cfg.stream_window,
             peer_window: est.peer_window,
@@ -706,6 +786,7 @@ impl Session {
             session_id: est.session_id,
             changes: watch::channel(0).0,
             origin: Instant::now(),
+            dead_after,
         });
         shared.start_subflow(transport)?;
         Ok(Session {
@@ -906,9 +987,37 @@ impl Session {
                     received_bytes: sub.received.load(Ordering::Relaxed),
                     acked_bytes: sub.acked,
                     rtt: (rtt != NO_RTT).then(|| Duration::from_micros(rtt)),
+                    probe_sent_bytes: sub.probe_sent,
+                    probe_received_bytes: sub.probe_received,
+                    probe_acked_bytes: sub.probe_acked,
+                    probe_rate: sub.probe_rate,
                 }
             })
             .collect()
+    }
+
+    /// Ask the writer of subflow `id` to send a probe whose record is `record_bytes` long (at
+    /// least 64, at most 60000; other values are clamped). The peer discards the filler and
+    /// answers, and [`SubflowStats::probe_rate`] then holds the measured rate. One probe at a
+    /// time is in flight per subflow.
+    pub fn send_probe(&self, id: SubflowId, record_bytes: usize) -> Result<()> {
+        let mut st = self.shared().lock();
+        let sub = st
+            .subflows
+            .get_mut(&id)
+            .ok_or_else(|| Error::Subflow("no such subflow".into()))?;
+        if sub.probe_request.is_some() || sub.probe_pending.is_some() {
+            return Err(Error::Subflow("a probe is already in flight".into()));
+        }
+        sub.probe_request = Some(record_bytes.clamp(64, 60_000));
+        sub.notify.notify_one();
+        Ok(())
+    }
+
+    /// Close subflow `id` without ending the session. The frames it carried that the peer has
+    /// not acknowledged go out again on another subflow. Does nothing if the subflow is gone.
+    pub fn close_subflow(&self, id: SubflowId) {
+        self.shared().subflow_died(id);
     }
 
     /// The number of subflows that are alive now.

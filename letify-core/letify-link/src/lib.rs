@@ -13,6 +13,9 @@
 //!
 //! - Keepalive: an idle subflow sends a Ping, the peer answers with a Pong that gives a round
 //!   trip estimate, and a subflow with no record for three intervals is declared dead.
+//! - Keepalive agreement: each side advertises its interval in the handshake, and the dead time
+//!   is three times the larger one.
+//! - Probes: a Probe frame measures an idle subflow within the probe budget.
 //! - The [`Acceptor`], which routes incoming transports to a live session or to a new one.
 //! - The [`PathManager`], which dials candidate paths, starts the session on the first that
 //!   answers, adds the others as subflows and redials when every subflow died, and the pure

@@ -21,6 +21,8 @@ const T_ACK: u8 = 0x10;
 const T_HELLO: u8 = 0x11;
 const T_PING: u8 = 0x12;
 const T_PONG: u8 = 0x13;
+const T_PROBE: u8 = 0x14;
+const T_PROBE_ACK: u8 = 0x15;
 
 /// What a sequenced frame does.
 #[derive(Debug)]
@@ -45,6 +47,10 @@ pub(crate) enum Frame {
     Ping { stamp: u64 },
     /// The answer to a `Ping`, carrying its stamp back.
     Pong { stamp: u64 },
+    /// Filler that measures a subflow. It has no sequence number and is never delivered.
+    Probe,
+    /// The answer to a `Probe`: the size of the probe's record in bytes.
+    ProbeAck { bytes: u64 },
 }
 
 fn head(t: u8, seq: u64, stream: u32, extra: usize) -> Vec<u8> {
@@ -97,6 +103,19 @@ pub(crate) fn encode_ping(stamp: u64) -> Vec<u8> {
     out
 }
 
+/// A probe whose sealed record is `record_bytes` long.
+pub(crate) fn encode_probe(record_bytes: usize) -> Vec<u8> {
+    let mut out = vec![0u8; record_bytes.saturating_sub(RECORD_HDR + TAG).max(1)];
+    out[0] = T_PROBE;
+    out
+}
+
+pub(crate) fn encode_probe_ack(bytes: u64) -> Vec<u8> {
+    let mut out = vec![T_PROBE_ACK];
+    out.extend_from_slice(&bytes.to_be_bytes());
+    out
+}
+
 pub(crate) fn encode_pong(stamp: u64) -> Vec<u8> {
     let mut out = vec![T_PONG];
     out.extend_from_slice(&stamp.to_be_bytes());
@@ -109,7 +128,10 @@ fn bad(why: &str) -> Error {
 
 pub(crate) fn decode(buf: Vec<u8>) -> Result<Frame> {
     let t = *buf.first().ok_or_else(|| bad("empty"))?;
-    if t == T_ACK || t == T_HELLO || t == T_PING || t == T_PONG {
+    if t == T_PROBE {
+        return Ok(Frame::Probe);
+    }
+    if t == T_ACK || t == T_HELLO || t == T_PING || t == T_PONG || t == T_PROBE_ACK {
         let raw: [u8; 8] = buf
             .get(1..9)
             .ok_or_else(|| bad("short ack"))?
@@ -120,6 +142,7 @@ pub(crate) fn decode(buf: Vec<u8>) -> Result<Frame> {
             T_ACK => Frame::Ack { next },
             T_HELLO => Frame::Hello { next },
             T_PING => Frame::Ping { stamp: next },
+            T_PROBE_ACK => Frame::ProbeAck { bytes: next },
             _ => Frame::Pong { stamp: next },
         });
     }

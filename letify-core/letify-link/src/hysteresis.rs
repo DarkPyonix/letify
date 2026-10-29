@@ -1,7 +1,8 @@
-//! The path switching rules as a pure decision: dwell, confirmation, no downgrade, handover and
-//! probe budget. It owns the rules and their state; it owns no clock, no socket and no task, so
+//! The path switching rules as a pure decision: dwell, confirmation, no downgrade, handover,
+//! probe budget and the floor rule for closing a slow subflow. It owns the rules and their state; it owns no clock, no socket and no task, so
 //! the caller passes the time in and a test needs no waiting.
 
+use std::collections::HashMap;
 use std::time::Duration;
 
 /// Index of a path in the caller's table.
@@ -190,4 +191,63 @@ impl Selector {
 /// as probes stay under `probe_budget` of the `total_bytes` of traffic.
 pub fn probe_allowed(policy: &Policy, probe_bytes: u64, total_bytes: u64) -> bool {
     (probe_bytes as f64) < policy.probe_budget * total_bytes as f64
+}
+
+/// True when a background probe may start: the `probe_bytes` already spent on probes in the
+/// window are under the budget, which is `probe_budget` of the `carried` bytes of the window
+/// and never less than `min_bytes`, so even an idle session may probe once. A probe that starts
+/// can overshoot the budget by its own size.
+pub fn probe_may_start(policy: &Policy, probe_bytes: u64, carried: u64, min_bytes: u64) -> bool {
+    (probe_bytes as f64) < (policy.probe_budget * carried as f64).max(min_bytes as f64)
+}
+
+/// The floor rule as a pure decision. A subflow whose rate stays below the floor for the
+/// confirmation rule of the policy (`confirmations` measurements at least `spacing` apart),
+/// while another live subflow is at or above the floor, is reported for closing. A subflow
+/// with no such neighbour is never reported, because the caller decides about a sole path.
+#[derive(Debug)]
+pub struct FloorWatch {
+    floor: f64,
+    confirmations: u32,
+    spacing: Duration,
+    /// Per path: measurements counted and the time of the latest.
+    counts: HashMap<PathId, (u32, Duration)>,
+}
+
+impl FloorWatch {
+    /// A watch for `floor` bytes per second with the confirmation rule of `policy`.
+    pub fn new(floor: f64, policy: &Policy) -> Self {
+        FloorWatch {
+            floor,
+            confirmations: policy.confirmations,
+            spacing: policy.spacing,
+            counts: HashMap::new(),
+        }
+    }
+
+    /// Feed one set of measurements taken at `now`. Returns the paths to close.
+    pub fn observe(&mut self, now: Duration, paths: &[PathView]) -> Vec<PathId> {
+        let mut close = Vec::new();
+        for p in paths {
+            let other_above = paths
+                .iter()
+                .any(|q| q.id != p.id && q.alive && q.rate >= self.floor);
+            if !(p.alive && p.rate < self.floor && other_above) {
+                self.counts.remove(&p.id);
+                continue;
+            }
+            let count = match self.counts.get(&p.id) {
+                None => 1,
+                Some(&(count, at)) if now >= at + self.spacing => count + 1,
+                Some(_) => continue,
+            };
+            if count >= self.confirmations {
+                self.counts.remove(&p.id);
+                close.push(p.id);
+            } else {
+                self.counts.insert(p.id, (count, now));
+            }
+        }
+        close
+    }
 }

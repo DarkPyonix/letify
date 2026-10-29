@@ -5,13 +5,16 @@
 //!
 //! - Initiator: `"LLNK"`, lowest version (2), highest version (2), length (2), Noise message 1.
 //!   The first eight bytes are the Noise prologue, so a tampered header fails the handshake.
-//!   Message 1 carries the initiator's ed25519 node id (32) and its stream window (4).
+//!   Message 1 carries the initiator's ed25519 node id (32), its stream window (4) and its
+//!   keepalive interval in milliseconds (4, 0 means off).
 //! - Responder, accepted: `"LLNK"`, 0, chosen version (2), length (2), Noise message 2.
-//!   Message 2 carries the chosen version again (2) and the responder's stream window (4).
+//!   Message 2 carries the chosen version again (2), the responder's stream window (4) and
+//!   its keepalive interval (4).
 //! - Responder, refused for versions: `"LLNK"`, 1, lowest (2), highest (2), text length (2),
 //!   text. A refusal for a key it does not accept is a closed transport and nothing else.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use snow::StatelessTransportState;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -29,6 +32,8 @@ pub(crate) struct Established {
     pub peer: NodeId,
     pub version: u16,
     pub peer_window: u32,
+    /// The keepalive interval the peer advertised; zero means the peer sends none.
+    pub peer_keepalive: Duration,
     pub session_id: [u8; 16],
 }
 
@@ -44,6 +49,11 @@ async fn read_exact<T: AsyncRead + Unpin>(t: &mut T, buf: &mut [u8]) -> Result<(
             Error::Io(e)
         }
     })
+}
+
+/// The keepalive interval as the handshake carries it: whole milliseconds, 0 for off.
+fn keepalive_ms(cfg: &Config) -> u32 {
+    cfg.keepalive_interval.as_millis().min(u32::MAX as u128) as u32
 }
 
 fn prologue(low: u16, high: u16) -> [u8; 8] {
@@ -87,9 +97,10 @@ async fn initiate_inner<T: AsyncRead + AsyncWrite + Unpin>(
         .remote_public_key(&remote_key)
         .build_initiator()
         .map_err(hs_err)?;
-    let mut payload = Vec::with_capacity(36);
+    let mut payload = Vec::with_capacity(40);
     payload.extend_from_slice(id.node_id().as_bytes());
     payload.extend_from_slice(&cfg.stream_window.to_be_bytes());
+    payload.extend_from_slice(&keepalive_ms(cfg).to_be_bytes());
     let mut msg = vec![0u8; 1024];
     let n = hs.write_message(&payload, &mut msg).map_err(hs_err)?;
     let mut out = pro.to_vec();
@@ -126,12 +137,16 @@ async fn initiate_inner<T: AsyncRead + AsyncWrite + Unpin>(
     read_exact(t, &mut reply).await?;
     let mut body = vec![0u8; 1024];
     let n = hs.read_message(&reply, &mut body).map_err(hs_err)?;
-    if n != 6 || u16::from_be_bytes([body[0], body[1]]) != chosen || !cfg.versions.contains(&chosen)
+    if n != 10
+        || u16::from_be_bytes([body[0], body[1]]) != chosen
+        || !cfg.versions.contains(&chosen)
     {
         return Err(hs_err("the chosen version is not the one the header named"));
     }
     let peer_window = u32::from_be_bytes([body[2], body[3], body[4], body[5]]);
-    finish(hs, remote, chosen, peer_window)
+    let peer_keepalive =
+        Duration::from_millis(u32::from_be_bytes([body[6], body[7], body[8], body[9]]).into());
+    finish(hs, remote, chosen, peer_window, peer_keepalive)
 }
 
 /// Run the responder side over `t`.
@@ -192,11 +207,13 @@ async fn respond_inner<T: AsyncRead + AsyncWrite + Unpin>(
     let mut hs = builder(&secret, &pro).build_responder().map_err(hs_err)?;
     let mut body = vec![0u8; 1024];
     let n = hs.read_message(&first, &mut body).map_err(hs_err)?;
-    if n != 36 {
+    if n != 40 {
         return Err(hs_err("the first message carries an unexpected payload"));
     }
     let peer = NodeId::from_bytes(body[..32].try_into().unwrap());
     let peer_window = u32::from_be_bytes(body[32..36].try_into().unwrap());
+    let peer_keepalive =
+        Duration::from_millis(u32::from_be_bytes(body[36..40].try_into().unwrap()).into());
     let proven = hs
         .get_remote_static()
         .ok_or_else(|| hs_err("no remote static key"))?;
@@ -212,6 +229,7 @@ async fn respond_inner<T: AsyncRead + AsyncWrite + Unpin>(
     let chosen = common_high;
     let mut payload = chosen.to_be_bytes().to_vec();
     payload.extend_from_slice(&cfg.stream_window.to_be_bytes());
+    payload.extend_from_slice(&keepalive_ms(cfg).to_be_bytes());
     let mut msg = vec![0u8; 1024];
     let n = hs.write_message(&payload, &mut msg).map_err(hs_err)?;
     let mut out = MAGIC.to_vec();
@@ -221,7 +239,7 @@ async fn respond_inner<T: AsyncRead + AsyncWrite + Unpin>(
     out.extend_from_slice(&msg[..n]);
     t.write_all(&out).await?;
     t.flush().await?;
-    finish(hs, peer, chosen, peer_window)
+    finish(hs, peer, chosen, peer_window, peer_keepalive)
 }
 
 fn finish(
@@ -229,6 +247,7 @@ fn finish(
     peer: NodeId,
     version: u16,
     peer_window: u32,
+    peer_keepalive: Duration,
 ) -> Result<Established> {
     let mut session_id = [0u8; 16];
     session_id.copy_from_slice(&hs.get_handshake_hash()[..16]);
@@ -238,6 +257,7 @@ fn finish(
         peer,
         version,
         peer_window,
+        peer_keepalive,
         session_id,
     })
 }
