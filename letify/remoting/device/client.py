@@ -18,6 +18,7 @@ import os
 import pickle
 import queue
 import subprocess
+import sys
 import threading
 import time
 from collections.abc import Iterator, Sequence
@@ -218,6 +219,8 @@ class Client:
         self.process = process
         self.name = name
         self.stats = Stats()
+        #: Whether this session asked the runtime to compile captured steps.
+        self.compile_requested = False
         #: Whether a single value read returns a deferred value instead of synchronizing.
         self.auto_fetch = auto_fetch_enabled(auto_fetch)
         #: The process that connected, the only one that may write to the transport.
@@ -807,6 +810,8 @@ class Client:
         reply = pickle.loads(head)
         results = reply["results"]
         failure = reply.get("failure")
+        for note in reply.get("notes", ()):
+            print(note, file=sys.stderr)
         waiter = None
         reported = False
         # Reads come first in a batch, so the i-th read owns the i-th result. A waiter's
