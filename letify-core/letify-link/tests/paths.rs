@@ -1,5 +1,5 @@
-//! Pins SPEC.md letify-link, Paths and the path manager items 1, 2 and 4 over real TCP on
-//! loopback.
+//! Pins SPEC.md letify-link, Paths and the path manager items 1, 2, 3 (active probes), 4, 6
+//! (below the floor) and 8 (events) over real TCP on loopback.
 
 mod common;
 
@@ -161,7 +161,7 @@ async fn path_events_report_lost_and_measured_paths() {
                         proxy.drop_connections();
                     }
                 }
-                PathEvent::Lost { name } => {
+                PathEvent::Lost { name, .. } => {
                     assert_eq!(name, "only");
                     saw_lost = true;
                 }
@@ -221,4 +221,296 @@ async fn when_every_subflow_dies_the_manager_redials_and_the_stream_continues() 
     writer.await.unwrap();
     assert_eq!(got.len(), total);
     assert!(got == data, "bytes differ after the redial");
+}
+
+/// A TCP forwarder that limits the client to server direction to about `chunk / delay`.
+async fn throttled(
+    target: std::net::SocketAddr,
+    chunk: usize,
+    delay: Duration,
+) -> std::net::SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        while let Ok((front, _)) = listener.accept().await {
+            tokio::spawn(async move {
+                let Ok(back) = tokio::net::TcpStream::connect(target).await else {
+                    return;
+                };
+                let (mut fr, mut fw) = front.into_split();
+                let (mut br, mut bw) = back.into_split();
+                let up = async move {
+                    let mut buf = vec![0u8; chunk];
+                    while let Ok(n) = fr.read(&mut buf).await {
+                        if n == 0 || bw.write_all(&buf[..n]).await.is_err() {
+                            break;
+                        }
+                        tokio::time::sleep(delay).await;
+                    }
+                };
+                let down = async move {
+                    let _ = tokio::io::copy(&mut br, &mut fw).await;
+                };
+                tokio::join!(up, down);
+            });
+        }
+    });
+    addr
+}
+
+/// Write 1 MB every 20 ms (about 50 MB/s) until aborted; the peer discards what arrives.
+fn traffic(
+    client: &letify_link::Session,
+    server: letify_link::Session,
+) -> Vec<tokio::task::JoinHandle<()>> {
+    let client = client.downgrade();
+    let writer = tokio::spawn(async move {
+        let Some(session) = client.upgrade() else {
+            return;
+        };
+        let Ok(mut s) = session.open_stream().await else {
+            return;
+        };
+        drop(session);
+        let chunk = vec![7u8; 1 << 20];
+        loop {
+            if s.write_all(&chunk).await.is_err() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    });
+    let reader = tokio::spawn(async move {
+        let Ok(mut s) = server.accept_stream().await else {
+            return;
+        };
+        let mut buf = vec![0u8; 1 << 16];
+        while let Ok(n) = s.read(&mut buf).await {
+            if n == 0 {
+                return;
+            }
+        }
+    });
+    vec![writer, reader]
+}
+
+fn floor_cfg() -> ManagerConfig {
+    ManagerConfig {
+        measure_interval: Duration::from_millis(50),
+        redial_initial: Duration::from_millis(20),
+        redial_max: Duration::from_millis(200),
+        floor: Some(500_000.0),
+        floor_backoff: Duration::from_secs(30),
+        policy: letify_link::hysteresis::Policy {
+            spacing: Duration::from_millis(100),
+            ..Default::default()
+        },
+        ..ManagerConfig::default()
+    }
+}
+
+fn small_window() -> Config {
+    Config {
+        subflow_window: 32 << 10,
+        resume_window: Duration::from_secs(60),
+        ..Config::default()
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_subflow_below_the_floor_is_closed_while_another_is_above_it() {
+    let mut rig = rig(small_window()).await;
+    let slow = throttled(rig.target, 4096, Duration::from_millis(20)).await;
+    let candidates = vec![
+        Candidate::tcp("slow", slow),
+        Candidate::tcp("fast", rig.target),
+    ];
+    let mut pm = PathManager::start(
+        rig.client.clone(),
+        rig.server.node_id(),
+        candidates,
+        small_window(),
+        floor_cfg(),
+    )
+    .await
+    .unwrap();
+    let server_session = rig.sessions.recv().await.unwrap();
+    let tasks = traffic(pm.session(), server_session);
+    let mut added_slow = 0;
+    let mut lost = None;
+    timeout(Duration::from_secs(20), async {
+        while lost.is_none() {
+            match pm.next_event().await.unwrap() {
+                PathEvent::Added { name } if name == "slow" => added_slow += 1,
+                PathEvent::Lost { name, reason } => lost = Some((name, reason)),
+                _ => {}
+            }
+        }
+    })
+    .await
+    .expect("the slow subflow is closed");
+    let (name, reason) = lost.unwrap();
+    assert_eq!(name, "slow");
+    assert_eq!(reason, "below the floor");
+    // The manager does not redial the candidate during the back-off.
+    let again = timeout(Duration::from_secs(1), async {
+        loop {
+            if let Some(PathEvent::Added { name }) = pm.next_event().await
+                && name == "slow"
+            {
+                return;
+            }
+        }
+    })
+    .await;
+    assert!(again.is_err(), "the slow candidate was redialed");
+    assert_eq!(pm.session().subflow_count(), 1);
+    tasks.iter().for_each(|t| t.abort());
+    let _ = added_slow;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_sole_slow_subflow_is_never_closed_for_being_slow() {
+    let mut rig = rig(small_window()).await;
+    let slow = throttled(rig.target, 4096, Duration::from_millis(20)).await;
+    let mut pm = PathManager::start(
+        rig.client.clone(),
+        rig.server.node_id(),
+        vec![Candidate::tcp("slow", slow)],
+        small_window(),
+        floor_cfg(),
+    )
+    .await
+    .unwrap();
+    let server_session = rig.sessions.recv().await.unwrap();
+    let tasks = traffic(pm.session(), server_session);
+    let lost = timeout(Duration::from_secs(3), async {
+        loop {
+            if let Some(PathEvent::Lost { .. }) = pm.next_event().await {
+                return;
+            }
+        }
+    })
+    .await;
+    assert!(lost.is_err(), "the sole subflow was closed");
+    assert_eq!(pm.session().subflow_count(), 1);
+    tasks.iter().for_each(|t| t.abort());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn lifecycle_events_are_not_dropped_when_the_reader_is_slow() {
+    let mut rig = rig(Config {
+        resume_window: Duration::from_secs(60),
+        ..Config::default()
+    })
+    .await;
+    let proxy = Proxy::to(rig.target).await;
+    let mut pm = PathManager::start(
+        rig.client.clone(),
+        rig.server.node_id(),
+        vec![Candidate::tcp("only", proxy.addr)],
+        Config {
+            resume_window: Duration::from_secs(60),
+            ..Config::default()
+        },
+        ManagerConfig {
+            measure_interval: Duration::from_millis(10),
+            event_capacity: 4,
+            ..quick()
+        },
+    )
+    .await
+    .unwrap();
+    let _server = rig.sessions.recv().await.unwrap();
+    // The caller reads nothing while the subflow is lost and redialed three times, and
+    // measurements keep arriving, far more than the capacity of 4.
+    for _ in 0..3 {
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        proxy.drop_connections();
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        timeout(Duration::from_secs(10), async {
+            while pm.session().subflow_count() < 1 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the manager redialed");
+    }
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let (mut added, mut lost, mut measured) = (0, 0, 0);
+    while let Ok(Some(ev)) = timeout(Duration::from_millis(100), pm.next_event()).await {
+        match ev {
+            PathEvent::Added { .. } => added += 1,
+            PathEvent::Lost { .. } => lost += 1,
+            PathEvent::Measured { .. } => measured += 1,
+            _ => {}
+        }
+    }
+    assert_eq!(added, 4, "one Added at the start and one per redial");
+    assert_eq!(lost, 3);
+    assert!(measured <= 4, "{measured} measurements were kept");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_idle_subflow_is_measured_by_probes_within_the_budget() {
+    let mut rig = rig(Config::default()).await;
+    let window = Duration::from_secs(1);
+    let min = 8 << 10;
+    let pm = PathManager::start(
+        rig.client.clone(),
+        rig.server.node_id(),
+        vec![
+            Candidate::tcp("one", rig.target),
+            Candidate::tcp("two", rig.target),
+        ],
+        Config::default(),
+        ManagerConfig {
+            measure_interval: Duration::from_millis(50),
+            probe_window: window,
+            probe_min_bytes: min,
+            probe_idle: Duration::from_millis(100),
+            ..quick()
+        },
+    )
+    .await
+    .unwrap();
+    let server_session = rig.sessions.recv().await.unwrap();
+    let begun = tokio::time::Instant::now();
+    timeout(Duration::from_secs(10), async {
+        while pm.session().subflow_count() < 2 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    tokio::time::sleep(Duration::from_millis(3200)).await;
+    let elapsed = begun.elapsed();
+
+    // Every idle subflow got a rate from a probe.
+    let stats = pm.session().subflow_stats();
+    assert_eq!(stats.len(), 2);
+    for st in &stats {
+        assert!(
+            st.probe_acked_bytes > 0,
+            "subflow {} was never probed",
+            st.id
+        );
+        assert!(st.probe_rate.is_some_and(|r| r > 0.0));
+    }
+    // The spend stays within the budget of each window, with one probe of slack.
+    let spent = pm.probe_bytes_spent();
+    let windows = (elapsed.as_secs_f64() / window.as_secs_f64()).ceil() as u64;
+    assert!(spent > 0);
+    assert!(
+        spent <= windows * min as u64 + min as u64,
+        "spent {spent} bytes in {windows} windows"
+    );
+    // The receiver discarded the filler: nothing reached a stream and the session still works.
+    let mut s = pm.session().open_stream().await.unwrap();
+    s.write_all(b"ok").await.unwrap();
+    let mut sb = server_session.accept_stream().await.unwrap();
+    let mut got = [0u8; 2];
+    sb.read_exact(&mut got).await.unwrap();
+    assert_eq!(&got, b"ok");
+    assert_eq!(server_session.dropped_records(), 0);
 }

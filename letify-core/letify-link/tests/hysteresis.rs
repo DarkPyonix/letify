@@ -1,9 +1,11 @@
-//! Pins SPEC.md letify-link, Paths and the path manager item 3: dwell, confirmation, no
-//! downgrade, handover and probe budget. Time is injected, so no test waits.
+//! Pins SPEC.md letify-link, Paths and the path manager item 3 and item 6: dwell,
+//! confirmation, no downgrade, handover, probe budget and the floor. Time is injected, so no test waits.
 
 use std::time::Duration;
 
-use letify_link::hysteresis::{Decision, PathView, Policy, Reason, Selector, probe_allowed};
+use letify_link::hysteresis::{
+    Decision, FloorWatch, PathView, Policy, Reason, Selector, probe_allowed, probe_may_start,
+};
 
 fn s(n: u64) -> Duration {
     Duration::from_secs(n)
@@ -145,4 +147,77 @@ fn background_probes_stay_within_two_percent_of_the_traffic() {
     assert!(probe_allowed(&policy, 19_999, 1_000_000));
     assert!(!probe_allowed(&policy, 20_000, 1_000_000));
     assert!(!probe_allowed(&policy, 1, 0));
+}
+
+#[test]
+fn a_probe_may_start_while_the_spend_is_under_the_budget_or_the_minimum() {
+    let policy = Policy::default();
+    // 2% of 1 MB is 20 kB, above the 16 KiB minimum.
+    assert!(probe_may_start(&policy, 19_999, 1_000_000, 16 << 10));
+    assert!(!probe_may_start(&policy, 20_000, 1_000_000, 16 << 10));
+    // An idle session still gets one probe: the minimum is the budget.
+    assert!(probe_may_start(&policy, 0, 0, 16 << 10));
+    assert!(!probe_may_start(&policy, 16 << 10, 0, 16 << 10));
+}
+
+fn watch() -> FloorWatch {
+    FloorWatch::new(100.0, &Policy::default())
+}
+
+#[test]
+fn a_subflow_below_the_floor_is_closed_after_three_spaced_measurements() {
+    let mut w = watch();
+    let paths = [view(0, 50.0), view(1, 500.0)];
+    assert!(w.observe(s(0), &paths).is_empty());
+    assert!(w.observe(s(10), &paths).is_empty());
+    assert_eq!(w.observe(s(20), &paths), vec![0]);
+}
+
+#[test]
+fn measurements_closer_than_the_spacing_do_not_count_toward_the_floor_rule() {
+    let mut w = watch();
+    let paths = [view(0, 50.0), view(1, 500.0)];
+    for t in 0..20 {
+        assert!(w.observe(s(t), &paths).is_empty());
+    }
+    assert_eq!(w.observe(s(20), &paths), vec![0]);
+}
+
+#[test]
+fn a_measurement_at_or_above_the_floor_resets_the_floor_count() {
+    let mut w = watch();
+    let low = [view(0, 50.0), view(1, 500.0)];
+    let ok = [view(0, 100.0), view(1, 500.0)];
+    assert!(w.observe(s(0), &low).is_empty());
+    assert!(w.observe(s(10), &low).is_empty());
+    assert!(w.observe(s(20), &ok).is_empty());
+    assert!(w.observe(s(30), &low).is_empty());
+    assert!(w.observe(s(40), &low).is_empty());
+    assert_eq!(w.observe(s(50), &low), vec![0]);
+}
+
+#[test]
+fn a_sole_subflow_is_never_closed_for_being_slow() {
+    let mut w = watch();
+    for t in 0..10 {
+        assert!(w.observe(s(t * 10), &[view(0, 1.0)]).is_empty());
+    }
+    // A dead neighbour is not a subflow above the floor.
+    let dead = PathView {
+        id: 1,
+        rate: 0.0,
+        alive: false,
+    };
+    for t in 10..20 {
+        assert!(w.observe(s(t * 10), &[view(0, 1.0), dead]).is_empty());
+    }
+}
+
+#[test]
+fn no_subflow_is_closed_while_every_subflow_is_below_the_floor() {
+    let mut w = watch();
+    let paths = [view(0, 50.0), view(1, 60.0)];
+    for t in 0..10 {
+        assert!(w.observe(s(t * 10), &paths).is_empty());
+    }
 }
