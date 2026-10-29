@@ -692,9 +692,7 @@ async fn candidate_loop(
         } else if by_floor {
             pause(cfg.floor_backoff, &mut hints).await;
             wait = cfg.redial_initial;
-        } else if up_since.elapsed() > Duration::from_secs(1) {
-            wait = cfg.redial_initial;
-        } else if pause(wait, &mut hints).await {
+        } else if up_since.elapsed() > Duration::from_secs(1) || pause(wait, &mut hints).await {
             wait = cfg.redial_initial;
         } else {
             wait = (wait * 2).min(cfg.redial_max);

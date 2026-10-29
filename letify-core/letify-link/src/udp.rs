@@ -258,7 +258,9 @@ impl UdpPath {
             crate::session::CongestionStats {
                 window: path.cwnd.min(usize::MAX as u64) as usize,
                 rtt: path.rtt,
+                min_rtt: path.min_rtt,
                 lost_packets: path.lost_packets,
+                sent_packets: path.sent_packets,
             }
         })
     }

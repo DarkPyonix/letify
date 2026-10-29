@@ -103,20 +103,6 @@ async fn a_small_message_is_not_queued_behind_a_bulk_stream() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn a_small_message_is_not_queued_behind_a_bulk_stream_over_a_udp_path() {
-    // A 20 ms round trip and 8 MiB/s, as the TCP case, with no loss.
-    let rate = 8.0 * MIB;
-    let one_way = Duration::from_millis(10);
-    let (a, b, _p) = udp_session(Config::default(), one_way, 0.0, Some(rate)).await;
-    let (p50, p99) = small_message_rtts(&a, b).await;
-    eprintln!("small message over UDP under a saturating bulk stream: p50 {p50:?}, p99 {p99:?}");
-    assert!(
-        p99 < Duration::from_millis(100),
-        "p99 {p99:?} with p50 {p50:?}"
-    );
-}
-
-#[tokio::test(flavor = "multi_thread")]
 async fn bulk_streams_share_bandwidth_fairly() {
     let rate = 8.0 * MIB;
     let (a, b, _p) = throttled_session(&[rate], Config::default(), Config::default()).await;

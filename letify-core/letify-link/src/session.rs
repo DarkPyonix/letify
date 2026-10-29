@@ -47,10 +47,14 @@ impl<T: AsyncRead + AsyncWrite + Send + Unpin + 'static> Transport for T {}
 pub struct CongestionStats {
     /// The congestion window in bytes: the most the transport puts in flight.
     pub window: usize,
-    /// The transport's smoothed round trip.
+    /// The transport's smoothed round trip, which a lost packet's recovery does not inflate.
     pub rtt: Duration,
+    /// The lowest round trip the transport has seen.
+    pub min_rtt: Duration,
     /// Packets the transport has declared lost so far.
     pub lost_packets: u64,
+    /// Packets the transport has sent so far.
+    pub sent_packets: u64,
 }
 
 /// Reads the congestion statistics of one subflow's transport.
@@ -121,6 +125,14 @@ const MIN_RTT_SPAN: Duration = Duration::from_secs(10);
 const CAP_HOLD: u32 = 6;
 /// A subflow whose transport lost a packet this recently is recovering from loss.
 const LOSS_HOLD: Duration = Duration::from_secs(1);
+/// The loss ratio of a transport is taken over intervals of this length.
+const LOSS_SPAN: Duration = Duration::from_millis(250);
+/// A path that loses more than this share of its packets is overflowing a queue. A larger cap
+/// would only add delay there, so the cap stays the probed one.
+const HEAVY_LOSS: f64 = 0.10;
+/// While a path recovers from loss, the cap holds at most this long a flight at the delivery
+/// rate, so a small message waits behind at most this much bulk.
+const LOSS_DELAY: Duration = Duration::from_millis(150);
 /// A transport's congestion window is read at most this often.
 const GAUGE_EVERY: Duration = Duration::from_millis(10);
 /// While both classes have frames queued, this many interactive frames are followed by one
@@ -174,9 +186,9 @@ pub struct SubflowStats {
     pub bulk_cap: usize,
     /// The latest delivery rate sample of the subflow in bytes per second, if any.
     pub delivery_rate: Option<f64>,
-    /// The congestion window of the subflow's transport, for a transport that reports one (a
-    /// UDP path), as read at most every 10 ms.
-    pub congestion_window: Option<usize>,
+    /// What the subflow's transport reports about its congestion control, for a transport that
+    /// reports it (a UDP path), as read at most every 10 ms.
+    pub congestion: Option<CongestionStats>,
 }
 
 const NO_RTT: u64 = u64::MAX;
@@ -227,6 +239,10 @@ pub(crate) struct Sub {
     gauged: Option<(CongestionStats, Instant)>,
     /// When the transport last reported more lost packets than before.
     loss_at: Option<Instant>,
+    /// The start of the current loss interval with the counts then, and the share of packets
+    /// the transport lost in the last interval.
+    loss_base: Option<(Instant, u64, u64)>,
+    loss_ratio: f64,
     sent: Arc<AtomicU64>,
     received: Arc<AtomicU64>,
     acked: u64,
@@ -272,6 +288,8 @@ impl Sub {
             gauge,
             gauged: None,
             loss_at: None,
+            loss_base: None,
+            loss_ratio: 0.0,
             sent: shared.sent,
             received: shared.received,
             acked: 0,
@@ -304,11 +322,14 @@ impl Sub {
             Some((stats, at))
                 if self
                     .loss_at
-                    .is_some_and(|l| at.saturating_duration_since(l) <= LOSS_HOLD) =>
+                    .is_some_and(|l| at.saturating_duration_since(l) <= LOSS_HOLD)
+                    && self.loss_ratio <= HEAVY_LOSS =>
             {
                 let stall = (best * rtt.as_secs_f64()) as usize;
+                let flight = stats.window.saturating_add(stall);
+                let allowed = (best * LOSS_DELAY.as_secs_f64()) as usize;
                 probed
-                    .max(stats.window.saturating_add(stall))
+                    .max(flight.min(allowed))
                     .min(self.window.max(QUANTUM))
             }
             _ => probed,
@@ -330,6 +351,20 @@ impl Sub {
                 .is_some_and(|(old, _)| stats.lost_packets > old.lost_packets)
             {
                 self.loss_at = Some(now);
+            }
+            match self.loss_base {
+                Some((from, lost, sent)) if now.saturating_duration_since(from) >= LOSS_SPAN => {
+                    let sent_now = stats.sent_packets.saturating_sub(sent);
+                    let lost_now = stats.lost_packets.saturating_sub(lost);
+                    self.loss_ratio = if sent_now == 0 {
+                        0.0
+                    } else {
+                        lost_now as f64 / sent_now as f64
+                    };
+                    self.loss_base = Some((now, stats.lost_packets, stats.sent_packets));
+                }
+                Some(_) => {}
+                None => self.loss_base = Some((now, stats.lost_packets, stats.sent_packets)),
             }
             self.gauged = Some((stats, now));
         }
@@ -1916,7 +1951,7 @@ impl Session {
                     probe_rate: sub.probe_rate,
                     bulk_cap: sub.bulk_cap(),
                     delivery_rate: sub.rates.back().copied(),
-                    congestion_window: sub.gauged.map(|(g, _)| g.window),
+                    congestion: sub.gauged.map(|(g, _)| g),
                 }
             })
             .collect()
@@ -2026,7 +2061,9 @@ mod tests {
         Arc::new(move || CongestionStats {
             window,
             rtt: Duration::from_millis(50),
+            min_rtt: Duration::from_millis(50),
             lost_packets: lost,
+            sent_packets: 0,
         })
     }
 
@@ -2047,7 +2084,9 @@ mod tests {
             Arc::new(move || CongestionStats {
                 window: 600 << 10,
                 rtt: Duration::from_millis(50),
+                min_rtt: Duration::from_millis(50),
                 lost_packets: lost.load(Ordering::Relaxed),
+                sent_packets: 0,
             })
         };
         let mut s = busy(Some(gauge));
@@ -2062,13 +2101,77 @@ mod tests {
     }
 
     #[test]
-    fn the_cap_of_a_subflow_recovering_from_loss_stays_inside_the_subflow_window() {
+    fn the_cap_of_a_subflow_recovering_from_loss_holds_at_most_150_ms_at_the_delivery_rate() {
         let mut s = busy(Some(reading(8 << 20, 0)));
+        let now = Instant::now();
         s.gauged = Some((
             CongestionStats {
                 window: 8 << 20,
                 rtt: Duration::from_millis(50),
+                min_rtt: Duration::from_millis(50),
                 lost_packets: 9,
+                sent_packets: 1000,
+            },
+            now,
+        ));
+        s.loss_at = Some(now);
+        // 10 MB/s for 150 ms.
+        assert_eq!(s.bulk_cap(), 1_500_000);
+    }
+
+    #[test]
+    fn a_path_that_loses_more_than_a_tenth_of_its_packets_keeps_the_probed_cap() {
+        let mut s = busy(Some(reading(600 << 10, 0)));
+        let now = Instant::now();
+        s.gauged = Some((
+            CongestionStats {
+                window: 600 << 10,
+                rtt: Duration::from_millis(50),
+                min_rtt: Duration::from_millis(50),
+                lost_packets: 9,
+                sent_packets: 1000,
+            },
+            now,
+        ));
+        s.loss_at = Some(now);
+        s.loss_ratio = 0.25;
+        assert_eq!(s.bulk_cap(), busy(None).bulk_cap());
+    }
+
+    #[test]
+    fn the_loss_ratio_is_the_share_of_packets_lost_in_the_last_interval() {
+        let counts = Arc::new((AtomicU64::new(0), AtomicU64::new(0)));
+        let gauge: Gauge = {
+            let counts = counts.clone();
+            Arc::new(move || CongestionStats {
+                window: 1 << 20,
+                rtt: Duration::from_millis(50),
+                min_rtt: Duration::from_millis(50),
+                lost_packets: counts.0.load(Ordering::Relaxed),
+                sent_packets: counts.1.load(Ordering::Relaxed),
+            })
+        };
+        let mut s = sub(Some(gauge));
+        let t0 = Instant::now();
+        s.read_gauge(t0);
+        counts.0.store(30, Ordering::Relaxed);
+        counts.1.store(1000, Ordering::Relaxed);
+        s.read_gauge(t0 + LOSS_SPAN);
+        assert!((s.loss_ratio - 0.03).abs() < 1e-9, "{}", s.loss_ratio);
+    }
+
+    #[test]
+    fn the_cap_of_a_subflow_recovering_from_loss_stays_inside_the_subflow_window() {
+        let mut s = busy(Some(reading(8 << 20, 0)));
+        // 20 MB/s for 150 ms is 3 MB, more than the 2 MiB window.
+        s.rates.push_back(20e6);
+        s.gauged = Some((
+            CongestionStats {
+                window: 8 << 20,
+                rtt: Duration::from_millis(50),
+                min_rtt: Duration::from_millis(50),
+                lost_packets: 9,
+                sent_packets: 0,
             },
             Instant::now(),
         ));
@@ -2084,7 +2187,9 @@ mod tests {
             CongestionStats {
                 window: 600 << 10,
                 rtt: Duration::from_millis(50),
+                min_rtt: Duration::from_millis(50),
                 lost_packets: 3,
+                sent_packets: 0,
             },
             t0 + Duration::from_secs(2),
         ));
@@ -2102,7 +2207,9 @@ mod tests {
                 CongestionStats {
                     window: 1 << 20,
                     rtt: Duration::from_millis(50),
+                    min_rtt: Duration::from_millis(50),
                     lost_packets: 0,
+                    sent_packets: 0,
                 }
             })
         };
