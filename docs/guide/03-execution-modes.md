@@ -72,6 +72,8 @@ A read does not have to be a synchronization. `loss.detach().to("cpu", non_block
 
 You do not have to write either of those for a logged number. Under `host="local"`, `loss.item()` already returns a deferred value: the read is queued and the loop keeps going, and the value is waited for where it is used, such as in the `print` a step later. `tolist()`, `float(tensor)` and `int(tensor)` work the same way. `bool(tensor)` still waits, because control flow needs the value at once. The value a call returns is always a real `float`, `int` or `list`. Put `auto_fetch = false` in the account entry, or `LETIFY_AUTO_FETCH=0` in the environment, to turn this off. At the end of a call letify prints how many reads it deferred and how many had to wait, so a loop that gains nothing from it is visible.
 
+`torch.compile` and `Module.compile` return the model unchanged under `host="local"` and warn once that it runs eagerly. To have the runtime compile each captured step with Inductor instead, set `LETIFY_COMPILE_STEPS=1` in the environment or `compile_steps = true` at the top level of `~/.letify/config.toml`. It is off by default because it measured no gain on a Colab T4: 15.0 ms per step eager against 16.0 ms compiled, since the step time is bound by the client's dispatch.
+
 Other things that force a synchronization: `nonzero()`, boolean mask indexing, `unique()`, and mixture of experts routing, which reads per-expert token counts back to the host. Any operation whose output shape the host has to know is a synchronization.
 
 ### Measure it instead of guessing
