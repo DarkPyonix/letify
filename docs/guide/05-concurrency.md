@@ -157,7 +157,7 @@ def train():
     ...
 ```
 
-The hook runs when the worker receives `SIGTERM`, when its lease runs out, or when the channel closes during the call. It does not run for `SIGKILL` or the out of memory killer, so keep writing checkpoints as well. Hooks run newest first and share 120 seconds.
+The hook runs when the worker receives `SIGTERM`, when its lease runs out, when the channel closes during the call, or when the owner shuts down. A shutdown by the owner (a pool shutdown, or a client that received `SIGTERM`) runs the hooks and then ends the body and the worker. A channel that closes with no shutdown leaves the body running until the lease deadline, so another process can take it over. It does not run for `SIGKILL` or the out of memory killer, so keep writing checkpoints as well. Hooks run newest first and share 120 seconds.
 
 None of this works on a provider whose worker has only a one-shot channel, and the commands say which provider. There is no control socket on Windows. See the spec section "Controlling a running call".
 
