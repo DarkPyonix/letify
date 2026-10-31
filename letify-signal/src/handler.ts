@@ -90,10 +90,10 @@ export async function handle(request: Request, deps: Deps): Promise<Response> {
 
 async function route(request: Request, deps: Deps, sawBody: (n: number) => void): Promise<Response> {
   const url = new URL(request.url);
-  if (url.pathname === "/v1/health") {
-    return Response.json({ ok: true, v: 1 });
+  if (url.pathname === "/health") {
+    return Response.json({ ok: true });
   }
-  const match = /^\/v1\/(send|recv|ws)\/([^/]+)$/.exec(url.pathname);
+  const match = /^\/(send|recv|ws)\/([^/]+)$/.exec(url.pathname);
   if (match === null) return reply("not_found");
   const [, kind, target] = match;
   const method = kind === "send" ? "POST" : "GET";

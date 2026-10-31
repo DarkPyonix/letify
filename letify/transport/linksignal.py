@@ -172,7 +172,7 @@ class SignalClient:
     def post_unchecked(self, to: str, body: bytes, signer_id: str | None = None) -> int:
         """``send`` without the size check, to test what the service itself refuses."""
         reply = self._request(
-            "POST", f"/v1/send/{to}", body, timeout=self._timeout, signer_id=signer_id
+            "POST", f"/send/{to}", body, timeout=self._timeout, signer_id=signer_id
         )
         return int(reply["seq"])
 
@@ -181,7 +181,7 @@ class SignalClient:
     ) -> tuple[list[Incoming], int]:
         """Read the mailbox of ``node`` as this node, which the service allows only for itself."""
         wait = max(0, min(int(wait_s), int(POLL_S)))
-        target = f"/v1/recv/{node}?after={int(after)}&wait={wait}"
+        target = f"/recv/{node}?after={int(after)}&wait={wait}"
         reply = self._request("GET", target, b"", timeout=self._timeout + wait)
         messages = [
             Incoming(int(m["seq"]), str(m["from"]), int(m["at"]), base64.b64decode(m["body"]))
