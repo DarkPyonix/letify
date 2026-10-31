@@ -79,7 +79,33 @@ async fn startup_marks(secs: u64) -> Vec<(f64, f64)> {
     bulk_and_count(&a, b, stop.clone(), count.clone()).await;
     let mut out = Vec::new();
     for at in [1.0, 1.5, 2.0, secs as f64] {
-        tokio::time::sleep_until(t0 + Duration::from_secs_f64(at)).await;
+        // TEMP-INSTRUMENT
+        loop {
+            let next = t0 + Duration::from_secs_f64(at);
+            let step = Instant::now() + Duration::from_millis(100);
+            tokio::time::sleep_until(step.min(next)).await;
+            let caps: Vec<_> = a
+                .subflow_stats()
+                .iter()
+                .map(|s| {
+                    (
+                        s.bulk_cap >> 10,
+                        s.srtt.map(|d| d.as_millis()),
+                        s.delivery_rate.map(|r| (r / 1048576.0) as u32),
+                        s.inflight_bytes >> 10,
+                    )
+                })
+                .collect();
+            eprintln!(
+                "TEMP t={:?} bytes={} caps/srtt/rate/inflight={:?}",
+                t0.elapsed(),
+                count.load(Ordering::Relaxed) >> 20,
+                caps
+            );
+            if Instant::now() >= next {
+                break;
+            }
+        }
         out.push((at, count.load(Ordering::Relaxed) as f64 / MIB));
     }
     stop.store(true, Ordering::Relaxed);
