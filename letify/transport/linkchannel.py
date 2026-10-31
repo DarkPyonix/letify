@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import contextlib
 import json
+import math
 import os
 import secrets
 import shlex
@@ -20,7 +21,7 @@ import threading
 import time
 from collections.abc import Callable
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol
 
 from ..errors import ProviderUnavailable, RuntimeFailure
 from ..protocol import wire
@@ -37,6 +38,13 @@ SHIM_TIMEOUT = 60.0
 PUNCH_TCP = 4
 PUNCH_UDP = 1
 POLICE = {"floor_bps": 1 << 20, "burst_ms": 500}
+#: The punch window of a first attempt over a command channel, in milliseconds, and the factor
+#: the retry's window is longer by. Spec "Sidecar interface" item 8.
+PUNCH_WINDOW_MS = 20_000
+RETRY_WINDOW_FACTOR = 3
+#: The least lead a punch gets, in milliseconds, and how many bootstrap round trips it is.
+PUNCH_LEAD_FLOOR_MS = 2000
+PUNCH_LEAD_ROUND_TRIPS = 3
 #: Seconds the remote shim waits for a session after the hand-over before it leaves.
 WAIT_SESSION_S = 120
 #: Seconds a session keeps its place with no live path. It is the lease of spec "Sessions",
@@ -63,8 +71,98 @@ def stream_header(kind: str, token: str, **fields: Any) -> bytes:
     return json.dumps({"kind": kind, "token": token, **fields}).encode() + b"\n"
 
 
+def punch_lead_ms(rtt_s: float) -> int:
+    """The lead of a punch over a command channel: the larger of 2 s and 3 round trips.
+
+    Spec "Sidecar interface" item 8. A punch offer and its answer cross the channel once each,
+    and each crossing takes at most one round trip, so 3 leave a round trip of margin.
+    """
+    return max(PUNCH_LEAD_FLOOR_MS, math.ceil(round(PUNCH_LEAD_ROUND_TRIPS * rtt_s * 1000, 6)))
+
+
+class Bootstrap(Protocol):
+    """The line stream between the local side and the shim until the hand-over.
+
+    An ssh command is one implementation (``PopenBootstrap``) and a provider's command channel is
+    the other (``linkmailbox.MailboxBootstrap``). ``rtt_s`` is None for a stream that is not a
+    rendezvous cost, and the measured round trip in seconds for one that is.
+    """
+
+    rtt_s: float | None
+
+    def send_line(self, line: bytes) -> None: ...
+
+    def recv_line(self) -> bytes | None:
+        """The next line, blocking, or None once the stream has ended."""
+        ...
+
+    def stderr_text(self) -> str: ...
+
+    def close(self) -> None: ...
+
+
+class PopenBootstrap:
+    """The shim's standard input and output as an ssh command's."""
+
+    rtt_s = None
+
+    def __init__(self, command: list[str]):
+        self.proc = subprocess.Popen(
+            command, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE
+        )
+        assert self.proc.stdin is not None and self.proc.stdout is not None
+        self._lock = threading.Lock()
+
+    def send_line(self, line: bytes) -> None:
+        with self._lock, contextlib.suppress(OSError, ValueError):
+            assert self.proc.stdin is not None
+            self.proc.stdin.write(line.rstrip(b"\n") + b"\n")
+            self.proc.stdin.flush()
+
+    def recv_line(self) -> bytes | None:
+        assert self.proc.stdout is not None
+        line = self.proc.stdout.readline()
+        return line or None
+
+    def stderr_text(self) -> str:
+        stderr = b""
+        if self.proc.stderr is not None:
+            with contextlib.suppress(OSError, ValueError):
+                stderr = self.proc.stderr.read()
+        return stderr.decode("utf-8", "replace")
+
+    def close(self) -> None:
+        """End the command: the shim runs without it after the hand-over."""
+        if self.proc.poll() is not None:
+            return
+        with contextlib.suppress(OSError, ValueError):
+            assert self.proc.stdin is not None
+            self.proc.stdin.close()
+        self.proc.terminate()
+        try:
+            self.proc.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            with contextlib.suppress(OSError):
+                self.proc.kill()
+
+
+def letify_link_enabled(provider: Any) -> bool:
+    """Whether the account's ``link`` option is ``"letify-link"``; ``"ssh"`` or absent is not.
+
+    Spec "Sidecar interface" item 7. Any other value is refused by name.
+    """
+    value = provider.config.option("link", "ssh")
+    if value in (None, "ssh"):
+        return False
+    if value == "letify-link":
+        return True
+    raise ProviderUnavailable(
+        provider.kind, f'{provider.alias} sets link = {value!r}; use "ssh" or "letify-link"'
+    )
+
+
 class PlainSshLink:
-    """The ssh command of an account that carries its channel over letify-link.
+    """The ssh command of an account that carries its channel over letify-link, if it has one.
 
     Owns the ssh command for the commands that are not the data path (a card query, a worker
     stop) and the numbers the transfer decision reads, which are the session's. It runs no
@@ -76,11 +174,15 @@ class PlainSshLink:
     rank = 0
     note: str | None = None
 
-    def __init__(self, command: Callable[[str | None], list[str]], remote: Callable[[], Any]):
+    def __init__(
+        self, command: Callable[[str | None], list[str]] | None, remote: Callable[[], Any]
+    ):
         self._command = command
         self._remote = remote
 
     def ssh_command(self, remote_command: str | None = None) -> list[str]:
+        if self._command is None:
+            raise RuntimeFailure("the letify-link session carries no SSH session")
         return self._command(remote_command)
 
     @property
@@ -200,13 +302,17 @@ def prepare_binary(
         done = subprocess.run(command, capture_output=True, text=True, timeout=PREPARE_TIMEOUT)
     except (OSError, subprocess.TimeoutExpired) as error:
         raise _fail(alias, f"the ssh bootstrap could not prepare letify-link: {error}") from error
-    for line in done.stdout.splitlines():
+    return _binary_path(alias, done.stdout, done.stderr)
+
+
+def _binary_path(alias: str, stdout: str, stderr: str) -> str:
+    for line in stdout.splitlines():
         if line.startswith("LETIFY-LINK "):
             return str(json.loads(line[len("LETIFY-LINK ") :]))
     raise _fail(
         alias,
         "letify-link is not on the machine and the wheel could not supply it: "
-        + (done.stderr or done.stdout).strip()[-400:],
+        + (stderr or stdout).strip()[-400:],
     )
 
 
@@ -230,44 +336,130 @@ def connect(
     Spec "Sidecar interface" item 7. Every failure raises ``ProviderUnavailable`` with the
     reason; nothing falls back to the ssh data path.
     """
+    return connect_over(
+        alias,
+        prepare=lambda: prepare_binary(alias, ssh, python, version, binary),
+        start=lambda: PopenBootstrap(ssh(f"{python} -u -c {shlex.quote(shim_source())}")),
+        address=address,
+        python=python,
+        bootstrap=bootstrap,
+        key_path=key_path,
+        punch=punch,
+        max_rtt_ms=max_rtt_ms,
+        min_bps=min_bps,
+        start_timeout_ms=start_timeout_ms,
+    )
+
+
+def connect_commands(
+    alias: str,
+    run: Callable[[str, float], str],
+    *,
+    python: str,
+    bootstrap: str,
+    key_path: str | os.PathLike[str],
+    version: str,
+    binary: str | None = None,
+    wrap: Callable[[str], str] | None = None,
+    max_rtt_ms: float | None = None,
+    min_bps: float | None = None,
+    start_timeout_ms: int = 60_000,
+) -> LinkRemote:
+    """Bootstrap over a provider's command channel once, and return the connected runtime.
+
+    Spec "Sidecar interface" item 8. ``run(source, timeout)`` runs one Python program on the
+    runtime and returns what it printed. The runtime has no address, so the session starts from
+    punched candidates only. ``wrap`` is the provider's ``remote_command``, applied to the
+    shim's workers.
+    """
+    from . import linkmailbox
+
+    def prepare() -> str:
+        if binary:
+            return binary
+        from .. import install
+
+        try:
+            output = run(install.remote_link_source(version), PREPARE_TIMEOUT)
+        except Exception as error:
+            raise _fail(
+                alias, f"the command channel could not prepare letify-link: {error}"
+            ) from error
+        return _binary_path(alias, output, "")
+
+    return connect_over(
+        alias,
+        prepare=prepare,
+        start=lambda: _started(linkmailbox.MailboxBootstrap(run, python=python)),
+        address=None,
+        python=python,
+        bootstrap=bootstrap,
+        key_path=key_path,
+        punch=True,
+        wrap=wrap,
+        max_rtt_ms=max_rtt_ms,
+        min_bps=min_bps,
+        start_timeout_ms=start_timeout_ms,
+    )
+
+
+def _started(mailbox: Any) -> Any:
+    mailbox.start()
+    return mailbox
+
+
+def connect_over(
+    alias: str,
+    *,
+    prepare: Callable[[], str],
+    start: Callable[[], Bootstrap],
+    address: str | None,
+    python: str,
+    bootstrap: str,
+    key_path: str | os.PathLike[str],
+    punch: bool = False,
+    wrap: Callable[[str], str] | None = None,
+    max_rtt_ms: float | None = None,
+    min_bps: float | None = None,
+    start_timeout_ms: int = 60_000,
+) -> LinkRemote:
+    """The connect of items 7 and 8: ``prepare`` returns the remote binary's path, ``start`` the
+    line stream to the shim, and everything after is the same for both."""
     try:
         daemon = linkd.LinkDaemon(key_path)
     except linkd.LinkMissing as error:
         raise _fail(alias, str(error)) from error
     except linkd.LinkError as error:
         raise _fail(alias, f"the local sidecar failed: {error}") from error
-    proc: subprocess.Popen[bytes] | None = None
+    stream: Bootstrap | None = None
     try:
-        remote_binary = prepare_binary(alias, ssh, python, version, binary)
-        proc = subprocess.Popen(
-            ssh(f"{python} -u -c {shlex.quote(shim_source())}"),
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-        )
-        assert proc.stdin is not None and proc.stdout is not None
-        stdin_lock = threading.Lock()
+        remote_binary = prepare()
+        stream = start()
+        rtt = stream.rtt_s
+        shim_wait = SHIM_TIMEOUT + (10 * rtt if rtt else 0.0)
 
         def write(message: dict[str, Any]) -> None:
-            with stdin_lock, contextlib.suppress(OSError, ValueError):
-                assert proc is not None and proc.stdin is not None
-                proc.stdin.write(json.dumps(message).encode() + b"\n")
-                proc.stdin.flush()
+            assert stream is not None
+            stream.send_line(json.dumps(message).encode())
 
-        write(
-            {
-                "binary": remote_binary,
-                "allow": daemon.node_id,
-                "bind": "0.0.0.0:0",
-                "python": python,
-                "bootstrap": bootstrap,
-                "relay": relay_program(),
-                "wait_s": WAIT_SESSION_S,
-                "resume_s": RESUME_S,
-            }
-        )
-        lines = _Lines(proc)
-        ready = lines.wait("ready", SHIM_TIMEOUT, alias, proc)
+        config: dict[str, Any] = {
+            "binary": remote_binary,
+            "allow": daemon.node_id,
+            "bind": "0.0.0.0:0",
+            "python": python,
+            "bootstrap": bootstrap,
+            "relay": relay_program(),
+            "wait_s": WAIT_SESSION_S,
+            "resume_s": RESUME_S,
+        }
+        if wrap is not None:
+            # The provider's wrapper (driver library path, environment) applies to every worker
+            # and relay the shim starts, as it applies to the worker's ssh command.
+            config["worker_command"] = wrap(f"{python} -u -c {shlex.quote(bootstrap)}")
+            config["relay_command"] = wrap(f"{python} -c {shlex.quote(relay_program())}")
+        write(config)
+        lines = _Lines(stream)
+        ready = lines.wait("ready", shim_wait, alias, stream)
         remote_id = str(ready["node_id"])
         daemon.rendezvous = _StdioRendezvous(lambda: daemon.node_id, write)
         lines.on_rendezvous = lambda to, message: daemon.deliver(remote_id, message)
@@ -278,30 +470,7 @@ def connect(
             where: dict[str, Any] = (
                 {"observers": "default"} if address is None else {"public_ip": address}
             )
-            write(
-                {
-                    "op": "punch",
-                    "peer": daemon.node_id,
-                    "sockets": PUNCH_TCP,
-                    "udp": PUNCH_UDP,
-                    **where,
-                }
-            )
-            try:
-                names = daemon.punch(
-                    remote_id,
-                    "initiator",
-                    sockets=PUNCH_TCP,
-                    udp=PUNCH_UDP,
-                    police=POLICE,
-                    **where,
-                )
-            except linkd.LinkError as error:
-                if address is not None:
-                    raise
-                raise _fail(
-                    alias, f"{alias} has no address and no punched path connected: {error}"
-                ) from error
+            names = _punch(alias, daemon, remote_id, stream, write, lines, address, where)
             candidates += [{"name": f"punch{i}", "punched": n} for i, n in enumerate(names)]
         session = daemon.open_session(
             remote_id,
@@ -317,12 +486,9 @@ def connect(
         )
         _hold_to_floor(remote, max_rtt_ms, min_bps)
         write({"op": "handover"})
-        lines.wait("handed_over", SHIM_TIMEOUT, alias, proc)
-        # The shim now runs without ssh, so the ssh command is ended rather than waited for.
-        with contextlib.suppress(OSError, ValueError):
-            proc.stdin.close()
-        proc.terminate()
-        proc.wait(timeout=10)
+        lines.wait("handed_over", shim_wait, alias, stream)
+        # The shim now runs without the bootstrap, so that is ended rather than waited for.
+        stream.close()
         return remote
     except linkd.LinkError as error:
         daemon.close()
@@ -331,9 +497,71 @@ def connect(
         daemon.close()
         raise
     finally:
-        if proc is not None and proc.poll() is None:
-            with contextlib.suppress(OSError):
-                proc.kill()
+        if stream is not None:
+            stream.close()
+
+
+def _punch(
+    alias: str,
+    daemon: linkd.LinkDaemon,
+    remote_id: str,
+    stream: Bootstrap,
+    write: Callable[[dict[str, Any]], None],
+    lines: _Lines,
+    address: str | None,
+    where: dict[str, Any],
+) -> list[str]:
+    """Punch with the shim as responder and return the usable path names.
+
+    A stream with no measured round trip (ssh) makes one attempt with the sidecar's own lead and
+    window. A command channel makes up to two, each with the lead of ``punch_lead_ms`` from the
+    freshest round trip, the second with a window ``RETRY_WINDOW_FACTOR`` times as long. Spec
+    "Sidecar interface" item 8.
+    """
+    windows: list[int | None] = [None]
+    if stream.rtt_s is not None:
+        windows = [PUNCH_WINDOW_MS, PUNCH_WINDOW_MS * RETRY_WINDOW_FACTOR]
+    failures: list[str] = []
+    for number, window in enumerate(windows, 1):
+        timing: dict[str, Any] = {}
+        if window is not None:
+            timing = {"lead_ms": punch_lead_ms(stream.rtt_s or 0.0), "window_ms": window}
+        write(
+            {
+                "op": "punch",
+                "peer": daemon.node_id,
+                "sockets": PUNCH_TCP,
+                "udp": PUNCH_UDP,
+                **where,
+                **timing,
+            }
+        )
+        try:
+            return daemon.punch(
+                remote_id,
+                "initiator",
+                sockets=PUNCH_TCP,
+                udp=PUNCH_UDP,
+                police=POLICE,
+                **where,
+                **timing,
+            )
+        except linkd.LinkError as error:
+            if address is not None:
+                raise
+            if window is None:
+                raise _fail(
+                    alias, f"{alias} has no address and no punched path connected: {error}"
+                ) from error
+            failures.append(
+                f"attempt {number} (lead {timing['lead_ms']} ms, window {window} ms): {error}"
+            )
+            # Let the responder finish this attempt before the next one starts.
+            settle_s = PUNCH_LEAD_ROUND_TRIPS * (stream.rtt_s or 0.0) + 2.0
+            lines.settle(("punched", "punch_failed"), settle_s)
+    raise _fail(
+        alias, f"{alias} has no address and no punched path connected: " + "; ".join(failures)
+    )
 
 
 def attach(
@@ -422,17 +650,19 @@ def _hold_to_floor(remote: LinkRemote, max_rtt_ms: float | None, min_bps: float 
 class _Lines:
     """Reads the shim's JSON lines on a thread, so a waiting caller can time out."""
 
-    def __init__(self, proc: subprocess.Popen[bytes]):
+    def __init__(self, stream: Bootstrap):
         import queue
 
         self.on_rendezvous: Callable[[str, bytes], None] = lambda to, message: None
         self._queue: queue.Queue[dict[str, Any] | None] = queue.Queue()
-        self._proc = proc
+        self._stream = stream
         threading.Thread(target=self._read, daemon=True).start()
 
     def _read(self) -> None:
-        assert self._proc.stdout is not None
-        for raw in self._proc.stdout:
+        while True:
+            raw = self._stream.recv_line()
+            if raw is None:
+                break
             try:
                 event = json.loads(raw)
             except ValueError:
@@ -444,8 +674,23 @@ class _Lines:
                 self._queue.put(event)
         self._queue.put(None)
 
+    def settle(self, names: tuple[str, ...], timeout: float) -> None:
+        """Wait for one of the events ``names``, or the timeout. Never raises."""
+        import queue
+
+        deadline = time.monotonic() + timeout
+        while True:
+            try:
+                event = self._queue.get(timeout=max(0.0, deadline - time.monotonic()))
+            except queue.Empty:
+                return
+            if event is None or event.get("event") in names:
+                if event is None:
+                    self._queue.put(None)
+                return
+
     def wait(
-        self, name: str, timeout: float, alias: str, proc: subprocess.Popen[bytes]
+        self, name: str, timeout: float, alias: str, stream: Bootstrap
     ) -> dict[str, Any]:
         import queue
 
@@ -456,14 +701,10 @@ class _Lines:
             except queue.Empty:
                 raise _fail(alias, f"the remote shim said nothing in {timeout:.0f} s") from None
             if event is None:
-                stderr = b""
-                if proc.stderr is not None:
-                    with contextlib.suppress(OSError, ValueError):
-                        stderr = proc.stderr.read()
                 raise _fail(
                     alias,
                     "the remote shim exited before it was ready: "
-                    + stderr.decode("utf-8", "replace").strip()[-400:],
+                    + stream.stderr_text().strip()[-400:],
                 )
             if event.get("event") == "error":
                 raise _fail(alias, str(event.get("error")))
@@ -594,12 +835,18 @@ class LinkChannel(FramedChannel):
 
 
 __all__ = [
+    "Bootstrap",
     "LinkChannel",
     "LinkRemote",
     "PlainSshLink",
+    "PopenBootstrap",
     "attach",
     "connect",
+    "connect_commands",
+    "connect_over",
+    "letify_link_enabled",
     "prepare_binary",
+    "punch_lead_ms",
     "shim_path",
     "shim_source",
     "stream_header",

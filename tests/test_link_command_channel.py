@@ -119,7 +119,9 @@ def colab(tmp_path: Path, commands: FakeCommands, monkeypatch, **options: Any) -
     provider = provider_of(
         Colab, "colab_a", link="letify-link", workspace=str(tmp_path / "ws"), **options
     )
-    monkeypatch.setattr(Colab, "_exec", lambda self, session, source, timeout: commands.run(source, timeout))
+    monkeypatch.setattr(
+        Colab, "_exec", lambda self, session, source, timeout: commands.run(source, timeout)
+    )
     monkeypatch.setattr(Colab, "remote_python", property(lambda self: sys.executable))
     return provider
 
