@@ -29,6 +29,7 @@ jobs:
   test:
     name: test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 25
     strategy:
       fail-fast: false
       matrix:
@@ -47,6 +48,11 @@ jobs:
         run: cargo clippy -p letify-link --all-targets --all-features --locked -- -D warnings
       - name: Build
         run: cargo build -p letify-link --all-features --locked
+      - name: Diagnose the UDP move tests
+        if: matrix.os == 'windows-latest'
+        continue-on-error: true
+        timeout-minutes: 4
+        run: cargo test -p letify-link --features relay --locked --test udp a_session_moves_from_tcp -- --nocapture --test-threads=1
       - name: Test with the relay role
         run: cargo test -p letify-link --features relay --locked
 
