@@ -46,8 +46,13 @@ pub(crate) enum Frame {
     /// sequenced frames arrived on the subflow that carries this frame (the subflow ack).
     Ack { next: u64, sub: u64 },
     /// The first record of a subflow added to a running session: same meaning as `Ack`, plus
-    /// `epoch`, the newest epoch of the peer's keys that the sender has switched to.
-    Hello { next: u64, epoch: u16 },
+    /// `epoch`, the newest epoch of the peer's keys that the sender has switched to, and the
+    /// `challenge` the peer drew for this transport, which binds the Hello to it.
+    Hello {
+        next: u64,
+        epoch: u16,
+        challenge: [u8; 16],
+    },
     /// The sender's next record, on any subflow, is sealed in epoch `next`. The frame itself is
     /// sealed in the epoch before.
     Rekey { next: u64 },
@@ -118,10 +123,11 @@ pub(crate) fn encode_ack(next: u64, sub: u64) -> Vec<u8> {
     out
 }
 
-pub(crate) fn encode_hello(next: u64, epoch: u16) -> Vec<u8> {
+pub(crate) fn encode_hello(next: u64, epoch: u16, challenge: &[u8; 16]) -> Vec<u8> {
     let mut out = vec![T_HELLO];
     out.extend_from_slice(&next.to_be_bytes());
     out.extend_from_slice(&epoch.to_be_bytes());
+    out.extend_from_slice(challenge);
     out
 }
 
@@ -187,10 +193,11 @@ pub(crate) fn decode(buf: Vec<u8>) -> Result<Frame> {
         return Ok(Frame::Ack { next, sub });
     }
     if t == T_HELLO {
-        let raw = buf.get(1..11).ok_or_else(|| bad("short hello"))?;
+        let raw = buf.get(1..27).ok_or_else(|| bad("short hello"))?;
         return Ok(Frame::Hello {
             next: u64::from_be_bytes(raw[..8].try_into().unwrap()),
-            epoch: u16::from_be_bytes(raw[8..].try_into().unwrap()),
+            epoch: u16::from_be_bytes(raw[8..10].try_into().unwrap()),
+            challenge: raw[10..].try_into().unwrap(),
         });
     }
     if t == T_REKEY || t == T_PING || t == T_PONG || t == T_PROBE_ACK || t == T_KEEPALIVE {

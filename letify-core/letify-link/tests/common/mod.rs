@@ -226,7 +226,7 @@ impl Proxy {
 pub enum Prefix {
     /// A session handshake: the header, then the first Noise message.
     Handshake,
-    /// A subflow added to a running session: the magic and session id.
+    /// A subflow added to a running session: the magic, the join token and the challenge.
     Subflow,
 }
 
@@ -266,7 +266,7 @@ impl Mitm {
             async move {
                 let mut head = match prefix {
                     Prefix::Handshake => vec![0u8; 10],
-                    Prefix::Subflow => vec![0u8; 20],
+                    Prefix::Subflow => vec![0u8; 52],
                 };
                 if ar.read_exact(&mut head).await.is_err() {
                     return;
@@ -281,6 +281,16 @@ impl Mitm {
                 *prefix_seen.lock().unwrap() = head.clone();
                 if to_b.lock().await.write_all(&head).await.is_err() {
                     return;
+                }
+                if let Prefix::Handshake = prefix {
+                    // The confirmation record of the handshake: 64 bytes, not a session record.
+                    let mut confirm = vec![0u8; 64];
+                    if ar.read_exact(&mut confirm).await.is_err() {
+                        return;
+                    }
+                    if to_b.lock().await.write_all(&confirm).await.is_err() {
+                        return;
+                    }
                 }
                 loop {
                     let mut rec = vec![0u8; 12];

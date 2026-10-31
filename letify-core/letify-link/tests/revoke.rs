@@ -183,6 +183,8 @@ async fn a_revoked_node_is_refused_when_it_resumes() {
     let c = Identity::generate();
     let rig = rig(&[&c]).await;
     let (a, b) = open(&rig, &c).await;
+    // Let the session's policy watcher make its first check while the policy still accepts.
+    sleep(Duration::from_millis(100)).await;
     // The acceptor's policy turns against the node without a revoke call, so the session
     // stays open and only the resume can notice.
     rig.gate.store(false, Ordering::SeqCst);

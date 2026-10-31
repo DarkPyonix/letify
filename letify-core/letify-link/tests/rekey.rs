@@ -179,13 +179,17 @@ async fn a_session_resumes_across_a_rekey() {
     assert_eq!(b.receive_epoch(), 0);
     let (ta, tb) = duplex_pair();
     let (old_a, old_b) = (a.subflow_stats()[0].id, b.subflow_stats()[0].id);
+    let reached = a.send_epoch();
     let (ra, rb) = tokio::join!(a.add_subflow(ta), b.add_subflow(tb));
     ra.unwrap();
     rb.unwrap();
-    assert_eq!(
-        b.receive_epoch(),
-        a.send_epoch(),
-        "the Hello brought b up to date"
+    // The Hello follows the peer's challenge, so records that the withheld subflow keeps
+    // sealing may move a on by an epoch after the Hello left. b must be at least where a was
+    // before the join.
+    assert!(
+        b.receive_epoch() >= reached,
+        "the Hello brought b up to date: {} < {reached}",
+        b.receive_epoch()
     );
     a.close_subflow(old_a);
     b.close_subflow(old_b);

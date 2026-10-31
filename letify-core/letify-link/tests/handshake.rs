@@ -201,3 +201,71 @@ async fn the_highest_common_version_is_chosen() {
     assert_eq!(initiator.version(), 5);
     assert_eq!(responder.version(), 5);
 }
+
+#[tokio::test]
+async fn a_version_refusal_is_the_status_and_the_range_and_no_text() {
+    let b = Identity::generate();
+    let (mut att, tb) = duplex_pair();
+    let responder = tokio::spawn(async move {
+        Session::accept(
+            tb,
+            &b,
+            PeerPolicy::allow(vec![]),
+            Config {
+                versions: 1..=2,
+                ..Config::default()
+            },
+        )
+        .await
+    });
+    // The header offers 7..=8 and an empty first message.
+    let mut header = b"LLNK".to_vec();
+    header.extend_from_slice(&[0, 7, 0, 8, 0, 0]);
+    att.write_all(&header).await.unwrap();
+    let mut reply = Vec::new();
+    att.read_to_end(&mut reply).await.unwrap();
+    assert_eq!(reply, b"LLNK\x01\x00\x01\x00\x02");
+    assert!(matches!(
+        responder.await.unwrap(),
+        Err(Error::VersionMismatch { .. })
+    ));
+}
+
+#[tokio::test]
+async fn a_replayed_first_handshake_message_yields_no_session() {
+    let a = Identity::generate();
+    let b = Identity::generate();
+    let config = Config {
+        handshake_timeout: std::time::Duration::from_millis(400),
+        ..Config::default()
+    };
+    let acceptor = letify_link::Acceptor::new(
+        b.clone(),
+        PeerPolicy::allow(vec![a.node_id()]),
+        config.clone(),
+    );
+    let (ta, m_a) = duplex_pair();
+    let (m_b, tb) = duplex_pair();
+    let mitm = Mitm::new(m_a, m_b, Prefix::Handshake);
+    let (genuine, accepted) = tokio::join!(
+        Session::connect(ta, &a, b.node_id(), config),
+        acceptor.accept(tb)
+    );
+    genuine.unwrap();
+    assert!(matches!(accepted, Ok(letify_link::Accepted::Session(_))));
+
+    // The observer replays the recorded header and message 1 to the same acceptor.
+    let recorded = mitm.prefix.lock().unwrap().clone();
+    assert!(!recorded.is_empty());
+    let (mut att, victim) = duplex_pair();
+    att.write_all(&recorded).await.unwrap();
+    // It cannot send the confirmation, because it holds no key.
+    let outcome = tokio::time::timeout(std::time::Duration::from_secs(5), acceptor.accept(victim))
+        .await
+        .expect("the acceptor gives up within the handshake timeout");
+    assert!(
+        matches!(outcome, Err(Error::Handshake(_))),
+        "a replayed message 1 must not become a session"
+    );
+    drop(att);
+}
