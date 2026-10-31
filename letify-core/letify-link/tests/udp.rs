@@ -275,7 +275,7 @@ async fn a_session_moves_from_tcp_to_udp_without_losing_bytes() {
 async fn a_session_moves_from_udp_to_tcp_when_udp_dies() {
     // Windows debug builds move far fewer UDP bytes a second, see the move to UDP above.
     let (tcp_rate, warm_mib, after_mib) = if cfg!(windows) {
-        (0.5 * MIB, 16, 16)
+        (0.5 * MIB, 16, 24)
     } else {
         (4.0 * MIB, 24, 32)
     };
@@ -312,7 +312,10 @@ async fn a_session_moves_from_udp_to_tcp_when_udp_dies() {
 
     let knobs = duo.udp_proxy.knobs.clone();
     let cut = tokio::spawn(async move {
-        tokio::time::sleep(Duration::from_millis(1200)).await;
+        // The transfer must still be running when UDP is cut. The UDP path carried 16 to
+        // 28 MB/s on windows-latest, so 16 MiB took about 1 s and ended before a cut at
+        // 1.2 s. The cut comes at 0.5 s and the Windows transfer is 24 MiB.
+        tokio::time::sleep(Duration::from_millis(500)).await;
         knobs.set_loss(1.0);
     });
     timeout(
