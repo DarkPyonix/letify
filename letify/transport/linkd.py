@@ -434,6 +434,31 @@ class LinkDaemon:
         """Hand the sidecar a rendezvous message that a bootstrap received from ``from_node``."""
         self.request({"op": "rendezvous_message", "from": from_node, "message": message.hex()})
 
+    def sign(self, domain: str, message: bytes) -> bytes:
+        """The ed25519 signature of this node over ``domain``, a newline and ``message``.
+
+        The sidecar signs only under domains that start with ``letify-signal ``. Spec "Sidecar
+        interface" operations ``sign`` and ``verify``.
+        """
+        reply = self.request({"op": "sign", "domain": domain, "message": message.hex()})
+        return bytes.fromhex(reply["signature"])
+
+    def verify(self, node: str, domain: str, message: bytes, signature: bytes) -> bool:
+        """Whether ``signature`` is ``node``'s signature of ``sign(domain, message)``.
+
+        Raises LinkError when ``node`` is not a canonical node id.
+        """
+        reply = self.request(
+            {
+                "op": "verify",
+                "node": node,
+                "domain": domain,
+                "message": message.hex(),
+                "signature": signature.hex(),
+            }
+        )
+        return bool(reply["valid"])
+
     def listen(self, allow: Iterable[str], bind: str | None = None) -> LinkListener:
         """Accept sessions from the nodes in ``allow``, on a TCP address when ``bind`` is given."""
         request: dict[str, Any] = {"op": "listen", "allow": list(allow)}
