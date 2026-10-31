@@ -1050,11 +1050,17 @@ async fn a_punch_nobody_answers_reports_this_sides_nat_and_offers() {
         .await;
     assert_eq!(r["ok"], false, "{r}");
     let text = r["error"].as_str().unwrap();
-    assert!(text.contains("here: NAT symmetric:2, offered tcp 2 (2 predicted) udp 1"), "{text}");
+    assert!(
+        text.contains("here: NAT symmetric:2, offered tcp 2 (2 predicted) udp 1"),
+        "{text}"
+    );
     assert!(text.contains("there: no answer"), "{text}");
     assert_eq!(r["detail"]["nat"], "symmetric:2", "{r}");
     assert!(r["detail"]["peer_nat"].is_null(), "{r}");
-    assert_eq!(r["detail"]["report"].as_str().unwrap(), &text[text.find("here:").unwrap()..]);
+    assert_eq!(
+        r["detail"]["report"].as_str().unwrap(),
+        &text[text.find("here:").unwrap()..]
+    );
 }
 
 #[tokio::test]
@@ -1107,7 +1113,10 @@ async fn a_punch_that_cannot_classify_says_why_in_the_detail() {
     assert_eq!(r["ok"], false, "{r}");
     assert!(r["detail"]["nat"].is_null(), "{r}");
     assert!(
-        r["detail"]["nat_error"].as_str().unwrap().contains("1 of 1 address observers"),
+        r["detail"]["nat_error"]
+            .as_str()
+            .unwrap()
+            .contains("1 of 1 address observers"),
         "{r}"
     );
 }

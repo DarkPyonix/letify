@@ -225,12 +225,15 @@ impl Rendezvous for ControlRendezvous {
 struct OpError {
     kind: &'static str,
     msg: String,
+    /// Structured facts about the failure, sent as the `detail` field of the error reply.
+    detail: Option<Value>,
 }
 
 fn usage(msg: impl Into<String>) -> OpError {
     OpError {
         kind: "usage",
         msg: msg.into(),
+        detail: None,
     }
 }
 
@@ -238,6 +241,7 @@ fn infra(msg: impl Into<String>) -> OpError {
     OpError {
         kind: "infrastructure",
         msg: msg.into(),
+        detail: None,
     }
 }
 
@@ -251,6 +255,7 @@ impl From<Error> for OpError {
         OpError {
             kind,
             msg: e.to_string(),
+            detail: None,
         }
     }
 }
@@ -820,6 +825,89 @@ struct Own {
     udp_maps: Vec<SocketAddr>,
 }
 
+/// What the other side offered, as far as the exchange got.
+struct There {
+    nat: NatType,
+    tcp: usize,
+    udp: usize,
+}
+
+/// The facts of one punch that explain how it went. Spec "NAT traversal" item 8.
+struct Report {
+    /// This side's NAT, or why there is none.
+    here: Result<NatType, String>,
+    tcp: usize,
+    tcp_predicted: usize,
+    udp: usize,
+    /// `None` until the peer has answered.
+    there: Option<There>,
+    /// The UDP plan, once both NATs are known.
+    plan: Option<String>,
+}
+
+impl Report {
+    fn new(own: &Own, bound: &[u16]) -> Report {
+        let predicted = own
+            .tcp_maps
+            .iter()
+            .zip(bound)
+            .filter(|(m, port)| m.port() != **port)
+            .count();
+        Report {
+            here: Ok(own.nat),
+            tcp: own.tcp_maps.len(),
+            tcp_predicted: predicted,
+            udp: own.udp_maps.len(),
+            there: None,
+            plan: None,
+        }
+    }
+
+    fn text(&self) -> String {
+        let here = match &self.here {
+            Ok(nat) => format!(
+                "NAT {}, offered tcp {} ({} predicted) udp {}",
+                nat_name(*nat),
+                self.tcp,
+                self.tcp_predicted,
+                self.udp
+            ),
+            Err(why) => format!("NAT unknown ({why}), nothing offered"),
+        };
+        let there = match &self.there {
+            Some(t) => format!(
+                "NAT {}, offered tcp {} udp {}",
+                nat_name(t.nat),
+                t.tcp,
+                t.udp
+            ),
+            None => "no answer".to_string(),
+        };
+        let mut out = format!("here: {here}; there: {there}");
+        if let Some(plan) = &self.plan {
+            out.push_str("; udp plan: ");
+            out.push_str(plan);
+        }
+        out
+    }
+
+    /// `e` with the report appended to its message and its facts in `detail`.
+    fn explain(&self, mut e: OpError) -> OpError {
+        let text = self.text();
+        e.msg = format!("{}; {text}", e.msg);
+        let mut detail = json!({
+            "nat": self.here.as_ref().ok().map(|n| nat_name(*n)),
+            "peer_nat": self.there.as_ref().map(|t| nat_name(t.nat)),
+            "report": text,
+        });
+        if let Err(why) = &self.here {
+            detail["nat_error"] = json!(why);
+        }
+        e.detail = Some(detail);
+        e
+    }
+}
+
 /// Ask the observers about the first UDP socket and work out the mappings to offer. Without
 /// observers the mappings are the bound addresses on `public_ip`.
 async fn own_mappings(
@@ -1104,7 +1192,21 @@ async fn op_punch(shared: &Arc<Shared>, req: &Value) -> OpResult {
         }
     };
     let ports: Vec<u16> = locals.iter().map(|a| a.port()).collect();
-    let own = own_mappings(observers.as_deref(), ip, &ports, &udp_socks, probe).await?;
+    let own = match own_mappings(observers.as_deref(), ip, &ports, &udp_socks, probe).await {
+        Ok(own) => own,
+        Err(e) => {
+            let report = Report {
+                here: Err(e.msg.clone()),
+                tcp: 0,
+                tcp_predicted: 0,
+                udp: 0,
+                there: None,
+                plan: None,
+            };
+            return Err(report.explain(e));
+        }
+    };
+    let mut report = Report::new(&own, &ports);
     let rdv = &shared.rendezvous;
     let ext = |police: bool| PunchExt {
         nat: own.nat,
@@ -1143,7 +1245,8 @@ async fn op_punch(shared: &Arc<Shared>, req: &Value) -> OpResult {
             udp_offer.as_ref(),
             Duration::from_millis(lead + window),
         )
-        .await?;
+        .await
+        .map_err(|e| report.explain(e))?;
         peer_nat = answers
             .tcp
             .iter()
@@ -1173,7 +1276,8 @@ async fn op_punch(shared: &Arc<Shared>, req: &Value) -> OpResult {
             udp_n > 0,
             Duration::from_millis(lead + window + 60_000),
         )
-        .await?;
+        .await
+        .map_err(|e| report.explain(e))?;
         peer_nat = offers
             .tcp
             .iter()
@@ -1200,6 +1304,11 @@ async fn op_punch(shared: &Arc<Shared>, req: &Value) -> OpResult {
         }
     }
 
+    report.there = Some(There {
+        nat: peer_nat,
+        tcp: tcp_terms.as_ref().map_or(0, |t| t.0.len()),
+        udp: udp_terms.as_ref().map_or(0, |t| t.0.len()),
+    });
     // The UDP plan depends on both NATs, so it is made after the exchange.
     let udp_job = match &udp_terms {
         Some((theirs, token, plan)) => {
@@ -1213,6 +1322,27 @@ async fn op_punch(shared: &Arc<Shared>, req: &Value) -> OpResult {
                 );
             }
             udp_socks.truncate(p.sockets);
+            report.plan = Some(match &p.dests {
+                plan::Destinations::Fixed(v) => {
+                    let extra = v.len().saturating_sub(theirs.len());
+                    let kind = if extra == 0 {
+                        "fixed".to_string()
+                    } else {
+                        format!("fixed, {extra} predicted")
+                    };
+                    format!(
+                        "{} socket(s) to {} destination(s) ({kind})",
+                        p.sockets,
+                        v.len()
+                    )
+                }
+                plan::Destinations::Birthday { count, .. } => {
+                    format!(
+                        "{} socket(s) to {count} destination(s) (birthday)",
+                        p.sockets
+                    )
+                }
+            });
             let dests = match p.dests {
                 plan::Destinations::Fixed(v) => v,
                 plan::Destinations::Birthday { ip, count } => {
@@ -1250,9 +1380,11 @@ async fn op_punch(shared: &Arc<Shared>, req: &Value) -> OpResult {
     let (tcp_res, udp_res) = tokio::join!(tcp_fut, udp_fut);
     drop(held);
     let (tcp_streams, udp_found) = match (tcp_res, udp_res) {
-        (Err(t), Err(u)) => return Err(infra(format!("punch failed: tcp: {t}; udp: {u}"))),
-        (Err(t), Ok(None)) => return Err(infra(format!("punch failed: {t}"))),
-        (Ok(None), Err(u)) => return Err(infra(format!("punch failed: {u}"))),
+        (Err(t), Err(u)) => {
+            return Err(report.explain(infra(format!("punch failed: tcp: {t}; udp: {u}"))));
+        }
+        (Err(t), Ok(None)) => return Err(report.explain(infra(format!("punch failed: {t}")))),
+        (Ok(None), Err(u)) => return Err(report.explain(infra(format!("punch failed: {u}")))),
         (t, u) => (t.ok().flatten().unwrap_or_default(), u.ok().flatten()),
     };
     let mapped = json!({
@@ -1263,6 +1395,7 @@ async fn op_punch(shared: &Arc<Shared>, req: &Value) -> OpResult {
         reply["nat"] = json!(nat_name(own.nat));
         reply["peer_nat"] = json!(nat_name(peer_nat));
         reply["mapped"] = mapped.clone();
+        reply["report"] = json!(report.text());
         reply
     };
     match acceptor {
@@ -1420,7 +1553,13 @@ async fn control_loop(shared: Arc<Shared>, mut rd: ReadHalf<LocalConn>) {
                     v["ok"] = json!(true);
                     v
                 }
-                Err(e) => json!({"id": id, "ok": false, "error": e.msg, "kind": e.kind}),
+                Err(e) => {
+                    let mut reply = json!({"id": id, "ok": false, "error": e.msg, "kind": e.kind});
+                    if let Some(detail) = e.detail {
+                        reply["detail"] = detail;
+                    }
+                    reply
+                }
             };
             sh.emit(reply);
         });
