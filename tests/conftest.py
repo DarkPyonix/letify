@@ -2279,9 +2279,9 @@ class FakeSignalService:
         import urllib.parse
 
         url = urllib.parse.urlsplit(h.path)
-        if url.path == "/v1/health":
-            return self._reply(h, 200, {"ok": True, "v": 1})
-        match = re.fullmatch(r"/v1/(send|recv)/([^/]+)", url.path)
+        if url.path == "/health":
+            return self._reply(h, 200, {"ok": True})
+        match = re.fullmatch(r"/(send|recv)/([^/]+)", url.path)
         if match is None:
             return self._fail(h, 404, "not_found")
         kind, target = match.groups()

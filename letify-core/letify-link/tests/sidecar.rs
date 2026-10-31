@@ -1140,7 +1140,7 @@ fn hex_of(bytes: &[u8]) -> String {
 async fn a_signature_by_the_sidecar_verifies_under_its_node_id_in_another_sidecar() {
     let mut a = Sidecar::start(None).await;
     let mut b = Sidecar::start(None).await;
-    let message = hex_of(b"POST\n/v1/send/x\n1700000000");
+    let message = hex_of(b"POST\n/send/x\n1700000000");
     let signed = a
         .ok(json!({"op": "sign", "domain": SIGNAL_DOMAIN, "message": message}))
         .await;
@@ -1153,7 +1153,7 @@ async fn a_signature_by_the_sidecar_verifies_under_its_node_id_in_another_sideca
     let good = b.ok(check(&a.node_id, &message, &signature)).await;
     assert_eq!(good["valid"], true);
     // Another message, another signer and another domain each fail to verify.
-    let other = hex_of(b"POST\n/v1/send/y\n1700000000");
+    let other = hex_of(b"POST\n/send/y\n1700000000");
     assert_eq!(
         b.ok(check(&a.node_id, &other, &signature)).await["valid"],
         false

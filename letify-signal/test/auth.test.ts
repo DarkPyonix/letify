@@ -4,7 +4,7 @@ import { authenticate } from "../src/auth";
 import { freshNonce, newNode, sha256Hex, signedHeaders } from "./helpers";
 
 const NOW = 1_800_000_000;
-const PATH = "/v1/send/" + "ab".repeat(32);
+const PATH = "/send/" + "ab".repeat(32);
 
 async function attempt(
   mutate: (headers: Record<string, string>) => void = () => {},
@@ -75,7 +75,7 @@ describe("authenticate", () => {
     const headers = await signedHeaders(node, { method: "POST", path: PATH, time: NOW });
     const result = await authenticate({
       method: "POST",
-      pathAndQuery: "/v1/send/" + "cd".repeat(32),
+      pathAndQuery: "/send/" + "cd".repeat(32),
       header: (name) => headers[Object.keys(headers).find((k) => k.toLowerCase() === name.toLowerCase())!] ?? null,
       body: new Uint8Array(),
       now: NOW,

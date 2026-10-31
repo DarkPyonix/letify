@@ -252,11 +252,11 @@ def test_a_stray_local_connection_does_not_get_a_loopback_stream(sidecar_binary,
 
 def test_a_daemon_signs_and_another_verifies_under_a_signalling_domain(pair):
     a, b, _ = pair
-    signature = a.sign("letify-signal v1", b"GET\n/v1/health")
+    signature = a.sign("letify-signal v1", b"GET\n/health")
     assert len(signature) == 64
-    assert b.verify(a.node_id, "letify-signal v1", b"GET\n/v1/health", signature)
+    assert b.verify(a.node_id, "letify-signal v1", b"GET\n/health", signature)
     assert not b.verify(a.node_id, "letify-signal v1", b"GET\n/v1/other", signature)
-    assert not b.verify(b.node_id, "letify-signal v1", b"GET\n/v1/health", signature)
+    assert not b.verify(b.node_id, "letify-signal v1", b"GET\n/health", signature)
 
 
 def test_a_daemon_refuses_to_sign_outside_the_signalling_domains(pair):

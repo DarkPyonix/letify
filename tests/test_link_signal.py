@@ -125,10 +125,18 @@ def test_the_service_refuses_an_oversize_body_that_skips_the_client_check(
         client.post_unchecked(b.node_id, b"x" * 5000)
 
 
+def test_the_fake_service_has_no_versioned_paths(signal_service, daemons) -> None:
+    b = daemons("b")
+    for path in ("/v1/health", f"/v1/send/{b.node_id}"):
+        with pytest.raises(urllib.error.HTTPError) as raised:
+            urllib.request.urlopen(f"{signal_service.url}{path}", timeout=5)
+        assert raised.value.code == 404
+
+
 def test_an_unsigned_request_is_refused_by_the_service(signal_service, daemons) -> None:
     b = daemons("b")
     request = urllib.request.Request(
-        f"{signal_service.url}/v1/send/{b.node_id}", data=b"x", method="POST"
+        f"{signal_service.url}/send/{b.node_id}", data=b"x", method="POST"
     )
     with pytest.raises(urllib.error.HTTPError) as raised:
         urllib.request.urlopen(request, timeout=5)

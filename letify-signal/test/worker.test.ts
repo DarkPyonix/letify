@@ -35,7 +35,7 @@ class World {
 }
 
 async function send(world: World, from: TestNode, to: string, body: Uint8Array, over: { time?: number; nonce?: string; ip?: string } = {}) {
-  const path = `/v1/send/${to}`;
+  const path = `/send/${to}`;
   const headers = await signedHeaders(from, { method: "POST", path, body, time: over.time ?? world.now, nonce: over.nonce });
   return handle(
     new Request(BASE + path, { method: "POST", body, headers: { ...headers, "CF-Connecting-IP": over.ip ?? "203.0.113.5" } }),
@@ -64,7 +64,7 @@ describe("send and recv", () => {
     const sent = await send(world, alice, bob.id, text("hello"));
     expect(sent.status).toBe(202);
     expect(await sent.json()).toEqual({ ok: true, seq: 1 });
-    const got = await recv(world, bob, `/v1/recv/${bob.id}?wait=0`);
+    const got = await recv(world, bob, `/recv/${bob.id}?wait=0`);
     expect(got.status).toBe(200);
     const body = (await got.json()) as { messages: Array<{ seq: number; from: string; body: string }>; cursor: number };
     expect(body.messages).toHaveLength(1);
@@ -76,27 +76,27 @@ describe("send and recv", () => {
   it("deletes what the after cursor acknowledges", async () => {
     await send(world, alice, bob.id, text("one"));
     await send(world, alice, bob.id, text("two"));
-    const after = await recv(world, bob, `/v1/recv/${bob.id}?after=1&wait=0`);
+    const after = await recv(world, bob, `/recv/${bob.id}?after=1&wait=0`);
     const body = (await after.json()) as { messages: Array<{ seq: number }> };
     expect(body.messages.map((m) => m.seq)).toEqual([2]);
   });
 
   it("refuses to let alice read bob's mailbox even with a valid signature of her own", async () => {
     await send(world, alice, bob.id, text("secret"));
-    const stolen = await recv(world, bob, `/v1/recv/${bob.id}?wait=0`, alice);
+    const stolen = await recv(world, bob, `/recv/${bob.id}?wait=0`, alice);
     expect(stolen.status).toBe(403);
     expect(await stolen.json()).toEqual({ ok: false, error: "forbidden" });
   });
 
   it("refuses an unsigned send and a send with a wrong signature", async () => {
-    const unsigned = await handle(new Request(`${BASE}/v1/send/${bob.id}`, { method: "POST", body: text("x") }), world.deps);
+    const unsigned = await handle(new Request(`${BASE}/send/${bob.id}`, { method: "POST", body: text("x") }), world.deps);
     expect(unsigned.status).toBe(400);
-    const path = `/v1/send/${bob.id}`;
+    const path = `/send/${bob.id}`;
     const headers = await signedHeaders(alice, { method: "POST", path, body: text("x"), time: NOW, tamper: "no" });
     const wrong = await handle(new Request(BASE + path, { method: "POST", body: text("x"), headers }), world.deps);
     expect(wrong.status).toBe(401);
     expect(await wrong.json()).toEqual({ ok: false, error: "bad_signature" });
-    expect((await recv(world, bob, `/v1/recv/${bob.id}?wait=0`).then((r) => r.json())) as { messages: unknown[] }).toMatchObject({ messages: [] });
+    expect((await recv(world, bob, `/recv/${bob.id}?wait=0`).then((r) => r.json())) as { messages: unknown[] }).toMatchObject({ messages: [] });
   });
 
   it("refuses a stale request", async () => {
@@ -111,7 +111,7 @@ describe("send and recv", () => {
     const again = await send(world, alice, bob.id, text("x"), { nonce });
     expect(again.status).toBe(401);
     expect(await again.json()).toEqual({ ok: false, error: "replay" });
-    const got = (await (await recv(world, bob, `/v1/recv/${bob.id}?wait=0`)).json()) as { messages: unknown[] };
+    const got = (await (await recv(world, bob, `/recv/${bob.id}?wait=0`)).json()) as { messages: unknown[] };
     expect(got.messages).toHaveLength(1);
   });
 
@@ -154,7 +154,7 @@ describe("send and recv", () => {
   it("limits a client address to 240 requests per minute, before any signature is checked", async () => {
     let last = 0;
     for (let i = 0; i < 241; i++) {
-      const r = await handle(new Request(`${BASE}/v1/send/${bob.id}`, { method: "POST", body: text("x"), headers: { "CF-Connecting-IP": "192.0.2.1" } }), world.deps);
+      const r = await handle(new Request(`${BASE}/send/${bob.id}`, { method: "POST", body: text("x"), headers: { "CF-Connecting-IP": "192.0.2.1" } }), world.deps);
       last = r.status;
     }
     expect(last).toBe(429);
@@ -163,19 +163,25 @@ describe("send and recv", () => {
 
 describe("routing", () => {
   it("answers the health check without a signature", async () => {
-    const r = await handle(new Request(`${BASE}/v1/health`), world.deps);
+    const r = await handle(new Request(`${BASE}/health`), world.deps);
     expect(r.status).toBe(200);
-    expect(await r.json()).toEqual({ ok: true, v: 1 });
+    expect(await r.json()).toEqual({ ok: true });
+  });
+
+  it("answers 404 for the old versioned paths", async () => {
+    for (const path of ["/health", `/v1/send/${bob.id}`, `/v1/recv/${bob.id}`, `/v1/ws/${bob.id}`]) {
+      expect((await handle(new Request(`${BASE}${path}`), world.deps)).status, path).toBe(404);
+    }
   });
 
   it("answers 404 for an unknown path and 405 for a wrong method", async () => {
     expect((await handle(new Request(`${BASE}/v2/send/${bob.id}`), world.deps)).status).toBe(404);
-    expect((await handle(new Request(`${BASE}/v1/send/${bob.id}`, { method: "GET" }), world.deps)).status).toBe(405);
+    expect((await handle(new Request(`${BASE}/send/${bob.id}`, { method: "GET" }), world.deps)).status).toBe(405);
   });
 
   it("refuses a bad wait or after value", async () => {
     for (const query of ["wait=26", "wait=-1", "wait=x", "after=-1", "after=1.5"]) {
-      const r = await recv(world, bob, `/v1/recv/${bob.id}?${query}`);
+      const r = await recv(world, bob, `/recv/${bob.id}?${query}`);
       expect(r.status, query).toBe(400);
     }
   });
