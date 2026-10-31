@@ -236,7 +236,9 @@ async fn a_local_close_ends_a_pending_accept_on_the_same_side() {
     let accept = tokio::spawn(async move { waiting.accept_stream().await.map(|_| ()) });
     tokio::time::sleep(Duration::from_millis(100)).await;
     a.close().await;
-    let ended = timeout(PROMPT, accept).await.expect("accept still pending after close");
+    let ended = timeout(PROMPT, accept)
+        .await
+        .expect("accept still pending after close");
     assert!(matches!(ended.unwrap(), Err(letify_link::Error::Closed)));
 }
 
@@ -244,7 +246,9 @@ async fn a_local_close_ends_a_pending_accept_on_the_same_side() {
 async fn accept_after_a_local_close_returns_closed() {
     let (a, _b) = session_pair(Config::default()).await;
     a.close().await;
-    let ended = timeout(PROMPT, a.accept_stream()).await.expect("accept pending");
+    let ended = timeout(PROMPT, a.accept_stream())
+        .await
+        .expect("accept pending");
     assert!(matches!(ended, Err(letify_link::Error::Closed)));
 }
 
@@ -260,7 +264,9 @@ async fn a_local_close_ends_a_pending_read_on_an_open_stream() {
     });
     tokio::time::sleep(Duration::from_millis(100)).await;
     a.close().await;
-    let ended = timeout(PROMPT, reader).await.expect("read still pending after close");
+    let ended = timeout(PROMPT, reader)
+        .await
+        .expect("read still pending after close");
     assert_eq!(ended.unwrap().unwrap(), 0);
 }
 
@@ -274,6 +280,8 @@ async fn a_local_close_ends_a_write_that_waits_for_window() {
     let writer = tokio::spawn(async move { s.write_all(&vec![0u8; 256 << 20]).await });
     tokio::time::sleep(Duration::from_millis(300)).await;
     a.close().await;
-    let ended = timeout(PROMPT, writer).await.expect("write still pending after close");
+    let ended = timeout(PROMPT, writer)
+        .await
+        .expect("write still pending after close");
     assert!(ended.unwrap().is_err());
 }
