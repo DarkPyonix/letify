@@ -38,6 +38,12 @@ class LocalShell(Shell):
         """The account's plain ssh command, run on this machine under ``sh -c``."""
         return self.__dict__["fake_ssh"].ssh_command(remote_command)
 
+    def link(self, runtime: Any = None) -> Any:
+        """An account with no address is reached through its pipeline, here the same hop."""
+        if self.address is None:
+            return self.__dict__["fake_ssh"]
+        return super().link(runtime)
+
 
 class FakeSsh:
     """Records the commands the bootstrap would send over ssh and runs them locally."""
@@ -457,18 +463,79 @@ def test_a_link_account_bootstraps_over_plain_ssh_without_the_strategy_race(
         channel.close()
 
 
-def test_a_link_account_with_no_address_names_the_missing_rendezvous(
-    isolated_home, tmp_path, ssh
-) -> None:
+def no_address_machine(tmp_path: Path, fake: FakeSshLink, sidecar_binary: Path) -> LocalShell:
     provider = provider_of(
-        LocalShell, "lab", tailcat="100.64.0.9", tailcat_port=7001, link="letify-link"
+        LocalShell,
+        "lab",
+        tailcat="100.64.0.9",
+        tailcat_port=7001,
+        workspace=str(tmp_path / "ws"),
+        link="letify-link",
+        link_binary=str(sidecar_binary),
     )
-    provider.__dict__["fake_ssh"] = ssh
+    provider.__dict__["fake_ssh"] = fake
+    return provider
+
+
+def test_an_account_with_no_address_starts_its_session_from_punched_candidates_only(
+    sidecar_binary, isolated_home, tmp_path, ssh, udp_stun, monkeypatch
+) -> None:
+    monkeypatch.setenv("LETIFY_LINK_STUN", udp_stun.env)
+    seen: list[Any] = []
+    original = linkd.LinkDaemon.open_session
+
+    def spy(self, peer, candidates, rendezvous=None, *, config=None):
+        seen.append(list(candidates))
+        return original(self, peer, candidates, rendezvous, config=config)
+
+    monkeypatch.setattr(linkd.LinkDaemon, "open_session", spy)
+    provider = no_address_machine(tmp_path, ssh, sidecar_binary)
+    channel = provider.open_channel(runtime())
+    try:
+        assert channel.call(worker_pid(), (), {})[0] != os.getpid()
+        assert seen and all(isinstance(c, dict) and "punched" in c for c in seen[0])
+        # The pipeline's link carried the shim and nothing else: no data path used it.
+        assert len(ssh.commands) == 1
+        remote = provider.__dict__["_link_remotes"][""]
+        assert remote.endpoint == ""
+        assert remote.record()["endpoint"] == ""
+    finally:
+        channel.close()
+        provider.close_link()
+
+
+def test_an_account_with_no_address_names_the_policed_paths_when_none_is_usable(
+    sidecar_binary, isolated_home, tmp_path, ssh, udp_stun, monkeypatch
+) -> None:
+    monkeypatch.setenv("LETIFY_LINK_STUN", udp_stun.env)
+    # A floor no loopback path reaches makes every punched path count as policed.
+    monkeypatch.setattr(linkchannel, "POLICE", {"floor_bps": 1 << 50, "burst_ms": 200})
+    provider = no_address_machine(tmp_path, ssh, sidecar_binary)
     with pytest.raises(ProviderUnavailable) as raised:
         provider.open_channel(runtime())
-    assert "lab" in str(raised.value)
-    assert "letify-link needs an address until the NAT rendezvous lands" in str(raised.value)
-    assert ssh.commands == []
+    message = str(raised.value)
+    assert "lab has no address and no punched path connected" in message
+    assert "policed" in message
+    provider.close_link()
+
+
+def test_an_account_with_no_address_that_cannot_classify_its_nat_says_so(
+    sidecar_binary, isolated_home, tmp_path, ssh, monkeypatch
+) -> None:
+    monkeypatch.setenv("LETIFY_LINK_STUN", "127.0.0.1:9")
+    provider = no_address_machine(tmp_path, ssh, sidecar_binary)
+    with pytest.raises(ProviderUnavailable, match="address observers answered"):
+        provider.open_channel(runtime())
+    provider.close_link()
+
+
+def test_a_run_of_an_account_with_no_address_cannot_be_attached_without_a_new_punch(
+    isolated_home, tmp_path, ssh
+) -> None:
+    provider = no_address_machine(tmp_path, ssh, Path("unused"))
+    record = {"door": "/tmp/door", "link": {"endpoint": "", "node_id": "n", "local_node": "m"}}
+    with pytest.raises(UnsupportedMode, match="no address"):
+        provider.attach_channel("r1", record)
 
 
 # -- Gap 3: the resume window is the lease -------------------------------------------

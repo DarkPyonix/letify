@@ -245,6 +245,7 @@ class LinkDaemon:
     ):
         self._binary = Path(binary) if binary else require_binary()
         self.rendezvous = rendezvous
+        self.last_punch: dict[str, Any] = {}
         self._dir = Path(tempfile.mkdtemp(prefix="ll"))
         self._ids = itertools.count(1)
         self._lock = threading.Lock()
@@ -476,11 +477,19 @@ class LinkDaemon:
         public_ip: str | None = None,
         lead_ms: int | None = None,
         window_ms: int | None = None,
+        udp: int | None = None,
+        observers: str | list[str] | None = None,
+        police: dict[str, int] | None = None,
     ) -> list[str]:
-        """Run the TCP punch plan through the rendezvous.
+        """Run the punch plan through the rendezvous.
 
-        The initiator gets the names of its punched sockets, to pass as ``punched`` candidates.
-        The responder hands its sockets to ``listener`` and gets an empty list.
+        ``sockets`` TCP sockets and ``udp`` UDP sockets are punched. ``observers`` is
+        ``"default"`` or a list of ``host:port`` STUN servers, and makes the offer carry the
+        mappings they report; without it the mappings are the bound ports on ``public_ip``.
+        ``police`` is ``{"floor_bps": ..., "burst_ms": ...}`` and runs the policing check on every
+        punched path. The initiator gets the names of its usable paths, to pass as ``punched``
+        candidates, and the whole reply (``policed``, ``nat``, ``peer_nat``, ``mapped``) in
+        ``last_punch``. The responder hands its paths to ``listener`` and gets an empty list.
         """
         request: dict[str, Any] = {
             "op": "punch",
@@ -494,10 +503,15 @@ class LinkDaemon:
             ("public_ip", public_ip),
             ("lead_ms", lead_ms),
             ("window_ms", window_ms),
+            ("udp", udp),
+            ("observers", observers),
+            ("police", police),
         ):
             if value is not None:
                 request[key] = value
-        return self.request(request).get("punched", [])
+        reply = self.request(request)
+        self.last_punch = reply
+        return list(reply.get("punched", []))
 
     @property
     def pid(self) -> int:

@@ -18,8 +18,10 @@ import json
 import os
 import shutil
 import socket
+import struct
 import subprocess
 import sys
+import threading
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -1539,6 +1541,55 @@ def stun_server():
     server = StunServer()
     yield server
     server.close()
+
+
+class UdpStunServers:
+    """Three STUN servers on loopback that report the address a client was seen at.
+
+    That is a NAT that keeps ports, which two sidecars on this machine can really punch through.
+    ``env`` is the value of ``LETIFY_LINK_STUN`` that makes the sidecars ask them.
+    """
+
+    def __init__(self, count: int = 3) -> None:
+        self.socks = []
+        for _ in range(count):
+            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            sock.bind(("127.0.0.1", 0))
+            self.socks.append(sock)
+            threading.Thread(target=self.serve, args=(sock,), daemon=True).start()
+
+    @property
+    def env(self) -> str:
+        return ",".join(f"{sock.getsockname()[0]}:{sock.getsockname()[1]}" for sock in self.socks)
+
+    @staticmethod
+    def serve(sock: socket.socket) -> None:
+        cookie = 0x2112A442
+        while True:
+            try:
+                data, peer = sock.recvfrom(1500)
+            except OSError:
+                return
+            if len(data) < 20:
+                continue
+            port = peer[1] ^ (cookie >> 16)
+            ip = struct.unpack("!I", socket.inet_aton(peer[0]))[0] ^ cookie
+            value = struct.pack("!BBHI", 0, 1, port, ip)
+            attribute = struct.pack("!HH", 0x0020, len(value)) + value
+            sock.sendto(
+                struct.pack("!HHI", 0x0101, len(attribute), cookie) + data[8:20] + attribute, peer
+            )
+
+    def close(self) -> None:
+        for sock in self.socks:
+            sock.close()
+
+
+@pytest.fixture
+def udp_stun():
+    servers = UdpStunServers()
+    yield servers
+    servers.close()
 
 
 class FakeLink:

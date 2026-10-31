@@ -32,6 +32,11 @@ from . import linkd
 PREPARE_TIMEOUT = 600.0
 #: Seconds the shim gets to start the remote sidecar and print its ready line.
 SHIM_TIMEOUT = 60.0
+#: TCP and UDP sockets a punch opens, and the policing check each punched path passes: a floor of
+#: 1 MiB/s and bursts of 500 ms. Spec "Sidecar interface" item 3.
+PUNCH_TCP = 4
+PUNCH_UDP = 1
+POLICE = {"floor_bps": 1 << 20, "burst_ms": 500}
 #: Seconds the remote shim waits for a session after the hand-over before it leaves.
 WAIT_SESSION_S = 120
 #: Seconds a session keeps its place with no live path. It is the lease of spec "Sessions",
@@ -209,7 +214,7 @@ def connect(
     alias: str,
     *,
     ssh: Callable[[str], list[str]],
-    address: str,
+    address: str | None,
     python: str,
     bootstrap: str,
     key_path: str | os.PathLike[str],
@@ -266,10 +271,37 @@ def connect(
         remote_id = str(ready["node_id"])
         daemon.rendezvous = _StdioRendezvous(lambda: daemon.node_id, write)
         lines.on_rendezvous = lambda to, message: daemon.deliver(remote_id, message)
-        candidates: list[Any] = [f"{address}:{ready['port']}"]
-        if punch:
-            write({"op": "punch", "peer": daemon.node_id, "sockets": 4, "public_ip": address})
-            names = daemon.punch(remote_id, "initiator", sockets=4, public_ip=address)
+        candidates: list[Any] = [] if address is None else [f"{address}:{ready['port']}"]
+        if punch or address is None:
+            # An account with an address is reachable, so its mappings are that address. One
+            # without is behind a NAT, and the sidecars ask the address observers instead.
+            where: dict[str, Any] = (
+                {"observers": "default"} if address is None else {"public_ip": address}
+            )
+            write(
+                {
+                    "op": "punch",
+                    "peer": daemon.node_id,
+                    "sockets": PUNCH_TCP,
+                    "udp": PUNCH_UDP,
+                    **where,
+                }
+            )
+            try:
+                names = daemon.punch(
+                    remote_id,
+                    "initiator",
+                    sockets=PUNCH_TCP,
+                    udp=PUNCH_UDP,
+                    police=POLICE,
+                    **where,
+                )
+            except linkd.LinkError as error:
+                if address is not None:
+                    raise
+                raise _fail(
+                    alias, f"{alias} has no address and no punched path connected: {error}"
+                ) from error
             candidates += [{"name": f"punch{i}", "punched": n} for i, n in enumerate(names)]
         session = daemon.open_session(
             remote_id,
@@ -277,7 +309,11 @@ def connect(
             config={"start_timeout_ms": start_timeout_ms, "resume_window_s": RESUME_S},
         )
         remote = LinkRemote(
-            daemon, session, alias, remote_id=remote_id, endpoint=f"{address}:{ready['port']}"
+            daemon,
+            session,
+            alias,
+            remote_id=remote_id,
+            endpoint="" if address is None else f"{address}:{ready['port']}",
         )
         _hold_to_floor(remote, max_rtt_ms, min_bps)
         write({"op": "handover"})
@@ -322,6 +358,12 @@ def attach(
     except linkd.LinkError as error:
         raise _fail(alias, f"the local sidecar failed: {error}") from error
     try:
+        if not record.get("endpoint"):
+            raise UnsupportedMode(
+                f"{alias} has no address, so its letify-link shim has no endpoint a second "
+                f"process can dial, and attaching to it would need a punch through a new "
+                f"bootstrap, which is not built yet"
+            )
         if daemon.node_id != record.get("local_node"):
             raise UnsupportedMode(
                 f"{alias} runs this call behind a letify-link shim whose allow list holds "
