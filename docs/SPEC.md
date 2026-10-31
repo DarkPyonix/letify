@@ -2289,11 +2289,11 @@ The sidecar is a binary named `letify-link`, built for each wheel and installed 
    **The probe stream.** `{"kind":"probe","token":"<hex>"}` asks the shim to answer the probe of [Choosing a link](#choosing-a-link) on the stream: it echoes a round trip request, discards the bytes of an upload and reports their total, and sends bytes for a requested number of seconds for a download. It starts no process.
 
    **Announced lines.** The connect prints one line per decision to standard error with the `letify: ` prefix of [Choosing a link](#choosing-a-link), through the same printer, and `Launcher(announce=False)` prints none of them. The lines, in order, with `<alias>` the account:
-   - `<alias> letify-link: bootstrapping over <ssh|the command channel>, round trip <N> ms` (the round trip only when the channel measured one).
-   - `<alias> letify-link: binary <path> from <the account|the wheel|an upload|the machine's cache> (<size> MiB) in <N> s`.
+   - `<alias> letify-link: binary <path> from <the account|the wheel|an upload|the machine's cache> (<size> MiB) in <N> s`, the size only for an upload or a cached upload.
+   - `<alias> letify-link: bootstrapping over <ssh|the command channel>, round trip <N> ms` (the round trip only when the channel measured one), printed once the channel to the shim is open.
    - `<alias> letify-link: shim ready in <N> s`.
    - `<alias> letify-link: NAT <local type> here, <peer type> there`, after a punch.
-   - `<alias> letify-link: path <name> <tcp|udp|relay> <direct|punched> rtt <N> ms`, one line per subflow of the session when the probe starts.
+   - `<alias> letify-link: path <tcp|udp|relay> <direct|punched> rtt <N> ms`, one line per subflow of the session, printed after the probe so that every subflow that joined during it is listed.
    - `<alias> letify-link: probe round trip <N> ms, up <N> MiB/s, down <N> MiB/s over <K> path(s)`.
    - `<alias> letify-link: chose the session` when the floor is cleared, or `<alias> letify-link: rejected, <reasons>` when it is not.
    - `<alias> letify-link: connected in <N> s (bootstrap <N>, binary <N>, shim <N>, punch <N>, session <N>, probe <N>)`, the phases in seconds. `bootstrap` is the start of the channel to the shim, `binary` the preparation of the remote binary, `shim` the wait for its ready line, `punch` the hole punch (0 with none), `session` the opening of the session and `probe` the bulk probe. The same figures are kept on `LinkRemote.phases`.
