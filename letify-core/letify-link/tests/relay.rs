@@ -747,7 +747,10 @@ async fn a_held_port_is_refused_and_unavailable_until_it_listens() {
     // on it, or a parallel test run takes it and the test fails on the bind.
     let held = HeldPort::new();
     let addr = held.addr;
-    assert!(std::net::TcpListener::bind(addr).is_err(), "the port was free");
+    assert!(
+        std::net::TcpListener::bind(addr).is_err(),
+        "the port was free"
+    );
     assert!(TcpStream::connect(addr).await.is_err(), "the port accepted");
     let listener = held.listen();
     let (client, accepted) = tokio::join!(TcpStream::connect(addr), listener.accept());

@@ -272,7 +272,10 @@ async fn records_of_a_left_epoch_do_not_hold_the_window_of_their_subflow() {
             .map(|f| f.inflight_bytes)
             .unwrap()
     };
-    assert!(inflight(&a) > 0, "nothing was held back, the test forces nothing");
+    assert!(
+        inflight(&a) > 0,
+        "nothing was held back, the test forces nothing"
+    );
     let dropped = b.dropped_records();
     gate.open();
     let settled = async {
