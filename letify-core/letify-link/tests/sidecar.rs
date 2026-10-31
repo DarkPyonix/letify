@@ -1016,3 +1016,105 @@ async fn a_path_above_the_policing_floor_is_kept() {
     assert_eq!(names.len(), 2, "{ra}");
     carries_a_stream(&mut a, &mut b, &names).await;
 }
+
+// -- A failed punch explains itself (spec "NAT traversal" item 8) -----------------------
+
+/// Three servers that claim every client holds the TEST-NET-3 address `203.0.113.9`, with the
+/// port the client used, so a punch dials an address nobody answers on.
+async fn blackhole_nat() -> Vec<SocketAddr> {
+    let rewrite = |from: SocketAddr| SocketAddr::new("203.0.113.9".parse().unwrap(), from.port());
+    let mut out = Vec::new();
+    for _ in 0..3 {
+        out.push(fake_stun(rewrite).await);
+    }
+    out
+}
+
+#[tokio::test]
+async fn a_punch_nobody_answers_reports_this_sides_nat_and_offers() {
+    let mut servers = Vec::new();
+    for k in 0..3u16 {
+        servers.push(
+            fake_stun(move |_| SocketAddr::new("203.0.113.9".parse().unwrap(), 10_000 + 2 * k))
+                .await,
+        );
+    }
+    let mut a = Sidecar::start(None).await;
+    let peer = Sidecar::start(None).await.node_id;
+    let r = a
+        .call(json!({
+            "op": "punch", "peer": peer, "role": "initiator", "sockets": 2, "udp": 1,
+            "observers": servers.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+            "lead_ms": 100, "window_ms": 400,
+        }))
+        .await;
+    assert_eq!(r["ok"], false, "{r}");
+    let text = r["error"].as_str().unwrap();
+    assert!(text.contains("here: NAT symmetric:2, offered tcp 2 (2 predicted) udp 1"), "{text}");
+    assert!(text.contains("there: no answer"), "{text}");
+    assert_eq!(r["detail"]["nat"], "symmetric:2", "{r}");
+    assert!(r["detail"]["peer_nat"].is_null(), "{r}");
+    assert_eq!(r["detail"]["report"].as_str().unwrap(), &text[text.find("here:").unwrap()..]);
+}
+
+#[tokio::test]
+async fn a_punch_whose_dials_fail_reports_both_nats_and_both_offers() {
+    let servers = blackhole_nat().await;
+    let env = [("LETIFY_LINK_STUN", join_addrs(&servers))];
+    let mut a = Sidecar::start_with(None, &env).await;
+    let mut b = Sidecar::start_with(None, &env).await;
+    a.forward_rendezvous_to(b.writer());
+    b.forward_rendezvous_to(a.writer());
+    let l = b.ok(json!({"op": "listen", "allow": [a.node_id]})).await;
+    let (a_id, b_id) = (a.node_id.clone(), b.node_id.clone());
+    let (ra, _rb) = tokio::join!(
+        a.call(json!({
+            "op": "punch", "peer": b_id, "role": "initiator", "sockets": 2, "udp": 1,
+            "observers": "default", "lead_ms": 300, "window_ms": 1500,
+        })),
+        b.call(json!({
+            "op": "punch", "peer": a_id, "role": "responder", "sockets": 2, "udp": 1,
+            "observers": "default", "listener": l["listener"], "lead_ms": 300,
+            "window_ms": 1500,
+        })),
+    );
+    assert_eq!(ra["ok"], false, "{ra}");
+    let text = ra["error"].as_str().unwrap();
+    assert!(text.starts_with("punch failed: "), "{text}");
+    assert!(
+        text.contains(
+            "here: NAT endpoint_independent, offered tcp 2 (0 predicted) udp 1; \
+             there: NAT endpoint_independent, offered tcp 2 udp 1; \
+             udp plan: 1 socket(s) to 1 destination(s) (fixed)"
+        ),
+        "{text}"
+    );
+    assert_eq!(ra["detail"]["nat"], "endpoint_independent", "{ra}");
+    assert_eq!(ra["detail"]["peer_nat"], "endpoint_independent", "{ra}");
+}
+
+#[tokio::test]
+async fn a_punch_that_cannot_classify_says_why_in_the_detail() {
+    let one = fake_stun(|from| from).await;
+    let mut a = Sidecar::start(None).await;
+    let peer = Sidecar::start(None).await.node_id;
+    let r = a
+        .call(json!({
+            "op": "punch", "peer": peer, "role": "initiator", "udp": 1,
+            "observers": [one.to_string()], "lead_ms": 100, "window_ms": 400,
+        }))
+        .await;
+    assert_eq!(r["ok"], false, "{r}");
+    assert!(r["detail"]["nat"].is_null(), "{r}");
+    assert!(
+        r["detail"]["nat_error"].as_str().unwrap().contains("1 of 1 address observers"),
+        "{r}"
+    );
+}
+
+#[tokio::test]
+async fn a_successful_punch_reply_carries_the_report() {
+    let (_a, _b, ra, _rb, _l) = punch_pair(2, 1, None).await;
+    let report = ra["report"].as_str().unwrap();
+    assert!(report.starts_with("here: NAT endpoint_independent, offered tcp 2 (0 predicted) udp 1; there: NAT endpoint_independent, offered tcp 2 udp 1"), "{report}");
+}
