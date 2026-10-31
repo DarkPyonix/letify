@@ -9,7 +9,7 @@ publish = false
 
 [dependencies]
 # snow is the Noise implementation, with its pure Rust default crypto resolver.
-snow = "0.9"
+snow = { version = "0.9", features = ["ring-accelerated"] }
 ed25519-dalek = "2"
 # getrandom seeds a generated node key from the operating system.
 getrandom = "0.2"
