@@ -169,7 +169,7 @@ describe("routing", () => {
   });
 
   it("answers 404 for the old versioned paths", async () => {
-    for (const path of ["/health", `/v1/send/${bob.id}`, `/v1/recv/${bob.id}`, `/v1/ws/${bob.id}`]) {
+    for (const path of ["/v1/health", `/v1/send/${bob.id}`, `/v1/recv/${bob.id}`, `/v1/ws/${bob.id}`]) {
       expect((await handle(new Request(`${BASE}${path}`), world.deps)).status, path).toBe(404);
     }
   });
