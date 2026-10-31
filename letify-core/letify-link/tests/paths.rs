@@ -600,3 +600,53 @@ async fn a_version_mismatch_is_reported_when_every_path_refuses() {
         "{err:?}"
     );
 }
+
+/// A candidate over a delayed path that can be dialed once, like a punched socket.
+fn one_shot(name: &str, front: std::net::SocketAddr) -> Candidate {
+    let slot = std::sync::Arc::new(std::sync::Mutex::new(Some(())));
+    Candidate::new(name, move || {
+        let slot = slot.clone();
+        async move {
+            if slot.lock().unwrap().take().is_none() {
+                return Err(std::io::Error::other("the punched socket was used"));
+            }
+            letify_link::tcp::connect(front).await
+        }
+    })
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_path_faster_than_the_first_one_still_joins_the_session_it_started() {
+    let mut r = rig(Config::default()).await;
+    // The first candidate is the slow one, so the session starts on it. The join of the fast
+    // path reaches the responder before the session is registered there.
+    let slow = Throttle::delayed(r.target, 50e6, Duration::from_millis(150)).await;
+    let fast = Throttle::delayed(r.target, 50e6, Duration::from_millis(10)).await;
+    let mut pm = PathManager::start(
+        r.client.clone(),
+        r.server.node_id(),
+        vec![one_shot("slow", slow.addr), one_shot("fast", fast.addr)],
+        Config::default(),
+        quick(),
+    )
+    .await
+    .unwrap();
+    let mut added = Vec::new();
+    while added.len() < 2 {
+        let name = timeout(Duration::from_secs(5), next_added(&mut pm))
+            .await
+            .unwrap_or_else(|_| panic!("only {added:?} joined"));
+        added.push(name);
+    }
+    let server = timeout(Duration::from_secs(5), r.sessions.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    timeout(Duration::from_secs(5), async {
+        while server.subflow_count() < 2 {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("the responder holds both subflows");
+}

@@ -19,12 +19,16 @@ struct Rig {
 }
 
 async fn rig() -> Rig {
+    rig_with(Config::default()).await
+}
+
+async fn rig_with(config: Config) -> Rig {
     let client = Identity::generate();
     let server = Identity::generate();
     let acceptor = Arc::new(Acceptor::new(
         server.clone(),
         PeerPolicy::allow(vec![client.node_id()]),
-        Config::default(),
+        config,
     ));
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     Rig {
@@ -92,7 +96,11 @@ async fn a_resuming_subflow_is_routed_to_its_session_by_the_acceptor() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_subflow_naming_an_unknown_session_is_dropped() {
-    let rig = rig().await;
+    let rig = rig_with(Config {
+        handshake_timeout: Duration::from_millis(500),
+        ..Config::default()
+    })
+    .await;
     let addr = rig.listener.local_addr().unwrap();
     let mut rogue = TcpStream::connect(addr).await.unwrap();
     let mut bytes = b"LLNS".to_vec();
@@ -112,7 +120,11 @@ async fn a_subflow_naming_an_unknown_session_is_dropped() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_closed_session_is_forgotten_by_the_acceptor() {
-    let rig = rig().await;
+    let rig = rig_with(Config {
+        handshake_timeout: Duration::from_millis(500),
+        ..Config::default()
+    })
+    .await;
     let (a, b) = pair(&rig).await;
     // A prefix that was valid while the session lived.
     let prefix = join_through_mitm(&a, &rig.acceptor).await;
