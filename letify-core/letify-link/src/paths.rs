@@ -382,6 +382,7 @@ impl PathManager {
 
         let deadline = Instant::now() + cfg.start_timeout;
         let mut consumed: HashSet<usize> = HashSet::new();
+        let mut refused: HashSet<usize> = HashSet::new();
         let (session, winner) = loop {
             let got = tokio::time::timeout_at(deadline, ready_rx.recv()).await;
             let Ok(Some((i, transport))) = got else {
@@ -393,11 +394,16 @@ impl PathManager {
             consumed.insert(i);
             match Session::connect(transport, &identity, remote, link.clone()).await {
                 Ok(s) => break (s, i),
-                Err(e @ Error::VersionMismatch { .. }) => {
-                    dialers.iter().flatten().for_each(AbortHandle::abort);
-                    return Err(e);
-                }
-                Err(_) => {
+                Err(e) => {
+                    // A version refusal is plaintext, so a forger on one path can send it.
+                    // It fails this candidate only, and is reported when all of them got one.
+                    if let Error::VersionMismatch { .. } = e {
+                        refused.insert(i);
+                        if refused.len() == n {
+                            dialers.iter().flatten().for_each(AbortHandle::abort);
+                            return Err(e);
+                        }
+                    }
                     consumed.remove(&i);
                     spawn_dialer(i, &mut dialers);
                 }

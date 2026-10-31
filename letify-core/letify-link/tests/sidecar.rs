@@ -250,16 +250,27 @@ impl Sidecar {
     }
 }
 
-async fn local_connect(socket: &str) -> Box<dyn Conn> {
+/// Connect to the stream socket named by an `open_stream` reply or a `stream_incoming` event,
+/// sending its secret first when it has one.
+async fn local_connect(reply: &Value) -> Box<dyn Conn> {
+    let socket = reply["socket"].as_str().unwrap();
     if let Some(p) = socket.strip_prefix("unix:") {
         Box::new(UnixStream::connect(PathBuf::from(p)).await.unwrap())
     } else {
-        Box::new(
-            TcpStream::connect(socket.strip_prefix("tcp:").unwrap())
-                .await
-                .unwrap(),
-        )
+        let mut tcp = TcpStream::connect(socket.strip_prefix("tcp:").unwrap())
+            .await
+            .unwrap();
+        if let Some(secret) = reply["secret"].as_str() {
+            tcp.write_all(&unhex(secret)).await.unwrap();
+        }
+        Box::new(tcp)
     }
+}
+
+fn unhex(text: &str) -> Vec<u8> {
+    (0..text.len() / 2)
+        .map(|i| u8::from_str_radix(&text[2 * i..2 * i + 2], 16).unwrap())
+        .collect()
 }
 
 trait Conn: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + Unpin {}
@@ -316,11 +327,11 @@ async fn pair_over_tcp(control_arg: Option<&str>) -> (Sidecar, Sidecar, u64, u64
 async fn a_stream_carries_bytes_both_ways_between_two_sidecars() {
     let (mut a, mut b, sa, sb) = pair_over_tcp(None).await;
     let st = a.ok(json!({"op": "open_stream", "session": sa})).await;
-    let mut local_a = local_connect(st["socket"].as_str().unwrap()).await;
+    let mut local_a = local_connect(&st).await;
     local_a.write_all(b"x").await.unwrap();
     let inc = b.event("stream_incoming").await;
     assert_eq!(inc["session"], json!(sb));
-    let mut local_b = local_connect(inc["socket"].as_str().unwrap()).await;
+    let mut local_b = local_connect(&inc).await;
     let mut first = [0u8; 1];
     local_b.read_exact(&mut first).await.unwrap();
     assert_eq!(&first, b"x");
@@ -362,7 +373,7 @@ async fn a_bad_request_gets_a_usage_error_and_the_channel_stays_open() {
 async fn a_peer_outside_the_allow_list_is_refused() {
     let mut a = Sidecar::start(None).await;
     let mut b = Sidecar::start(None).await;
-    let stranger = "11".repeat(32);
+    let stranger = letify_link::Identity::generate().node_id().to_string();
     let l = b
         .ok(json!({"op": "listen", "allow": [stranger], "bind": "127.0.0.1:0"}))
         .await;
@@ -434,10 +445,10 @@ async fn a_punch_through_the_control_rendezvous_gives_a_session() {
     let st = a
         .ok(json!({"op": "open_stream", "session": s["session"]}))
         .await;
-    let mut conn = local_connect(st["socket"].as_str().unwrap()).await;
+    let mut conn = local_connect(&st).await;
     conn.write_all(b"hi").await.unwrap();
     let ev = b.event("stream_incoming").await;
-    let mut other = local_connect(ev["socket"].as_str().unwrap()).await;
+    let mut other = local_connect(&ev).await;
     let mut buf = [0u8; 2];
     other.read_exact(&mut buf).await.unwrap();
     assert_eq!(&buf, b"hi");
@@ -555,4 +566,170 @@ async fn open_stream_takes_a_priority_and_refuses_an_unknown_one() {
         .await;
     assert_eq!(bad["ok"], false);
     assert_eq!(bad["kind"], "usage");
+}
+
+#[tokio::test]
+async fn a_tcp_stream_socket_needs_its_secret_and_ignores_a_stray_connection() {
+    let (mut a, mut b, sa, sb) = pair_over_tcp(Some("tcp")).await;
+    let st = a.ok(json!({"op": "open_stream", "session": sa})).await;
+    let secret = st["secret"].as_str().expect("a secret for a tcp socket");
+    assert_eq!(secret.len(), 64);
+    let addr = st["socket"].as_str().unwrap().strip_prefix("tcp:").unwrap();
+
+    // A local process that sends nothing is not served, and does not block the right one.
+    let _silent = TcpStream::connect(addr).await.unwrap();
+    // One that sends 32 wrong bytes is closed.
+    let mut wrong = TcpStream::connect(addr).await.unwrap();
+    let mut bytes = unhex(secret);
+    bytes[31] ^= 1;
+    wrong.write_all(&bytes).await.unwrap();
+    let mut buf = [0u8; 1];
+    let n = tokio::time::timeout(Duration::from_secs(5), wrong.read(&mut buf))
+        .await
+        .expect("the wrong secret was not closed");
+    assert!(matches!(n, Ok(0) | Err(_)), "a wrong secret got data");
+
+    // The right secret still gets the stream.
+    let mut local_a = local_connect(&st).await;
+    local_a.write_all(b"x").await.unwrap();
+    let inc = b.event("stream_incoming").await;
+    assert_eq!(inc["session"], json!(sb));
+    assert_eq!(inc["secret"].as_str().unwrap().len(), 64);
+    assert_ne!(inc["secret"], st["secret"]);
+    let mut local_b = local_connect(&inc).await;
+    let mut first = [0u8; 1];
+    local_b.read_exact(&mut first).await.unwrap();
+    assert_eq!(&first, b"x");
+}
+
+#[tokio::test]
+async fn a_silent_connection_does_not_delay_the_one_that_authenticates() {
+    let (_child, ready, _dir) = start_unconnected("tcp").await;
+    let token = ready["token"].as_str().unwrap();
+    let addr = ready["control"]
+        .as_str()
+        .unwrap()
+        .strip_prefix("tcp:")
+        .unwrap()
+        .to_string();
+    // The silent connection comes first and holds the 5 s authentication window.
+    let _silent = TcpStream::connect(&addr).await.unwrap();
+    let mut good = TcpStream::connect(&addr).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(2), authenticate(&mut good, token))
+        .await
+        .expect("the silent connection delayed the right one");
+}
+
+/// Run `letify-link serve` until it exits and return whether it succeeded and what it printed
+/// on standard error. A sidecar that starts instead is killed and reported as a success.
+async fn serve_outcome(control: &str, key: &str, extra: &[&str]) -> (bool, String) {
+    let mut child = Command::new(BIN)
+        .args(["serve", "--control", control, "--key", key])
+        .args(extra)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    let mut err = child.stderr.take().unwrap();
+    let mut lines = BufReader::new(child.stdout.take().unwrap()).lines();
+    tokio::select! {
+        line = lines.next_line() => match line {
+            Ok(Some(_)) => (true, String::new()),
+            _ => {
+                let status = child.wait().await.unwrap();
+                let mut text = String::new();
+                let _ = err.read_to_string(&mut text).await;
+                (status.success(), text)
+            }
+        },
+        status = child.wait() => {
+            let mut text = String::new();
+            let _ = err.read_to_string(&mut text).await;
+            (status.unwrap().success(), text)
+        }
+        _ = tokio::time::sleep(Duration::from_secs(10)) => panic!("neither ready nor exited"),
+    }
+}
+
+fn mode(path: &std::path::Path) -> u32 {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(path).unwrap().permissions().mode() & 0o7777
+}
+
+fn set_mode(path: &std::path::Path, bits: u32) {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(bits)).unwrap();
+}
+
+#[tokio::test]
+async fn a_control_directory_that_others_can_write_is_refused() {
+    let dir = tempdir::Dir::new();
+    let key = dir.path().join("key");
+    set_mode(dir.path(), 0o777);
+    let control = dir.path().join("c");
+    let (ok, err) = serve_outcome(control.to_str().unwrap(), key.to_str().unwrap(), &[]).await;
+    assert!(!ok, "started in a world writable directory");
+    assert!(err.contains(dir.path().to_str().unwrap()), "{err}");
+    // With the sticky bit, as /tmp has, it is accepted.
+    set_mode(dir.path(), 0o1777);
+    let (ok, _) = serve_outcome(control.to_str().unwrap(), key.to_str().unwrap(), &[]).await;
+    assert!(ok);
+}
+
+#[tokio::test]
+async fn a_stream_directory_that_others_can_write_is_refused() {
+    let dir = tempdir::Dir::new();
+    let streams = dir.path().join("streams");
+    std::fs::create_dir(&streams).unwrap();
+    set_mode(&streams, 0o757);
+    let key = dir.path().join("key");
+    let control = dir.path().join("c");
+    let (ok, err) = serve_outcome(
+        control.to_str().unwrap(),
+        key.to_str().unwrap(),
+        &["--stream-dir", streams.to_str().unwrap()],
+    )
+    .await;
+    assert!(!ok);
+    assert!(err.contains("streams"), "{err}");
+}
+
+#[tokio::test]
+async fn the_control_socket_is_private_and_so_is_the_directory_of_a_stream_socket() {
+    let (mut a, _b, sa, _sb) = pair_over_tcp(None).await;
+    let control = a.control.strip_prefix("unix:").unwrap().to_string();
+    assert_eq!(mode(std::path::Path::new(&control)), 0o600);
+    let st = a.ok(json!({"op": "open_stream", "session": sa})).await;
+    let socket = st["socket"]
+        .as_str()
+        .unwrap()
+        .strip_prefix("unix:")
+        .unwrap();
+    let socket = std::path::Path::new(socket);
+    assert_eq!(mode(socket), 0o600);
+    assert_eq!(mode(socket.parent().unwrap()), 0o700);
+    // The private directory of the control socket is gone; only the one of the streams stays.
+    let beside: Vec<_> = std::fs::read_dir(std::path::Path::new(&control).parent().unwrap())
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    let private = beside.iter().filter(|n| n.starts_with(".letify-")).count();
+    assert_eq!(private, 1, "{beside:?}");
+}
+
+#[tokio::test]
+async fn a_key_file_that_others_can_read_is_refused() {
+    let dir = tempdir::Dir::new();
+    let key = dir.path().join("key");
+    std::fs::write(&key, "ab".repeat(32)).unwrap();
+    let control = dir.path().join("c");
+    set_mode(&key, 0o644);
+    let (ok, err) = serve_outcome(control.to_str().unwrap(), key.to_str().unwrap(), &[]).await;
+    assert!(!ok, "loaded a world readable key");
+    assert!(err.contains("chmod 600"), "{err}");
+    set_mode(&key, 0o600);
+    let (ok, _) = serve_outcome(control.to_str().unwrap(), key.to_str().unwrap(), &[]).await;
+    assert!(ok);
 }
