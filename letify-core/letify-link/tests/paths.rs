@@ -701,7 +701,7 @@ async fn a_black_hole_candidate_does_not_delay_the_start_on_a_good_one() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_path_manager_session_closes_when_its_peer_is_revoked() {
     let rig = rig(Config::default()).await;
-    let mut pm = PathManager::start(
+    let pm = PathManager::start(
         rig.client.clone(),
         rig.server.node_id(),
         vec![Candidate::tcp("only", rig.target)],
