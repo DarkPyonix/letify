@@ -3,8 +3,8 @@
 Sessions are created and destroyed with ``colab new`` and ``colab stop``. Colab is a
 ``Shell`` whose rendezvous is its provider layer: ``colab exec`` runs letify's remote half
 on the runtime, which installs and starts an SSH server (a Colab VM has none) and answers
-the punch or Tailcat request. The connection pipeline then races TCP hole punching and
-Tailcat, with no forward SSH, and falls back to ``colab exec`` itself, one program per
+the punch request. The connection pipeline then races TCP hole punching and QUIC,
+with no forward SSH, and falls back to ``colab exec`` itself, one program per
 call. ``channel = "exec"`` in the configuration skips the pipeline and uses that fallback
 directly.
 
@@ -446,18 +446,14 @@ class Colab(Shell):
     def rendezvous(self, runtime: Runtime | None = None) -> Rendezvous | None:
         if runtime is None:
             return None
-        from ..transport.rendezvous import ColabRendezvous, prepare_tailcat
+        from ..transport.rendezvous import ColabRendezvous
 
         name = runtime.name
 
         def run(source: str, timeout: float) -> str:
             return self._exec(name, source, timeout)
 
-        return ColabRendezvous(
-            run,
-            self._public_key(),
-            prepare_tailcat=prepare_tailcat(run, self.config.option("tailcat_binary")),
-        )
+        return ColabRendezvous(run, self._public_key())
 
     def fallback(self, runtime: Runtime | None = None) -> Callable[[], Link] | None:
         if runtime is None:

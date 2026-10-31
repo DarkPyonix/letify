@@ -712,17 +712,6 @@ def begin(request: dict):
             command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True
         )
         return {"mapping": list(mapping)}, _drain_then_wait(carrier)
-    if kind == "tailcat":
-        process = subprocess.Popen(
-            [request.get("binary", "tailcat"), "serve", str(request.get("ssh_port", 22))],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-        )
-        address = _match_then_drain(process, process.stdout, r"address:\s*(tc\S+)")
-        if address is None:
-            raise RuntimeError("tailcat serve exited without printing its address")
-        return {"address": address}, process.wait
     if kind == "reverse_ssh":
         # The directory is under the account's workspace root, which may start with ~.
         key = Path(os.path.expanduser(request["key_directory"])) / "letify_reverse"

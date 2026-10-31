@@ -649,18 +649,6 @@ __all__ = [
 ]
 
 
-def remote_tailcat_source() -> str:
-    """Prepare the pinned Linux binary on Colab using this installer's release metadata."""
-    import inspect
-
-    return (
-        inspect.getsource(_remote_tailcat)
-        + f"\nbinary = _remote_tailcat({TAILCAT_VERSION!r}, "
-        + f"{TAILCAT_RELEASE.format(version=TAILCAT_VERSION)!r}, {TAILCAT_SHA256!r})\n"
-        + "import json\nprint('LETIFY-TAILCAT ' + json.dumps(binary))\n"
-    )
-
-
 def remote_quic_source(version: str) -> str:
     """Prepare ``letify-quic`` on the remote from the letify wheel of this version.
 
@@ -728,73 +716,3 @@ def _remote_quic(version):
     target.chmod(0o755)
     json.dumps(str(target))
     return str(target)
-
-
-def _remote_tailcat(version, release, pins):
-    """Install a verified Linux tailcat using only the runtime's standard library."""
-    import hashlib
-    import io
-    import json
-    import os
-    import platform
-    import tarfile
-    import tempfile
-    import urllib.request
-    from pathlib import Path
-
-    arch = {"x86_64": "amd64", "aarch64": "arm64", "arm64": "arm64", "armv7l": "armv7"}.get(
-        platform.machine().lower()
-    )
-    asset = f"tailcat_{version}_linux_{arch}.tar.gz"
-    if platform.system() != "Linux" or asset not in pins:
-        raise RuntimeError(f"tailcat: unsupported runtime platform {platform.machine()}")
-    destination = Path.home() / ".letify" / "tools" / "tailcat" / version
-    binary = destination / "tailcat"
-    marker = destination / "verified.json"
-    if binary.is_file() and marker.is_file():
-        verified = json.loads(marker.read_text())
-        actual = hashlib.sha256(binary.read_bytes()).hexdigest()
-        if verified.get("archive") != pins[asset] or verified.get("binary") != actual:
-            raise RuntimeError("tailcat cached binary SHA-256 mismatch; refused")
-        return str(binary)
-    with urllib.request.urlopen(f"{release}/{asset}", timeout=60) as response:
-        data = response.read()
-    actual = hashlib.sha256(data).hexdigest()
-    if actual != pins[asset]:
-        raise RuntimeError(
-            f"tailcat archive SHA-256 mismatch: expected {pins[asset]}, got {actual}"
-        )
-    with tarfile.open(fileobj=io.BytesIO(data), mode="r:gz") as archive:
-        members = archive.getmembers()
-        if any(
-            Path(m.name).is_absolute()
-            or ".." in Path(m.name).parts
-            or m.isdev()
-            or m.islnk()
-            or m.issym()
-            for m in members
-        ):
-            raise RuntimeError("tailcat archive contains an unsafe member; refused")
-        candidates = [
-            m
-            for m in members
-            if m.isfile() and Path(m.name).name == "tailcat" and len(Path(m.name).parts) <= 2
-        ]
-        if len(candidates) != 1:
-            raise RuntimeError("tailcat archive must hold one regular tailcat binary")
-        payload = archive.extractfile(candidates[0]).read()
-    destination.mkdir(parents=True, exist_ok=True)
-    descriptor, temporary = tempfile.mkstemp(prefix=".tailcat-", dir=destination)
-    try:
-        with os.fdopen(descriptor, "wb") as handle:
-            handle.write(payload)
-        os.chmod(temporary, 0o555)
-        os.replace(temporary, binary)
-    finally:
-        if os.path.exists(temporary):
-            os.unlink(temporary)
-    marker.write_text(
-        json.dumps({"archive": actual, "binary": hashlib.sha256(payload).hexdigest()})
-    )
-    marker.chmod(0o444)
-    return str(binary)
