@@ -853,10 +853,14 @@ def _failure(report: str, nat: str | None, peer: str | None) -> linkd.LinkError:
 
 
 def test_each_failed_attempt_prints_its_nat_line_and_its_report() -> None:
-    first = "here: NAT endpoint_independent, offered tcp 4 (0 predicted) udp 1; there: NAT symmetric:2, offered tcp 4 udp 1"
-    second = "here: NAT endpoint_independent, offered tcp 4 (0 predicted) udp 1; there: no answer"
+    here = "here: NAT endpoint_independent, offered tcp 4 (0 predicted) udp 1"
+    first = f"{here}; there: NAT symmetric:2, offered tcp 4 udp 1"
+    second = f"{here}; there: no answer"
     message, told = _punch_failure(
-        [_failure(first, "endpoint_independent", "symmetric:2"), _failure(second, "endpoint_independent", None)],
+        [
+            _failure(first, "endpoint_independent", "symmetric:2"),
+            _failure(second, "endpoint_independent", None),
+        ],
         rtt_s=1.5,
     )
     assert told[0] == "NAT endpoint_independent here, symmetric:2 there (attempt 1)"
@@ -868,12 +872,16 @@ def test_each_failed_attempt_prints_its_nat_line_and_its_report() -> None:
 
 
 def test_a_punch_with_no_classification_prints_a_nat_line_saying_why() -> None:
-    error = linkd.LinkInfrastructureError("cannot classify the NAT: 2 of 3 address observers answered")
+    reason = "cannot classify the NAT: 2 of 3 address observers answered"
+    error = linkd.LinkInfrastructureError(reason)
     error.detail = {
         "nat": None,
         "peer_nat": None,
-        "nat_error": "cannot classify the NAT: 2 of 3 address observers answered",
-        "report": "here: NAT unknown (2 of 3 address observers answered), nothing offered; there: no answer",
+        "nat_error": reason,
+        "report": (
+            "here: NAT unknown (2 of 3 address observers answered), nothing offered; "
+            "there: no answer"
+        ),
     }
     _message, told = _punch_failure([error, error], rtt_s=1.0)
     assert told[0].startswith("NAT unknown here (cannot classify the NAT: 2 of 3 address observers")
@@ -887,16 +895,20 @@ def test_an_error_with_no_detail_still_prints_a_nat_line() -> None:
 
 
 def test_a_successful_punch_prints_the_report_after_the_nat_line() -> None:
+    report = (
+        "here: NAT endpoint_independent, offered tcp 4 (0 predicted) udp 1; "
+        "there: NAT symmetric:2, offered tcp 4 udp 1"
+    )
     daemon = SimpleNamespace(
         last_punch={
             "nat": "endpoint_independent",
             "peer_nat": "symmetric:2",
-            "report": "here: NAT endpoint_independent, offered tcp 4 (0 predicted) udp 1; there: NAT symmetric:2, offered tcp 4 udp 1",
+            "report": report,
         }
     )
     assert linkchannel.nat_lines(daemon) == [  # type: ignore[arg-type]
         "NAT endpoint_independent here, symmetric:2 there",
-        "punch here: NAT endpoint_independent, offered tcp 4 (0 predicted) udp 1; there: NAT symmetric:2, offered tcp 4 udp 1",
+        f"punch {report}",
     ]
 
 
