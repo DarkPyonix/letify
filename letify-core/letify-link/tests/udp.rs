@@ -337,3 +337,86 @@ async fn a_session_moves_from_udp_to_tcp_when_udp_dies() {
     assert!(died, "UDP was reported lost: {seen:?}");
     assert!(tcp_back, "TCP was dialed again and added: {seen:?}");
 }
+
+/// Pins SPEC.md Paths and the path manager, Kinds compete by their sum.
+/// One UDP candidate and several TCP candidates toward one server, every path delayed. The
+/// UDP path is faster than any single TCP path and slower than all of them together.
+async fn swarm(tcp_paths: usize, tcp_rate: f64, udp_rate: f64) -> (Duo, Vec<Throttle>) {
+    let client = Identity::generate();
+    let server = Identity::generate();
+    let tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let tcp_addr = tcp.local_addr().unwrap();
+    let udp_sock = udp_socket();
+    let udp_addr = udp_sock.local_addr().unwrap();
+    let listener = UdpListener::new(udp_sock, None, &UdpConfig::default()).unwrap();
+    let server_id = server.node_id();
+    let acceptor = Acceptor::new(
+        server,
+        PeerPolicy::allow(vec![client.node_id()]),
+        Config::default(),
+    );
+    let sessions = serve(acceptor, Some(tcp), Some(listener));
+    let udp_proxy =
+        UdpProxy::limited(udp_addr, Duration::from_millis(40), 0.0, Some(udp_rate)).await;
+    let udp_front = udp_proxy.addr;
+    let mut candidates = vec![Candidate::udp("udp", move || async move {
+        UdpPath::connect_with(udp_socket(), udp_front, &quick_udp()).await
+    })];
+    let mut throttles = Vec::new();
+    for i in 0..tcp_paths {
+        let t = Throttle::delayed(tcp_addr, tcp_rate, Duration::from_millis(60)).await;
+        candidates.push(Candidate::tcp(format!("tcp{i}"), t.addr));
+        throttles.push(t);
+    }
+    let duo = Duo {
+        client,
+        server_id,
+        candidates,
+        sessions,
+        udp_proxy,
+        _throttle: Throttle::to(tcp_addr, 1e9).await,
+    };
+    (duo, throttles)
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn tcp_subflows_that_together_beat_the_udp_path_are_not_closed_by_a_move_to_it() {
+    let (mut duo, _throttles) = swarm(4, 3.0 * MIB, 5.0 * MIB).await;
+    let pm = PathManager::start(
+        duo.client.clone(),
+        duo.server_id,
+        duo.candidates.clone(),
+        Config::default(),
+        ManagerConfig {
+            probe_idle: Duration::from_millis(300),
+            probe_window: Duration::from_millis(500),
+            ..mover()
+        },
+    )
+    .await
+    .unwrap();
+    let a = Arc::new(pm.session().downgrade().upgrade().unwrap());
+    let mut events = collect(pm);
+    let b = Arc::new(
+        timeout(Duration::from_secs(10), duo.sessions.recv())
+            .await
+            .unwrap()
+            .unwrap(),
+    );
+    // A bulk burst, then idle, then another transfer, as a probe, a build and a call do.
+    transfer(&a, &b, 24, Duration::ZERO).await;
+    tokio::time::sleep(Duration::from_secs(8)).await;
+    transfer(&a, &b, 24, Duration::ZERO).await;
+    let mut seen = Vec::new();
+    let end = Instant::now() + Duration::from_millis(200);
+    while let Ok(Some(item)) = tokio::time::timeout_at(end, events.recv()).await {
+        seen.push(item);
+    }
+    assert!(
+        !seen
+            .iter()
+            .any(|(_, ev)| matches!(ev, PathEvent::Lost { .. })),
+        "no subflow was lost: {seen:?}"
+    );
+    assert_eq!(a.subflow_count(), 5, "every subflow is still open");
+}
