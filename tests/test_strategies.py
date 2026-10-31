@@ -275,11 +275,15 @@ def test_ssh_over_tailcat_uses_it_as_the_proxy_command(patch_which, patch_run) -
     assert rendezvous.requests == [{"kind": "tailcat", "ssh_port": 22}]
 
 
-def test_the_remote_half_reads_the_address_tailcat_serve_prints(patch_popen) -> None:
-    started = patch_popen(nat, ["starting\n", "Server listening with new address: tcAbC123\n"])
-    answer, _ = nat.begin({"kind": "tailcat", "ssh_port": 22})
-    assert answer == {"address": "tcAbC123"}
-    assert started[0].command == ["tailcat", "serve", "22"]
+def test_a_command_rendezvous_has_no_tailcat_endpoint() -> None:
+    # Spec "Connection strategies": only the agent behind a tailcat address offers one.
+    with pytest.raises(OSError, match="no Tailcat endpoint"):
+        Canned("").tailcat_endpoint(22, 5.0)
+
+
+def test_the_remote_half_refuses_a_tailcat_request() -> None:
+    with pytest.raises(ValueError, match="unknown rendezvous request"):
+        nat.begin({"kind": "tailcat", "ssh_port": 22})
 
 
 def test_a_rendezvous_through_the_agent_needs_no_exchange_for_tailcat(patch_which) -> None:
@@ -765,43 +769,6 @@ def test_the_remote_half_starts_no_sshd_when_an_ssh_server_already_answers(
     finally:
         server.close()
     assert not any(str(binary) in command for command in recorder.commands)
-
-
-def _flooding_binary(directory, address: str, bytes_after: int) -> str:
-    """An executable that prints ``address`` the way tailcat does, then floods its output."""
-    import os
-    import sys
-    from pathlib import Path
-
-    path = Path(directory) / "flooding_tailcat"
-    path.write_text(
-        f"#!{sys.executable}\n"
-        "import sys\n"
-        f"print('Server listening with new address: {address}', flush=True)\n"
-        f"sys.stdout.write('x' * {bytes_after})\n"
-        "sys.stdout.flush()\n"
-    )
-    path.chmod(0o755)
-    return os.fspath(path)
-
-
-def test_the_remote_half_keeps_reading_what_tailcat_serve_prints_after_the_address(
-    tmp_path,
-) -> None:
-    # A pipe holds about 64 KiB, so a megabyte is far past the point where an unread
-    # pipe blocks the writer and the tunnel stops moving bytes.
-    binary = _flooding_binary(tmp_path, "tcReal1", 1 << 20)
-    answer, serve = nat.begin({"kind": "tailcat", "ssh_port": 22, "binary": binary})
-    assert answer == {"address": "tcReal1"}
-
-    import threading
-
-    waiter = threading.Thread(target=serve, daemon=True)
-    waiter.start()
-    waiter.join(30.0)
-    assert not waiter.is_alive(), (
-        "tailcat serve never finished, so it blocked writing to a pipe nobody reads"
-    )
 
 
 def test_the_punch_asks_the_remote_for_a_window_and_stops_when_it_does(patch_run) -> None:
