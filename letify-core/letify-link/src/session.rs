@@ -327,6 +327,11 @@ impl Sub {
         }
     }
 
+    /// The largest bulk cap this subflow ever has: half of its window, at least one frame.
+    fn cap_ceiling(&self) -> usize {
+        (self.window / 2).max(QUANTUM)
+    }
+
     /// The most bulk bytes this subflow may have in flight: the smallest cap found by probing
     /// that keeps the delivery rate, between two frames and half the window. See SPEC.md
     /// letify-link, Session item 7.
@@ -334,7 +339,7 @@ impl Sub {
         let best = self.rates.iter().copied().fold(0.0, f64::max);
         let rtt = self.min_rtt.map_or(RTT_FLOOR, |(r, _)| r).max(RTT_FLOOR);
         let bound = (CAP_BOUND * best * rtt.as_secs_f64()) as usize;
-        let top = (self.window / 2).max(QUANTUM);
+        let top = self.cap_ceiling();
         // The rate samples of startup lag the cap by a round trip, so the 8 x B x R bound
         // would hold the cap at the size of the first, nearly empty, samples. Startup is held
         // to a few times what the best sample delivered in one round trip instead.
@@ -356,9 +361,7 @@ impl Sub {
                 let stall = (best * rtt.as_secs_f64()) as usize;
                 let flight = stats.window.saturating_add(stall);
                 let allowed = (best * LOSS_DELAY.as_secs_f64()) as usize;
-                probed
-                    .max(flight.min(allowed))
-                    .min(self.window.max(QUANTUM))
+                probed.max(flight.min(allowed)).min(top)
             }
             _ => probed,
         }
@@ -415,7 +418,10 @@ impl Sub {
                 if self.cap_ref == 0.0 {
                     // Another subflow of the session already knows what a path delivers.
                     let rtt = self.srtt.unwrap_or_default().as_secs_f64();
-                    self.cap = self.cap.max((sibling_rate * rtt) as usize);
+                    self.cap = self
+                        .cap
+                        .max((sibling_rate * rtt) as usize)
+                        .min(self.cap_ceiling());
                 }
                 if rate > self.cap_ref * STARTUP_RESPONSE {
                     self.cap_ref = rate;
@@ -444,7 +450,10 @@ impl Sub {
                     // The rate answers a cap one sample late, so the sample after a doubling
                     // may show nothing yet and the cap doubles again. A second sample without
                     // growth holds the cap while the third one is awaited.
-                    self.cap = self.cap.saturating_mul(STARTUP_GROWTH);
+                    self.cap = self
+                        .cap
+                        .saturating_mul(STARTUP_GROWTH)
+                        .min(self.cap_ceiling());
                 }
             }
             CapMode::Grow => {
@@ -2190,7 +2199,7 @@ mod tests {
 
     fn sub(gauge: Option<Gauge>) -> Sub {
         Sub::new(
-            2 << 20,
+            4 << 20,
             gauge,
             SubShared {
                 sent: Arc::new(AtomicU64::new(0)),
@@ -2273,6 +2282,26 @@ mod tests {
     }
 
     #[test]
+    fn the_cap_of_a_subflow_recovering_from_loss_stays_within_half_the_subflow_window() {
+        let mut s = busy(Some(reading(8 << 20, 0)));
+        s.rates.push_back(40e6);
+        let now = Instant::now();
+        s.gauged = Some((
+            CongestionStats {
+                window: 8 << 20,
+                rtt: Duration::from_millis(50),
+                min_rtt: Duration::from_millis(50),
+                lost_packets: 9,
+                sent_packets: 1000,
+            },
+            now,
+        ));
+        s.loss_at = Some(now);
+        // 40 MB/s for 150 ms is 6 MB and cwnd + B x R is 10 MB, but the window is 4 MiB.
+        assert_eq!(s.bulk_cap(), 2 << 20);
+    }
+
+    #[test]
     fn a_path_that_loses_more_than_a_tenth_of_its_packets_keeps_the_probed_cap() {
         let mut s = busy(Some(reading(600 << 10, 0)));
         let now = Instant::now();
@@ -2311,25 +2340,6 @@ mod tests {
         counts.1.store(1000, Ordering::Relaxed);
         s.read_gauge(t0 + LOSS_SPAN);
         assert!((s.loss_ratio - 0.03).abs() < 1e-9, "{}", s.loss_ratio);
-    }
-
-    #[test]
-    fn the_cap_of_a_subflow_recovering_from_loss_stays_inside_the_subflow_window() {
-        let mut s = busy(Some(reading(8 << 20, 0)));
-        // 20 MB/s for 150 ms is 3 MB, more than the 2 MiB window.
-        s.rates.push_back(20e6);
-        s.gauged = Some((
-            CongestionStats {
-                window: 8 << 20,
-                rtt: Duration::from_millis(50),
-                min_rtt: Duration::from_millis(50),
-                lost_packets: 9,
-                sent_packets: 0,
-            },
-            Instant::now(),
-        ));
-        s.loss_at = Some(Instant::now());
-        assert_eq!(s.bulk_cap(), 2 << 20);
     }
 
     #[test]
@@ -2393,6 +2403,25 @@ mod tests {
     }
 
     #[test]
+    fn startup_never_raises_the_cap_above_half_the_subflow_window() {
+        let mut s = sub(None);
+        for n in 0..12 {
+            judged(&mut s, 1e6 * (1u64 << n) as f64);
+            assert!(s.cap <= s.window / 2, "cap {} after sample {n}", s.cap);
+        }
+    }
+
+    #[test]
+    fn a_cap_settled_after_startup_is_a_size_the_subflow_can_use_so_shrinking_acts_on_it() {
+        let mut s = sub(None);
+        for rate in [4e6, 8e6, 16e6, 20e6, 20e6, 20e6, 20e6, 20e6] {
+            judged(&mut s, rate);
+        }
+        assert!(matches!(s.cap_mode, CapMode::Hold(_)));
+        assert!(s.cap <= s.window / 2);
+    }
+
+    #[test]
     fn startup_does_not_judge_a_sample_in_which_no_bulk_frame_waited() {
         let mut s = sub(None);
         s.srtt = Some(Duration::from_millis(180));
@@ -2442,7 +2471,7 @@ mod tests {
         let mut s = sub(None);
         s.srtt = Some(Duration::from_millis(200));
         s.capped = true;
-        s.adjust_cap(1e6, 10e6);
-        assert_eq!(s.cap, 2 * 2_000_000);
+        s.adjust_cap(1e6, 4e6);
+        assert_eq!(s.cap, 2 * 800_000);
     }
 }
