@@ -21,6 +21,8 @@ pub const MAX_MESSAGE: usize = 4096;
 pub const DEFAULT_LEAD: Duration = Duration::from_secs(10);
 /// How long a punch keeps trying after its start.
 pub const DEFAULT_WINDOW: Duration = Duration::from_secs(150);
+/// The longest relay address a [`Message::RelayOffer`] carries, in bytes.
+pub const MAX_RELAY_ADDRESS: usize = 255;
 
 /// A channel for small messages between nodes. Delivery may be delayed by seconds and need not
 /// be ordered, but a message arrives whole or not at all.
@@ -61,6 +63,25 @@ pub enum Message {
     PunchOfferExt(Punch, PunchExt),
     /// A [`Message::PunchAnswer`] that also carries the sender's NAT type and policing flag.
     PunchAnswerExt(Punch, PunchExt),
+    /// "Meet me at this relay under this token": the sender will call
+    /// `RelayDialer::connect` for the receiver with `token`. This is not a punch. A
+    /// [`Message::PunchOffer`] with no mappings is a punch with no sockets and never a relay
+    /// request.
+    RelayOffer {
+        /// The pairing token both sides give the relay.
+        token: [u8; 16],
+        /// The node id of the relay.
+        relay: NodeId,
+        /// The relay address, `host:port`, 1 to 255 bytes.
+        address: String,
+    },
+    /// The answer to a [`Message::RelayOffer`]: whether the sender will connect to the relay.
+    RelayAnswer {
+        /// The token of the offer.
+        token: [u8; 16],
+        /// True when the sender connects, false when it declines.
+        accepted: bool,
+    },
 }
 
 /// What a sidecar adds to a punch message: how its NAT maps ports, and whether a policing
@@ -95,6 +116,8 @@ const K_OFFER: u8 = 3;
 const K_ANSWER: u8 = 4;
 const K_OFFER_EXT: u8 = 5;
 const K_ANSWER_EXT: u8 = 6;
+const K_RELAY_OFFER: u8 = 7;
+const K_RELAY_ANSWER: u8 = 8;
 
 impl Message {
     /// Encode as one kind byte followed by the fields.
@@ -116,6 +139,25 @@ impl Message {
             Message::PunchAnswerExt(p, e) => {
                 let mut out = p.encode(K_ANSWER_EXT);
                 e.encode_into(&mut out);
+                out
+            }
+            Message::RelayOffer {
+                token,
+                relay,
+                address,
+            } => {
+                let address = &address.as_bytes()[..address.len().min(MAX_RELAY_ADDRESS)];
+                let mut out = vec![K_RELAY_OFFER];
+                out.extend(token);
+                out.extend(relay.as_bytes());
+                out.push(address.len() as u8);
+                out.extend(address);
+                out
+            }
+            Message::RelayAnswer { token, accepted } => {
+                let mut out = vec![K_RELAY_ANSWER];
+                out.extend(token);
+                out.push(u8::from(*accepted));
                 out
             }
         }
@@ -154,6 +196,25 @@ impl Message {
                     Message::PunchAnswerExt(punch, ext)
                 })
             }
+            Some(&K_RELAY_OFFER) if data.len() >= 51 => {
+                let len = data[49] as usize;
+                let address = data
+                    .get(50..50 + len)
+                    .filter(|_| len > 0 && data.len() == 50 + len)
+                    .and_then(|a| std::str::from_utf8(a).ok())
+                    .ok_or_else(|| bad("bad relay address"))?;
+                let relay = NodeId::try_from_bytes(data[17..49].try_into().unwrap())
+                    .map_err(|_| bad("bad relay node id"))?;
+                Ok(Message::RelayOffer {
+                    token: data[1..17].try_into().unwrap(),
+                    relay,
+                    address: address.to_string(),
+                })
+            }
+            Some(&K_RELAY_ANSWER) if data.len() == 18 => Ok(Message::RelayAnswer {
+                token: data[1..17].try_into().unwrap(),
+                accepted: data[17] != 0,
+            }),
             _ => Err(bad("unknown or malformed message")),
         }
     }
@@ -253,6 +314,14 @@ impl Punch {
 
 /// Send one [`Message`] through a rendezvous.
 pub async fn send_message<R: Rendezvous>(r: &R, to: NodeId, msg: &Message) -> io::Result<()> {
+    if let Message::RelayOffer { address, .. } = msg
+        && !(1..=MAX_RELAY_ADDRESS).contains(&address.len())
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "rendezvous: relay address must be 1 to 255 bytes",
+        ));
+    }
     let bytes = msg.encode();
     if bytes.len() > MAX_MESSAGE {
         return Err(io::Error::new(

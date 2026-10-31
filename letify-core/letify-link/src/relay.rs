@@ -25,10 +25,12 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Notify, Semaphore};
 use tokio::time::Instant;
 
+use crate::acceptor::{Accepted, Acceptor};
 use crate::config::Config;
 use crate::handshake;
 use crate::identity::{Identity, NodeId, PeerPolicy};
 use crate::paths::Candidate;
+use crate::rendezvous::{Message, Rendezvous, recv_message, send_message};
 
 /// Length of the pairing token.
 pub const TOKEN_LEN: usize = 16;
@@ -637,5 +639,113 @@ impl RelayDialer {
             async move { dialer.connect(peer, token).await }
         })
         .with_kind(crate::PathKind::Relay)
+    }
+}
+
+/// Decides whether to use the relay that an offer names: the sender, the relay node id and
+/// the relay address.
+type Trust = Arc<dyn Fn(&NodeId, &NodeId, &str) -> bool + Send + Sync>;
+
+/// The answering side of a [`Message::RelayOffer`](crate::rendezvous::Message::RelayOffer):
+/// it dials the relay the offer names, is paired with the sender and hands the transport to an
+/// [`Acceptor`]. SPEC.md letify-link, Relay item 15.
+pub struct RelayPairing<R> {
+    rendezvous: Arc<R>,
+    identity: Identity,
+    acceptor: Arc<Acceptor>,
+    trust: Trust,
+    pair_wait: Duration,
+}
+
+impl<R> Clone for RelayPairing<R> {
+    fn clone(&self) -> Self {
+        RelayPairing {
+            rendezvous: self.rendezvous.clone(),
+            identity: self.identity.clone(),
+            acceptor: self.acceptor.clone(),
+            trust: self.trust.clone(),
+            pair_wait: self.pair_wait,
+        }
+    }
+}
+
+impl<R: Rendezvous + 'static> RelayPairing<R> {
+    /// `trust(sender, relay, address)` decides whether to dial that relay for that sender. An
+    /// offer names an address, so a `trust` that returns true for everything lets any
+    /// rendezvous sender make this node connect to any address.
+    pub fn new(
+        rendezvous: Arc<R>,
+        identity: Identity,
+        acceptor: Arc<Acceptor>,
+        trust: impl Fn(&NodeId, &NodeId, &str) -> bool + Send + Sync + 'static,
+    ) -> Self {
+        RelayPairing {
+            rendezvous,
+            identity,
+            acceptor,
+            trust: Arc::new(trust),
+            pair_wait: Duration::from_secs(35),
+        }
+    }
+
+    /// How long to wait at the relay for the offerer. Default 35 s, as [`RelayDialer`].
+    pub fn pair_wait(mut self, wait: Duration) -> Self {
+        self.pair_wait = wait;
+        self
+    }
+
+    /// Serve one offer. Declines with a `RelayAnswer` and returns `Ok(None)` when `trust`
+    /// says no; otherwise answers, pairs at the relay and returns what the acceptor made of
+    /// the transport.
+    pub async fn handle(
+        &self,
+        from: NodeId,
+        token: [u8; TOKEN_LEN],
+        relay: NodeId,
+        address: &str,
+    ) -> io::Result<Option<Accepted>> {
+        let accepted = (self.trust)(&from, &relay, address);
+        let answer = Message::RelayAnswer { token, accepted };
+        send_message(&*self.rendezvous, from, &answer).await?;
+        if !accepted {
+            return Ok(None);
+        }
+        let tcp = RelayDialer::new(address, relay, self.identity.clone())
+            .pair_wait(self.pair_wait)
+            .connect(from, token)
+            .await?;
+        let accepted = self.acceptor.accept(tcp).await.map_err(io::Error::from)?;
+        Ok(Some(accepted))
+    }
+
+    /// Receive from the rendezvous until it fails, serve every `RelayOffer` on its own task
+    /// and call `on_accepted(sender, accepted)` for each pairing that yields a transport. Other
+    /// messages and undecodable ones are ignored, so use this on a rendezvous that carries
+    /// only relay messages, or call [`RelayPairing::handle`] from your own loop.
+    pub async fn run(
+        &self,
+        on_accepted: impl Fn(NodeId, Accepted) + Send + Sync + 'static,
+    ) -> io::Result<()> {
+        let on_accepted = Arc::new(on_accepted);
+        loop {
+            let (from, msg) = match recv_message(&*self.rendezvous).await {
+                Ok(got) => got,
+                Err(e) if e.kind() == io::ErrorKind::InvalidData => continue,
+                Err(e) => return Err(e),
+            };
+            if let Message::RelayOffer {
+                token,
+                relay,
+                address,
+            } = msg
+            {
+                let (this, on_accepted) = (self.clone(), on_accepted.clone());
+                tokio::spawn(async move {
+                    if let Ok(Some(accepted)) = this.handle(from, token, relay, &address).await {
+                        on_accepted(from, accepted);
+                    }
+                });
+            }
+        }
     }
 }

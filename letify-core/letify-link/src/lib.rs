@@ -112,6 +112,8 @@
 //! `io::Error` that wraps [`Error::ConnectionLost`]. Recover it with [`Error::from_io`]. It is
 //! an infrastructure failure and never an application error.
 
+#![deny(unnameable_types)]
+
 mod acceptor;
 mod config;
 mod error;
@@ -142,7 +144,8 @@ pub use config::{Config, PROTOCOL_VERSION, PowerState};
 pub use error::{Error, Result};
 pub use identity::{Identity, NodeId, PeerPolicy};
 pub use paths::{
-    BoxTransport, Candidate, ManagerConfig, PathEvent, PathKind, PathManager, ProbePolicy,
+    BoxTransport, Candidate, ManagerConfig, PathEvent, PathKind, PathKinds, PathManager,
+    ProbePolicy,
 };
 pub use replay::REPLAY_WINDOW;
 pub use session::{
