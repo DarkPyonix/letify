@@ -2242,10 +2242,10 @@ class FakeSignalService:
             def log_message(self, *args: Any) -> None:
                 pass
 
-            def do_GET(self) -> None:  # noqa: N802
+            def do_GET(self) -> None:
                 service._serve(self, "GET")
 
-            def do_POST(self) -> None:  # noqa: N802
+            def do_POST(self) -> None:
                 service._serve(self, "POST")
 
         self._server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
