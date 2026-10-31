@@ -308,3 +308,18 @@ async fn an_initiator_watch_composes_with_an_acceptor_on_the_same_policy() {
     assert!(until(2, || dialed.is_closed()).await);
     assert_eq!(dialed.close_reason().as_deref(), Some("revoked"));
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_revoke_ends_a_pending_accept_on_the_initiator_side() {
+    let policy = PeerPolicy::from_fn(|_| true);
+    let (_a, b, ia, _rb) = initiator_pair(&policy).await;
+    let ia = Arc::new(ia);
+    let waiting = ia.clone();
+    let accept = tokio::spawn(async move { waiting.accept_stream().await.map(|_| ()) });
+    sleep(Duration::from_millis(100)).await;
+    policy.revoke(b.node_id());
+    let ended = timeout(Duration::from_secs(3), accept)
+        .await
+        .expect("accept still pending after the revoke");
+    assert!(matches!(ended.unwrap(), Err(Error::Closed)));
+}

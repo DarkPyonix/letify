@@ -224,3 +224,56 @@ async fn the_unacknowledged_buffer_is_bounded_in_bytes() {
     writer.await.unwrap();
     assert!(all == data);
 }
+
+/// A waiter that a local close must end returns within this long, or the test fails.
+const PROMPT: Duration = Duration::from_secs(3);
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_local_close_ends_a_pending_accept_on_the_same_side() {
+    let (a, _b) = session_pair(Config::default()).await;
+    let a = std::sync::Arc::new(a);
+    let waiting = a.clone();
+    let accept = tokio::spawn(async move { waiting.accept_stream().await.map(|_| ()) });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    a.close().await;
+    let ended = timeout(PROMPT, accept).await.expect("accept still pending after close");
+    assert!(matches!(ended.unwrap(), Err(letify_link::Error::Closed)));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn accept_after_a_local_close_returns_closed() {
+    let (a, _b) = session_pair(Config::default()).await;
+    a.close().await;
+    let ended = timeout(PROMPT, a.accept_stream()).await.expect("accept pending");
+    assert!(matches!(ended, Err(letify_link::Error::Closed)));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_local_close_ends_a_pending_read_on_an_open_stream() {
+    let (a, b) = session_pair(Config::default()).await;
+    let mut s = a.open_stream().await.unwrap();
+    s.write_all(b"x").await.unwrap();
+    let _sb = b.accept_stream().await.unwrap();
+    let reader = tokio::spawn(async move {
+        let mut buf = [0u8; 8];
+        s.read(&mut buf).await
+    });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    a.close().await;
+    let ended = timeout(PROMPT, reader).await.expect("read still pending after close");
+    assert_eq!(ended.unwrap().unwrap(), 0);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_local_close_ends_a_write_that_waits_for_window() {
+    let (a, b) = session_pair(Config::default()).await;
+    let mut s = a.open_stream().await.unwrap();
+    s.write_all(b"x").await.unwrap();
+    let _sb = b.accept_stream().await.unwrap();
+    // The peer never reads, so this write stalls on the stream window.
+    let writer = tokio::spawn(async move { s.write_all(&vec![0u8; 256 << 20]).await });
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    a.close().await;
+    let ended = timeout(PROMPT, writer).await.expect("write still pending after close");
+    assert!(ended.unwrap().is_err());
+}
