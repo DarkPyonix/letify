@@ -145,6 +145,11 @@ pub struct ManagerConfig {
     pub dial_timeout: Duration,
     /// Time limit for the first handshake over any candidate. Default 60 s.
     pub start_timeout: Duration,
+    /// How long the oldest running start handshake is given before the next ready candidate
+    /// also starts one, so a candidate that never answers delays the others by this and not
+    /// by `Config::handshake_timeout`. A handshake still running when another one wins is
+    /// cancelled and its candidate dials again. Default 1 s.
+    pub handshake_stagger: Duration,
     /// The switching rules.
     pub policy: Policy,
     /// Unread `Measured` events kept for a caller that reads slowly; later ones are dropped.
@@ -209,6 +214,7 @@ impl Default for ManagerConfig {
             redial_max: Duration::from_secs(10),
             dial_timeout: Duration::from_secs(10),
             start_timeout: Duration::from_secs(60),
+            handshake_stagger: Duration::from_secs(1),
             policy: Policy::default(),
             event_capacity: 256,
             floor: None,
@@ -394,35 +400,78 @@ impl PathManager {
             spawn_dialer(i, &mut dialers);
         }
 
+        // The first transport that is ready handshakes at once. A transport that is ready
+        // while a handshake runs waits in `queue`, and starts its own handshake when the
+        // oldest running one has taken `handshake_stagger`, so a candidate that accepts the
+        // connection and never answers delays the others by one stagger and not by the
+        // handshake timeout. A running handshake is a session attempt that the responder has
+        // seen, so a second one is started only after that wait.
         let deadline = Instant::now() + cfg.start_timeout;
-        let mut consumed: HashSet<usize> = HashSet::new();
         let mut refused: HashSet<usize> = HashSet::new();
+        let (done_tx, mut done_rx) = mpsc::unbounded_channel::<(usize, Result<Session>)>();
+        let mut handshakes: Vec<Option<AbortHandle>> = (0..n).map(|_| None).collect();
+        let mut running = 0usize;
+        let mut queue: VecDeque<(usize, BoxTransport)> = VecDeque::new();
+        let mut next_launch = Instant::now();
         let (session, winner) = loop {
-            let got = tokio::time::timeout_at(deadline, ready_rx.recv()).await;
-            let Ok(Some((i, transport))) = got else {
-                dialers.iter().flatten().for_each(AbortHandle::abort);
-                return Err(Error::Handshake(
-                    "no candidate completed the handshake in time".into(),
-                ));
+            let launch_due = (!queue.is_empty()).then_some(if running == 0 {
+                Instant::now()
+            } else {
+                next_launch
+            });
+            enum Step {
+                Ready(Option<(usize, BoxTransport)>),
+                Done(Option<(usize, Result<Session>)>),
+                Launch,
+                Timeout,
+            }
+            let step = tokio::select! {
+                got = ready_rx.recv() => Step::Ready(got),
+                got = done_rx.recv() => Step::Done(got),
+                _ = tokio::time::sleep_until(launch_due.unwrap_or(deadline)), if launch_due.is_some() => Step::Launch,
+                _ = tokio::time::sleep_until(deadline) => Step::Timeout,
             };
-            consumed.insert(i);
-            match Session::connect(transport, &identity, remote, link.clone()).await {
-                Ok(s) => break (s, i),
-                Err(e) => {
+            match step {
+                Step::Ready(Some(item)) => queue.push_back(item),
+                Step::Launch => {
+                    let (i, transport) = queue.pop_front().expect("a launch is due");
+                    let (identity, link, done_tx) =
+                        (identity.clone(), link.clone(), done_tx.clone());
+                    let h = tokio::spawn(async move {
+                        let r = Session::connect(transport, &identity, remote, link).await;
+                        let _ = done_tx.send((i, r));
+                    });
+                    handshakes[i] = Some(h.abort_handle());
+                    running += 1;
+                    next_launch = Instant::now() + cfg.handshake_stagger;
+                }
+                Step::Done(Some((i, Ok(s)))) => break (s, i),
+                Step::Done(Some((i, Err(e)))) => {
+                    running -= 1;
                     // A version refusal is plaintext, so a forger on one path can send it.
                     // It fails this candidate only, and is reported when all of them got one.
                     if let Error::VersionMismatch { .. } = e {
                         refused.insert(i);
                         if refused.len() == n {
                             dialers.iter().flatten().for_each(AbortHandle::abort);
+                            handshakes.iter().flatten().for_each(AbortHandle::abort);
                             return Err(e);
                         }
                     }
-                    consumed.remove(&i);
                     spawn_dialer(i, &mut dialers);
+                }
+                Step::Ready(None) | Step::Done(None) | Step::Timeout => {
+                    dialers.iter().flatten().for_each(AbortHandle::abort);
+                    handshakes.iter().flatten().for_each(AbortHandle::abort);
+                    return Err(Error::Handshake(
+                        "no candidate completed the handshake in time".into(),
+                    ));
                 }
             }
         };
+        // Handshakes still running are cancelled and their transports closed. Their candidates
+        // dial again below and join the session.
+        handshakes.iter().flatten().for_each(AbortHandle::abort);
         dialers.iter().flatten().for_each(AbortHandle::abort);
 
         let mut begin: Vec<Begin> = (0..n).map(|_| Begin::Dial).collect();
@@ -432,7 +481,11 @@ impl PathManager {
             .map(|s| s.id)
             .ok_or_else(|| Error::ConnectionLost("the first subflow is already gone".into()))?;
         begin[winner] = Begin::Attached(first);
-        while let Ok((i, t)) = ready_rx.try_recv() {
+        // Transports that waited for their turn, and those that arrived since, are joined.
+        while let Ok(item) = ready_rx.try_recv() {
+            queue.push_back(item);
+        }
+        for (i, t) in queue {
             if i != winner {
                 begin[i] = Begin::Transport(t);
             }
