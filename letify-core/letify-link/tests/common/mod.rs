@@ -474,7 +474,12 @@ async fn pump(
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<(tokio::time::Instant, Vec<u8>)>();
     let writer = tokio::spawn(async move {
         while let Some((at, bytes)) = rx.recv().await {
-            tokio::time::sleep_until(at).await;
+            // A chunk that is already due is written at once. Waiting on a timer for it would
+            // cost a tick of the OS timer, 15.6 ms on Windows, in each direction of a path
+            // that has no delay, and show up as latency that the session does not cause.
+            if at > tokio::time::Instant::now() {
+                tokio::time::sleep_until(at).await;
+            }
             if to.write_all(&bytes).await.is_err() {
                 return;
             }
@@ -511,7 +516,9 @@ async fn pump(
         if let Some(rate) = rate {
             sent += n as f64;
             let due = start + std::time::Duration::from_secs_f64(sent / rate);
-            tokio::time::sleep_until(due).await;
+            if due > tokio::time::Instant::now() {
+                tokio::time::sleep_until(due).await;
+            }
         }
     }
     drop(tx);

@@ -29,6 +29,12 @@ async fn five_slow_paths() -> (Session, Session, Vec<Throttle>) {
     delayed_session(&[PER_FLOW; SUBFLOWS], ONE_WAY, cfg(), cfg()).await
 }
 
+/// The same five paths without any delay: the cap needs no time to open there, so what this
+/// gives is what the machine, the proxies and the debug build of the session can carry.
+async fn five_paths_without_delay() -> (Session, Session, Vec<Throttle>) {
+    delayed_session(&[PER_FLOW; SUBFLOWS], Duration::ZERO, cfg(), cfg()).await
+}
+
 /// Writes a bulk stream until `stop`, and counts the bytes the peer reads in `count`.
 async fn bulk_and_count(a: &Session, b: Session, stop: Arc<AtomicBool>, count: Arc<AtomicU64>) {
     tokio::spawn(async move {
@@ -71,8 +77,12 @@ async fn bulk_and_count(a: &Session, b: Session, stop: Arc<AtomicBool>, count: A
 }
 
 /// Cumulative MiB delivered at 1, 1.5, 2 and `secs` seconds after the stream starts.
-async fn startup_marks(secs: u64) -> Vec<(f64, f64)> {
-    let (a, b, _p) = five_slow_paths().await;
+async fn startup_marks(secs: u64, delayed: bool) -> Vec<(f64, f64)> {
+    let (a, b, _p) = if delayed {
+        five_slow_paths().await
+    } else {
+        five_paths_without_delay().await
+    };
     let count = Arc::new(AtomicU64::new(0));
     let stop = Arc::new(AtomicBool::new(false));
     let t0 = Instant::now();
@@ -88,8 +98,14 @@ async fn startup_marks(secs: u64) -> Vec<(f64, f64)> {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_bulk_stream_over_five_long_round_trip_subflows_fills_them_within_two_seconds() {
-    let m = startup_marks(10).await;
-    let full = SUBFLOWS as f64 * PER_FLOW / MIB;
+    // What this machine carries over the same paths without delay, measured first and in this
+    // run. A shared runner with 3 vCPUs gave 21 to 26 MiB/s here where a developer machine
+    // gives 42, because the 10 proxy pumps and the debug build of the session compete for
+    // CPU, and the check would then measure the runner and not the cap.
+    let reference = startup_marks(2, false).await;
+    let ceiling = ((reference[1].1 - reference[0].1) / 0.5).min(SUBFLOWS as f64 * PER_FLOW / MIB);
+    let m = startup_marks(10, true).await;
+    let full = ceiling;
     let first = m[0].1;
     let late = (m[1].1 - m[0].1) / 0.5;
     let mean2 = m[2].1 / 2.0;

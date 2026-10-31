@@ -50,17 +50,40 @@ async fn measure(label: &str, rates: &[f64], total: usize) -> f64 {
     let got = transfer(&a, &b, total).await;
     let sum: f64 = rates.iter().sum::<f64>() / MIB;
     eprintln!("{label}: {got:.1} MiB/s of {sum:.1} MiB/s (sum of the subflows)");
-    got / sum
+    got
 }
 
+/// The median of three runs, so one run that lost its CPU to another process does not decide.
+async fn median_of_three(label: &str, rates: &[f64], total: usize) -> f64 {
+    let mut runs = [
+        measure(label, rates, total).await,
+        measure(label, rates, total).await,
+        measure(label, rates, total).await,
+    ];
+    runs.sort_by(|x, y| x.total_cmp(y));
+    runs[1]
+}
+
+/// The claim is that a slow subflow does not drag the session down to its own speed. The
+/// absolute rate is a property of the machine: the throttle proxies and the debug build of
+/// the session share the runner's few CPUs, and a loaded runner gave 33 to 57 of 62 MiB/s.
+/// So the check compares the three fast subflows with and without the slow one, measured in
+/// this run on this machine, and requires the slow one to cost at most 20%. The transfer is
+/// 160 MiB, about 2.5 s, because the last frames sent on the slow subflow arrive late and a
+/// 64 MiB transfer of 1 s counted that tail as 17% on macOS.
 #[tokio::test(flavor = "multi_thread")]
 async fn aggregate_throughput_is_close_to_the_sum_of_the_subflows_not_the_slowest() {
-    let rates = [2.0 * MIB, 20.0 * MIB, 20.0 * MIB, 20.0 * MIB];
-    let share = measure("3 fast + 1 slow", &rates, 64).await;
+    let fast = [20.0 * MIB; 3];
+    let mixed = [2.0 * MIB, 20.0 * MIB, 20.0 * MIB, 20.0 * MIB];
+    let without = median_of_three("3 fast", &fast, 160).await;
+    let with = median_of_three("3 fast + 1 slow", &mixed, 160).await;
+    eprintln!(
+        "with the slow subflow {:.0}% of without it",
+        with / without * 100.0
+    );
     assert!(
-        share >= 0.7,
-        "aggregate is {:.0}% of the sum",
-        share * 100.0
+        with >= 0.8 * without,
+        "3 fast + 1 slow gave {with:.1} MiB/s against {without:.1} MiB/s for the 3 fast alone"
     );
 }
 
