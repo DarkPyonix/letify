@@ -51,6 +51,10 @@ pub struct Config {
     pub background_keepalive_interval: Duration,
     /// Time limit for a handshake or for adding a subflow. Default 30 s.
     pub handshake_timeout: Duration,
+    /// How many incoming transports an [`crate::Acceptor`] reads at one time before it has
+    /// routed them or returned their sessions. A transport over the cap is closed at once.
+    /// Default 64.
+    pub max_half_open: usize,
     /// This side moves its sending keys to the next epoch after sealing this many records in
     /// one epoch. Zero turns the count limit off. Default 2^32.
     pub rekey_after_records: u64,
@@ -102,6 +106,7 @@ impl Default for Config {
             keepalive_interval: Duration::from_secs(15),
             background_keepalive_interval: Duration::from_secs(120),
             handshake_timeout: Duration::from_secs(30),
+            max_half_open: 64,
             rekey_after_records: 1 << 32,
             rekey_after: Duration::from_secs(24 * 3600),
         }
