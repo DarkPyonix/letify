@@ -767,3 +767,43 @@ def test_a_stream_with_a_bad_first_line_is_closed() -> None:
         assert far.recv(10) == b""
         thread.join(10)
         far.close()
+
+
+# -- The path set settles before the probe (spec "Sidecar interface" item 8) ----------------
+
+
+class EventSession:
+    def __init__(self) -> None:
+        import queue
+
+        self.events: queue.Queue[dict[str, Any]] = queue.Queue()
+
+
+def test_the_probe_waits_until_every_candidate_has_joined() -> None:
+    session = EventSession()
+    session.events.put({"event": "path_added", "name": "punch0"})
+    late = threading.Timer(0.3, lambda: session.events.put({"event": "path_added", "name": "p1"}))
+    late.start()
+    began = time.monotonic()
+    names = linkchannel.settle_paths(session, ["punch0", "p1"], 5.0)  # type: ignore[arg-type]
+    assert names == ["punch0", "p1"]
+    assert time.monotonic() - began >= 0.25
+
+
+def test_a_candidate_that_was_lost_does_not_hold_the_probe() -> None:
+    session = EventSession()
+    session.events.put({"event": "path_added", "name": "punch0"})
+    session.events.put({"event": "path_lost", "name": "punch1", "reason": "the subflow died"})
+    began = time.monotonic()
+    names = linkchannel.settle_paths(session, ["punch0", "punch1"], 5.0)  # type: ignore[arg-type]
+    assert names == ["punch0"]
+    assert time.monotonic() - began < 1.0
+
+
+def test_the_wait_for_the_path_set_ends_at_its_bound() -> None:
+    session = EventSession()
+    session.events.put({"event": "path_added", "name": "punch0"})
+    began = time.monotonic()
+    names = linkchannel.settle_paths(session, ["punch0", "punch1"], 0.3)  # type: ignore[arg-type]
+    assert names == ["punch0"]
+    assert 0.25 <= time.monotonic() - began < 2.0
