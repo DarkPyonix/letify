@@ -11,7 +11,7 @@
 //! subflow that stays below the caller's floor while another is above it, and reports path
 //! events without loss for the lifecycle kinds.
 
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::future::Future;
 use std::io;
 use std::net::SocketAddr;
@@ -954,6 +954,19 @@ async fn measure_loop(
                 if kinds[i] == PathKind::Relay {
                     views[i].alive = false;
                 }
+            }
+        }
+        // Kinds compete by their sum: a move to another kind closes every subflow of the old
+        // kind, so a path is judged by what its whole kind carries, not by one subflow.
+        let mut kind_sum: HashMap<PathKind, f64> = HashMap::new();
+        for (i, view) in views.iter().enumerate() {
+            if view.alive {
+                *kind_sum.entry(kinds[i]).or_default() += view.rate;
+            }
+        }
+        for (i, view) in views.iter_mut().enumerate() {
+            if view.alive {
+                view.rate = kind_sum[&kinds[i]];
             }
         }
         let before = selector.current();
