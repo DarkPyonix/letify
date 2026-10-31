@@ -4,9 +4,9 @@ Owns starting the remote ``letify-link`` sidecar, listening for the one local no
 rendezvous messages as JSON lines on standard input and output until the hand-over, and
 serving each stream the local side opens: a new worker process, the relay to a running
 worker's second door, the tail of a worker's standard error, the probe endpoint, or one
-helper command with bounded time and output, as the first line of the stream says. It does not own the local side
-(``linkchannel.py``), the worker program and the relay program (both are passed in) or any path decision. Spec "Sidecar
-interface" item 7.
+helper command with bounded time and output, as the first line of the stream says. It does
+not own the local side (``linkchannel.py``), the worker program and the relay program (both
+are passed in) or any path decision. Spec "Sidecar interface" item 7.
 This file is sent to the machine as the argument of ``python -c``, so it imports nothing from
 letify and avoids syntax newer than Python 3.6.
 """
