@@ -17,10 +17,12 @@ import queue
 import secrets
 import shlex
 import socket
+import struct
 import subprocess
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol
 
@@ -64,6 +66,10 @@ RESUME_S = int(GRACE)
 STDERR_LINES = 40
 #: Seconds to wait for the shim to answer a request for a worker's standard error.
 STDERR_WAIT_S = 5.0
+#: The default bound on the output of an exec stream, and the seconds the local side waits
+#: beyond the command's timeout for the end frame.
+EXEC_OUTPUT = 4 * 1024 * 1024
+EXEC_SLACK_S = 15.0
 
 
 def shim_path() -> Path:
@@ -215,6 +221,27 @@ class PlainSshLink:
         return None
 
 
+@dataclass(frozen=True)
+class ExecResult:
+    """What one exec stream returned. Spec "Sidecar interface" item 7, the exec stream."""
+
+    status: int
+    stdout: str
+    stderr: str
+    timed_out: bool = False
+    truncated: bool = False
+
+
+def _read_exact(sock: socket.socket, size: int) -> bytes:
+    data = bytearray()
+    while len(data) < size:
+        part = sock.recv(size - len(data))
+        if not part:
+            raise EOFError("the stream closed")
+        data += part
+    return bytes(data)
+
+
 class LinkRemote:
     """One connected machine: the local sidecar, the session, and the ssh command that ended."""
 
@@ -257,6 +284,63 @@ class LinkRemote:
             raise RuntimeFailure(
                 f"{self.alias}: cannot open a letify-link stream: {error}"
             ) from error
+
+    def exec(
+        self,
+        argv: Sequence[str],
+        timeout: float = 120.0,
+        *,
+        max_output: int = EXEC_OUTPUT,
+    ) -> ExecResult:
+        """Run one command on the machine over an ``exec`` stream, with no shell.
+
+        The shim kills the command at ``timeout`` seconds or at ``max_output`` bytes of
+        output and says which in the result. Spec "Sidecar interface" item 7.
+        """
+        body = json.dumps(list(argv)).encode()
+        sock = self.open_stream("interactive")
+        out: list[bytes] = []
+        err: list[bytes] = []
+        try:
+            sock.settimeout(timeout + EXEC_SLACK_S)
+            sock.sendall(
+                stream_header(
+                    "exec",
+                    secrets.token_hex(8),
+                    argv_bytes=len(body),
+                    timeout_s=timeout,
+                    max_output=max_output,
+                )
+                + body
+            )
+            while True:
+                tag = _read_exact(sock, 1)
+                data = _read_exact(sock, struct.unpack(">I", _read_exact(sock, 4))[0])
+                if tag == b"o":
+                    out.append(data)
+                elif tag == b"e":
+                    err.append(data)
+                elif tag == b"x":
+                    end = json.loads(data)
+                    break
+                else:
+                    raise ValueError(f"unknown exec frame {tag!r}")
+        except (OSError, EOFError, ValueError) as error:
+            raise RuntimeFailure(
+                f"{self.alias}: the exec stream for `{argv[0] if argv else ''}` ended with no "
+                f"result: {error}",
+                command=" ".join(argv),
+            ) from error
+        finally:
+            with contextlib.suppress(OSError):
+                sock.close()
+        return ExecResult(
+            status=int(end["status"]),
+            stdout=b"".join(out).decode("utf-8", "replace"),
+            stderr=b"".join(err).decode("utf-8", "replace"),
+            timed_out=bool(end.get("timed_out")),
+            truncated=bool(end.get("truncated")),
+        )
 
     def _paths(self) -> list[dict[str, Any]]:
         try:
@@ -1099,6 +1183,7 @@ class LinkChannel(FramedChannel):
 __all__ = [
     "SETTLE_S",
     "Bootstrap",
+    "ExecResult",
     "LinkChannel",
     "LinkRemote",
     "PlainSshLink",

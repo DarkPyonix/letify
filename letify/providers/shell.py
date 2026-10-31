@@ -411,13 +411,8 @@ class Shell(Provider):
         if declared:
             return {name: Instance(self, gpu=name) for name in declared}
 
-        result = subprocess.run(
-            self.link().ssh_command(
-                "nvidia-smi --query-gpu=name,memory.total --format=csv,noheader"
-            ),
-            capture_output=True,
-            text=True,
-            timeout=120,
+        result = self._run_helper(
+            ["nvidia-smi", "--query-gpu=name,memory.total", "--format=csv,noheader"], 120
         )
         if result.returncode != 0:
             raise ProviderUnavailable(
@@ -454,25 +449,54 @@ class Shell(Provider):
 
     def _remote_runner(self, failure: str) -> Callable[[tuple[str, ...]], str]:
         """Run one command on the machine over its link, raising ``failure`` when it cannot."""
-        link = self.link()
 
         def run(command: tuple[str, ...]) -> str:
-            remote = shlex.join(command)
-            result = subprocess.run(
-                link.ssh_command(self.remote_command(remote)),
-                capture_output=True,
-                text=True,
-                timeout=120,
-            )
+            result = self._run_helper(list(command), 120)
             if result.returncode != 0:
                 raise RuntimeFailure(
                     f"{self.alias}: {failure}",
-                    command=remote,
+                    command=shlex.join(command),
                     stderr=result.stderr.strip(),
                 )
             return result.stdout
 
         return run
+
+    def link_exec_remote(self) -> Any:
+        """The live letify-link session to this machine, or None when there is none.
+
+        None on an account that keeps ssh, and on a link account before its session exists.
+        This asks and never connects: a helper command must not start a session.
+        """
+        if not self.uses_letify_link:
+            return None
+        remote = self.__dict__.get("_link_remotes", {}).get(self._link_key(None))
+        return remote if remote is not None and remote.alive else None
+
+    def _run_helper(self, argv: list[str], timeout: float) -> subprocess.CompletedProcess[str]:
+        """Run one helper command on the machine, as an ``exec`` stream when a session is live.
+
+        Spec "Sidecar interface" item 7, the exec stream. Without a live session the command
+        goes over the account's ssh link, as it always has.
+        """
+        remote = self.link_exec_remote()
+        if remote is not None:
+            bounded = min(float(timeout), 600.0)
+            done = remote.exec(argv, bounded)
+            if done.timed_out:
+                raise subprocess.TimeoutExpired(argv, bounded)
+            if done.truncated:
+                raise RuntimeFailure(
+                    f"{self.alias}: `{argv[0]}` wrote more output than a helper may",
+                    command=shlex.join(argv),
+                )
+            return subprocess.CompletedProcess(argv, done.status, done.stdout, done.stderr)
+        return subprocess.run(
+            self.link().ssh_command(self.remote_command(shlex.join(argv))),
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
 
     # -- the workers on this machine ----------------------------------------
 
@@ -481,14 +505,7 @@ class Shell(Provider):
 
     def _run_program(self, source: str, *args: str, timeout: float = 120) -> str:
         """Run one Python program on the machine over its link and return what it printed."""
-        link = self.link()
-        remote = f"{self.remote_python} -c {shlex.quote(source)} {shlex.join(args)}"
-        result = subprocess.run(
-            link.ssh_command(self.remote_command(remote)),
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-        )
+        result = self._run_helper([self.remote_python, "-c", source, *args], timeout)
         if result.returncode != 0:
             raise RuntimeFailure(
                 f"{self.alias}: the worker program exited {result.returncode}",

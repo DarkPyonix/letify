@@ -3,9 +3,9 @@
 Owns starting the remote ``letify-link`` sidecar, listening for the one local node, relaying
 rendezvous messages as JSON lines on standard input and output until the hand-over, and
 serving each stream the local side opens: a new worker process, the relay to a running
-worker's second door, the tail of a worker's standard error, or the probe endpoint, as the
-first line of the stream says. It does not own the local side (``linkchannel.py``), the worker
-program and the relay program (both are passed in) or any path decision. Spec "Sidecar
+worker's second door, the tail of a worker's standard error, the probe endpoint, or one
+helper command with bounded time and output, as the first line of the stream says. It does not own the local side
+(``linkchannel.py``), the worker program and the relay program (both are passed in) or any path decision. Spec "Sidecar
 interface" item 7.
 This file is sent to the machine as the argument of ``python -c``, so it imports nothing from
 letify and avoids syntax newer than Python 3.6.
@@ -158,8 +158,109 @@ class Control:
 
 LINES = 40
 HEADER_LIMIT = 4096
+#: Bounds of the exec stream. Spec "Sidecar interface" item 7.
+EXEC_ARGV_LIMIT = 1048576
+EXEC_TIMEOUT_LIMIT = 600
+EXEC_OUTPUT_LIMIT = 16777216
+EXEC_CHUNK = 65536
 HEADER_WAIT_S = 10.0
 TOKEN = re.compile(r"^[0-9a-f]{1,32}$")
+
+
+def exec_frame(sock, tag, data):
+    sock.sendall(tag + struct.pack(">I", len(data)) + data)
+
+
+def exec_limits(header):
+    """The (argv_bytes, timeout_s, max_output) of an exec header, or None when out of bounds."""
+    try:
+        size = int(header["argv_bytes"])
+        timeout = float(header["timeout_s"])
+        limit = int(header["max_output"])
+    except (KeyError, TypeError, ValueError):
+        return None
+    if not (1 <= size <= EXEC_ARGV_LIMIT and 1 <= timeout <= EXEC_TIMEOUT_LIMIT):
+        return None
+    if not 1 <= limit <= EXEC_OUTPUT_LIMIT:
+        return None
+    return size, timeout, limit
+
+
+def run_exec(sock, header):
+    """Serve one exec stream, and close it whatever happens."""
+    try:
+        serve_exec(sock, header)
+    except OSError:
+        pass
+    finally:
+        try:
+            sock.close()
+        except OSError:
+            pass
+
+
+def serve_exec(sock, header):
+    """Run the argv that follows an exec header, stream its output as frames, then the end."""
+    limits = exec_limits(header)
+    if limits is None:
+        return
+    size, timeout, limit = limits
+    try:
+        argv = json.loads(recv_exact(sock, size).decode("utf-8"))
+    except (EOFError, OSError, ValueError):
+        return
+    if not (isinstance(argv, list) and argv and all(isinstance(a, str) for a in argv)):
+        return
+    state = {"status": -1, "timed_out": False, "truncated": False}
+    lock = threading.Lock()
+    total = [0]
+    try:
+        proc = subprocess.Popen(
+            argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE
+        )
+    except OSError as error:
+        exec_frame(sock, b"e", str(error).encode("utf-8", "replace")[:EXEC_CHUNK])
+        exec_frame(sock, b"x", json.dumps(state).encode())
+        return
+
+    def pump(pipe, tag):
+        while True:
+            data = pipe.read1(EXEC_CHUNK) if hasattr(pipe, "read1") else pipe.read(EXEC_CHUNK)
+            if not data:
+                return
+            with lock:
+                room = limit - total[0]
+                if len(data) > room:
+                    data = data[: max(room, 0)]
+                    state["truncated"] = True
+                total[0] += len(data)
+                if data:
+                    exec_frame(sock, tag, data)
+                if state["truncated"]:
+                    proc.kill()
+                    return
+
+    readers = [
+        threading.Thread(target=pump, args=(proc.stdout, b"o"), daemon=True),
+        threading.Thread(target=pump, args=(proc.stderr, b"e"), daemon=True),
+    ]
+    try:
+        for reader in readers:
+            reader.start()
+        deadline = time.time() + timeout
+        while proc.poll() is None:
+            if time.time() > deadline:
+                state["timed_out"] = True
+                proc.kill()
+                break
+            time.sleep(0.02)
+        proc.wait()
+        for reader in readers:
+            reader.join(5)
+        state["status"] = proc.returncode
+        exec_frame(sock, b"x", json.dumps(state).encode())
+    except OSError:
+        proc.kill()
 
 
 class Shim:
@@ -300,6 +401,9 @@ class Shim:
             return
         elif kind == "probe":
             threading.Thread(target=serve_probe, args=(sock,), daemon=True).start()
+            return
+        elif kind == "exec":
+            threading.Thread(target=run_exec, args=(sock, header), daemon=True).start()
             return
         else:
             sock.close()
