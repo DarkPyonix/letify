@@ -92,7 +92,10 @@ class Rendezvous(Protocol):
     def send(self, to: str, message: bytes) -> None: ...
 
 
-def _connect(address: str, timeout: float | None = 10.0) -> socket.socket:
+def _connect(
+    address: str, timeout: float | None = 10.0, secret: str | None = None
+) -> socket.socket:
+    """Connect to a sidecar socket. A ``tcp:`` stream socket needs its ``secret`` first."""
     kind, _, rest = address.partition(":")
     if kind == "unix":
         sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -102,6 +105,8 @@ def _connect(address: str, timeout: float | None = 10.0) -> socket.socket:
         host, _, port = rest.rpartition(":")
         sock = socket.create_connection((host, int(port)), timeout=timeout)
         sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        if secret:
+            sock.sendall(bytes.fromhex(secret))
     else:
         raise LinkError(f"unknown socket address {address!r}")
     sock.settimeout(None)
@@ -155,7 +160,7 @@ class LinkSession:
         reply = self._daemon.request(
             {"op": "open_stream", "session": self.number, "priority": priority}
         )
-        return _connect(reply["socket"])
+        return _connect(reply["socket"], secret=reply.get("secret"))
 
     def accept_stream(self, timeout: float | None = None) -> socket.socket:
         """Wait for a stream the peer opened and return its local socket."""
@@ -166,7 +171,7 @@ class LinkSession:
         if event.get("event") == "session_closed":
             self._streams.put(event)
             raise LinkClosed(f"session closed: {event.get('reason', '')}")
-        return _connect(event["socket"])
+        return _connect(event["socket"], secret=event.get("secret"))
 
     def paths(self) -> list[dict[str, Any]]:
         """What the session measured on each live path."""

@@ -65,6 +65,8 @@ pub enum RecordError {
     Expired,
     /// The timestamp is more than [`MAX_SKEW`] ahead of the receiver's clock.
     FromTheFuture,
+    /// The cache holds a newer record of the same node.
+    Stale,
 }
 
 impl fmt::Display for RecordError {
@@ -74,6 +76,7 @@ impl fmt::Display for RecordError {
             RecordError::BadSignature => write!(f, "address record signature does not verify"),
             RecordError::Expired => write!(f, "address record is older than {MAX_AGE:?}"),
             RecordError::FromTheFuture => write!(f, "address record is dated in the future"),
+            RecordError::Stale => write!(f, "a newer address record of this node is held"),
         }
     }
 }
@@ -399,6 +402,72 @@ pub fn from_pkarr_txt<S: AsRef<str>>(strings: &[S]) -> Result<Vec<u8>, RecordErr
     Ok(out)
 }
 
+/// Most nodes a [`RecordCache`] holds by default.
+pub const CACHE_CAPACITY: usize = 4096;
+
+/// The newest record seen of each node, so that a replayed old record cannot roll a node's
+/// addresses back. It owns the comparison and the bound on its size; it does not fetch records.
+pub struct RecordCache {
+    capacity: usize,
+    held: std::sync::Mutex<std::collections::HashMap<NodeId, AddressRecord>>,
+}
+
+impl Default for RecordCache {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl RecordCache {
+    /// A cache of [`CACHE_CAPACITY`] nodes.
+    pub fn new() -> Self {
+        Self::with_capacity(CACHE_CAPACITY)
+    }
+
+    /// A cache of at most `capacity` nodes (at least 1).
+    pub fn with_capacity(capacity: usize) -> Self {
+        RecordCache {
+            capacity: capacity.max(1),
+            held: std::sync::Mutex::new(std::collections::HashMap::new()),
+        }
+    }
+
+    /// Decode and verify `bytes` as [`AddressRecord::decode`] does, then keep the record when
+    /// it is not older than the one held for its node, by record version and then timestamp.
+    /// An older record is refused with [`RecordError::Stale`]. The entries are keyed on the
+    /// canonical node id.
+    pub fn accept(&self, bytes: &[u8], now: u32) -> Result<AddressRecord, RecordError> {
+        let record = AddressRecord::decode(bytes, now)?;
+        let key = record.node.canonical();
+        let mut held = self.held.lock().unwrap_or_else(|e| e.into_inner());
+        // A record past its age is refused by decode whatever the cache says, so an entry
+        // that old protects nothing.
+        held.retain(|_, r| (now as i64 - r.timestamp as i64) <= MAX_AGE.as_secs() as i64);
+        if let Some(old) = held.get(&key)
+            && (record.version, record.timestamp) < (old.version, old.timestamp)
+        {
+            return Err(RecordError::Stale);
+        }
+        if !held.contains_key(&key)
+            && held.len() >= self.capacity
+            && let Some(oldest) = held
+                .iter()
+                .min_by_key(|(_, r)| r.timestamp)
+                .map(|(k, _)| *k)
+        {
+            held.remove(&oldest);
+        }
+        held.insert(key, record.clone());
+        Ok(record)
+    }
+
+    /// The record held for `node`.
+    pub fn get(&self, node: &NodeId) -> Option<AddressRecord> {
+        let held = self.held.lock().unwrap_or_else(|e| e.into_inner());
+        held.get(&node.canonical()).cloned()
+    }
+}
+
 fn short_err() -> RecordError {
     RecordError::Malformed("truncated")
 }
@@ -697,5 +766,56 @@ mod tests {
         let flipped = if txt[0].starts_with('A') { 'B' } else { 'A' };
         txt[0].replace_range(10..11, &flipped.to_string());
         assert!(AddressRecord::decode_txt(&txt, r.timestamp).is_err());
+    }
+
+    #[test]
+    fn an_older_record_than_the_one_held_is_refused_as_stale() {
+        let id = Identity::generate();
+        let cache = RecordCache::new();
+        let at = |version, ts| {
+            let mut r = AddressRecord::new(id.node_id(), version);
+            r.timestamp = ts;
+            r.encode(&id)
+        };
+        let now = unix_now();
+        assert!(cache.accept(&at(5, now), now).is_ok());
+        assert_eq!(cache.accept(&at(4, now), now), Err(RecordError::Stale));
+        // The same version with an older timestamp is also a rollback.
+        assert_eq!(cache.accept(&at(5, now - 10), now), Err(RecordError::Stale));
+        // The same record again, and a newer one, are taken.
+        assert!(cache.accept(&at(5, now), now).is_ok());
+        assert_eq!(cache.accept(&at(6, now), now).unwrap().version, 6);
+        assert_eq!(cache.get(&id.node_id()).unwrap().version, 6);
+        // Another node has its own entry.
+        let other = Identity::generate();
+        let r = AddressRecord::new(other.node_id(), 1);
+        assert!(cache.accept(&r.encode(&other), now).is_ok());
+    }
+
+    #[test]
+    fn a_record_that_fails_the_signature_does_not_enter_the_cache() {
+        let id = Identity::generate();
+        let cache = RecordCache::new();
+        let mut bytes = AddressRecord::new(id.node_id(), 9).encode(&id);
+        let n = bytes.len();
+        bytes[n - 1] ^= 1;
+        assert!(cache.accept(&bytes, unix_now()).is_err());
+        assert!(cache.get(&id.node_id()).is_none());
+    }
+
+    #[test]
+    fn the_cache_is_bounded_and_drops_the_oldest_entry() {
+        let cache = RecordCache::with_capacity(2);
+        let now = unix_now();
+        let mut ids = Vec::new();
+        for age in [30u32, 20, 10] {
+            let id = Identity::generate();
+            let mut r = AddressRecord::new(id.node_id(), 1);
+            r.timestamp = now - age;
+            cache.accept(&r.encode(&id), now).unwrap();
+            ids.push(id.node_id());
+        }
+        assert!(cache.get(&ids[0]).is_none());
+        assert!(cache.get(&ids[1]).is_some() && cache.get(&ids[2]).is_some());
     }
 }
