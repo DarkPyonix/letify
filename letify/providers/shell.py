@@ -596,7 +596,7 @@ class Shell(Provider):
 
         from ..config.secrets import account_directory
         from ..protocol.worker import BOOTSTRAP
-        from ..transport import linkchannel
+        from ..transport import linkchannel, linkupload
 
         address = self.address
         if address is None:
@@ -624,6 +624,8 @@ class Shell(Provider):
             key_path=directory / "link.key",
             version=letify.__version__,
             binary=binary if isinstance(binary, str) else None,
+            upload=linkupload.configured(self.config.option("link_binary_upload")),
+            workspace=self.workspace_root,
             punch=bool(self.config.option("link_punch")),
             max_rtt_ms=floor.max_rtt_ms,
             min_bps=floor.min_bps,
