@@ -37,6 +37,33 @@ pub fn duplex_pair() -> (tokio::io::DuplexStream, tokio::io::DuplexStream) {
     tokio::io::duplex(256 * 1024)
 }
 
+/// A loopback TCP port that this process holds bound without listening. Connecting to it is
+/// refused, as to a port nobody has, and no other socket of the machine can take it, which a
+/// port found by binding and dropping a listener does not guarantee.
+pub struct HeldPort {
+    socket: socket2::Socket,
+    pub addr: std::net::SocketAddr,
+}
+
+impl HeldPort {
+    pub fn new() -> HeldPort {
+        let socket =
+            socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::STREAM, None).unwrap();
+        socket
+            .bind(&std::net::SocketAddr::from(([127, 0, 0, 1], 0)).into())
+            .unwrap();
+        let addr = socket.local_addr().unwrap().as_socket().unwrap();
+        HeldPort { socket, addr }
+    }
+
+    /// Start listening on the held port.
+    pub fn listen(self) -> TcpListener {
+        self.socket.listen(1024).unwrap();
+        self.socket.set_nonblocking(true).unwrap();
+        TcpListener::from_std(self.socket.into()).unwrap()
+    }
+}
+
 /// Two sessions over one in-memory subflow. The responder accepts exactly the initiator.
 pub async fn session_pair(config: Config) -> (Session, Session) {
     let a = Identity::generate();

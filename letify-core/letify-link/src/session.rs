@@ -169,6 +169,9 @@ pub struct SubflowStats {
     pub received_bytes: u64,
     /// Bytes of frames sent on this subflow that the peer acknowledged.
     pub acked_bytes: u64,
+    /// Bytes of frames written to the subflow that its ack does not cover yet. It counts against
+    /// the subflow's window.
+    pub inflight_bytes: usize,
     /// Round trip of the latest keepalive answered on this subflow, if any.
     pub rtt: Option<Duration>,
     /// Bytes of probe records written to this subflow.
@@ -2004,6 +2007,7 @@ impl Session {
                     sent_bytes: sub.sent.load(Ordering::Relaxed),
                     received_bytes: sub.received.load(Ordering::Relaxed),
                     acked_bytes: sub.acked,
+                    inflight_bytes: (sub.sent_seq - sub.acked_seq) as usize,
                     rtt: (rtt != NO_RTT).then(|| Duration::from_micros(rtt)),
                     probe_sent_bytes: sub.probe_sent,
                     probe_received_bytes: sub.probe_received,
