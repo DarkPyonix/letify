@@ -33,8 +33,8 @@ async fn each_side_learns_the_other_sides_node_id() {
         .await
         .unwrap();
     let responder = responder.await.unwrap().unwrap();
-    assert_eq!(initiator.peer(), b.node_id());
-    assert_eq!(responder.peer(), a.node_id());
+    assert_eq!(initiator.peer(), b.node_id().canonical());
+    assert_eq!(responder.peer(), a.node_id().canonical());
 }
 
 #[tokio::test]
@@ -268,4 +268,40 @@ async fn a_replayed_first_handshake_message_yields_no_session() {
         "a replayed message 1 must not become a session"
     );
     drop(att);
+}
+
+fn identity_with_sign_bit(set: bool) -> Identity {
+    loop {
+        let i = Identity::generate();
+        if (i.node_id().as_bytes()[31] & 0x80 != 0) == set {
+            return i;
+        }
+    }
+}
+
+/// SPEC.md letify-link, Identity: `Session::peer` is the canonical id, and
+/// `Session::peer_presented` is the id as the handshake carried it.
+#[tokio::test]
+async fn a_session_reports_the_canonical_peer_id_and_keeps_the_presented_one() {
+    let a = identity_with_sign_bit(true);
+    let b = identity_with_sign_bit(true);
+    let (ta, tb) = duplex_pair();
+    let (bb, a_id) = (b.clone(), a.node_id());
+    let responder = tokio::spawn(async move {
+        Session::accept(tb, &bb, PeerPolicy::allow(vec![a_id]), Config::default()).await
+    });
+    // The initiator names the responder by its sign-flipped alias.
+    let mut alias = *b.node_id().as_bytes();
+    alias[31] ^= 0x80;
+    let alias = letify_link::NodeId::from_bytes(alias);
+    assert_ne!(alias, b.node_id());
+    let initiator = Session::connect(ta, &a, alias, Config::default())
+        .await
+        .unwrap();
+    let responder = responder.await.unwrap().unwrap();
+    assert_eq!(responder.peer(), a.node_id().canonical());
+    assert_ne!(responder.peer(), a.node_id());
+    assert_eq!(responder.peer_presented(), a.node_id());
+    assert_eq!(initiator.peer(), b.node_id().canonical());
+    assert_eq!(initiator.peer_presented(), alias);
 }

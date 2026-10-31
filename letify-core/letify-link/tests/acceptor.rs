@@ -63,7 +63,7 @@ async fn pair(rig: &Rig) -> (Session, Session) {
 async fn a_new_handshake_at_the_acceptor_yields_a_new_session() {
     let rig = rig().await;
     let (a, b) = pair(&rig).await;
-    assert_eq!(b.peer(), rig.client.node_id());
+    assert_eq!(b.peer(), rig.client.node_id().canonical());
     let mut s = a.open_stream().await.unwrap();
     s.write_all(b"hello").await.unwrap();
     let mut sb = b.accept_stream().await.unwrap();

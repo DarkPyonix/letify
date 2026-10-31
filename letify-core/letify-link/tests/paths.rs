@@ -650,3 +650,50 @@ async fn a_path_faster_than_the_first_one_still_joins_the_session_it_started() {
     .await
     .expect("the responder holds both subflows");
 }
+
+/// SPEC.md letify-link, Paths item 1, concurrent handshakes: a candidate that accepts the TCP
+/// connection and never speaks must not delay a candidate that answers.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_black_hole_candidate_does_not_delay_the_start_on_a_good_one() {
+    let mut rig = rig(Config::default()).await;
+    let hole = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let hole_addr = hole.local_addr().unwrap();
+    // Hold every connection open and silent.
+    let held = tokio::spawn(async move {
+        let mut keep = Vec::new();
+        while let Ok((tcp, _)) = hole.accept().await {
+            keep.push(tcp);
+        }
+    });
+    let good_target = rig.target;
+    let candidates = vec![
+        Candidate::tcp("hole", hole_addr),
+        // Delivered after the black hole, so the black hole is handshaken first.
+        Candidate::new("good", move || async move {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            letify_link::tcp::connect(good_target).await
+        }),
+    ];
+    let t0 = std::time::Instant::now();
+    let mut pm = PathManager::start(
+        rig.client.clone(),
+        rig.server.node_id(),
+        candidates,
+        Config::default(),
+        quick(),
+    )
+    .await
+    .unwrap();
+    assert!(
+        t0.elapsed() < Duration::from_secs(5),
+        "started after {:?}, handshake_timeout is 30 s",
+        t0.elapsed()
+    );
+    assert_eq!(next_added(&mut pm).await, "good");
+    let server_session = timeout(Duration::from_secs(5), rig.sessions.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(server_session.peer(), rig.client.node_id().canonical());
+    held.abort();
+}
