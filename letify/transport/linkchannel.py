@@ -13,6 +13,7 @@ import contextlib
 import json
 import math
 import os
+import queue
 import secrets
 import shlex
 import socket
@@ -47,6 +48,10 @@ RETRY_WINDOW_FACTOR = 3
 #: The least lead a punch gets, in milliseconds, and how many bootstrap round trips it is.
 PUNCH_LEAD_FLOOR_MS = 2000
 PUNCH_LEAD_ROUND_TRIPS = 3
+#: Seconds the probe waits for every candidate of a session to join or be lost. Spec "Sidecar
+#: interface" item 8. A join takes a few round trips, so 10 s is many round trips of any link
+#: the floor admits.
+SETTLE_S = 10.0
 #: The phases of a connect, in the order the announcement lists them.
 PHASES = ("bootstrap", "binary", "shim", "punch", "session", "probe")
 MIB = 1 << 20
@@ -606,6 +611,9 @@ def connect_over(
             candidates,
             config={"start_timeout_ms": start_timeout_ms, "resume_window_s": RESUME_S},
         )
+        added = settle_paths(
+            session, [str(_candidate_name(c, i)) for i, c in enumerate(candidates)]
+        )
         phases["session"] = clock() - began
         remote = LinkRemote(
             daemon,
@@ -621,7 +629,7 @@ def connect_over(
             remote.close()
             raise _fail(alias, f"cannot measure the session: {error}") from error
         phases["probe"] = clock() - began
-        _announce_paths(remote, tell, punched)
+        _announce_paths(remote, tell, punched, added)
         tell(
             f"probe round trip {result.rtt_ms:.1f} ms, up {result.upload_bps / MIB:.1f} MiB/s, "
             f"down {result.download_bps / MIB:.1f} MiB/s over {len(remote._paths())} path(s)"
@@ -652,14 +660,49 @@ def connect_over(
             stream.close()
 
 
-def _announce_paths(remote: LinkRemote, tell: Callable[[str], None], punched: int) -> None:
+def _candidate_name(candidate: Any, index: int) -> str:
+    """The name the sidecar gives a candidate in its events: its ``name``, else ``path<index>``."""
+    if isinstance(candidate, dict) and "name" in candidate:
+        return str(candidate["name"])
+    return f"path{index}"
+
+
+def settle_paths(session: Any, expected: list[str], timeout_s: float = SETTLE_S) -> list[str]:
+    """Wait until each name in ``expected`` has joined the session or been lost.
+
+    Spec "Sidecar interface" item 8. ``open_session`` replies when the first candidate has
+    completed the handshake and the others join afterwards, so a probe that started at once
+    would measure the paths that happened to be up. The wait ends at ``timeout_s`` and never
+    raises: the probe then measures what exists and the floor refuses a slow set. Returns the
+    names that joined, in order.
+    """
+    joined: list[str] = []
+    pending = set(expected)
+    deadline = time.monotonic() + timeout_s
+    while pending:
+        try:
+            event = session.events.get(timeout=max(0.0, deadline - time.monotonic()))
+        except queue.Empty:
+            break
+        name = str(event.get("name", ""))
+        if event.get("event") == "path_added":
+            joined.append(name)
+            pending.discard(name)
+        elif event.get("event") == "path_lost":
+            pending.discard(name)
+    return joined
+
+
+def _announce_paths(
+    remote: LinkRemote, tell: Callable[[str], None], punched: int, added: list[str]
+) -> None:
     """One line per subflow: its kind, its round trip and whether a punch produced it.
 
     The sidecar names a candidate in ``path_added`` and a subflow by id in ``paths``, in the
     order they were added, so the names are matched to the subflows by position and, when the
     counts differ, a path is called punched only when the session had no other candidate.
     """
-    names: list[str] = []
+    names = list(added)
     while not remote.session.events.empty():
         event = remote.session.events.get_nowait()
         if event.get("event") == "path_added":
@@ -1025,6 +1068,7 @@ class LinkChannel(FramedChannel):
 
 
 __all__ = [
+    "SETTLE_S",
     "Bootstrap",
     "LinkChannel",
     "LinkRemote",
@@ -1037,6 +1081,7 @@ __all__ = [
     "letify_link_enabled",
     "prepare_binary",
     "punch_lead_ms",
+    "settle_paths",
     "shim_path",
     "shim_source",
     "stream_header",
