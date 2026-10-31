@@ -2185,3 +2185,20 @@ def sidecar_binary(tmp_path_factory) -> Path:
     binary = core / "target" / "release" / linkd.BINARY
     assert binary.is_file(), binary
     return binary
+
+
+@pytest.fixture(autouse=True)
+def quick_link_probe(monkeypatch):
+    """A letify-link connect measures its session with a probe that takes a fraction of a second.
+
+    The real probe is 30 round trips and 2 s each way after a warm-up (Spec "Choosing a link"),
+    which every connect of every test would otherwise pay. The shape is unchanged.
+    """
+    from letify.transport import linkchannel
+    from letify.transport.probe import Probe
+
+    class Quick(Probe):
+        def warmup_for(self, rtt_ms: float) -> float:
+            return 0.05
+
+    monkeypatch.setattr(linkchannel, "make_probe", lambda: Quick(round_trips=5, seconds=0.2))

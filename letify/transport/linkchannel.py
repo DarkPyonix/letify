@@ -28,6 +28,8 @@ from ..protocol import wire
 from ..runtime.channel import FramedChannel, relay_program
 from ..runtime.lease import GRACE
 from . import linkd
+from .announce import Say, quiet
+from .probe import Probe, ProbeResult
 
 #: Seconds the remote gets to download the wheel and take ``letify-link`` out of it.
 PREPARE_TIMEOUT = 600.0
@@ -45,6 +47,9 @@ RETRY_WINDOW_FACTOR = 3
 #: The least lead a punch gets, in milliseconds, and how many bootstrap round trips it is.
 PUNCH_LEAD_FLOOR_MS = 2000
 PUNCH_LEAD_ROUND_TRIPS = 3
+#: The phases of a connect, in the order the announcement lists them.
+PHASES = ("bootstrap", "binary", "shim", "punch", "session", "probe")
+MIB = 1 << 20
 #: Seconds the remote shim waits for a session after the hand-over before it leaves.
 WAIT_SESSION_S = 120
 #: Seconds a session keeps its place with no live path. It is the lease of spec "Sessions",
@@ -223,6 +228,10 @@ class LinkRemote:
         #: The shim's node id and the ``address:port`` it listens on, which a run record keeps.
         self.remote_id = remote_id
         self.endpoint = endpoint
+        #: What the bulk probe measured over the whole session, once the connect has run it.
+        self.measured: ProbeResult | None = None
+        #: Seconds each phase of the connect took, by phase name. Spec "Sidecar interface" item 7.
+        self.phases: dict[str, float] = {}
 
     def record(self) -> dict[str, str]:
         """What a second process needs to open its own session to this machine."""
@@ -252,15 +261,28 @@ class LinkRemote:
 
     @property
     def rtt_ms(self) -> float | None:
-        """The round trip the session measured on its best path, or None before one is known."""
+        """The session's round trip: the bulk probe's median, else its best path's smoothed one."""
+        if self.measured is not None:
+            return self.measured.rtt_ms
         rtts = [p["srtt_ms"] for p in self._paths() if p.get("srtt_ms")]
         return min(rtts) if rtts else None
 
     @property
     def upload_bps(self) -> float | None:
-        """The rate the session measured on its best path, or None before one is known."""
+        """The session's upload rate: the bulk probe's, else the idle probe of its best path.
+
+        The idle probe is one 16 KiB record and a lower bound, so it only stands in until the
+        connect has measured the session.
+        """
+        if self.measured is not None:
+            return self.measured.upload_bps
         rates = [p["probe_rate"] for p in self._paths() if p.get("probe_rate")]
         return max(rates) if rates else None
+
+    @property
+    def download_bps(self) -> float | None:
+        """The session's download rate from the bulk probe, or None before it has run."""
+        return self.measured.download_bps if self.measured is not None else None
 
     @property
     def alive(self) -> bool:
@@ -306,7 +328,12 @@ def prepare_binary(
 
 
 def _upload_over_ssh(
-    alias: str, ssh: Callable[[str], list[str]], python: str, upload: str, workspace: str
+    alias: str,
+    ssh: Callable[[str], list[str]],
+    python: str,
+    upload: str,
+    workspace: str,
+    report: Callable[[str, int], None] | None = None,
 ) -> str:
     """Upload the development binary of Spec item 7 over the ssh command's standard input."""
     from . import linkupload
@@ -332,7 +359,7 @@ def _upload_over_ssh(
             tail = done.stderr.decode(errors="replace")[-400:]
             raise _fail(alias, f"the ssh upload failed: {tail}")
 
-    return linkupload.ensure(alias, upload, workspace=workspace, run=run, push=push)
+    return linkupload.ensure(alias, upload, workspace=workspace, run=run, push=push, report=report)
 
 
 def _binary_path(alias: str, stdout: str, stderr: str) -> str:
@@ -344,6 +371,20 @@ def _binary_path(alias: str, stdout: str, stderr: str) -> str:
         "letify-link is not on the machine and the wheel could not supply it: "
         + (stderr or stdout).strip()[-400:],
     )
+
+
+def _binary_line(note: dict[str, Any]) -> str:
+    """The words of the binary announcement from what the preparation recorded."""
+    size = f" ({note['size'] / (1 << 20):.1f} MiB)" if note.get("size") else ""
+    return f"from {note.get('how', 'the machine')}{size}"
+
+
+def _reporter(note: dict[str, Any]) -> Callable[[str, int], None]:
+    def report(how: str, size: int) -> None:
+        note["how"] = "an upload" if how == "uploaded" else "the machine's cache"
+        note["size"] = size
+
+    return report
 
 
 def connect(
@@ -362,15 +403,19 @@ def connect(
     max_rtt_ms: float | None = None,
     min_bps: float | None = None,
     start_timeout_ms: int = 60_000,
+    say: Say = quiet,
 ) -> LinkRemote:
     """Bootstrap over ssh once, start a session, and return the connected machine.
 
     Spec "Sidecar interface" item 7. Every failure raises ``ProviderUnavailable`` with the
     reason; nothing falls back to the ssh data path.
     """
+    note: dict[str, Any] = {}
+
     def prepare() -> str:
         if upload:
-            return _upload_over_ssh(alias, ssh, python, upload, workspace)
+            return _upload_over_ssh(alias, ssh, python, upload, workspace, _reporter(note))
+        note["how"] = "the account" if binary else "the wheel"
         return prepare_binary(alias, ssh, python, version, binary)
 
     return connect_over(
@@ -385,6 +430,9 @@ def connect(
         max_rtt_ms=max_rtt_ms,
         min_bps=min_bps,
         start_timeout_ms=start_timeout_ms,
+        say=say,
+        note=note,
+        channel="ssh",
     )
 
 
@@ -403,6 +451,7 @@ def connect_commands(
     max_rtt_ms: float | None = None,
     min_bps: float | None = None,
     start_timeout_ms: int = 60_000,
+    say: Say = quiet,
 ) -> LinkRemote:
     """Bootstrap over a provider's command channel once, and return the connected runtime.
 
@@ -413,15 +462,21 @@ def connect_commands(
     """
     from . import linkmailbox
 
+    note: dict[str, Any] = {}
+
     def prepare() -> str:
         if upload:
             from . import linkupload
 
-            return linkupload.ensure(alias, upload, workspace=workspace, run=run)
+            return linkupload.ensure(
+                alias, upload, workspace=workspace, run=run, report=_reporter(note)
+            )
         if binary:
+            note["how"] = "the account"
             return binary
         from .. import install
 
+        note["how"] = "the wheel"
         try:
             output = run(install.remote_link_source(version), PREPARE_TIMEOUT)
         except Exception as error:
@@ -443,6 +498,9 @@ def connect_commands(
         max_rtt_ms=max_rtt_ms,
         min_bps=min_bps,
         start_timeout_ms=start_timeout_ms,
+        say=say,
+        note=note,
+        channel="the command channel",
     )
 
 
@@ -465,9 +523,18 @@ def connect_over(
     max_rtt_ms: float | None = None,
     min_bps: float | None = None,
     start_timeout_ms: int = 60_000,
+    say: Say = quiet,
+    note: dict[str, Any] | None = None,
+    channel: str = "the bootstrap channel",
 ) -> LinkRemote:
     """The connect of items 7 and 8: ``prepare`` returns the remote binary's path, ``start`` the
-    line stream to the shim, and everything after is the same for both."""
+    line stream to the shim, and everything after is the same for both.
+
+    ``say`` prints each decision, and ``note`` is what ``prepare`` recorded about the binary.
+    """
+    tell = lambda message: say(f"{alias} letify-link: {message}")  # noqa: E731
+    phases: dict[str, float] = {}
+    clock = time.monotonic
     try:
         daemon = linkd.LinkDaemon(key_path)
     except linkd.LinkMissing as error:
@@ -476,9 +543,15 @@ def connect_over(
         raise _fail(alias, f"the local sidecar failed: {error}") from error
     stream: Bootstrap | None = None
     try:
+        began = clock()
         remote_binary = prepare()
+        phases["binary"] = clock() - began
+        tell(f"binary {remote_binary} {_binary_line(note or {})} in {phases['binary']:.1f} s")
+        began = clock()
         stream = start()
+        phases["bootstrap"] = clock() - began
         rtt = stream.rtt_s
+        tell(f"bootstrapping over {channel}" + (f", round trip {rtt * 1000:.0f} ms" if rtt else ""))
         shim_wait = SHIM_TIMEOUT + (10 * rtt if rtt else 0.0)
 
         def write(message: dict[str, Any]) -> None:
@@ -500,26 +573,40 @@ def connect_over(
             # and relay the shim starts, as it applies to the worker's ssh command.
             config["worker_command"] = wrap(f"{python} -u -c {shlex.quote(bootstrap)}")
             config["relay_command"] = wrap(f"{python} -c {shlex.quote(relay_program())}")
+        began = clock()
         write(config)
         lines = _Lines(stream)
         ready = lines.wait("ready", shim_wait, alias, stream)
+        phases["shim"] = clock() - began
+        tell(f"shim ready in {phases['shim']:.1f} s")
         remote_id = str(ready["node_id"])
         daemon.rendezvous = _StdioRendezvous(lambda: daemon.node_id, write)
         lines.on_rendezvous = lambda to, message: daemon.deliver(remote_id, message)
         candidates: list[Any] = [] if address is None else [f"{address}:{ready['port']}"]
+        phases["punch"] = 0.0
+        punched = 0
         if punch or address is None:
             # An account with an address is reachable, so its mappings are that address. One
             # without is behind a NAT, and the sidecars ask the address observers instead.
             where: dict[str, Any] = (
                 {"observers": "default"} if address is None else {"public_ip": address}
             )
+            began = clock()
             names = _punch(alias, daemon, remote_id, stream, write, lines, address, where)
+            phases["punch"] = clock() - began
+            punched = len(names)
+            reply = getattr(daemon, "last_punch", None) or {}
+            tell(
+                f"NAT {reply.get('nat', 'unknown')} here, {reply.get('peer_nat', 'unknown')} there"
+            )
             candidates += [{"name": f"punch{i}", "punched": n} for i, n in enumerate(names)]
+        began = clock()
         session = daemon.open_session(
             remote_id,
             candidates,
             config={"start_timeout_ms": start_timeout_ms, "resume_window_s": RESUME_S},
         )
+        phases["session"] = clock() - began
         remote = LinkRemote(
             daemon,
             session,
@@ -527,11 +614,32 @@ def connect_over(
             remote_id=remote_id,
             endpoint="" if address is None else f"{address}:{ready['port']}",
         )
-        _hold_to_floor(remote, max_rtt_ms, min_bps)
+        began = clock()
+        try:
+            result = measure_session(remote)
+        except (OSError, EOFError, RuntimeFailure, linkd.LinkError) as error:
+            remote.close()
+            raise _fail(alias, f"cannot measure the session: {error}") from error
+        phases["probe"] = clock() - began
+        _announce_paths(remote, tell, punched)
+        tell(
+            f"probe round trip {result.rtt_ms:.1f} ms, up {result.upload_bps / MIB:.1f} MiB/s, "
+            f"down {result.download_bps / MIB:.1f} MiB/s over {len(remote._paths())} path(s)"
+        )
+        hold_to_floor(remote, result, max_rtt_ms, min_bps, say)
+        remote.measured = result
+        remote.phases = phases
+        tell("chose the session")
         write({"op": "handover"})
         lines.wait("handed_over", shim_wait, alias, stream)
         # The shim now runs without the bootstrap, so that is ended rather than waited for.
         stream.close()
+        total = sum(phases.values())
+        tell(
+            f"connected in {total:.1f} s ("
+            + ", ".join(f"{name} {phases[name]:.1f}" for name in PHASES)
+            + ")"
+        )
         return remote
     except linkd.LinkError as error:
         daemon.close()
@@ -542,6 +650,28 @@ def connect_over(
     finally:
         if stream is not None:
             stream.close()
+
+
+def _announce_paths(remote: LinkRemote, tell: Callable[[str], None], punched: int) -> None:
+    """One line per subflow: its kind, its round trip and whether a punch produced it.
+
+    The sidecar names a candidate in ``path_added`` and a subflow by id in ``paths``, in the
+    order they were added, so the names are matched to the subflows by position and, when the
+    counts differ, a path is called punched only when the session had no other candidate.
+    """
+    names: list[str] = []
+    while not remote.session.events.empty():
+        event = remote.session.events.get_nowait()
+        if event.get("event") == "path_added":
+            names.append(str(event.get("name", "")))
+    paths = remote._paths()
+    for index, path in enumerate(paths):
+        if len(names) == len(paths):
+            how = "punched" if names[index].startswith("punch") else "direct"
+        else:
+            how = "punched" if punched and not remote.endpoint else "direct"
+        rtt = path.get("srtt_ms") or path.get("rtt_ms")
+        tell(f"path {path.get('kind') or 'unknown'} {how}" + (f" rtt {rtt:.1f} ms" if rtt else ""))
 
 
 def _punch(
@@ -662,32 +792,51 @@ def attach(
     )
 
 
-def _hold_to_floor(remote: LinkRemote, max_rtt_ms: float | None, min_bps: float | None) -> None:
-    """Spec "Link floor": the session's measured path is held to the account's floor."""
-    found: list[str] = []
-    rtt = remote.rtt_ms
-    if max_rtt_ms is not None and rtt is not None and rtt > max_rtt_ms:
-        found.append(f"round trip {rtt:.1f} ms above the floor {max_rtt_ms:.0f} ms")
-    if min_bps is not None:
-        while not remote.session.events.empty():
-            event = remote.session.events.get_nowait()
-            slow = (
-                event.get("event") == "path_probe"
-                and (event.get("throughput") or min_bps) < min_bps
-            )
-            if slow:
-                found.append(
-                    f"throughput {event['throughput'] / (1 << 20):.1f} MiB/s below the "
-                    f"floor {min_bps / (1 << 20):.1f} MiB/s"
-                )
-    if found:
-        remote.close()
-        raise _fail(
-            remote.alias,
-            "the session's path is below the link floor: "
-            + "; ".join(found)
-            + ". Set min_mib_per_s and max_rtt_ms on the account to change the floor",
-        )
+def make_probe() -> Probe:
+    """The probe of Spec "Choosing a link": 30 round trips, a discarded warm-up, 2 s each way."""
+    return Probe()
+
+
+def measure_session(remote: LinkRemote) -> ProbeResult:
+    """Run the bulk probe over the session on a dedicated ``probe`` stream of the shim.
+
+    The stream is in the bulk class, so the rates are the session's, summed over its subflows.
+    Spec "Sidecar interface" item 7.
+    """
+    sock = remote.open_stream("bulk")
+    try:
+        sock.sendall(stream_header("probe", secrets.token_hex(8)))
+        return make_probe().measure(sock)
+    finally:
+        with contextlib.suppress(OSError):
+            sock.close()
+
+
+def hold_to_floor(
+    remote: Any,
+    result: ProbeResult,
+    max_rtt_ms: float | None,
+    min_bps: float | None,
+    say: Say = quiet,
+) -> None:
+    """Spec "Link floor": the session's measured rates are held to the account's floor.
+
+    A floor of None in either number is not checked. A session below it closes and the connect
+    fails with the rejection the pipeline gives a slow strategy.
+    """
+    from .pipeline import LinkFloor
+
+    floor = LinkFloor(
+        min_bps=min_bps or 0.0,
+        max_rtt_ms=max_rtt_ms if max_rtt_ms is not None else math.inf,
+    )
+    found = floor.violations(result)
+    if not found:
+        return
+    reason = "; ".join(found)
+    say(f"{remote.alias} letify-link: rejected, {reason}")
+    remote.close()
+    raise _fail(remote.alias, f"the session is below the link floor: {reason}")
 
 
 class _Lines:
@@ -732,9 +881,7 @@ class _Lines:
                     self._queue.put(None)
                 return
 
-    def wait(
-        self, name: str, timeout: float, alias: str, stream: Bootstrap
-    ) -> dict[str, Any]:
+    def wait(self, name: str, timeout: float, alias: str, stream: Bootstrap) -> dict[str, Any]:
         import queue
 
         deadline = time.monotonic() + timeout

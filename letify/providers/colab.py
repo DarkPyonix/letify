@@ -522,6 +522,7 @@ class Colab(Shell):
 
         from ..protocol.worker import BOOTSTRAP
         from ..transport import linkchannel, linkupload
+        from ..transport.announce import printer
 
         if runtime is None:
             raise ProviderUnavailable(self.kind, "a letify-link session needs a runtime")
@@ -543,6 +544,7 @@ class Colab(Shell):
             wrap=self.remote_command,
             max_rtt_ms=floor.max_rtt_ms,
             min_bps=floor.min_bps,
+            say=printer(bool(getattr(self, "announce", True))),
         )
 
     def _public_key(self) -> str | None:

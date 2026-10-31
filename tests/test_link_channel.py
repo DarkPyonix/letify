@@ -183,7 +183,8 @@ def test_transfers_open_bulk_streams_and_the_worker_channel_an_interactive_one(
     finally:
         worker.close()
         transfer.close()
-    assert opened == ["interactive", "bulk"]
+    # The first bulk stream is the connect's own probe stream; the rest is the call.
+    assert opened == ["bulk", "interactive", "bulk"]
 
 
 class CuttableProxy:
@@ -331,33 +332,150 @@ def test_a_link_run_record_without_the_link_section_is_refused(
         provider.attach_channel("r1", {"door": "/tmp/door"})
 
 
-def test_a_path_below_the_link_floor_fails_the_connect_naming_the_settings() -> None:
-    probe = {"event": "path_probe", "throughput": 1.0 * MIB, "rtt_ms": 5.0}
+def measured(rtt_ms: float, up_mib: float, down_mib: float) -> Any:
+    from letify.transport.probe import ProbeResult
 
-    class Events:
-        def __init__(self) -> None:
-            self.items = [probe]
+    return ProbeResult(rtt_ms, up_mib * MIB, down_mib * MIB)
 
-        def empty(self) -> bool:
-            return not self.items
 
-        def get_nowait(self) -> dict[str, Any]:
-            return self.items.pop()
+def floored_remote(closed: list[bool]) -> Any:
+    return SimpleNamespace(alias="lab", close=lambda: closed.append(True))
 
+
+def test_a_session_below_the_link_floor_fails_the_connect_naming_the_settings_and_both_rates():
     closed: list[bool] = []
-    remote = SimpleNamespace(
-        alias="lab",
-        rtt_ms=400.0,
-        session=SimpleNamespace(events=Events()),
-        close=lambda: closed.append(True),
-    )
     with pytest.raises(ProviderUnavailable) as raised:
-        linkchannel._hold_to_floor(remote, 300.0, 10.0 * MIB)  # type: ignore[arg-type]
+        linkchannel.hold_to_floor(
+            floored_remote(closed), measured(400.0, 1.0, 2.0), 300.0, 10.0 * MIB
+        )
     text = str(raised.value)
     assert "round trip 400.0 ms above the floor 300 ms" in text
-    assert "1.0 MiB/s below the floor 10.0 MiB/s" in text
+    assert "up 1.0 MiB/s below 100% of the floor 10.0 MiB/s" in text
+    assert "down 2.0 MiB/s below 100% of the floor 10.0 MiB/s" in text
     assert "min_mib_per_s" in text and "max_rtt_ms" in text
     assert closed == [True]
+
+
+def test_a_policed_session_names_the_pattern_and_reverse_ssh() -> None:
+    with pytest.raises(ProviderUnavailable) as raised:
+        linkchannel.hold_to_floor(floored_remote([]), measured(50.0, 30.0, 0.1), 300.0, 10.0 * MIB)
+    assert "reverse_ssh" in str(raised.value)
+
+
+def test_a_session_at_the_floor_is_accepted() -> None:
+    closed: list[bool] = []
+    linkchannel.hold_to_floor(floored_remote(closed), measured(50.0, 12.0, 11.0), 300.0, 10.0 * MIB)
+    assert closed == []
+    # No floor given, nothing to hold it to.
+    linkchannel.hold_to_floor(floored_remote(closed), measured(900.0, 0.1, 0.1), None, None)
+    assert closed == []
+
+
+def test_a_connect_whose_probe_measures_below_the_floor_fails_and_closes(
+    linked, monkeypatch
+) -> None:
+    monkeypatch.setattr(linkchannel, "measure_session", lambda remote: measured(60.0, 0.5, 0.4))
+    with pytest.raises(ProviderUnavailable) as raised:
+        linked.open_channel(runtime())
+    text = str(raised.value)
+    assert "up 0.5 MiB/s" in text and "down 0.4 MiB/s" in text
+    assert "min_mib_per_s" in text
+
+
+def test_a_connect_whose_probe_cannot_run_fails_with_the_reason(linked, monkeypatch) -> None:
+    def broken(remote):
+        raise OSError("the probe responder answered out of order")
+
+    monkeypatch.setattr(linkchannel, "measure_session", broken)
+    with pytest.raises(ProviderUnavailable, match="cannot measure the session"):
+        linked.open_channel(runtime())
+
+
+def test_the_connect_measures_the_session_over_a_probe_stream_of_the_shim(linked) -> None:
+    channel = linked.open_channel(runtime())
+    try:
+        remote = linked.__dict__["_link_remotes"][""]
+        assert remote.measured is not None
+        assert remote.rtt_ms == remote.measured.rtt_ms > 0
+        assert remote.upload_bps == remote.measured.upload_bps > 0
+        assert remote.download_bps == remote.measured.download_bps > 0
+        assert set(remote.phases) == {"bootstrap", "binary", "shim", "punch", "session", "probe"}
+        assert all(seconds >= 0 for seconds in remote.phases.values())
+    finally:
+        channel.close()
+
+
+def test_the_transfer_decision_reads_the_bulk_probe_not_the_idle_probe() -> None:
+    from letify.store import pathdata
+
+    session = SessionStub([{"srtt_ms": 90.0, "probe_rate": 0.15 * MIB}])
+    remote = linkchannel.LinkRemote(None, session, "lab")  # type: ignore[arg-type]
+    assert remote.upload_bps == 0.15 * MIB
+    remote.measured = measured(55.0, 27.8, 30.0)
+    assert (remote.rtt_ms, remote.upload_bps, remote.download_bps) == (
+        55.0,
+        27.8 * MIB,
+        30.0 * MIB,
+    )
+    provider = SimpleNamespace(
+        link=lambda runtime: linkchannel.PlainSshLink(None, lambda: remote),
+        transfer_streams=4,
+        transfer_parallel_mib=0,
+    )
+    assert pathdata._measured_rtt(provider, None) == 55.0
+
+
+def test_paths_carry_the_kind_of_their_subflow(linked) -> None:
+    channel = linked.open_channel(runtime())
+    try:
+        remote = linked.__dict__["_link_remotes"][""]
+        assert [p["kind"] for p in remote.session.paths()] == ["tcp"]
+    finally:
+        channel.close()
+
+
+def test_the_connect_announces_each_decision_in_order(linked, capsys) -> None:
+    channel = linked.open_channel(runtime())
+    try:
+        err = capsys.readouterr().err
+        lines = [line.split("letify: ", 1)[1] for line in err.splitlines() if "letify: " in line]
+        order = [
+            "lab letify-link: binary ",
+            "lab letify-link: bootstrapping over ssh",
+            "lab letify-link: shim ready in ",
+            "lab letify-link: path ",
+            "lab letify-link: probe round trip ",
+            "lab letify-link: chose the session",
+            "lab letify-link: connected in ",
+        ]
+        at = -1
+        for prefix in order:
+            found = [i for i, line in enumerate(lines) if line.startswith(prefix) and i > at]
+            assert found, f"no line starting {prefix!r} after {at} in {lines}"
+            at = found[0]
+        path = next(line for line in lines if line.startswith("lab letify-link: path "))
+        assert " tcp direct rtt " in path
+        done = next(line for line in lines if line.startswith("lab letify-link: connected in "))
+        for phase in ("bootstrap", "binary", "shim", "punch", "session", "probe"):
+            assert f"{phase} " in done
+    finally:
+        channel.close()
+
+
+def test_the_connect_announces_nothing_when_announce_is_off(linked, capsys) -> None:
+    linked.announce = False
+    channel = linked.open_channel(runtime())
+    try:
+        assert capsys.readouterr().err == ""
+    finally:
+        channel.close()
+
+
+def test_a_rejected_session_announces_the_rejection(linked, capsys, monkeypatch) -> None:
+    monkeypatch.setattr(linkchannel, "measure_session", lambda remote: measured(60.0, 0.5, 0.4))
+    with pytest.raises(ProviderUnavailable):
+        linked.open_channel(runtime())
+    assert "lab letify-link: rejected, " in capsys.readouterr().err
 
 
 def test_the_wheel_extraction_names_the_sidecar_binary() -> None:
@@ -499,6 +617,22 @@ def test_an_account_with_no_address_starts_its_session_from_punched_candidates_o
         remote = provider.__dict__["_link_remotes"][""]
         assert remote.endpoint == ""
         assert remote.record()["endpoint"] == ""
+    finally:
+        channel.close()
+        provider.close_link()
+
+
+def test_a_punched_connect_announces_both_nat_types(
+    sidecar_binary, isolated_home, tmp_path, ssh, udp_stun, monkeypatch, capsys
+) -> None:
+    monkeypatch.setenv("LETIFY_LINK_STUN", udp_stun.env)
+    provider = no_address_machine(tmp_path, ssh, sidecar_binary)
+    channel = provider.open_channel(runtime())
+    try:
+        lines = capsys.readouterr().err.splitlines()
+        nat = [line for line in lines if "letify-link: NAT " in line]
+        assert len(nat) == 1 and " here, " in nat[0] and nat[0].endswith(" there")
+        assert any(" punched rtt " in line for line in lines)
     finally:
         channel.close()
         provider.close_link()
