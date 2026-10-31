@@ -521,7 +521,7 @@ class Colab(Shell):
         import letify
 
         from ..protocol.worker import BOOTSTRAP
-        from ..transport import linkchannel
+        from ..transport import linkchannel, linkupload
 
         if runtime is None:
             raise ProviderUnavailable(self.kind, "a letify-link session needs a runtime")
@@ -538,6 +538,8 @@ class Colab(Shell):
             key_path=directory / "link.key",
             version=letify.__version__,
             binary=binary if isinstance(binary, str) else None,
+            upload=linkupload.configured(self.config.option("link_binary_upload")),
+            workspace=self.workspace_root,
             wrap=self.remote_command,
             max_rtt_ms=floor.max_rtt_ms,
             min_bps=floor.min_bps,

@@ -305,6 +305,36 @@ def prepare_binary(
     return _binary_path(alias, done.stdout, done.stderr)
 
 
+def _upload_over_ssh(
+    alias: str, ssh: Callable[[str], list[str]], python: str, upload: str, workspace: str
+) -> str:
+    """Upload the development binary of Spec item 7 over the ssh command's standard input."""
+    from . import linkupload
+
+    def run(source: str, timeout: float) -> str:
+        command = ssh(f"{python} -c {shlex.quote(source)}")
+        try:
+            done = subprocess.run(command, capture_output=True, text=True, timeout=timeout)
+        except (OSError, subprocess.TimeoutExpired) as error:
+            raise _fail(alias, f"the ssh upload step failed: {error}") from error
+        return done.stdout + done.stderr
+
+    def push(part: str, local: Path) -> None:
+        command = ssh(f"cat > {shlex.quote(part)}")
+        try:
+            with open(local, "rb") as handle:
+                done = subprocess.run(
+                    command, stdin=handle, capture_output=True, timeout=PREPARE_TIMEOUT
+                )
+        except (OSError, subprocess.TimeoutExpired) as error:
+            raise _fail(alias, f"the ssh upload failed: {error}") from error
+        if done.returncode != 0:
+            tail = done.stderr.decode(errors="replace")[-400:]
+            raise _fail(alias, f"the ssh upload failed: {tail}")
+
+    return linkupload.ensure(alias, upload, workspace=workspace, run=run, push=push)
+
+
 def _binary_path(alias: str, stdout: str, stderr: str) -> str:
     for line in stdout.splitlines():
         if line.startswith("LETIFY-LINK "):
@@ -326,6 +356,8 @@ def connect(
     key_path: str | os.PathLike[str],
     version: str,
     binary: str | None = None,
+    upload: str | None = None,
+    workspace: str = "~",
     punch: bool = False,
     max_rtt_ms: float | None = None,
     min_bps: float | None = None,
@@ -336,9 +368,14 @@ def connect(
     Spec "Sidecar interface" item 7. Every failure raises ``ProviderUnavailable`` with the
     reason; nothing falls back to the ssh data path.
     """
+    def prepare() -> str:
+        if upload:
+            return _upload_over_ssh(alias, ssh, python, upload, workspace)
+        return prepare_binary(alias, ssh, python, version, binary)
+
     return connect_over(
         alias,
-        prepare=lambda: prepare_binary(alias, ssh, python, version, binary),
+        prepare=prepare,
         start=lambda: PopenBootstrap(ssh(f"{python} -u -c {shlex.quote(shim_source())}")),
         address=address,
         python=python,
@@ -360,6 +397,8 @@ def connect_commands(
     key_path: str | os.PathLike[str],
     version: str,
     binary: str | None = None,
+    upload: str | None = None,
+    workspace: str = "~",
     wrap: Callable[[str], str] | None = None,
     max_rtt_ms: float | None = None,
     min_bps: float | None = None,
@@ -375,6 +414,10 @@ def connect_commands(
     from . import linkmailbox
 
     def prepare() -> str:
+        if upload:
+            from . import linkupload
+
+            return linkupload.ensure(alias, upload, workspace=workspace, run=run)
         if binary:
             return binary
         from .. import install
