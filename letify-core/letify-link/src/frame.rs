@@ -24,6 +24,7 @@ const T_PONG: u8 = 0x13;
 const T_PROBE: u8 = 0x14;
 const T_PROBE_ACK: u8 = 0x15;
 const T_KEEPALIVE: u8 = 0x16;
+const T_REKEY: u8 = 0x17;
 
 /// What a sequenced frame does.
 #[derive(Debug)]
@@ -44,8 +45,12 @@ pub(crate) enum Frame {
     /// All frames below `next` have been delivered (the session ack), and `sub` bytes of
     /// sequenced frames arrived on the subflow that carries this frame (the subflow ack).
     Ack { next: u64, sub: u64 },
-    /// The first record of a subflow added to a running session: same meaning as `Ack`.
-    Hello { next: u64 },
+    /// The first record of a subflow added to a running session: same meaning as `Ack`, plus
+    /// `epoch`, the newest epoch of the peer's keys that the sender has switched to.
+    Hello { next: u64, epoch: u16 },
+    /// The sender's next record, on any subflow, is sealed in epoch `next`. The frame itself is
+    /// sealed in the epoch before.
+    Rekey { next: u64 },
     /// Keepalive. `stamp` is the sender's clock in microseconds, returned by the `Pong`.
     Ping { stamp: u64 },
     /// The answer to a `Ping`, carrying its stamp back.
@@ -113,8 +118,15 @@ pub(crate) fn encode_ack(next: u64, sub: u64) -> Vec<u8> {
     out
 }
 
-pub(crate) fn encode_hello(next: u64) -> Vec<u8> {
+pub(crate) fn encode_hello(next: u64, epoch: u16) -> Vec<u8> {
     let mut out = vec![T_HELLO];
+    out.extend_from_slice(&next.to_be_bytes());
+    out.extend_from_slice(&epoch.to_be_bytes());
+    out
+}
+
+pub(crate) fn encode_rekey(next: u64) -> Vec<u8> {
+    let mut out = vec![T_REKEY];
     out.extend_from_slice(&next.to_be_bytes());
     out
 }
@@ -174,7 +186,14 @@ pub(crate) fn decode(buf: Vec<u8>) -> Result<Frame> {
         );
         return Ok(Frame::Ack { next, sub });
     }
-    if t == T_HELLO || t == T_PING || t == T_PONG || t == T_PROBE_ACK || t == T_KEEPALIVE {
+    if t == T_HELLO {
+        let raw = buf.get(1..11).ok_or_else(|| bad("short hello"))?;
+        return Ok(Frame::Hello {
+            next: u64::from_be_bytes(raw[..8].try_into().unwrap()),
+            epoch: u16::from_be_bytes(raw[8..].try_into().unwrap()),
+        });
+    }
+    if t == T_REKEY || t == T_PING || t == T_PONG || t == T_PROBE_ACK || t == T_KEEPALIVE {
         let raw: [u8; 8] = buf
             .get(1..9)
             .ok_or_else(|| bad("short ack"))?
@@ -182,7 +201,7 @@ pub(crate) fn decode(buf: Vec<u8>) -> Result<Frame> {
             .unwrap();
         let next = u64::from_be_bytes(raw);
         return Ok(match t {
-            T_HELLO => Frame::Hello { next },
+            T_REKEY => Frame::Rekey { next },
             T_PING => Frame::Ping { stamp: next },
             T_PROBE_ACK => Frame::ProbeAck { bytes: next },
             T_KEEPALIVE => Frame::Keepalive { ms: next },

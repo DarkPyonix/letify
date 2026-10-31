@@ -55,6 +55,8 @@ type LocalConn = Box<dyn Local>;
 
 /// Read the node secret from `path` (64 hex characters), or create the file with mode 0600.
 pub fn load_or_create_key(path: &str) -> Result<Identity, String> {
+    #[cfg(unix)]
+    check_key_file(path)?;
     match std::fs::read_to_string(path) {
         Ok(text) => {
             let text = text.trim();
@@ -80,6 +82,65 @@ pub fn load_or_create_key(path: &str) -> Result<Identity, String> {
         }
         Err(e) => Err(format!("cannot read {path}: {e}")),
     }
+}
+
+/// Refuse an existing key file that group or others can reach, or that another user owns.
+#[cfg(unix)]
+fn check_key_file(path: &str) -> Result<(), String> {
+    use std::os::unix::fs::MetadataExt;
+    let Ok(meta) = std::fs::metadata(path) else {
+        // A missing file is created later; any other error surfaces when it is read.
+        return Ok(());
+    };
+    if meta.mode() & 0o077 != 0 {
+        return Err(format!(
+            "{path} can be read by group or others (mode {:03o}); run chmod 600 {path}",
+            meta.mode() & 0o777
+        ));
+    }
+    // SAFETY: geteuid takes no arguments and cannot fail.
+    if meta.uid() != unsafe { libc::geteuid() } {
+        return Err(format!(
+            "{path} is not owned by the user running letify-link; run chown to that user and chmod 600 {path}"
+        ));
+    }
+    Ok(())
+}
+
+/// Refuse a directory in which any user could replace a socket: one that everyone can write to
+/// and that does not have the sticky bit, as `/tmp` has. Group write is allowed, because the
+/// default umask 002 with a private group per user gives every new directory that mode.
+#[cfg(unix)]
+fn check_socket_dir(dir: &Path) -> io::Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    let dir = if dir.as_os_str().is_empty() {
+        Path::new(".")
+    } else {
+        dir
+    };
+    let mode = std::fs::metadata(dir)?.mode();
+    if mode & 0o002 != 0 && mode & 0o1000 == 0 {
+        return Err(io::Error::other(format!(
+            "{} can be written by every user and has no sticky bit; use a private directory",
+            dir.display()
+        )));
+    }
+    Ok(())
+}
+
+/// A new directory with mode 0700 inside `parent`, named from random bytes. A socket bound
+/// inside it cannot be reached by anyone else while its own mode is still the default.
+#[cfg(unix)]
+fn private_dir(parent: &Path, tag: &str) -> io::Result<PathBuf> {
+    use std::os::unix::fs::DirBuilderExt;
+    let parent = if parent.as_os_str().is_empty() {
+        Path::new(".")
+    } else {
+        parent
+    };
+    let dir = parent.join(format!(".letify-{tag}-{}", hex(&new_secret()?[..8])));
+    std::fs::DirBuilder::new().mode(0o700).create(&dir)?;
+    Ok(dir)
 }
 
 fn write_private(path: &str, text: &str) -> io::Result<()> {
@@ -269,6 +330,9 @@ struct ListenerEntry {
 struct LocalListener {
     inner: LocalListenerKind,
     address: String,
+    /// The bytes a client must send first. Only a TCP socket has one; a Unix socket is
+    /// limited to its owner by its mode.
+    secret: Option<[u8; 32]>,
 }
 
 enum LocalListenerKind {
@@ -287,12 +351,36 @@ impl Drop for LocalListener {
 }
 
 impl LocalListener {
+    /// Wait for the controlling process. A TCP connection counts only after it has sent the
+    /// stream secret; the others are closed and the wait goes on. Connections are checked
+    /// concurrently, so a connection that stays silent delays no other.
     async fn accept(&self) -> io::Result<LocalConn> {
         match &self.inner {
             LocalListenerKind::Tcp(l) => {
-                let (s, _) = l.accept().await?;
-                s.set_nodelay(true)?;
-                Ok(Box::new(s))
+                let secret = self.secret.unwrap_or([0; 32]);
+                let (tx, mut rx) = mpsc::unbounded_channel();
+                loop {
+                    tokio::select! {
+                        accepted = l.accept() => {
+                            let (s, _) = accepted?;
+                            s.set_nodelay(true)?;
+                            let tx = tx.clone();
+                            tokio::spawn(async move {
+                                let mut s = s;
+                                let mut given = [0u8; 32];
+                                let read = tokio::time::timeout(
+                                    AUTH_TIMEOUT,
+                                    s.read_exact(&mut given),
+                                )
+                                .await;
+                                if matches!(read, Ok(Ok(_))) && same_bytes(&given, &secret) {
+                                    let _ = tx.send(s);
+                                }
+                            });
+                        }
+                        Some(s) = rx.recv() => return Ok(Box::new(s)),
+                    }
+                }
             }
             #[cfg(unix)]
             LocalListenerKind::Unix(l, _) => Ok(Box::new(l.accept().await?.0)),
@@ -334,20 +422,23 @@ impl Shared {
             return Ok(LocalListener {
                 address: format!("unix:{}", path.display()),
                 inner: LocalListenerKind::Unix(l, path),
+                secret: None,
             });
         }
         let l = TcpListener::bind("127.0.0.1:0").await?;
         Ok(LocalListener {
             address: format!("tcp:{}", l.local_addr()?),
             inner: LocalListenerKind::Tcp(l),
+            secret: Some(new_secret()?),
         })
     }
 
     /// Bind a local socket for `stream`, bridge it once the controlling process connects and
     /// return the socket's address.
-    async fn bridge(&self, stream: crate::stream::Stream) -> io::Result<String> {
+    async fn bridge(&self, stream: crate::stream::Stream) -> io::Result<(String, Option<String>)> {
         let listener = self.stream_listener().await?;
         let address = listener.address.clone();
+        let secret = listener.secret.map(|s| hex(&s));
         tokio::spawn(async move {
             let mut stream = stream;
             match tokio::time::timeout(STREAM_CONNECT_WAIT, listener.accept()).await {
@@ -363,7 +454,7 @@ impl Shared {
                 }
             }
         });
-        Ok(address)
+        Ok((address, secret))
     }
 }
 
@@ -402,10 +493,16 @@ fn register(
                     Ok(stream) => {
                         let sid = stream.id();
                         match sh.bridge(stream).await {
-                            Ok(socket) => sh.emit(json!({
-                                "event": "stream_incoming", "session": id,
-                                "stream": sid, "socket": socket,
-                            })),
+                            Ok((socket, secret)) => {
+                                let mut ev = json!({
+                                    "event": "stream_incoming", "session": id,
+                                    "stream": sid, "socket": socket,
+                                });
+                                if let Some(secret) = secret {
+                                    ev["secret"] = json!(secret);
+                                }
+                                sh.emit(ev);
+                            }
                             Err(e) => eprintln!("letify-link: cannot bind a stream socket: {e}"),
                         }
                     }
@@ -511,11 +608,15 @@ async fn handle(shared: &Arc<Shared>, req: &Value) -> OpResult {
             };
             let stream = session.open_stream_with(priority).await?;
             let sid = stream.id();
-            let socket = shared
+            let (socket, secret) = shared
                 .bridge(stream)
                 .await
                 .map_err(|e| infra(format!("cannot bind a stream socket: {e}")))?;
-            Ok(json!({"stream": sid, "socket": socket}))
+            let mut reply = json!({"stream": sid, "socket": socket});
+            if let Some(secret) = secret {
+                reply["secret"] = json!(secret);
+            }
+            Ok(reply)
         }
         "close" => op_close(shared, req).await,
         other => Err(usage(format!("unknown op {other}"))),
@@ -845,18 +946,25 @@ pub async fn serve(opts: ServeOptions, identity: Identity) -> io::Result<()> {
             #[cfg(unix)]
             {
                 let path = PathBuf::from(&opts.control);
+                let parent = path.parent().map(Path::to_path_buf).unwrap_or_default();
+                check_socket_dir(&parent)?;
+                if let Some(dir) = &opts.stream_dir {
+                    check_socket_dir(dir)?;
+                }
+                // Bind inside a directory only this user can enter, then move the socket to
+                // its name, so it is never reachable with the default mode.
+                let hidden = private_dir(&parent, "c")?;
+                let bound = hidden.join("c");
+                let listener = tokio::net::UnixListener::bind(&bound)?;
+                restrict(&bound)?;
                 let _ = std::fs::remove_file(&path);
-                let listener = tokio::net::UnixListener::bind(&path)?;
-                restrict(&path)?;
+                std::fs::rename(&bound, &path)?;
+                let _ = std::fs::remove_dir(&hidden);
                 announce(&node, &format!("unix:{}", path.display()), None);
                 let (conn, _) = listener.accept().await?;
                 drop(listener);
-                let dir = opts
-                    .stream_dir
-                    .clone()
-                    .or_else(|| path.parent().map(Path::to_path_buf))
-                    .unwrap_or_else(|| PathBuf::from("."));
-                (Box::new(conn), Some(dir))
+                let dir = opts.stream_dir.clone().unwrap_or_else(|| parent.clone());
+                (Box::new(conn), Some(private_dir(&dir, "s")?))
             }
             #[cfg(not(unix))]
             unreachable!()
@@ -868,14 +976,24 @@ pub async fn serve(opts: ServeOptions, identity: Identity) -> io::Result<()> {
             // Any local process can connect to a loopback port, so the first message of a
             // connection must carry the token. A connection that fails that is closed and the
             // listener stays open for the right one.
+            // Connections are checked at the same time, so a silent one delays no other.
+            let (won_tx, mut won_rx) = mpsc::unbounded_channel();
             let conn = loop {
-                let (mut conn, _) = listener.accept().await?;
-                conn.set_nodelay(true)?;
-                if tokio::time::timeout(AUTH_TIMEOUT, authenticate(&mut conn, &token))
-                    .await
-                    .unwrap_or(false)
-                {
-                    break conn;
+                tokio::select! {
+                    accepted = listener.accept() => {
+                        let (mut conn, _) = accepted?;
+                        conn.set_nodelay(true)?;
+                        let (token, won) = (token.clone(), won_tx.clone());
+                        tokio::spawn(async move {
+                            if tokio::time::timeout(AUTH_TIMEOUT, authenticate(&mut conn, &token))
+                                .await
+                                .unwrap_or(false)
+                            {
+                                let _ = won.send(conn);
+                            }
+                        });
+                    }
+                    Some(conn) = won_rx.recv() => break conn,
                 }
             };
             drop(listener);
@@ -898,8 +1016,12 @@ pub async fn serve(opts: ServeOptions, identity: Identity) -> io::Result<()> {
         listeners: Mutex::new(HashMap::new()),
         punched: Mutex::new(HashMap::new()),
     });
-    control_loop(shared, rd).await;
+    control_loop(shared.clone(), rd).await;
     writer.abort();
+    #[cfg(unix)]
+    if let Some(dir) = &shared.stream_dir {
+        let _ = std::fs::remove_dir(dir);
+    }
     Ok(())
 }
 
@@ -911,6 +1033,18 @@ fn new_token() -> io::Result<String> {
     let mut bytes = [0u8; 32];
     getrandom::getrandom(&mut bytes).map_err(|e| io::Error::other(e.to_string()))?;
     Ok(hex(&bytes))
+}
+
+/// 32 random bytes from the operating system.
+fn new_secret() -> io::Result<[u8; 32]> {
+    let mut bytes = [0u8; 32];
+    getrandom::getrandom(&mut bytes).map_err(|e| io::Error::other(e.to_string()))?;
+    Ok(bytes)
+}
+
+/// Compare without stopping at the first difference.
+fn same_bytes(a: &[u8; 32], b: &[u8; 32]) -> bool {
+    a.iter().zip(b).fold(0u8, |diff, (x, y)| diff | (x ^ y)) == 0
 }
 
 /// Compare without stopping at the first difference.

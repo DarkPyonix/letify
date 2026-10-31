@@ -206,6 +206,22 @@ pub async fn recv_message<R: Rendezvous>(r: &R) -> io::Result<(NodeId, Message)>
     Ok((from, msg))
 }
 
+/// Like [`recv_message`], but a `Record` must verify and must not be older than the record
+/// `cache` holds for its node. A record the cache refuses is an `InvalidData` error, so a
+/// replayed old record never reaches the caller.
+pub async fn recv_checked<R: Rendezvous>(
+    r: &R,
+    cache: &crate::record::RecordCache,
+) -> io::Result<(NodeId, Message)> {
+    let (from, msg) = recv_message(r).await?;
+    if let Message::Record(bytes) = &msg {
+        cache
+            .accept(bytes, crate::record::unix_now())
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("rendezvous: {e}")))?;
+    }
+    Ok((from, msg))
+}
+
 type Mailbox = mpsc::UnboundedSender<(NodeId, Vec<u8>)>;
 
 /// An in-memory network of rendezvous endpoints, for tests.
@@ -351,5 +367,23 @@ mod tests {
         let (ea, _eb) = (hub.endpoint(a), hub.endpoint(b));
         let err = ea.send(b, vec![0; MAX_MESSAGE + 1]).await.unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    #[tokio::test]
+    async fn a_replayed_old_record_is_refused_by_recv_checked() {
+        use crate::record::{AddressRecord, RecordCache};
+        let hub = MemoryHub::new();
+        let (ida, idb) = (Identity::generate(), Identity::generate());
+        let (a, b) = (ida.node_id(), idb.node_id());
+        let (ea, eb) = (hub.endpoint(a), hub.endpoint(b));
+        let cache = RecordCache::new();
+        for version in [3, 2, 4] {
+            let rec = AddressRecord::new(a, version).encode(&ida);
+            send_message(&ea, b, &Message::Record(rec)).await.unwrap();
+        }
+        assert!(recv_checked(&eb, &cache).await.is_ok());
+        assert!(recv_checked(&eb, &cache).await.is_err());
+        assert!(recv_checked(&eb, &cache).await.is_ok());
+        assert_eq!(cache.get(&a).unwrap().version, 4);
     }
 }
