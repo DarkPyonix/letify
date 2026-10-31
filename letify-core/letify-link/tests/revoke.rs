@@ -204,3 +204,107 @@ async fn a_revoked_node_is_refused_when_it_resumes() {
     assert!(added.is_err());
     assert_eq!(b.subflow_count(), 1);
 }
+
+/// An initiator session to `b` and the responder session, both under no policy of their own,
+/// with `policy` handed to the initiator side.
+async fn initiator_pair(policy: &PeerPolicy) -> (Identity, Identity, Session, Session) {
+    let (a, b) = (Identity::generate(), Identity::generate());
+    let (ta, tb) = duplex_pair();
+    let responder = tokio::spawn({
+        let b = b.clone();
+        async move { Session::accept(tb, &b, PeerPolicy::from_fn(|_| true), Config::default()).await }
+    });
+    let ia = Session::connect(ta, &a, b.node_id(), Config::default())
+        .await
+        .unwrap();
+    let rb = responder.await.unwrap().unwrap();
+    ia.close_when_revoked(policy);
+    (a, b, ia, rb)
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_initiator_session_closes_soon_after_its_peer_is_revoked() {
+    let policy = PeerPolicy::from_fn(|_| true);
+    let (_a, b, ia, rb) = initiator_pair(&policy).await;
+    sleep(Duration::from_millis(100)).await;
+    assert!(!ia.is_closed());
+    policy.revoke(b.node_id());
+    assert!(
+        until(2, || ia.is_closed()).await,
+        "the initiator stays open"
+    );
+    assert_eq!(ia.close_reason().as_deref(), Some("revoked"));
+    assert!(until(2, || rb.is_closed()).await);
+    assert_eq!(rb.close_reason().as_deref(), Some("revoked"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn revoking_another_peer_leaves_an_initiator_session_open() {
+    let policy = PeerPolicy::from_fn(|_| true);
+    let (_a, _b, ia, rb) = initiator_pair(&policy).await;
+    policy.revoke(Identity::generate().node_id());
+    sleep(Duration::from_millis(300)).await;
+    assert!(!ia.is_closed() && !rb.is_closed());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_initiator_session_to_an_already_revoked_peer_closes_at_once() {
+    let policy = PeerPolicy::from_fn(|_| true);
+    let (_a, b, ia, _rb) = initiator_pair(&PeerPolicy::from_fn(|_| true)).await;
+    policy.revoke(b.node_id());
+    ia.close_when_revoked(&policy);
+    assert!(until(2, || ia.is_closed()).await);
+    assert_eq!(ia.close_reason().as_deref(), Some("revoked"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_initiator_watch_composes_with_an_acceptor_on_the_same_policy() {
+    let (c, other) = (Identity::generate(), Identity::generate());
+    let server = Identity::generate();
+    let policy = PeerPolicy::from_fn(|_| true);
+    let acceptor = Arc::new(Acceptor::new(
+        server.clone(),
+        policy.clone(),
+        Config::default(),
+    ));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    // The server dials `other` too, as an initiator under the same policy.
+    let (td, to) = duplex_pair();
+    let other_side = tokio::spawn({
+        let other = other.clone();
+        async move {
+            Session::accept(to, &other, PeerPolicy::from_fn(|_| true), Config::default()).await
+        }
+    });
+    let dialed = Session::connect(td, &server, other.node_id(), Config::default())
+        .await
+        .unwrap();
+    let _other_session = other_side.await.unwrap().unwrap();
+    dialed.close_when_revoked(&policy);
+    let (accepted, client) = tokio::join!(
+        async {
+            let (tcp, _) = listener.accept().await.unwrap();
+            acceptor.accept(tcp).await.unwrap()
+        },
+        async {
+            let tcp = TcpStream::connect(addr).await.unwrap();
+            Session::connect(tcp, &c, server.node_id(), Config::default())
+                .await
+                .unwrap()
+        }
+    );
+    let Accepted::Session(served) = accepted else {
+        panic!("a handshake is not a subflow");
+    };
+    acceptor.revoke(c.node_id());
+    assert!(until(2, || served.is_closed() && client.is_closed()).await);
+    sleep(Duration::from_millis(200)).await;
+    assert!(
+        !dialed.is_closed(),
+        "a revoke of c must not close the dial to other"
+    );
+    policy.revoke(other.node_id());
+    assert!(until(2, || dialed.is_closed()).await);
+    assert_eq!(dialed.close_reason().as_deref(), Some("revoked"));
+}

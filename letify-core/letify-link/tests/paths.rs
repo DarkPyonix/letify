@@ -697,3 +697,30 @@ async fn a_black_hole_candidate_does_not_delay_the_start_on_a_good_one() {
     assert_eq!(server_session.peer(), rig.client.node_id().canonical());
     held.abort();
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_path_manager_session_closes_when_its_peer_is_revoked() {
+    let rig = rig(Config::default()).await;
+    let mut pm = PathManager::start(
+        rig.client.clone(),
+        rig.server.node_id(),
+        vec![Candidate::tcp("only", rig.target)],
+        Config::default(),
+        quick(),
+    )
+    .await
+    .unwrap();
+    let policy = letify_link::PeerPolicy::from_fn(|_| true);
+    pm.close_when_revoked(&policy);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(!pm.session().is_closed());
+    policy.revoke(rig.server.node_id());
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while !pm.session().is_closed() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the manager's session closes");
+    assert_eq!(pm.session().close_reason().as_deref(), Some("revoked"));
+}
