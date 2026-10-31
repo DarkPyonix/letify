@@ -875,7 +875,44 @@ def kaggle_account(answers: Answers) -> dict[str, Any]:
 
 
 #: The prompt for the token when ``--connect`` is not given.
-TOKEN_PROMPT = "Token printed by 'letify client shell connect': "
+TOKEN_PROMPT = "Token printed by 'letify agent serve' or 'letify client shell connect': "
+
+
+def link_tunnel_account(answers: Answers, token: str) -> dict[str, Any]:
+    """Pair this machine with the agent of a token v2 and record the agent and the service.
+
+    No ssh and no Tailcat: the pairing travels through the signalling service, signed by the
+    account's own node key ``link.key``. Spec "Agent and pairing" items 3 and 8.
+    """
+    import socket
+
+    from ..transport import linkagent, linkd, linksignal
+
+    def failed(step: str, reason: object) -> LoginError:
+        return LoginError(f"tunnel login failed at {step}: {reason}")
+
+    try:
+        fields = linkagent.parse_token(token)
+    except linkagent.TokenError as exc:
+        raise failed("token", exc) from None
+    directory = secrets.account_directory(answers.alias)
+    directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+    try:
+        daemon = linkd.LinkDaemon(directory / "link.key")
+    except linkd.LinkError as exc:
+        raise failed("sidecar", exc) from None
+    try:
+        label = f"{getpass.getuser()}@{socket.gethostname()}"
+        client = linksignal.SignalClient(daemon, fields.signal)
+        linkagent.pair(client, fields, label=label)
+    except (linkagent.AgentError, linksignal.SignalError) as exc:
+        raise failed("pairing", exc) from None
+    finally:
+        daemon.close()
+    options: dict[str, Any] = {"kind": "tunnel", "agent": fields.agent, "signal": fields.signal}
+    if answers.get("persistent") is not None:
+        options["persistent"] = bool(answers.get("persistent"))
+    return options
 
 
 def tunnel_account(answers: Answers) -> dict[str, Any]:
@@ -885,18 +922,10 @@ def tunnel_account(answers: Answers) -> dict[str, Any]:
     account is written with no address. A failure at any step names the step.
     """
     from ..install import InstallError, ensure
-    from ..transport import setup
+    from ..transport import linkagent, setup
 
     def failed(step: str, reason: object) -> LoginError:
         return LoginError(f"tunnel login failed at {step}: {reason}")
-
-    try:
-        tailcat = ensure(
-            "tailcat",
-            instructions=setup.tailcat_install_instructions(),
-        )
-    except InstallError as exc:
-        raise failed("tailcat", exc) from None
 
     token = answers.get("connect")
     if not (isinstance(token, str) and token):
@@ -906,6 +935,16 @@ def tunnel_account(answers: Answers) -> dict[str, Any]:
                 f"{answers.alias} needs the token. Pass --connect <token> or drop --no-input.",
             )
         token = read_line(TOKEN_PROMPT)
+    if token.strip().startswith(linkagent.PREFIX):
+        return link_tunnel_account(answers, token.strip())
+
+    try:
+        tailcat = ensure(
+            "tailcat",
+            instructions=setup.tailcat_install_instructions(),
+        )
+    except InstallError as exc:
+        raise failed("tailcat", exc) from None
     try:
         fields = setup.decode_token(token)
     except ValueError as exc:

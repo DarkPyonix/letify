@@ -134,7 +134,7 @@ def build_parser() -> argparse.ArgumentParser:
     log_in.add_argument(
         "--connect",
         metavar="TOKEN",
-        help="the token 'letify client shell connect' printed, for tunnel",
+        help="the token 'letify agent serve' or 'letify client shell connect' printed, for tunnel",
     )
     log_in.add_argument(
         "--cookie",
@@ -265,7 +265,107 @@ def build_parser() -> argparse.ArgumentParser:
         "--name", help="the alias the printed login command names; defaults to the host name"
     )
 
+    agent = sub.add_parser(
+        "agent",
+        help="run the persistent agent of an address-less machine, reached by signalling",
+    )
+    agent_sub = agent.add_subparsers(dest="agent_command", required=True)
+    serve = agent_sub.add_parser(
+        "serve", help="serve the paired nodes and print a token to pair another one"
+    )
+    serve.add_argument(
+        "--signal",
+        metavar="URL",
+        help="the signalling service; defaults to LETIFY_SIGNAL_URL, then agent/config.toml",
+    )
+    serve.add_argument(
+        "--max-conversations",
+        dest="max_conversations",
+        type=int,
+        default=4,
+        help="how many nodes may have a running shim at once",
+    )
+    serve.add_argument("--name", help="the alias the printed login command names")
+    unpair = agent_sub.add_parser("unpair", help="stop serving a paired node")
+    unpair.add_argument("node", help="the node id, or a prefix of at least 8 characters")
+    agent_sub.add_parser("paired", help="list the paired nodes")
+
     return parser
+
+
+def _agent_command(args: argparse.Namespace) -> int:
+    """``letify agent serve|unpair|paired``. Spec "Agent and pairing" items 4 to 9."""
+    import signal as signals
+    import time
+
+    from .transport import linkagent
+
+    home = linkagent.AgentHome()
+    if args.agent_command == "paired":
+        nodes = home.paired.nodes()
+        for node, entry in sorted(nodes.items(), key=lambda item: item[1].get("at", 0)):
+            when = time.strftime("%Y-%m-%d %H:%M", time.localtime(entry.get("at", 0)))
+            print(f"{node}  {when}  {entry.get('label', '')}")
+        if not nodes:
+            print("no paired nodes")
+        return 0
+    if args.agent_command == "unpair":
+        try:
+            node = home.paired.remove(args.node)
+        except linkagent.AgentError as exc:
+            _fail(str(exc))
+            return 1
+        _say("ok", f"unpaired {node}")
+        return 0
+
+    from .protocol.worker import BOOTSTRAP
+    from .runtime.channel import relay_program
+    from .transport import linkd, linksignal
+
+    try:
+        url = linkagent.signal_url(home, args.signal)
+        binary = linkd.require_binary()
+        daemon = linkagent.open_daemon(home, binary=binary)
+    except (linkagent.AgentError, linkd.LinkError) as exc:
+        _fail(str(exc))
+        return 1
+
+    def log(line: str) -> None:
+        print(f"{time.strftime('%Y-%m-%d %H:%M:%S')} {line}", file=sys.stderr, flush=True)
+
+    service = linkagent.AgentService(
+        linksignal.SignalClient(daemon, url),
+        home,
+        binary=str(binary),
+        python=sys.executable,
+        bootstrap=BOOTSTRAP,
+        relay=relay_program(),
+        log=log,
+        max_conversations=args.max_conversations,
+    )
+    token = service.new_token(url)
+    alias = args.name or setup_default_alias()
+    style = _out()
+    print(style.bold("On your own machine, within 15 minutes, run:"))
+    print()
+    print(f"  letify login tunnel {alias} --connect {token}")
+    print()
+    print(style.dim(f"Agent {daemon.node_id[:12]} serves through {url}. It needs no ssh server."))
+    print(style.dim("Keep it running: tmux new -s letify 'letify agent serve'"))
+    sys.stdout.flush()
+    for number in (signals.SIGTERM, signals.SIGINT):
+        signals.signal(number, lambda *_: service.stop())
+    try:
+        service.serve()
+    finally:
+        daemon.close()
+    return 0
+
+
+def setup_default_alias() -> str:
+    from .transport import setup
+
+    return setup.default_alias()
 
 
 def _client_shell_connect(args: argparse.Namespace) -> int:
@@ -821,6 +921,10 @@ def _dispatch(args: argparse.Namespace) -> int:
     if args.command in ("runs", "interrupt", "exec", "takeover"):
         # Talks to the process that owns the run, so no Launcher is built.
         return _run_control(args)
+
+    if args.command == "agent":
+        # Runs on the address-less machine, which has no accounts, so no Launcher is built.
+        return _agent_command(args)
 
     if args.command == "client":
         # Runs on the remote machine, which has no accounts, so no Launcher is built.

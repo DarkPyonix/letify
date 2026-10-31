@@ -616,6 +616,24 @@ class SignalAgent:
             with contextlib.suppress(OSError):
                 session.proc.kill()
 
+    @property
+    def alive(self) -> bool:
+        """Whether this agent's shim is running."""
+        session = self._session
+        return session is not None and session.proc is not None and session.proc.poll() is None
+
+    def kill(self) -> None:
+        """End the shim even after the hand-over, which ``stop`` leaves to finish."""
+        self._stop.set()
+        session = self._session
+        if session is not None and session.proc is not None:
+            with contextlib.suppress(OSError):
+                session.proc.kill()
+
+    def handle(self, message: Incoming) -> None:
+        """Take one message of the mailbox, for a caller that owns the read loop."""
+        self._handle(message)
+
     def _handle(self, message: Incoming) -> None:
         if message.sender not in self._paired:
             self._drop(f"a message from {message.sender[:12]} which is not paired")
