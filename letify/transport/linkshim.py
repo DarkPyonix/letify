@@ -16,6 +16,7 @@ import json
 import os
 import queue
 import re
+import shlex
 import signal
 import socket
 import struct
@@ -177,7 +178,8 @@ class Shim:
             self.sessions[session].discard(event["name"])
             self.last_path = time.monotonic()
         elif name == "stream_incoming" and session in self.sessions:
-            threading.Thread(target=self.serve_stream, args=(event["socket"], event.get("secret")), daemon=True).start()
+            args = (event["socket"], event.get("secret"))
+            threading.Thread(target=self.serve_stream, args=args, daemon=True).start()
         elif name == "session_closed" and session in self.sessions:
             del self.sessions[session]
             return not self.sessions
@@ -235,10 +237,17 @@ class Shim:
     def serve_socket(self, sock):
         header = self.read_header(sock)
         kind = header.get("kind") if header else None
+        shell = False
         if kind == "worker":
             command = [self.config["python"], "-u", "-c", self.config["bootstrap"]]
+            if self.config.get("worker_command"):
+                # The provider's wrapper (driver library path, environment) is part of the command.
+                command, shell = self.config["worker_command"], True
         elif kind == "door" and isinstance(header.get("path"), str):
             command = [self.config["python"], "-c", self.config["relay"], header["path"]]
+            if self.config.get("relay_command"):
+                command = "%s %s" % (self.config["relay_command"], shlex.quote(header["path"]))
+                shell = True
         elif kind == "stderr":
             self.send_tail(sock, header["token"])
             return
@@ -246,7 +255,7 @@ class Shim:
             sock.close()
             return
         log = open(self.log_path(header["token"]), "wb")
-        proc = subprocess.Popen(command, stdin=sock, stdout=sock, stderr=log)
+        proc = subprocess.Popen(command, stdin=sock, stdout=sock, stderr=log, shell=shell)
         sock.close()
         log.close()
         threading.Thread(target=proc.wait, daemon=True).start()

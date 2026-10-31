@@ -574,14 +574,9 @@ class Shell(Provider):
         Spec "Sidecar interface" item 7: ``link = "letify-link"`` opts in, and the default,
         ``"ssh"``, keeps the ssh data path.
         """
-        value = self.config.option("link", "ssh")
-        if value in (None, "ssh"):
-            return False
-        if value == "letify-link":
-            return True
-        raise ProviderUnavailable(
-            self.kind, f'{self.alias} sets link = {value!r}; use "ssh" or "letify-link"'
-        )
+        from ..transport.linkchannel import letify_link_enabled
+
+        return letify_link_enabled(self)
 
     def link_remote(self, runtime: Runtime | None = None) -> Any:
         """The connected letify-link session to this machine, bootstrapped over ssh once."""
@@ -592,6 +587,11 @@ class Shell(Provider):
             return remote
         if remote is not None:
             remote.close()
+        remotes[key] = self.connect_link(runtime)
+        return remotes[key]
+
+    def connect_link(self, runtime: Runtime | None = None) -> Any:
+        """Bootstrap a new letify-link session to this machine; a provider may do it otherwise."""
         import letify
 
         from ..config.secrets import account_directory
@@ -615,7 +615,7 @@ class Shell(Provider):
         directory.mkdir(mode=0o700, parents=True, exist_ok=True)
         floor = self.link_floor
         binary = self.config.option("link_binary")
-        remotes[key] = linkchannel.connect(
+        return linkchannel.connect(
             self.alias,
             ssh=ssh,
             address=address,
@@ -628,7 +628,6 @@ class Shell(Provider):
             max_rtt_ms=floor.max_rtt_ms,
             min_bps=floor.min_bps,
         )
-        return remotes[key]
 
     # -- sessions ------------------------------------------------------------
 
