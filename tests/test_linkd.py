@@ -94,6 +94,9 @@ def test_32_mib_both_ways_over_a_stream_arrives_intact(pair):
     assert got["b"] == hashlib.sha256(up).hexdigest()
     assert got["a"] == hashlib.sha256(down).hexdigest()
     assert len(session_a.paths()) == 1
+    # The side that dialed knows the kind of its subflow; the side that accepted does not.
+    assert [p["kind"] for p in session_a.paths()] == ["tcp"]
+    assert [p["kind"] for p in session_b.paths()] == [None]
     sock_a.close()
     sock_b.close()
 

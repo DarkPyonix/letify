@@ -29,7 +29,9 @@ use crate::config::Config;
 use crate::error::Error;
 use crate::identity::{Identity, NodeId, PeerPolicy};
 use crate::observe::AddressObserver;
-use crate::paths::{BoxTransport, Candidate, ManagerConfig, PathEvent, PathManager};
+use crate::paths::{
+    BoxTransport, Candidate, ManagerConfig, PathEvent, PathKind, PathKinds, PathManager,
+};
 use crate::plan;
 use crate::policing::{self, Verdict};
 use crate::punch::{self, Plan};
@@ -324,6 +326,8 @@ fn manager_config(req: &Value) -> Result<ManagerConfig, OpError> {
 
 struct SessionEntry {
     session: Session,
+    /// Which kind each subflow runs on, known only for a session this side started.
+    kinds: Option<PathKinds>,
     tasks: Vec<AbortHandle>,
 }
 
@@ -480,6 +484,7 @@ fn register(
     let id = shared.next_session.fetch_add(1, Ordering::Relaxed) + 1;
     let mut tasks = Vec::new();
     let peer = session.peer();
+    let kinds = manager.as_ref().map(PathManager::kinds);
     if let Some(mut manager) = manager {
         let sh = shared.clone();
         tasks.push(
@@ -523,7 +528,14 @@ fn register(
         })
         .abort_handle(),
     );
-    lock(&shared.sessions).insert(id, SessionEntry { session, tasks });
+    lock(&shared.sessions).insert(
+        id,
+        SessionEntry {
+            session,
+            kinds,
+            tasks,
+        },
+    );
     if let Some(l) = listener {
         shared.emit(json!({
             "event": "session_incoming", "listener": l, "session": id, "peer": peer.to_string(),
@@ -586,13 +598,22 @@ async fn handle(shared: &Arc<Shared>, req: &Value) -> OpResult {
         }
         "paths" => {
             let session = session_of(shared, req)?;
+            let kinds = lock(&shared.sessions)
+                .get(&u64_field(req, "session")?)
+                .and_then(|e| e.kinds.clone());
+            let kind_of = |id| match kinds.as_ref().and_then(|k| k.of(id)) {
+                Some(PathKind::Tcp) => json!("tcp"),
+                Some(PathKind::Udp) => json!("udp"),
+                Some(PathKind::Relay) => json!("relay"),
+                None => Value::Null,
+            };
             let ms = |d: Option<Duration>| d.map(|d| d.as_secs_f64() * 1000.0);
             let paths: Vec<Value> = session
                 .subflow_stats()
                 .into_iter()
                 .map(|s| {
                     json!({
-                        "id": s.id, "sent_bytes": s.sent_bytes,
+                        "id": s.id, "kind": kind_of(s.id), "sent_bytes": s.sent_bytes,
                         "received_bytes": s.received_bytes, "acked_bytes": s.acked_bytes,
                         "rtt_ms": ms(s.rtt), "srtt_ms": ms(s.srtt),
                         "window": s.window, "probe_rate": s.probe_rate,

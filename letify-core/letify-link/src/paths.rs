@@ -317,6 +317,20 @@ fn emit(events: &Events, ev: PathEvent) {
     events.emit(ev);
 }
 
+/// A shared view of which transport kind each live subflow of a manager's session runs on.
+#[derive(Clone)]
+pub struct PathKinds(Arc<Mutex<Table>>);
+
+impl PathKinds {
+    /// The kind of the candidate that owns subflow `id`, or `None` when no candidate does.
+    pub fn of(&self, id: SubflowId) -> Option<PathKind> {
+        let t = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        (0..t.subflow.len())
+            .find(|&i| t.subflow[i] == Some(id))
+            .map(|i| t.kinds[i])
+    }
+}
+
 /// A session started and kept alive over a set of candidate paths.
 pub struct PathManager {
     session: Session,
@@ -474,6 +488,11 @@ impl PathManager {
             probe,
             cfg,
         })
+    }
+
+    /// A handle that names the kind of each live subflow, and outlives moving the manager.
+    pub fn kinds(&self) -> PathKinds {
+        PathKinds(self.table.clone())
     }
 
     /// The session. Dropping every handle to it, the manager's included, closes it.
