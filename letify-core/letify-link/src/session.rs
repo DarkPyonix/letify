@@ -2003,6 +2003,11 @@ impl Session {
             st.closing = true;
             st.close_reason = reason.map(|r| frame::cut_reason(r).to_string());
             st.want_close();
+            // A local close ends the waits on this side as the peer's Close frame ends them
+            // on the other: a pending accept, and a read or write that waits on a stream.
+            st.wake_all_streams();
+            drop(st);
+            self.shared().accept.notify_waiters();
         }
     }
 

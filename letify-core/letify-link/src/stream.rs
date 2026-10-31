@@ -50,7 +50,7 @@ impl AsyncRead for Stream {
     ) -> Poll<io::Result<()>> {
         let mut st = self.guard.shared.lock();
         let id = self.id;
-        let (remote_closed, failed) = (st.remote_closed, st.failed.clone());
+        let (remote_closed, failed) = (st.remote_closed || st.closing, st.failed.clone());
         let Some(s) = st.streams.get_mut(&id) else {
             return Poll::Ready(Ok(()));
         };
