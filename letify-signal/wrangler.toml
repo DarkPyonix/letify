@@ -1,0 +1,26 @@
+# The letify signalling service. Replace the placeholders, then follow README.md.
+name = "letify-signal"
+main = "src/index.ts"
+compatibility_date = "2025-09-01"
+# Placeholder: the id of the Cloudflare account that owns darkpyonix.dev.
+account_id = "REPLACE_WITH_ACCOUNT_ID"
+workers_dev = false
+
+# Placeholder route. A custom domain needs darkpyonix.dev to be a zone of the account above.
+# To use a route on an existing zone instead, replace this line with
+#   routes = [{ pattern = "letify.darkpyonix.dev/*", zone_name = "darkpyonix.dev" }]
+routes = [{ pattern = "letify.darkpyonix.dev", custom_domain = true }]
+
+[durable_objects]
+bindings = [
+  { name = "MAILBOX", class_name = "Mailbox" },
+  { name = "LIMITER", class_name = "Limiter" },
+]
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["Mailbox", "Limiter"]
+
+[observability]
+# The service logs no message content and no node id, and Workers logs stay off.
+enabled = false

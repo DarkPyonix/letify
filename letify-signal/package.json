@@ -1,0 +1,21 @@
+{
+  "name": "letify-signal",
+  "version": "0.1.0",
+  "private": true,
+  "description": "The letify signalling service: one Durable Object mailbox per node id, for signed bootstrap lines.",
+  "license": "SEE LICENSE IN ../LICENSE",
+  "type": "module",
+  "scripts": {
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit",
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^5.20261023.1",
+    "@types/node": "^18.19.0",
+    "typescript": "^5.6.3",
+    "vitest": "^2.1.9",
+    "wrangler": "^4.0.0"
+  }
+}
