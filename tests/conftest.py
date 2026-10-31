@@ -2202,3 +2202,182 @@ def quick_link_probe(monkeypatch):
             return 0.05
 
     monkeypatch.setattr(linkchannel, "make_probe", lambda: Quick(round_trips=5, seconds=0.2))
+
+
+# -- the signalling service ----------------------------------------------------------------
+
+
+class FakeSignalService:
+    """An in-process signalling service with the contract of Spec "Signalling service".
+
+    It verifies every request with a real sidecar (``verifier``), so it applies the same
+    canonical-key and strict-signature rules as letify-link, and it keeps mailboxes in memory.
+    Real Cloudflare is the only thing it stands in for. ``clock`` is the service clock,
+    ``rewrite`` lets a test act as a malicious service by changing a stored message, and
+    ``requests`` records (method, path without query, status) of every request.
+    """
+
+    MAX_BODY = 4096
+    TTL_S = 60
+    DEPTH = 32
+    WINDOW_S = 60
+
+    def __init__(self, verifier: Any) -> None:
+        import http.server
+        import time as _time
+
+        self.verifier = verifier
+        self.clock = _time.time
+        self.rewrite: Any = None
+        self.requests: list[tuple[str, str, int]] = []
+        #: The byte length of every message body the service accepted.
+        self.sizes: list[int] = []
+        self._boxes: dict[str, list[dict[str, Any]]] = {}
+        self._counters: dict[str, int] = {}
+        self._nonces: dict[str, float] = {}
+        self._cond = threading.Condition()
+        service = self
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def log_message(self, *args: Any) -> None:
+                pass
+
+            def do_GET(self) -> None:
+                service._serve(self, "GET")
+
+            def do_POST(self) -> None:
+                service._serve(self, "POST")
+
+        self._server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self._server.daemon_threads = True
+        self.url = f"http://127.0.0.1:{self._server.server_address[1]}"
+        threading.Thread(target=self._server.serve_forever, daemon=True).start()
+
+    def close(self) -> None:
+        self._server.shutdown()
+        self._server.server_close()
+
+    def waiting(self, node: str) -> int:
+        with self._cond:
+            return len(self._boxes.get(node, []))
+
+    def _reply(self, h: Any, status: int, payload: dict[str, Any]) -> None:
+        data = json.dumps(payload).encode()
+        h.send_response(status)
+        h.send_header("Content-Type", "application/json")
+        h.send_header("Content-Length", str(len(data)))
+        h.end_headers()
+        h.wfile.write(data)
+        self.requests.append((h.command, h.path.split("?")[0], status))
+
+    def _fail(self, h: Any, status: int, code: str) -> None:
+        self._reply(h, status, {"ok": False, "error": code})
+
+    def _serve(self, h: Any, method: str) -> None:
+        import hashlib
+        import re
+        import urllib.parse
+
+        url = urllib.parse.urlsplit(h.path)
+        if url.path == "/v1/health":
+            return self._reply(h, 200, {"ok": True, "v": 1})
+        match = re.fullmatch(r"/v1/(send|recv)/([^/]+)", url.path)
+        if match is None:
+            return self._fail(h, 404, "not_found")
+        kind, target = match.groups()
+        if method != ("POST" if kind == "send" else "GET"):
+            return self._fail(h, 405, "method_not_allowed")
+        length = int(h.headers.get("Content-Length") or 0)
+        if length > self.MAX_BODY:
+            return self._fail(h, 413, "too_large")
+        body = h.rfile.read(length) if length else b""
+        node = h.headers.get("X-Letify-Node")
+        stamp = h.headers.get("X-Letify-Time")
+        nonce = h.headers.get("X-Letify-Nonce")
+        signature = h.headers.get("X-Letify-Signature")
+        if None in (node, stamp, nonce, signature):
+            return self._fail(h, 400, "bad_request")
+        assert node and stamp and nonce and signature
+        if not (
+            re.fullmatch(r"[0-9]{1,12}", stamp)
+            and re.fullmatch(r"[0-9a-f]{32}", nonce)
+            and re.fullmatch(r"[0-9a-f]{128}", signature)
+            and re.fullmatch(r"[0-9a-f]{64}", node)
+        ):
+            return self._fail(h, 400, "bad_request")
+        if abs(int(stamp) - self.clock()) > self.WINDOW_S:
+            return self._fail(h, 401, "stale")
+        text = f"{method}\n{h.path}\n{stamp}\n{nonce}\n{hashlib.sha256(body).hexdigest()}"
+        try:
+            valid = self.verifier.verify(
+                node, "letify-signal v1", text.encode(), bytes.fromhex(signature)
+            )
+        except Exception:
+            return self._fail(h, 400, "bad_key")
+        if not valid:
+            return self._fail(h, 401, "bad_signature")
+        with self._cond:
+            now = self.clock()
+            self._nonces = {n: t for n, t in self._nonces.items() if now - t <= 2 * self.WINDOW_S}
+            if f"{node}:{nonce}" in self._nonces:
+                return self._fail(h, 401, "replay")
+            self._nonces[f"{node}:{nonce}"] = now
+        if kind == "send":
+            return self._send(h, node, target, body)
+        if target != node:
+            return self._fail(h, 403, "forbidden")
+        query = urllib.parse.parse_qs(url.query)
+        after = int(query.get("after", ["0"])[0])
+        wait = min(float(query.get("wait", ["25"])[0]), 25.0)
+        self._recv(h, node, after, wait)
+
+    def _send(self, h: Any, sender: str, to: str, body: bytes) -> None:
+        import base64 as b64
+
+        if not body:
+            return self._fail(h, 400, "bad_request")
+        with self._cond:
+            box = self._boxes.setdefault(to, [])
+            now = self.clock()
+            box[:] = [m for m in box if m["at"] + self.TTL_S > now]
+            if len(box) >= self.DEPTH:
+                return self._fail(h, 429, "mailbox_full")
+            seq = self._counters.get(to, 0) + 1
+            self._counters[to] = seq
+            stored = self.rewrite(body) if self.rewrite else body
+            box.append(
+                {"seq": seq, "from": sender, "at": int(now), "body": b64.b64encode(stored).decode()}
+            )
+            self.sizes.append(len(body))
+            self._cond.notify_all()
+        self._reply(h, 202, {"ok": True, "seq": seq})
+
+    def _recv(self, h: Any, node: str, after: int, wait: float) -> None:
+        import time as _time
+
+        deadline = _time.monotonic() + wait
+        with self._cond:
+            while True:
+                box = self._boxes.setdefault(node, [])
+                box[:] = [m for m in box if m["seq"] > after]
+                now = self.clock()
+                box[:] = [m for m in box if m["at"] + self.TTL_S > now]
+                if box or _time.monotonic() >= deadline:
+                    messages = [dict(m) for m in box]
+                    break
+                self._cond.wait(timeout=max(0.0, deadline - _time.monotonic()))
+            cursor = self._counters.get(node, 0)
+        self._reply(h, 200, {"messages": messages, "cursor": cursor})
+
+
+@pytest.fixture
+def signal_service(sidecar_binary, tmp_path: Path):
+    from letify.transport import linkd
+
+    verifier = linkd.LinkDaemon(tmp_path / "service.key", binary=sidecar_binary)
+    service = FakeSignalService(verifier)
+    try:
+        yield service
+    finally:
+        service.close()
+        verifier.close()

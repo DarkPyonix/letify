@@ -651,8 +651,51 @@ async fn handle(shared: &Arc<Shared>, req: &Value) -> OpResult {
             Ok(reply)
         }
         "close" => op_close(shared, req).await,
+        "sign" => {
+            let bytes = signed_bytes(req)?;
+            Ok(json!({"signature": hex(&shared.identity.sign(&bytes))}))
+        }
+        "verify" => {
+            let node = node_id(str_field(req, "node")?)?;
+            let bytes = signed_bytes(req)?;
+            let signature: [u8; 64] = unhex(str_field(req, "signature")?)
+                .and_then(|s| s.try_into().ok())
+                .ok_or_else(|| usage("signature must be 128 hex characters"))?;
+            Ok(json!({"valid": node.verify(&bytes, &signature)}))
+        }
         other => Err(usage(format!("unknown op {other}"))),
     }
+}
+
+/// The domain prefix every signature of the `sign` and `verify` ops must start with. It keeps
+/// the node key from signing a handshake, an address record or anything else it is used for.
+const SIGN_DOMAIN_PREFIX: &str = "letify-signal ";
+/// The longest domain, in characters.
+const SIGN_DOMAIN_MAX: usize = 64;
+/// The longest message to sign, in bytes.
+const SIGN_MESSAGE_MAX: usize = 8192;
+
+/// The bytes a signature covers: the domain, a newline, then the message.
+fn signed_bytes(req: &Value) -> Result<Vec<u8>, OpError> {
+    let domain = str_field(req, "domain")?;
+    let printable = domain.bytes().all(|b| (0x20..0x7f).contains(&b));
+    if !printable || !domain.starts_with(SIGN_DOMAIN_PREFIX) || domain.len() > SIGN_DOMAIN_MAX {
+        return Err(usage(format!(
+            "domain must be printable ASCII of at most {SIGN_DOMAIN_MAX} characters and start with {SIGN_DOMAIN_PREFIX:?}"
+        )));
+    }
+    let message = unhex(str_field(req, "message")?).ok_or_else(|| usage("message is not hex"))?;
+    if message.len() > SIGN_MESSAGE_MAX {
+        return Err(usage(format!(
+            "message is over {SIGN_MESSAGE_MAX} bytes: {}",
+            message.len()
+        )));
+    }
+    let mut bytes = Vec::with_capacity(domain.len() + 1 + message.len());
+    bytes.extend_from_slice(domain.as_bytes());
+    bytes.push(b'\n');
+    bytes.extend_from_slice(&message);
+    Ok(bytes)
 }
 
 async fn op_listen(shared: &Arc<Shared>, req: &Value) -> OpResult {

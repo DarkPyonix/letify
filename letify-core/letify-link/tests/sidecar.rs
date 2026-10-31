@@ -1127,3 +1127,122 @@ async fn a_successful_punch_reply_carries_the_report() {
     let report = ra["report"].as_str().unwrap();
     assert!(report.starts_with("here: NAT endpoint_independent, offered tcp 2 (0 predicted) udp 1; there: NAT endpoint_independent, offered tcp 2 udp 1"), "{report}");
 }
+
+// -- Signing for the signalling service ------------------------------------------------------
+
+const SIGNAL_DOMAIN: &str = "letify-signal v1";
+
+fn hex_of(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+#[tokio::test]
+async fn a_signature_by_the_sidecar_verifies_under_its_node_id_in_another_sidecar() {
+    let mut a = Sidecar::start(None).await;
+    let mut b = Sidecar::start(None).await;
+    let message = hex_of(b"POST\n/v1/send/x\n1700000000");
+    let signed = a
+        .ok(json!({"op": "sign", "domain": SIGNAL_DOMAIN, "message": message}))
+        .await;
+    let signature = signed["signature"].as_str().unwrap().to_string();
+    assert_eq!(signature.len(), 128);
+    let check = |node: &str, message: &str, signature: &str| {
+        json!({"op": "verify", "node": node, "domain": SIGNAL_DOMAIN,
+               "message": message, "signature": signature})
+    };
+    let good = b.ok(check(&a.node_id, &message, &signature)).await;
+    assert_eq!(good["valid"], true);
+    // Another message, another signer and another domain each fail to verify.
+    let other = hex_of(b"POST\n/v1/send/y\n1700000000");
+    assert_eq!(
+        b.ok(check(&a.node_id, &other, &signature)).await["valid"],
+        false
+    );
+    assert_eq!(
+        b.ok(check(&b.node_id.clone(), &message, &signature)).await["valid"],
+        false
+    );
+    let moved = json!({"op": "verify", "node": a.node_id, "domain": "letify-signal line v1",
+                       "message": message, "signature": signature});
+    assert_eq!(b.ok(moved).await["valid"], false);
+    // A flipped bit in the signature is refused as well.
+    let mut flipped = signature.into_bytes();
+    flipped[0] = if flipped[0] == b'0' { b'1' } else { b'0' };
+    let flipped = String::from_utf8(flipped).unwrap();
+    assert_eq!(
+        b.ok(check(&a.node_id, &message, &flipped)).await["valid"],
+        false
+    );
+}
+
+#[tokio::test]
+async fn a_signature_is_plain_ed25519_over_the_domain_a_newline_and_the_message() {
+    use ed25519_dalek::{Signature, VerifyingKey};
+    let mut a = Sidecar::start(None).await;
+    let signed = a
+        .ok(json!({"op": "sign", "domain": SIGNAL_DOMAIN, "message": hex_of(b"hello")}))
+        .await;
+    let signature = unhex(signed["signature"].as_str().unwrap());
+    let node = unhex(&a.node_id);
+    let key = VerifyingKey::from_bytes(node.as_slice().try_into().unwrap()).unwrap();
+    let signature = Signature::from_bytes(signature.as_slice().try_into().unwrap());
+    key.verify_strict(b"letify-signal v1\nhello", &signature)
+        .expect("the signature is over domain, newline, message");
+}
+
+#[tokio::test]
+async fn the_sidecar_signs_only_inside_the_signalling_domains() {
+    let mut a = Sidecar::start(None).await;
+    for domain in [
+        "letify-link record v2",
+        "",
+        "letify-signal",
+        "other",
+        "letify-signal v1\nsmuggled",
+    ] {
+        let r = a
+            .call(json!({"op": "sign", "domain": domain, "message": "00"}))
+            .await;
+        assert_eq!(r["ok"], false, "signed under {domain:?}");
+        assert_eq!(r["kind"], "usage");
+    }
+    let long = format!("letify-signal {}", "x".repeat(60));
+    let r = a
+        .call(json!({"op": "sign", "domain": long, "message": "00"}))
+        .await;
+    assert_eq!(r["kind"], "usage");
+    let big = "00".repeat(8193);
+    let r = a
+        .call(json!({"op": "sign", "domain": SIGNAL_DOMAIN, "message": big}))
+        .await;
+    assert_eq!(r["kind"], "usage");
+    let r = a
+        .call(json!({"op": "sign", "domain": SIGNAL_DOMAIN, "message": "zz"}))
+        .await;
+    assert_eq!(r["kind"], "usage");
+}
+
+#[tokio::test]
+async fn verify_refuses_node_ids_that_are_not_canonical_keys_and_malformed_signatures() {
+    let mut a = Sidecar::start(None).await;
+    let signature = "00".repeat(64);
+    // The identity point, a short id and a non-hex id are not node ids.
+    let identity = format!("01{}", "00".repeat(31));
+    for node in [identity, "ab".repeat(31), "zz".repeat(32)] {
+        let r = a
+            .call(
+                json!({"op": "verify", "node": node, "domain": SIGNAL_DOMAIN,
+                         "message": "00", "signature": signature}),
+            )
+            .await;
+        assert_eq!(r["ok"], false, "accepted {node}");
+        assert_eq!(r["kind"], "usage");
+    }
+    let r = a
+        .call(
+            json!({"op": "verify", "node": a.node_id, "domain": SIGNAL_DOMAIN,
+                     "message": "00", "signature": "00"}),
+        )
+        .await;
+    assert_eq!(r["kind"], "usage");
+}

@@ -637,7 +637,10 @@ def connect_over(
         phases["binary"] = clock() - began
         tell(f"binary {remote_binary} {_binary_line(note or {})} in {phases['binary']:.1f} s")
         began = clock()
-        stream = start()
+        try:
+            stream = start()
+        except OSError as error:
+            raise _fail(alias, str(error)) from error
         phases["bootstrap"] = clock() - began
         rtt = stream.rtt_s
         tell(f"bootstrapping over {channel}" + (f", round trip {rtt * 1000:.0f} ms" if rtt else ""))
