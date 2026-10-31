@@ -103,9 +103,9 @@ async fn the_responder_dials_only_the_observed_source_address() {
 
 #[tokio::test]
 async fn a_dial_back_is_charged_more_than_a_plain_request() {
-    // A burst of 6 tokens: one dial-back costs 1 + 4, so the second is answered but untested.
+    // A burst of 7 tokens: one dial-back costs 1 + 4, so the second is answered but untested.
     let (addr, id) = responder(QadLimits {
-        source_burst: 6,
+        source_burst: 7,
         source_per_s: 0.001,
         dialback_cost: 4,
         ..QadLimits::default()
