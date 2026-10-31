@@ -52,7 +52,7 @@ jobs:
         if: matrix.os == 'windows-latest'
         continue-on-error: true
         timeout-minutes: 4
-        run: cargo test -p letify-link --features relay --locked --test udp a_session_moves_from_tcp -- --nocapture --test-threads=1
+        run: cargo test -p letify-link --features relay --locked --test udp -- --nocapture
       - name: Test with the relay role
         run: cargo test -p letify-link --features relay --locked
 
