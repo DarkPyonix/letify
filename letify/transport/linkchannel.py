@@ -597,13 +597,11 @@ def connect_over(
                 {"observers": "default"} if address is None else {"public_ip": address}
             )
             began = clock()
-            names = _punch(alias, daemon, remote_id, stream, write, lines, address, where)
+            names = _punch(alias, daemon, remote_id, stream, write, lines, address, where, tell)
             phases["punch"] = clock() - began
             punched = len(names)
-            reply = getattr(daemon, "last_punch", None) or {}
-            tell(
-                f"NAT {reply.get('nat', 'unknown')} here, {reply.get('peer_nat', 'unknown')} there"
-            )
+            for line in nat_lines(daemon):
+                tell(line)
             candidates += [{"name": f"punch{i}", "punched": n} for i, n in enumerate(names)]
         began = clock()
         session = daemon.open_session(
@@ -717,6 +715,33 @@ def _announce_paths(
         tell(f"path {path.get('kind') or 'unknown'} {how}" + (f" rtt {rtt:.1f} ms" if rtt else ""))
 
 
+def nat_lines(daemon: Any) -> list[str]:
+    """The NAT line of a punch that succeeded, and its report when the sidecar gave one."""
+    reply = getattr(daemon, "last_punch", None) or {}
+    lines = [f"NAT {reply.get('nat', 'unknown')} here, {reply.get('peer_nat', 'unknown')} there"]
+    if reply.get("report"):
+        lines.append(f"punch {reply['report']}")
+    return lines
+
+
+def failure_lines(error: linkd.LinkError, attempt: int | None = None) -> list[str]:
+    """The NAT line and the report of a punch that failed.
+
+    A NAT with no classification is printed as ``unknown`` with the reason, and a failure that
+    carries no detail from the sidecar still gets the line. Spec "Sidecar interface" item 8.
+    """
+    detail = getattr(error, "detail", None) or {}
+    suffix = "" if attempt is None else f" (attempt {attempt})"
+    here = detail.get("nat") or "unknown"
+    why = "" if detail.get("nat") else f" ({detail.get('nat_error') or error})"
+    there = detail.get("peer_nat") or "unknown"
+    lines = [f"NAT {here} here{why}, {there} there{suffix}"]
+    if detail.get("report"):
+        label = "punch" if attempt is None else f"punch attempt {attempt}"
+        lines.append(f"{label}: {detail['report']}")
+    return lines
+
+
 def _punch(
     alias: str,
     daemon: linkd.LinkDaemon,
@@ -726,13 +751,15 @@ def _punch(
     lines: _Lines,
     address: str | None,
     where: dict[str, Any],
+    tell: Callable[[str], None] = lambda message: None,
 ) -> list[str]:
     """Punch with the shim as responder and return the usable path names.
 
     A stream with no measured round trip (ssh) makes one attempt with the sidecar's own lead and
     window. A command channel makes up to two, each with the lead of ``punch_lead_ms`` from the
     freshest round trip, the second with a window ``RETRY_WINDOW_FACTOR`` times as long. Spec
-    "Sidecar interface" item 8.
+    "Sidecar interface" item 8. Every failed attempt tells its NAT line and its report through
+    ``tell`` before the next one starts, as "NAT traversal" item 8 says.
     """
     windows: list[int | None] = [None]
     if stream.rtt_s is not None:
@@ -763,6 +790,8 @@ def _punch(
                 **timing,
             )
         except linkd.LinkError as error:
+            for line in failure_lines(error, number if len(windows) > 1 else None):
+                tell(line)
             if address is not None:
                 raise
             if window is None:

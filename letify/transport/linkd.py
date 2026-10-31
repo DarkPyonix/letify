@@ -46,17 +46,20 @@ class LinkMissing(LetifyError):
 class LinkError(LetifyError):
     """The sidecar refused a request or the control channel failed. ``kind`` is the sidecar's."""
 
-    def __init__(self, message: str, kind: str = "usage"):
+    def __init__(self, message: str, kind: str = "usage", detail: dict[str, Any] | None = None):
         self.kind = kind
+        # Structured facts the sidecar gave with the error, such as the NAT report of a punch.
+        self.detail = detail
         super().__init__(message)
 
 
 class LinkInfrastructureError(LinkError, RuntimeFailure):
     """A failure a new attempt may cure: no path answered, the handshake was refused."""
 
-    def __init__(self, message: str):
+    def __init__(self, message: str, detail: dict[str, Any] | None = None):
         RuntimeFailure.__init__(self, message)
         self.kind = "infrastructure"
+        self.detail = detail
 
 
 class LinkClosed(LinkError):
@@ -418,11 +421,12 @@ class LinkDaemon:
             return reply
         kind = reply.get("kind", "usage")
         text = reply.get("error", "request failed")
+        detail = reply.get("detail")
         if kind == "infrastructure":
-            raise LinkInfrastructureError(text)
+            raise LinkInfrastructureError(text, detail)
         if kind == "closed":
             raise LinkClosed(text)
-        raise LinkError(text, kind)
+        raise LinkError(text, kind, detail)
 
     # -- the API ----------------------------------------------------------------------------
 
