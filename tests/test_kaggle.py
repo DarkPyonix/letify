@@ -1759,3 +1759,37 @@ def test_a_worker_source_that_arrives_whole_still_runs() -> None:
     # The worker announces itself and then reads, so closing its input ends it cleanly.
     assert b"arrived" not in done.stderr, done.stderr[-2000:]
     assert done.stdout, "the worker said nothing, so it never started"
+
+
+def _http_error(code: int):
+    import io
+    import urllib.error
+
+    return urllib.error.HTTPError("https://www.kaggle.com/", code, "x", {}, io.BytesIO(b""))
+
+
+@pytest.mark.parametrize("code", [400, 401, 403])
+def test_an_http_error_that_refuses_the_session_reads_as_a_refused_cookie(
+    monkeypatch, code
+) -> None:
+    """Spec "Kaggle account": 400, 401 and 403 from GetCurrentUser mean the cookie is refused."""
+    from letify.providers import kaggle as kaggle_module
+
+    def refuse(request, timeout=None):
+        raise _http_error(code)
+
+    monkeypatch.setattr(kaggle_module, "urlopen", refuse)
+    with pytest.raises(ValueError, match=rf"was refused \(HTTP {code}\)"):
+        kaggle_module.verify_cookie(make_cookie())
+
+
+def test_a_server_error_during_the_cookie_check_names_its_status(monkeypatch) -> None:
+    """Spec "Kaggle account": any other status is a failed check, with the status shown."""
+    from letify.providers import kaggle as kaggle_module
+
+    def fail(request, timeout=None):
+        raise _http_error(503)
+
+    monkeypatch.setattr(kaggle_module, "urlopen", fail)
+    with pytest.raises(ValueError, match="could not be checked: HTTP 503"):
+        kaggle_module.verify_cookie(make_cookie())
