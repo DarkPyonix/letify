@@ -126,7 +126,7 @@ impl Acceptor {
         self.policy.revoke(node);
         let sessions = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
         for session in sessions.values().filter_map(|e| e.session.upgrade()) {
-            if session.peer() == node {
+            if session.peer().canonical() == node.canonical() {
                 session.begin_close(Some("revoked"));
             }
         }
