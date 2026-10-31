@@ -51,6 +51,9 @@ async fn transfer(from: &Session, to: &Session, mib: u64, pace: Duration) -> Ins
     for i in 0..mib {
         rx.read_exact(&mut got).await.unwrap();
         assert!(got == chunk(&base, i), "chunk {i} differs");
+        if i % 8 == 7 {
+            eprintln!("transfer of {mib} MiB: {} MiB received", i + 1);
+        }
     }
     assert_eq!(rx.read(&mut got).await.unwrap(), 0, "the stream ends");
     writer.await.unwrap();
@@ -178,7 +181,9 @@ fn collect(mut pm: PathManager) -> mpsc::UnboundedReceiver<(Instant, PathEvent)>
     let (tx, rx) = mpsc::unbounded_channel();
     tokio::spawn(async move {
         while let Some(ev) = pm.next_event().await {
-            eprintln!("path event: {ev:?}");
+            if !matches!(ev, PathEvent::Measured { .. }) {
+                eprintln!("path event: {ev:?}");
+            }
             if tx.send((Instant::now(), ev)).is_err() {
                 break;
             }
