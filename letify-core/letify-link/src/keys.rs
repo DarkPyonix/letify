@@ -234,6 +234,12 @@ impl Keys {
         epoch < inner.recv_epoch || (epoch == inner.recv_epoch && inner.announced == Some(nonce))
     }
 
+    /// Whether `epoch` is one the receiving direction has already left, so that a record of it
+    /// is dropped for being late and not for being a replay.
+    pub fn is_left(&self, epoch: u16) -> bool {
+        epoch < self.lock().recv_epoch
+    }
+
     /// The peer has switched to `epoch` of this side's keys, so the announcements below it are
     /// no longer needed.
     pub fn prune(&self, epoch: u16) {

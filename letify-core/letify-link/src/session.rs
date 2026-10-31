@@ -1134,6 +1134,15 @@ impl Shared {
         }
     }
 
+    /// Count `len` plaintext bytes of a dropped late record in the subflow ack of `id`.
+    fn credit_late(&self, id: u64, len: usize) {
+        if let Some(sub) = self.lock().subflows.get_mut(&id) {
+            sub.recv_seq += len as u64;
+            sub.ack_dirty = true;
+            sub.notify.notify_one();
+        }
+    }
+
     /// Encrypt `plain` into a record: length, epoch, nonce, ciphertext.
     ///
     /// `announced` is the subflow's count of key announcements already written, see
@@ -1263,7 +1272,14 @@ async fn reader_task<R: AsyncRead + Unpin>(
             };
             last = tokio::time::Instant::now();
             received.fetch_add((RECORD_HDR + ct.len()) as u64, Ordering::Relaxed);
+            let left = shared.keys.is_left(epoch);
             let Some(plain) = shared.open(epoch, nonce, &ct)? else {
+                if left {
+                    // A late record of an epoch already left. Its frames, if any, are sent
+                    // again in the new epoch, but the sender counted them in this subflow's
+                    // window, so the subflow ack covers the record all the same.
+                    shared.credit_late(id, ct.len().saturating_sub(frame::TAG));
+                }
                 continue;
             };
             match frame::decode(plain)? {
