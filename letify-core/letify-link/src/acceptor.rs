@@ -10,6 +10,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 
+use tokio::sync::Notify;
+
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, ReadBuf};
 use tokio::net::TcpStream;
 
@@ -35,6 +37,8 @@ pub struct Acceptor {
     policy: PeerPolicy,
     config: Config,
     sessions: Mutex<HashMap<SessionId, Entry>>,
+    /// Woken when a session enters the table, for joins that arrived before it.
+    registered: Notify,
     half_open: Arc<AtomicUsize>,
 }
 
@@ -114,6 +118,7 @@ impl Acceptor {
             policy,
             config,
             sessions: Mutex::new(HashMap::new()),
+            registered: Notify::new(),
             half_open: Arc::new(AtomicUsize::new(0)),
         }
     }
@@ -182,6 +187,8 @@ impl Acceptor {
                         pending: Arc::new(AtomicUsize::new(0)),
                     },
                 );
+                drop(sessions);
+                self.registered.notify_waiters();
                 Ok(Accepted::Session(session))
             }
             b"LLNS" => {
@@ -196,15 +203,29 @@ impl Acceptor {
                 let token: [u8; 32] = rest[..32].try_into().unwrap();
                 let challenge: [u8; 16] = rest[32..].try_into().unwrap();
                 // The token names no session to anyone without its secret, so each live
-                // session is asked whether the token is its own.
-                let (session, pending) = {
-                    let mut sessions = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
-                    sessions.retain(|_, e| e.session.upgrade().is_some());
-                    sessions
-                        .values()
-                        .filter_map(|e| Some((e.session.upgrade()?, e.pending.clone())))
-                        .find(|(s, _)| s.owns_token(&token))
-                        .ok_or_else(|| Error::Subflow("no live session owns this token".into()))?
+                // session is asked whether the token is its own. A join can arrive before the
+                // session it names is registered, when its path is faster than the path that
+                // started the session, so it waits for the table to change, up to the
+                // handshake timeout.
+                let deadline = tokio::time::Instant::now() + self.config.handshake_timeout;
+                let (session, pending) = loop {
+                    let woken = self.registered.notified();
+                    tokio::pin!(woken);
+                    woken.as_mut().enable();
+                    let found = {
+                        let mut sessions = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
+                        sessions.retain(|_, e| e.session.upgrade().is_some());
+                        sessions
+                            .values()
+                            .filter_map(|e| Some((e.session.upgrade()?, e.pending.clone())))
+                            .find(|(s, _)| s.owns_token(&token))
+                    };
+                    if let Some(found) = found {
+                        break found;
+                    }
+                    if tokio::time::timeout_at(deadline, woken).await.is_err() {
+                        return Err(Error::Subflow("no live session owns this token".into()));
+                    }
                 };
                 if !self.policy.accepts(&session.peer()) {
                     return Err(Error::UnknownPeer(session.peer()));
