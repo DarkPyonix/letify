@@ -49,7 +49,7 @@ jobs:
       - name: Build
         run: cargo build -p letify-link --all-features --locked
       - name: Test with the relay role
-        run: cargo test -p letify-link --features relay --locked -- --nocapture # TEMP-INSTRUMENT
+        run: cargo test -p letify-link --features relay --locked
 
   mobile-ios:
     name: check (aarch64-apple-ios)

@@ -74,29 +74,11 @@ async fn small_message_rtts(a: &Session, b: Session) -> (Duration, Duration) {
     let mut rtts = Vec::new();
     let end = Instant::now() + Duration::from_secs(8);
     let mut msg = [7u8; 64];
-    let t_zero = Instant::now();
-    let mut last_dump = Instant::now();
     while Instant::now() < end {
         let t = Instant::now();
         s.write_all(&msg).await.unwrap();
         s.read_exact(&mut msg).await.unwrap();
         rtts.push(t.elapsed());
-        // TEMP-INSTRUMENT
-        if last_dump.elapsed() >= Duration::from_millis(500) {
-            last_dump = Instant::now();
-            for st in a.subflow_stats() {
-                eprintln!(
-                    "TEMP t={:?} rtt={:?} cap={} inflight={} rate={:?} srtt={:?} win={}",
-                    t_zero.elapsed(),
-                    t.elapsed(),
-                    st.bulk_cap,
-                    st.inflight_bytes,
-                    st.delivery_rate,
-                    st.srtt,
-                    st.window
-                );
-            }
-        }
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
     stop.store(true, Ordering::Relaxed);
