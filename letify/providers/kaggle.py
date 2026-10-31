@@ -90,6 +90,9 @@ RETIRED = {
 KAGGLE_INTERNAL = "https://www.kaggle.com/api/i/"
 KERNELS_SERVICE = "kernels.KernelsService/"
 USERS_SERVICE = "users.UsersService/"
+#: HTTP statuses ``GetCurrentUser`` answers for a session Kaggle no longer accepts. A stale
+#: ``XSRF-TOKEN`` cookie is answered with 400 and an empty body.
+REFUSING_STATUSES = frozenset({400, 401, 403})
 
 #: The host that routes to a session's Jupyter server, and the language id for Python.
 JUPYTER_PROXY_HOST = "https://kkb-production.jupyter-proxy.kaggle.net"
@@ -257,6 +260,13 @@ def verify_cookie(cookie: str) -> str:
     try:
         with urlopen(request) as response:
             body = json.loads(response.read())
+    except urllib.error.HTTPError as exc:
+        if exc.code in REFUSING_STATUSES:
+            raise ValueError(
+                f"the Kaggle cookie was refused (HTTP {exc.code}); log in to kaggle.com and "
+                f"copy a fresh cookie"
+            ) from None
+        raise ValueError(f"the Kaggle cookie could not be checked: HTTP {exc.code}") from None
     except (urllib.error.URLError, OSError, ValueError) as exc:
         raise ValueError(f"the Kaggle cookie could not be checked: {type(exc).__name__}") from None
     name = body.get("displayName") or (body.get("user") or {}).get("displayName")
