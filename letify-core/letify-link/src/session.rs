@@ -327,6 +327,11 @@ impl Sub {
         }
     }
 
+    /// The largest bulk cap this subflow ever has: half of its window, at least one frame.
+    fn cap_ceiling(&self) -> usize {
+        (self.window / 2).max(QUANTUM)
+    }
+
     /// The most bulk bytes this subflow may have in flight: the smallest cap found by probing
     /// that keeps the delivery rate, between two frames and half the window. See SPEC.md
     /// letify-link, Session item 7.
@@ -334,7 +339,7 @@ impl Sub {
         let best = self.rates.iter().copied().fold(0.0, f64::max);
         let rtt = self.min_rtt.map_or(RTT_FLOOR, |(r, _)| r).max(RTT_FLOOR);
         let bound = (CAP_BOUND * best * rtt.as_secs_f64()) as usize;
-        let top = (self.window / 2).max(QUANTUM);
+        let top = self.cap_ceiling();
         // The rate samples of startup lag the cap by a round trip, so the 8 x B x R bound
         // would hold the cap at the size of the first, nearly empty, samples. Startup is held
         // to a few times what the best sample delivered in one round trip instead.
@@ -356,9 +361,7 @@ impl Sub {
                 let stall = (best * rtt.as_secs_f64()) as usize;
                 let flight = stats.window.saturating_add(stall);
                 let allowed = (best * LOSS_DELAY.as_secs_f64()) as usize;
-                probed
-                    .max(flight.min(allowed))
-                    .min(self.window.max(QUANTUM))
+                probed.max(flight.min(allowed)).min(top)
             }
             _ => probed,
         }
@@ -415,7 +418,10 @@ impl Sub {
                 if self.cap_ref == 0.0 {
                     // Another subflow of the session already knows what a path delivers.
                     let rtt = self.srtt.unwrap_or_default().as_secs_f64();
-                    self.cap = self.cap.max((sibling_rate * rtt) as usize);
+                    self.cap = self
+                        .cap
+                        .max((sibling_rate * rtt) as usize)
+                        .min(self.cap_ceiling());
                 }
                 if rate > self.cap_ref * STARTUP_RESPONSE {
                     self.cap_ref = rate;
@@ -444,7 +450,10 @@ impl Sub {
                     // The rate answers a cap one sample late, so the sample after a doubling
                     // may show nothing yet and the cap doubles again. A second sample without
                     // growth holds the cap while the third one is awaited.
-                    self.cap = self.cap.saturating_mul(STARTUP_GROWTH);
+                    self.cap = self
+                        .cap
+                        .saturating_mul(STARTUP_GROWTH)
+                        .min(self.cap_ceiling());
                 }
             }
             CapMode::Grow => {
@@ -2462,7 +2471,7 @@ mod tests {
         let mut s = sub(None);
         s.srtt = Some(Duration::from_millis(200));
         s.capped = true;
-        s.adjust_cap(1e6, 10e6);
-        assert_eq!(s.cap, 2 * 2_000_000);
+        s.adjust_cap(1e6, 4e6);
+        assert_eq!(s.cap, 2 * 800_000);
     }
 }
