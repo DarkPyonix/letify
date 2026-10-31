@@ -102,16 +102,26 @@ async fn a_bulk_stream_over_five_long_round_trip_subflows_fills_them_within_two_
     // run. A shared runner with 3 vCPUs gave 21 to 26 MiB/s here where a developer machine
     // gives 42, because the 10 proxy pumps and the debug build of the session compete for
     // CPU, and the check would then measure the runner and not the cap.
-    let reference = startup_marks(2, false).await;
-    let ceiling = ((reference[1].1 - reference[0].1) / 0.5).min(SUBFLOWS as f64 * PER_FLOW / MIB);
-    let m = startup_marks(10, true).await;
-    let full = ceiling;
-    let first = m[0].1;
-    let late = (m[1].1 - m[0].1) / 0.5;
-    let mean2 = m[2].1 / 2.0;
-    let mean10 = m[3].1 / 10.0;
+    // Both sides are the median of three runs in this process: one 0.5 s window on a shared
+    // runner gave 31.25 MiB/s against a ceiling of 40 in one run and 38 or more in others.
+    let mut ceilings = Vec::new();
+    for _ in 0..3 {
+        let r = startup_marks(2, false).await;
+        ceilings.push((r[1].1 - r[0].1) / 0.5);
+    }
+    let mut runs = Vec::new();
+    for _ in 0..3 {
+        let m = startup_marks(2, true).await;
+        runs.push(((m[1].1 - m[0].1) / 0.5, m[2].1 / 2.0, m[0].1));
+    }
+    ceilings.sort_by(f64::total_cmp);
+    let full = ceilings[1].min(SUBFLOWS as f64 * PER_FLOW / MIB);
+    runs.sort_by(|x, y| x.0.total_cmp(&y.0));
+    let (late, _, first) = runs[1];
+    runs.sort_by(|x, y| x.1.total_cmp(&y.1));
+    let mean2 = runs[1].1;
     eprintln!(
-        "of {full:.0} MiB/s: first 1 s {first:.2}, 1.0-1.5 s {late:.2}, mean of first 2 s {mean2:.2}, mean of first 10 s {mean10:.2}"
+        "of {full:.0} MiB/s (median of 3): first 1 s {first:.2}, 1.0-1.5 s {late:.2}, mean of first 2 s {mean2:.2}; runs {runs:?}"
     );
     assert!(late >= 0.8 * full, "rate over 1.0-1.5 s {late:.2} MiB/s");
     // The target is 70%. Runs gave 23 to 28 MiB/s of 40 (the base commit gave 7), so the check leaves 3 MiB/s
