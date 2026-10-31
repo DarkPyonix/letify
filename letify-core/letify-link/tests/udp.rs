@@ -273,7 +273,13 @@ async fn a_session_moves_from_tcp_to_udp_without_losing_bytes() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_session_moves_from_udp_to_tcp_when_udp_dies() {
-    let mut duo = duo(4.0 * MIB, 16.0 * MIB, Duration::from_millis(100)).await;
+    // Windows debug builds move far fewer UDP bytes a second, see the move to UDP above.
+    let (tcp_rate, warm_mib, after_mib) = if cfg!(windows) {
+        (0.5 * MIB, 16, 16)
+    } else {
+        (4.0 * MIB, 24, 32)
+    };
+    let mut duo = duo(tcp_rate, 16.0 * MIB, Duration::from_millis(100)).await;
     let pm = PathManager::start(
         duo.client.clone(),
         duo.server_id,
@@ -295,7 +301,7 @@ async fn a_session_moves_from_udp_to_tcp_when_udp_dies() {
     // gives the manager rates to compare.
     let warm = tokio::spawn({
         let (a, b) = (a.clone(), b.clone());
-        async move { transfer(&a, &b, 24, Duration::ZERO).await }
+        async move { transfer(&a, &b, warm_mib, Duration::ZERO).await }
     });
     let mut seen = Vec::new();
     until(&mut events, &mut seen, |ev| is_moved(ev, "tcp")).await;
@@ -311,7 +317,7 @@ async fn a_session_moves_from_udp_to_tcp_when_udp_dies() {
     });
     timeout(
         Duration::from_secs(90),
-        transfer(&a, &b, 32, Duration::ZERO),
+        transfer(&a, &b, after_mib, Duration::ZERO),
     )
     .await
     .expect("the transfer completes over TCP after UDP died");
