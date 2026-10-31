@@ -807,3 +807,106 @@ def test_the_wait_for_the_path_set_ends_at_its_bound() -> None:
     names = linkchannel.settle_paths(session, ["punch0", "punch1"], 0.3)  # type: ignore[arg-type]
     assert names == ["punch0"]
     assert 0.25 <= time.monotonic() - began < 2.0
+
+
+# -- A failed punch explains itself (spec "NAT traversal" item 8, "Sidecar interface" item 8) --
+
+
+class _FailingDaemon:
+    """A daemon whose punch fails with a sidecar-style error, to drive ``_punch`` alone."""
+
+    node_id = "local"
+
+    def __init__(self, errors: list[linkd.LinkError]) -> None:
+        self.errors = errors
+
+    def punch(self, *args: Any, **kwargs: Any) -> list[str]:
+        raise self.errors.pop(0)
+
+
+class _QuietLines:
+    def settle(self, names: Any, timeout: float) -> None:
+        return None
+
+
+def _punch_failure(errors: list[linkd.LinkError], rtt_s: float | None) -> tuple[str, list[str]]:
+    told: list[str] = []
+    with pytest.raises(ProviderUnavailable) as raised:
+        linkchannel._punch(
+            "lab",
+            _FailingDaemon(errors),  # type: ignore[arg-type]
+            "remote",
+            SimpleNamespace(rtt_s=rtt_s),  # type: ignore[arg-type]
+            lambda message: None,
+            _QuietLines(),  # type: ignore[arg-type]
+            None,
+            {"observers": "default"},
+            told.append,
+        )
+    return str(raised.value), told
+
+
+def _failure(report: str, nat: str | None, peer: str | None) -> linkd.LinkError:
+    error = linkd.LinkInfrastructureError(f"punch failed: tcp: no connection; {report}")
+    error.detail = {"nat": nat, "peer_nat": peer, "report": report}
+    return error
+
+
+def test_each_failed_attempt_prints_its_nat_line_and_its_report() -> None:
+    first = "here: NAT endpoint_independent, offered tcp 4 (0 predicted) udp 1; there: NAT symmetric:2, offered tcp 4 udp 1"
+    second = "here: NAT endpoint_independent, offered tcp 4 (0 predicted) udp 1; there: no answer"
+    message, told = _punch_failure(
+        [_failure(first, "endpoint_independent", "symmetric:2"), _failure(second, "endpoint_independent", None)],
+        rtt_s=1.5,
+    )
+    assert told[0] == "NAT endpoint_independent here, symmetric:2 there (attempt 1)"
+    assert told[1] == f"punch attempt 1: {first}"
+    assert told[2] == "NAT endpoint_independent here, unknown there (attempt 2)"
+    assert told[3] == f"punch attempt 2: {second}"
+    assert "attempt 1 (lead " in message and "attempt 2 (lead " in message
+    assert message.count("here: NAT endpoint_independent") == 2
+
+
+def test_a_punch_with_no_classification_prints_a_nat_line_saying_why() -> None:
+    error = linkd.LinkInfrastructureError("cannot classify the NAT: 2 of 3 address observers answered")
+    error.detail = {
+        "nat": None,
+        "peer_nat": None,
+        "nat_error": "cannot classify the NAT: 2 of 3 address observers answered",
+        "report": "here: NAT unknown (2 of 3 address observers answered), nothing offered; there: no answer",
+    }
+    _message, told = _punch_failure([error, error], rtt_s=1.0)
+    assert told[0].startswith("NAT unknown here (cannot classify the NAT: 2 of 3 address observers")
+    assert told[0].endswith(", unknown there (attempt 1)")
+
+
+def test_an_error_with_no_detail_still_prints_a_nat_line() -> None:
+    error = linkd.LinkInfrastructureError("the control channel failed")
+    _message, told = _punch_failure([error], rtt_s=None)
+    assert told == ["NAT unknown here (the control channel failed), unknown there"]
+
+
+def test_a_successful_punch_prints_the_report_after_the_nat_line() -> None:
+    daemon = SimpleNamespace(
+        last_punch={
+            "nat": "endpoint_independent",
+            "peer_nat": "symmetric:2",
+            "report": "here: NAT endpoint_independent, offered tcp 4 (0 predicted) udp 1; there: NAT symmetric:2, offered tcp 4 udp 1",
+        }
+    )
+    assert linkchannel.nat_lines(daemon) == [  # type: ignore[arg-type]
+        "NAT endpoint_independent here, symmetric:2 there",
+        "punch here: NAT endpoint_independent, offered tcp 4 (0 predicted) udp 1; there: NAT symmetric:2, offered tcp 4 udp 1",
+    ]
+
+
+def test_an_account_that_cannot_classify_its_nat_prints_the_nat_line_before_failing(
+    sidecar_binary, isolated_home, tmp_path, ssh, monkeypatch, capsys
+) -> None:
+    monkeypatch.setenv("LETIFY_LINK_STUN", "127.0.0.1:9")
+    provider = no_address_machine(tmp_path, ssh, sidecar_binary)
+    with pytest.raises(ProviderUnavailable, match="address observers answered"):
+        provider.open_channel(runtime())
+    provider.close_link()
+    nat = [line for line in capsys.readouterr().err.splitlines() if "letify-link: NAT " in line]
+    assert nat and nat[0].split("letify-link: ")[1].startswith("NAT unknown here (cannot classify")
