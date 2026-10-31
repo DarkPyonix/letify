@@ -51,6 +51,9 @@ async fn transfer(from: &Session, to: &Session, mib: u64, pace: Duration) -> Ins
     for i in 0..mib {
         rx.read_exact(&mut got).await.unwrap();
         assert!(got == chunk(&base, i), "chunk {i} differs");
+        if i % 8 == 7 {
+            eprintln!("transfer of {mib} MiB: {} MiB received", i + 1);
+        }
     }
     assert_eq!(rx.read(&mut got).await.unwrap(), 0, "the stream ends");
     writer.await.unwrap();
@@ -178,6 +181,9 @@ fn collect(mut pm: PathManager) -> mpsc::UnboundedReceiver<(Instant, PathEvent)>
     let (tx, rx) = mpsc::unbounded_channel();
     tokio::spawn(async move {
         while let Some(ev) = pm.next_event().await {
+            if !matches!(ev, PathEvent::Measured { .. }) {
+                eprintln!("path event: {ev:?}");
+            }
             if tx.send((Instant::now(), ev)).is_err() {
                 break;
             }
@@ -192,10 +198,13 @@ async fn until(
     seen: &mut Vec<(Instant, PathEvent)>,
     want: impl Fn(&PathEvent) -> bool,
 ) -> Instant {
+    // Measured events keep arriving, so a per-event timeout never fires. The deadline is for
+    // the whole wait, and a miss shows what was seen.
+    let end = Instant::now() + Duration::from_secs(60);
     loop {
-        let (at, ev) = timeout(Duration::from_secs(30), events.recv())
+        let (at, ev) = tokio::time::timeout_at(end, events.recv())
             .await
-            .expect("the awaited event arrives")
+            .unwrap_or_else(|_| panic!("the awaited event arrives; saw {seen:?}"))
             .expect("the manager runs");
         let hit = want(&ev);
         seen.push((at, ev));
@@ -211,7 +220,14 @@ fn is_moved(ev: &PathEvent, name: &str) -> bool {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_session_moves_from_tcp_to_udp_without_losing_bytes() {
-    let mut duo = duo(2.0 * MIB, 12.0 * MIB, Duration::from_millis(300)).await;
+    // Windows debug builds move far fewer UDP bytes a second through the shaping proxy, so
+    // the TCP path is slowed to keep the same ratio and the transfer is shortened to match.
+    let (tcp_rate, mib) = if cfg!(windows) {
+        (0.5 * MIB, 16)
+    } else {
+        (2.0 * MIB, 64)
+    };
+    let mut duo = duo(tcp_rate, 12.0 * MIB, Duration::from_millis(300)).await;
     let pm = PathManager::start(
         duo.client.clone(),
         duo.server_id,
@@ -236,7 +252,12 @@ async fn a_session_moves_from_tcp_to_udp_without_losing_bytes() {
         let at = until(&mut events, &mut seen, |ev| is_moved(ev, "tcp")).await;
         (at, seen)
     });
-    let done = transfer(&a, &b, 64, Duration::ZERO).await;
+    let done = timeout(
+        Duration::from_secs(120),
+        transfer(&a, &b, mib, Duration::ZERO),
+    )
+    .await
+    .expect("the transfer completes");
     let (moved_at, seen) = moved_at.await.unwrap();
     assert!(
         moved_at < done,
@@ -252,7 +273,13 @@ async fn a_session_moves_from_tcp_to_udp_without_losing_bytes() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_session_moves_from_udp_to_tcp_when_udp_dies() {
-    let mut duo = duo(4.0 * MIB, 16.0 * MIB, Duration::from_millis(100)).await;
+    // Windows debug builds move far fewer UDP bytes a second, see the move to UDP above.
+    let (tcp_rate, warm_mib, after_mib) = if cfg!(windows) {
+        (0.5 * MIB, 16, 16)
+    } else {
+        (4.0 * MIB, 24, 32)
+    };
+    let mut duo = duo(tcp_rate, 16.0 * MIB, Duration::from_millis(100)).await;
     let pm = PathManager::start(
         duo.client.clone(),
         duo.server_id,
@@ -274,11 +301,14 @@ async fn a_session_moves_from_udp_to_tcp_when_udp_dies() {
     // gives the manager rates to compare.
     let warm = tokio::spawn({
         let (a, b) = (a.clone(), b.clone());
-        async move { transfer(&a, &b, 24, Duration::ZERO).await }
+        async move { transfer(&a, &b, warm_mib, Duration::ZERO).await }
     });
     let mut seen = Vec::new();
     until(&mut events, &mut seen, |ev| is_moved(ev, "tcp")).await;
-    warm.await.unwrap();
+    timeout(Duration::from_secs(120), warm)
+        .await
+        .expect("the warm transfer completes")
+        .unwrap();
 
     let knobs = duo.udp_proxy.knobs.clone();
     let cut = tokio::spawn(async move {
@@ -287,7 +317,7 @@ async fn a_session_moves_from_udp_to_tcp_when_udp_dies() {
     });
     timeout(
         Duration::from_secs(90),
-        transfer(&a, &b, 32, Duration::ZERO),
+        transfer(&a, &b, after_mib, Duration::ZERO),
     )
     .await
     .expect("the transfer completes over TCP after UDP died");

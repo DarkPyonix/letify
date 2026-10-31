@@ -62,7 +62,14 @@ mod tempdir {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let mut x = (t as u64) ^ ((std::process::id() as u64) << 32) | 1;
+        // The clock on macOS ticks in microseconds, so threads that start together read the
+        // same time. A process wide counter keeps their directories apart.
+        static COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        let mut x = ((t as u64)
+            ^ ((std::process::id() as u64) << 32)
+            ^ n.wrapping_mul(0x9e37_79b9_7f4a_7c15))
+            | 1;
         for v in b {
             x ^= x << 13;
             x ^= x >> 7;

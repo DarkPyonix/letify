@@ -615,7 +615,13 @@ impl UdpProxy {
             let shape = shape.clone();
             async move {
                 let mut buf = vec![0u8; 65536];
-                while let Ok((n, client)) = front.recv_from(&mut buf).await {
+                loop {
+                    let (n, client) = match front.recv_from(&mut buf).await {
+                        Ok(got) => got,
+                        // Windows fails a receive after a datagram went to a closed port.
+                        Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset => continue,
+                        Err(_) => break,
+                    };
                     let known = clients.lock().unwrap().get(&client).cloned();
                     let back = match known {
                         Some(b) => b,
@@ -628,7 +634,16 @@ impl UdpProxy {
                             let shape = shape.clone();
                             tokio::spawn(async move {
                                 let mut buf = vec![0u8; 65536];
-                                while let Ok(n) = b2.recv(&mut buf).await {
+                                loop {
+                                    let n = match b2.recv(&mut buf).await {
+                                        Ok(n) => n,
+                                        Err(e)
+                                            if e.kind() == std::io::ErrorKind::ConnectionReset =>
+                                        {
+                                            continue;
+                                        }
+                                        Err(_) => break,
+                                    };
                                     if knobs.drops() {
                                         continue;
                                     }
