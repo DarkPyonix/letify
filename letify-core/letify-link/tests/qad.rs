@@ -78,7 +78,15 @@ async fn a_dial_back_to_a_closed_port_is_not_reachable() {
 async fn the_responder_dials_only_the_observed_source_address() {
     let (addr, _) = responder(QadLimits::default()).await;
     // A listener on another loopback address, on a port the observed address does not have.
-    let other = TcpListener::bind("127.0.0.2:0").await.unwrap();
+    // macOS has no 127.0.0.2 unless an alias is added, so the test runs where it exists.
+    let other = match TcpListener::bind("127.0.0.2:0").await {
+        Ok(listener) => listener,
+        Err(e) if e.kind() == std::io::ErrorKind::AddrNotAvailable => {
+            eprintln!("skipped: 127.0.0.2 is not assigned on this machine");
+            return;
+        }
+        Err(e) => panic!("{e}"),
+    };
     let port = other.local_addr().unwrap().port();
     // The request names that address and port in every spare byte, in the formats a
     // careless parser might read, and asks to test the same port number at the source.
