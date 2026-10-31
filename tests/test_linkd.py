@@ -248,3 +248,31 @@ def test_a_stray_local_connection_does_not_get_a_loopback_stream(sidecar_binary,
     finally:
         a.close()
         b.close()
+
+
+def test_a_daemon_signs_and_another_verifies_under_a_signalling_domain(pair):
+    a, b, _ = pair
+    signature = a.sign("letify-signal v1", b"GET\n/v1/health")
+    assert len(signature) == 64
+    assert b.verify(a.node_id, "letify-signal v1", b"GET\n/v1/health", signature)
+    assert not b.verify(a.node_id, "letify-signal v1", b"GET\n/v1/other", signature)
+    assert not b.verify(b.node_id, "letify-signal v1", b"GET\n/v1/health", signature)
+
+
+def test_a_daemon_refuses_to_sign_outside_the_signalling_domains(pair):
+    a, _, _ = pair
+    with pytest.raises(linkd.LinkError, match="domain"):
+        a.sign("letify-link record v2", b"x")
+
+
+def test_a_signature_made_by_webcrypto_verifies_in_the_sidecar(pair):
+    # Made in Node with crypto.subtle.sign("Ed25519", ...) over "letify-signal v1\nhello", the
+    # signing the Worker of letify-signal/ would do; the Worker verifies the sidecar's the same way.
+    node = "9c7e5dc346f3f026131593fddf6b52e18ec216fae4e512d76db409ead4897612"
+    signature = bytes.fromhex(
+        "28fed214ecb4ad4dd1b351669a556c20eec29c8dfc48efe558f1bb9afad4dcca"
+        "51a81fa70f205f4874a57921f55f332d38c57a9ab045ecdc3cc86ff942259e0c"
+    )
+    a, _, _ = pair
+    assert a.verify(node, "letify-signal v1", b"hello", signature)
+    assert not a.verify(node, "letify-signal v1", b"hellO", signature)
