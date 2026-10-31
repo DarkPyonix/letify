@@ -198,10 +198,13 @@ async fn until(
     seen: &mut Vec<(Instant, PathEvent)>,
     want: impl Fn(&PathEvent) -> bool,
 ) -> Instant {
+    // Measured events keep arriving, so a per-event timeout never fires. The deadline is for
+    // the whole wait, and a miss shows what was seen.
+    let end = Instant::now() + Duration::from_secs(60);
     loop {
-        let (at, ev) = timeout(Duration::from_secs(30), events.recv())
+        let (at, ev) = tokio::time::timeout_at(end, events.recv())
             .await
-            .expect("the awaited event arrives")
+            .unwrap_or_else(|_| panic!("the awaited event arrives; saw {seen:?}"))
             .expect("the manager runs");
         let hit = want(&ev);
         seen.push((at, ev));
@@ -217,7 +220,14 @@ fn is_moved(ev: &PathEvent, name: &str) -> bool {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_session_moves_from_tcp_to_udp_without_losing_bytes() {
-    let mut duo = duo(2.0 * MIB, 12.0 * MIB, Duration::from_millis(300)).await;
+    // Windows debug builds move far fewer UDP bytes a second through the shaping proxy, so
+    // the TCP path is slowed to keep the same ratio and the transfer is shortened to match.
+    let (tcp_rate, mib) = if cfg!(windows) {
+        (0.5 * MIB, 16)
+    } else {
+        (2.0 * MIB, 64)
+    };
+    let mut duo = duo(tcp_rate, 12.0 * MIB, Duration::from_millis(300)).await;
     let pm = PathManager::start(
         duo.client.clone(),
         duo.server_id,
@@ -244,7 +254,7 @@ async fn a_session_moves_from_tcp_to_udp_without_losing_bytes() {
     });
     let done = timeout(
         Duration::from_secs(120),
-        transfer(&a, &b, 64, Duration::ZERO),
+        transfer(&a, &b, mib, Duration::ZERO),
     )
     .await
     .expect("the transfer completes");
