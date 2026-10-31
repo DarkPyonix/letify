@@ -1784,8 +1784,16 @@ impl Session {
         &self.guard.shared
     }
 
-    /// The node id of the other side, authenticated by the handshake.
+    /// The node id of the other side, authenticated by the handshake, in its canonical form
+    /// ([`NodeId::canonical`]). Use this one to store, compare or pass to
+    /// [`crate::Acceptor::revoke`], because the two encodings of one key give one value.
     pub fn peer(&self) -> NodeId {
+        self.shared().peer.canonical()
+    }
+
+    /// The node id of the other side exactly as the handshake carried it, which can be the
+    /// sign-flipped alias of [`Session::peer`]. For display or logs; do not key a table on it.
+    pub fn peer_presented(&self) -> NodeId {
         self.shared().peer
     }
 

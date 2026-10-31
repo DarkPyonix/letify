@@ -488,7 +488,8 @@ fn register(
 ) -> u64 {
     let id = shared.next_session.fetch_add(1, Ordering::Relaxed) + 1;
     let mut tasks = Vec::new();
-    let peer = session.peer();
+    // The protocol reports the id as presented, which is the id the Python side knows.
+    let peer = session.peer_presented();
     let kinds = manager.as_ref().map(PathManager::kinds);
     if let Some(mut manager) = manager {
         let sh = shared.clone();
