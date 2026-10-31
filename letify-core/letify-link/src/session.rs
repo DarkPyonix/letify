@@ -1112,17 +1112,17 @@ fn interval_ms(interval: Duration) -> u64 {
 /// Closes the session when the last handle goes away.
 pub(crate) struct Guard {
     pub shared: Arc<Shared>,
-    /// The task that closes the session when its peer is revoked, see `Session::watch_policy`.
-    watcher: Mutex<Option<AbortHandle>>,
+    /// The task that closes the session when its peer is revoked, see `Session::close_when_revoked`.
+    watchers: Mutex<Vec<AbortHandle>>,
 }
 
 impl Drop for Guard {
     fn drop(&mut self) {
-        if let Some(task) = self
-            .watcher
+        for task in self
+            .watchers
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .take()
+            .drain(..)
         {
             task.abort();
         }
@@ -1683,7 +1683,7 @@ impl Session {
     ) -> Result<Session> {
         let est = handshake::respond(&mut transport, identity, &policy, &config).await?;
         let session = Self::establish(transport, est, config, false, gauge)?;
-        session.watch_policy(policy);
+        session.close_when_revoked(&policy);
         Ok(session)
     }
 
@@ -1749,14 +1749,19 @@ impl Session {
         Ok(Session {
             guard: Arc::new(Guard {
                 shared,
-                watcher: Mutex::new(None),
+                watchers: Mutex::new(Vec::new()),
             }),
         })
     }
 
     /// Close the session with the reason `revoked` as soon as `policy` stops accepting the
-    /// peer. SPEC.md letify-link, Session item 9.
-    fn watch_policy(&self, policy: PeerPolicy) {
+    /// peer, whether that is by `PeerPolicy::revoke` on the canonical id of the peer or by a
+    /// policy that no longer lists it. A session accepted under a policy already does this. An
+    /// initiator session (from `Session::connect` or a `PathManager`) calls it with the policy
+    /// of the node that dialed. It can be called again with another policy and every call
+    /// stays in force. SPEC.md letify-link, Session item 9.
+    pub fn close_when_revoked(&self, policy: &PeerPolicy) {
+        let policy = policy.clone();
         let peer = self.shared().peer;
         let weak = self.downgrade();
         let mut changes = policy.changes();
@@ -1773,7 +1778,11 @@ impl Session {
                 }
             }
         });
-        *self.guard.watcher.lock().unwrap_or_else(|e| e.into_inner()) = Some(task.abort_handle());
+        self.guard
+            .watchers
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(task.abort_handle());
     }
 
     pub(crate) fn from_guard(guard: Arc<Guard>) -> Session {

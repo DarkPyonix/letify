@@ -553,6 +553,12 @@ impl PathManager {
         &self.session
     }
 
+    /// Close the session with the reason `revoked` when `policy` stops accepting the peer, see
+    /// [`Session::close_when_revoked`]. The watch ends with the session.
+    pub fn close_when_revoked(&self, policy: &crate::identity::PeerPolicy) {
+        self.session.close_when_revoked(policy);
+    }
+
     /// The next path event, or `None` once the session is over and the events are read.
     pub async fn next_event(&mut self) -> Option<PathEvent> {
         let ev = self.events.recv().await?;
