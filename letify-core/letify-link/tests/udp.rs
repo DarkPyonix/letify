@@ -390,6 +390,19 @@ async fn tcp_subflows_that_together_beat_the_udp_path_are_not_closed_by_a_move_t
         ManagerConfig {
             probe_idle: Duration::from_millis(300),
             probe_window: Duration::from_millis(500),
+            policy: Policy {
+                // Once the burst ends, the rate of each TCP subflow decays within a second
+                // and is replaced by its probe, and the probes go round the four subflows one
+                // per probe_idle, so for about 1.2 s the sum of the TCP kind is made of probes
+                // and decayed rates, and can fall below the UDP probe. A confirmation spacing
+                // shorter than that cycle (100 ms in `mover`) lets this transient count as two
+                // confirmations, which happened in 2 of 6 runs under CPU load and once on
+                // ubuntu-latest. The default spacing is 10 s, far above the cycle, so this
+                // test spaces the confirmations by 2 s, and the 8 s idle below still holds
+                // three of them, enough to catch a kind comparison made on single probes.
+                spacing: Duration::from_secs(2),
+                ..mover().policy
+            },
             ..mover()
         },
     )
