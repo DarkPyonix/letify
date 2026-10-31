@@ -597,6 +597,7 @@ class Shell(Provider):
         from ..config.secrets import account_directory
         from ..protocol.worker import BOOTSTRAP
         from ..transport import linkchannel, linkupload
+        from ..transport.announce import printer
 
         address = self.address
         if address is None:
@@ -629,6 +630,7 @@ class Shell(Provider):
             punch=bool(self.config.option("link_punch")),
             max_rtt_ms=floor.max_rtt_ms,
             min_bps=floor.min_bps,
+            say=printer(self.announce),
         )
 
     # -- sessions ------------------------------------------------------------

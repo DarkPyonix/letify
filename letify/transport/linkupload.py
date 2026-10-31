@@ -111,11 +111,14 @@ def ensure(
     run: Callable[[str, float], str],
     push: Callable[[str, Path], None] | None = None,
     chunk: int | None = None,
+    report: Callable[[str, int], None] | None = None,
 ) -> str:
     """Make sure the runtime holds ``local`` and return its path there.
 
     ``push(remote_path, local)`` streams the whole file when the machine has a byte stream;
     without it the file goes through ``run`` in chunks of ``chunk`` bytes as base64.
+    ``report(how, size)`` is told ``"cached"`` when the runtime already held the file and
+    ``"uploaded"`` when it was sent, with the size in bytes.
     """
     path = Path(local).expanduser()
     if not path.is_file():
@@ -135,6 +138,8 @@ def ensure(
         )
     final = str(probe["path"])
     if probe.get("have"):
+        if report is not None:
+            report("cached", size)
         return final
     part = final + ".part"
     if push is not None:
@@ -163,4 +168,6 @@ def ensure(
             f"letify-link upload: checksum mismatch on {alias}: expected {sha}, "
             f"got {done.get('sha')}",
         )
+    if report is not None:
+        report("uploaded", size)
     return final

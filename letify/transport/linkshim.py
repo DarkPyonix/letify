@@ -3,9 +3,10 @@
 Owns starting the remote ``letify-link`` sidecar, listening for the one local node, relaying
 rendezvous messages as JSON lines on standard input and output until the hand-over, and
 serving each stream the local side opens: a new worker process, the relay to a running
-worker's second door, or the tail of a worker's standard error, as the first line of the
-stream says. It does not own the local side (``linkchannel.py``), the worker program and the
-relay program (both are passed in) or any path decision. Spec "Sidecar interface" item 7.
+worker's second door, the tail of a worker's standard error, or the probe endpoint, as the
+first line of the stream says. It does not own the local side (``linkchannel.py``), the worker
+program and the relay program (both are passed in) or any path decision. Spec "Sidecar
+interface" item 7.
 This file is sent to the machine as the argument of ``python -c``, so it imports nothing from
 letify and avoids syntax newer than Python 3.6.
 """
@@ -51,6 +52,52 @@ def connect(address, timeout=10.0, secret=None):
             sock.sendall(bytes.fromhex(secret))
     sock.settimeout(None)
     return sock
+
+
+PROBE_CHUNK = 64 * 1024
+
+
+def recv_exact(sock, n):
+    data = b""
+    while len(data) < n:
+        part = sock.recv(n - len(data))
+        if not part:
+            raise EOFError("the probe peer left")
+        data += part
+    return data
+
+
+def serve_probe(sock):
+    """Answer the probe of Spec "Choosing a link" on a stream: echo, discard, send."""
+    try:
+        while True:
+            op = recv_exact(sock, 1)
+            if op == b"P":
+                sock.sendall(b"P" + recv_exact(sock, 8))
+            elif op == b"U":
+                total = 0
+                while True:
+                    size = struct.unpack("!I", recv_exact(sock, 4))[0]
+                    if size == 0:
+                        break
+                    total += len(recv_exact(sock, size))
+                sock.sendall(struct.pack("!Q", total))
+            elif op == b"D":
+                seconds = struct.unpack("!d", recv_exact(sock, 8))[0]
+                block = b"\0" * PROBE_CHUNK
+                began = time.time()
+                while time.time() - began < seconds:
+                    sock.sendall(struct.pack("!I", PROBE_CHUNK) + block)
+                sock.sendall(struct.pack("!I", 0))
+            else:
+                break
+    except (EOFError, OSError):
+        pass
+    finally:
+        try:
+            sock.close()
+        except OSError:
+            pass
 
 
 class Control:
@@ -250,6 +297,9 @@ class Shim:
                 shell = True
         elif kind == "stderr":
             self.send_tail(sock, header["token"])
+            return
+        elif kind == "probe":
+            threading.Thread(target=serve_probe, args=(sock,), daemon=True).start()
             return
         else:
             sock.close()

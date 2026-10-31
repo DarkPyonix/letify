@@ -1570,6 +1570,7 @@ class Kaggle(Provider):
         from ..config.secrets import account_directory
         from ..protocol.worker import BOOTSTRAP
         from ..transport import linkchannel, linkupload
+        from ..transport.announce import printer
 
         directory = account_directory(self.alias)
         directory.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -1597,6 +1598,7 @@ class Kaggle(Provider):
             wrap=wrap,
             max_rtt_ms=floor.max_rtt_ms,
             min_bps=floor.min_bps,
+            say=printer(bool(self.__dict__.get("announce", True))),
         )
         self._link_remotes[name] = remote
         self._links[name] = linkchannel.PlainSshLink(None, lambda: self._link_remotes.get(name))
