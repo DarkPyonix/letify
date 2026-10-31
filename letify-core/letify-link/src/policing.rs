@@ -68,7 +68,7 @@ impl Verdict {
 /// caller's minimum throughput in bytes per second and `burst` the time of each burst.
 pub async fn check<S>(stream: S, floor_bps: u64, burst: Duration) -> io::Result<Verdict>
 where
-    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    S: AsyncRead + AsyncWrite + Unpin + Send,
 {
     let (mut r, mut w) = split(stream);
     let mut rtts = Vec::with_capacity(ROUND_TRIPS);
@@ -114,7 +114,7 @@ where
 /// download burst is done, or with an error when the peer leaves early.
 pub async fn serve<S>(stream: S) -> io::Result<()>
 where
-    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    S: AsyncRead + AsyncWrite + Unpin + Send,
 {
     let (mut r, mut w) = split(stream);
     loop {

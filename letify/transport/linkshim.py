@@ -3,9 +3,10 @@
 Owns starting the remote ``letify-link`` sidecar, listening for the one local node, relaying
 rendezvous messages as JSON lines on standard input and output until the hand-over, and
 serving each stream the local side opens: a new worker process, the relay to a running
-worker's second door, or the tail of a worker's standard error, as the first line of the
-stream says. It does not own the local side (``linkchannel.py``), the worker program and the
-relay program (both are passed in) or any path decision. Spec "Sidecar interface" item 7.
+worker's second door, the tail of a worker's standard error, or the probe endpoint, as the
+first line of the stream says. It does not own the local side (``linkchannel.py``), the worker
+program and the relay program (both are passed in) or any path decision. Spec "Sidecar
+interface" item 7.
 This file is sent to the machine as the argument of ``python -c``, so it imports nothing from
 letify and avoids syntax newer than Python 3.6.
 """
@@ -16,6 +17,7 @@ import json
 import os
 import queue
 import re
+import shlex
 import signal
 import socket
 import struct
@@ -50,6 +52,52 @@ def connect(address, timeout=10.0, secret=None):
             sock.sendall(bytes.fromhex(secret))
     sock.settimeout(None)
     return sock
+
+
+PROBE_CHUNK = 64 * 1024
+
+
+def recv_exact(sock, n):
+    data = b""
+    while len(data) < n:
+        part = sock.recv(n - len(data))
+        if not part:
+            raise EOFError("the probe peer left")
+        data += part
+    return data
+
+
+def serve_probe(sock):
+    """Answer the probe of Spec "Choosing a link" on a stream: echo, discard, send."""
+    try:
+        while True:
+            op = recv_exact(sock, 1)
+            if op == b"P":
+                sock.sendall(b"P" + recv_exact(sock, 8))
+            elif op == b"U":
+                total = 0
+                while True:
+                    size = struct.unpack("!I", recv_exact(sock, 4))[0]
+                    if size == 0:
+                        break
+                    total += len(recv_exact(sock, size))
+                sock.sendall(struct.pack("!Q", total))
+            elif op == b"D":
+                seconds = struct.unpack("!d", recv_exact(sock, 8))[0]
+                block = b"\0" * PROBE_CHUNK
+                began = time.time()
+                while time.time() - began < seconds:
+                    sock.sendall(struct.pack("!I", PROBE_CHUNK) + block)
+                sock.sendall(struct.pack("!I", 0))
+            else:
+                break
+    except (EOFError, OSError):
+        pass
+    finally:
+        try:
+            sock.close()
+        except OSError:
+            pass
 
 
 class Control:
@@ -177,7 +225,8 @@ class Shim:
             self.sessions[session].discard(event["name"])
             self.last_path = time.monotonic()
         elif name == "stream_incoming" and session in self.sessions:
-            threading.Thread(target=self.serve_stream, args=(event["socket"], event.get("secret")), daemon=True).start()
+            args = (event["socket"], event.get("secret"))
+            threading.Thread(target=self.serve_stream, args=args, daemon=True).start()
         elif name == "session_closed" and session in self.sessions:
             del self.sessions[session]
             return not self.sessions
@@ -235,18 +284,28 @@ class Shim:
     def serve_socket(self, sock):
         header = self.read_header(sock)
         kind = header.get("kind") if header else None
+        shell = False
         if kind == "worker":
             command = [self.config["python"], "-u", "-c", self.config["bootstrap"]]
+            if self.config.get("worker_command"):
+                # The provider's wrapper (driver library path, environment) is part of the command.
+                command, shell = self.config["worker_command"], True
         elif kind == "door" and isinstance(header.get("path"), str):
             command = [self.config["python"], "-c", self.config["relay"], header["path"]]
+            if self.config.get("relay_command"):
+                command = "%s %s" % (self.config["relay_command"], shlex.quote(header["path"]))
+                shell = True
         elif kind == "stderr":
             self.send_tail(sock, header["token"])
+            return
+        elif kind == "probe":
+            threading.Thread(target=serve_probe, args=(sock,), daemon=True).start()
             return
         else:
             sock.close()
             return
         log = open(self.log_path(header["token"]), "wb")
-        proc = subprocess.Popen(command, stdin=sock, stdout=sock, stderr=log)
+        proc = subprocess.Popen(command, stdin=sock, stdout=sock, stderr=log, shell=shell)
         sock.close()
         log.close()
         threading.Thread(target=proc.wait, daemon=True).start()
@@ -288,17 +347,19 @@ class Shim:
             os._exit(0)
 
     def punch(self, command):
+        request = {
+            "op": "punch",
+            "peer": command["peer"],
+            "role": "responder",
+            "sockets": command.get("sockets", 4),
+            "public_ip": command.get("public_ip", "127.0.0.1"),
+            "listener": self.listener,
+        }
+        for key in ("udp", "observers", "lead_ms", "window_ms"):
+            if key in command:
+                request[key] = command[key]
         try:
-            self.control.request(
-                {
-                    "op": "punch",
-                    "peer": command["peer"],
-                    "role": "responder",
-                    "sockets": command.get("sockets", 4),
-                    "public_ip": command.get("public_ip", "127.0.0.1"),
-                    "listener": self.listener,
-                }
-            )
+            self.control.request(request)
             self.emit(event="punched")
         except RuntimeError as error:
             self.emit(event="punch_failed", error=str(error))

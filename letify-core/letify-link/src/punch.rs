@@ -143,6 +143,7 @@ pub async fn punch_tcp(
     let expected: Vec<u8> = [HELLO, token].concat();
     let mut tasks: JoinSet<Event> = JoinSet::new();
     let mut dialing = false;
+    let mut attempts = 0usize;
     let mut retry_at = Instant::now();
     // How each dial ended, so the failure names the cause: a refused dial and an unanswered
     // one have different remedies.
@@ -150,6 +151,7 @@ pub async fn punch_tcp(
     loop {
         if !dialing && Instant::now() >= retry_at {
             dialing = true;
+            attempts += 1;
             tasks.spawn(async move {
                 Event::Dialed(match reusable_socket(local) {
                     Ok(sock) => sock.connect(peer).await,
@@ -201,6 +203,11 @@ pub async fn punch_tcp(
         .into_iter()
         .map(|(k, v)| format!("{v} x {k}"))
         .collect();
+    // A dial still in flight has no outcome yet. Windows holds a dial to a closed port for
+    // seconds before it fails, so the window can close first.
+    if dialing {
+        causes.push(format!("{attempts} x still dialing"));
+    }
     causes.sort();
     Err(io::Error::new(
         io::ErrorKind::TimedOut,
@@ -277,7 +284,15 @@ pub async fn punch_udp(
         let (socket, found, token) = (socket.clone(), found_tx.clone(), *token);
         readers.spawn(async move {
             let mut buf = [0u8; 64];
-            while let Ok((n, from)) = socket.recv_from(&mut buf).await {
+            loop {
+                let (n, from) = match socket.recv_from(&mut buf).await {
+                    Ok(got) => got,
+                    // Windows reports an ICMP port unreachable, drawn by an earlier probe to a
+                    // closed port, as a failed receive on this socket. It says nothing about
+                    // the datagrams still to come, so the reader goes on.
+                    Err(e) if e.kind() == io::ErrorKind::ConnectionReset => continue,
+                    Err(_) => return,
+                };
                 if n != 26 || buf[10..26] != token {
                     continue;
                 }

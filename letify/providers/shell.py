@@ -315,13 +315,14 @@ class Shell(Provider):
     def link(self, runtime: Runtime | None = None) -> Link:
         """The chosen link, connecting through the pipeline the first time it is asked for.
 
-        On an account with ``link = "letify-link"`` it is the plain ssh command with the
-        session's measurements and no pipeline: the data path is the session, so no strategy
-        is raced and no probe runs. Spec "Sidecar interface" item 7.
+        On an account with ``link = "letify-link"`` and an address it is the plain ssh command
+        with the session's measurements and no pipeline: the data path is the session, so no
+        strategy is raced and no probe runs. An account with no address is reached through the
+        pipeline, which is the bootstrap's only way to it. Spec "Sidecar interface" item 7.
         """
         links: dict[str, Link] = self.__dict__.setdefault("_links", {})
         key = self._link_key(runtime)
-        if key not in links and self.uses_letify_link:
+        if key not in links and self.uses_letify_link and self.address is not None:
             from ..transport.linkchannel import PlainSshLink
 
             remotes = self.__dict__.setdefault("_link_remotes", {})
@@ -573,14 +574,9 @@ class Shell(Provider):
         Spec "Sidecar interface" item 7: ``link = "letify-link"`` opts in, and the default,
         ``"ssh"``, keeps the ssh data path.
         """
-        value = self.config.option("link", "ssh")
-        if value in (None, "ssh"):
-            return False
-        if value == "letify-link":
-            return True
-        raise ProviderUnavailable(
-            self.kind, f'{self.alias} sets link = {value!r}; use "ssh" or "letify-link"'
-        )
+        from ..transport.linkchannel import letify_link_enabled
+
+        return letify_link_enabled(self)
 
     def link_remote(self, runtime: Runtime | None = None) -> Any:
         """The connected letify-link session to this machine, bootstrapped over ssh once."""
@@ -591,37 +587,51 @@ class Shell(Provider):
             return remote
         if remote is not None:
             remote.close()
+        remotes[key] = self.connect_link(runtime)
+        return remotes[key]
+
+    def connect_link(self, runtime: Runtime | None = None) -> Any:
+        """Bootstrap a new letify-link session to this machine; a provider may do it otherwise."""
         import letify
 
         from ..config.secrets import account_directory
         from ..protocol.worker import BOOTSTRAP
-        from ..transport import linkchannel
+        from ..transport import linkchannel, linkupload
+        from ..transport.announce import printer
 
         address = self.address
         if address is None:
-            raise ProviderUnavailable(
-                self.kind,
-                f'{self.alias} sets link = "letify-link" and has no address: letify-link '
-                f"needs an address until the NAT rendezvous lands",
+            # No address: the pipeline's link (Tailcat for a machine behind a NAT) carries the
+            # bootstrap's standard input and output and nothing else. The session starts from
+            # punched candidates only.
+            bootstrap = self.link(runtime)
+            ssh = lambda command: sshopts.unshared(  # noqa: E731
+                bootstrap.ssh_command(self.remote_command(command))
+            )
+        else:
+            ssh = lambda command: sshopts.unshared(  # noqa: E731
+                self.ssh_command(self.remote_command(command))
             )
         directory = account_directory(self.alias)
         directory.mkdir(mode=0o700, parents=True, exist_ok=True)
         floor = self.link_floor
         binary = self.config.option("link_binary")
-        remotes[key] = linkchannel.connect(
+        return linkchannel.connect(
             self.alias,
-            ssh=lambda command: sshopts.unshared(self.ssh_command(self.remote_command(command))),
+            ssh=ssh,
             address=address,
             python=self.remote_python,
             bootstrap=BOOTSTRAP,
             key_path=directory / "link.key",
             version=letify.__version__,
             binary=binary if isinstance(binary, str) else None,
+            upload=linkupload.configured(self.config.option("link_binary_upload")),
+            workspace=self.workspace_root,
             punch=bool(self.config.option("link_punch")),
             max_rtt_ms=floor.max_rtt_ms,
             min_bps=floor.min_bps,
+            say=printer(self.announce),
         )
-        return remotes[key]
 
     # -- sessions ------------------------------------------------------------
 

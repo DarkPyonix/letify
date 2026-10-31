@@ -495,6 +495,58 @@ class Colab(Shell):
     def _link_key(self, runtime: Runtime | None) -> str:
         return runtime.name if runtime is not None else ""
 
+    def link(self, runtime: Runtime | None = None) -> Link:
+        """The runtime's session measurements with no ssh command, on a letify-link account.
+
+        Spec "Sidecar interface" item 8: a Colab VM has no ssh server, and a link account runs
+        no strategy race, so there is nothing to connect before the session exists.
+        """
+        if not self.uses_letify_link:
+            return super().link(runtime)
+        from ..transport.linkchannel import PlainSshLink
+
+        links: dict[str, Any] = self.__dict__.setdefault("_links", {})
+        key = self._link_key(runtime)
+        if key not in links:
+            remotes = self.__dict__.setdefault("_link_remotes", {})
+            links[key] = PlainSshLink(None, lambda: remotes.get(key))
+        return links[key]  # type: ignore[no-any-return]
+
+    def connect_link(self, runtime: Runtime | None = None) -> Any:
+        """A letify-link session bootstrapped through ``colab exec``, by punched candidates.
+
+        Spec "Sidecar interface" item 8. ``remote_command`` wraps the shim's workers, so they
+        see the driver libraries.
+        """
+        import letify
+
+        from ..protocol.worker import BOOTSTRAP
+        from ..transport import linkchannel, linkupload
+        from ..transport.announce import printer
+
+        if runtime is None:
+            raise ProviderUnavailable(self.kind, "a letify-link session needs a runtime")
+        name = runtime.name
+        directory = account_directory(self.alias)
+        directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+        floor = self.link_floor
+        binary = self.config.option("link_binary")
+        return linkchannel.connect_commands(
+            self.alias,
+            lambda source, timeout: self._exec(name, source, timeout),
+            python=self.remote_python,
+            bootstrap=BOOTSTRAP,
+            key_path=directory / "link.key",
+            version=letify.__version__,
+            binary=binary if isinstance(binary, str) else None,
+            upload=linkupload.configured(self.config.option("link_binary_upload")),
+            workspace=self.workspace_root,
+            wrap=self.remote_command,
+            max_rtt_ms=floor.max_rtt_ms,
+            min_bps=floor.min_bps,
+            say=printer(bool(getattr(self, "announce", True))),
+        )
+
     def _public_key(self) -> str | None:
         if not self.key_path:
             return None
@@ -631,6 +683,11 @@ class Colab(Shell):
         from ..runtime.channel import OneShotChannel
         from .colab_files import ColabFiles
 
+        if self.channel_kind == "exec" and self.uses_letify_link:
+            raise ProviderUnavailable(
+                self.kind,
+                f'{self.alias} sets channel = "exec" and link = "letify-link"; choose one',
+            )
         if self.channel_kind == "exec":
             name = runtime.name
 

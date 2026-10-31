@@ -122,6 +122,7 @@ mod identity;
 mod keys;
 pub mod observe;
 mod paths;
+pub mod plan;
 pub mod policing;
 pub mod punch;
 pub mod record;
