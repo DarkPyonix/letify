@@ -119,7 +119,11 @@ def test_a_token_v2_carries_the_agent_the_secret_the_url_and_the_version() -> No
     )
     assert token.startswith("letify-agent2:")
     fields = linkagent.parse_token(token)
-    assert (fields.agent, fields.secret, fields.signal) == ("ab" * 32, "cd" * 32, "https://x.example")
+    assert (fields.agent, fields.secret, fields.signal) == (
+        "ab" * 32,
+        "cd" * 32,
+        "https://x.example",
+    )
     assert (fields.version, fields.exp) == ("1.2.3", 99)
 
 
@@ -263,7 +267,11 @@ def test_a_pairing_that_is_replayed_is_dropped_and_a_fresh_one_with_the_used_sec
     client = linksignal.SignalClient(user, signal_service.url)
     sid = "ef" * 16
     line = json.dumps(
-        {"op": "pair", "proof": linkagent.proof(token.secret, user.node_id, token.agent), "label": "a"}
+        {
+            "op": "pair",
+            "proof": linkagent.proof(token.secret, user.node_id, token.agent),
+            "label": "a",
+        }
     )
     body = linksignal.seal(user, token.agent, sid, 1, line)
     client.send(token.agent, body)
@@ -279,7 +287,7 @@ def test_a_pairing_that_is_replayed_is_dropped_and_a_fresh_one_with_the_used_sec
 
 
 def test_an_expired_secret_is_refused(start_service, signal_service, daemons) -> None:
-    now = [1_000_000.0]
+    now = [time.time()]
     agent = start_service(clock=lambda: now[0], secret_ttl_s=900)
     user = daemons("user")
     token = agent.service.new_token(signal_service.url)
@@ -425,7 +433,10 @@ def test_a_paired_node_connects_end_to_end_and_unpairing_stops_the_next_connect(
         try:
             assert channel.call(pid_of_worker(), (), {})[0] != os.getpid()
             assert agent.service.started == 1
-            assert any(line.startswith(f"conversation {local.node_id[:12]} started") for line in agent.lines)
+            assert any(
+                line.startswith(f"conversation {local.node_id[:12]} started")
+                for line in agent.lines
+            )
         finally:
             channel.close()
         agent.home.paired.remove(local.node_id)
@@ -496,9 +507,7 @@ def test_login_with_a_tailcat_token_does_not_take_the_agent_path(tmp_path, monke
     assert taken == [new]
 
 
-def test_a_tailcat_token_given_to_the_agent_login_is_refused_by_name(
-    tmp_path, monkeypatch
-) -> None:
+def test_a_tailcat_token_given_to_the_agent_login_is_refused_by_name(tmp_path, monkeypatch) -> None:
     from letify.config import login
 
     monkeypatch.setenv("LETIFY_HOME", str(tmp_path / "home"))
@@ -508,4 +517,3 @@ def test_a_tailcat_token_given_to_the_agent_login_is_refused_by_name(
             login.Answers(alias="box", kind="tunnel", values={"connect": old}, interactive=False),
             old,
         )
-

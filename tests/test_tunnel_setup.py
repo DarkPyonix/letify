@@ -381,7 +381,7 @@ def test_a_tunnel_login_without_connect_asks_for_the_token(
 
     monkeypatch.setattr(login, "read_line", read)
     assert main(["login", "tunnel", "home_box"]) == 0
-    assert "Token printed by 'letify client shell connect': " in asked
+    assert "Token printed by 'letify agent serve' or 'letify client shell connect': " in asked
     assert home_config()["home_box"]["tailcat"] == "tcAbc123"
 
 
