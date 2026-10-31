@@ -13,6 +13,7 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 
 use crate::identity::NodeId;
+use crate::stun::NatType;
 
 /// The largest message a rendezvous has to carry.
 pub const MAX_MESSAGE: usize = 4096;
@@ -56,6 +57,20 @@ pub enum Message {
     PunchOffer(Punch),
     /// The other side accepts and reports its own mappings and when it stops.
     PunchAnswer(Punch),
+    /// A [`Message::PunchOffer`] that also carries the sender's NAT type and policing flag.
+    PunchOfferExt(Punch, PunchExt),
+    /// A [`Message::PunchAnswer`] that also carries the sender's NAT type and policing flag.
+    PunchAnswerExt(Punch, PunchExt),
+}
+
+/// What a sidecar adds to a punch message: how its NAT maps ports, and whether a policing
+/// check follows on every path the punch makes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PunchExt {
+    /// The sender's NAT classification.
+    pub nat: NatType,
+    /// True when the initiator will run the policing check on each punched path.
+    pub police: bool,
 }
 
 /// The terms of one punch. Times are unix milliseconds of the sender's clock; the two clocks
@@ -78,6 +93,8 @@ const K_HELLO: u8 = 1;
 const K_RECORD: u8 = 2;
 const K_OFFER: u8 = 3;
 const K_ANSWER: u8 = 4;
+const K_OFFER_EXT: u8 = 5;
+const K_ANSWER_EXT: u8 = 6;
 
 impl Message {
     /// Encode as one kind byte followed by the fields.
@@ -91,6 +108,16 @@ impl Message {
             Message::Record(bytes) => [&[K_RECORD][..], bytes].concat(),
             Message::PunchOffer(p) => p.encode(K_OFFER),
             Message::PunchAnswer(p) => p.encode(K_ANSWER),
+            Message::PunchOfferExt(p, e) => {
+                let mut out = p.encode(K_OFFER_EXT);
+                e.encode_into(&mut out);
+                out
+            }
+            Message::PunchAnswerExt(p, e) => {
+                let mut out = p.encode(K_ANSWER_EXT);
+                e.encode_into(&mut out);
+                out
+            }
         }
     }
 
@@ -112,8 +139,54 @@ impl Message {
                     Message::PunchAnswer(punch)
                 })
             }
+            Some(&k @ (K_OFFER_EXT | K_ANSWER_EXT)) => {
+                // The extension is the last 4 bytes: kind, step and flags.
+                let split = data
+                    .len()
+                    .checked_sub(PunchExt::LEN)
+                    .ok_or_else(|| bad("short punch message"))?;
+                let punch =
+                    Punch::decode(&data[1..split]).ok_or_else(|| bad("bad punch message"))?;
+                let ext = PunchExt::decode(&data[split..]).ok_or_else(|| bad("bad punch flags"))?;
+                Ok(if k == K_OFFER_EXT {
+                    Message::PunchOfferExt(punch, ext)
+                } else {
+                    Message::PunchAnswerExt(punch, ext)
+                })
+            }
             _ => Err(bad("unknown or malformed message")),
         }
+    }
+}
+
+impl PunchExt {
+    const LEN: usize = 4;
+
+    fn encode_into(&self, out: &mut Vec<u8>) {
+        let (kind, step) = match self.nat {
+            NatType::Unknown => (0u8, 0i16),
+            NatType::EndpointIndependent => (1, 0),
+            NatType::Symmetric { step } => (2, step),
+        };
+        out.push(kind);
+        out.extend(step.to_be_bytes());
+        out.push(u8::from(self.police));
+    }
+
+    fn decode(d: &[u8]) -> Option<PunchExt> {
+        let [kind, hi, lo, flags] = <[u8; 4]>::try_from(d).ok()?;
+        let nat = match kind {
+            0 => NatType::Unknown,
+            1 => NatType::EndpointIndependent,
+            2 => NatType::Symmetric {
+                step: i16::from_be_bytes([hi, lo]),
+            },
+            _ => return None,
+        };
+        Some(PunchExt {
+            nat,
+            police: flags & 1 != 0,
+        })
     }
 }
 
@@ -310,6 +383,35 @@ mod tests {
         ] {
             assert_eq!(Message::decode(&msg.encode()).unwrap(), msg);
         }
+    }
+
+    #[test]
+    fn the_nat_type_and_policing_flag_round_trip_with_a_punch() {
+        for nat in [
+            NatType::Unknown,
+            NatType::EndpointIndependent,
+            NatType::Symmetric { step: -3 },
+            NatType::Symmetric { step: 0 },
+        ] {
+            for police in [false, true] {
+                let ext = PunchExt { nat, police };
+                for msg in [
+                    Message::PunchOfferExt(punch(Proto::Udp), ext),
+                    Message::PunchAnswerExt(punch(Proto::Tcp), ext),
+                ] {
+                    assert_eq!(Message::decode(&msg.encode()).unwrap(), msg);
+                }
+            }
+        }
+        let bytes = Message::PunchOfferExt(
+            punch(Proto::Tcp),
+            PunchExt {
+                nat: NatType::Unknown,
+                police: true,
+            },
+        )
+        .encode();
+        assert!(Message::decode(&bytes[..bytes.len() - 1]).is_err());
     }
 
     #[test]

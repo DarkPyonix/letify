@@ -19,18 +19,24 @@ use tokio::io::{
     AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadHalf, WriteHalf,
     copy_bidirectional_with_sizes,
 };
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::mpsc;
 use tokio::task::AbortHandle;
+use tokio::task::JoinSet;
 
 use crate::acceptor::{Accepted, Acceptor};
 use crate::config::Config;
 use crate::error::Error;
 use crate::identity::{Identity, NodeId, PeerPolicy};
-use crate::paths::{Candidate, ManagerConfig, PathEvent, PathManager};
+use crate::observe::AddressObserver;
+use crate::paths::{BoxTransport, Candidate, ManagerConfig, PathEvent, PathManager};
+use crate::plan;
+use crate::policing::{self, Verdict};
 use crate::punch::{self, Plan};
-use crate::rendezvous::{Message, Proto, Punch, Rendezvous, recv_message, send_message};
+use crate::rendezvous::{Message, Proto, Punch, PunchExt, Rendezvous, recv_message, send_message};
 use crate::session::{Priority, Session};
+use crate::stun::{self, NatType, StunObserver, classify_with};
+use crate::udp::UdpPath;
 
 /// The longest control message accepted, in bytes.
 pub const MAX_CONTROL_MESSAGE: usize = 1 << 20;
@@ -399,7 +405,7 @@ struct Shared {
     next_punch: AtomicU64,
     sessions: Mutex<HashMap<u64, SessionEntry>>,
     listeners: Mutex<HashMap<u64, ListenerEntry>>,
-    punched: Mutex<HashMap<String, TcpStream>>,
+    punched: Mutex<HashMap<String, Punched>>,
 }
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -685,18 +691,27 @@ async fn op_open_session(shared: &Arc<Shared>, req: &Value) -> OpResult {
                 .map_err(|_| usage(format!("not an address: {addr:?}")))?;
             candidates.push(Candidate::tcp(name, addr));
         } else if let Some(key) = c.get("punched").and_then(Value::as_str) {
-            let stream = lock(&shared.punched)
+            let path = lock(&shared.punched)
                 .remove(key)
                 .ok_or_else(|| usage(format!("no unused punched socket {key}")))?;
-            let slot = Arc::new(Mutex::new(Some(stream)));
-            candidates.push(Candidate::new(name, move || {
+            let (udp, transport): (bool, BoxTransport) = match path {
+                Punched::Tcp(s) => (false, Box::new(s)),
+                Punched::Udp(p) => (true, Box::new(p)),
+            };
+            let slot = Arc::new(Mutex::new(Some(transport)));
+            let dial = move || {
                 let slot = slot.clone();
                 async move {
                     lock(&slot).take().ok_or_else(|| {
                         io::Error::new(io::ErrorKind::ConnectionAborted, "punched socket used")
                     })
                 }
-            }));
+            };
+            candidates.push(if udp {
+                Candidate::udp(name, dial)
+            } else {
+                Candidate::new(name, dial)
+            });
         } else {
             return Err(usage("a candidate needs tcp or punched"));
         }
@@ -714,6 +729,290 @@ async fn op_open_session(shared: &Arc<Shared>, req: &Value) -> OpResult {
     Ok(json!({"session": id, "peer": peer.to_string()}))
 }
 
+/// A path that a punch made and has not yet been given to a session.
+enum Punched {
+    Tcp(TcpStream),
+    Udp(UdpPath),
+}
+
+/// How long each address observer has to answer one query.
+const OBSERVE_WAIT: Duration = Duration::from_millis(1500);
+/// How long the initiator waits for the second answer after the first, and the responder for
+/// the second offer. Both messages leave together, so they arrive together.
+const SECOND_MESSAGE_GRACE: Duration = Duration::from_millis(400);
+/// The default length of a policing burst.
+const DEFAULT_BURST_MS: u64 = 500;
+
+fn nat_name(nat: NatType) -> String {
+    match nat {
+        NatType::Unknown => "unknown".into(),
+        NatType::EndpointIndependent => "endpoint_independent".into(),
+        NatType::Symmetric { step } => format!("symmetric:{step}"),
+    }
+}
+
+/// The STUN servers named by the `observers` field: none, the default list (or the servers of
+/// `LETIFY_LINK_STUN`), or the listed `host:port` names.
+async fn observer_servers(req: &Value) -> Result<Option<Vec<SocketAddr>>, OpError> {
+    let names: Vec<String> = match req.get("observers") {
+        None | Some(Value::Null) => return Ok(None),
+        Some(Value::String(word)) if word == "default" => match std::env::var("LETIFY_LINK_STUN") {
+            Ok(list) if !list.trim().is_empty() => list
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect(),
+            _ => stun::DEFAULT_SERVERS
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+        },
+        Some(Value::Array(list)) => list
+            .iter()
+            .map(|v| {
+                v.as_str()
+                    .map(str::to_string)
+                    .ok_or_else(|| usage("observers must be host:port strings"))
+            })
+            .collect::<Result<_, _>>()?,
+        Some(_) => {
+            return Err(usage(
+                "observers must be \"default\" or a list of host:port",
+            ));
+        }
+    };
+    let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+    let mut found = Vec::new();
+    for name in &refs {
+        match name.parse::<SocketAddr>() {
+            Ok(addr) => found.push(addr),
+            Err(_) => found.extend(stun::resolve(&[name]).await),
+        }
+    }
+    Ok(Some(found))
+}
+
+/// What one punch offers: this side's sockets, mappings and NAT.
+struct Own {
+    nat: NatType,
+    tcp_maps: Vec<SocketAddr>,
+    udp_maps: Vec<SocketAddr>,
+}
+
+/// Ask the observers about the first UDP socket and work out the mappings to offer. Without
+/// observers the mappings are the bound addresses on `public_ip`.
+async fn own_mappings(
+    observers: Option<&[SocketAddr]>,
+    public_ip: std::net::IpAddr,
+    tcp_ports: &[u16],
+    udp: &[UdpSocket],
+    probe: &UdpSocket,
+) -> Result<Own, OpError> {
+    let Some(servers) = observers else {
+        return Ok(Own {
+            nat: NatType::Unknown,
+            tcp_maps: plan::tcp_mappings(public_ip, tcp_ports, NatType::Unknown, None),
+            udp_maps: udp
+                .iter()
+                .map(|s| {
+                    s.local_addr()
+                        .map(|a| SocketAddr::new(public_ip, a.port()))
+                        .map_err(|e| infra(e.to_string()))
+                })
+                .collect::<Result<_, _>>()?,
+        });
+    };
+    let observers: Vec<StunObserver> = servers
+        .iter()
+        .map(|s| StunObserver::new(*s, OBSERVE_WAIT))
+        .collect();
+    let refs: Vec<&dyn AddressObserver> = observers
+        .iter()
+        .map(|o| o as &dyn AddressObserver)
+        .collect();
+    let class = classify_with(probe, &refs)
+        .await
+        .map_err(|e| infra(format!("cannot classify the NAT: {e}")))?;
+    let last = class.last_mapped();
+    let ip = class.mappings[0].mapped.ip();
+    let mut udp_maps = Vec::new();
+    for (i, sock) in udp.iter().enumerate() {
+        if i == 0 {
+            udp_maps.extend(last);
+        } else {
+            let seen = refs[0]
+                .observe(sock)
+                .await
+                .map_err(|e| infra(format!("cannot observe a UDP socket: {e}")))?;
+            udp_maps.push(seen.mapped);
+        }
+    }
+    Ok(Own {
+        nat: class.nat,
+        tcp_maps: plan::tcp_mappings(ip, tcp_ports, class.nat, last),
+        udp_maps,
+    })
+}
+
+/// One side's view of an exchanged offer or answer.
+type Terms = (Punch, PunchExt);
+
+fn terms_of(msg: Message) -> Option<(bool, Terms)> {
+    let plain = PunchExt {
+        nat: NatType::Unknown,
+        police: false,
+    };
+    match msg {
+        Message::PunchOffer(p) => Some((true, (p, plain))),
+        Message::PunchOfferExt(p, e) => Some((true, (p, e))),
+        Message::PunchAnswer(p) => Some((false, (p, plain))),
+        Message::PunchAnswerExt(p, e) => Some((false, (p, e))),
+        _ => None,
+    }
+}
+
+/// What the initiator got back for the offers it sent.
+struct Answers {
+    tcp: Option<Terms>,
+    udp: Option<Terms>,
+}
+
+async fn await_answers(
+    rdv: &ControlRendezvous,
+    peer: NodeId,
+    tcp: Option<&Punch>,
+    udp: Option<&Punch>,
+    wait: Duration,
+) -> Result<Answers, OpError> {
+    let overall = tokio::time::Instant::now() + wait;
+    let mut deadline = overall;
+    let mut got = Answers {
+        tcp: None,
+        udp: None,
+    };
+    while (tcp.is_some() && got.tcp.is_none()) || (udp.is_some() && got.udp.is_none()) {
+        let next = match tokio::time::timeout_at(deadline, recv_message(rdv)).await {
+            Err(_) => break,
+            Ok(Ok(next)) => next,
+            Ok(Err(e)) if e.kind() == io::ErrorKind::InvalidData => continue,
+            Ok(Err(e)) => return Err(infra(e.to_string())),
+        };
+        let (from, msg) = next;
+        let Some((false, (answer, ext))) = terms_of(msg) else {
+            continue;
+        };
+        if from != peer {
+            continue;
+        }
+        match (answer.proto, tcp, udp) {
+            (Proto::Tcp, Some(o), _) if o.token == answer.token => got.tcp = Some((answer, ext)),
+            (Proto::Udp, _, Some(o)) if o.token == answer.token => got.udp = Some((answer, ext)),
+            _ => continue,
+        }
+        deadline = overall.min(tokio::time::Instant::now() + SECOND_MESSAGE_GRACE);
+    }
+    if got.tcp.is_none() && got.udp.is_none() {
+        return Err(infra("the punch window closed before the peer answered"));
+    }
+    Ok(got)
+}
+
+/// What the responder got from the initiator.
+struct Offers {
+    tcp: Option<Terms>,
+    udp: Option<Terms>,
+}
+
+async fn await_offers(
+    rdv: &ControlRendezvous,
+    peer: NodeId,
+    want_tcp: bool,
+    want_udp: bool,
+    wait: Duration,
+) -> Result<Offers, OpError> {
+    let overall = tokio::time::Instant::now() + wait;
+    let mut deadline = overall;
+    let mut got = Offers {
+        tcp: None,
+        udp: None,
+    };
+    let mut first = false;
+    loop {
+        let next = match tokio::time::timeout_at(deadline, recv_message(rdv)).await {
+            Err(_) => break,
+            Ok(Ok(next)) => next,
+            Ok(Err(e)) if e.kind() == io::ErrorKind::InvalidData => continue,
+            Ok(Err(e)) => return Err(infra(e.to_string())),
+        };
+        let (from, msg) = next;
+        let Some((true, terms)) = terms_of(msg) else {
+            continue;
+        };
+        if from != peer {
+            continue;
+        }
+        match terms.0.proto {
+            Proto::Tcp if want_tcp && got.tcp.is_none() => got.tcp = Some(terms),
+            Proto::Udp if want_udp && got.udp.is_none() => got.udp = Some(terms),
+            _ => continue,
+        }
+        if !first {
+            first = true;
+            deadline = overall.min(tokio::time::Instant::now() + SECOND_MESSAGE_GRACE);
+        }
+        if (!want_tcp || got.tcp.is_some()) && (!want_udp || got.udp.is_some()) {
+            break;
+        }
+    }
+    if got.tcp.is_none() && got.udp.is_none() {
+        return Err(infra("the punch window closed before the peer answered"));
+    }
+    Ok(got)
+}
+
+/// The result of checking one punched path on the initiator.
+enum Vetted {
+    Usable(String, Punched),
+    Policed(String, &'static str, policing::Rates),
+    Failed(String, String),
+}
+
+async fn vet<S>(
+    name: String,
+    proto: &'static str,
+    mut stream: S,
+    police: Option<(u64, Duration)>,
+    wrap: impl FnOnce(S) -> Punched,
+) -> Vetted
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send,
+{
+    if let Some((floor, burst)) = police {
+        match policing::check(&mut stream, floor, burst).await {
+            Ok(Verdict::Usable(_)) => {}
+            Ok(Verdict::Policed(rates)) => return Vetted::Policed(name, proto, rates),
+            Err(e) => return Vetted::Failed(name, e.to_string()),
+        }
+    }
+    Vetted::Usable(name, wrap(stream))
+}
+
+/// Check a punched path as the responder, then hand it to the acceptor.
+async fn accept_punched<T: crate::session::Transport>(
+    shared: Arc<Shared>,
+    acceptor: Arc<Acceptor>,
+    listener: u64,
+    mut transport: T,
+    police: bool,
+) {
+    if police && policing::serve(&mut transport).await.is_err() {
+        return;
+    }
+    if let Ok(Accepted::Session(session)) = acceptor.accept(transport).await {
+        register(&shared, session, None, Some(listener));
+    }
+}
+
 async fn op_punch(shared: &Arc<Shared>, req: &Value) -> OpResult {
     let peer = node_id(str_field(req, "peer")?)?;
     let initiator = match str_field(req, "role")? {
@@ -725,13 +1024,24 @@ async fn op_punch(shared: &Arc<Shared>, req: &Value) -> OpResult {
             )));
         }
     };
-    let n = (opt_u64(req, "sockets", punch::PUNCH_SOCKETS as u64)? as usize)
-        .clamp(1, punch::MAX_PUNCH_SOCKETS);
+    let tcp_n = (opt_u64(req, "sockets", punch::PUNCH_SOCKETS as u64)? as usize)
+        .min(punch::MAX_PUNCH_SOCKETS);
+    let udp_n = (opt_u64(req, "udp", 0)? as usize).min(punch::MAX_PUNCH_SOCKETS);
+    if tcp_n + udp_n == 0 {
+        return Err(usage("a punch needs sockets or udp above 0"));
+    }
     let ip: std::net::IpAddr = match req.get("public_ip").and_then(Value::as_str) {
         Some(text) => text
             .parse()
             .map_err(|_| usage(format!("not an address: {text:?}")))?,
         None => [127, 0, 0, 1].into(),
+    };
+    let police = match req.get("police") {
+        None | Some(Value::Null) => None,
+        Some(p) => Some((
+            u64_field(p, "floor_bps")?,
+            Duration::from_millis(opt_u64(p, "burst_ms", DEFAULT_BURST_MS)?),
+        )),
     };
     let lead = opt_u64(req, "lead_ms", DEFAULT_LEAD_MS)?;
     let window = opt_u64(req, "window_ms", DEFAULT_WINDOW_MS)?;
@@ -742,114 +1052,276 @@ async fn op_punch(shared: &Arc<Shared>, req: &Value) -> OpResult {
         let found = lock(&shared.listeners).get(&l).map(|e| e.acceptor.clone());
         Some((l, found.ok_or_else(|| usage(format!("no listener {l}")))?))
     };
+    let observers = observer_servers(req).await?;
 
     // Hold the bound sockets until the punch ends, so no other process takes the ports.
     let mut held = Vec::new();
     let mut locals = Vec::new();
-    for _ in 0..n {
+    for _ in 0..tcp_n {
         let sock = punch::reusable_socket("0.0.0.0:0".parse().unwrap())
             .map_err(|e| infra(format!("cannot bind a punch socket: {e}")))?;
         locals.push(sock.local_addr().map_err(|e| infra(e.to_string()))?);
         held.push(sock);
     }
-    let mappings: Vec<SocketAddr> = locals
-        .iter()
-        .map(|a| SocketAddr::new(ip, a.port()))
-        .collect();
+    let mut udp_socks = Vec::new();
+    for _ in 0..udp_n {
+        udp_socks.push(
+            UdpSocket::bind("0.0.0.0:0")
+                .await
+                .map_err(|e| infra(format!("cannot bind a UDP socket: {e}")))?,
+        );
+    }
+    // The NAT is classified from the first UDP socket, or from one made for it.
+    let spare;
+    let probe = match udp_socks.first() {
+        Some(s) => s,
+        None => {
+            spare = UdpSocket::bind("0.0.0.0:0")
+                .await
+                .map_err(|e| infra(format!("cannot bind a UDP socket: {e}")))?;
+            &spare
+        }
+    };
+    let ports: Vec<u16> = locals.iter().map(|a| a.port()).collect();
+    let own = own_mappings(observers.as_deref(), ip, &ports, &udp_socks, probe).await?;
     let rdv = &shared.rendezvous;
-    let timed_out = || infra("the punch window closed before the peer answered");
+    let ext = |police: bool| PunchExt {
+        nat: own.nat,
+        police,
+    };
 
-    let (plan, theirs, token) = if initiator {
+    // The terms of each protocol: (theirs, token, plan, peer nat).
+    let mut tcp_terms: Option<(Vec<SocketAddr>, [u8; 16], Plan)> = None;
+    let mut udp_terms: Option<(Vec<SocketAddr>, [u8; 16], Plan)> = None;
+    let peer_nat;
+    let policed_by_offer;
+    if initiator {
         let start = punch::now_ms() + lead;
-        let offer = Punch {
-            proto: Proto::Tcp,
+        let make = |proto: Proto, mappings: &[SocketAddr]| Punch {
+            proto,
             token: random_token(),
             start_at_ms: start,
             until_ms: start + window,
-            mappings,
+            mappings: mappings.to_vec(),
         };
-        send_message(rdv, peer, &Message::PunchOffer(offer.clone()))
+        let tcp_offer = (tcp_n > 0).then(|| make(Proto::Tcp, &own.tcp_maps));
+        let udp_offer = (udp_n > 0).then(|| make(Proto::Udp, &own.udp_maps));
+        for offer in tcp_offer.iter().chain(&udp_offer) {
+            send_message(
+                rdv,
+                peer,
+                &Message::PunchOfferExt(offer.clone(), ext(police.is_some())),
+            )
             .await
             .map_err(|e| infra(e.to_string()))?;
-        let wait = Duration::from_millis(lead + window);
-        let answer = tokio::time::timeout(wait, async {
-            loop {
-                match recv_message(rdv).await {
-                    Ok((from, Message::PunchAnswer(a)))
-                        if from == peer && a.token == offer.token =>
-                    {
-                        break Ok(a);
-                    }
-                    Ok(_) => continue,
-                    Err(e) if e.kind() == io::ErrorKind::InvalidData => continue,
-                    Err(e) => break Err(e),
-                }
-            }
-        })
-        .await
-        .map_err(|_| timed_out())?
-        .map_err(|e| infra(e.to_string()))?;
-        (
-            Plan::of(&offer).with_peer_until(answer.until_ms),
-            answer.mappings,
-            offer.token,
+        }
+        let answers = await_answers(
+            rdv,
+            peer,
+            tcp_offer.as_ref(),
+            udp_offer.as_ref(),
+            Duration::from_millis(lead + window),
         )
+        .await?;
+        peer_nat = answers
+            .tcp
+            .iter()
+            .chain(&answers.udp)
+            .next()
+            .map_or(NatType::Unknown, |(_, e)| e.nat);
+        policed_by_offer = police.is_some();
+        if let (Some(o), Some((a, _))) = (&tcp_offer, &answers.tcp) {
+            tcp_terms = Some((
+                a.mappings.clone(),
+                o.token,
+                Plan::of(o).with_peer_until(a.until_ms),
+            ));
+        }
+        if let (Some(o), Some((a, _))) = (&udp_offer, &answers.udp) {
+            udp_terms = Some((
+                a.mappings.clone(),
+                o.token,
+                Plan::of(o).with_peer_until(a.until_ms),
+            ));
+        }
     } else {
-        let wait = Duration::from_millis(lead + window + 60_000);
-        let offer = tokio::time::timeout(wait, async {
-            loop {
-                match recv_message(rdv).await {
-                    Ok((from, Message::PunchOffer(o))) if from == peer && o.proto == Proto::Tcp => {
-                        break Ok(o);
-                    }
-                    Ok(_) => continue,
-                    Err(e) if e.kind() == io::ErrorKind::InvalidData => continue,
-                    Err(e) => break Err(e),
-                }
-            }
-        })
-        .await
-        .map_err(|_| timed_out())?
-        .map_err(|e| infra(e.to_string()))?;
-        let answer = Punch {
-            proto: Proto::Tcp,
-            token: offer.token,
-            start_at_ms: offer.start_at_ms,
-            until_ms: offer.until_ms,
-            mappings,
-        };
-        send_message(rdv, peer, &Message::PunchAnswer(answer))
-            .await
-            .map_err(|e| infra(e.to_string()))?;
-        (Plan::of(&offer), offer.mappings.clone(), offer.token)
-    };
+        let offers = await_offers(
+            rdv,
+            peer,
+            tcp_n > 0,
+            udp_n > 0,
+            Duration::from_millis(lead + window + 60_000),
+        )
+        .await?;
+        peer_nat = offers
+            .tcp
+            .iter()
+            .chain(&offers.udp)
+            .next()
+            .map_or(NatType::Unknown, |(_, e)| e.nat);
+        policed_by_offer = offers.tcp.iter().chain(&offers.udp).any(|(_, e)| e.police);
+        for (terms, maps, slot) in [
+            (&offers.tcp, &own.tcp_maps, &mut tcp_terms),
+            (&offers.udp, &own.udp_maps, &mut udp_terms),
+        ] {
+            let Some((o, e)) = terms else { continue };
+            let answer = Punch {
+                proto: o.proto,
+                token: o.token,
+                start_at_ms: o.start_at_ms,
+                until_ms: o.until_ms,
+                mappings: maps.clone(),
+            };
+            send_message(rdv, peer, &Message::PunchAnswerExt(answer, ext(e.police)))
+                .await
+                .map_err(|e| infra(e.to_string()))?;
+            *slot = Some((o.mappings.clone(), o.token, Plan::of(o)));
+        }
+    }
 
-    let streams = punch::punch_tcp_many(&locals, &theirs, &token, initiator, plan)
-        .await
-        .map_err(|e| infra(format!("punch failed: {e}")))?;
+    // The UDP plan depends on both NATs, so it is made after the exchange.
+    let udp_job = match &udp_terms {
+        Some((theirs, token, plan)) => {
+            let p = plan::udp_plan(own.nat, peer_nat, udp_n, theirs);
+            let have = udp_socks.len();
+            if p.sockets > have {
+                udp_socks.extend(
+                    punch::bind_birthday_sockets("0.0.0.0".parse().unwrap(), p.sockets - have)
+                        .await
+                        .map_err(|e| infra(format!("cannot bind UDP sockets: {e}")))?,
+                );
+            }
+            udp_socks.truncate(p.sockets);
+            let dests = match p.dests {
+                plan::Destinations::Fixed(v) => v,
+                plan::Destinations::Birthday { ip, count } => {
+                    punch::birthday_destinations(ip, count)
+                }
+            };
+            Some((dests, *token, *plan))
+        }
+        None => None,
+    };
+    let tcp_fut = async {
+        match &tcp_terms {
+            Some((theirs, token, plan)) => {
+                punch::punch_tcp_many(&locals, theirs, token, initiator, *plan)
+                    .await
+                    .map(Some)
+            }
+            None => Ok(None),
+        }
+    };
+    let udp_fut = async {
+        match udp_job {
+            Some((dests, token, plan)) => punch::punch_udp(
+                std::mem::take(&mut udp_socks),
+                &dests,
+                &token,
+                plan,
+                punch::SPRAY_PER_SECOND,
+            )
+            .await
+            .map(Some),
+            None => Ok(None),
+        }
+    };
+    let (tcp_res, udp_res) = tokio::join!(tcp_fut, udp_fut);
     drop(held);
+    let (tcp_streams, udp_found) = match (tcp_res, udp_res) {
+        (Err(t), Err(u)) => return Err(infra(format!("punch failed: tcp: {t}; udp: {u}"))),
+        (Err(t), Ok(None)) => return Err(infra(format!("punch failed: {t}"))),
+        (Ok(None), Err(u)) => return Err(infra(format!("punch failed: {u}"))),
+        (t, u) => (t.ok().flatten().unwrap_or_default(), u.ok().flatten()),
+    };
+    let mapped = json!({
+        "tcp": own.tcp_maps.iter().map(|a| a.to_string()).collect::<Vec<_>>(),
+        "udp": own.udp_maps.iter().map(|a| a.to_string()).collect::<Vec<_>>(),
+    });
+    let summary = |mut reply: Value| {
+        reply["nat"] = json!(nat_name(own.nat));
+        reply["peer_nat"] = json!(nat_name(peer_nat));
+        reply["mapped"] = mapped.clone();
+        reply
+    };
     match acceptor {
         None => {
             let batch = shared.next_punch.fetch_add(1, Ordering::Relaxed) + 1;
-            let mut names = Vec::new();
-            for (i, s) in streams.into_iter().enumerate() {
+            let mut set = JoinSet::new();
+            for (i, s) in tcp_streams.into_iter().enumerate() {
                 let name = format!("punched-{batch}-{i}");
-                lock(&shared.punched).insert(name.clone(), s);
-                names.push(name);
+                set.spawn(vet(name, "tcp", s, police, Punched::Tcp));
             }
-            Ok(json!({"punched": names}))
-        }
-        Some((l, acceptor)) => {
-            let count = streams.len();
-            for s in streams {
-                let (sh, acc) = (shared.clone(), acceptor.clone());
-                tokio::spawn(async move {
-                    if let Ok(Accepted::Session(sess)) = acc.accept(s).await {
-                        register(&sh, sess, None, Some(l));
+            if let Some((socket, from)) = udp_found {
+                let name = format!("punched-{batch}-u");
+                set.spawn(async move {
+                    let std = match socket.into_std() {
+                        Ok(s) => s,
+                        Err(e) => return Vetted::Failed(name, e.to_string()),
+                    };
+                    match UdpPath::connect(std, from).await {
+                        Ok(path) => vet(name, "udp", path, police, Punched::Udp).await,
+                        Err(e) => Vetted::Failed(name, e.to_string()),
                     }
                 });
             }
-            Ok(json!({"sockets": count}))
+            let mut names = Vec::new();
+            let mut policed = Vec::new();
+            let mut failed = Vec::new();
+            while let Some(done) = set.join_next().await {
+                match done {
+                    Ok(Vetted::Usable(name, path)) => {
+                        lock(&shared.punched).insert(name.clone(), path);
+                        names.push(name);
+                    }
+                    Ok(Vetted::Policed(name, proto, rates)) => {
+                        shared.emit(json!({
+                            "event": "path_policed", "peer": peer.to_string(), "name": name,
+                            "proto": proto, "up_bps": rates.up_bps, "down_bps": rates.down_bps,
+                        }));
+                        policed.push(name);
+                    }
+                    Ok(Vetted::Failed(name, why)) => failed.push(format!("{name}: {why}")),
+                    Err(e) => failed.push(e.to_string()),
+                }
+            }
+            names.sort();
+            policed.sort();
+            if names.is_empty() {
+                return Err(infra(format!(
+                    "every punched path was dropped: {} policed ({}), {} failed its check ({})",
+                    policed.len(),
+                    policed.join(", "),
+                    failed.len(),
+                    failed.join("; ")
+                )));
+            }
+            Ok(summary(json!({"punched": names, "policed": policed})))
+        }
+        Some((l, acceptor)) => {
+            let count = tcp_streams.len() + usize::from(udp_found.is_some());
+            for s in tcp_streams {
+                tokio::spawn(accept_punched(
+                    shared.clone(),
+                    acceptor.clone(),
+                    l,
+                    s,
+                    policed_by_offer,
+                ));
+            }
+            if let Some((socket, from)) = udp_found {
+                let (sh, acc) = (shared.clone(), acceptor.clone());
+                tokio::spawn(async move {
+                    let Ok(std) = socket.into_std() else { return };
+                    let accepted =
+                        tokio::time::timeout(Duration::from_secs(30), UdpPath::accept(std, from))
+                            .await;
+                    if let Ok(Ok(path)) = accepted {
+                        accept_punched(sh, acc, l, path, policed_by_offer).await;
+                    }
+                });
+            }
+            Ok(summary(json!({"sockets": count})))
         }
     }
 }

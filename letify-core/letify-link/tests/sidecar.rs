@@ -5,6 +5,7 @@
 mod common;
 
 use std::collections::VecDeque;
+use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::Duration;
@@ -28,6 +29,8 @@ struct Sidecar {
     inbox: mpsc::UnboundedReceiver<Value>,
     stash: VecDeque<Value>,
     forward: Option<Frames>,
+    /// Every `rendezvous_out` message this sidecar emitted, decoded from hex.
+    sent: Vec<Vec<u8>>,
     _dir: tempdir::Dir,
 }
 
@@ -96,6 +99,10 @@ async fn read_frame(tcp: &mut TcpStream) -> Option<Value> {
 
 impl Sidecar {
     async fn start(control_arg: Option<&str>) -> Sidecar {
+        Self::start_with(control_arg, &[]).await
+    }
+
+    async fn start_with(control_arg: Option<&str>, env: &[(&str, String)]) -> Sidecar {
         let dir = tempdir::Dir::new();
         let control_path = dir.path().join("c");
         let key = dir.path().join("key");
@@ -107,6 +114,7 @@ impl Sidecar {
                 "--key",
                 key.to_str().unwrap(),
             ])
+            .envs(env.iter().map(|(k, v)| (*k, v.as_str())))
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
@@ -172,6 +180,7 @@ impl Sidecar {
             inbox,
             stash: VecDeque::new(),
             forward: None,
+            sent: Vec::new(),
             _dir: dir,
         }
     }
@@ -197,6 +206,9 @@ impl Sidecar {
             .await
             .expect("timed out waiting for the sidecar")
             .expect("the control channel closed");
+        if v["event"] == "rendezvous_out" {
+            self.sent.push(unhex(v["message"].as_str().unwrap()));
+        }
         if v["event"] == "rendezvous_out"
             && let Some(other) = &self.forward
         {
@@ -732,4 +744,268 @@ async fn a_key_file_that_others_can_read_is_refused() {
     set_mode(&key, 0o600);
     let (ok, _) = serve_outcome(control.to_str().unwrap(), key.to_str().unwrap(), &[]).await;
     assert!(ok);
+}
+
+// -- NAT-aware punch: observers, UDP paths, policing ------------------------------------
+
+use letify_link::rendezvous::{Message, Proto, Punch, PunchExt};
+use letify_link::stun::NatType;
+use tokio::net::UdpSocket;
+
+/// A STUN server on loopback. `report` turns the address the client was seen at into the
+/// address the fake NAT claims to have given it.
+async fn fake_stun(report: impl Fn(SocketAddr) -> SocketAddr + Send + 'static) -> SocketAddr {
+    let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let addr = socket.local_addr().unwrap();
+    tokio::spawn(async move {
+        let mut buf = [0u8; 1500];
+        while let Ok((n, from)) = socket.recv_from(&mut buf).await {
+            if n < 20 {
+                continue;
+            }
+            let txid = &buf[8..20];
+            let SocketAddr::V4(mapped) = report(from) else {
+                continue;
+            };
+            let cookie = 0x2112_A442u32.to_be_bytes();
+            let mut attr = vec![0, 1];
+            attr.extend((mapped.port() ^ 0x2112).to_be_bytes());
+            attr.extend(mapped.ip().octets().iter().zip(cookie).map(|(a, c)| a ^ c));
+            let mut out = Vec::new();
+            out.extend(0x0101u16.to_be_bytes());
+            out.extend((attr.len() as u16 + 4).to_be_bytes());
+            out.extend(cookie);
+            out.extend(txid);
+            out.extend(0x0020u16.to_be_bytes());
+            out.extend((attr.len() as u16).to_be_bytes());
+            out.extend(attr);
+            let _ = socket.send_to(&out, from).await;
+        }
+    });
+    addr
+}
+
+/// Three servers that report the client's own address: a NAT that keeps ports.
+async fn open_nat() -> Vec<SocketAddr> {
+    let mut out = Vec::new();
+    for _ in 0..3 {
+        out.push(fake_stun(|from| from).await);
+    }
+    out
+}
+
+fn join_addrs(servers: &[SocketAddr]) -> String {
+    servers
+        .iter()
+        .map(|s| s.to_string())
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn offers_of(sidecar: &Sidecar) -> Vec<(Punch, PunchExt)> {
+    sidecar
+        .sent
+        .iter()
+        .filter_map(|m| match Message::decode(m) {
+            Ok(Message::PunchOfferExt(p, e)) => Some((p, e)),
+            _ => None,
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn the_offer_carries_the_mappings_the_observers_reported() {
+    let rewrite = |from: SocketAddr| SocketAddr::new("203.0.113.9".parse().unwrap(), from.port());
+    let mut servers = Vec::new();
+    for _ in 0..3 {
+        servers.push(fake_stun(rewrite).await);
+    }
+    let mut a = Sidecar::start(None).await;
+    let peer = Sidecar::start(None).await.node_id;
+    let reply = a
+        .call(json!({
+            "op": "punch", "peer": peer, "role": "initiator", "sockets": 2, "udp": 1,
+            "observers": servers.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+            "lead_ms": 100, "window_ms": 400,
+        }))
+        .await;
+    // Nobody answers, so the punch ends, but the offers were sent first.
+    assert_eq!(reply["ok"], false, "{reply}");
+    assert_eq!(reply["kind"], "infrastructure");
+    let offers = offers_of(&a);
+    let tcp = offers.iter().find(|(p, _)| p.proto == Proto::Tcp).unwrap();
+    let udp = offers.iter().find(|(p, _)| p.proto == Proto::Udp).unwrap();
+    assert_eq!(tcp.0.mappings.len(), 2);
+    assert_eq!(udp.0.mappings.len(), 1);
+    for m in tcp.0.mappings.iter().chain(&udp.0.mappings) {
+        assert_eq!(m.ip().to_string(), "203.0.113.9", "{m}");
+    }
+    assert_eq!(tcp.1.nat, NatType::EndpointIndependent);
+    assert_eq!(udp.1.nat, NatType::EndpointIndependent);
+    assert!(!tcp.1.police);
+    assert_eq!(tcp.0.start_at_ms, udp.0.start_at_ms);
+    assert_ne!(tcp.0.token, udp.0.token);
+}
+
+#[tokio::test]
+async fn a_symmetric_classification_is_offered_with_its_step_and_predicted_tcp_ports() {
+    let mut servers = Vec::new();
+    for k in 0..3u16 {
+        servers.push(
+            fake_stun(move |_| SocketAddr::new("203.0.113.9".parse().unwrap(), 10_000 + 2 * k))
+                .await,
+        );
+    }
+    let mut a = Sidecar::start(None).await;
+    let peer = Sidecar::start(None).await.node_id;
+    let _ = a
+        .call(json!({
+            "op": "punch", "peer": peer, "role": "initiator", "sockets": 2, "udp": 1,
+            "observers": servers.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+            "lead_ms": 100, "window_ms": 400,
+        }))
+        .await;
+    let offers = offers_of(&a);
+    let tcp = offers.iter().find(|(p, _)| p.proto == Proto::Tcp).unwrap();
+    let udp = offers.iter().find(|(p, _)| p.proto == Proto::Udp).unwrap();
+    assert_eq!(tcp.1.nat, NatType::Symmetric { step: 2 });
+    // The last observation was port 10004; the NAT is expected to hand out 10006, 10008 next.
+    let ports: Vec<u16> = tcp.0.mappings.iter().map(|m| m.port()).collect();
+    assert_eq!(ports, vec![10_006, 10_008]);
+    assert_eq!(udp.0.mappings[0].port(), 10_004);
+}
+
+#[tokio::test]
+async fn fewer_than_three_answering_observers_fail_the_punch_with_the_count() {
+    let one = fake_stun(|from| from).await;
+    let mut a = Sidecar::start(None).await;
+    let peer = Sidecar::start(None).await.node_id;
+    let r = a
+        .call(json!({
+            "op": "punch", "peer": peer, "role": "initiator", "udp": 1,
+            "observers": [one.to_string()], "lead_ms": 100, "window_ms": 400,
+        }))
+        .await;
+    assert_eq!(r["ok"], false, "{r}");
+    assert_eq!(r["kind"], "infrastructure");
+    assert!(
+        r["error"]
+            .as_str()
+            .unwrap()
+            .contains("1 of 1 address observers"),
+        "{r}"
+    );
+    assert!(offers_of(&a).is_empty());
+}
+
+/// Two sidecars with a punch between them and the observers of an open NAT. Returns both and
+/// the two replies.
+async fn punch_pair(
+    tcp: u64,
+    udp: u64,
+    police: Option<Value>,
+) -> (Sidecar, Sidecar, Value, Value, Value) {
+    let servers = open_nat().await;
+    let env = [("LETIFY_LINK_STUN", join_addrs(&servers))];
+    let mut a = Sidecar::start_with(None, &env).await;
+    let mut b = Sidecar::start_with(None, &env).await;
+    a.forward_rendezvous_to(b.writer());
+    b.forward_rendezvous_to(a.writer());
+    let l = b.ok(json!({"op": "listen", "allow": [a.node_id]})).await;
+    let (a_id, b_id) = (a.node_id.clone(), b.node_id.clone());
+    let mut init = json!({
+        "op": "punch", "peer": b_id, "role": "initiator", "sockets": tcp, "udp": udp,
+        "observers": "default", "lead_ms": 300, "window_ms": 15000,
+    });
+    if let Some(p) = police {
+        init["police"] = p;
+    }
+    let (ra, rb) = tokio::join!(
+        a.call(init),
+        b.call(json!({
+            "op": "punch", "peer": a_id, "role": "responder", "sockets": tcp, "udp": udp,
+            "observers": "default", "listener": l["listener"], "lead_ms": 300,
+            "window_ms": 15000,
+        })),
+    );
+    (a, b, ra, rb, l)
+}
+
+async fn carries_a_stream(a: &mut Sidecar, b: &mut Sidecar, names: &[Value]) {
+    let cands: Vec<Value> = names
+        .iter()
+        .map(|n| json!({"name": n, "punched": n}))
+        .collect();
+    let s = a
+        .ok(json!({"op": "open_session", "peer": b.node_id, "candidates": cands}))
+        .await;
+    b.event("session_incoming").await;
+    let st = a
+        .ok(json!({"op": "open_stream", "session": s["session"]}))
+        .await;
+    let mut conn = local_connect(&st).await;
+    conn.write_all(b"over udp").await.unwrap();
+    let ev = b.event("stream_incoming").await;
+    let mut other = local_connect(&ev).await;
+    let mut buf = [0u8; 8];
+    other.read_exact(&mut buf).await.unwrap();
+    assert_eq!(&buf, b"over udp");
+}
+
+#[tokio::test]
+async fn a_punched_udp_path_carries_a_session_between_two_sidecars() {
+    let (mut a, mut b, ra, rb, _l) = punch_pair(0, 1, None).await;
+    assert_eq!(ra["ok"], true, "{ra}");
+    assert_eq!(rb["ok"], true, "{rb}");
+    assert_eq!(ra["nat"], "endpoint_independent", "{ra}");
+    assert_eq!(ra["peer_nat"], "endpoint_independent", "{ra}");
+    assert_eq!(ra["mapped"]["udp"].as_array().unwrap().len(), 1);
+    assert_eq!(ra["mapped"]["tcp"].as_array().unwrap().len(), 0);
+    let names = ra["punched"].as_array().unwrap().clone();
+    assert_eq!(names.len(), 1, "{ra}");
+    carries_a_stream(&mut a, &mut b, &names).await;
+}
+
+#[tokio::test]
+async fn tcp_and_udp_paths_from_one_punch_join_one_session() {
+    let (mut a, mut b, ra, rb, _l) = punch_pair(2, 1, None).await;
+    assert_eq!(ra["ok"], true, "{ra}");
+    assert_eq!(rb["ok"], true, "{rb}");
+    let names = ra["punched"].as_array().unwrap().clone();
+    assert_eq!(names.len(), 3, "{ra}");
+    assert_eq!(rb["sockets"], 3, "{rb}");
+    carries_a_stream(&mut a, &mut b, &names).await;
+}
+
+#[tokio::test]
+async fn policed_paths_are_reported_and_not_used() {
+    // A floor no loopback path can reach makes every bulk burst count as policed.
+    let police = json!({"floor_bps": 1u64 << 50, "burst_ms": 200});
+    let (mut a, _b, ra, _rb, _l) = punch_pair(2, 1, Some(police)).await;
+    assert_eq!(ra["ok"], false, "{ra}");
+    assert_eq!(ra["kind"], "infrastructure");
+    assert!(ra["error"].as_str().unwrap().contains("policed"), "{ra}");
+    let ev = a.event("path_policed").await;
+    assert!(ev["name"].as_str().unwrap().starts_with("punched-"), "{ev}");
+    assert!(ev["up_bps"].as_f64().is_some());
+    // The dropped sockets are gone: a candidate that names one is refused.
+    let r = a
+        .call(json!({
+            "op": "open_session", "peer": a.node_id.clone(),
+            "candidates": [{"name": "x", "punched": ev["name"]}],
+        }))
+        .await;
+    assert_eq!(r["kind"], "usage", "{r}");
+}
+
+#[tokio::test]
+async fn a_path_above_the_policing_floor_is_kept() {
+    let police = json!({"floor_bps": 1024, "burst_ms": 200});
+    let (mut a, mut b, ra, rb, _l) = punch_pair(1, 1, Some(police)).await;
+    assert_eq!(ra["ok"], true, "{ra}");
+    assert_eq!(rb["ok"], true, "{rb}");
+    assert_eq!(ra["policed"].as_array().unwrap().len(), 0);
+    let names = ra["punched"].as_array().unwrap().clone();
+    assert_eq!(names.len(), 2, "{ra}");
+    carries_a_stream(&mut a, &mut b, &names).await;
 }

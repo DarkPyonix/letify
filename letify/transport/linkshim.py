@@ -288,17 +288,19 @@ class Shim:
             os._exit(0)
 
     def punch(self, command):
+        request = {
+            "op": "punch",
+            "peer": command["peer"],
+            "role": "responder",
+            "sockets": command.get("sockets", 4),
+            "public_ip": command.get("public_ip", "127.0.0.1"),
+            "listener": self.listener,
+        }
+        for key in ("udp", "observers", "lead_ms", "window_ms"):
+            if key in command:
+                request[key] = command[key]
         try:
-            self.control.request(
-                {
-                    "op": "punch",
-                    "peer": command["peer"],
-                    "role": "responder",
-                    "sockets": command.get("sockets", 4),
-                    "public_ip": command.get("public_ip", "127.0.0.1"),
-                    "listener": self.listener,
-                }
-            )
+            self.control.request(request)
             self.emit(event="punched")
         except RuntimeError as error:
             self.emit(event="punch_failed", error=str(error))

@@ -315,13 +315,14 @@ class Shell(Provider):
     def link(self, runtime: Runtime | None = None) -> Link:
         """The chosen link, connecting through the pipeline the first time it is asked for.
 
-        On an account with ``link = "letify-link"`` it is the plain ssh command with the
-        session's measurements and no pipeline: the data path is the session, so no strategy
-        is raced and no probe runs. Spec "Sidecar interface" item 7.
+        On an account with ``link = "letify-link"`` and an address it is the plain ssh command
+        with the session's measurements and no pipeline: the data path is the session, so no
+        strategy is raced and no probe runs. An account with no address is reached through the
+        pipeline, which is the bootstrap's only way to it. Spec "Sidecar interface" item 7.
         """
         links: dict[str, Link] = self.__dict__.setdefault("_links", {})
         key = self._link_key(runtime)
-        if key not in links and self.uses_letify_link:
+        if key not in links and self.uses_letify_link and self.address is not None:
             from ..transport.linkchannel import PlainSshLink
 
             remotes = self.__dict__.setdefault("_link_remotes", {})
@@ -599,10 +600,16 @@ class Shell(Provider):
 
         address = self.address
         if address is None:
-            raise ProviderUnavailable(
-                self.kind,
-                f'{self.alias} sets link = "letify-link" and has no address: letify-link '
-                f"needs an address until the NAT rendezvous lands",
+            # No address: the pipeline's link (Tailcat for a machine behind a NAT) carries the
+            # bootstrap's standard input and output and nothing else. The session starts from
+            # punched candidates only.
+            bootstrap = self.link(runtime)
+            ssh = lambda command: sshopts.unshared(  # noqa: E731
+                bootstrap.ssh_command(self.remote_command(command))
+            )
+        else:
+            ssh = lambda command: sshopts.unshared(  # noqa: E731
+                self.ssh_command(self.remote_command(command))
             )
         directory = account_directory(self.alias)
         directory.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -610,7 +617,7 @@ class Shell(Provider):
         binary = self.config.option("link_binary")
         remotes[key] = linkchannel.connect(
             self.alias,
-            ssh=lambda command: sshopts.unshared(self.ssh_command(self.remote_command(command))),
+            ssh=ssh,
             address=address,
             python=self.remote_python,
             bootstrap=BOOTSTRAP,
