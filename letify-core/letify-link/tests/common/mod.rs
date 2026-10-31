@@ -375,6 +375,12 @@ pub struct Throttle {
 impl Throttle {
     /// Forward to `target` at `rate` bytes per second toward the target.
     pub async fn to(target: std::net::SocketAddr, rate: f64) -> Throttle {
+        Throttle::delayed(target, rate, Duration::ZERO).await
+    }
+
+    /// Like [`Throttle::to`], and every byte in either direction also waits `one_way` before
+    /// it is written on, so the path has a round trip of twice that.
+    pub async fn delayed(target: std::net::SocketAddr, rate: f64, one_way: Duration) -> Throttle {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let paused = Arc::new(AtomicBool::new(false));
@@ -393,8 +399,8 @@ impl Throttle {
                         let (fr, fw) = front.into_split();
                         let (br, bw) = back.into_split();
                         tokio::join!(
-                            pump(fr, bw, Some(rate), paused.clone(), resume.clone()),
-                            pump(br, fw, None, paused, resume),
+                            pump(fr, bw, Some(rate), one_way, paused.clone(), resume.clone()),
+                            pump(br, fw, None, one_way, paused, resume),
                         );
                     });
                 }
@@ -422,10 +428,22 @@ async fn pump(
     mut from: tokio::net::tcp::OwnedReadHalf,
     mut to: tokio::net::tcp::OwnedWriteHalf,
     rate: Option<f64>,
+    one_way: Duration,
     paused: Arc<AtomicBool>,
     resume: Arc<tokio::sync::Notify>,
 ) {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    // With a delay, a second task writes each chunk once its time has come.
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<(tokio::time::Instant, Vec<u8>)>();
+    let writer = tokio::spawn(async move {
+        while let Some((at, bytes)) = rx.recv().await {
+            tokio::time::sleep_until(at).await;
+            if to.write_all(&bytes).await.is_err() {
+                return;
+            }
+        }
+        let _ = to.shutdown().await;
+    });
     let mut buf = vec![0u8; 16 * 1024];
     let mut start = tokio::time::Instant::now();
     let mut sent = 0f64;
@@ -446,7 +464,11 @@ async fn pump(
         let Ok(n) = from.read(&mut buf).await else {
             break;
         };
-        if n == 0 || to.write_all(&buf[..n]).await.is_err() {
+        if n == 0 {
+            break;
+        }
+        let at = tokio::time::Instant::now() + one_way;
+        if tx.send((at, buf[..n].to_vec())).is_err() {
             break;
         }
         if let Some(rate) = rate {
@@ -455,7 +477,8 @@ async fn pump(
             tokio::time::sleep_until(due).await;
         }
     }
-    let _ = to.shutdown().await;
+    drop(tx);
+    let _ = writer.await;
 }
 
 /// A session over `rates.len()` TCP subflows on loopback; subflow `i` runs through a
@@ -463,6 +486,16 @@ async fn pump(
 /// result is the initiator.
 pub async fn throttled_session(
     rates: &[f64],
+    client: Config,
+    server: Config,
+) -> (Session, Session, Vec<Throttle>) {
+    delayed_session(rates, Duration::ZERO, client, server).await
+}
+
+/// Like [`throttled_session`], and every subflow also has `one_way` of delay each way.
+pub async fn delayed_session(
+    rates: &[f64],
+    one_way: Duration,
     client: Config,
     server: Config,
 ) -> (Session, Session, Vec<Throttle>) {
@@ -487,7 +520,7 @@ pub async fn throttled_session(
     });
     let mut proxies = Vec::new();
     for rate in rates {
-        proxies.push(Throttle::to(target, *rate).await);
+        proxies.push(Throttle::delayed(target, *rate, one_way).await);
     }
     let a = Session::connect(
         TcpStream::connect(proxies[0].addr).await.unwrap(),
