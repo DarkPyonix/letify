@@ -2190,7 +2190,7 @@ mod tests {
 
     fn sub(gauge: Option<Gauge>) -> Sub {
         Sub::new(
-            2 << 20,
+            4 << 20,
             gauge,
             SubShared {
                 sent: Arc::new(AtomicU64::new(0)),
@@ -2273,6 +2273,26 @@ mod tests {
     }
 
     #[test]
+    fn the_cap_of_a_subflow_recovering_from_loss_stays_within_half_the_subflow_window() {
+        let mut s = busy(Some(reading(8 << 20, 0)));
+        s.rates.push_back(40e6);
+        let now = Instant::now();
+        s.gauged = Some((
+            CongestionStats {
+                window: 8 << 20,
+                rtt: Duration::from_millis(50),
+                min_rtt: Duration::from_millis(50),
+                lost_packets: 9,
+                sent_packets: 1000,
+            },
+            now,
+        ));
+        s.loss_at = Some(now);
+        // 40 MB/s for 150 ms is 6 MB and cwnd + B x R is 10 MB, but the window is 4 MiB.
+        assert_eq!(s.bulk_cap(), 2 << 20);
+    }
+
+    #[test]
     fn a_path_that_loses_more_than_a_tenth_of_its_packets_keeps_the_probed_cap() {
         let mut s = busy(Some(reading(600 << 10, 0)));
         let now = Instant::now();
@@ -2311,25 +2331,6 @@ mod tests {
         counts.1.store(1000, Ordering::Relaxed);
         s.read_gauge(t0 + LOSS_SPAN);
         assert!((s.loss_ratio - 0.03).abs() < 1e-9, "{}", s.loss_ratio);
-    }
-
-    #[test]
-    fn the_cap_of_a_subflow_recovering_from_loss_stays_inside_the_subflow_window() {
-        let mut s = busy(Some(reading(8 << 20, 0)));
-        // 20 MB/s for 150 ms is 3 MB, more than the 2 MiB window.
-        s.rates.push_back(20e6);
-        s.gauged = Some((
-            CongestionStats {
-                window: 8 << 20,
-                rtt: Duration::from_millis(50),
-                min_rtt: Duration::from_millis(50),
-                lost_packets: 9,
-                sent_packets: 0,
-            },
-            Instant::now(),
-        ));
-        s.loss_at = Some(Instant::now());
-        assert_eq!(s.bulk_cap(), 2 << 20);
     }
 
     #[test]
@@ -2390,6 +2391,25 @@ mod tests {
             assert_eq!(s.cap, START_BULK << (n + 1));
             assert!(matches!(s.cap_mode, CapMode::Startup(0)));
         }
+    }
+
+    #[test]
+    fn startup_never_raises_the_cap_above_half_the_subflow_window() {
+        let mut s = sub(None);
+        for n in 0..12 {
+            judged(&mut s, 1e6 * (1u64 << n) as f64);
+            assert!(s.cap <= s.window / 2, "cap {} after sample {n}", s.cap);
+        }
+    }
+
+    #[test]
+    fn a_cap_settled_after_startup_is_a_size_the_subflow_can_use_so_shrinking_acts_on_it() {
+        let mut s = sub(None);
+        for rate in [4e6, 8e6, 16e6, 20e6, 20e6, 20e6, 20e6, 20e6] {
+            judged(&mut s, rate);
+        }
+        assert!(matches!(s.cap_mode, CapMode::Hold(_)));
+        assert!(s.cap <= s.window / 2);
     }
 
     #[test]
