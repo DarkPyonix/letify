@@ -110,6 +110,18 @@ const MIN_BULK: usize = 2 * (HDR + frame::CHUNK);
 const START_BULK: usize = 4 * (HDR + frame::CHUNK);
 /// A delivery rate sample covers at least this long, and at least four smoothed round trips.
 const RATE_SAMPLE_FLOOR: Duration = Duration::from_millis(150);
+/// In startup the cap doubles per sample, and a sample is one smoothed round trip long, at least this.
+const STARTUP_SAMPLE_FLOOR: Duration = Duration::from_millis(20);
+/// Startup ends with a cap of this many times rate x smoothed round trip.
+const STARTUP_HEADROOM: f64 = 2.0;
+/// Startup ends after this many judged samples in a row without growth of the rate.
+const STARTUP_STALLS: u32 = 3;
+/// In startup a rate this much above the best so far counts as growth.
+const STARTUP_RESPONSE: f64 = 1.25;
+/// In startup the cap stays at or below this many times the best rate x smoothed round trip.
+const STARTUP_BOUND: f64 = 3.0;
+/// In startup the cap is multiplied by this per sample.
+const STARTUP_GROWTH: usize = 2;
 /// The bulk cap grows by this factor while a larger cap still raises the delivery rate.
 const CAP_GROWTH: f64 = 1.5;
 /// A rate this much above the previous sample counts as a response to a larger cap.
@@ -142,6 +154,9 @@ const GUARD_RUN: u32 = 9;
 /// How the bulk cap of a subflow is moving.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum CapMode {
+    /// The first phase: the cap doubles every round trip while the rate responds. Holds the
+    /// count of judged samples in a row in which it did not.
+    Startup(u32),
     /// Raising the cap while the delivery rate responds.
     Grow,
     /// The rate did not respond to a larger cap; counting samples until a trial shrink.
@@ -282,7 +297,7 @@ impl Sub {
             cap: START_BULK,
             cap_ref: 0.0,
             cap_saved: START_BULK,
-            cap_mode: CapMode::Grow,
+            cap_mode: CapMode::Startup(0),
             told_keepalive: 0,
             capped: false,
             gauge,
@@ -315,6 +330,14 @@ impl Sub {
         let rtt = self.min_rtt.map_or(RTT_FLOOR, |(r, _)| r).max(RTT_FLOOR);
         let bound = (CAP_BOUND * best * rtt.as_secs_f64()) as usize;
         let top = (self.window / 2).max(QUANTUM);
+        // The rate samples of startup lag the cap by a round trip, so the 8 x B x R bound
+        // would hold the cap at the size of the first, nearly empty, samples. Startup is held
+        // to a few times what the best sample delivered in one round trip instead.
+        let bound = if matches!(self.cap_mode, CapMode::Startup(_)) {
+            ((STARTUP_BOUND * self.cap_ref * rtt.as_secs_f64()) as usize).max(START_BULK)
+        } else {
+            bound
+        };
         let probed = self.cap.min(bound).max(MIN_BULK).min(top);
         match self.gauged {
             // A path whose transport recovers losses by itself holds back the acknowledgements
@@ -374,7 +397,7 @@ impl Sub {
     /// which a bulk frame waited for the cap says anything about it. The cap grows by half
     /// while the rate responds to it. Once the rate stops responding the cap is held, and after
     /// `CAP_HOLD` samples a smaller cap is tried and kept if the rate stays within 10%.
-    fn adjust_cap(&mut self, rate: f64) {
+    fn adjust_cap(&mut self, rate: f64, sibling_rate: f64) {
         self.rates.push_back(rate);
         if self.rates.len() > RATE_KEEP {
             self.rates.pop_front();
@@ -383,6 +406,42 @@ impl Sub {
             return;
         }
         match self.cap_mode {
+            CapMode::Startup(stalls) => {
+                if self.cap_ref == 0.0 {
+                    // Another subflow of the session already knows what a path delivers.
+                    let rtt = self.srtt.unwrap_or_default().as_secs_f64();
+                    self.cap = self.cap.max((sibling_rate * rtt) as usize);
+                }
+                if rate > self.cap_ref * STARTUP_RESPONSE {
+                    self.cap_ref = rate;
+                    // The cap in force while the rate last grew.
+                    self.cap_saved = self.cap;
+                    self.cap_mode = CapMode::Startup(0);
+                } else {
+                    self.cap_ref = self.cap_ref.max(rate);
+                    self.cap_mode = CapMode::Startup(stalls + 1);
+                }
+                let stalls_now = match self.cap_mode {
+                    CapMode::Startup(n) => n,
+                    _ => 0,
+                };
+                if stalls_now >= STARTUP_STALLS {
+                    // The rate stopped following the cap three samples ago, and the cap kept
+                    // doubling since: settle on twice the cap in force when the rate last
+                    // grew, or on twice the flight that rate needs if that is more. The lowest round trip is the path without a queue of our own making.
+                    let rtt = self.min_rtt.map_or(RTT_FLOOR, |(r, _)| r).max(RTT_FLOOR);
+                    let need = (STARTUP_HEADROOM * self.cap_ref * rtt.as_secs_f64()) as usize;
+                    self.cap = need
+                        .max(self.cap_saved.saturating_mul(STARTUP_GROWTH))
+                        .clamp(MIN_BULK, self.cap.max(MIN_BULK));
+                    self.cap_mode = CapMode::Hold(CAP_HOLD - 1);
+                } else if stalls_now < STARTUP_STALLS - 1 {
+                    // The rate answers a cap one sample late, so the sample after a doubling
+                    // may show nothing yet and the cap doubles again. A second sample without
+                    // growth holds the cap while the third one is awaited.
+                    self.cap = self.cap.saturating_mul(STARTUP_GROWTH);
+                }
+            }
             CapMode::Grow => {
                 if rate > self.cap_ref * CAP_RESPONSE {
                     self.cap = (self.cap as f64 * CAP_GROWTH) as usize;
@@ -753,6 +812,13 @@ impl State {
     /// The subflow ack: the peer received `n` bytes of sequenced frames on subflow `id`.
     fn apply_sub_ack(&mut self, id: u64, n: u64) {
         let cap = self.subflow_window;
+        // The best rate the other subflows delivered, which seeds a subflow starting up.
+        let sibling_rate = self
+            .subflows
+            .iter()
+            .filter(|(other, s)| **other != id && !matches!(s.cap_mode, CapMode::Startup(_)))
+            .flat_map(|(_, s)| s.rates.iter().copied())
+            .fold(0.0, f64::max);
         let Some(sub) = self.subflows.get_mut(&id) else {
             return;
         };
@@ -785,11 +851,16 @@ impl State {
             });
         }
         sub.rate_bytes += delta;
-        let span = (sub.srtt.unwrap_or_default() * 4).max(RATE_SAMPLE_FLOOR);
+        let srtt = sub.srtt.unwrap_or_default();
+        let span = if matches!(sub.cap_mode, CapMode::Startup(_)) {
+            srtt.max(STARTUP_SAMPLE_FLOOR)
+        } else {
+            (srtt * 4).max(RATE_SAMPLE_FLOOR)
+        };
         let since = now.saturating_duration_since(sub.rate_from);
         if since >= span {
             let rate = sub.rate_bytes as f64 / since.as_secs_f64();
-            sub.adjust_cap(rate);
+            sub.adjust_cap(rate, sibling_rate);
             sub.rate_from = now;
             sub.rate_bytes = 0;
         }
@@ -2241,5 +2312,76 @@ mod tests {
         assert_eq!(reads.load(Ordering::Relaxed), 1);
         s.read_gauge(t0 + GAUGE_EVERY);
         assert_eq!(reads.load(Ordering::Relaxed), 2);
+    }
+
+    /// A startup sample in which a bulk frame waited for the cap.
+    fn judged(s: &mut Sub, rate: f64) {
+        s.srtt = Some(Duration::from_millis(180));
+        s.capped = true;
+        s.adjust_cap(rate, 0.0);
+    }
+
+    #[test]
+    fn startup_doubles_the_cap_every_judged_sample_while_the_rate_grows() {
+        let mut s = sub(None);
+        for (n, rate) in [1e6, 2e6, 4e6].into_iter().enumerate() {
+            judged(&mut s, rate);
+            assert_eq!(s.cap, START_BULK << (n + 1));
+            assert!(matches!(s.cap_mode, CapMode::Startup(0)));
+        }
+    }
+
+    #[test]
+    fn startup_does_not_judge_a_sample_in_which_no_bulk_frame_waited() {
+        let mut s = sub(None);
+        s.srtt = Some(Duration::from_millis(180));
+        s.adjust_cap(1e6, 0.0);
+        assert_eq!(s.cap, START_BULK);
+        assert!(matches!(s.cap_mode, CapMode::Startup(0)));
+    }
+
+    #[test]
+    fn startup_ends_after_three_samples_without_growth_and_settles_below_the_last_cap() {
+        let mut s = sub(None);
+        judged(&mut s, 4e6);
+        judged(&mut s, 8e6);
+        let grown = s.cap;
+        for rate in [8.2e6, 8.1e6] {
+            judged(&mut s, rate);
+            assert!(matches!(s.cap_mode, CapMode::Startup(_)));
+        }
+        judged(&mut s, 8.3e6);
+        assert!(matches!(s.cap_mode, CapMode::Hold(n) if n == CAP_HOLD - 1));
+        // Twice the cap in force when the rate last grew, below the cap reached.
+        assert!(s.cap < grown * 8);
+        assert!(s.cap >= START_BULK * 2 * 2);
+    }
+
+    #[test]
+    fn startup_is_held_to_three_rounds_of_the_best_rate_not_to_the_bound_that_lags_the_cap() {
+        let mut s = sub(None);
+        s.rates.push_back(1e5);
+        s.min_rtt = Some((Duration::from_millis(180), Instant::now()));
+        s.srtt = Some(Duration::from_millis(180));
+        s.cap = 8 << 20;
+        s.window = 32 << 20;
+        // The best sample of startup delivered 2 MiB/s: three rounds of it is 1.1 MiB.
+        s.cap_ref = 2.0 * 1048576.0;
+        assert_eq!(s.bulk_cap(), (3.0 * 2.0 * 1048576.0 * 0.18) as usize);
+        // Nothing delivered yet: the start cap.
+        s.cap_ref = 0.0;
+        assert_eq!(s.bulk_cap(), START_BULK);
+        // After startup the 8 x B x R bound applies, B being 0.1 MB/s here.
+        s.cap_mode = CapMode::Hold(0);
+        assert_eq!(s.bulk_cap(), (8.0 * 1e5 * 0.18) as usize);
+    }
+
+    #[test]
+    fn a_subflow_starting_up_raises_its_first_cap_to_what_a_sibling_delivers() {
+        let mut s = sub(None);
+        s.srtt = Some(Duration::from_millis(200));
+        s.capped = true;
+        s.adjust_cap(1e6, 10e6);
+        assert_eq!(s.cap, 2 * 2_000_000);
     }
 }

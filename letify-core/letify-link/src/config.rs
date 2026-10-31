@@ -28,10 +28,10 @@ pub struct Config {
     /// writer waits while the bound is reached. Default 8 MiB.
     pub max_unacked_bytes: usize,
     /// Bytes a stream may receive before its reader consumes them, advertised to the peer.
-    /// Default 4 MiB.
+    /// Default 16 MiB.
     pub stream_window: u32,
     /// Bytes that may be in flight on one subflow, sent and not yet acknowledged on that
-    /// subflow. Default 2 MiB.
+    /// subflow. Default 4 MiB.
     pub subflow_window: usize,
     /// Bytes of frames the receiver holds ahead of a gap, advertised to the peer, which limits
     /// its unacknowledged bytes to the smaller of this and its own `max_unacked_bytes`. Values
@@ -95,8 +95,8 @@ impl Default for Config {
         Config {
             versions: PROTOCOL_VERSION..=PROTOCOL_VERSION,
             max_unacked_bytes: 8 << 20,
-            stream_window: 4 << 20,
-            subflow_window: 2 << 20,
+            stream_window: 16 << 20,
+            subflow_window: 4 << 20,
             max_reorder_bytes: 16 << 20,
             resume_window: Duration::from_secs(24 * 3600),
             keepalive_interval: Duration::from_secs(15),
