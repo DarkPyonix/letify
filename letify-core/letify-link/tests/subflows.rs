@@ -140,7 +140,7 @@ async fn a_stalled_subflow_does_not_stall_delivery() {
     );
     // The stalled subflow's window bounds what it was handed.
     assert!(
-        sent_during <= 2 * 1024 * 1024 + 128 * 1024,
+        sent_during <= (Config::default().subflow_window + 128 * 1024) as u64,
         "{sent_during} bytes were written to a stalled subflow"
     );
     timeout(Duration::from_secs(60), reader)
