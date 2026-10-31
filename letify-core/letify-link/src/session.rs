@@ -33,7 +33,7 @@ use crate::error::{Error, Result};
 use crate::frame::{self, Frame, HDR, Kind, RECORD_HDR, TAG};
 use crate::handshake::{self, Established};
 use crate::identity::{Identity, NodeId, PeerPolicy};
-use crate::keys::Keys;
+use crate::keys::{self, Keys};
 use crate::replay::MAX_UNACKED_FRAMES;
 use crate::stream::Stream;
 
@@ -74,6 +74,8 @@ pub(crate) fn gauge_of<T: Transport>(transport: &T) -> Option<Gauge> {
 }
 
 const SUBFLOW_MAGIC: &[u8; 4] = b"LLNS";
+/// The magic, the join token and the challenge that open a subflow.
+pub(crate) const JOIN_PREFIX: usize = 4 + 32 + 16;
 
 pub(crate) struct Sent {
     bytes: Arc<Vec<u8>>,
@@ -182,6 +184,9 @@ pub struct SubflowStats {
     pub received_bytes: u64,
     /// Bytes of frames sent on this subflow that the peer acknowledged.
     pub acked_bytes: u64,
+    /// Bytes of frames written to the subflow that its ack does not cover yet. It counts against
+    /// the subflow's window.
+    pub inflight_bytes: usize,
     /// Round trip of the latest keepalive answered on this subflow, if any.
     pub rtt: Option<Duration>,
     /// Bytes of probe records written to this subflow.
@@ -1067,6 +1072,8 @@ pub(crate) struct Shared {
     peer: NodeId,
     version: u16,
     session_id: SessionId,
+    /// Authenticates the join tokens of this session, see SPEC.md letify-link, Session item 4.
+    join_secret: [u8; 32],
     /// Counts every change in the set of subflows, so a path manager can wait for one.
     changes: watch::Sender<u64>,
     /// Origin of the keepalive stamps.
@@ -1195,6 +1202,15 @@ impl Shared {
             });
         } else {
             st.wake_subflows();
+        }
+    }
+
+    /// Count `len` plaintext bytes of a dropped late record in the subflow ack of `id`.
+    fn credit_late(&self, id: u64, len: usize) {
+        if let Some(sub) = self.lock().subflows.get_mut(&id) {
+            sub.recv_seq += len as u64;
+            sub.ack_dirty = true;
+            sub.notify.notify_one();
         }
     }
 
@@ -1327,7 +1343,14 @@ async fn reader_task<R: AsyncRead + Unpin>(
             };
             last = tokio::time::Instant::now();
             received.fetch_add((RECORD_HDR + ct.len()) as u64, Ordering::Relaxed);
+            let left = shared.keys.is_left(epoch);
             let Some(plain) = shared.open(epoch, nonce, &ct)? else {
+                if left {
+                    // A late record of an epoch already left. Its frames, if any, are sent
+                    // again in the new epoch, but the sender counted them in this subflow's
+                    // window, so the subflow ack covers the record all the same.
+                    shared.credit_late(id, ct.len().saturating_sub(frame::TAG));
+                }
                 continue;
             };
             match frame::decode(plain)? {
@@ -1704,6 +1727,7 @@ impl Session {
             peer: est.peer,
             version: est.version,
             session_id: est.session_id,
+            join_secret: est.join_secret,
             changes: watch::channel(0).0,
             origin: Instant::now(),
             keepalive_ms: AtomicU64::new(own_keepalive_ms),
@@ -1816,19 +1840,29 @@ impl Session {
     /// died resumes on this one and retransmits what the peer lacks. A listener that routes
     /// transports by session id uses [`crate::Acceptor`] instead on its side.
     pub async fn add_subflow<T: Transport>(&self, transport: T) -> Result<SubflowId> {
-        self.add_subflow_inner(transport, false).await
+        self.add_subflow_inner(transport, None).await
     }
 
-    /// Add a subflow whose peer preamble (magic and session id) the caller already read and
-    /// checked, as the acceptor does.
-    pub(crate) async fn add_subflow_routed<T: Transport>(&self, transport: T) -> Result<SubflowId> {
-        self.add_subflow_inner(transport, true).await
+    /// Add a subflow whose peer prefix (magic, token and challenge) the caller already read and
+    /// checked, as the acceptor does. `peer_challenge` is the challenge from that prefix.
+    pub(crate) async fn add_subflow_routed<T: Transport>(
+        &self,
+        transport: T,
+        peer_challenge: [u8; 16],
+    ) -> Result<SubflowId> {
+        self.add_subflow_inner(transport, Some(peer_challenge))
+            .await
+    }
+
+    /// Whether `token` is a join token of this session.
+    pub(crate) fn owns_token(&self, token: &[u8; 32]) -> bool {
+        keys::join_token_is_valid(&self.shared().join_secret, token)
     }
 
     async fn add_subflow_inner<T: Transport>(
         &self,
         mut transport: T,
-        preamble_read: bool,
+        routed: Option<[u8; 16]>,
     ) -> Result<SubflowId> {
         let shared = self.shared().clone();
         let gauge = gauge_of(&transport);
@@ -1843,25 +1877,42 @@ impl Session {
         }
         let limit = shared.cfg.handshake_timeout;
         let (peer_next, announced) = tokio::time::timeout(limit, async {
-            let next = shared.lock().recv_next;
-            let mut announced = 0;
-            let hello = frame::encode_hello(next, shared.keys.receive_epoch());
+            let mut mine = [0u8; 16];
+            getrandom::getrandom(&mut mine).map_err(|e| Error::Subflow(e.to_string()))?;
             let mut out = SUBFLOW_MAGIC.to_vec();
-            out.extend_from_slice(&shared.session_id);
+            out.extend_from_slice(&keys::join_token(&shared.join_secret)?);
+            out.extend_from_slice(&mine);
+            // The challenge of the peer goes into the Hello, so the Hello is valid on the
+            // transport that the challenge came from and nowhere else. A side that was
+            // routed read the peer's prefix already and answers with its own at once; a side
+            // that was not sends its prefix first and reads the peer's.
+            let peer_challenge = match routed {
+                Some(challenge) => challenge,
+                None => {
+                    transport.write_all(&out).await?;
+                    transport.flush().await?;
+                    out.clear();
+                    let mut head = [0u8; JOIN_PREFIX];
+                    transport.read_exact(&mut head).await?;
+                    let token: [u8; 32] = head[4..36].try_into().unwrap();
+                    if &head[..4] != SUBFLOW_MAGIC
+                        || !keys::join_token_is_valid(&shared.join_secret, &token)
+                    {
+                        return Err(Error::Subflow(
+                            "the subflow belongs to another session".into(),
+                        ));
+                    }
+                    head[36..].try_into().unwrap()
+                }
+            };
+            let mut announced = 0;
+            let next = shared.lock().recv_next;
+            let hello = frame::encode_hello(next, shared.keys.receive_epoch(), &peer_challenge);
             // The announcements of earlier rekeys come first, so a peer that missed them with
             // a dead subflow reaches the epoch the Hello is sealed in.
             out.extend_from_slice(&shared.seal(&hello, &mut announced)?);
             transport.write_all(&out).await?;
             transport.flush().await?;
-            if !preamble_read {
-                let mut head = [0u8; 20];
-                transport.read_exact(&mut head).await?;
-                if &head[..4] != SUBFLOW_MAGIC || head[4..] != shared.session_id {
-                    return Err(Error::Subflow(
-                        "the subflow belongs to another session".into(),
-                    ));
-                }
-            }
             loop {
                 let mut rec = [0u8; RECORD_HDR];
                 transport.read_exact(&mut rec).await?;
@@ -1884,7 +1935,16 @@ impl Session {
                 };
                 match frame::decode(plain)? {
                     Frame::Rekey { next } => shared.keys.announce(next, nonce),
-                    Frame::Hello { next, epoch } => {
+                    Frame::Hello {
+                        next,
+                        epoch,
+                        challenge,
+                    } => {
+                        if challenge != mine {
+                            return Err(Error::Subflow(
+                                "the hello is not bound to this transport".into(),
+                            ));
+                        }
                         shared.keys.prune(epoch);
                         return Ok((next, announced));
                     }
@@ -2034,6 +2094,7 @@ impl Session {
                     sent_bytes: sub.sent.load(Ordering::Relaxed),
                     received_bytes: sub.received.load(Ordering::Relaxed),
                     acked_bytes: sub.acked,
+                    inflight_bytes: (sub.sent_seq - sub.acked_seq) as usize,
                     rtt: (rtt != NO_RTT).then(|| Duration::from_micros(rtt)),
                     probe_sent_bytes: sub.probe_sent,
                     probe_received_bytes: sub.probe_received,

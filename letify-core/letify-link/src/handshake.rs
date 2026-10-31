@@ -10,8 +10,11 @@
 //! - Responder, accepted: `"LLNK"`, 0, chosen version (2), length (2), Noise message 2.
 //!   Message 2 carries the chosen version again (2), the responder's stream window (4), its
 //!   keepalive interval (4) and its reorder bound in KiB (4).
-//! - Responder, refused for versions: `"LLNK"`, 1, lowest (2), highest (2), text length (2),
-//!   text. A refusal for a key it does not accept is a closed transport and nothing else.
+//! - Initiator, confirmation: 64 bytes, the seal under the initiator-to-responder key with the
+//!   reserved nonce `CONFIRM_NONCE` of `CONFIRM_TAG` and a random 32-byte join secret. The
+//!   responder returns a session only after this record opens.
+//! - Responder, refused for versions: `"LLNK"`, 1, lowest (2), highest (2). No text. A refusal
+//!   for a key it does not accept is a closed transport and nothing else.
 
 use std::time::Duration;
 
@@ -23,6 +26,12 @@ use crate::error::{Error, Result};
 use crate::identity::{Identity, NodeId, PeerPolicy};
 
 const MAGIC: &[u8; 4] = b"LLNK";
+/// The tag the confirmation record opens with.
+const CONFIRM_TAG: &[u8; 16] = b"letify-confirm-1";
+/// The nonce of the confirmation record. The session counter starts at 0 and the Noise rekey
+/// uses `u64::MAX`, so this one is never used for a session record.
+const CONFIRM_NONCE: u64 = u64::MAX - 1;
+const CONFIRM_LEN: usize = 16 + 32 + 16;
 const PARAMS: &str = "Noise_IK_25519_ChaChaPoly_BLAKE2s";
 
 /// What a finished handshake yields.
@@ -36,6 +45,8 @@ pub(crate) struct Established {
     /// The reorder bound the peer advertised, in bytes.
     pub peer_reorder: usize,
     pub session_id: [u8; 16],
+    /// The random secret the initiator chose, which authenticates join tokens.
+    pub join_secret: [u8; 32],
 }
 
 fn hs_err(why: impl std::fmt::Display) -> Error {
@@ -119,11 +130,9 @@ async fn initiate_inner<T: AsyncRead + AsyncWrite + Unpin>(
         ));
     }
     if head[4] == 1 {
-        let mut r = [0u8; 6];
+        let mut r = [0u8; 4];
         read_exact(t, &mut r).await?;
         let theirs = u16::from_be_bytes([r[0], r[1]])..=u16::from_be_bytes([r[2], r[3]]);
-        let mut text = vec![0u8; u16::from_be_bytes([r[4], r[5]]) as usize];
-        read_exact(t, &mut text).await?;
         return Err(Error::VersionMismatch {
             ours: cfg.versions.clone(),
             theirs,
@@ -149,14 +158,30 @@ async fn initiate_inner<T: AsyncRead + AsyncWrite + Unpin>(
     let peer_keepalive =
         Duration::from_millis(u32::from_be_bytes([body[6], body[7], body[8], body[9]]).into());
     let peer_reorder = u32::from_be_bytes(body[10..14].try_into().unwrap()) as usize;
-    finish(
+    let mut est = finish(
         hs,
         remote,
         chosen,
         peer_window,
         peer_keepalive,
         peer_reorder << 10,
-    )
+    )?;
+    // The confirmation shows the responder that this side holds the ephemeral key of this
+    // handshake, so a replayed message 1 cannot end in a session.
+    let mut join_secret = [0u8; 32];
+    getrandom::getrandom(&mut join_secret).map_err(hs_err)?;
+    let mut plain = CONFIRM_TAG.to_vec();
+    plain.extend_from_slice(&join_secret);
+    let mut sealed = [0u8; CONFIRM_LEN];
+    let n = est
+        .crypto
+        .write_message(CONFIRM_NONCE, &plain, &mut sealed)
+        .map_err(hs_err)?;
+    debug_assert_eq!(n, CONFIRM_LEN);
+    t.write_all(&sealed).await?;
+    t.flush().await?;
+    est.join_secret = join_secret;
+    Ok(est)
 }
 
 /// Run the responder side over `t`.
@@ -199,13 +224,10 @@ async fn respond_inner<T: AsyncRead + AsyncWrite + Unpin>(
             ours: cfg.versions.clone(),
             theirs,
         };
-        let text = err.to_string();
         let mut out = MAGIC.to_vec();
         out.push(1);
         out.extend_from_slice(&cfg.versions.start().to_be_bytes());
         out.extend_from_slice(&cfg.versions.end().to_be_bytes());
-        out.extend_from_slice(&(text.len() as u16).to_be_bytes());
-        out.extend_from_slice(text.as_bytes());
         t.write_all(&out).await?;
         t.flush().await?;
         return Err(err);
@@ -251,14 +273,27 @@ async fn respond_inner<T: AsyncRead + AsyncWrite + Unpin>(
     out.extend_from_slice(&msg[..n]);
     t.write_all(&out).await?;
     t.flush().await?;
-    finish(
+    let mut est = finish(
         hs,
         peer,
         chosen,
         peer_window,
         peer_keepalive,
         peer_reorder << 10,
-    )
+    )?;
+    // No session without the confirmation record.
+    let mut sealed = [0u8; CONFIRM_LEN];
+    read_exact(t, &mut sealed).await?;
+    let mut plain = [0u8; CONFIRM_LEN];
+    let n = est
+        .crypto
+        .read_message(CONFIRM_NONCE, &sealed, &mut plain)
+        .map_err(|_| hs_err("the confirmation does not authenticate"))?;
+    if n != 48 || &plain[..16] != CONFIRM_TAG {
+        return Err(hs_err("the confirmation carries an unexpected payload"));
+    }
+    est.join_secret.copy_from_slice(&plain[16..48]);
+    Ok(est)
 }
 
 fn finish(
@@ -280,5 +315,6 @@ fn finish(
         peer_keepalive,
         peer_reorder,
         session_id,
+        join_secret: [0u8; 32],
     })
 }

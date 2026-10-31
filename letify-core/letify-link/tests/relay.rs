@@ -267,9 +267,8 @@ async fn a_relayed_path_is_promoted_to_a_direct_path_when_one_appears() {
     ));
 
     // The direct port is reserved now and listens only after the relayed path is running.
-    let reserved = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let direct = reserved.local_addr().unwrap();
-    drop(reserved);
+    let held = HeldPort::new();
+    let direct = held.addr;
 
     let (tx, mut sessions) = tokio::sync::mpsc::channel(4);
     {
@@ -319,7 +318,7 @@ async fn a_relayed_path_is_promoted_to_a_direct_path_when_one_appears() {
         }
     });
     tokio::time::sleep(Duration::from_millis(500)).await;
-    let listener = TcpListener::bind(direct).await.unwrap();
+    let listener = held.listen();
     let _direct_sessions = spawn_server_into(listener, acceptor);
 
     let moved = timeout(Duration::from_secs(40), async {
@@ -363,9 +362,8 @@ async fn a_relay_path_is_dropped_as_soon_as_a_direct_path_carries_traffic() {
         PeerPolicy::allow(vec![a.node_id()]),
         Config::default(),
     ));
-    let reserved = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let direct = reserved.local_addr().unwrap();
-    drop(reserved);
+    let held = HeldPort::new();
+    let direct = held.addr;
 
     let (tx, mut sessions) = tokio::sync::mpsc::channel(4);
     {
@@ -428,7 +426,7 @@ async fn a_relay_path_is_dropped_as_soon_as_a_direct_path_carries_traffic() {
     })
     .await;
     assert!(early.is_err(), "the relay was dropped with no direct path");
-    let listener = TcpListener::bind(direct).await.unwrap();
+    let listener = held.listen();
     let _direct_sessions = spawn_server_into(listener, acceptor);
     let started = Instant::now();
     let (mut direct_added, mut reason) = (false, None);
@@ -741,4 +739,21 @@ async fn the_waiting_pairs_are_capped_as_a_whole() {
         .await
         .expect_err("a third waiting pair is refused");
     assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied, "{err}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_held_port_is_refused_and_unavailable_until_it_listens() {
+    // The direct port of the promotion tests must stay ours between choosing it and listening
+    // on it, or a parallel test run takes it and the test fails on the bind.
+    let held = HeldPort::new();
+    let addr = held.addr;
+    assert!(
+        std::net::TcpListener::bind(addr).is_err(),
+        "the port was free"
+    );
+    assert!(TcpStream::connect(addr).await.is_err(), "the port accepted");
+    let listener = held.listen();
+    let (client, accepted) = tokio::join!(TcpStream::connect(addr), listener.accept());
+    client.unwrap();
+    accepted.unwrap();
 }

@@ -35,6 +35,47 @@ struct Inner {
     replay: ReplayWindow,
 }
 
+/// The domain prefix of a join token's authenticator.
+const JOIN_DOMAIN: &[u8] = b"letify-link join v1";
+
+/// HMAC-BLAKE2s from the crypto resolver of `snow`, the hash the handshake itself uses.
+fn hmac_blake2s(key: &[u8; 32], data: &[u8]) -> [u8; 32] {
+    use snow::params::HashChoice;
+    use snow::resolvers::{CryptoResolver, DefaultResolver};
+    let mut hash = DefaultResolver
+        .resolve_hash(&HashChoice::Blake2s)
+        .expect("the default resolver has BLAKE2s");
+    let mut out = [0u8; 32];
+    hash.hmac(key, data, &mut out);
+    out
+}
+
+fn join_mac(secret: &[u8; 32], random: &[u8]) -> [u8; 16] {
+    let mut data = JOIN_DOMAIN.to_vec();
+    data.extend_from_slice(random);
+    hmac_blake2s(secret, &data)[..16].try_into().unwrap()
+}
+
+/// A fresh join token for a session with `secret`: 16 random bytes, then their authenticator.
+/// Two tokens of one session share nothing a holder of no secret can see.
+pub(crate) fn join_token(secret: &[u8; 32]) -> Result<[u8; 32]> {
+    let mut token = [0u8; 32];
+    getrandom::getrandom(&mut token[..16]).map_err(|e| Error::Handshake(e.to_string()))?;
+    let mac = join_mac(secret, &token[..16]);
+    token[16..].copy_from_slice(&mac);
+    Ok(token)
+}
+
+/// Whether `token` was made with `secret`.
+pub(crate) fn join_token_is_valid(secret: &[u8; 32], token: &[u8; 32]) -> bool {
+    let mac = join_mac(secret, &token[..16]);
+    // Fold every byte so the comparison does not stop at the first difference.
+    mac.iter()
+        .zip(&token[16..])
+        .fold(0u8, |d, (a, b)| d | (a ^ b))
+        == 0
+}
+
 /// The keys of one session, shared by every subflow.
 pub(crate) struct Keys {
     /// Sealing and opening take the read side. A rekey of either direction takes the write
@@ -191,6 +232,12 @@ impl Keys {
     pub fn is_stale(&self, epoch: u16, nonce: u64) -> bool {
         let inner = self.lock();
         epoch < inner.recv_epoch || (epoch == inner.recv_epoch && inner.announced == Some(nonce))
+    }
+
+    /// Whether `epoch` is one the receiving direction has already left, so that a record of it
+    /// is dropped for being late and not for being a replay.
+    pub fn is_left(&self, epoch: u16) -> bool {
+        epoch < self.lock().recv_epoch
     }
 
     /// The peer has switched to `epoch` of this side's keys, so the announcements below it are

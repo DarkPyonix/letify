@@ -179,13 +179,17 @@ async fn a_session_resumes_across_a_rekey() {
     assert_eq!(b.receive_epoch(), 0);
     let (ta, tb) = duplex_pair();
     let (old_a, old_b) = (a.subflow_stats()[0].id, b.subflow_stats()[0].id);
+    let reached = a.send_epoch();
     let (ra, rb) = tokio::join!(a.add_subflow(ta), b.add_subflow(tb));
     ra.unwrap();
     rb.unwrap();
-    assert_eq!(
-        b.receive_epoch(),
-        a.send_epoch(),
-        "the Hello brought b up to date"
+    // The Hello follows the peer's challenge, so records that the withheld subflow keeps
+    // sealing may move a on by an epoch after the Hello left. b must be at least where a was
+    // before the join.
+    assert!(
+        b.receive_epoch() >= reached,
+        "the Hello brought b up to date: {} < {reached}",
+        b.receive_epoch()
     );
     a.close_subflow(old_a);
     b.close_subflow(old_b);
@@ -228,4 +232,65 @@ async fn a_session_resumes_across_epochs() {
         .unwrap();
     got.extend_from_slice(&rest);
     assert!(got == data, "bytes differ after resuming across epochs");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn records_of_a_left_epoch_do_not_hold_the_window_of_their_subflow() {
+    // The second subflow is held while the first carries the transfer through several rekeys.
+    // When the second is released, its records are of epochs the receiver has left and are
+    // dropped. The sender wrote them into that subflow's window, so the subflow ack must still
+    // cover them, or the window stays occupied by bytes that never come back.
+    let (a, b) = session_pair(tiny_limit(16)).await;
+    let (ta, tb) = duplex_pair();
+    let (tb, gate) = Gated::new(tb);
+    let (ra, rb) = tokio::join!(a.add_subflow(ta), b.add_subflow(tb));
+    let held = ra.unwrap();
+    rb.unwrap();
+    gate.close();
+    let data = pattern(6 << 20, 4);
+    let mut tx = a.open_stream().await.unwrap();
+    let writer = tokio::spawn({
+        let data = data.clone();
+        async move {
+            tx.write_all(&data).await.unwrap();
+            tx.shutdown().await.unwrap();
+        }
+    });
+    let mut rx = b.accept_stream().await.unwrap();
+    let mut got = Vec::new();
+    timeout(Duration::from_secs(60), rx.read_to_end(&mut got))
+        .await
+        .unwrap()
+        .unwrap();
+    writer.await.unwrap();
+    assert!(got == data);
+    assert!(b.receive_epoch() >= 4, "epoch {}", b.receive_epoch());
+    let inflight = |s: &letify_link::Session| {
+        s.subflow_stats()
+            .iter()
+            .find(|f| f.id == held)
+            .map(|f| f.inflight_bytes)
+            .unwrap()
+    };
+    assert!(
+        inflight(&a) > 0,
+        "nothing was held back, the test forces nothing"
+    );
+    let dropped = b.dropped_records();
+    gate.open();
+    let settled = async {
+        while inflight(&a) != 0 {
+            sleep(Duration::from_millis(20)).await;
+        }
+    };
+    let waited = timeout(Duration::from_secs(10), settled).await;
+    assert!(
+        b.dropped_records() > dropped,
+        "the held records were not dropped, the test forces nothing"
+    );
+    assert!(
+        waited.is_ok(),
+        "{} bytes stay in the window of the subflow after its records were dropped",
+        inflight(&a)
+    );
 }

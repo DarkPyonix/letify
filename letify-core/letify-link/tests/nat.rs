@@ -13,13 +13,17 @@ use letify_link::stun::NatType;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 
-/// Reserve `count` loopback TCP ports. The sockets are closed again, so the punch can bind them.
-async fn free_tcp_addrs(count: usize) -> Vec<SocketAddr> {
+/// Reserve `count` loopback TCP ports. The returned sockets stay bound, and the caller keeps
+/// them until the punch is over: the punch binds the same ports with address and port reuse,
+/// which works beside them, while a port that was freed could be taken by another process
+/// and make the punch fail with "address not available".
+fn free_tcp_addrs(count: usize) -> (Vec<SocketAddr>, Vec<tokio::net::TcpSocket>) {
     let mut held = Vec::new();
     for _ in 0..count {
         held.push(punch::reusable_socket("127.0.0.1:0".parse().unwrap()).unwrap());
     }
-    held.iter().map(|s| s.local_addr().unwrap()).collect()
+    let addrs = held.iter().map(|s| s.local_addr().unwrap()).collect();
+    (addrs, held)
 }
 
 #[tokio::test]
@@ -28,8 +32,8 @@ async fn two_nodes_exchange_records_and_punch_tcp_over_the_in_memory_rendezvous(
     let (ida, idb) = (Identity::generate(), Identity::generate());
     let (a, b) = (ida.node_id(), idb.node_id());
     let (ra, rb) = (hub.endpoint(a), hub.endpoint(b));
-    let addrs_a = free_tcp_addrs(punch::PUNCH_SOCKETS).await;
-    let addrs_b = free_tcp_addrs(punch::PUNCH_SOCKETS).await;
+    let (addrs_a, _hold_a) = free_tcp_addrs(punch::PUNCH_SOCKETS);
+    let (addrs_b, _hold_b) = free_tcp_addrs(punch::PUNCH_SOCKETS);
 
     // First contact: A says hello and asks for B's record, B answers with it, A sends its own.
     send_message(
@@ -122,7 +126,7 @@ async fn two_nodes_exchange_records_and_punch_tcp_over_the_in_memory_rendezvous(
 
 #[tokio::test]
 async fn a_tcp_punch_to_a_peer_that_never_dials_times_out_and_names_the_dials() {
-    let addrs = free_tcp_addrs(2).await;
+    let (addrs, _hold) = free_tcp_addrs(2);
     let now = now_ms();
     let err = punch::punch_tcp(
         addrs[0],
@@ -187,12 +191,22 @@ async fn a_udp_spray_finds_the_one_right_pair_among_wrong_ports() {
     for _ in 0..4 {
         a_socks.push(UdpSocket::bind("127.0.0.1:0").await.unwrap());
     }
-    // B binds last: Windows hands out ascending ports, and the wrong window starts above B's
-    // port, so it must not cover A's own sockets.
-    let b = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-    let ab = b.local_addr().unwrap();
+    // The wrong window starts above B's port and must not cover A's own sockets, or A's
+    // probes reach A's other sockets and any of them can be the one that succeeds. Windows
+    // hands out ascending ports, so binding B last is enough there. Linux picks ports at
+    // random, so B is bound again until the window is clear.
     let a_addr = a_socks[2].local_addr().unwrap();
-    let wrong = punch::predicted_destinations(ab, NatType::Symmetric { step: 1 }, 5);
+    let (b, ab, wrong) = loop {
+        let b = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let ab = b.local_addr().unwrap();
+        let wrong = punch::predicted_destinations(ab, NatType::Symmetric { step: 1 }, 5);
+        let clear = a_socks
+            .iter()
+            .all(|s| !wrong.contains(&s.local_addr().unwrap()));
+        if clear {
+            break (b, ab, wrong);
+        }
+    };
     let now = now_ms();
     let plan = Plan {
         start_at_ms: now,

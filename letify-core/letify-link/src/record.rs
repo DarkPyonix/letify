@@ -762,10 +762,23 @@ mod tests {
         // A tampered text fails the record signature, not just the text.
         let id = Identity::generate();
         let r = sample(&id);
-        let mut txt = r.encode_txt(&id);
-        let flipped = if txt[0].starts_with('A') { 'B' } else { 'A' };
-        txt[0].replace_range(10..11, &flipped.to_string());
-        assert!(AddressRecord::decode_txt(&txt, r.timestamp).is_err());
+        let txt = r.encode_txt(&id);
+        assert!(AddressRecord::decode_txt(&txt, r.timestamp).is_ok());
+        // Change every character in turn to a different one. Choosing the replacement from the
+        // character itself matters: a fixed replacement equals the original at some positions
+        // and would leave the text untouched.
+        for (si, s) in txt.iter().enumerate() {
+            for pos in 0..s.len() {
+                let old = s.as_bytes()[pos] as char;
+                let new = if old == 'A' { 'B' } else { 'A' };
+                let mut bad = txt.clone();
+                bad[si].replace_range(pos..pos + 1, &new.to_string());
+                assert!(
+                    AddressRecord::decode_txt(&bad, r.timestamp).is_err(),
+                    "string {si} position {pos}"
+                );
+            }
+        }
     }
 
     #[test]

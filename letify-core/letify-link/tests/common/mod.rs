@@ -37,6 +37,33 @@ pub fn duplex_pair() -> (tokio::io::DuplexStream, tokio::io::DuplexStream) {
     tokio::io::duplex(256 * 1024)
 }
 
+/// A loopback TCP port that this process holds bound without listening. Connecting to it is
+/// refused, as to a port nobody has, and no other socket of the machine can take it, which a
+/// port found by binding and dropping a listener does not guarantee.
+pub struct HeldPort {
+    socket: socket2::Socket,
+    pub addr: std::net::SocketAddr,
+}
+
+impl HeldPort {
+    pub fn new() -> HeldPort {
+        let socket =
+            socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::STREAM, None).unwrap();
+        socket
+            .bind(&std::net::SocketAddr::from(([127, 0, 0, 1], 0)).into())
+            .unwrap();
+        let addr = socket.local_addr().unwrap().as_socket().unwrap();
+        HeldPort { socket, addr }
+    }
+
+    /// Start listening on the held port.
+    pub fn listen(self) -> TcpListener {
+        self.socket.listen(1024).unwrap();
+        self.socket.set_nonblocking(true).unwrap();
+        TcpListener::from_std(self.socket.into()).unwrap()
+    }
+}
+
 /// Two sessions over one in-memory subflow. The responder accepts exactly the initiator.
 pub async fn session_pair(config: Config) -> (Session, Session) {
     let a = Identity::generate();
@@ -226,7 +253,7 @@ impl Proxy {
 pub enum Prefix {
     /// A session handshake: the header, then the first Noise message.
     Handshake,
-    /// A subflow added to a running session: the magic and session id.
+    /// A subflow added to a running session: the magic, the join token and the challenge.
     Subflow,
 }
 
@@ -266,7 +293,7 @@ impl Mitm {
             async move {
                 let mut head = match prefix {
                     Prefix::Handshake => vec![0u8; 10],
-                    Prefix::Subflow => vec![0u8; 20],
+                    Prefix::Subflow => vec![0u8; 52],
                 };
                 if ar.read_exact(&mut head).await.is_err() {
                     return;
@@ -281,6 +308,16 @@ impl Mitm {
                 *prefix_seen.lock().unwrap() = head.clone();
                 if to_b.lock().await.write_all(&head).await.is_err() {
                     return;
+                }
+                if let Prefix::Handshake = prefix {
+                    // The confirmation record of the handshake: 64 bytes, not a session record.
+                    let mut confirm = vec![0u8; 64];
+                    if ar.read_exact(&mut confirm).await.is_err() {
+                        return;
+                    }
+                    if to_b.lock().await.write_all(&confirm).await.is_err() {
+                        return;
+                    }
                 }
                 loop {
                     let mut rec = vec![0u8; 12];
