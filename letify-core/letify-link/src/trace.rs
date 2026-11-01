@@ -19,6 +19,8 @@ pub const ENV_TRACE: &str = "LETIFY_LINK_TRACE";
 pub const ENV_TRACE_MS: &str = "LETIFY_LINK_TRACE_MS";
 /// The trace file a binary falls back to when it was built with `LETIFY_LINK_TRACE_DEFAULT`.
 const BUILT_IN_PATH: Option<&str> = option_env!("LETIFY_LINK_TRACE_DEFAULT");
+/// The interval a binary falls back to when it was built with `LETIFY_LINK_TRACE_MS_DEFAULT`.
+const BUILT_IN_MS: Option<&str> = option_env!("LETIFY_LINK_TRACE_MS_DEFAULT");
 const DEFAULT_MS: u64 = 1000;
 const LEAST_MS: u64 = 50;
 
@@ -36,7 +38,7 @@ impl TraceConfig {
     pub fn from_env() -> Option<TraceConfig> {
         TraceConfig::parse(
             std::env::var(ENV_TRACE).ok().as_deref(),
-            std::env::var(ENV_TRACE_MS).ok().as_deref(),
+            std::env::var(ENV_TRACE_MS).ok().as_deref().or(BUILT_IN_MS),
             BUILT_IN_PATH,
         )
     }
@@ -44,7 +46,11 @@ impl TraceConfig {
     /// The setting from the three raw values: the variable, the interval and the build default.
     /// An empty path is off. An interval that is not a number is the default, and one below
     /// 50 ms is 50 ms.
-    pub fn parse(path: Option<&str>, ms: Option<&str>, built_in: Option<&str>) -> Option<TraceConfig> {
+    pub fn parse(
+        path: Option<&str>,
+        ms: Option<&str>,
+        built_in: Option<&str>,
+    ) -> Option<TraceConfig> {
         let path = path.or(built_in).filter(|p| !p.is_empty())?;
         let ms = ms
             .and_then(|m| m.trim().parse::<u64>().ok())
@@ -67,6 +73,12 @@ fn cpu_ms() -> Option<u64> {
     let stime: u64 = fields.next()?.parse().ok()?;
     // A clock tick is 10 ms on every Linux the sidecar runs on.
     Some((utime + stime) * 10)
+}
+
+fn unix_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis() as u64)
 }
 
 fn ms(d: Option<Duration>) -> Value {
@@ -99,7 +111,7 @@ pub fn line(
         })
         .collect();
     let mut v = json!({
-        "t_ms": t_ms, "session": session,
+        "t_ms": t_ms, "unix_ms": unix_ms(), "session": session,
         "unacked_bytes": flow.unacked_bytes, "max_unacked": flow.max_unacked,
         "reinjected": flow.reinjected, "reorder_bytes": flow.reorder_bytes,
         "reorder_peak": flow.reorder_peak, "pending_frames": flow.pending_frames,
