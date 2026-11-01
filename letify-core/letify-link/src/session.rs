@@ -2352,6 +2352,7 @@ mod tests {
     fn sub(gauge: Option<Gauge>) -> Sub {
         Sub::new(
             4 << 20,
+            16 << 20,
             gauge,
             SubShared {
                 sent: Arc::new(AtomicU64::new(0)),
@@ -2625,5 +2626,116 @@ mod tests {
         s.capped = true;
         s.adjust_cap(1e6, 4e6);
         assert_eq!(s.cap, 2 * 800_000);
+    }
+
+    /// A UDP subflow held to its window: 30 MB/s at 124 ms, a congestion window far above it.
+    fn window_bound(cwnd: usize) -> Sub {
+        let mut s = busy(Some(reading(cwnd, 0)));
+        s.rates.clear();
+        s.rates.push_back(30e6);
+        s.srtt = Some(Duration::from_millis(124));
+        s.read_gauge(Instant::now());
+        s
+    }
+
+    fn step(s: &mut Sub, n: u32) {
+        let t0 = Instant::now();
+        for i in 1..=n {
+            s.retarget_window(t0 + WINDOW_EVERY * i);
+        }
+    }
+
+    #[test]
+    fn a_udp_subflow_held_to_its_window_raises_it_by_at_most_a_factor_of_two_per_step() {
+        let mut s = window_bound(64 << 20);
+        step(&mut s, 1);
+        assert_eq!(s.window, 8 << 20);
+    }
+
+    #[test]
+    fn a_udp_subflow_window_settles_at_four_times_rate_times_round_trip() {
+        let mut s = window_bound(64 << 20);
+        step(&mut s, 10);
+        assert_eq!(s.window, (4.0 * 30e6 * 0.124) as usize);
+        assert_eq!(s.window_limit, s.window);
+    }
+
+    #[test]
+    fn a_udp_subflow_window_never_exceeds_the_ceiling() {
+        let mut s = window_bound(64 << 20);
+        s.rates.push_back(200e6);
+        step(&mut s, 20);
+        assert_eq!(s.window, 16 << 20);
+    }
+
+    #[test]
+    fn a_udp_subflow_window_does_not_run_ahead_of_its_congestion_window() {
+        let mut s = window_bound(6 << 20);
+        step(&mut s, 10);
+        assert_eq!(s.window, 6 << 20);
+    }
+
+    #[test]
+    fn a_subflow_without_a_congestion_gauge_keeps_the_fixed_window() {
+        let mut s = busy(None);
+        s.rates.push_back(30e6);
+        s.srtt = Some(Duration::from_millis(124));
+        step(&mut s, 10);
+        assert_eq!(s.window, 4 << 20);
+    }
+
+    #[test]
+    fn a_ceiling_at_the_floor_keeps_the_window_fixed() {
+        let mut s = Sub::new(
+            1 << 20,
+            1 << 20,
+            Some(reading(64 << 20, 0)),
+            SubShared {
+                sent: Arc::new(AtomicU64::new(0)),
+                received: Arc::new(AtomicU64::new(0)),
+                rtt_us: Arc::new(AtomicU64::new(NO_RTT)),
+                notify: Arc::new(Notify::new()),
+                aborts: Vec::new(),
+            },
+        );
+        s.rates.push_back(30e6);
+        s.srtt = Some(Duration::from_millis(124));
+        s.read_gauge(Instant::now());
+        step(&mut s, 10);
+        assert_eq!(s.window, 1 << 20);
+    }
+
+    #[test]
+    fn a_falling_target_lowers_the_window_by_at_most_an_eighth_per_step() {
+        let mut s = window_bound(64 << 20);
+        step(&mut s, 10);
+        let high = s.window;
+        s.rates.clear();
+        s.rates.push_back(1e6);
+        step(&mut s, 1);
+        assert_eq!(s.window, high - high / 8);
+    }
+
+    #[test]
+    fn a_penalty_is_not_undone_by_a_rise_of_the_window_limit() {
+        let mut s = window_bound(64 << 20);
+        s.window /= 2;
+        let halved = s.window;
+        step(&mut s, 1);
+        // The limit rose from 4 MiB to 8 MiB, so the penalised window rises by 4 MiB.
+        assert_eq!(s.window, halved + (4 << 20));
+        assert!(s.window < s.window_limit);
+    }
+
+    #[test]
+    fn startup_keeps_the_cap_within_half_the_floor_window_after_the_window_grew() {
+        let mut s = window_bound(64 << 20);
+        step(&mut s, 10);
+        s.cap = 64 << 20;
+        s.cap_ref = 30e6;
+        assert!(matches!(s.cap_mode, CapMode::Startup(_)));
+        assert!(s.bulk_cap() <= 2 << 20);
+        s.cap_mode = CapMode::Hold(0);
+        assert!(s.bulk_cap() > 2 << 20);
     }
 }
