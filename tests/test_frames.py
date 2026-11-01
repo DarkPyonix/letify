@@ -189,6 +189,9 @@ def _declare(let: letify.Launcher, cpu: letify.Instance):
     return noop, take, give
 
 
+RATIO_OF_SOCKETPAIR = 0.05
+
+
 # -- Spec: Frames, large values ------------------------------------------------
 
 
@@ -205,13 +208,48 @@ def test_arguments_and_results_round_trip_with_matching_checksums(let, cpu, size
         assert give(size) != result
 
 
+def _send_all(sock, data: bytes) -> None:
+    sock.sendall(data)
+    sock.close()
+
+
+def _socketpair_mib_per_s(attempts: int = 5) -> float:
+    """The best rate of a plain socketpair copy of 64 MiB in this process, in MiB/s.
+
+    It is the machine's own ceiling for moving 64 MiB between two endpoints, with no framing,
+    no pickling and no worker, so a value that moves at a fixed fraction of it has not lost
+    that fraction to letify.
+    """
+    import socket
+    import threading
+
+    data = os.urandom(64 * MiB)
+    best = 0.0
+    for _ in range(attempts):
+        sender, receiver = socket.socketpair()
+        buffer = bytearray(len(data))
+        view = memoryview(buffer)
+        thread = threading.Thread(target=_send_all, args=(sender, data))
+        start = time.perf_counter()
+        thread.start()
+        received = 0
+        while received < len(buffer):
+            received += receiver.recv_into(view[received:])
+        elapsed = time.perf_counter() - start
+        thread.join()
+        receiver.close()
+        best = max(best, 64 / elapsed)
+    return best
+
+
 def test_a_64_mib_value_moves_at_least_300_mib_per_second_each_way_on_this_machine(
     let, cpu
 ) -> None:
-    # A throughput floor, not a benchmark. Base64 lines managed 55 MiB/s up and 95 MiB/s
-    # down here and binary frames about 1000 MiB/s, so 300 MiB/s keeps a wide margin for a
-    # loaded CI machine. LETIFY_THROUGHPUT_FLOOR lowers it where a runner is slower still.
-    floor = float(os.environ.get("LETIFY_THROUGHPUT_FLOOR", "300"))
+    # Spec "Frames": a floor, not a benchmark. Base64 lines managed 55 MiB/s up and 95 MiB/s
+    # down here and binary frames about 1000 MiB/s. Off CI the floor is the absolute 300 MiB/s
+    # (LETIFY_THROUGHPUT_FLOOR overrides it). A shared CI runner moves a plain socketpair copy
+    # at a rate that varies by several times between runs, so there the floor is the same
+    # fraction of that copy measured in this process, taken from the ratio the floor has here.
     noop, _take, _give = _declare(let, cpu)
 
     @let.function(device=cpu, host=letify.remote)
@@ -236,8 +274,15 @@ def test_a_64_mib_value_moves_at_least_300_mib_per_second_each_way_on_this_machi
             start = time.perf_counter()
             assert len(filled(64 * MiB, attempt)) == 64 * MiB
             best_down = max(best_down, 64 / (time.perf_counter() - start))
-    assert best_up >= floor, f"upload {best_up:.0f} MiB/s"
-    assert best_down >= floor, f"download {best_down:.0f} MiB/s"
+    if os.environ.get("CI") and "LETIFY_THROUGHPUT_FLOOR" not in os.environ:
+        baseline = _socketpair_mib_per_s()
+        floor = baseline * RATIO_OF_SOCKETPAIR
+        where = f"{RATIO_OF_SOCKETPAIR:.0%} of the {baseline:.0f} MiB/s socketpair copy"
+    else:
+        floor = float(os.environ.get("LETIFY_THROUGHPUT_FLOOR", "300"))
+        where = "the absolute floor"
+    assert best_up >= floor, f"upload {best_up:.0f} MiB/s, under {floor:.0f} ({where})"
+    assert best_down >= floor, f"download {best_down:.0f} MiB/s, under {floor:.0f} ({where})"
 
 
 _RSS_SCRIPT = textwrap.dedent(
