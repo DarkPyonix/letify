@@ -734,3 +734,37 @@ def test_a_service_that_is_down_makes_a_read_raise(signal_service, daemons) -> N
             watch.read(0.2)
     finally:
         watch.close()
+
+
+def test_an_idle_watch_sends_the_text_ping_and_a_pong_is_liveness_not_a_message(
+    signal_service, daemons, monkeypatch
+) -> None:
+    monkeypatch.setattr(linksignal, "WS_PING_S", 0.2)
+    monkeypatch.setattr(linksignal, "WS_PONG_S", 1.0)
+    watch = linksignal.SignalClient(daemons("b"), signal_service.url).watch()
+    try:
+        deadline = time.monotonic() + 1.2
+        while time.monotonic() < deadline:
+            assert watch.read(0.3) == []
+        assert signal_service.ws_pings >= 3
+        assert signal_service.ws_accepted == 1
+        assert [r for r in signal_service.requests if r[1].startswith("/recv/")] == []
+    finally:
+        watch.close()
+
+
+def test_a_watch_whose_ping_is_not_answered_drops_the_socket_after_the_pong_limit(
+    signal_service, daemons, monkeypatch
+) -> None:
+    monkeypatch.setattr(linksignal, "WS_PING_S", 0.1)
+    monkeypatch.setattr(linksignal, "WS_PONG_S", 0.4)
+    signal_service.answer_pings = False
+    watch = linksignal.SignalClient(daemons("b"), signal_service.url).watch()
+    try:
+        began = time.monotonic()
+        with pytest.raises(linksignal.SignalError, match="no pong"):
+            while time.monotonic() - began < 5:
+                watch.read(0.3)
+        assert time.monotonic() - began < 3
+    finally:
+        watch.close()

@@ -2245,6 +2245,9 @@ class _FakeWebSocket:
         else:
             self._write(self._frame(0x1, data))
 
+    def send_text(self, text: str) -> None:
+        self._write(self._frame(0x1, text.encode()))
+
     def close(self, code: int = 1000) -> None:
         import struct
 
@@ -2326,6 +2329,9 @@ class FakeSignalService:
         self.ws_acks: list[int] = []
         #: Send every text frame as two fragments with a ping between them.
         self.fragment_frames = False
+        #: Text pings received, and whether the service answers them with the text pong.
+        self.ws_pings = 0
+        self.answer_pings = True
         service = self
 
         class Handler(http.server.BaseHTTPRequestHandler):
@@ -2466,6 +2472,12 @@ class FakeSignalService:
                 text = sock.read_text()
                 if text is None:
                     break
+                if text == "ping":
+                    with self._cond:
+                        self.ws_pings += 1
+                    if self.answer_pings:
+                        sock.send_text("pong")
+                    continue
                 try:
                     ack = int(json.loads(text)["ack"])
                 except (ValueError, KeyError, TypeError):
