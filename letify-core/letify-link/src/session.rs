@@ -167,6 +167,10 @@ const HEAVY_LOSS: f64 = 0.10;
 /// While a path recovers from loss, the cap holds at most this long a flight at the delivery
 /// rate, so a small message waits behind at most this much bulk.
 const LOSS_DELAY: Duration = Duration::from_millis(150);
+/// The window limit of a UDP subflow is recomputed at most this often.
+const WINDOW_EVERY: Duration = Duration::from_millis(100);
+/// The window limit of a UDP subflow aims at this many times its best rate x round trip.
+const WINDOW_HEADROOM: f64 = 4.0;
 /// A transport's congestion window is read at most this often.
 const GAUGE_EVERY: Duration = Duration::from_millis(10);
 /// While both classes have frames queued, this many interactive frames are followed by one
@@ -252,6 +256,13 @@ pub(crate) struct Sub {
     /// A subflow ack is owed on this subflow.
     ack_dirty: bool,
     window: usize,
+    /// The window the subflow regains to after a penalty: `base_window` for a subflow with a
+    /// fixed window, else the target that follows the transport, see `retarget_window`.
+    window_limit: usize,
+    /// The configured floor of the window, and the most `window_limit` may rise to.
+    base_window: usize,
+    window_ceiling: usize,
+    window_at: Instant,
     last_penalty: Option<Instant>,
     srtt: Option<Duration>,
     /// For each frame written: the value of `sent_seq` after it and when, to time its ack.
@@ -304,13 +315,23 @@ pub(crate) struct Sub {
 }
 
 impl Sub {
-    fn new(window: usize, gauge: Option<Gauge>, shared: SubShared) -> Sub {
+    fn new(window: usize, ceiling: usize, gauge: Option<Gauge>, shared: SubShared) -> Sub {
+        // Only a transport that reports its congestion window can say how far to open.
+        let ceiling = if gauge.is_some() {
+            ceiling.max(window)
+        } else {
+            window
+        };
         Sub {
             sent_seq: 0,
             acked_seq: 0,
             recv_seq: 0,
             ack_dirty: false,
             window,
+            window_limit: window,
+            base_window: window,
+            window_ceiling: ceiling,
+            window_at: Instant::now(),
             last_penalty: None,
             srtt: None,
             marks: VecDeque::new(),
@@ -347,9 +368,41 @@ impl Sub {
         }
     }
 
-    /// The largest bulk cap this subflow ever has: half of its window, at least one frame.
+    /// The largest bulk cap this subflow has: half of its window, at least one frame. Startup
+    /// and loss recovery hold to half of the configured window, which a window that grew with
+    /// the path does not raise.
     fn cap_ceiling(&self) -> usize {
-        (self.window / 2).max(QUANTUM)
+        let window = if matches!(self.cap_mode, CapMode::Startup(_)) {
+            self.window.min(self.base_window)
+        } else {
+            self.window
+        };
+        (window / 2).max(QUANTUM)
+    }
+
+    /// Move the window limit toward min(cwnd, 4 x best rate x round trip), between the floor and
+    /// the ceiling, and move the window by the same amount. SPEC.md letify-link, Session item 4.
+    fn retarget_window(&mut self, now: Instant) {
+        if self.window_ceiling <= self.base_window
+            || now.saturating_duration_since(self.window_at) < WINDOW_EVERY
+        {
+            return;
+        }
+        let (Some((stats, _)), Some(srtt)) = (self.gauged, self.srtt) else {
+            return;
+        };
+        self.window_at = now;
+        let best = self.rates.iter().copied().fold(0.0, f64::max);
+        let want = (WINDOW_HEADROOM * best * srtt.as_secs_f64()) as usize;
+        let target = want
+            .min(stats.window)
+            .clamp(self.base_window, self.window_ceiling);
+        let next = step_unacked(self.window_limit, target);
+        if next > self.window_limit {
+            self.window += next - self.window_limit;
+        }
+        self.window_limit = next;
+        self.window = self.window.min(next);
     }
 
     /// The most bulk bytes this subflow may have in flight: the smallest cap found by probing
@@ -360,6 +413,7 @@ impl Sub {
         let rtt = self.min_rtt.map_or(RTT_FLOOR, |(r, _)| r).max(RTT_FLOOR);
         let bound = (CAP_BOUND * best * rtt.as_secs_f64()) as usize;
         let top = self.cap_ceiling();
+        let recovery_top = top.min((self.base_window / 2).max(QUANTUM));
         // The rate samples of startup lag the cap by a round trip, so the 8 x B x R bound
         // would hold the cap at the size of the first, nearly empty, samples. Startup is held
         // to a few times what the best sample delivered in one round trip instead.
@@ -381,7 +435,7 @@ impl Sub {
                 let stall = (best * rtt.as_secs_f64()) as usize;
                 let flight = stats.window.saturating_add(stall);
                 let allowed = (best * LOSS_DELAY.as_secs_f64()) as usize;
-                probed.max(flight.min(allowed)).min(top)
+                probed.max(flight.min(allowed)).min(recovery_top)
             }
             _ => probed,
         }
@@ -543,7 +597,6 @@ pub(crate) struct State {
     max_unacked_floor: usize,
     max_unacked_ceiling: usize,
     unacked_at: Instant,
-    subflow_window: usize,
     next_seq: u64,
     unacked: BTreeMap<u64, Sent>,
     pub unacked_bytes: usize,
@@ -849,7 +902,6 @@ impl State {
 
     /// The subflow ack: the peer received `n` bytes of sequenced frames on subflow `id`.
     fn apply_sub_ack(&mut self, id: u64, n: u64) {
-        let cap = self.subflow_window;
         // The best rate the other subflows delivered, which seeds a subflow starting up.
         let sibling_rate = self
             .subflows
@@ -903,7 +955,8 @@ impl State {
             sub.rate_bytes = 0;
         }
         // A penalised window regains an eighth of what the subflow got acknowledged.
-        sub.window = (sub.window + (delta / 8) as usize).min(cap);
+        sub.window = (sub.window + (delta / 8) as usize).min(sub.window_limit);
+        sub.retarget_window(now);
         sub.notify.notify_one();
         self.retarget_unacked(now);
     }
@@ -1336,6 +1389,7 @@ impl Shared {
             id,
             Sub::new(
                 self.cfg.subflow_window,
+                self.cfg.subflow_window_ceiling,
                 gauge,
                 SubShared {
                     sent,
@@ -1759,7 +1813,6 @@ impl Session {
             max_unacked_floor: cfg.max_unacked_bytes.min(est.peer_reorder),
             max_unacked_ceiling: cfg.max_unacked_ceiling.min(est.peer_reorder),
             unacked_at: Instant::now(),
-            subflow_window: cfg.subflow_window,
             next_seq: 0,
             unacked: BTreeMap::new(),
             unacked_bytes: 0,
@@ -2352,6 +2405,7 @@ mod tests {
     fn sub(gauge: Option<Gauge>) -> Sub {
         Sub::new(
             4 << 20,
+            16 << 20,
             gauge,
             SubShared {
                 sent: Arc::new(AtomicU64::new(0)),
@@ -2625,5 +2679,115 @@ mod tests {
         s.capped = true;
         s.adjust_cap(1e6, 4e6);
         assert_eq!(s.cap, 2 * 800_000);
+    }
+
+    /// A UDP subflow held to its window: 30 MB/s at 124 ms, a congestion window far above it.
+    fn window_bound(cwnd: usize) -> Sub {
+        let mut s = busy(Some(reading(cwnd, 0)));
+        s.rates.clear();
+        s.rates.push_back(30e6);
+        s.srtt = Some(Duration::from_millis(124));
+        s.read_gauge(Instant::now());
+        s
+    }
+
+    fn step(s: &mut Sub, n: u32) {
+        for _ in 0..n {
+            s.retarget_window(s.window_at + WINDOW_EVERY);
+        }
+    }
+
+    #[test]
+    fn a_udp_subflow_held_to_its_window_raises_it_by_at_most_a_factor_of_two_per_step() {
+        let mut s = window_bound(64 << 20);
+        step(&mut s, 1);
+        assert_eq!(s.window, 8 << 20);
+    }
+
+    #[test]
+    fn a_udp_subflow_window_settles_at_four_times_rate_times_round_trip() {
+        let mut s = window_bound(64 << 20);
+        step(&mut s, 10);
+        assert_eq!(s.window, (4.0 * 30e6 * 0.124) as usize);
+        assert_eq!(s.window_limit, s.window);
+    }
+
+    #[test]
+    fn a_udp_subflow_window_never_exceeds_the_ceiling() {
+        let mut s = window_bound(64 << 20);
+        s.rates.push_back(200e6);
+        step(&mut s, 20);
+        assert_eq!(s.window, 16 << 20);
+    }
+
+    #[test]
+    fn a_udp_subflow_window_does_not_run_ahead_of_its_congestion_window() {
+        let mut s = window_bound(6 << 20);
+        step(&mut s, 10);
+        assert_eq!(s.window, 6 << 20);
+    }
+
+    #[test]
+    fn a_subflow_without_a_congestion_gauge_keeps_the_fixed_window() {
+        let mut s = busy(None);
+        s.rates.push_back(30e6);
+        s.srtt = Some(Duration::from_millis(124));
+        step(&mut s, 10);
+        assert_eq!(s.window, 4 << 20);
+    }
+
+    #[test]
+    fn a_ceiling_at_the_floor_keeps_the_window_fixed() {
+        let mut s = Sub::new(
+            1 << 20,
+            1 << 20,
+            Some(reading(64 << 20, 0)),
+            SubShared {
+                sent: Arc::new(AtomicU64::new(0)),
+                received: Arc::new(AtomicU64::new(0)),
+                rtt_us: Arc::new(AtomicU64::new(NO_RTT)),
+                notify: Arc::new(Notify::new()),
+                aborts: Vec::new(),
+            },
+        );
+        s.rates.push_back(30e6);
+        s.srtt = Some(Duration::from_millis(124));
+        s.read_gauge(Instant::now());
+        step(&mut s, 10);
+        assert_eq!(s.window, 1 << 20);
+    }
+
+    #[test]
+    fn a_falling_target_lowers_the_window_by_at_most_an_eighth_per_step() {
+        let mut s = window_bound(64 << 20);
+        step(&mut s, 10);
+        let high = s.window;
+        s.rates.clear();
+        s.rates.push_back(1e6);
+        step(&mut s, 1);
+        assert_eq!(s.window, high - high / 8);
+    }
+
+    #[test]
+    fn a_penalty_is_not_undone_by_a_rise_of_the_window_limit() {
+        let mut s = window_bound(64 << 20);
+        s.window /= 2;
+        let halved = s.window;
+        step(&mut s, 1);
+        // The limit rose from 4 MiB to 8 MiB, so the penalised window rises by 4 MiB.
+        assert_eq!(s.window, halved + (4 << 20));
+        assert!(s.window < s.window_limit);
+    }
+
+    #[test]
+    fn startup_keeps_the_cap_within_half_the_floor_window_after_the_window_grew() {
+        let mut s = window_bound(64 << 20);
+        step(&mut s, 10);
+        s.cap = 64 << 20;
+        s.cap_ref = 30e6;
+        assert!(matches!(s.cap_mode, CapMode::Startup(_)));
+        assert!(s.bulk_cap() <= 2 << 20);
+        s.cap_mode = CapMode::Hold(0);
+        assert!(s.bulk_cap() > 2 << 20);
     }
 }

@@ -296,3 +296,32 @@ async fn bench_bulk_beside_32_streams_at_2_percent_loss() {
     let r = latencies(Arc::new(a), Arc::new(b), run, true).await;
     report("1 UDP path (quinn, BBR)   ", r);
 }
+
+/// SPEC.md letify-link, Session item 4, Window of a UDP subflow: one UDP path at a 250 ms round
+/// trip with 100 MiB/s of room. A fixed 4 MiB window holds the path to about 4 MiB / 0.25 s =
+/// 16 MiB/s, so a result well above that shows the window follows the path.
+/// `SIM_LOSS` (default 0.01) is the loss share and `SIM_WINDOW_MIB` the window and its ceiling.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "a measurement, about 40 s"]
+async fn bench_one_udp_path_at_250_ms_rtt_is_not_held_to_a_fixed_window() {
+    let one_way = Duration::from_millis(125);
+    let loss: f64 = std::env::var("SIM_LOSS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0.01);
+    let mut config = Config::default();
+    if let Some(m) = std::env::var("SIM_WINDOW_MIB")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+    {
+        config.subflow_window = m << 20;
+        config.subflow_window_ceiling = m << 20;
+    }
+    let (a, b, _proxy) = udp_session(config, one_way, loss, Some(100.0 * 1048576.0)).await;
+    let rate = throughput(&a, &b, Duration::from_secs(8), Duration::from_secs(12)).await;
+    let window = a.subflow_stats()[0].window >> 10;
+    println!(
+        "RESULT one UDP path, rtt 250 ms, loss {:.1}%: {rate:6.2} MiB/s, window {window} KiB",
+        loss * 100.0
+    );
+}

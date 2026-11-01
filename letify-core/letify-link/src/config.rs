@@ -38,6 +38,10 @@ pub struct Config {
     /// Bytes that may be in flight on one subflow, sent and not yet acknowledged on that
     /// subflow. Default 4 MiB.
     pub subflow_window: usize,
+    /// The most the window of a UDP subflow may rise to. The window of such a subflow follows
+    /// its congestion window and delivery rate between `subflow_window` and this. A value at or
+    /// below `subflow_window` keeps the window fixed. Default 16 MiB.
+    pub subflow_window_ceiling: usize,
     /// Bytes of frames the receiver holds ahead of a gap, advertised to the peer, which limits
     /// its unacknowledged bytes to this. Values below 128 KiB are raised to 128 KiB. Default
     /// 64 MiB.
@@ -81,13 +85,14 @@ impl Config {
 
     /// A profile for a phone or a tablet: less memory in flight and fewer pings than the
     /// default. `max_unacked_bytes` and `max_unacked_ceiling` 4 MiB, `max_reorder_bytes` 8 MiB, `stream_window` 2 MiB,
-    /// `subflow_window` 1 MiB and `keepalive_interval` 30 s. Every other field is the default.
+    /// `subflow_window` and `subflow_window_ceiling` 1 MiB and `keepalive_interval` 30 s. Every other field is the default.
     pub fn mobile() -> Config {
         Config {
             max_unacked_bytes: 4 << 20,
             max_unacked_ceiling: 4 << 20,
             stream_window: 2 << 20,
             subflow_window: 1 << 20,
+            subflow_window_ceiling: 1 << 20,
             max_reorder_bytes: 8 << 20,
             keepalive_interval: Duration::from_secs(30),
             ..Config::default()
@@ -108,6 +113,7 @@ impl Default for Config {
             max_unacked_ceiling: 64 << 20,
             stream_window: 32 << 20,
             subflow_window: 4 << 20,
+            subflow_window_ceiling: 16 << 20,
             max_reorder_bytes: 64 << 20,
             resume_window: Duration::from_secs(24 * 3600),
             keepalive_interval: Duration::from_secs(15),

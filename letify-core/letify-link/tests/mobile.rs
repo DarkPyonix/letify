@@ -49,6 +49,9 @@ fn the_mobile_profile_holds_less_and_pings_less_often() {
     assert_eq!(mobile.max_reorder_bytes, 8 << 20);
     assert_eq!(mobile.stream_window, 2 << 20);
     assert_eq!(mobile.subflow_window, 1 << 20);
+    assert_eq!(mobile.subflow_window_ceiling, 1 << 20);
+    assert_eq!(normal.subflow_window, 4 << 20);
+    assert_eq!(normal.subflow_window_ceiling, 16 << 20);
     assert!(mobile.max_reorder_bytes < normal.max_reorder_bytes);
     assert_eq!(mobile.keepalive_interval, Duration::from_secs(30));
     assert!(mobile.keepalive_interval > normal.keepalive_interval);
