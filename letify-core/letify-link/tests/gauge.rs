@@ -123,4 +123,26 @@ async fn a_punched_udp_candidate_has_a_gauge_through_the_path_manager() {
         .unwrap();
     carry(pm.session(), &b).await;
     assert!(pm.session().subflow_stats()[0].congestion.is_some());
+
+    // The trace names the subflow as a gauged UDP one and reports its congestion window.
+    let dir = std::env::temp_dir().join(format!("ll-gauge-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = dir.join("trace.jsonl");
+    let config = letify_link::trace::TraceConfig::parse(file.to_str(), Some("50"), None).unwrap();
+    let task = letify_link::trace::spawn(
+        config,
+        1,
+        pm.session().downgrade(),
+        std::time::Instant::now(),
+        Some(pm.kinds()),
+    );
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    task.abort();
+    let text = std::fs::read_to_string(&file).unwrap();
+    let last: serde_json::Value = serde_json::from_str(text.lines().last().unwrap()).unwrap();
+    let sub = &last["subflows"][0];
+    assert_eq!(sub["kind"], "udp");
+    assert_eq!(sub["gauged"], true);
+    assert!(sub["cwnd"].as_u64().unwrap() > 0);
+    std::fs::remove_dir_all(&dir).unwrap();
 }
