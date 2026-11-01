@@ -716,3 +716,56 @@ def test_a_client_error_on_a_piece_is_not_retried(
     with pytest.raises(RuntimeFailure, match="403"):
         backend.put_file("digest-i", source)
     assert len(fake_drive.uploads()) == 1
+
+
+# -- the pack tolerates a tree that changes under it ----------------------------
+
+
+def test_a_file_that_vanishes_during_the_pack_is_left_out_not_fatal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Spec: Google Drive is a store, not a volume, the pack tolerates a changing tree."""
+    import os
+    import tarfile
+
+    from letify.protocol import worker as worker_module
+
+    text = worker_module.SOURCE.rstrip()
+    assert text.endswith("_serve()")
+    worker: dict[str, Any] = {"__name__": "probe"}
+    exec(compile(text[: -len("_serve()")], "worker", "exec"), worker)
+
+    root = tmp_path / "env"
+    (root / "pkg" / "__pycache__").mkdir(parents=True)
+    (root / "pkg" / "keep.py").write_text("x = 1")
+    (root / "pkg" / "__pycache__" / "keep.cpython-311.pyc").write_bytes(b"pyc")
+    temporary = root / "pkg" / "__pycache__" / "uuid.cpython-311.pyc.139776096370992"
+    temporary.write_bytes(b"half")
+    (root / "pkg" / "gone.txt").write_text("vanishes")
+    (root / "gonedir").mkdir()
+
+    real = os.listdir
+
+    def listing_then_removal(path: Any = ".") -> list[str]:
+        names = real(path)
+        if Path(path) == root / "pkg":
+            (root / "pkg" / "gone.txt").unlink()
+        if Path(path) == root:
+            (root / "gonedir").rmdir()
+        return names
+
+    monkeypatch.setattr(os, "listdir", listing_then_removal)
+    packed = worker["_op_pack_blob"](
+        {"path": str(root), "dir": str(tmp_path / "blobs"), "gzip": False}
+    )["value"]
+    monkeypatch.undo()
+
+    archive = Path(worker["_data_file"](str(tmp_path / "blobs"), packed["digest"]))
+    assert archive.stat().st_size == packed["size"]
+    with tarfile.open(archive, "r:") as tar:
+        names = sorted(tar.getnames())
+    assert "env/pkg/keep.py" in names
+    assert "env/pkg/__pycache__/keep.cpython-311.pyc" in names
+    assert "env/pkg/gone.txt" not in names
+    assert "env/gonedir" not in names
+    assert not any(".pyc." in name for name in names)
