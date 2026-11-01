@@ -1567,11 +1567,16 @@ class _Scandir:
     """What the patched ``os.scandir`` answers: real entries, then the pending ones."""
 
     def __init__(self, entries, close):
-        self._entries = entries
+        self._entries = iter(entries)
         self._close = close
 
     def __iter__(self):
-        return iter(self._entries)
+        return self
+
+    def __next__(self):
+        # ``os.walk`` calls ``next`` on what ``os.scandir`` answers, so an object that is
+        # only iterable breaks every walk of a directory inside a running call.
+        return next(self._entries)
 
     def __enter__(self):
         return self
