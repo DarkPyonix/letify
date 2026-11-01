@@ -1934,3 +1934,33 @@ def test_skipped_files_do_not_enter_the_progress_line(project, monkeypatch) -> N
     )
     pathdata.write_back(Runtime(), Collector(), "/rt/blobs")
     assert totals == [0], totals
+
+
+def test_a_file_written_during_a_local_call_reaches_the_client_before_the_call_returns(
+    launcher_from, project
+) -> None:
+    """Spec "Writing back": the background write-back delivers each completed file of an
+    output directory that already holds files, while the call still runs.
+    """
+    let = streaming(launcher_from)
+    root = project / "selfplay"
+    root.mkdir()
+    (root / "selfplay-000000.pt").write_bytes(b"\x01" * 4096)
+
+    @let.function(device=let.providers.lab.CPU, host=letify.remote)
+    def train(directory: Path, held: float) -> str:
+        import time as clock
+
+        (directory / "selfplay-000001.pt").write_bytes(b"\x02" * 4096)
+        clock.sleep(held)
+        (directory / "selfplay-000002.pt").write_bytes(b"\x03" * 4096)
+        clock.sleep(held)
+        return "done"
+
+    thread, outcome = in_a_thread(lambda: train(root, HELD_S))
+    try:
+        wait_until(lambda: (root / "selfplay-000001.pt").is_file(), timeout=HELD_S - 2.0)
+        assert thread.is_alive()
+    finally:
+        thread.join(timeout=120)
+    assert outcome.get("value") == "done", outcome
