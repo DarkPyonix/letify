@@ -2207,6 +2207,90 @@ def quick_link_probe(monkeypatch):
 # -- the signalling service ----------------------------------------------------------------
 
 
+class _FakeWebSocket:
+    """The service side of one WebSocket: unmasks client frames, writes unmasked frames."""
+
+    def __init__(self, connection: Any, reader: Any, fragment: bool) -> None:
+        self._connection = connection
+        self._reader = reader
+        self._fragment = fragment
+        self._lock = threading.Lock()
+        self.pongs = 0
+
+    def _write(self, data: bytes) -> None:
+        with self._lock:
+            try:
+                self._connection.sendall(data)
+            except OSError:
+                pass
+
+    @staticmethod
+    def _frame(opcode: int, payload: bytes, fin: bool = True) -> bytes:
+        import struct
+
+        head = bytes([(0x80 if fin else 0) | opcode])
+        if len(payload) < 126:
+            return head + bytes([len(payload)]) + payload
+        return head + bytes([126]) + struct.pack(">H", len(payload)) + payload
+
+    def push(self, stored: dict[str, Any]) -> None:
+        data = json.dumps(
+            {k: stored[k] for k in ("seq", "from", "at", "body")}, separators=(",", ":")
+        ).encode()
+        if self._fragment:
+            half = len(data) // 2
+            self._write(self._frame(0x1, data[:half], fin=False))
+            self._write(self._frame(0x9, b"hi"))
+            self._write(self._frame(0x0, data[half:]))
+        else:
+            self._write(self._frame(0x1, data))
+
+    def close(self, code: int = 1000) -> None:
+        import struct
+
+        self._write(self._frame(0x8, struct.pack(">H", code)))
+
+    def cut(self) -> None:
+        import socket as _socket
+
+        try:
+            self._connection.shutdown(_socket.SHUT_RDWR)
+        except OSError:
+            pass
+
+    def read_text(self) -> str | None:
+        """The next text message of the client, or None once the socket ended."""
+        import struct
+
+        while True:
+            try:
+                head = self._reader.read(2)
+                if len(head) < 2:
+                    return None
+                opcode, length = head[0] & 0x0F, head[1] & 0x7F
+                if not head[1] & 0x80:
+                    return None
+                if length == 126:
+                    length = struct.unpack(">H", self._reader.read(2))[0]
+                elif length == 127:
+                    length = struct.unpack(">Q", self._reader.read(8))[0]
+                mask = self._reader.read(4)
+                data = bytearray(self._reader.read(length))
+            except (OSError, ValueError):
+                return None
+            for i in range(len(data)):
+                data[i] ^= mask[i % 4]
+            if opcode == 0x1:
+                return bytes(data).decode()
+            if opcode == 0x8:
+                self._write(self._frame(0x8, bytes(data[:2])))
+                return None
+            if opcode == 0x9:
+                self._write(self._frame(0xA, bytes(data)))
+            elif opcode == 0xA:
+                self.pongs += 1
+
+
 class FakeSignalService:
     """An in-process signalling service with the contract of Spec "Signalling service".
 
@@ -2236,6 +2320,12 @@ class FakeSignalService:
         self._counters: dict[str, int] = {}
         self._nonces: dict[str, float] = {}
         self._cond = threading.Condition()
+        #: Open WebSockets by node, how many were accepted, and the acknowledgements received.
+        self._sockets: dict[str, list[_FakeWebSocket]] = {}
+        self.ws_accepted = 0
+        self.ws_acks: list[int] = []
+        #: Send every text frame as two fragments with a ping between them.
+        self.fragment_frames = False
         service = self
 
         class Handler(http.server.BaseHTTPRequestHandler):
@@ -2254,8 +2344,20 @@ class FakeSignalService:
         threading.Thread(target=self._server.serve_forever, daemon=True).start()
 
     def close(self) -> None:
+        self.drop_sockets()
         self._server.shutdown()
         self._server.server_close()
+
+    def drop_sockets(self) -> None:
+        """Cut every open WebSocket without a close frame, as a network failure does."""
+        with self._cond:
+            sockets = [sock for socks in self._sockets.values() for sock in socks]
+        for sock in sockets:
+            sock.cut()
+
+    def sockets_open(self, node: str) -> int:
+        with self._cond:
+            return len(self._sockets.get(node, []))
 
     def waiting(self, node: str) -> int:
         with self._cond:
@@ -2281,7 +2383,7 @@ class FakeSignalService:
         url = urllib.parse.urlsplit(h.path)
         if url.path == "/health":
             return self._reply(h, 200, {"ok": True})
-        match = re.fullmatch(r"/(send|recv)/([^/]+)", url.path)
+        match = re.fullmatch(r"/(send|recv|ws)/([^/]+)", url.path)
         if match is None:
             return self._fail(h, 404, "not_found")
         kind, target = match.groups()
@@ -2326,10 +2428,57 @@ class FakeSignalService:
             return self._send(h, node, target, body)
         if target != node:
             return self._fail(h, 403, "forbidden")
+        if kind == "ws":
+            if (h.headers.get("Upgrade") or "").lower() != "websocket":
+                return self._fail(h, 426, "upgrade_required")
+            return self._websocket(h, node)
         query = urllib.parse.parse_qs(url.query)
         after = int(query.get("after", ["0"])[0])
         wait = min(float(query.get("wait", ["25"])[0]), 25.0)
         self._recv(h, node, after, wait)
+
+    def _websocket(self, h: Any, node: str) -> None:
+        import base64 as b64
+        import hashlib
+
+        key = h.headers.get("Sec-WebSocket-Key") or ""
+        guid = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+        accept = b64.b64encode(hashlib.sha1((key + guid).encode()).digest()).decode()
+        h.wfile.write(
+            (
+                "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n"
+                f"Connection: Upgrade\r\nSec-WebSocket-Accept: {accept}\r\n\r\n"
+            ).encode()
+        )
+        h.wfile.flush()
+        h.close_connection = True
+        self.requests.append((h.command, h.path.split("?")[0], 101))
+        sock = _FakeWebSocket(h.connection, h.rfile, self.fragment_frames)
+        with self._cond:
+            self.ws_accepted += 1
+            self._sockets.setdefault(node, []).append(sock)
+            now = self.clock()
+            for stored in self._boxes.get(node, []):
+                if stored["at"] + self.TTL_S > now:
+                    sock.push(stored)
+        try:
+            while True:
+                text = sock.read_text()
+                if text is None:
+                    break
+                try:
+                    ack = int(json.loads(text)["ack"])
+                except (ValueError, KeyError, TypeError):
+                    sock.close(1008)
+                    break
+                with self._cond:
+                    self.ws_acks.append(ack)
+                    box = self._boxes.setdefault(node, [])
+                    box[:] = [m for m in box if m["seq"] > ack]
+        finally:
+            with self._cond:
+                if sock in self._sockets.get(node, []):
+                    self._sockets[node].remove(sock)
 
     def _send(self, h: Any, sender: str, to: str, body: bytes) -> None:
         import base64 as b64
@@ -2349,6 +2498,8 @@ class FakeSignalService:
                 {"seq": seq, "from": sender, "at": int(now), "body": b64.b64encode(stored).decode()}
             )
             self.sizes.append(len(body))
+            for sock in list(self._sockets.get(to, [])):
+                sock.push(box[-1])
             self._cond.notify_all()
         self._reply(h, 202, {"ok": True, "seq": seq})
 

@@ -517,3 +517,43 @@ def test_a_tailcat_token_given_to_the_agent_login_is_refused_by_name(tmp_path, m
             login.Answers(alias="box", kind="tunnel", values={"connect": old}, interactive=False),
             old,
         )
+
+
+# -- the standing wait ----------------------------------------------------------------------
+# Spec "Signalling service" item 1, "Which wait uses which endpoint", and "Agent and pairing" item 5.
+
+
+def recv_requests(signal_service, node: str) -> list[tuple[str, str, int]]:
+    return [r for r in signal_service.requests if r[1] == f"/recv/{node}"]
+
+
+def test_the_agent_receives_a_pairing_over_the_websocket_and_never_long_polls(
+    start_service, signal_service, daemons
+) -> None:
+    agent, user = start_service(), daemons("user")
+    token = agent.service.new_token(signal_service.url)
+    assert user_pair(signal_service, user, token) == agent.node_id
+    assert ("GET", f"/ws/{agent.node_id}", 101) in signal_service.requests
+    assert recv_requests(signal_service, agent.node_id) == []
+
+
+def test_an_idle_agent_sends_no_request_while_it_waits(start_service, signal_service) -> None:
+    agent = start_service()
+    assert wait_for(lambda: signal_service.sockets_open(agent.node_id) == 1)
+    before = len(signal_service.requests)
+    time.sleep(1.5)
+    assert len(signal_service.requests) == before
+    assert recv_requests(signal_service, agent.node_id) == []
+
+
+def test_an_agent_whose_socket_dropped_reconnects_and_still_serves_a_pairing(
+    start_service, signal_service, daemons
+) -> None:
+    agent, user = start_service(backoff_s=(0.05, 0.1)), daemons("user")
+    assert wait_for(lambda: signal_service.sockets_open(agent.node_id) == 1)
+    signal_service.drop_sockets()
+    assert wait_for(lambda: signal_service.ws_accepted == 2)
+    token = agent.service.new_token(signal_service.url)
+    assert user_pair(signal_service, user, token) == agent.node_id
+    assert recv_requests(signal_service, agent.node_id) == []
+    assert agent.home.paired.nodes() == [user.node_id]

@@ -565,3 +565,172 @@ def test_live_a_signed_round_trip_through_the_deployed_service(daemons) -> None:
     (message,) = drain(receiver, 1)
     assert message.sender == a.node_id and message.body == b"live check"
     receiver.recv(message.seq, wait_s=0)
+
+
+# -- the standing wait over the WebSocket -------------------------------------------------
+# Spec "Signalling service" item 1, "Which wait uses which endpoint".
+
+
+def read_until(watch, count: int, timeout: float = 10.0):
+    """Read from a watch until ``count`` messages arrived, riding out a dropped socket."""
+    got: list[linksignal.Incoming] = []
+    deadline = time.monotonic() + timeout
+    while len(got) < count and time.monotonic() < deadline:
+        try:
+            got.extend(watch.read(0.2))
+        except linksignal.SignalError:
+            time.sleep(0.05)
+    return got
+
+
+def test_a_message_reaches_a_watching_node_over_the_websocket(signal_service, daemons) -> None:
+    a, b = daemons("a"), daemons("b")
+    sender = linksignal.SignalClient(a, signal_service.url)
+    watch = linksignal.SignalClient(b, signal_service.url).watch()
+    try:
+        sender.send(b.node_id, b"hello")
+        (message,) = read_until(watch, 1)
+        assert (message.seq, message.sender, message.body) == (1, a.node_id, b"hello")
+    finally:
+        watch.close()
+    assert ("GET", f"/ws/{b.node_id}", 101) in signal_service.requests
+    assert not [r for r in signal_service.requests if r[1].startswith("/recv/")]
+
+
+def test_a_message_waiting_before_the_socket_opened_is_delivered(signal_service, daemons) -> None:
+    a, b = daemons("a"), daemons("b")
+    linksignal.SignalClient(a, signal_service.url).send(b.node_id, b"early")
+    watch = linksignal.SignalClient(b, signal_service.url).watch()
+    try:
+        (message,) = read_until(watch, 1)
+        assert message.body == b"early"
+    finally:
+        watch.close()
+
+
+def test_a_watch_with_nothing_to_deliver_sends_no_request_while_it_waits(
+    signal_service, daemons
+) -> None:
+    b = daemons("b")
+    watch = linksignal.SignalClient(b, signal_service.url).watch()
+    try:
+        assert watch.read(0.1) == []
+        before = len(signal_service.requests)
+        for _ in range(4):
+            assert watch.read(0.25) == []
+        assert len(signal_service.requests) == before
+    finally:
+        watch.close()
+
+
+def test_a_read_returns_when_its_wait_is_over(signal_service, daemons) -> None:
+    watch = linksignal.SignalClient(daemons("b"), signal_service.url).watch()
+    try:
+        began = time.monotonic()
+        assert watch.read(0.4) == []
+        assert 0.3 <= time.monotonic() - began < 3
+    finally:
+        watch.close()
+
+
+def test_a_handled_message_is_acknowledged_so_the_service_deletes_it(
+    signal_service, daemons
+) -> None:
+    a, b = daemons("a"), daemons("b")
+    sender = linksignal.SignalClient(a, signal_service.url)
+    watch = linksignal.SignalClient(b, signal_service.url).watch()
+    try:
+        sender.send(b.node_id, b"one")
+        sender.send(b.node_id, b"two")
+        assert len(read_until(watch, 2)) == 2
+        assert signal_service.waiting(b.node_id) == 2
+        watch.read(0.3)
+        deadline = time.monotonic() + 5
+        while signal_service.waiting(b.node_id) and time.monotonic() < deadline:
+            time.sleep(0.05)
+        assert signal_service.waiting(b.node_id) == 0
+        assert signal_service.ws_acks[-1] == 2
+    finally:
+        watch.close()
+
+
+def test_a_dropped_socket_reconnects_and_delivers_each_message_exactly_once(
+    signal_service, daemons
+) -> None:
+    a, b = daemons("a"), daemons("b")
+    sender = linksignal.SignalClient(a, signal_service.url)
+    watch = linksignal.SignalClient(b, signal_service.url).watch()
+    try:
+        sender.send(b.node_id, b"1")
+        sender.send(b.node_id, b"2")
+        first = read_until(watch, 2)
+        # The messages are not acknowledged yet, so the service sends them again.
+        signal_service.drop_sockets()
+        sender.send(b.node_id, b"3")
+        rest = read_until(watch, 1)
+        extra = read_until(watch, 1, timeout=0.6)
+        bodies = [m.body for m in first + rest + extra]
+        assert bodies == [b"1", b"2", b"3"]
+        assert signal_service.ws_accepted == 2
+    finally:
+        watch.close()
+
+
+def test_a_read_on_a_cut_socket_raises_instead_of_waiting_for_the_next_message(
+    signal_service, daemons
+) -> None:
+    watch = linksignal.SignalClient(daemons("b"), signal_service.url).watch()
+    try:
+        watch.read(0.1)
+        signal_service.drop_sockets()
+        with pytest.raises(linksignal.SignalError):
+            for _ in range(20):
+                watch.read(0.3)
+    finally:
+        watch.close()
+
+
+def test_fragmented_frames_with_a_ping_between_them_are_put_together(
+    signal_service, daemons
+) -> None:
+    a, b = daemons("a"), daemons("b")
+    signal_service.fragment_frames = True
+    watch = linksignal.SignalClient(b, signal_service.url).watch()
+    try:
+        linksignal.SignalClient(a, signal_service.url).send(b.node_id, b"in pieces")
+        (message,) = read_until(watch, 1)
+        assert message.body == b"in pieces"
+    finally:
+        watch.close()
+
+
+def test_an_upgrade_with_a_bad_signature_is_refused_and_named(signal_service, daemons) -> None:
+    class Forger:
+        def __init__(self, daemon) -> None:
+            self.node_id = daemon.node_id
+            self._daemon = daemon
+
+        def sign(self, domain: str, message: bytes) -> bytes:
+            return self._daemon.sign(domain, message + b"x")
+
+        def verify(self, *args: Any) -> bool:
+            return self._daemon.verify(*args)
+
+    watch = linksignal.SignalClient(Forger(daemons("b")), signal_service.url).watch()
+    try:
+        with pytest.raises(linksignal.SignalError, match="bad_signature"):
+            watch.read(0.2)
+    finally:
+        watch.close()
+    assert ("GET", f"/ws/{watch.node_id}", 401) in signal_service.requests
+    assert signal_service.ws_accepted == 0
+
+
+def test_a_service_that_is_down_makes_a_read_raise(signal_service, daemons) -> None:
+    watch = linksignal.SignalClient(daemons("b"), signal_service.url).watch()
+    signal_service.close()
+    try:
+        with pytest.raises(linksignal.SignalError):
+            watch.read(0.2)
+    finally:
+        watch.close()
