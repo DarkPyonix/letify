@@ -1419,7 +1419,7 @@ async fn op_punch(shared: &Arc<Shared>, req: &Value) -> OpResult {
     };
     let udp_fut = async {
         match udp_job {
-            Some((dests, token, plan)) => punch::punch_udp(
+            Some((dests, token, plan)) => punch::punch_udp_all(
                 std::mem::take(&mut udp_socks),
                 &dests,
                 &token,
@@ -1427,7 +1427,7 @@ async fn op_punch(shared: &Arc<Shared>, req: &Value) -> OpResult {
                 punch::SPRAY_PER_SECOND,
             )
             .await
-            .map(Some),
+            .map(|(socks, index, from)| Some((socks, index, from, plan))),
             None => Ok(None),
         }
     };
@@ -1445,11 +1445,11 @@ async fn op_punch(shared: &Arc<Shared>, req: &Value) -> OpResult {
         "tcp": own.tcp_maps.iter().map(|a| a.to_string()).collect::<Vec<_>>(),
         "udp": own.udp_maps.iter().map(|a| a.to_string()).collect::<Vec<_>>(),
     });
-    let summary = |mut reply: Value| {
+    let summary = |mut reply: Value, udp_failed: &[String]| {
         reply["nat"] = json!(nat_name(own.nat));
         reply["peer_nat"] = json!(nat_name(peer_nat));
         reply["mapped"] = mapped.clone();
-        reply["report"] = json!(report.text());
+        reply["report"] = json!(format!("{}{}", report.text(), udp_clause(udp_failed)));
         reply
     };
     match acceptor {
@@ -1460,7 +1460,9 @@ async fn op_punch(shared: &Arc<Shared>, req: &Value) -> OpResult {
                 let name = format!("punched-{batch}-{i}");
                 set.spawn(vet(name, "tcp", s, police, Punched::Tcp));
             }
-            if let Some((socket, from)) = udp_found {
+            if let Some((mut socks, index, from, _)) = udp_found {
+                let socket = socks.swap_remove(index);
+                drop(socks);
                 let name = format!("punched-{batch}-u");
                 set.spawn(async move {
                     let std = match socket.into_std() {
@@ -1504,7 +1506,15 @@ async fn op_punch(shared: &Arc<Shared>, req: &Value) -> OpResult {
                     failed.join("; ")
                 )));
             }
-            Ok(summary(json!({"punched": names, "policed": policed})))
+            let udp_failed: Vec<String> = failed
+                .iter()
+                .filter(|f| f.starts_with("punched-") && f.contains("-u: "))
+                .cloned()
+                .collect();
+            Ok(summary(
+                json!({"punched": names, "policed": policed}),
+                &udp_failed,
+            ))
         }
         Some((l, acceptor)) => {
             let count = tcp_streams.len() + usize::from(udp_found.is_some());
@@ -1517,20 +1527,28 @@ async fn op_punch(shared: &Arc<Shared>, req: &Value) -> OpResult {
                     policed_by_offer,
                 ));
             }
-            if let Some((socket, from)) = udp_found {
+            if let Some((socks, _, _, plan)) = udp_found {
                 let (sh, acc) = (shared.clone(), acceptor.clone());
                 tokio::spawn(async move {
-                    let Ok(std) = socket.into_std() else { return };
-                    let accepted =
-                        tokio::time::timeout(Duration::from_secs(30), UdpPath::accept(std, from))
-                            .await;
-                    if let Ok(Ok(path)) = accepted {
+                    if let Ok(path) = punch::accept_udp(socks, plan).await {
                         accept_punched(sh, acc, l, path, policed_by_offer).await;
                     }
                 });
             }
-            Ok(summary(json!({"sockets": count})))
+            Ok(summary(json!({"sockets": count}), &[]))
         }
+    }
+}
+
+/// The report clause for UDP paths that failed their QUIC connect, from the `name: reason`
+/// entries of the failed vets. Empty when none failed. Spec "NAT traversal" item 8.
+fn udp_clause(failed: &[String]) -> String {
+    match failed.first() {
+        Some(first) => {
+            let why = first.split_once(": ").map_or(first.as_str(), |(_, w)| w);
+            format!("; udp: did not open: {why}")
+        }
+        None => String::new(),
     }
 }
 
@@ -1769,4 +1787,23 @@ fn announce(node: &NodeId, control: &str, token: Option<&str>) {
     }
     println!("{line}");
     let _ = io::Write::flush(&mut io::stdout());
+}
+
+#[cfg(test)]
+mod udp_clause_tests {
+    use super::udp_clause;
+
+    #[test]
+    fn a_failed_udp_vet_is_named_in_the_report() {
+        let failed = vec!["punched-3-u: the UDP path did not open".to_string()];
+        assert_eq!(
+            udp_clause(&failed),
+            "; udp: did not open: the UDP path did not open"
+        );
+    }
+
+    #[test]
+    fn no_failed_udp_vet_adds_nothing_to_the_report() {
+        assert_eq!(udp_clause(&[]), "");
+    }
 }

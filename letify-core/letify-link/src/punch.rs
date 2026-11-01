@@ -269,6 +269,21 @@ pub async fn punch_udp(
     plan: Plan,
     per_second: u32,
 ) -> io::Result<(UdpSocket, SocketAddr)> {
+    let (mut sockets, index, from) = punch_udp_all(sockets, dests, token, plan, per_second).await?;
+    Ok((sockets.swap_remove(index), from))
+}
+
+/// Probe as [`punch_udp`] does, but keep every socket. Returns all of them, the index of the one
+/// that heard the first ack and the address it heard it from. The responder of a UDP punch
+/// uses it, because the initiator alone chooses the pair, and the responder has to listen on
+/// all its sockets until the initiator's handshake arrives on one.
+pub async fn punch_udp_all(
+    sockets: Vec<UdpSocket>,
+    dests: &[SocketAddr],
+    token: &[u8; 16],
+    plan: Plan,
+    per_second: u32,
+) -> io::Result<(Vec<UdpSocket>, usize, SocketAddr)> {
     if sockets.is_empty() || dests.is_empty() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -338,12 +353,45 @@ pub async fn punch_udp(
         let _ = sockets[index].send_to(&ack, from).await;
     }
     readers.shutdown().await;
-    let chosen = sockets
+    let all = sockets
         .into_iter()
-        .nth(index)
-        .and_then(|arc| Arc::try_unwrap(arc).ok())
-        .ok_or_else(|| io::Error::other("the punched socket is still shared"))?;
-    Ok((chosen, from))
+        .map(|arc| Arc::try_unwrap(arc).ok())
+        .collect::<Option<Vec<_>>>()
+        .ok_or_else(|| io::Error::other("a punched socket is still shared"))?;
+    Ok((all, index, from))
+}
+
+/// Wait on every socket of a UDP punch for the QUIC handshake of the initiator, and return the
+/// path of the first one that completes. The other sockets are closed. It waits until the end
+/// of the punch window plus `UdpConfig::connect_timeout`, and fails with `TimedOut` after that.
+pub async fn accept_udp(sockets: Vec<UdpSocket>, plan: Plan) -> io::Result<crate::udp::UdpPath> {
+    let cfg = crate::udp::UdpConfig::default();
+    let left = plan.until_ms.saturating_sub(now_ms());
+    let limit = Duration::from_millis(left) + cfg.connect_timeout;
+    let count = sockets.len();
+    let mut set = JoinSet::new();
+    for socket in sockets {
+        let std = socket.into_std()?;
+        let mut listener = crate::udp::UdpListener::new(std, None, &cfg)?;
+        set.spawn(async move { listener.accept().await });
+    }
+    let first = tokio::time::timeout(limit, async {
+        while let Some(done) = set.join_next().await {
+            if let Ok(Ok(path)) = done {
+                return Some(path);
+            }
+        }
+        None
+    })
+    .await;
+    set.abort_all();
+    match first {
+        Ok(Some(path)) => Ok(path),
+        _ => Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            format!("no QUIC handshake reached any of {count} UDP sockets"),
+        )),
+    }
 }
 
 /// The ports a symmetric NAT is predicted to map to next: `last + step * k` for k in
