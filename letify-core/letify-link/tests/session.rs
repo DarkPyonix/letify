@@ -285,3 +285,62 @@ async fn a_local_close_ends_a_write_that_waits_for_window() {
         .expect("write still pending after close");
     assert!(ended.unwrap().is_err());
 }
+
+/// Pins SPEC.md Session item 4, Unacknowledged limit: the limit follows the rate and the round
+/// trip of the slowest path, and the floor holds on one path.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_unacknowledged_limit_grows_on_a_long_uneven_session() {
+    let mib = 1048576.0;
+    let rates = [20.0 * mib, 3.0 * mib, 3.0 * mib, 3.0 * mib, 3.0 * mib];
+    let (a, b, _p) = delayed_session(
+        &rates,
+        Duration::from_millis(90),
+        Config::default(),
+        Config::default(),
+    )
+    .await;
+    assert_eq!(a.flow_snapshot().max_unacked, 8 << 20);
+    let mut s = a
+        .open_stream_with(letify_link::Priority::Bulk)
+        .await
+        .unwrap();
+    let blk = pattern(1 << 20, 1);
+    let w = tokio::spawn(async move {
+        for _ in 0..96 {
+            s.write_all(&blk).await.unwrap();
+        }
+        s.shutdown().await.unwrap();
+    });
+    let mut sb = b.accept_stream().await.unwrap();
+    let mut buf = vec![0u8; 1 << 20];
+    let mut peak = 0;
+    for _ in 0..96 {
+        sb.read_exact(&mut buf).await.unwrap();
+        peak = peak.max(a.flow_snapshot().max_unacked);
+    }
+    w.await.unwrap();
+    assert!(peak > 8 << 20, "limit stayed at {peak}");
+    assert!(peak <= 64 << 20, "limit passed the ceiling: {peak}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_unacknowledged_limit_stays_at_the_floor_on_one_slow_path() {
+    let rates = [2.0 * 1048576.0];
+    let (a, b, _p) = delayed_session(
+        &rates,
+        Duration::from_millis(90),
+        Config::default(),
+        Config::default(),
+    )
+    .await;
+    let mut s = a.open_stream().await.unwrap();
+    let w = tokio::spawn(async move {
+        s.write_all(&pattern(6 << 20, 2)).await.unwrap();
+        s.shutdown().await.unwrap();
+    });
+    let mut sb = b.accept_stream().await.unwrap();
+    let mut got = Vec::new();
+    sb.read_to_end(&mut got).await.unwrap();
+    w.await.unwrap();
+    assert_eq!(a.flow_snapshot().max_unacked, 8 << 20);
+}
