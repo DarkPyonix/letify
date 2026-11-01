@@ -17,12 +17,14 @@ from __future__ import annotations
 
 import atexit
 import contextlib
+import hashlib
 import json
 import os
 import secrets
 import socket
 import stat
 import sys
+import tempfile
 import threading
 import time
 from collections.abc import Iterator
@@ -65,21 +67,36 @@ def runs_directory() -> Path:
 
 
 def socket_path(pid: int) -> Path:
-    """Where the process ``pid`` listens: ``runs/<pid>.sock``, or a shorter path if too long.
+    """Where the process ``pid`` listens, at most ``SOCKET_LIMIT`` bytes long where it can be.
 
-    A Unix socket path is limited to about 107 bytes. When the preferred path exceeds
-    ``SOCKET_LIMIT`` the socket goes in the SSH control directory, which letify already
-    keeps short for the same reason.
+    Spec "Controlling a running call": ``runs/<pid>.sock`` when that fits, else
+    ``run-<pid>.sock`` in the SSH control directory, else ``run-<h>-<pid>.sock`` in a
+    private per-user directory below the system temporary directory, where ``<h>`` hashes
+    the preferred path so two state roots never share a name.
     """
     preferred = runs_directory() / f"{pid}.sock"
     if len(os.fsencode(preferred)) <= SOCKET_LIMIT:
         return preferred
-    return paths.ssh_control_directory() / f"run-{pid}.sock"
+    shared = paths.ssh_control_directory() / f"run-{pid}.sock"
+    if len(os.fsencode(shared)) <= SOCKET_LIMIT:
+        return shared
+    digest = hashlib.sha256(os.fsencode(preferred)).hexdigest()[:12]
+    name = f"run-{digest}-{pid}.sock"
+    path = Path(tempfile.gettempdir()) / f"letify-{os.getuid()}" / name
+    if len(os.fsencode(path)) <= SOCKET_LIMIT:
+        return path
+    return Path("/tmp") / f"letify-{os.getuid()}" / name
 
 
 def _private_directory(directory: Path) -> None:
-    directory.mkdir(parents=True, exist_ok=True)
-    if stat.S_IMODE(directory.stat().st_mode) != 0o700:
+    """Create ``directory`` mode 0700 and refuse a symbolic link or another user's directory."""
+    directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+    info = directory.lstat()
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+        raise OSError(f"{directory} is not a plain directory")
+    if info.st_uid != os.getuid():
+        raise OSError(f"{directory} is not owned by this user")
+    if stat.S_IMODE(info.st_mode) != 0o700:
         directory.chmod(0o700)
 
 
