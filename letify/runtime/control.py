@@ -82,10 +82,7 @@ def socket_path(pid: int) -> Path:
         return shared
     digest = hashlib.sha256(os.fsencode(preferred)).hexdigest()[:12]
     name = f"run-{digest}-{pid}.sock"
-    path = Path(tempfile.gettempdir()) / f"letify-{os.getuid()}" / name
-    if len(os.fsencode(path)) <= SOCKET_LIMIT:
-        return path
-    return Path("/tmp") / f"letify-{os.getuid()}" / name
+    return Path(tempfile.gettempdir()) / f"letify-{os.getuid()}" / name
 
 
 def _private_directory(directory: Path) -> None:
