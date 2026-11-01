@@ -7,19 +7,11 @@ import threading
 import time
 
 import pytest
-from conftest import LoopbackRendezvous
+from conftest import LoopbackRendezvous, free_port, free_ports
 
 from letify.transport import nat
 from letify.transport.link import PunchedLink
 from letify.transport.strategies import PUNCH_SOCKETS, Target, TCPPunch
-
-
-def free_ports(count: int) -> list[int]:
-    holders = [nat.reusable_socket(0, "127.0.0.1") for _ in range(count)]
-    ports = [holder.getsockname()[1] for holder in holders]
-    for holder in holders:
-        holder.close()
-    return ports
 
 
 def punch_both(mine, theirs, token, *, window=5.0, dead=()):
@@ -172,3 +164,19 @@ def test_serving_several_links_returns_only_when_every_link_has_ended():
     assert not finished.wait(0.5)
     spare_near.close()
     assert finished.wait(5)
+
+
+# -- Spec: Transport, the simultaneous open: a port a test picks is its own --------
+
+
+def test_the_free_ports_of_two_test_workers_never_overlap() -> None:
+    # A punch binds with SO_REUSEPORT, so a port that another worker's punch also holds is
+    # shared with it and the kernel splits inbound connections between the two listeners.
+    # The ports a test picks therefore come from a slice per xdist worker, below the
+    # ephemeral range the kernel hands to outgoing connections. CI run 41265480426 attempt 1
+    # returned from a punch to a refusing port, which only a stray connection can explain.
+    first = {free_port("gw0") for _ in range(50)}
+    second = {free_port("gw1") for _ in range(50)}
+    assert len(first) == len(second) == 50
+    assert not first & second
+    assert max(first | second) < 32768

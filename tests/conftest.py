@@ -2544,3 +2544,43 @@ def signal_service(sidecar_binary, tmp_path: Path):
     finally:
         service.close()
         verifier.close()
+
+
+# -- Ports a test picks for itself ---------------------------------------------------
+
+#: Each xdist worker draws from its own slice below the ephemeral range, so two workers
+#: never pick the same port and the kernel never hands one to an outgoing connection. A
+#: punch binds with SO_REUSEPORT, so a port that two punches hold is shared by both.
+_PORT_SLICE_START = 20000
+_PORT_SLICE_SIZE = 1000
+_port_cursor: dict[str, int] = {}
+
+
+def free_port(worker: str | None = None) -> int:
+    """A port nothing holds, from the slice of this xdist worker (or of ``worker``)."""
+    name = worker or os.environ.get("PYTEST_XDIST_WORKER", "gw0")
+    index = int(name[2:]) if name.startswith("gw") and name[2:].isdigit() else 0
+    base = _PORT_SLICE_START + (index % 12) * _PORT_SLICE_SIZE
+    for _ in range(_PORT_SLICE_SIZE):
+        offset = _port_cursor.get(name, 0)
+        _port_cursor[name] = (offset + 1) % _PORT_SLICE_SIZE
+        probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            probe.bind(("0.0.0.0", base + offset))  # no reuse options: fails if anything holds it
+        except OSError:
+            continue
+        finally:
+            probe.close()
+        return base + offset
+    raise RuntimeError("no free port in the slice of " + name)  # pragma: no cover
+
+
+def free_ports(count: int) -> list[int]:
+    return [free_port() for _ in range(count)]
+
+
+def refusing_port() -> socket.socket:
+    """A port that answers a connection with a reset: bound by the caller, never listening."""
+    holder = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    holder.bind(("127.0.0.1", 0))
+    return holder
