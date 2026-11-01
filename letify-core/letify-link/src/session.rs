@@ -2255,6 +2255,40 @@ impl WeakSession {
 mod tests {
     use super::*;
 
+    const MIB: usize = 1 << 20;
+
+    #[test]
+    fn the_unacknowledged_target_is_twice_the_rate_times_the_slowest_round_trip() {
+        // 25 MiB/s over a 300 ms slowest path: 2 x 7.5 MiB.
+        let rate = (25 * MIB) as f64;
+        let want = (2.0 * rate * 0.3) as usize;
+        assert_eq!(
+            unacked_target(8 * MIB, 64 * MIB, rate, Duration::from_millis(300)),
+            want
+        );
+    }
+
+    #[test]
+    fn the_unacknowledged_target_stays_between_the_floor_and_the_ceiling() {
+        let slow = unacked_target(8 * MIB, 64 * MIB, 1e6, Duration::from_millis(50));
+        assert_eq!(slow, 8 * MIB);
+        let huge = unacked_target(8 * MIB, 64 * MIB, 1e9, Duration::from_secs(1));
+        assert_eq!(huge, 64 * MIB);
+        // A ceiling under the floor means a fixed limit at the floor.
+        assert_eq!(
+            unacked_target(4 * MIB, 4 * MIB, 1e9, Duration::from_secs(1)),
+            4 * MIB
+        );
+    }
+
+    #[test]
+    fn the_unacknowledged_limit_doubles_at_most_and_falls_by_an_eighth_at_most() {
+        assert_eq!(step_unacked(8 * MIB, 60 * MIB), 16 * MIB);
+        assert_eq!(step_unacked(8 * MIB, 10 * MIB), 10 * MIB);
+        assert_eq!(step_unacked(32 * MIB, 8 * MIB), 28 * MIB);
+        assert_eq!(step_unacked(32 * MIB, 31 * MIB), 31 * MIB);
+    }
+
     fn sub(gauge: Option<Gauge>) -> Sub {
         Sub::new(
             4 << 20,

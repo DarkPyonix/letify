@@ -45,6 +45,7 @@ fn read_by(session: &Session) -> u64 {
 fn the_mobile_profile_holds_less_and_pings_less_often() {
     let (mobile, normal) = (Config::mobile(), Config::default());
     assert_eq!(mobile.max_unacked_bytes, 4 << 20);
+    assert_eq!(mobile.max_unacked_ceiling, 4 << 20);
     assert_eq!(mobile.max_reorder_bytes, 8 << 20);
     assert_eq!(mobile.stream_window, 2 << 20);
     assert_eq!(mobile.subflow_window, 1 << 20);
