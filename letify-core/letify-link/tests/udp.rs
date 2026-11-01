@@ -428,11 +428,29 @@ async fn tcp_subflows_that_together_beat_the_udp_path_are_not_closed_by_a_move_t
     while let Ok(Some(item)) = tokio::time::timeout_at(end, events.recv()).await {
         seen.push(item);
     }
+    // The session starts on the UDP path, which answers first, so `Preferred` names it once
+    // at the start. A move to the TCP kind may follow, because four TCP subflows at 3 MiB/s
+    // beat the UDP path at 5 MiB/s, and it closes the UDP subflow as "moved" (SPEC.md Paths
+    // and the path manager, Kinds). What must never happen is a TCP subflow closed, or a move
+    // from the TCP kind to the UDP path.
     assert!(
-        !seen
-            .iter()
-            .any(|(_, ev)| matches!(ev, PathEvent::Lost { .. })),
-        "no subflow was lost: {seen:?}"
+        !seen.iter().any(|(_, ev)| matches!(
+            ev,
+            PathEvent::Lost { name, .. } if name.starts_with("tcp")
+        )),
+        "no TCP subflow was lost: {seen:?}"
     );
-    assert_eq!(a.subflow_count(), 5, "every subflow is still open");
+    assert!(
+        !seen.iter().any(|(_, ev)| matches!(
+            ev,
+            PathEvent::Preferred { from: Some(from), to } if from.starts_with("tcp") && to == "udp"
+        )),
+        "the session did not move from the TCP kind to UDP: {seen:?}"
+    );
+    let udp_lost = seen.iter().any(|(_, ev)| is_moved(ev, "udp"));
+    assert_eq!(
+        a.subflow_count(),
+        if udp_lost { 4 } else { 5 },
+        "the four TCP subflows are open, and the UDP subflow too unless the TCP kind won: {seen:?}"
+    );
 }
