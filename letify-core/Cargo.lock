@@ -138,11 +138,11 @@ dependencies = [
 
 [[package]]
 name = "letify"
-version = "2.10.3"
+version = "2.10.4"
 
 [[package]]
 name = "letify-quic"
-version = "2.10.3"
+version = "2.10.4"
 dependencies = [
  "quinn",
  "rcgen",
