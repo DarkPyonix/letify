@@ -14,6 +14,7 @@ import json
 import os
 import shutil
 import signal
+import socket
 import stat
 import sys
 import tempfile
@@ -714,3 +715,32 @@ def _alive(pid: int) -> bool:
 def test_on_exit_outside_a_body_raises_unsupported_mode() -> None:
     with pytest.raises(letify.UnsupportedMode, match="atexit"):
         letify.on_exit(lambda: None)
+
+
+def test_a_run_control_socket_binds_and_answers_under_a_deep_letify_home(
+    monkeypatch, tmp_path
+) -> None:
+    deep = tmp_path / ("d" * 60) / ("e" * 60)
+    deep.mkdir(parents=True)
+    monkeypatch.setenv("LETIFY_HOME", str(deep))
+    monkeypatch.delenv("XDG_RUNTIME_DIR", raising=False)
+    natural = control.runs_directory() / f"{os.getpid()}.sock"
+    assert len(os.fsencode(natural)) > 107
+    assert len(os.fsencode(paths.ssh_control_directory() / f"run-{os.getpid()}.sock")) > 107
+
+    server = control._Server()
+    try:
+        assert len(os.fsencode(server.path)) <= 100
+        assert server.path.exists()
+        assert stat.S_IMODE(server.path.parent.stat().st_mode) == 0o700
+        assert control.socket_path(os.getpid()) == server.path
+
+        client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            client.settimeout(5)
+            client.connect(str(server.path))
+        finally:
+            client.close()
+    finally:
+        server.close()
+    assert not server.path.exists()
