@@ -151,6 +151,6 @@ pub use paths::{
 pub use replay::REPLAY_WINDOW;
 pub use session::{
     CongestionStats, FlowSnapshot, Priority, Session, SessionId, SubflowId, SubflowStats,
-    Transport, WeakSession,
+    TraceEvent, Transport, WeakSession,
 };
 pub use stream::Stream;

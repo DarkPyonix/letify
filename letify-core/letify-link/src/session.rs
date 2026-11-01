@@ -234,6 +234,29 @@ pub struct SubflowStats {
     /// What the subflow's transport reports about its congestion control, for a transport that
     /// reports it (a UDP path), as read at most every 10 ms.
     pub congestion: Option<CongestionStats>,
+    /// Whether the subflow's transport reports congestion statistics, which only a UDP path does.
+    pub gauged: bool,
+    /// The subflow's current window limit in bytes, between the configured window and the
+    /// window ceiling.
+    pub window_limit: usize,
+    /// The lowest write to subflow ack time, if any.
+    pub min_rtt: Option<Duration>,
+}
+
+/// Something the diagnostic trace reports once: a subflow that closed or the session failing.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TraceEvent {
+    /// A subflow closed, with whether it had a congestion gauge and why it closed.
+    SubflowClosed {
+        /// The subflow's id.
+        id: SubflowId,
+        /// Whether its transport reported congestion statistics.
+        gauged: bool,
+        /// Why it closed.
+        reason: String,
+    },
+    /// The session failed, with the text the session recorded.
+    Failed(String),
 }
 
 const NO_RTT: u64 = u64::MAX;
@@ -618,6 +641,8 @@ pub(crate) struct State {
     max_reorder: usize,
     pub reorder_peak: usize,
     pub reinjected: u64,
+    /// Subflow closes and the failure, kept for the diagnostic trace until it takes them.
+    trace_events: Vec<TraceEvent>,
     pub streams: HashMap<u32, StreamState>,
     accept_queue: VecDeque<u32>,
     next_stream_id: u32,
@@ -1245,6 +1270,16 @@ impl Drop for Guard {
     }
 }
 
+impl State {
+    /// Keep a trace event, dropping the oldest when 256 are waiting.
+    fn note(&mut self, ev: TraceEvent) {
+        if self.trace_events.len() >= 256 {
+            self.trace_events.remove(0);
+        }
+        self.trace_events.push(ev);
+    }
+}
+
 impl Shared {
     pub fn lock(&self) -> MutexGuard<'_, State> {
         self.state.lock().unwrap_or_else(|e| e.into_inner())
@@ -1254,9 +1289,16 @@ impl Shared {
         if st.failed.is_some() {
             return;
         }
+        st.note(TraceEvent::Failed(why.clone()));
         st.failed = Some(why);
-        for (_, sub) in st.subflows.drain() {
+        let drained: Vec<(u64, Sub)> = st.subflows.drain().collect();
+        for (id, sub) in drained {
             sub.aborts.iter().for_each(AbortHandle::abort);
+            st.note(TraceEvent::SubflowClosed {
+                id,
+                gauged: sub.gauge.is_some(),
+                reason: "session failed".into(),
+            });
         }
         self.bump();
         st.wake_all_streams();
@@ -1286,11 +1328,16 @@ impl Shared {
         self.origin.elapsed().as_micros() as u64
     }
 
-    fn subflow_died(self: &Arc<Self>, id: u64) {
+    fn subflow_died(self: &Arc<Self>, id: u64, reason: String) {
         let mut st = self.lock();
         let Some(sub) = st.subflows.remove(&id) else {
             return;
         };
+        st.note(TraceEvent::SubflowClosed {
+            id,
+            gauged: sub.gauge.is_some(),
+            reason,
+        });
         self.bump();
         sub.aborts.iter().for_each(AbortHandle::abort);
         // Everything sent on the dead subflow and not acknowledged goes out again.
@@ -1521,8 +1568,14 @@ async fn reader_task<R: AsyncRead + Unpin>(
         }
     }
     .await;
-    let _ = result;
-    shared.subflow_died(id);
+    let reason = match result {
+        Err(Error::ConnectionLost(why)) if why.starts_with("no record for") => {
+            format!("dead timeout: {why}")
+        }
+        Err(e) => format!("transport error: {e}"),
+        Ok(()) => "transport error: the read side ended".into(),
+    };
+    shared.subflow_died(id, reason);
 }
 
 enum Work {
@@ -1740,8 +1793,8 @@ async fn writer_task<W: AsyncWrite + Unpin>(
         }
     }
     .await;
-    if result.is_err() {
-        shared.subflow_died(id);
+    if let Err(e) = result {
+        shared.subflow_died(id, format!("transport error: {e}"));
     }
 }
 
@@ -1830,6 +1883,7 @@ impl Session {
             max_reorder: (cfg.reorder_kib() as usize) << 10,
             reorder_peak: 0,
             reinjected: 0,
+            trace_events: Vec::new(),
             streams: HashMap::new(),
             accept_queue: VecDeque::new(),
             next_stream_id: if initiator { 1 } else { 2 },
@@ -2209,7 +2263,7 @@ impl Session {
         let shared = self.shared();
         let ids: Vec<SubflowId> = shared.lock().subflows.keys().copied().collect();
         for id in ids {
-            shared.subflow_died(id);
+            shared.subflow_died(id, "closed by caller".into());
         }
         shared.hints.send_modify(|n| *n += 1);
     }
@@ -2223,6 +2277,12 @@ impl Session {
     /// A counter that changes whenever a subflow is added or dies.
     pub fn subflow_changes(&self) -> watch::Receiver<u64> {
         self.shared().changes.subscribe()
+    }
+
+    /// Take the subflow closes and the failure that happened since the last call, oldest first.
+    /// Only the diagnostic trace calls it. At most 256 events are kept.
+    pub fn take_trace_events(&self) -> Vec<TraceEvent> {
+        std::mem::take(&mut self.shared().lock().trace_events)
     }
 
     /// What was measured on each live subflow, ordered by the subflow's age.
@@ -2250,6 +2310,9 @@ impl Session {
                     bulk_cap: sub.bulk_cap(),
                     delivery_rate: sub.rates.back().copied(),
                     congestion: sub.gauged.map(|(g, _)| g),
+                    gauged: sub.gauge.is_some(),
+                    window_limit: sub.window_limit,
+                    min_rtt: sub.min_rtt.map(|(r, _)| r),
                 }
             })
             .collect()
@@ -2276,7 +2339,7 @@ impl Session {
     /// Close subflow `id` without ending the session. The frames it carried that the peer has
     /// not acknowledged go out again on another subflow. Does nothing if the subflow is gone.
     pub fn close_subflow(&self, id: SubflowId) {
-        self.shared().subflow_died(id);
+        self.shared().subflow_died(id, "closed by caller".into());
     }
 
     /// The number of subflows that are alive now.

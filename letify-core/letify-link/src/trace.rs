@@ -11,7 +11,8 @@ use std::time::{Duration, Instant};
 use serde_json::{Value, json};
 use tokio::task::AbortHandle;
 
-use crate::session::{FlowSnapshot, Session, SubflowStats, WeakSession};
+use crate::paths::{PathKind, PathKinds};
+use crate::session::{FlowSnapshot, Session, SubflowId, SubflowStats, TraceEvent, WeakSession};
 
 /// The environment variable that names the trace file.
 pub const ENV_TRACE: &str = "LETIFY_LINK_TRACE";
@@ -85,6 +86,33 @@ fn ms(d: Option<Duration>) -> Value {
     d.map_or(Value::Null, |d| json!(d.as_secs_f64() * 1000.0))
 }
 
+/// The kind of a subflow: the path manager's answer when there is one, otherwise UDP for a
+/// subflow with a congestion gauge and TCP for one without.
+fn kind_name(kinds: Option<&PathKinds>, id: SubflowId, gauged: bool) -> &'static str {
+    match kinds.and_then(|k| k.of(id)) {
+        Some(PathKind::Tcp) => "tcp",
+        Some(PathKind::Udp) => "udp",
+        Some(PathKind::Relay) => "relay",
+        None if gauged => "udp",
+        None => "tcp",
+    }
+}
+
+/// The line for one event: a subflow that closed or the session failing.
+pub fn event_line(t_ms: u64, session: u64, event: &TraceEvent, kinds: Option<&PathKinds>) -> Value {
+    let mut v = match event {
+        TraceEvent::SubflowClosed { id, gauged, reason } => json!({
+            "event": "subflow_closed", "subflow": id, "reason": reason,
+            "kind": kind_name(kinds, *id, *gauged), "gauged": gauged,
+        }),
+        TraceEvent::Failed(why) => json!({"event": "session_failed", "reason": why}),
+    };
+    v["t_ms"] = json!(t_ms);
+    v["unix_ms"] = json!(unix_ms());
+    v["session"] = json!(session);
+    v
+}
+
 /// One line of the trace.
 pub fn line(
     t_ms: u64,
@@ -92,6 +120,7 @@ pub fn line(
     cpu: Option<u64>,
     flow: &FlowSnapshot,
     subflows: &[SubflowStats],
+    kinds: Option<&PathKinds>,
 ) -> Value {
     let subs: Vec<Value> = subflows
         .iter()
@@ -101,6 +130,8 @@ pub fn line(
                 "acked": s.acked_bytes, "inflight": s.inflight_bytes, "window": s.window,
                 "bulk_cap": s.bulk_cap, "srtt_ms": ms(s.srtt),
                 "delivery_rate": s.delivery_rate,
+                "kind": kind_name(kinds, s.id, s.gauged), "gauged": s.gauged,
+                "window_limit": s.window_limit, "min_rtt_ms": ms(s.min_rtt),
             });
             if let Some(c) = &s.congestion {
                 v["cwnd"] = json!(c.window);
@@ -126,7 +157,13 @@ pub fn line(
 
 /// Sample `session` into the trace file until the session is gone. The task ends when the
 /// last handle to the session is dropped, and the returned handle aborts it earlier.
-pub fn spawn(config: TraceConfig, id: u64, session: WeakSession, start: Instant) -> AbortHandle {
+pub fn spawn(
+    config: TraceConfig,
+    id: u64,
+    session: WeakSession,
+    start: Instant,
+    kinds: Option<PathKinds>,
+) -> AbortHandle {
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(config.interval);
         loop {
@@ -134,7 +171,7 @@ pub fn spawn(config: TraceConfig, id: u64, session: WeakSession, start: Instant)
             let Some(session) = session.upgrade() else {
                 return;
             };
-            if !write_line(&config, id, &session, start) {
+            if !write_line(&config, id, &session, start, kinds.as_ref()) {
                 return;
             }
         }
@@ -142,19 +179,32 @@ pub fn spawn(config: TraceConfig, id: u64, session: WeakSession, start: Instant)
     .abort_handle()
 }
 
-fn write_line(config: &TraceConfig, id: u64, session: &Session, start: Instant) -> bool {
+fn write_line(
+    config: &TraceConfig,
+    id: u64,
+    session: &Session,
+    start: Instant,
+    kinds: Option<&PathKinds>,
+) -> bool {
+    let t_ms = start.elapsed().as_millis() as u64;
+    let mut out = String::new();
+    for ev in session.take_trace_events() {
+        out.push_str(&format!("{}\n", event_line(t_ms, id, &ev, kinds)));
+    }
     let value = line(
-        start.elapsed().as_millis() as u64,
+        t_ms,
         id,
         cpu_ms(),
         &session.flow_snapshot(),
         &session.subflow_stats(),
+        kinds,
     );
+    out.push_str(&format!("{value}\n"));
     std::fs::OpenOptions::new()
         .create(true)
         .append(true)
         .open(&config.path)
-        .and_then(|mut f| writeln!(f, "{value}"))
+        .and_then(|mut f| f.write_all(out.as_bytes()))
         .is_ok()
 }
 
@@ -197,7 +247,7 @@ mod tests {
             queued_bytes: 2,
             min_send_credit: Some(9),
         };
-        let v = line(1500, 4, Some(30), &flow, &[]);
+        let v = line(1500, 4, Some(30), &flow, &[], None);
         assert_eq!(v["t_ms"], 1500);
         assert_eq!(v["session"], 4);
         assert_eq!(v["cpu_ms"], 30);

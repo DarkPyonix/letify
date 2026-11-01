@@ -542,6 +542,7 @@ fn register(
             id,
             session.downgrade(),
             shared.started,
+            kinds.clone(),
         ));
     }
     lock(&shared.sessions).insert(
