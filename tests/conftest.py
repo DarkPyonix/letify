@@ -2371,12 +2371,14 @@ class FakeSignalService:
 
     def _reply(self, h: Any, status: int, payload: dict[str, Any]) -> None:
         data = json.dumps(payload).encode()
+        # Recorded before the first reply byte, so a test that acts on the client's view of
+        # the reply never reads the record ahead of the server thread.
+        self.requests.append((h.command, h.path.split("?")[0], status))
         h.send_response(status)
         h.send_header("Content-Type", "application/json")
         h.send_header("Content-Length", str(len(data)))
         h.end_headers()
         h.wfile.write(data)
-        self.requests.append((h.command, h.path.split("?")[0], status))
 
     def _fail(self, h: Any, status: int, code: str) -> None:
         self._reply(h, status, {"ok": False, "error": code})
@@ -2450,19 +2452,22 @@ class FakeSignalService:
         key = h.headers.get("Sec-WebSocket-Key") or ""
         guid = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
         accept = b64.b64encode(hashlib.sha1((key + guid).encode()).digest()).decode()
-        h.wfile.write(
-            (
-                "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n"
-                f"Connection: Upgrade\r\nSec-WebSocket-Accept: {accept}\r\n\r\n"
-            ).encode()
-        )
-        h.wfile.flush()
         h.close_connection = True
-        self.requests.append((h.command, h.path.split("?")[0], 101))
         sock = _FakeWebSocket(h.connection, h.rfile, self.fragment_frames)
+        # Everything the client can observe is recorded before the upgrade reply is written.
+        # The lock is held across the reply and the replay so a concurrent send cannot push a
+        # frame ahead of the 101.
         with self._cond:
+            self.requests.append((h.command, h.path.split("?")[0], 101))
             self.ws_accepted += 1
             self._sockets.setdefault(node, []).append(sock)
+            h.wfile.write(
+                (
+                    "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n"
+                    f"Connection: Upgrade\r\nSec-WebSocket-Accept: {accept}\r\n\r\n"
+                ).encode()
+            )
+            h.wfile.flush()
             now = self.clock()
             for stored in self._boxes.get(node, []):
                 if stored["at"] + self.TTL_S > now:

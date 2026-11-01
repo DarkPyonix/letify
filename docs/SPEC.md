@@ -749,6 +749,8 @@ On Linux both ends set every pipe they frame over to 1 MiB with `fcntl(F_SETPIPE
 
 Frames of different streams interleave. A writer holds the write lock for one frame at a time, so a `stat` or `lease` request is sent between two 8 MiB chunks of a large upload, and a reply is not delayed behind another stream's data.
 
+A 64 MiB value moves at least 300 MiB/s in each direction through a local worker. The test `a_64_mib_value_moves_at_least_300_mib_per_second_each_way_on_this_machine` checks that floor as it stands, except when the `CI` environment variable is set: a shared runner moves bytes at a rate that varies several times between runs, so there the floor is 5% of the rate of a plain socketpair copy of 64 MiB measured in the same process. The measurements behind the 5% are in the pull request of the commit that introduced it.
+
 The worker announces itself with a `HELLO` frame naming the version of the interpreter it runs on. A worker asked to move to another interpreter replies, then replaces its process with `os.execv(<interpreter>, [<interpreter>, "-u", "-c", <bootstrap stub>])` on the same pipes, and the channel sends the worker source again and waits for the new `HELLO`. No other request is sent between the `reexec` request and that `HELLO`.
 
 ### Worker output <!-- id: worker-output -->
