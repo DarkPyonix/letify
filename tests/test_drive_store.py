@@ -609,10 +609,12 @@ def test_an_upload_resumes_at_the_offset_the_session_reports_after_a_dropped_ans
     starts = piece_starts(fake_drive)
     assert sorted(starts) == [0, PIECE, 2 * PIECE, 3 * PIECE]
     assert any(
-        r["headers"]["content-range"] == f"bytes */{len(data)}" and r["headers"]["content-length"] == "0"
+        r["headers"]["content-range"] == f"bytes */{len(data)}"
+        and r["headers"]["content-length"] == "0"
         for r in fake_drive.uploads()
     )
-    assert f"letify: Drive upload resumed at {PIECE} of {len(data)} after" in capsys.readouterr().err
+    said = capsys.readouterr().err
+    assert f"letify: Drive upload resumed at {PIECE} of {len(data)} after" in said
 
 
 def test_an_upload_resends_a_piece_the_session_never_stored_after_a_dropped_connection(

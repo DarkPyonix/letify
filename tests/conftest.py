@@ -1244,7 +1244,8 @@ class FakeDriveServer:
 
             if headers["content-range"].startswith("bytes */"):
                 if self.status_glitches:
-                    return answer(self.status_glitches.pop(0), b'{"error": {"message": "injected"}}')
+                    status = self.status_glitches.pop(0)
+                    return answer(status, b'{"error": {"message": "injected"}}')
                 return progress()
             glitch = self.glitches.pop(0) if self.glitches else None
             if glitch == "expired":
