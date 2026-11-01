@@ -134,6 +134,26 @@ const CAP_SHRINK: f64 = 0.75;
 const CAP_BOUND: f64 = 8.0;
 /// The rate bound uses the best of this many latest delivery rate samples.
 const RATE_KEEP: usize = 8;
+/// The unacknowledged limit targets this many times the session rate times the slowest round trip.
+const UNACKED_HEADROOM: f64 = 2.0;
+/// The unacknowledged limit is recomputed at most this often.
+const UNACKED_EVERY: Duration = Duration::from_millis(100);
+
+/// The unacknowledged limit a session rate `rate` (bytes per second) and a slowest round trip
+/// `rtt` call for, between `floor` and `ceiling`. A ceiling under the floor fixes it at the floor.
+fn unacked_target(floor: usize, ceiling: usize, rate: f64, rtt: Duration) -> usize {
+    let want = UNACKED_HEADROOM * rate * rtt.as_secs_f64();
+    (want as usize).clamp(floor, ceiling.max(floor))
+}
+
+/// One step from `current` toward `target`: up by at most a factor of 2, down by at most 1/8.
+fn step_unacked(current: usize, target: usize) -> usize {
+    if target > current {
+        target.min(current.saturating_mul(2))
+    } else {
+        target.max(current - current / 8)
+    }
+}
 /// The lowest round trip of a subflow is taken over this span.
 const MIN_RTT_SPAN: Duration = Duration::from_secs(10);
 const CAP_HOLD: u32 = 6;
@@ -518,7 +538,11 @@ enum Fresh {
 pub(crate) struct State {
     window: u32,
     peer_window: u32,
+    /// The current limit on `unacked_bytes`, between the floor and the ceiling.
     max_unacked: usize,
+    max_unacked_floor: usize,
+    max_unacked_ceiling: usize,
+    unacked_at: Instant,
     subflow_window: usize,
     next_seq: u64,
     unacked: BTreeMap<u64, Sent>,
@@ -881,6 +905,39 @@ impl State {
         // A penalised window regains an eighth of what the subflow got acknowledged.
         sub.window = (sub.window + (delta / 8) as usize).min(cap);
         sub.notify.notify_one();
+        self.retarget_unacked(now);
+    }
+
+    /// Move the unacknowledged limit toward 2 x (sum of the subflows' best delivery rates) x
+    /// (the largest smoothed round trip). SPEC.md letify-link, Session item 4.
+    fn retarget_unacked(&mut self, now: Instant) {
+        if self.max_unacked_ceiling <= self.max_unacked_floor
+            || now.saturating_duration_since(self.unacked_at) < UNACKED_EVERY
+        {
+            return;
+        }
+        self.unacked_at = now;
+        let rate: f64 = self
+            .subflows
+            .values()
+            .map(|s| s.rates.iter().copied().fold(0.0, f64::max))
+            .sum();
+        let rtt = self
+            .subflows
+            .values()
+            .filter_map(|s| s.srtt)
+            .max()
+            .unwrap_or_default();
+        // One subflow has no uneven paths to wait for, so its limit stays at the floor.
+        let rate = if self.subflows.len() < 2 { 0.0 } else { rate };
+        let target = unacked_target(self.max_unacked_floor, self.max_unacked_ceiling, rate, rtt);
+        let next = step_unacked(self.max_unacked, target);
+        if next > self.max_unacked {
+            self.max_unacked = next;
+            self.wake_writers();
+        } else {
+            self.max_unacked = next;
+        }
     }
 
     /// Reinject the frame that blocks delivery when it sits on a stalled or slower subflow.
@@ -1699,6 +1756,9 @@ impl Session {
             window: cfg.stream_window,
             peer_window: est.peer_window,
             max_unacked: cfg.max_unacked_bytes.min(est.peer_reorder),
+            max_unacked_floor: cfg.max_unacked_bytes.min(est.peer_reorder),
+            max_unacked_ceiling: cfg.max_unacked_ceiling.min(est.peer_reorder),
+            unacked_at: Instant::now(),
             subflow_window: cfg.subflow_window,
             next_seq: 0,
             unacked: BTreeMap::new(),

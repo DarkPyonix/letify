@@ -300,7 +300,10 @@ async fn the_unacknowledged_limit_grows_on_a_long_uneven_session() {
     )
     .await;
     assert_eq!(a.flow_snapshot().max_unacked, 8 << 20);
-    let mut s = a.open_stream_with(letify_link::Priority::Bulk).await.unwrap();
+    let mut s = a
+        .open_stream_with(letify_link::Priority::Bulk)
+        .await
+        .unwrap();
     let blk = pattern(1 << 20, 1);
     let w = tokio::spawn(async move {
         for _ in 0..96 {

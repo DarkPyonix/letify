@@ -24,9 +24,14 @@ pub enum PowerState {
 pub struct Config {
     /// The protocol versions this side supports. The responder picks the highest common one.
     pub versions: RangeInclusive<u16>,
-    /// Upper bound, in bytes, on the frames kept until the peer acknowledges them. A stream
-    /// writer waits while the bound is reached. Default 8 MiB.
+    /// The least bound, in bytes, on the frames kept until the peer acknowledges them. A stream
+    /// writer waits while the bound is reached. The bound rises above this with the session's
+    /// delivery rate and round trip, up to `max_unacked_ceiling`. Default 8 MiB.
     pub max_unacked_bytes: usize,
+    /// The most the bound on unacknowledged bytes may rise to. A value at or below
+    /// `max_unacked_bytes` keeps the bound fixed there. The peer's reorder bound caps it too.
+    /// Default 64 MiB.
+    pub max_unacked_ceiling: usize,
     /// Bytes a stream may receive before its reader consumes them, advertised to the peer.
     /// Default 16 MiB.
     pub stream_window: u32,
@@ -34,8 +39,8 @@ pub struct Config {
     /// subflow. Default 4 MiB.
     pub subflow_window: usize,
     /// Bytes of frames the receiver holds ahead of a gap, advertised to the peer, which limits
-    /// its unacknowledged bytes to the smaller of this and its own `max_unacked_bytes`. Values
-    /// below 128 KiB are raised to 128 KiB. Default 16 MiB.
+    /// its unacknowledged bytes to this. Values below 128 KiB are raised to 128 KiB. Default
+    /// 64 MiB.
     pub max_reorder_bytes: usize,
     /// How long a session without any subflow waits for a new one before its streams fail
     /// with `Error::ConnectionLost`. Default 24 h.
@@ -75,11 +80,12 @@ impl Config {
     }
 
     /// A profile for a phone or a tablet: less memory in flight and fewer pings than the
-    /// default. `max_unacked_bytes` 4 MiB, `max_reorder_bytes` 8 MiB, `stream_window` 2 MiB,
+    /// default. `max_unacked_bytes` and `max_unacked_ceiling` 4 MiB, `max_reorder_bytes` 8 MiB, `stream_window` 2 MiB,
     /// `subflow_window` 1 MiB and `keepalive_interval` 30 s. Every other field is the default.
     pub fn mobile() -> Config {
         Config {
             max_unacked_bytes: 4 << 20,
+            max_unacked_ceiling: 4 << 20,
             stream_window: 2 << 20,
             subflow_window: 1 << 20,
             max_reorder_bytes: 8 << 20,
@@ -99,9 +105,10 @@ impl Default for Config {
         Config {
             versions: PROTOCOL_VERSION..=PROTOCOL_VERSION,
             max_unacked_bytes: 8 << 20,
-            stream_window: 16 << 20,
+            max_unacked_ceiling: 64 << 20,
+            stream_window: 32 << 20,
             subflow_window: 4 << 20,
-            max_reorder_bytes: 16 << 20,
+            max_reorder_bytes: 64 << 20,
             resume_window: Duration::from_secs(24 * 3600),
             keepalive_interval: Duration::from_secs(15),
             background_keepalive_interval: Duration::from_secs(120),
