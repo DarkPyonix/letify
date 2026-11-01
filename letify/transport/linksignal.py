@@ -1,6 +1,7 @@
 """A letify-link bootstrap carried over the signalling service's mailbox.
 
-Owns talking to the signalling service (signed requests, long poll), the signed envelope that
+Owns talking to the signalling service (signed requests, the short long poll of a connect, the
+WebSocket watch of a standing wait), the signed envelope that
 wraps every bootstrap line, ``SignalBootstrap`` (the ``Bootstrap`` of ``linkchannel.py`` over
 that mailbox) and ``SignalAgent`` (the program on the address-less machine that serves a paired
 node's bootstrap). It does not own the service (``letify-signal/``), signing (the sidecar's
@@ -27,6 +28,8 @@ from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from typing import Any, Protocol
 
+from . import linkwebsocket
+
 #: The service the owner operates.
 DEFAULT_URL = "https://letify.darkpyonix.dev"
 #: The signature domain of a request, and of an envelope.
@@ -49,6 +52,9 @@ DEFAULT_RESUME_S = 30
 PINGS = 2
 #: The ops of a bootstrap line that the agent passes to the shim.
 SHIM_OPS = ("rendezvous", "punch", "handover")
+#: Bounds of the WebSocket keepalive, in seconds. See ``linkwebsocket``.
+WS_PING_S = linkwebsocket.PING_S
+WS_PONG_S = linkwebsocket.PONG_S
 #: Transient failures of the long poll a bootstrap rides out before it gives up.
 POLL_RETRIES = 3
 
@@ -192,6 +198,112 @@ class SignalClient:
     def recv(self, after: int = 0, wait_s: float = POLL_S) -> tuple[list[Incoming], int]:
         """Acknowledge up to ``after``, then wait up to ``wait_s`` for a message above it."""
         return self.recv_from(self.daemon.node_id, after, wait_s)
+
+
+    def watch(self) -> SignalWatch:
+        """A standing wait on this node's mailbox over ``/ws/<node>``, for an idle receiver."""
+        return SignalWatch(self)
+
+
+class SignalWatch:
+    """The standing wait of one node on its own mailbox, over a WebSocket.
+
+    A pending long poll keeps the service's Durable Object awake, while an idle WebSocket lets
+    it hibernate, so a receiver that waits all day uses this and not ``SignalClient.recv``. The
+    service sends the messages it holds when a socket opens and each new one as it arrives, and
+    deletes up to the ``seq`` the client acknowledges. ``read`` therefore keeps the highest
+    ``seq`` it returned, skips what the service sends again after a reconnect, and acknowledges
+    the messages of the previous call at the start of the next one, once the caller has handled
+    them. ``read`` opens the socket when there is none, so the first call after a drop is the
+    reconnect; a failure raises SignalError and the caller decides how long to wait.
+    """
+
+    def __init__(self, client: SignalClient) -> None:
+        self._client = client
+        self._ws: linkwebsocket.WebSocket | None = None
+        self._last = 0
+        self._acked = 0
+        self._closed = False
+
+    @property
+    def node_id(self) -> str:
+        return self._client.node_id
+
+    def _open(self) -> linkwebsocket.WebSocket:
+        client = self._client
+        target = f"/ws/{client.node_id}"
+        headers = client._headers("GET", target, b"", None)
+        parts = urllib.parse.urlsplit(client.base_url)
+        scheme = "wss" if parts.scheme == "https" else "ws"
+        url = f"{scheme}://{parts.netloc}{target}"
+        try:
+            return linkwebsocket.WebSocket.connect(
+                url, headers, timeout=client._timeout, ping_s=WS_PING_S, pong_s=WS_PONG_S
+            )
+        except linkwebsocket.HandshakeRefused as error:
+            retry = error.headers.get("retry-after")
+            raise SignalError(
+                f"the signalling service refused the request: {error.error_code()} "
+                f"(HTTP {error.status}" + (f", retry in {retry} s)" if retry else ")")
+            ) from error
+        except (linkwebsocket.WebSocketError, OSError, ValueError) as error:
+            raise SignalError(f"the signalling service did not answer: {error}") from error
+
+    def _drop(self, error: Exception) -> SignalError:
+        ws, self._ws = self._ws, None
+        if ws is not None:
+            ws.close()
+        return SignalError(f"the signalling WebSocket ended: {error}")
+
+    def read(self, wait_s: float) -> list[Incoming]:
+        """Messages that arrived, waiting up to ``wait_s`` seconds when none is there yet.
+
+        Sends no request while it waits. Returns early with every message already received
+        once one arrives. Raises SignalError when the socket cannot be opened or ended.
+        """
+        if self._closed:
+            return []
+        if self._ws is None:
+            self._ws = self._open()
+        ws = self._ws
+        found: list[Incoming] = []
+        deadline = time.monotonic() + max(0.0, wait_s)
+        try:
+            if self._acked < self._last:
+                ws.send_text(json.dumps({"ack": self._last}))
+                self._acked = self._last
+            while True:
+                left = 0.0 if found else deadline - time.monotonic()
+                text = ws.recv_text(max(0.0, left))
+                if text is None:
+                    break
+                message = self._decode(text)
+                if message is not None and message.seq > self._last:
+                    self._last = message.seq
+                    found.append(message)
+        except linkwebsocket.WebSocketError as error:
+            if self._closed:
+                return []
+            failure = self._drop(error)
+            if not found:
+                raise failure from error
+        return found
+
+    @staticmethod
+    def _decode(text: str) -> Incoming | None:
+        try:
+            m = json.loads(text)
+            body = base64.b64decode(m["body"])
+            return Incoming(int(m["seq"]), str(m["from"]), int(m["at"]), body)
+        except (ValueError, KeyError, TypeError):
+            return None
+
+    def close(self) -> None:
+        """End the watch. A read in another thread returns an empty list."""
+        self._closed = True
+        ws = self._ws
+        if ws is not None:
+            ws.close()
 
 
 # -- the envelope -------------------------------------------------------------------------
@@ -774,6 +886,7 @@ __all__ = [
     "SignalBootstrap",
     "SignalClient",
     "SignalError",
+    "SignalWatch",
     "lean_config",
     "open_envelope",
     "seal",

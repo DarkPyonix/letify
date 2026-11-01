@@ -37,6 +37,7 @@ from .linksignal import (
     SignalAgent,
     SignalClient,
     SignalError,
+    SignalWatch,
     open_envelope,
     seal,
 )
@@ -53,9 +54,10 @@ MIN_PREFIX = 8
 #: Conversations with a running shim at once, and the seconds a conversation with no shim lives.
 MAX_CONVERSATIONS = 4
 IDLE_S = 120.0
-#: Seconds one poll of the loop waits, and the pause after the 1st, 2nd, ... failure in a row.
+#: Seconds one read of the loop waits before it checks for changes, and the pause after the
+#: 1st, 2nd, ... failure in a row.
 POLL_S = 5.0
-BACKOFF_S = (1.0, 2.0, 4.0, 8.0, 16.0, 30.0)
+BACKOFF_S = (1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 60.0)
 #: Sids remembered per node so a finished bootstrap is never started again.
 SEEN_SIDS = 64
 PAIR_DOMAIN = "letify-agent pair v1"
@@ -400,6 +402,7 @@ class AgentService:
         self._backoff = tuple(backoff_s) or (1.0,)
         self._clock = clock
         self._stop = threading.Event()
+        self._watch: SignalWatch | None = None
         self._lock = threading.Lock()
         self._secrets: list[_Secret] = []
         self._conversations: dict[str, _Conversation] = {}
@@ -433,17 +436,20 @@ class AgentService:
     def stop(self) -> None:
         """End ``serve`` and every conversation that has not handed over."""
         self._stop.set()
+        if self._watch is not None:
+            self._watch.close()
 
     # -- the loop ---------------------------------------------------------------------------
 
     def serve(self) -> None:
         self._known = set(self.home.paired.nodes())
         self._stamp = self.home.paired.mtime()
-        after = 0
         failures = 0
+        watch = self._client.watch()
+        self._watch = watch
         while not self._stop.is_set():
             try:
-                messages, _ = self._client.recv(after, wait_s=self._poll_s)
+                messages = watch.read(self._poll_s)
             except SignalError as error:
                 if failures == 0:
                     self._log(f"{error}; retrying with a backoff")
@@ -456,12 +462,12 @@ class AgentService:
                 failures = 0
             self._refresh()
             for message in messages:
-                after = max(after, message.seq)
                 try:
                     self._dispatch(message)
                 except Exception as error:  # one bad message must not end the agent
                     self._drop(f"{type(error).__name__}: {error}")
             self._reap()
+        watch.close()
         for conversation in list(self._conversations.values()):
             conversation.agent.stop()
 
