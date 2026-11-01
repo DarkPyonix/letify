@@ -21,7 +21,9 @@ import hashlib
 import json
 import os
 import shutil
+import sys
 import threading
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -53,21 +55,71 @@ _SCOPES = (
 _FOLDER_TYPE = "application/vnd.google-apps.folder"
 
 
+#: Seconds to wait before each successive attempt after a failed piece. A failure that
+#: follows progress starts the count again, and the seventh in a row raises.
+RESUME_DELAYS = (1, 2, 4, 8, 16, 32)
+
+#: HTTP statuses of a piece that are worth asking the session about and trying again.
+_RETRYABLE = (500, 502, 503, 504)
+
+
+class _Retry(Exception):
+    """A request that failed in a way the session may recover from."""
+
+
+def _session_status(url: str, headers: dict[str, str], size: int) -> tuple[int, str | None]:
+    """Ask a resumable session where it stands: the next byte it wants and, once done, the id.
+
+    This is Google's status query, an empty PUT with ``Content-Range: bytes */<size>``.
+    """
+    query = urllib.request.Request(url, data=b"", method="PUT", headers=headers)
+    query.add_header("Content-Length", "0")
+    query.add_header("Content-Range", f"bytes */{size}")
+    try:
+        with urllib.request.urlopen(query, timeout=300) as response:
+            return size, str(json.loads(response.read())["id"])
+    except urllib.error.HTTPError as exc:
+        if exc.code == 308:
+            held = exc.headers.get("Range")
+            return (int(held.rsplit("-", 1)[1]) + 1 if held else 0), None
+        _refuse(exc)
+        raise _Retry(f"status query returned {exc.code}") from exc
+    except (urllib.error.URLError, OSError) as exc:
+        raise _Retry(str(exc)) from exc
+
+
+def _refuse(exc: urllib.error.HTTPError) -> None:
+    """Raise ``RuntimeFailure`` for a status that is not worth retrying."""
+    if exc.code in _RETRYABLE:
+        return
+    detail = exc.read()[:300].decode(errors="replace")
+    if exc.code in (404, 410):
+        raise RuntimeFailure(
+            f"Drive upload session expired ({exc.code}): the upload must start again"
+        ) from exc
+    raise RuntimeFailure(f"Drive upload returned {exc.code}: {detail}") from exc
+
+
 def upload_pieces(
     path: str | os.PathLike[str], url: str, headers: dict[str, str], piece: int
 ) -> str:
     """Send one file to a resumable session URL in pieces and return the new file's id.
 
     Every piece but the last is a multiple of 256 KiB, as Drive requires, and is answered
-    308 until the last, which is answered with the new file's metadata. This is plain
-    standard library code that both this process and a worker can run, so a handoff made
-    inside a shipped function uploads from the runtime and the bytes never cross the client.
+    308 until the last, which is answered with the new file's metadata. A piece that fails
+    with a network error, a timeout or a 5xx status is not lost: the session is asked where
+    it stands and the upload continues from that offset, waiting ``RESUME_DELAYS`` between
+    attempts that make no progress. This is plain standard library code that both this
+    process and a worker can run, so a handoff made inside a shipped function uploads from
+    the runtime and the bytes never cross the client.
     """
     size = os.path.getsize(path)
     remote_id: str | None = None
+    failures = 0
     with open(path, "rb") as handle:
         offset = 0
-        while offset < size:
+        while remote_id is None and offset < size:
+            handle.seek(offset)
             block = handle.read(piece)
             end = offset + len(block)
             send = urllib.request.Request(url, data=block, method="PUT", headers=headers)
@@ -76,13 +128,39 @@ def upload_pieces(
             try:
                 with urllib.request.urlopen(send, timeout=3600) as response:
                     remote_id = str(json.loads(response.read())["id"])
+                offset, failures = end, 0
+                continue
             except urllib.error.HTTPError as exc:
-                if exc.code != 308:
-                    detail = exc.read()[:300].decode(errors="replace")
-                    raise RuntimeFailure(f"Drive upload returned {exc.code}: {detail}") from exc
+                if exc.code == 308:
+                    offset, failures = end, 0
+                    continue
+                _refuse(exc)
+                reason = f"HTTP {exc.code}"
             except (urllib.error.URLError, OSError) as exc:
-                raise RuntimeFailure(f"Drive upload failed: {exc}") from exc
-            offset = end
+                reason = str(exc)
+            # The piece failed: ask the session where it stands, waiting between attempts.
+            while True:
+                if failures >= len(RESUME_DELAYS):
+                    raise RuntimeFailure(
+                        f"Drive upload failed at {offset} of {size} after "
+                        f"{failures + 1} attempts without progress: {reason}"
+                    )
+                time.sleep(RESUME_DELAYS[failures])
+                failures += 1
+                try:
+                    held, remote_id = _session_status(url, headers, size)
+                except _Retry as retry:
+                    reason = str(retry)
+                    continue
+                break
+            if held > offset:
+                failures = 0
+            print(
+                f"letify: Drive upload resumed at {held} of {size} after {reason}",
+                file=sys.stderr,
+                flush=True,
+            )
+            offset = held
     if remote_id is None:
         raise RuntimeFailure("Drive upload: the session never answered with a file")
     return remote_id

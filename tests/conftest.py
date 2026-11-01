@@ -1088,6 +1088,12 @@ class FakeDriveServer:
         self.requests: list[dict[str, Any]] = []
         self.refresh_grants: list[dict[str, str]] = []
         self.fail_with: int | None = None
+        #: One entry is consumed by each piece of a resumable upload: an HTTP status as text,
+        #: "drop" to close the connection before storing the piece, "drop-after-store" to
+        #: store it and then close without answering, or "expired" for a 404.
+        self.glitches: list[str] = []
+        #: One HTTP status is consumed by each status query (Content-Range: bytes */N).
+        self.status_glitches: list[int] = []
         #: When set, a piece of a resumable upload waits for this event before it is taken.
         self.hold_uploads: threading.Event | None = None
         #: When set, a DELETE waits for this event before it is answered.
@@ -1228,18 +1234,42 @@ class FakeDriveServer:
             if self.hold_uploads is not None:
                 self.hold_uploads.wait(timeout=20)
             session = self.sessions[parsed.path[len(session_prefix) :]]
+
+            def progress() -> None:
+                if "id" in session:
+                    return reply({"id": session["id"], "name": session["meta"]["name"]})
+                if not session["body"]:
+                    return answer(308)
+                return answer(308, extra={"Range": f"bytes=0-{len(session['body']) - 1}"})
+
+            if headers["content-range"].startswith("bytes */"):
+                if self.status_glitches:
+                    status = self.status_glitches.pop(0)
+                    return answer(status, b'{"error": {"message": "injected"}}')
+                return progress()
+            glitch = self.glitches.pop(0) if self.glitches else None
+            if glitch == "expired":
+                return answer(404, b'{"error": {"message": "session expired"}}')
+            if glitch is not None and glitch.isdigit():
+                return answer(int(glitch), b'{"error": {"message": "injected"}}')
+            if glitch == "drop":
+                handler.close_connection = True
+                return None
             start = int(headers["content-range"].split(" ")[1].split("-")[0])
             if start != len(session["body"]):
                 return answer(400, b'{"error": {"message": "out of order"}}')
             session["body"] += body
-            if len(session["body"]) < session["size"]:
-                return answer(308, extra={"Range": f"bytes=0-{len(session['body']) - 1}"})
-            identifier = self._new_id()
-            self.files[identifier] = {
-                **session["meta"], "id": identifier, "content": session["body"],
-                "folder": False, "trashed": False,
-            }
-            return reply({"id": identifier, "name": session["meta"]["name"]})
+            if len(session["body"]) >= session["size"]:
+                identifier = self._new_id()
+                self.files[identifier] = {
+                    **session["meta"], "id": identifier, "content": session["body"],
+                    "folder": False, "trashed": False,
+                }
+                session["id"] = identifier
+            if glitch == "drop-after-store":
+                handler.close_connection = True
+                return None
+            return progress()
 
         if headers.get("authorization") != f"Bearer {self.token}":
             return answer(401, b'{"error": {"message": "unauthenticated"}}')
