@@ -1246,3 +1246,19 @@ async fn verify_refuses_node_ids_that_are_not_canonical_keys_and_malformed_signa
         .await;
     assert_eq!(r["kind"], "usage");
 }
+
+#[tokio::test]
+async fn several_udp_sockets_still_give_the_two_sides_one_working_path() {
+    // Each side keeps the first (socket, address) pair that answered it. With 4 sockets the two
+    // sides can keep different pairs, and a QUIC connection over mismatched pairs never opens,
+    // so the UDP path is silently lost. Spec: NAT traversal item 4 and Sidecar interface, punch.
+    let mut lost = Vec::new();
+    for round in 0..6 {
+        let (_a, _b, ra, _rb, _l) = punch_pair(1, 4, None).await;
+        let names = ra["punched"].as_array().cloned().unwrap_or_default();
+        if !names.iter().any(|n| n.as_str().is_some_and(|s| s.ends_with("-u"))) {
+            lost.push(round);
+        }
+    }
+    assert!(lost.is_empty(), "the UDP path was lost in rounds {lost:?} of 6");
+}
