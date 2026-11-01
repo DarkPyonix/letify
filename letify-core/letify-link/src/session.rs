@@ -60,17 +60,18 @@ pub struct CongestionStats {
 /// Reads the congestion statistics of one subflow's transport.
 pub(crate) type Gauge = Arc<dyn Fn() -> CongestionStats + Send + Sync>;
 
-/// The gauge of `transport` when it is a UDP path, directly or behind a [`crate::BoxTransport`].
+/// The gauge of `transport` when it is a UDP path, directly or behind any number of
+/// [`crate::BoxTransport`] layers. A punched candidate is boxed by the sidecar and again by the
+/// path manager, so one layer is not enough.
 pub(crate) fn gauge_of<T: Transport>(transport: &T) -> Option<Gauge> {
-    let any: &dyn Any = transport;
-    if let Some(path) = any.downcast_ref::<crate::udp::UdpPath>() {
-        return Some(path.gauge());
+    let mut any: &dyn Any = transport;
+    loop {
+        if let Some(path) = any.downcast_ref::<crate::udp::UdpPath>() {
+            return Some(path.gauge());
+        }
+        let boxed = any.downcast_ref::<crate::BoxTransport>()?;
+        any = &**boxed;
     }
-    let boxed = any.downcast_ref::<crate::BoxTransport>()?;
-    let inner: &dyn Any = &**boxed;
-    inner
-        .downcast_ref::<crate::udp::UdpPath>()
-        .map(crate::udp::UdpPath::gauge)
 }
 
 const SUBFLOW_MAGIC: &[u8; 4] = b"LLNS";
