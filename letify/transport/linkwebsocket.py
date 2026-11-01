@@ -2,11 +2,12 @@
 
 Owns the opening handshake (``GET`` with an upgrade, ``Sec-WebSocket-Accept`` check), frame
 reading and writing with client masking, text messages (fragmented ones are put together),
-ping and pong, the close handshake, and a keepalive that treats a missing pong as a dead
-connection. It does not own signing the upgrade request, the meaning of a message,
-reconnecting, proxies or permessage-deflate (``linksignal.py`` builds the first on top of it,
-and the others are not offered). Binary messages are read and dropped. Spec "Signalling
-service" item 1. Standard library only.
+ping and pong, the close handshake, and a keepalive (the text ``ping``, which the service
+answers with the text ``pong``) that treats a missing answer as a dead connection. It does not
+own signing the upgrade request, the meaning of a message, reconnecting, proxies or
+permessage-deflate (``linksignal.py`` builds the first on top of it, and the others are not
+offered). Binary messages are read and dropped. Spec "Signalling service" item 1.
+Standard library only.
 """
 
 from __future__ import annotations
@@ -31,6 +32,10 @@ MAX_HEAD = 16384
 #: Seconds of silence before a ping, and seconds a ping may stay unanswered.
 PING_S = 30.0
 PONG_S = 10.0
+#: The text keepalive. The signalling service registers it as a Hibernation auto-response,
+#: which the runtime answers without waking the object. A ``pong`` is never returned as a message.
+PING_TEXT = "ping"
+PONG_TEXT = "pong"
 
 _CONTINUATION, _TEXT, _BINARY, _CLOSE, _PING, _PONG = 0x0, 0x1, 0x2, 0x8, 0x9, 0xA
 
@@ -197,8 +202,8 @@ class WebSocket:
     def recv_text(self, timeout: float) -> str | None:
         """The next text message, or None when ``timeout`` seconds pass without one.
 
-        Answers pings, sends its own ping after ``ping_s`` of silence, and raises WebSocketError
-        when the peer closes, the pong does not come, or the connection breaks.
+        Answers pings, sends the text ``ping`` after ``ping_s`` of silence, and raises
+        WebSocketError when the peer closes, the pong does not come, or the connection breaks.
         """
         deadline = time.monotonic() + max(0.0, timeout)
         while True:
@@ -220,7 +225,7 @@ class WebSocket:
             else:
                 if now - self._heard >= self._ping_s:
                     self._pong_due = now + self._pong_s
-                    self._send_frame(_PING)
+                    self.send_text(PING_TEXT)
                     continue
                 wake = min(wake, self._heard + self._ping_s)
             if now >= deadline:
@@ -310,7 +315,8 @@ class WebSocket:
         if not self._text:
             return None
         try:
-            return data.decode()
+            text = data.decode()
         except UnicodeDecodeError:
             self._fail(1007, "a text message is not UTF-8")
             return None
+        return None if text == PONG_TEXT else text

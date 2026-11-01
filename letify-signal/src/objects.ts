@@ -37,6 +37,8 @@ export class Mailbox extends DurableObject {
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
     this.core = new MailboxCore(ctx.storage as unknown as KV);
+    // The client keepalive. The runtime answers it without waking a hibernated object.
+    ctx.setWebSocketAutoResponse(new WebSocketRequestResponsePair("ping", "pong"));
   }
 
   async put(from: string, body: string, now: number): Promise<PutResult> {
