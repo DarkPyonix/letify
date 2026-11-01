@@ -2200,6 +2200,42 @@ impl Session {
     pub fn unacked_bytes(&self) -> usize {
         self.shared().lock().unacked_bytes
     }
+
+    /// A reading of the session-wide queues that bound a transfer, for a diagnostic trace.
+    pub fn flow_snapshot(&self) -> FlowSnapshot {
+        let st = self.shared().lock();
+        FlowSnapshot {
+            unacked_bytes: st.unacked_bytes,
+            max_unacked: st.max_unacked,
+            reinjected: st.reinjected,
+            reorder_bytes: st.reorder_bytes,
+            reorder_peak: st.reorder_peak,
+            pending_frames: st.pending.len(),
+            queued_bytes: st.streams.values().map(|s| s.queued).sum(),
+            min_send_credit: st.streams.values().map(|s| s.send_credit).min(),
+        }
+    }
+}
+
+/// What [`Session::flow_snapshot`] read at one moment.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FlowSnapshot {
+    /// Bytes of frames sent and not yet acknowledged by the session ack.
+    pub unacked_bytes: usize,
+    /// The bound on `unacked_bytes`: this side's setting or the peer's reorder bound.
+    pub max_unacked: usize,
+    /// Frames sent again on another subflow so far.
+    pub reinjected: u64,
+    /// Bytes held in the reorder buffer now.
+    pub reorder_bytes: usize,
+    /// The most bytes the reorder buffer held at once.
+    pub reorder_peak: usize,
+    /// Frames waiting to be sent again.
+    pub pending_frames: usize,
+    /// Bytes queued by streams that no subflow writer has taken yet.
+    pub queued_bytes: usize,
+    /// The least send credit of any stream, if there is a stream.
+    pub min_send_credit: Option<u64>,
 }
 
 /// A reference to a session that does not keep it open.

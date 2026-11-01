@@ -415,6 +415,8 @@ struct Shared {
     sessions: Mutex<HashMap<u64, SessionEntry>>,
     listeners: Mutex<HashMap<u64, ListenerEntry>>,
     punched: Mutex<HashMap<String, Punched>>,
+    /// When the sidecar started, the zero of the diagnostic trace.
+    started: std::time::Instant,
 }
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -534,6 +536,14 @@ fn register(
         })
         .abort_handle(),
     );
+    if let Some(config) = crate::trace::TraceConfig::from_env() {
+        tasks.push(crate::trace::spawn(
+            config,
+            id,
+            session.downgrade(),
+            shared.started,
+        ));
+    }
     lock(&shared.sessions).insert(
         id,
         SessionEntry {
@@ -1691,6 +1701,7 @@ pub async fn serve(opts: ServeOptions, identity: Identity) -> io::Result<()> {
         sessions: Mutex::new(HashMap::new()),
         listeners: Mutex::new(HashMap::new()),
         punched: Mutex::new(HashMap::new()),
+        started: std::time::Instant::now(),
     });
     control_loop(shared.clone(), rd).await;
     writer.abort();
