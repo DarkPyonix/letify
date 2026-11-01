@@ -520,7 +520,7 @@ def test_a_tailcat_token_given_to_the_agent_login_is_refused_by_name(tmp_path, m
 
 
 # -- the standing wait ----------------------------------------------------------------------
-# Spec "Signalling service" item 1, "Which wait uses which endpoint", and "Agent and pairing" item 5.
+# Spec "Signalling service" item 1, "Which wait uses which endpoint", and "Agent and pairing".
 
 
 def recv_requests(signal_service, node: str) -> list[tuple[str, str, int]]:
@@ -556,4 +556,4 @@ def test_an_agent_whose_socket_dropped_reconnects_and_still_serves_a_pairing(
     token = agent.service.new_token(signal_service.url)
     assert user_pair(signal_service, user, token) == agent.node_id
     assert recv_requests(signal_service, agent.node_id) == []
-    assert agent.home.paired.nodes() == [user.node_id]
+    assert list(agent.home.paired.nodes()) == [user.node_id]

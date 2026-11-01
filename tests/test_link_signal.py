@@ -641,15 +641,15 @@ def test_a_handled_message_is_acknowledged_so_the_service_deletes_it(
     watch = linksignal.SignalClient(b, signal_service.url).watch()
     try:
         sender.send(b.node_id, b"one")
-        sender.send(b.node_id, b"two")
-        assert len(read_until(watch, 2)) == 2
-        assert signal_service.waiting(b.node_id) == 2
+        assert len(read_until(watch, 1)) == 1
+        # Nothing is acknowledged until the caller comes back for more.
+        assert signal_service.waiting(b.node_id) == 1
         watch.read(0.3)
         deadline = time.monotonic() + 5
         while signal_service.waiting(b.node_id) and time.monotonic() < deadline:
             time.sleep(0.05)
         assert signal_service.waiting(b.node_id) == 0
-        assert signal_service.ws_acks[-1] == 2
+        assert signal_service.ws_acks[-1] == 1
     finally:
         watch.close()
 
