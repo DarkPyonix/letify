@@ -2332,6 +2332,8 @@ class FakeSignalService:
         #: Text pings received, and whether the service answers them with the text pong.
         self.ws_pings = 0
         self.answer_pings = True
+        #: Set by ``close``, so a WebSocket still in its handshake is cut once it registers.
+        self._closed = False
         service = self
 
         class Handler(http.server.BaseHTTPRequestHandler):
@@ -2350,6 +2352,8 @@ class FakeSignalService:
         threading.Thread(target=self._server.serve_forever, daemon=True).start()
 
     def close(self) -> None:
+        with self._cond:
+            self._closed = True
         self.drop_sockets()
         self._server.shutdown()
         self._server.server_close()
@@ -2472,6 +2476,11 @@ class FakeSignalService:
             for stored in self._boxes.get(node, []):
                 if stored["at"] + self.TTL_S > now:
                     sock.push(stored)
+            closed = self._closed
+        if closed:
+            # A handshake that raced ``close`` ends like every other socket: cut.
+            sock.cut()
+            return
         try:
             while True:
                 text = sock.read_text()
