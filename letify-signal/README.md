@@ -40,7 +40,7 @@ No secret, token or API key is needed: the service authenticates nodes by their 
 
 ## Operating notes
 
-- Cost. A connect sends about 20 messages. A long poll holds a Durable Object for up to 25 s, so the duration charge grows with open polls, not with messages.
+- Cost. A connect sends about 20 messages. A long poll holds a Durable Object awake for up to 25 s, so the duration charge grows with open polls, not with messages. An idle `letify agent serve` therefore waits on `/ws/<node>`, where the object hibernates, because one agent long polling all day would use about 86,400 s of the roughly 104,000 s per day (13,000 GB-s at 128 MB) that the free plan allows. A connect's short waits use `/recv`.
 - Limits are constants in `src/protocol.ts` (body 4096 bytes, time to live 60 s, depth 32, 120 requests and 30 sends per signer per minute, 240 requests per IP per minute). Changing one does not change the wire protocol.
 - The service logs the hour, the method, the reply code and the body length. `observability` is off in `wrangler.toml`. Do not turn on request logging for the zone, because it would record node ids in paths.
 - Rolling back is `npx wrangler rollback`. Stored messages live at most 60 s, so nothing needs migrating.
