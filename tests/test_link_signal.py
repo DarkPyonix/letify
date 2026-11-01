@@ -768,3 +768,35 @@ def test_a_watch_whose_ping_is_not_answered_drops_the_socket_after_the_pong_limi
         assert time.monotonic() - began < 3
     finally:
         watch.close()
+
+
+def test_the_service_records_a_request_before_any_reply_byte_is_written(
+    signal_service, daemons
+) -> None:
+    # Spec "Signalling service": the fake is observed by tests that act on the client's view
+    # of a reply, so the record must exist by the time the client can see the reply.
+    class SlowRecord(list):
+        def append(self, item: Any) -> None:
+            time.sleep(0.3)
+            super().append(item)
+
+    signal_service.requests = SlowRecord()
+
+    class Forger:
+        def __init__(self, daemon) -> None:
+            self.node_id = daemon.node_id
+            self._daemon = daemon
+
+        def sign(self, domain: str, message: bytes) -> bytes:
+            return self._daemon.sign(domain, message + b"x")
+
+        def verify(self, *args: Any) -> bool:
+            return self._daemon.verify(*args)
+
+    watch = linksignal.SignalClient(Forger(daemons("b")), signal_service.url).watch()
+    try:
+        with pytest.raises(linksignal.SignalError, match="bad_signature"):
+            watch.read(2.0)
+    finally:
+        watch.close()
+    assert ("GET", f"/ws/{watch.node_id}", 401) in signal_service.requests
