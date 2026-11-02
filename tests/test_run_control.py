@@ -29,6 +29,7 @@ import pytest
 import letify
 from letify import paths
 from letify.cli import main
+from letify.errors import RunNotFound
 from letify.protocol import wire
 from letify.runtime import control
 
@@ -715,6 +716,39 @@ def _alive(pid: int) -> bool:
 def test_on_exit_outside_a_body_raises_unsupported_mode() -> None:
     with pytest.raises(letify.UnsupportedMode, match="atexit"):
         letify.on_exit(lambda: None)
+
+
+def test_a_run_control_socket_is_reached_by_descriptor_when_every_short_path_is_too_long(
+    monkeypatch, tmp_path
+) -> None:
+    """Spec "Controlling a running call": a deep system temp directory creates nothing there."""
+    if not os.path.isdir("/proc/self/fd"):
+        pytest.skip("needs /proc")
+    deep = tmp_path / ("d" * 60) / ("e" * 60)
+    deep.mkdir(parents=True)
+    deep_tmp = tmp_path / ("t" * 60) / ("u" * 60)
+    deep_tmp.mkdir(parents=True)
+    monkeypatch.setenv("LETIFY_HOME", str(deep))
+    monkeypatch.delenv("XDG_RUNTIME_DIR", raising=False)
+    monkeypatch.setattr(tempfile, "tempdir", str(deep_tmp))
+    natural = control.runs_directory() / f"{os.getpid()}.sock"
+    assert len(os.fsencode(natural)) > 107
+
+    assert control.socket_path(os.getpid()) == natural
+    server = control._Server()
+    try:
+        assert server.path == natural
+        assert server.path.exists()
+        assert list(deep_tmp.iterdir()) == []
+
+        record = {"run": "abcdef012345", "pid": os.getpid(), "socket": str(server.path)}
+        control.write_record({**record, "function": "f", "runtime": "r", "provider": "a"})
+        # The owner answers RunNotFound for a run it does not hold, so the round trip worked.
+        with pytest.raises(RunNotFound):
+            control.ask("abcdef012345", {"cmd": "nothing"})
+    finally:
+        server.close()
+    assert list(deep_tmp.iterdir()) == []
 
 
 def test_a_run_control_socket_binds_and_answers_under_a_deep_letify_home(
