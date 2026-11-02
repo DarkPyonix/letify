@@ -29,6 +29,7 @@ import pytest
 import letify
 from letify import paths
 from letify.cli import main
+from letify.errors import RunNotFound
 from letify.protocol import wire
 from letify.runtime import control
 
@@ -742,8 +743,9 @@ def test_a_run_control_socket_is_reached_by_descriptor_when_every_short_path_is_
 
         record = {"run": "abcdef012345", "pid": os.getpid(), "socket": str(server.path)}
         control.write_record({**record, "function": "f", "runtime": "r", "provider": "a"})
-        answer = control.ask("abcdef012345", {"cmd": "nothing"})
-        assert answer.get("type") != "RuntimeFailure", answer
+        # The owner answers RunNotFound for a run it does not hold, so the round trip worked.
+        with pytest.raises(RunNotFound):
+            control.ask("abcdef012345", {"cmd": "nothing"})
     finally:
         server.close()
     assert list(deep_tmp.iterdir()) == []

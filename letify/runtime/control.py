@@ -33,6 +33,7 @@ from typing import Any
 
 from .. import paths
 from ..errors import LetifyError, RunNotFound, UnsupportedMode
+from ..protocol import wire
 from .channel import INTERRUPT_HOOK
 
 #: Characters of a run id: 12 lowercase hexadecimal digits.
@@ -72,7 +73,8 @@ def socket_path(pid: int) -> Path:
     Spec "Controlling a running call": ``runs/<pid>.sock`` when that fits, else
     ``run-<pid>.sock`` in the SSH control directory, else ``run-<h>-<pid>.sock`` in a
     private per-user directory below the system temporary directory, where ``<h>`` hashes
-    the preferred path so two state roots never share a name.
+    the preferred path so two state roots never share a name. When that path is also too long
+    the preferred path is returned, and the caller reaches it through ``wire.unix_address``.
     """
     preferred = runs_directory() / f"{pid}.sock"
     if len(os.fsencode(preferred)) <= SOCKET_LIMIT:
@@ -82,7 +84,8 @@ def socket_path(pid: int) -> Path:
         return shared
     digest = hashlib.sha256(os.fsencode(preferred)).hexdigest()[:12]
     name = f"run-{digest}-{pid}.sock"
-    return Path(tempfile.gettempdir()) / f"letify-{os.getuid()}" / name
+    private = Path(tempfile.gettempdir()) / f"letify-{os.getuid()}" / name
+    return private if len(os.fsencode(private)) <= SOCKET_LIMIT else preferred
 
 
 def _private_directory(directory: Path) -> None:
@@ -334,13 +337,18 @@ class _Server:
         with contextlib.suppress(FileNotFoundError):
             self.path.unlink()
         self.socket = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        descriptor = None
         try:
-            self.socket.bind(str(self.path))
+            address, descriptor = wire.unix_address(str(self.path))
+            self.socket.bind(address)
             self.path.chmod(0o600)
             self.socket.listen(8)
         except OSError:
             self.socket.close()
             raise
+        finally:
+            if descriptor is not None:
+                os.close(descriptor)
         threading.Thread(target=self._accept, name="letify-control", daemon=True).start()
         atexit.register(self.close)
 
@@ -537,14 +545,18 @@ def ask(run: str, command: dict[str, Any], *, wait: float = EXEC_WAIT_S + 30) ->
         return {"ok": False, "type": "RuntimeFailure", "error": f"run {run} has no control socket"}
     client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     client.settimeout(wait)
+    descriptor = None
     try:
-        client.connect(row["socket"])
+        address, descriptor = wire.unix_address(row["socket"])
+        client.connect(address)
         client.sendall(json.dumps({**command, "run": run}).encode("utf-8") + b"\n")
         answer = json.loads(_read_line(client))
     except (OSError, ValueError) as exc:
         return {"ok": False, "type": "RuntimeFailure", "error": f"run {run}: {exc}"}
     finally:
         client.close()
+        if descriptor is not None:
+            os.close(descriptor)
     if answer.get("type") == "RunNotFound":
         raise RunNotFound(f"no run {run} is live on this machine")
     return answer  # type: ignore[no-any-return]
