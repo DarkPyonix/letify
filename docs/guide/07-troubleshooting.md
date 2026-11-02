@@ -193,6 +193,8 @@ The remote process died without returning. The tail of its output is included, w
 
 letify discards the runtime and retries once by default, because the session is at fault.
 
+One case is handled before that. When only your connection to the machine broke (for example `client_loop: send disconnect: Broken pipe`, ssh exit status 255) and the lease still has time left, the worker keeps running your function. letify prints `letify: lost the channel to <runtime> during <run>; reattaching (attempt 1)`, reconnects to the same run after 5, 10, 20 and 40 s, and prints `letify: reattached to <run> on <runtime>`. The function does not run again. Only when every attempt fails, or the machine itself is gone, does the discard and retry above apply.
+
 ---
 
 ## `RuntimeFailure` and `RuntimeLost`

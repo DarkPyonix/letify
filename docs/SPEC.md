@@ -971,7 +971,7 @@ After each write the worker lists the blob directory and removes files, oldest m
 
 > Infrastructure failure may be retried. User code failure never is. Neither falls back to a slower path.
 
-`RuntimeFailure` and `ProtocolError` mean the session misbehaved, so the runtime is discarded and the call is retried on a fresh one up to `retries` times. Before that, `Provider.diagnose(runtime, failure)` may replace the failure with a more specific infrastructure failure, as Elice does with `SpotPreempted`; the default returns it unchanged. A `SpotPreempted` left after the last retry is raised as it is. `RemoteError` means the shipped function raised, and it propagates with the remote traceback attached.
+`RuntimeFailure` and `ProtocolError` mean the session misbehaved, so the runtime is discarded and the call is retried on a fresh one up to `retries` times. Before that, `Provider.diagnose(runtime, failure)` may replace the failure with a more specific infrastructure failure, as Elice does with `SpotPreempted`; the default returns it unchanged. A `SpotPreempted` left after the last retry is raised as it is. `RemoteError` means the shipped function raised, and it propagates with the remote traceback attached. A `ProtocolError` from a channel that broke while the worker may still be running is first handled by [Reattaching after a lost channel](#run-reattach).
 
 A `RuntimeFailure` raised for a failed command carries `command` and `stderr`, and its message names the command and the last 40 lines of stderr. The `RuntimeLost` raised after the last retry keeps the last failure's message, `command` and `stderr`.
 
@@ -1096,6 +1096,26 @@ A call has exactly one owner at a time, and the session still ends with the call
 6. **The same from Python.** `letify.takeover(run)` does the same in the calling process and returns the value or raises the body's exception, as a call does. It holds no handle: it returns once the call has ended and the session is gone. A darkpyonix kernel uses this to adopt a run started elsewhere.
 
 A provider whose runtime cannot be reached by a second process refuses with `UnsupportedMode` naming it. On the `Local` provider the runtime is this machine, so the new owner connects to the socket directly, but the worker is a child of the owning process and dies with it: a `Local` run can be taken over only from an owner that is still alive.
+
+### Reattaching after a lost channel <!-- id: run-reattach -->
+
+> An owner whose channel to a running call broke reopens a channel to the same worker and adopts its own run, so a dropped connection does not cost the call.
+
+The worker outlives a channel that closes without a shutdown frame, as [Taking over a running call](#run-takeover) describes. The owner uses that itself before it discards the session.
+
+1. **What counts as a lost channel.** A persistent-channel call raises `ProtocolError`, the stream ended with no reply, and all of these hold:
+   - the channel's local process has not exited, or exited with status 255 (ssh could not keep the link) or by a signal. Any other exit status, including 0, is the worker's own end, and the call is not reattached;
+   - the runtime has a lease whose `deadline` is more than `MARGIN_S` (10 s) in the future;
+   - the run's record names a `door`;
+   - `Provider.runtime_state` does not say `ended`, and `Provider.diagnose` returns the failure unchanged.
+
+   `RuntimeLost` (including `SpotPreempted`), `RuntimeFailure` (including a call that exceeded its `timeout`), `RemoteError` and a provider that raises `UnsupportedMode` from `attach_channel` are never reattached. They take the path of [Failure and retry](#failure-and-retry).
+2. **Attempts.** The owner stops renewing the lease on the dead channel, waits 5, 10, 20, then 40 s before each attempt (40 s for every attempt after the fourth, at most 8 attempts), and gives up when the next wait plus `MARGIN_S` would pass the lease deadline. Each attempt builds a channel with `Provider.attach_channel`, starts it and sends `adopt` for the run id, exactly as `letify takeover` does, and the body's `timeout` keeps counting from the first send.
+3. **On success.** The runtime's channel becomes the new one, which keeps the old channel's output setting. The lease is armed again over it, the buffered output reaches this process first, and the call goes on waiting for its reply. The call's value, its raised exception and its written-back outputs are those of the original call. The body is not run again. A channel lost again is reattached again under the same limits.
+4. **Messages.** Before each attempt the owner prints to standard error `letify: lost the channel to <runtime> during <run>; reattaching (attempt <n>)`, and on success `letify: reattached to <run> on <runtime>`.
+5. **When it gives up.** The old channel is closed without a shutdown frame, and the original failure takes the path of [Failure and retry](#failure-and-retry): the runtime is discarded and the call is retried on a fresh one under `retries`. A failure of the user's code is never retried, as before.
+
+Only `Runtime.call` reattaches. A `host="local"` call runs its body in this process, so there is no remote body to reattach to.
 
 ### A deliberate shutdown <!-- id: run-shutdown -->
 
