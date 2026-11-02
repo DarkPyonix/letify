@@ -744,3 +744,86 @@ def test_a_run_control_socket_binds_and_answers_under_a_deep_letify_home(
     finally:
         server.close()
     assert not server.path.exists()
+
+
+# -- utilization of a session another process owns ---------------------------------
+# Spec "GPU utilization": a session is read through its running call's control socket.
+
+ELICE = '[e]\nkind = "elice"\nzone_id = "z"\ngpus = ["A100"]\n'
+
+
+def _as_session_run(isolated_home: Path, run: str) -> None:
+    """Declare an Elice account and make the live Local run look like its session's call.
+
+    The control socket, the worker and the exec path stay the real ones. Only the record's
+    provider and accelerator are changed, because Elice itself needs a live account.
+    """
+    (isolated_home / ".letify" / "config.toml").write_text(ELICE, encoding="utf-8")
+    record = paths.letify_root() / "runs" / f"{run}.json"
+    row = json.loads(record.read_text(encoding="utf-8"))
+    row.update({"provider": "e", "accelerator": "A100"})
+    record.write_text(json.dumps(row), encoding="utf-8")
+
+
+def test_utilization_reads_a_session_whose_call_runs_in_another_process(
+    let, isolated_home, tmp_path, monkeypatch, capsys
+) -> None:
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    smi = bin_dir / "nvidia-smi"
+    smi.write_text("#!/bin/sh\necho '0, NVIDIA A100, 95, 30000, 40960, 61, 250'\n")
+    smi.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ['PATH']}")
+    ready, stop = str(tmp_path / "ready"), str(tmp_path / "stop")
+    call = Running(spin_with_counter(let), ready, stop)
+    until(lambda: Path(ready).exists(), "the body to start")
+    _as_session_run(isolated_home, the_run())
+
+    assert main(["utilization", "e", "--json"]) == 0
+    rows = json.loads(capsys.readouterr().out)
+    assert len(rows) == 1
+    assert (rows[0]["scope"], rows[0]["accelerator"]) == ("session", "A100")
+    assert rows[0]["reason"] is None
+    assert [d["utilization_percent"] for d in rows[0]["devices"]] == [95.0]
+    assert rows[0]["devices"][0]["name"] == "NVIDIA A100"
+
+    Path(stop).write_text("x", encoding="utf-8")
+    call.join()
+    assert call.error is None and call.value > 0
+
+
+def test_utilization_of_a_run_that_does_not_answer_gives_a_reason_and_returns(
+    isolated_home, short_dir, capsys, monkeypatch
+) -> None:
+    listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    path = short_dir / "mute.sock"
+    listener.bind(str(path))
+    listener.listen(1)
+    runs = paths.letify_root() / "runs"
+    runs.mkdir(parents=True, exist_ok=True)
+    (runs / "abcabcabcabc.json").write_text(
+        json.dumps(
+            {
+                "run": "abcabcabcabc",
+                "function": "f",
+                "runtime": "r",
+                "provider": "e",
+                "accelerator": "A100",
+                "started_at": time.time(),
+                "pid": os.getpid(),
+                "socket": str(path),
+            }
+        ),
+        encoding="utf-8",
+    )
+    (isolated_home / ".letify" / "config.toml").write_text(ELICE, encoding="utf-8")
+    monkeypatch.setattr(control, "UTILIZATION_WAIT_S", 0.5, raising=False)
+    started = time.monotonic()
+    try:
+        assert main(["utilization", "e", "--json"]) == 0
+    finally:
+        listener.close()
+    assert time.monotonic() - started < 5
+    rows = json.loads(capsys.readouterr().out)
+    assert rows[0]["devices"] == []
+    assert rows[0]["reason"] and "no live session" not in rows[0]["reason"]
