@@ -341,3 +341,19 @@ __all__ = [
     "read_machine",
     "read_smi",
 ]
+
+
+def smi_source(timeout: float) -> str:
+    """Source that prints the same nvidia-smi query ``read_smi`` makes, for ``exec``.
+
+    A run of another process is reached through its control socket, which takes source and
+    returns what it printed. ``timeout`` bounds the query so it ends before the caller gives
+    up.
+    """
+    return (
+        "import shutil, subprocess\n"
+        "if shutil.which('nvidia-smi'):\n"
+        f"    r = subprocess.run({list(SMI_COMMAND)!r}, capture_output=True, text=True, "
+        f"timeout={timeout!r})\n"
+        "    print(r.stdout if r.returncode == 0 else '', end='')\n"
+    )
