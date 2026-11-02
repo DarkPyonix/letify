@@ -185,6 +185,7 @@ def test_a_call_whose_channel_broke_is_adopted_again_and_returns_its_value(
     assert call.error is None
     assert call.value == 7
     assert ledger.read_text(encoding="utf-8") == "ran\n", "the body must run once"
+    assert let.pool.live == [], "the session ends with the call that was adopted again"
     captured = capfd.readouterr()
     assert "before the gap" in captured.out
     assert "during the gap" in captured.out
@@ -192,9 +193,7 @@ def test_a_call_whose_channel_broke_is_adopted_again_and_returns_its_value(
     assert f"letify: reattached to {run} on " in captured.err
 
 
-def test_a_reattached_call_goes_on_renewing_the_lease_over_the_new_channel(
-    let, tmp_path
-) -> None:
+def test_a_reattached_call_goes_on_renewing_the_lease_over_the_new_channel(let, tmp_path) -> None:
     ready, stop, ledger = tmp_path / "ready", tmp_path / "stop", tmp_path / "ledger"
     call = Running(declare(let), str(ready), str(stop), str(ledger))
     until(ready.exists, "the body to start")
@@ -272,7 +271,9 @@ def test_a_worker_that_exited_with_its_own_status_is_not_reattached(
 
         with open(ledger_file, "a", encoding="utf-8") as handle:
             handle.write("ran\n")
-        if open(ledger_file, encoding="utf-8").read().count("ran") == 1:
+        with open(ledger_file, encoding="utf-8") as handle:
+            first = handle.read().count("ran") == 1
+        if first:
             os._exit(3)
         return 5
 

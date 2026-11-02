@@ -205,6 +205,11 @@ class RuntimePool:
             # the session ends with it as it would have.
             runtime.shutdown(reason="released_but_not_taken")
             return
+        if runtime.reattached:
+            # Spec "Reattaching after a lost channel": the session ends with the call that
+            # was adopted again, as one does after a takeover.
+            self.discard(runtime, reason="reattached_call_done")
+            return
         with self._guard:
             runtime.busy = False
             runtime.last_used = time.monotonic()

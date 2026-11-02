@@ -1515,6 +1515,14 @@ class WriteBack:
                     self.files += 1
                     self.bytes += int(size)
 
+    def resume(self) -> None:
+        """Poll again after a lost channel ended the poll, as spec run-reattach says."""
+        thread = self._thread
+        if thread is not None and thread.is_alive():
+            return
+        if not self._cancelled.is_set():
+            self.start()
+
     def cancel(self) -> None:
         """Stop polling, which the call's end does before the final write-back runs."""
         self._cancelled.set()

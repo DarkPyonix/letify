@@ -38,7 +38,7 @@ from ..errors import (
     RemoteError,
     RuntimeFailure,
 )
-from . import control
+from . import control, reattach
 from .lease import Lease
 
 if TYPE_CHECKING:
@@ -190,6 +190,10 @@ class Runtime:
 
     #: Set once the worker switched to the other process, which ends the session from now on.
     handed_over: bool = field(default=False, repr=False)
+
+    #: Set when this process adopted its own running call over a new channel. Spec
+    #: "Reattaching after a lost channel": the session ends with that call.
+    reattached: bool = field(default=False, repr=False)
 
     #: The environment pack running on the worker, or None. Spec "Materializing into a
     #: runtime": the pack to Drive runs beside the session's calls.
@@ -543,9 +547,21 @@ class Runtime:
         if "door" in run.details:
             request["takeover"] = {"run": run.id, "door": run.details["door"]}
         moved = False
+
+        def follow(channel: Any) -> None:
+            # The Drive grants of a running call are answered over the channel it uses now.
+            nonlocal grants
+            grants.close()
+            grants = handoff.GrantWatcher(channel)
+            grants.start()
+            if back is not None:
+                back.resume()
+
         try:
             with run.interruptible():
-                outcome = self.channel.request(request, timeout=timeout)
+                outcome = reattach.request(
+                    self, run, request, timeout=timeout, on_channel=follow
+                )
         except OwnershipMoved:
             moved = True
             raise
