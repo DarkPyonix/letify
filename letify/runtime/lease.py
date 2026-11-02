@@ -48,7 +48,10 @@ class Lease:
             return
         self._renew()
         self._thread = threading.Thread(
-            target=self._loop, name=f"letify-lease-{self.runtime.name}", daemon=True
+            target=self._loop,
+            args=(self._stop,),
+            name=f"letify-lease-{self.runtime.name}",
+            daemon=True,
         )
         self._thread.start()
 
@@ -56,8 +59,18 @@ class Lease:
         self._stop.set()
         self._thread = None
 
-    def _loop(self) -> None:
-        while not self._stop.wait(self.interval):
+    def restart(self) -> None:
+        """Renew again after ``release``, over whatever channel the runtime has now.
+
+        Spec "Reattaching after a lost channel". The stopped renewer ends on its own stop
+        event, so it cannot renew beside the new one.
+        """
+        self.release()
+        self._stop = threading.Event()
+        self.arm()
+
+    def _loop(self, stop: threading.Event) -> None:
+        while not stop.wait(self.interval):
             if not self._renew():
                 return
 
