@@ -41,7 +41,7 @@ from .config import Config, load
 from .declare.env import Env
 from .declare.function import Function
 from .declare.instance import AnyInstance, Host, Instance, RemoteOnlyInstance
-from .errors import LetifyError, UnknownInstance, UnknownProvider
+from .errors import LetifyError, RunNotFound, UnknownInstance, UnknownProvider
 from .paths import config_label
 from .runtime.pool import RuntimePool
 
@@ -379,6 +379,7 @@ class Launcher:
         """
         from concurrent.futures import ThreadPoolExecutor
 
+        from .runtime import control
         from .runtime.telemetry import parse_smi, read_smi
 
         wanted = [alias] if alias else list(self.config.order)
@@ -435,11 +436,15 @@ class Launcher:
                 }
                 rows.append(row)
                 runtime = live.get((provider.alias, accelerator))
-                if runtime is None:
+                try:
+                    if runtime is not None:
+                        output, _logs = runtime.call(read_smi, (), {})
+                    else:
+                        # A session another process owns, reached through its running call.
+                        output = control.read_session_smi(provider.alias, accelerator)
+                except RunNotFound:
                     row["reason"] = "no live session, so nothing to measure"
                     continue
-                try:
-                    output, _logs = runtime.call(read_smi, (), {})
                 except LetifyError as exc:
                     row["reason"] = str(exc)
                     continue

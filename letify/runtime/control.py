@@ -32,7 +32,7 @@ from pathlib import Path
 from typing import Any
 
 from .. import paths
-from ..errors import LetifyError, RunNotFound, UnsupportedMode
+from ..errors import LetifyError, RunNotFound, RuntimeFailure, UnsupportedMode
 from ..protocol import wire
 from .channel import INTERRUPT_HOOK
 
@@ -51,6 +51,10 @@ INTERRUPT_WAIT_S = 10.0
 
 #: Seconds ``exec`` waits for the answer when the command names none.
 EXEC_WAIT_S = 60.0
+
+#: How long ``letify utilization`` waits for a run to print its card readings, so that an
+#: editor polling every 10 s never hangs behind a run that does not answer.
+UTILIZATION_WAIT_S = 10.0
 
 #: Seconds a takeover waits for the owning process to let go of a run. Spec "Taking over a
 #: running call": an owner that does not answer in this time is treated as gone.
@@ -154,6 +158,7 @@ class Run:
             "function": self.function,
             "runtime": str(getattr(self.runtime, "name", "")),
             "provider": self.provider,
+            "accelerator": getattr(getattr(self.runtime, "instance", None), "accelerator", None),
             "started_at": self.started_at,
             "pid": os.getpid(),
             "socket": str(socket_file) if socket_file is not None else None,
@@ -560,3 +565,39 @@ def ask(run: str, command: dict[str, Any], *, wait: float = EXEC_WAIT_S + 30) ->
     if answer.get("type") == "RunNotFound":
         raise RunNotFound(f"no run {run} is live on this machine")
     return answer  # type: ignore[no-any-return]
+
+
+def read_session_smi(alias: str, accelerator: str) -> str:
+    """The nvidia-smi text of the session a live run of another process holds.
+
+    Picks the first live run whose ``provider`` and ``accelerator`` match, since runs of
+    one session share its cards, and runs the reader through that run's control socket with
+    the ``exec`` command. Opens no channel and starts no session. Raises ``RunNotFound``
+    when no live run matches, and ``RuntimeFailure`` with the reason when the run does not
+    answer within ``UTILIZATION_WAIT_S`` or the source fails there.
+    """
+    from .telemetry import smi_source
+
+    run = next(
+        (
+            row["run"]
+            for row in list_runs()
+            if row.get("provider") == alias and row.get("accelerator") == accelerator
+        ),
+        None,
+    )
+    if run is None:
+        raise RunNotFound(f"no live run holds a session of {alias} on {accelerator}")
+    wait = UTILIZATION_WAIT_S
+    try:
+        answer = ask(
+            run,
+            {"cmd": "exec", "source": smi_source(wait * 0.8), "timeout": wait},
+            wait=wait + 2,
+        )
+    except LetifyError as exc:
+        raise RuntimeFailure(str(exc)) from exc
+    if not answer.get("ok") or answer.get("error"):
+        reason = answer.get("error") or answer.get("reason") or "the run did not answer"
+        raise RuntimeFailure(str(reason).strip().splitlines()[-1] if reason else "failed")
+    return str(answer.get("stdout") or "")
