@@ -67,8 +67,9 @@ KAGGLE_KERNEL = Tool(
 
 #: The official Kaggle CLI, run with the account's API token, never the cookie. It does
 #: everything that does not require the live web session: creating and deleting the
-#: ephemeral notebook, and reading the weekly quota.
-KAGGLE_CLI = Tool(package="kaggle", executable="kaggle", python="3.13")
+#: ephemeral notebook, and reading the weekly quota. Release 2.2.5 imports ``six`` without
+#: declaring it, so every command fails on import without the pin.
+KAGGLE_CLI = Tool(package="kaggle", executable="kaggle", python="3.13", pins=("six",))
 
 #: The Kaggle adapter file, run by path so it needs nothing of letify's own environment.
 KAGGLE_ADAPTER = Path(__file__).parent / "providers" / "kaggle_adapter.py"
