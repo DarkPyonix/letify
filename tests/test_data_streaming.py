@@ -30,6 +30,9 @@ from letify.errors import RuntimeFailure
 from letify.protocol import wire
 from letify.store import pathdata, sendorder
 
+#: Every test here pins the staging a remote runtime performs, so Local must stage.
+pytestmark = pytest.mark.usefixtures("staging_local")
+
 #: A module global a declared body reads, set per test.
 DATASET: Path | None = None
 

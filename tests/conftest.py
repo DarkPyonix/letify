@@ -102,6 +102,18 @@ def provider_of(cls, alias: str = "p", **options: Any):
     return cls(ProviderConfig(alias, cls.kind, dict(options), 0))
 
 
+@pytest.fixture
+def staging_local(monkeypatch) -> None:
+    """Make Local stage a call's data the way every remote provider does.
+
+    The real Local shares this machine's file system and passes paths through, spec "Data
+    in place". The staging path (call directory, blob cache placement, upload, write-back)
+    is what a remote runtime runs, and the Local worker is the cheapest real runtime to
+    exercise it on, so the tests of that path ask for this fixture.
+    """
+    monkeypatch.setattr(Local, "shares_filesystem", False)
+
+
 class LeasingLocal(Local):
     """A local provider whose session is treated as able to outlive this process.
 
