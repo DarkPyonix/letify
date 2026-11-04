@@ -318,8 +318,11 @@ def collect_module(
 class Collector:
     """Replaces local data paths in a pickled call with their runtime paths."""
 
-    def __init__(self, call_dir: str) -> None:
+    def __init__(self, call_dir: str, in_place: bool = False) -> None:
         self.call_dir = call_dir
+        #: True when the runtime shares this file system: no path is data, each one is
+        #: pickled as it was passed. Spec "Data in place".
+        self.in_place = in_place
         self.placed: dict[str, Placed] = {}
         self._rejected: set[str] = set()
         self._roots: tuple[Path, list[Path]] | None = None
@@ -346,6 +349,8 @@ class Collector:
         return pathlib.Path, (placed.runtime,)
 
     def _place(self, text: str) -> Placed | None:
+        if self.in_place:
+            return None
         try:
             resolved = Path(text).resolve()
         except (OSError, RuntimeError, ValueError):

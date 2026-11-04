@@ -181,6 +181,10 @@ def train(epochs):
 
 Each such call prints one more line, for example `letify: data wrote back 3 files 512.1 MiB in 2.4 s (213.4 MiB/s), 0 files 0.0 MiB already on the client`.
 
+### The Local provider uses your files in place
+
+The `Local` provider runs on this machine, so it stages nothing. The body receives the paths you passed, reads your files directly and writes into your project as it goes. There is no call directory, no upload, no write-back and no `letify: data` line. A call that raises or is stopped by a signal keeps every file it had written, as a local run would. Everything above describes the other providers.
+
 ## Data that is too big to move
 
 Three options, in the order worth trying.

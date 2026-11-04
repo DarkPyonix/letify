@@ -51,6 +51,10 @@ class Local(Provider):
     #: A local subprocess ends with this process and costs nothing.
     needs_lease = False
 
+    #: The worker is a subprocess of this machine, so a call reads and writes the user's
+    #: own files and nothing is staged or written back.
+    shares_filesystem = True
+
     #: The worker keeps the working directory of the process that started it.
     prepares_workspace = False
 

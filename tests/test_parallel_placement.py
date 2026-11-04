@@ -15,6 +15,9 @@ import pytest
 
 import letify
 
+#: Every test here pins the staging a remote runtime performs, so Local must stage.
+pytestmark = pytest.mark.usefixtures("staging_local")
+
 MiB = 1 << 20
 
 
