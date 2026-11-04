@@ -251,12 +251,7 @@ class Shell(Provider):
         return TailcatRendezvous(address, int(port), self.tailcat_binary)
 
     def strategies(self) -> list[Strategy]:
-        """The ranked strategy list.
-
-        Reverse SSH joins only when the account sets it, and Tailcat only when the account
-        names a ``tailcat`` address, because the agent behind it is the only rendezvous
-        Tailcat has.
-        """
+        """The ranked strategy list. Reverse SSH joins only when the account sets it."""
         from ..transport.strategies import (
             ConnectBack,
             DirectSSH,
@@ -270,10 +265,7 @@ class Shell(Provider):
         chosen: list[Strategy] = [DirectSSH()]
         if self.connect_back or self.port_mapping:
             chosen.append(ConnectBack(mapping=self.port_mapping))
-        chosen.append(TCPPunch())
-        if isinstance(self.config.option("tailcat"), str):
-            chosen.append(TailcatUDP())
-        chosen.append(QuicUDP())
+        chosen.extend((TCPPunch(), TailcatUDP(), QuicUDP()))
         if self.reverse_ssh:
             chosen.append(ReverseSSH())
         chosen.append(ProviderFallback(rank=7 if self.reverse_ssh else 6))

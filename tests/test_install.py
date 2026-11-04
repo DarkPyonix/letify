@@ -641,6 +641,32 @@ def test_the_provider_uses_the_durable_tailcat_after_uv_prunes_the_project_link(
     assert provider.tailcat_binary == path
 
 
+@pytest.mark.parametrize("corrupt", [False, True])
+def test_colab_verifies_the_release_on_the_runtime_before_installing(
+    releases, monkeypatch, nothing_on_path, corrupt
+) -> None:
+    # Spec "Colab", Runtime tools: run the actual remote source against a fake release.
+    archive = tar_gz([("tailcat", FAKE_TAILCAT, "file")])
+    publish_tailcat(monkeypatch, releases, archive)
+    if corrupt:
+        monkeypatch.setitem(install.TAILCAT_SHA256, TAILCAT_ASSET, "0" * 64)
+    scope = {}
+    source = install.remote_tailcat_source()
+    if corrupt:
+        with pytest.raises(RuntimeError, match=r"tailcat.*SHA-256"):
+            exec(source, scope)
+        assert not cached("tailcat", setup.TAILCAT_VERSION).exists()
+    else:
+        exec(source, scope)
+        path = Path(scope["binary"])
+        assert path.read_bytes() == FAKE_TAILCAT
+        assert path == cached("tailcat", setup.TAILCAT_VERSION)
+        path.chmod(0o755)
+        path.write_bytes(b"tampered")
+        with pytest.raises(RuntimeError, match=r"tailcat.*SHA-256"):
+            exec(source, {})
+
+
 def test_a_download_whose_host_cannot_be_reached_fails_fast_and_names_it(monkeypatch) -> None:
     """Spec "Automatic install": the connection is made first, with a timeout of its own.
 
