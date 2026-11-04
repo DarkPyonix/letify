@@ -179,6 +179,8 @@ persistent = true
 
 The connection pipeline defaults to `10 MiB/s` in each direction and `300 ms` RTT. Colab's measured sustained best is `8.8 MiB/s` up and `10.7 MiB/s` down, so it fails the default floor. The account example explicitly permits a slow link with `min_mib_per_s = 0.05`. Set `min_mib_per_s` and `max_rtt_ms` for your measurements. When all measured links fail the floor, the connection is refused even if an unprobed fallback connected.
 
+letify-link is an opt-in connection layer in 2.11 and stays opt-in through 2.x. Without it, an account connects as it did in 2.10. To carry one account's worker channel over letify-link, add `link = "letify-link"` to that account. The account then needs the `letify-link` binary from the platform wheel on both ends. See [docs/guide/09-agent.md](docs/guide/09-agent.md) for a machine with no address.
+
 The project's `.letify/config.toml` gets only the alias, which is what makes the account usable in this project:
 
 ```toml
