@@ -138,6 +138,11 @@ async fn a_punched_udp_candidate_has_a_gauge_through_the_path_manager() {
     );
     tokio::time::sleep(Duration::from_millis(200)).await;
     task.abort();
+    // abort takes effect at the task's next await, so a line it is writing on another worker
+    // thread would recreate the file while the directory is being removed.
+    while !task.is_finished() {
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
     let text = std::fs::read_to_string(&file).unwrap();
     let last: serde_json::Value = serde_json::from_str(text.lines().last().unwrap()).unwrap();
     let sub = &last["subflows"][0];
