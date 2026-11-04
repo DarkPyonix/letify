@@ -1,6 +1,6 @@
 [project]
 name = "letify"
-version = "2.10.10"
+version = "2.10.11"
 description = "Declarations that become infrastructure."
 readme = "README.md"
 requires-python = ">=3.11"
