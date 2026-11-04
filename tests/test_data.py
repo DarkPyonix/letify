@@ -595,7 +595,10 @@ def test_a_file_already_identical_on_the_client_is_not_sent(let, cpu, project, c
     assert "1 files 0.0 MiB already on the client" in line
 
 
-def test_a_failed_call_writes_nothing_back(let, cpu, project, capsys) -> None:
+def test_a_call_that_raises_still_writes_back_its_complete_outputs(
+    let, cpu, project, capsys
+) -> None:
+    """Spec "A failed call": a body that raised leaves its complete files on the client."""
     run = project / "runs" / "broken"
 
     @let.function(device=cpu, host=letify.remote)
@@ -606,8 +609,115 @@ def test_a_failed_call_writes_nothing_back(let, cpu, project, capsys) -> None:
 
     with pytest.raises(Exception, match="diverged"):
         train(run)
-    assert not run.exists()
-    assert wrote_back(capsys.readouterr().err) == []
+    assert (run / "partial.bin").read_bytes() == b"half"
+    err = capsys.readouterr().err
+    assert "letify: the call failed; wrote back 1 file(s)" in err
+    assert "skipped 0 still open" in err
+
+
+def test_an_output_still_open_when_the_call_raises_is_not_written_back(
+    let, cpu, project, capsys
+) -> None:
+    """Spec "A failed call", rule 1: a file a process still holds open is not final."""
+    run = project / "runs" / "open"
+
+    @let.function(device=cpu, host=letify.remote)
+    def train(out: Path) -> None:
+        import builtins
+
+        out.mkdir(parents=True)
+        (out / "done.bin").write_bytes(b"done")
+        # Kept on builtins so the handle outlives the frame the exception unwinds.
+        builtins._letify_test_handle = open(out / "live.bin", "wb")
+        builtins._letify_test_handle.write(b"partial")
+        builtins._letify_test_handle.flush()
+        raise ValueError("diverged")
+
+    with pytest.raises(Exception, match="diverged"):
+        train(run)
+    assert (run / "done.bin").read_bytes() == b"done"
+    assert not (run / "live.bin").exists()
+    assert "skipped 1 still open" in capsys.readouterr().err
+
+
+def test_an_interrupted_call_writes_back_its_complete_outputs(let, cpu, project) -> None:
+    """Spec "A failed call", rule 1: an interrupt delivered to the body is a failure."""
+    run = project / "runs" / "interrupted"
+
+    @let.function(device=cpu, host=letify.remote)
+    def train(out: Path) -> None:
+        import os
+        import signal
+        import time
+
+        out.mkdir(parents=True)
+        (out / "ckpt.bin").write_bytes(b"epoch 3")
+        os.kill(os.getpid(), signal.SIGINT)
+        time.sleep(30)
+
+    with pytest.raises(Exception, match="KeyboardInterrupt"):
+        train(run)
+    assert (run / "ckpt.bin").read_bytes() == b"epoch 3"
+
+
+def test_the_write_back_of_a_failed_call_does_not_hide_its_exception(
+    let, cpu, project, monkeypatch, capsys
+) -> None:
+    """Spec "A failed call", rule 3: the body's exception is the one that propagates."""
+    run = project / "runs" / "masked"
+
+    def broken(*args, **kwargs):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(pathdata, "write_back", broken)
+
+    @let.function(device=cpu, host=letify.remote)
+    def train(out: Path) -> None:
+        out.mkdir(parents=True)
+        (out / "a.bin").write_bytes(b"a")
+        raise ValueError("diverged")
+
+    with pytest.raises(Exception, match="diverged"):
+        train(run)
+    assert "the write-back of the failed call did not finish: disk full" in capsys.readouterr().err
+
+
+def kept_call_dirs(project: Path) -> list[Path]:
+    home = Path.home()
+    return [p.parent for p in home.glob("**/data/calls/*/.letify-kept")]
+
+
+def test_the_call_directory_of_a_failed_call_is_kept_until_its_write_back_is_taken(
+    let, cpu, project, monkeypatch
+) -> None:
+    """Spec "A failed call", rule 5: a lost owner can still have the outputs collected."""
+    run = project / "runs" / "kept"
+    real = pathdata.write_back
+    monkeypatch.setattr(pathdata, "write_back", lambda *a, **k: 0)
+
+    @let.function(device=cpu, host=letify.remote)
+    def train(out: Path) -> None:
+        out.mkdir(parents=True)
+        (out / "a.bin").write_bytes(b"a")
+        raise ValueError("diverged")
+
+    with pytest.raises(Exception, match="diverged"):
+        train(run)
+    # The owner never asked for the list, as when it died, so the directory stays.
+    assert len(kept_call_dirs(project)) == 1
+    monkeypatch.setattr(pathdata, "write_back", real)
+
+    @let.function(device=cpu, host=letify.remote)
+    def again(out: Path) -> None:
+        out.mkdir(parents=True, exist_ok=True)
+        (out / "b.bin").write_bytes(b"b")
+        raise ValueError("diverged again")
+
+    with pytest.raises(Exception, match="diverged again"):
+        again(project / "runs" / "other")
+    # The second call's own write-back took its list, which removed its directory.
+    assert (project / "runs" / "other" / "b.bin").read_bytes() == b"b"
+    assert len(kept_call_dirs(project)) == 1
 
 
 def test_a_file_deleted_on_the_runtime_stays_on_the_client(let, cpu, project) -> None:
