@@ -246,6 +246,8 @@ A provider is built from one entry in the configuration file and reached by attr
 
 `needs_lease` says whether a session can outlive this process and keep billing.
 
+`shares_filesystem` says whether the runtime sees this machine's file system, which only `Local` does. A call to such a provider keeps its paths as they are, as Data in place describes.
+
 | Provider | Persistence | Fast path | Channel | Store backend |
 |---|---|---|---|---|
 | `Local` | persistent | yes | persistent | `filesystem` |
@@ -1294,6 +1296,8 @@ Nothing hands a session to the caller. There is no call that returns one, no arg
 
 The declared function is sent with cloudpickle, which serializes its closure variables, the globals it references, its default arguments and the call's arguments. letify's pickler intercepts every `os.PathLike` among them through `reducer_override`. Nothing is declared: the function's own references are the declaration.
 
+A provider whose runtime is this machine, which is `Local`, does not stage data. Data in place describes it, and the rest of this section describes every other provider.
+
 Detection runs on a persistent channel only. A one-shot channel has no worker to hold a cache, so its paths travel as plain paths. A Kaggle account with a registered session has a persistent channel, so a call to one carries its project data like any other provider's does.
 
 #### Which paths are data <!-- id: project-data-detection -->
@@ -1318,6 +1322,12 @@ directory to [tool.letify] data_roots in <root>/pyproject.toml, or move the file
 A path that exists here and is inside a root is data; a path that does not exist here is a runtime path and still travels unchanged, because that is how a body is told where to write.
 
 A directory is walked without following symbolic links to directories. Regular files and symbolic links to regular files are included. Entries named `.git`, `.venv` and `__pycache__` are skipped.
+
+#### Data in place <!-- id: project-data-in-place -->
+
+A provider whose runtime shares this machine's file system passes a call's paths through unchanged: the body reads and writes the user's own files, exactly as a local run does. The class attribute `Provider.shares_filesystem` is `False` by default and `True` on `Local`, whose worker is a subprocess of this process and so sees the same disk and the same working directory.
+
+For such a provider a call has no call directory, no placement from the runtime blob cache, no upload, no background write-back and no final write-back, and nothing is removed afterwards. Every `os.PathLike` is pickled as it was passed, so an absolute path stays that path and a relative path resolves against the working directory the worker inherited, which is the one a local run would use. The refusal of a path outside the allowed roots does not apply, because nothing is sent. The body's writes land at the real path as they happen, so a file is there while the body is still running, and a call that raises or is stopped by a signal keeps what it had written. The call prints no `letify: data` line, because no transfer took place. The sections below, Digests and the digest cache through Writing back, describe the staging that every provider with `shares_filesystem` false performs.
 
 #### Digests and the digest cache <!-- id: project-data-digests -->
 
