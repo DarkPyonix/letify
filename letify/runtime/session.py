@@ -504,7 +504,7 @@ class Runtime:
         root = (self.workspace or self.provider.workspace_root).rstrip("/")
         call_dir = f"{root}/data/calls/{secrets.token_hex(8)}"
         modules_root = f"{root}/modules"
-        collector = pathdata.Collector(call_dir)
+        collector = pathdata.Collector(call_dir, in_place=self.provider.shares_filesystem)
         ship_digests: set[str] = set()
         if self.env.ship_modules:
             for name in self.env.ship_modules:
