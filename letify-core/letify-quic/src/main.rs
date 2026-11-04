@@ -63,11 +63,17 @@ fn parse() -> Result<Options, String> {
     if token.is_empty() {
         return Err("--token is required".into());
     }
-    Ok(Options { mode, bind, peer, token, forward })
+    Ok(Options {
+        mode,
+        bind,
+        peer,
+        token,
+        forward,
+    })
 }
 
 fn decode(text: &str) -> Option<Vec<u8>> {
-    if text.len() % 2 != 0 {
+    if !text.len().is_multiple_of(2) {
         return None;
     }
     (0..text.len())
@@ -92,15 +98,18 @@ fn bound(port: u16) -> std::io::Result<UdpSocket> {
 }
 
 /// A self signed certificate, because the token authenticates the peer, not a name.
-fn certificate() -> Result<(Vec<rustls::pki_types::CertificateDer<'static>>,
-                            rustls::pki_types::PrivateKeyDer<'static>), String> {
+fn certificate() -> Result<
+    (
+        Vec<rustls::pki_types::CertificateDer<'static>>,
+        rustls::pki_types::PrivateKeyDer<'static>,
+    ),
+    String,
+> {
     let generated = rcgen::generate_simple_self_signed(vec!["letify".into()])
         .map_err(|error| error.to_string())?;
     let chain = vec![generated.cert.der().clone()];
-    let key = rustls::pki_types::PrivateKeyDer::try_from(
-        generated.key_pair.serialize_der(),
-    )
-    .map_err(|error| error.to_string())?;
+    let key = rustls::pki_types::PrivateKeyDer::try_from(generated.key_pair.serialize_der())
+        .map_err(|error| error.to_string())?;
     Ok((chain, key))
 }
 
@@ -195,13 +204,10 @@ async fn serve(socket: UdpSocket, options: Options) -> Result<(), String> {
     )
     .map_err(|error| error.to_string())?;
     // The peer has to be sent to as well, so the punch holds while QUIC handshakes.
-    let incoming = tokio::time::timeout(
-        std::time::Duration::from_secs(TIMEOUT),
-        endpoint.accept(),
-    )
-    .await
-    .map_err(|_| "no QUIC connection arrived".to_string())?
-    .ok_or("the endpoint closed")?;
+    let incoming = tokio::time::timeout(std::time::Duration::from_secs(TIMEOUT), endpoint.accept())
+        .await
+        .map_err(|_| "no QUIC connection arrived".to_string())?
+        .ok_or("the endpoint closed")?;
     let connection = incoming.await.map_err(|error| error.to_string())?;
     let (mut send, mut recv) = connection
         .accept_bi()
@@ -262,13 +268,10 @@ async fn connect(socket: UdpSocket, options: Options) -> Result<(), String> {
     let connecting = endpoint
         .connect(options.peer, "letify")
         .map_err(|error| error.to_string())?;
-    let connection = tokio::time::timeout(
-        std::time::Duration::from_secs(TIMEOUT),
-        connecting,
-    )
-    .await
-    .map_err(|_| "the QUIC handshake did not complete".to_string())?
-    .map_err(|error| error.to_string())?;
+    let connection = tokio::time::timeout(std::time::Duration::from_secs(TIMEOUT), connecting)
+        .await
+        .map_err(|_| "the QUIC handshake did not complete".to_string())?
+        .map_err(|error| error.to_string())?;
     let (mut send, mut recv) = connection
         .open_bi()
         .await

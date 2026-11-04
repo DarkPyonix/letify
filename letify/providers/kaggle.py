@@ -26,6 +26,7 @@ import json
 import math
 import os
 import re
+import shlex
 import textwrap
 import time
 import urllib.error
@@ -1209,6 +1210,17 @@ def _capture_stdout(source: str) -> str:
     )
 
 
+def _run_on_bridge(bridge: Any, source: str, timeout: float | None) -> str:
+    """Run one program on the machine through the bridge and return what it printed.
+
+    The program prints its answer, and ``eval`` returns what the source left in
+    ``__letify_value__``, not what it printed: the print goes out as a STDOUT frame and never
+    reaches the caller. So the source runs with its standard output captured into that name.
+    """
+    value, _ = bridge.request({"op": "eval", "source": _capture_stdout(source)}, timeout=timeout)
+    return value if isinstance(value, str) else str(value or "")
+
+
 def _key_path():
     """Where letify keeps the key pair a Kaggle rendezvous authorizes."""
     from pathlib import Path as _Path
@@ -1383,6 +1395,8 @@ class Kaggle(Provider):
         self._kernels: dict[str, tuple[Session, str, KaggleChannel, int, int, str | None]] = {}
         #: The link chosen over the bridge, per runtime, closed with the session.
         self._links: dict[str, Any] = {}
+        #: The letify-link session per runtime, on an account with ``link = "letify-link"``.
+        self._link_remotes: dict[str, Any] = {}
         #: Monotonic time of the last confirmed-live cookie check, or None before the first.
         self._cookie_checked_at: float | None = None
 
@@ -1441,15 +1455,7 @@ class Kaggle(Provider):
                 return extra
 
             def run_python(self, source: str, timeout: float | None) -> str:
-                # The rendezvous program prints its answer, and ``eval`` returns what the
-                # source left in __letify_value__, not what it printed: the print goes out
-                # as a STDOUT frame and never reaches the caller. So the source runs with
-                # its standard output captured into that name.
-                captured = _capture_stdout(source)
-                value, _ = bridge.request(
-                    {"op": "eval", "source": captured}, timeout=timeout
-                )
-                return value if isinstance(value, str) else str(value or "")
+                return _run_on_bridge(bridge, source, timeout)
 
         rendezvous = KaggleRendezvous()
         # A Kaggle image ships no tailcat, so the request has to carry an installed path.
@@ -1531,6 +1537,8 @@ class Kaggle(Provider):
         from ..protocol.worker import BOOTSTRAP
         from ..runtime.channel import PersistentChannel
 
+        if self.uses_letify_link:
+            return self.link_session_over(bridge, name=name)
         try:
             link = self.link_over(bridge, name=name)
         except Exception as exc:
@@ -1553,6 +1561,58 @@ class Kaggle(Provider):
         if libraries:
             remote = f"env LD_LIBRARY_PATH={_shlex.quote(libraries)} {remote}"
         return PersistentChannel(sshopts.unshared(link.ssh_command(remote)), name=name)
+
+    @property
+    def uses_letify_link(self) -> bool:
+        """Whether the account carries the worker channel over letify-link, as a shell account's."""
+        from ..transport.linkchannel import letify_link_enabled
+
+        return letify_link_enabled(self)
+
+    def link_session_over(self, bridge: Any, *, name: str) -> Channel:
+        """A worker channel over a letify-link session bootstrapped through the bridge's ``eval``.
+
+        Spec "Sidecar interface" item 8. A failure raises: an account that set
+        ``link = "letify-link"`` does not fall back to the bridge.
+        """
+        import letify
+
+        from ..config.secrets import account_directory
+        from ..protocol.worker import BOOTSTRAP
+        from ..transport import linkchannel, linkupload
+        from ..transport.announce import printer
+
+        directory = account_directory(self.alias)
+        directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+        floor = self.link_floor
+        binary = self.config.option("link_binary")
+        libraries = self.kernel_library_path(bridge)
+
+        def wrap(command: str) -> str:
+            # Spec "Kaggle runtimes": the kernel finds libcuda through LD_LIBRARY_PATH, which a
+            # worker started by the shim does not inherit, so the command sets it.
+            if not libraries:
+                return command
+            return f"env LD_LIBRARY_PATH={shlex.quote(libraries)} {command}"
+
+        remote = linkchannel.connect_commands(
+            self.alias,
+            lambda source, timeout: _run_on_bridge(bridge, source, timeout),
+            python=self.remote_python,
+            bootstrap=BOOTSTRAP,
+            key_path=directory / "link.key",
+            version=letify.__version__,
+            binary=binary if isinstance(binary, str) else None,
+            upload=linkupload.configured(self.config.option("link_binary_upload")),
+            workspace=self.workspace_root,
+            wrap=wrap,
+            max_rtt_ms=floor.max_rtt_ms,
+            min_bps=floor.min_bps,
+            say=printer(bool(self.__dict__.get("announce", True))),
+        )
+        self._link_remotes[name] = remote
+        self._links[name] = linkchannel.PlainSshLink(None, lambda: self._link_remotes.get(name))
+        return linkchannel.LinkChannel(remote, name=name)
 
     @property
     def min_session_interval_s(self) -> float:
@@ -1614,6 +1674,12 @@ class Kaggle(Provider):
         from ..runtime.channel import PersistentChannel
 
         name = getattr(runtime, "name", None)
+        remote = self._link_remotes.get(name) if name else None
+        if remote is not None:
+            from ..transport.linkchannel import LinkChannel
+
+            # One more stream of the open session: no punch and no second bridge.
+            return LinkChannel(remote, name=f"{self.alias}-transfer", priority="bulk")
         link = self._links.get(name) if name else None
         if link is None:
             raise UnsupportedMode(
@@ -1672,6 +1738,12 @@ class Kaggle(Provider):
         if held is None:
             return
         session, kernel, channel, run, notebook, slug = held
+        remote = self._link_remotes.pop(runtime.name, None)
+        if remote is not None:
+            try:
+                remote.close()
+            except Exception:
+                pass
         link = self._links.pop(runtime.name, None)
         if link is not None:
             try:

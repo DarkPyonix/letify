@@ -13,7 +13,7 @@ import threading
 import time
 
 import pytest
-from conftest import FakeProbe, FakeStrategy, StunServer
+from conftest import FakeProbe, FakeStrategy, StunServer, free_port, refusing_port
 
 import letify
 from letify.transport import nat
@@ -52,13 +52,6 @@ def pipeline(strategies, *, cache=None, grace=0.2, fp=None, probe=None, floor=NO
         timeout=5.0,
         floor=floor,
     )
-
-
-def free_port() -> int:
-    holder = nat.reusable_socket(0)
-    port = holder.getsockname()[1]
-    holder.close()
-    return port
 
 
 # -- Spec: Transport, Rendezvous: STUN over TCP ---------------------------------
@@ -810,11 +803,18 @@ def test_a_dial_under_way_is_left_alone_so_the_peer_can_complete_it() -> None:
 def test_a_punch_whose_dials_are_refused_says_so() -> None:
     # Spec "the simultaneous open": measured against a host that resets the punch's SYN,
     # every dial ended writable with SO_ERROR ECONNREFUSED and the punch still reported
-    # only that it did not connect in time. Port 1 on the loopback answers with a reset
-    # the same way.
-    with pytest.raises(TimeoutError) as raised:
+    # only that it did not connect in time. A bound port that is not listening answers with a
+    # reset the same way.
+    # The target is a port this test holds bound and not listening, so the kernel answers
+    # every dial with a reset and nothing else can take it, as it could port 1.
+    with refusing_port() as target, pytest.raises(TimeoutError) as raised:
         nat.punch(
-            free_port(), ("127.0.0.1", 1), b"t" * 16, initiator=True, start_at=0, window=1.5
+            free_port(),
+            ("127.0.0.1", target.getsockname()[1]),
+            b"t" * 16,
+            initiator=True,
+            start_at=0,
+            window=1.5,
         )
     message = str(raised.value)
     assert "refused" in message, message

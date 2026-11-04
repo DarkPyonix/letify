@@ -16,9 +16,12 @@ import base64
 import contextlib
 import json
 import os
+import shutil
 import socket
+import struct
 import subprocess
 import sys
+import threading
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -148,9 +151,7 @@ class NoBlake3Local(Local):
         from letify.runtime.channel import PersistentChannel
 
         hide = "import sys; sys.modules['blake3'] = None\n"
-        return PersistentChannel(
-            [sys.executable, "-u", "-c", hide + BOOTSTRAP], name=runtime.name
-        )
+        return PersistentChannel([sys.executable, "-u", "-c", hide + BOOTSTRAP], name=runtime.name)
 
 
 @pytest.fixture
@@ -247,7 +248,8 @@ def patch_run(monkeypatch):
         monkeypatch.setattr(module.subprocess, "run", recorder)
         if module.__name__ == "letify.providers.colab":
             monkeypatch.setattr(
-                module.subprocess, "Popen",
+                module.subprocess,
+                "Popen",
                 lambda command, **options: FakeProcess(
                     list(command), ["LETIFY-KEEP-ALIVE ready\n"], **options
                 ),
@@ -1219,7 +1221,9 @@ class FakeDriveServer:
         )
 
         def answer(
-            status: int, payload: bytes = b"", extra: dict[str, str] | None = None,
+            status: int,
+            payload: bytes = b"",
+            extra: dict[str, str] | None = None,
             kind: str = "application/json",
         ) -> None:
             handler.send_response(status)
@@ -1305,7 +1309,10 @@ class FakeDriveServer:
             meta = json.loads(body)
             identifier = self._new_id()
             self.files[identifier] = {
-                "id": identifier, "name": meta["name"], "content": b"", "trashed": False,
+                "id": identifier,
+                "name": meta["name"],
+                "content": b"",
+                "trashed": False,
                 "parent": (meta.get("parents") or ["root"])[0],
                 "folder": meta.get("mimeType") == "application/vnd.google-apps.folder",
             }
@@ -1316,7 +1323,8 @@ class FakeDriveServer:
                 meta.setdefault("parent", (meta.get("parents") or ["root"])[0])
                 number = str(len(self.sessions) + 1)
                 self.sessions[number] = {
-                    "meta": meta, "body": b"",
+                    "meta": meta,
+                    "body": b"",
                     "size": int(headers["x-upload-content-length"]),
                 }
                 return answer(200, extra={"Location": f"{self.endpoint}{session_prefix}{number}"})
@@ -1327,8 +1335,12 @@ class FakeDriveServer:
             content = tail.split(b"\r\n\r\n", 1)[1].rsplit(b"\r\n--" + boundary, 1)[0]
             identifier = self._new_id()
             self.files[identifier] = {
-                "id": identifier, "name": meta["name"], "content": content, "trashed": False,
-                "parent": (meta.get("parents") or ["root"])[0], "folder": False,
+                "id": identifier,
+                "name": meta["name"],
+                "content": content,
+                "trashed": False,
+                "parent": (meta.get("parents") or ["root"])[0],
+                "folder": False,
             }
             return reply({"id": identifier, "name": meta["name"]})
         if method == "PATCH" and parsed.path.startswith("/upload/drive/v3/files/"):
@@ -1570,6 +1582,55 @@ def stun_server():
     server.close()
 
 
+class UdpStunServers:
+    """Three STUN servers on loopback that report the address a client was seen at.
+
+    That is a NAT that keeps ports, which two sidecars on this machine can really punch through.
+    ``env`` is the value of ``LETIFY_LINK_STUN`` that makes the sidecars ask them.
+    """
+
+    def __init__(self, count: int = 3) -> None:
+        self.socks = []
+        for _ in range(count):
+            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            sock.bind(("127.0.0.1", 0))
+            self.socks.append(sock)
+            threading.Thread(target=self.serve, args=(sock,), daemon=True).start()
+
+    @property
+    def env(self) -> str:
+        return ",".join(f"{sock.getsockname()[0]}:{sock.getsockname()[1]}" for sock in self.socks)
+
+    @staticmethod
+    def serve(sock: socket.socket) -> None:
+        cookie = 0x2112A442
+        while True:
+            try:
+                data, peer = sock.recvfrom(1500)
+            except OSError:
+                return
+            if len(data) < 20:
+                continue
+            port = peer[1] ^ (cookie >> 16)
+            ip = struct.unpack("!I", socket.inet_aton(peer[0]))[0] ^ cookie
+            value = struct.pack("!BBHI", 0, 1, port, ip)
+            attribute = struct.pack("!HH", 0x0020, len(value)) + value
+            sock.sendto(
+                struct.pack("!HHI", 0x0101, len(attribute), cookie) + data[8:20] + attribute, peer
+            )
+
+    def close(self) -> None:
+        for sock in self.socks:
+            sock.close()
+
+
+@pytest.fixture
+def udp_stun():
+    servers = UdpStunServers()
+    yield servers
+    servers.close()
+
+
 class FakeLink:
     """A link with no connection behind it, carrying the probe result a test chose."""
 
@@ -1756,8 +1817,6 @@ def patch_popen(monkeypatch):
         return started
 
     return patch
-
-
 
 
 # -- a Kaggle session, and the cloud that hands out its URL ---------------------
@@ -2046,12 +2105,24 @@ class FakeKaggleCLI:
             "irack000/letify-runtime-2,notebook77c1a2,irack000,2026-10-10 06:00:00,0\n"
         )
         #: Standard output a ``quota`` call answers with, as JSON text.
-        self.quota_json = json.dumps([
-            {"resource": "GPU", "used": "0.00h", "remaining": "60.00h", "total": "60.00h",
-             "refreshAt": "2026-10-10T00:00:00"},
-            {"resource": "TPU", "used": "0.00h", "remaining": "20.00h", "total": "20.00h",
-             "refreshAt": "2026-10-10T00:00:00"},
-        ])
+        self.quota_json = json.dumps(
+            [
+                {
+                    "resource": "GPU",
+                    "used": "0.00h",
+                    "remaining": "60.00h",
+                    "total": "60.00h",
+                    "refreshAt": "2026-10-10T00:00:00",
+                },
+                {
+                    "resource": "TPU",
+                    "used": "0.00h",
+                    "remaining": "20.00h",
+                    "total": "20.00h",
+                    "refreshAt": "2026-10-10T00:00:00",
+                },
+            ]
+        )
 
     def run(self, command: list[str], **kwargs: Any) -> FakeCompleted:
         self.calls.append(list(command))
@@ -2091,7 +2162,6 @@ def kaggle_api_token(isolated_home):
     return write_secret("kaggle_a", "access_token", "KGAT_" + "a" * 32)
 
 
-
 class FakeColabCli:
     """A Colab CLI that holds assignments, for ``patch_run`` as the ``result`` callable.
 
@@ -2128,3 +2198,446 @@ class FakeColabCli:
             if self.new_fails:
                 return FakeCompleted(returncode=1, stderr="ReadTimeout: Read timed out")
         return FakeCompleted()
+
+
+@pytest.fixture(scope="session")
+def sidecar_binary(tmp_path_factory) -> Path:
+    from letify.transport import linkd
+
+    core = Path(__file__).resolve().parent.parent / "letify-core"
+    named = os.environ.get(linkd.ENV_BINARY)
+    if named:
+        return Path(named)
+    if shutil.which("cargo") is None:
+        pytest.skip(
+            "cargo is not installed and LETIFY_LINK_BIN is not set, so letify-link is not built"
+        )
+    # One build per worker; cargo serialises concurrent builds on its own lock.
+    result = subprocess.run(
+        ["cargo", "build", "-p", "letify-link", "--release", "--features", "letify-link/relay"],
+        cwd=core,
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        pytest.fail(f"cargo build -p letify-link failed:\n{result.stderr[-2000:]}")
+    binary = core / "target" / "release" / linkd.BINARY
+    assert binary.is_file(), binary
+    return binary
+
+
+@pytest.fixture(autouse=True)
+def quick_link_probe(monkeypatch):
+    """A letify-link connect measures its session with a probe that takes a fraction of a second.
+
+    The real probe is 30 round trips and 2 s each way after a warm-up (Spec "Choosing a link"),
+    which every connect of every test would otherwise pay. The shape is unchanged.
+    """
+    from letify.transport import linkchannel
+    from letify.transport.probe import Probe
+
+    class Quick(Probe):
+        def warmup_for(self, rtt_ms: float) -> float:
+            return 0.05
+
+    monkeypatch.setattr(linkchannel, "make_probe", lambda: Quick(round_trips=5, seconds=0.2))
+
+
+# -- the signalling service ----------------------------------------------------------------
+
+
+class _FakeWebSocket:
+    """The service side of one WebSocket: unmasks client frames, writes unmasked frames."""
+
+    def __init__(self, connection: Any, reader: Any, fragment: bool) -> None:
+        self._connection = connection
+        self._reader = reader
+        self._fragment = fragment
+        self._lock = threading.Lock()
+        self.pongs = 0
+
+    def _write(self, data: bytes) -> None:
+        with self._lock:
+            try:
+                self._connection.sendall(data)
+            except OSError:
+                pass
+
+    @staticmethod
+    def _frame(opcode: int, payload: bytes, fin: bool = True) -> bytes:
+        import struct
+
+        head = bytes([(0x80 if fin else 0) | opcode])
+        if len(payload) < 126:
+            return head + bytes([len(payload)]) + payload
+        return head + bytes([126]) + struct.pack(">H", len(payload)) + payload
+
+    def push(self, stored: dict[str, Any]) -> None:
+        data = json.dumps(
+            {k: stored[k] for k in ("seq", "from", "at", "body")}, separators=(",", ":")
+        ).encode()
+        if self._fragment:
+            half = len(data) // 2
+            self._write(self._frame(0x1, data[:half], fin=False))
+            self._write(self._frame(0x9, b"hi"))
+            self._write(self._frame(0x0, data[half:]))
+        else:
+            self._write(self._frame(0x1, data))
+
+    def send_text(self, text: str) -> None:
+        self._write(self._frame(0x1, text.encode()))
+
+    def close(self, code: int = 1000) -> None:
+        import struct
+
+        self._write(self._frame(0x8, struct.pack(">H", code)))
+
+    def cut(self) -> None:
+        import socket as _socket
+
+        try:
+            self._connection.shutdown(_socket.SHUT_RDWR)
+        except OSError:
+            pass
+
+    def read_text(self) -> str | None:
+        """The next text message of the client, or None once the socket ended."""
+        import struct
+
+        while True:
+            try:
+                head = self._reader.read(2)
+                if len(head) < 2:
+                    return None
+                opcode, length = head[0] & 0x0F, head[1] & 0x7F
+                if not head[1] & 0x80:
+                    return None
+                if length == 126:
+                    length = struct.unpack(">H", self._reader.read(2))[0]
+                elif length == 127:
+                    length = struct.unpack(">Q", self._reader.read(8))[0]
+                mask = self._reader.read(4)
+                data = bytearray(self._reader.read(length))
+            except (OSError, ValueError):
+                return None
+            for i in range(len(data)):
+                data[i] ^= mask[i % 4]
+            if opcode == 0x1:
+                return bytes(data).decode()
+            if opcode == 0x8:
+                self._write(self._frame(0x8, bytes(data[:2])))
+                return None
+            if opcode == 0x9:
+                self._write(self._frame(0xA, bytes(data)))
+            elif opcode == 0xA:
+                self.pongs += 1
+
+
+class FakeSignalService:
+    """An in-process signalling service with the contract of Spec "Signalling service".
+
+    It verifies every request with a real sidecar (``verifier``), so it applies the same
+    canonical-key and strict-signature rules as letify-link, and it keeps mailboxes in memory.
+    Real Cloudflare is the only thing it stands in for. ``clock`` is the service clock,
+    ``rewrite`` lets a test act as a malicious service by changing a stored message, and
+    ``requests`` records (method, path without query, status) of every request.
+    """
+
+    MAX_BODY = 4096
+    TTL_S = 60
+    DEPTH = 32
+    WINDOW_S = 60
+
+    def __init__(self, verifier: Any) -> None:
+        import http.server
+        import time as _time
+
+        self.verifier = verifier
+        self.clock = _time.time
+        self.rewrite: Any = None
+        self.requests: list[tuple[str, str, int]] = []
+        #: The User-Agent header of every request, the WebSocket handshake included.
+        self.agents: list[str] = []
+        #: The byte length of every message body the service accepted.
+        self.sizes: list[int] = []
+        self._boxes: dict[str, list[dict[str, Any]]] = {}
+        self._counters: dict[str, int] = {}
+        self._nonces: dict[str, float] = {}
+        self._cond = threading.Condition()
+        #: Open WebSockets by node, how many were accepted, and the acknowledgements received.
+        self._sockets: dict[str, list[_FakeWebSocket]] = {}
+        self.ws_accepted = 0
+        self.ws_acks: list[int] = []
+        #: Send every text frame as two fragments with a ping between them.
+        self.fragment_frames = False
+        #: Text pings received, and whether the service answers them with the text pong.
+        self.ws_pings = 0
+        self.answer_pings = True
+        #: Set by ``close``, so a WebSocket still in its handshake is cut once it registers.
+        self._closed = False
+        service = self
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def log_message(self, *args: Any) -> None:
+                pass
+
+            def do_GET(self) -> None:
+                service._serve(self, "GET")
+
+            def do_POST(self) -> None:
+                service._serve(self, "POST")
+
+        self._server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self._server.daemon_threads = True
+        self.url = f"http://127.0.0.1:{self._server.server_address[1]}"
+        threading.Thread(target=self._server.serve_forever, daemon=True).start()
+
+    def close(self) -> None:
+        with self._cond:
+            self._closed = True
+        self.drop_sockets()
+        self._server.shutdown()
+        self._server.server_close()
+
+    def drop_sockets(self) -> None:
+        """Cut every open WebSocket without a close frame, as a network failure does."""
+        with self._cond:
+            sockets = [sock for socks in self._sockets.values() for sock in socks]
+        for sock in sockets:
+            sock.cut()
+
+    def sockets_open(self, node: str) -> int:
+        with self._cond:
+            return len(self._sockets.get(node, []))
+
+    def waiting(self, node: str) -> int:
+        with self._cond:
+            return len(self._boxes.get(node, []))
+
+    def _reply(self, h: Any, status: int, payload: dict[str, Any]) -> None:
+        data = json.dumps(payload).encode()
+        # Recorded before the first reply byte, so a test that acts on the client's view of
+        # the reply never reads the record ahead of the server thread.
+        self.requests.append((h.command, h.path.split("?")[0], status))
+        self.agents.append(h.headers.get("User-Agent") or "")
+        h.send_response(status)
+        h.send_header("Content-Type", "application/json")
+        h.send_header("Content-Length", str(len(data)))
+        h.end_headers()
+        h.wfile.write(data)
+
+    def _fail(self, h: Any, status: int, code: str) -> None:
+        self._reply(h, status, {"ok": False, "error": code})
+
+    def _serve(self, h: Any, method: str) -> None:
+        import hashlib
+        import re
+        import urllib.parse
+
+        url = urllib.parse.urlsplit(h.path)
+        if url.path == "/health":
+            return self._reply(h, 200, {"ok": True})
+        match = re.fullmatch(r"/(send|recv|ws)/([^/]+)", url.path)
+        if match is None:
+            return self._fail(h, 404, "not_found")
+        kind, target = match.groups()
+        if method != ("POST" if kind == "send" else "GET"):
+            return self._fail(h, 405, "method_not_allowed")
+        length = int(h.headers.get("Content-Length") or 0)
+        if length > self.MAX_BODY:
+            return self._fail(h, 413, "too_large")
+        body = h.rfile.read(length) if length else b""
+        node = h.headers.get("X-Letify-Node")
+        stamp = h.headers.get("X-Letify-Time")
+        nonce = h.headers.get("X-Letify-Nonce")
+        signature = h.headers.get("X-Letify-Signature")
+        if None in (node, stamp, nonce, signature):
+            return self._fail(h, 400, "bad_request")
+        assert node and stamp and nonce and signature
+        if not (
+            re.fullmatch(r"[0-9]{1,12}", stamp)
+            and re.fullmatch(r"[0-9a-f]{32}", nonce)
+            and re.fullmatch(r"[0-9a-f]{128}", signature)
+            and re.fullmatch(r"[0-9a-f]{64}", node)
+        ):
+            return self._fail(h, 400, "bad_request")
+        if abs(int(stamp) - self.clock()) > self.WINDOW_S:
+            return self._fail(h, 401, "stale")
+        text = f"{method}\n{h.path}\n{stamp}\n{nonce}\n{hashlib.sha256(body).hexdigest()}"
+        try:
+            valid = self.verifier.verify(
+                node, "letify-signal v1", text.encode(), bytes.fromhex(signature)
+            )
+        except Exception:
+            return self._fail(h, 400, "bad_key")
+        if not valid:
+            return self._fail(h, 401, "bad_signature")
+        with self._cond:
+            now = self.clock()
+            self._nonces = {n: t for n, t in self._nonces.items() if now - t <= 2 * self.WINDOW_S}
+            if f"{node}:{nonce}" in self._nonces:
+                return self._fail(h, 401, "replay")
+            self._nonces[f"{node}:{nonce}"] = now
+        if kind == "send":
+            return self._send(h, node, target, body)
+        if target != node:
+            return self._fail(h, 403, "forbidden")
+        if kind == "ws":
+            if (h.headers.get("Upgrade") or "").lower() != "websocket":
+                return self._fail(h, 426, "upgrade_required")
+            return self._websocket(h, node)
+        query = urllib.parse.parse_qs(url.query)
+        after = int(query.get("after", ["0"])[0])
+        wait = min(float(query.get("wait", ["25"])[0]), 25.0)
+        self._recv(h, node, after, wait)
+
+    def _websocket(self, h: Any, node: str) -> None:
+        import base64 as b64
+        import hashlib
+
+        key = h.headers.get("Sec-WebSocket-Key") or ""
+        guid = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+        accept = b64.b64encode(hashlib.sha1((key + guid).encode()).digest()).decode()
+        h.close_connection = True
+        sock = _FakeWebSocket(h.connection, h.rfile, self.fragment_frames)
+        # Everything the client can observe is recorded before the upgrade reply is written.
+        # The lock is held across the reply and the replay so a concurrent send cannot push a
+        # frame ahead of the 101.
+        with self._cond:
+            self.requests.append((h.command, h.path.split("?")[0], 101))
+            self.agents.append(h.headers.get("User-Agent") or "")
+            self.ws_accepted += 1
+            self._sockets.setdefault(node, []).append(sock)
+            h.wfile.write(
+                (
+                    "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n"
+                    f"Connection: Upgrade\r\nSec-WebSocket-Accept: {accept}\r\n\r\n"
+                ).encode()
+            )
+            h.wfile.flush()
+            now = self.clock()
+            for stored in self._boxes.get(node, []):
+                if stored["at"] + self.TTL_S > now:
+                    sock.push(stored)
+            closed = self._closed
+        if closed:
+            # A handshake that raced ``close`` ends like every other socket: cut.
+            sock.cut()
+            return
+        try:
+            while True:
+                text = sock.read_text()
+                if text is None:
+                    break
+                if text == "ping":
+                    with self._cond:
+                        self.ws_pings += 1
+                    if self.answer_pings:
+                        sock.send_text("pong")
+                    continue
+                try:
+                    ack = int(json.loads(text)["ack"])
+                except (ValueError, KeyError, TypeError):
+                    sock.close(1008)
+                    break
+                with self._cond:
+                    self.ws_acks.append(ack)
+                    box = self._boxes.setdefault(node, [])
+                    box[:] = [m for m in box if m["seq"] > ack]
+        finally:
+            with self._cond:
+                if sock in self._sockets.get(node, []):
+                    self._sockets[node].remove(sock)
+
+    def _send(self, h: Any, sender: str, to: str, body: bytes) -> None:
+        import base64 as b64
+
+        if not body:
+            return self._fail(h, 400, "bad_request")
+        with self._cond:
+            box = self._boxes.setdefault(to, [])
+            now = self.clock()
+            box[:] = [m for m in box if m["at"] + self.TTL_S > now]
+            if len(box) >= self.DEPTH:
+                return self._fail(h, 429, "mailbox_full")
+            seq = self._counters.get(to, 0) + 1
+            self._counters[to] = seq
+            stored = self.rewrite(body) if self.rewrite else body
+            box.append(
+                {"seq": seq, "from": sender, "at": int(now), "body": b64.b64encode(stored).decode()}
+            )
+            self.sizes.append(len(body))
+            for sock in list(self._sockets.get(to, [])):
+                sock.push(box[-1])
+            self._cond.notify_all()
+        self._reply(h, 202, {"ok": True, "seq": seq})
+
+    def _recv(self, h: Any, node: str, after: int, wait: float) -> None:
+        import time as _time
+
+        deadline = _time.monotonic() + wait
+        with self._cond:
+            while True:
+                box = self._boxes.setdefault(node, [])
+                box[:] = [m for m in box if m["seq"] > after]
+                now = self.clock()
+                box[:] = [m for m in box if m["at"] + self.TTL_S > now]
+                if box or _time.monotonic() >= deadline:
+                    messages = [dict(m) for m in box]
+                    break
+                self._cond.wait(timeout=max(0.0, deadline - _time.monotonic()))
+            cursor = self._counters.get(node, 0)
+        self._reply(h, 200, {"messages": messages, "cursor": cursor})
+
+
+@pytest.fixture
+def signal_service(sidecar_binary, tmp_path: Path):
+    from letify.transport import linkd
+
+    verifier = linkd.LinkDaemon(tmp_path / "service.key", binary=sidecar_binary)
+    service = FakeSignalService(verifier)
+    try:
+        yield service
+    finally:
+        service.close()
+        verifier.close()
+
+
+# -- Ports a test picks for itself ---------------------------------------------------
+
+#: Each xdist worker draws from its own slice below the ephemeral range, so two workers
+#: never pick the same port and the kernel never hands one to an outgoing connection. A
+#: punch binds with SO_REUSEPORT, so a port that two punches hold is shared by both.
+_PORT_SLICE_START = 20000
+_PORT_SLICE_SIZE = 1000
+_port_cursor: dict[str, int] = {}
+
+
+def free_port(worker: str | None = None) -> int:
+    """A port nothing holds, from the slice of this xdist worker (or of ``worker``)."""
+    name = worker or os.environ.get("PYTEST_XDIST_WORKER", "gw0")
+    index = int(name[2:]) if name.startswith("gw") and name[2:].isdigit() else 0
+    base = _PORT_SLICE_START + (index % 12) * _PORT_SLICE_SIZE
+    for _ in range(_PORT_SLICE_SIZE):
+        offset = _port_cursor.get(name, 0)
+        _port_cursor[name] = (offset + 1) % _PORT_SLICE_SIZE
+        probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            probe.bind(("0.0.0.0", base + offset))  # no reuse options: fails if anything holds it
+        except OSError:
+            continue
+        finally:
+            probe.close()
+        return base + offset
+    raise RuntimeError("no free port in the slice of " + name)  # pragma: no cover
+
+
+def free_ports(count: int) -> list[int]:
+    return [free_port() for _ in range(count)]
+
+
+def refusing_port() -> socket.socket:
+    """A port that answers a connection with a reset: bound by the caller, never listening."""
+    holder = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    holder.bind(("127.0.0.1", 0))
+    return holder

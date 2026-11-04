@@ -268,3 +268,8 @@ examples/**/.letify
 letify-ext/node_modules/
 letify-ext/out/
 *.vsix
+
+# letify-signal build output
+letify-signal/node_modules/
+letify-signal/.wrangler/
+letify-signal/.cloudflare/

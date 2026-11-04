@@ -64,7 +64,7 @@ def take(run: str, *, launcher: Launcher | None = None) -> Any:
 
 def _details(record: dict[str, Any]) -> dict[str, Any]:
     """The fields of a record that describe the call rather than its owner."""
-    keep = ("project", "config", "call_dir", "blobs", "outputs", "door", "external_id")
+    keep = ("project", "config", "call_dir", "blobs", "outputs", "door", "external_id", "link")
     return {key: record[key] for key in keep if key in record}
 
 

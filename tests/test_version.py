@@ -83,7 +83,7 @@ def test_the_extension_is_optional(tmp_path: Path) -> None:
 
 
 @pytest.mark.parametrize(
-    "crate", ["letify", "letify-quic"]
+    "crate", ["letify", "letify-quic", "letify-link"]
 )
 def test_a_crate_entry_in_the_lockfile_that_disagrees_is_reported(
     tmp_path: Path, crate: str
@@ -104,4 +104,4 @@ def test_set_writes_the_version_into_every_crate_entry_of_the_lockfile(tmp_path:
     lock = (root / "letify-core" / "Cargo.lock").read_text()
     for crate in version.CRATES:
         assert f'name = "{crate}"\nversion = "3.1.4"' in lock
-    assert {"letify", "letify-quic"} <= set(version.CRATES)
+    assert {"letify", "letify-quic", "letify-link"} <= set(version.CRATES)

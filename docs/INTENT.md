@@ -70,7 +70,8 @@ than whether it exists. The experiment that tests it reports the boundary as a m
 A reduction routed through the client cannot work on a link whose inbound is the weak
 direction, because every round moves `N` times the parameters into it. Two runtimes
 punch to each other with the client as the signalling broker only, so the parameters
-cross cloud to cloud and the client carries the mappings and nothing else. Measured
+cross cloud to cloud and the client carries the mappings and nothing else. A reduction goes
+through a third host only through a relay the user registered. Measured
 inbound on the network this was designed on is capped near 0.25 MiB/s, against 21 MiB/s
 outbound to a near runtime, which is why this is a claim rather than an optimization.
 
@@ -91,10 +92,14 @@ the placement is unusable there rather than slow.
 
 Two paths remain, and which one letify takes is an open decision rather than something to assume.
 Either both runtimes dial outward to a third host that is not the client, which is a relay and has to
-be argued against the constraint that a slow link is a failure, or they exchange parameters through
+be held to the constraint that a slow link is a failure, or they exchange parameters through
 object storage in one of their clouds, which letify already reaches with the `bucket` account option
 and the GCS backend. The second needs no inbound anywhere, which is the property the measurements
 above say is missing.
+
+### N11. A session that survives path changes makes a dropped path cost the call nothing
+
+A call that is running when its path dies, or when a faster path replaces it, finishes with the same result and no more than the reconnect time added to its wall time. The session retransmits unacknowledged frames after the change and the streams above see a pause, not an error. Where TCP passes and UDP does not, or the reverse, one session design carries both, and the measured link floor decides what is accepted, as [letify-link](SPEC.md#letify-link) specifies. An experiment refutes it by killing the path mid-call and comparing the result and the wall time with an undisturbed run.
 
 ## How an experiment reports efficiency
 
@@ -114,7 +119,7 @@ A report that omits one of the four is incomplete, and its claim stays open.
 - **The local process stays alive for the duration of a run.** letify does not offer detached execution. A detached run whose remote side is evicted loses its results, so the local process stays the owner and the durable artifacts are checkpoints in the store.
 - **Nothing is torn down by hand.** No release call and no shutdown call on the public surface. A call ends its own session, an idle one is reaped, and the lease covers a crash.
 - **No credential in a tracked file.** Accounts live in `~/.letify/config.toml`, and credentials live in the environment or in `~/.letify/accounts`.
-- **A slow link is a failure, not a fallback.** letify connects over a link fast enough for the work, or it refuses to connect and says why. A relayed or otherwise degraded path that merely completes is worse than no connection: it bills GPU hours while the transfer dominates the run, and the user cannot see that from the result. So no relay path is offered, and a measured link below the floor the account declares fails the connection.
+- **A slow link is a failure, not a fallback.** letify connects over a link fast enough for the work, or it refuses to connect and says why. A relayed or otherwise degraded path that merely completes is worse than no connection: it bills GPU hours while the transfer dominates the run, and the user cannot see that from the result. letify does not relay on its own and does not run a relay. A relay the user registers is the user's choice and is held to the same link floor. A measured link below the floor the account declares fails the connection.
 - **Colab accelerators require a paid entitlement.** The remote control features letify uses are permitted on paid plans while the compute unit balance is positive.
 
 ## Non-goals
