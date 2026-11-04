@@ -593,6 +593,64 @@ def connect_commands(
     )
 
 
+def connect_signal(
+    alias: str,
+    *,
+    agent: str,
+    signal: str,
+    python: str,
+    bootstrap: str,
+    key_path: str | os.PathLike[str],
+    version: str,
+    max_rtt_ms: float | None = None,
+    min_bps: float | None = None,
+    start_timeout_ms: int = 60_000,
+    say: Say = quiet,
+) -> LinkRemote:
+    """Bootstrap through the signalling service and a paired agent, and return the machine.
+
+    Spec "Agent and pairing" item 11. The agent holds the binary of its own machine, so nothing
+    is prepared. The machine has no address, so the session starts from punched candidates only.
+    """
+    from . import linksignal
+
+    try:
+        signer = linkd.LinkDaemon(key_path)
+    except linkd.LinkMissing as error:
+        raise _fail(alias, str(error)) from error
+    except linkd.LinkError as error:
+        raise _fail(alias, f"the local sidecar failed: {error}") from error
+    client = linksignal.SignalClient(signer, signal)
+
+    def start() -> Bootstrap:
+        stream = linksignal.SignalBootstrap(client, agent, version=version)
+        try:
+            stream.start()
+        except OSError as error:
+            raise _fail(alias, str(error)) from error
+        return stream
+
+    try:
+        return connect_over(
+            alias,
+            prepare=lambda: "",
+            start=start,
+            address=None,
+            python=python,
+            bootstrap=bootstrap,
+            key_path=key_path,
+            punch=True,
+            max_rtt_ms=max_rtt_ms,
+            min_bps=min_bps,
+            start_timeout_ms=start_timeout_ms,
+            say=say,
+            note={"how": "the agent"},
+            channel="the signalling service",
+        )
+    finally:
+        signer.close()
+
+
 def _started(mailbox: Any) -> Any:
     mailbox.start()
     return mailbox
@@ -1195,6 +1253,7 @@ __all__ = [
     "connect",
     "connect_commands",
     "connect_over",
+    "connect_signal",
     "letify_link_enabled",
     "prepare_binary",
     "punch_lead_ms",
