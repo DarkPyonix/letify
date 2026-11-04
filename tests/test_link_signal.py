@@ -800,3 +800,22 @@ def test_the_service_records_a_request_before_any_reply_byte_is_written(
     finally:
         watch.close()
     assert ("GET", f"/ws/{watch.node_id}", 401) in signal_service.requests
+
+
+# -- the User-Agent -----------------------------------------------------------------------
+# Spec "Signalling service" item 1, "User-Agent".
+
+
+def test_every_signalling_request_names_letify_as_its_user_agent(signal_service, daemons) -> None:
+    import letify
+
+    a, b = daemons("a"), daemons("b")
+    linksignal.SignalClient(a, signal_service.url).send(b.node_id, b"hello")
+    watch = linksignal.SignalClient(b, signal_service.url).watch()
+    try:
+        assert len(read_until(watch, 1)) == 1
+    finally:
+        watch.close()
+    assert ("GET", f"/ws/{b.node_id}", 101) in signal_service.requests
+    assert signal_service.agents
+    assert set(signal_service.agents) == {f"letify/{letify.__version__}"}

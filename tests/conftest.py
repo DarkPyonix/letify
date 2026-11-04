@@ -2356,6 +2356,8 @@ class FakeSignalService:
         self.clock = _time.time
         self.rewrite: Any = None
         self.requests: list[tuple[str, str, int]] = []
+        #: The User-Agent header of every request, the WebSocket handshake included.
+        self.agents: list[str] = []
         #: The byte length of every message body the service accepted.
         self.sizes: list[int] = []
         self._boxes: dict[str, list[dict[str, Any]]] = {}
@@ -2417,6 +2419,7 @@ class FakeSignalService:
         # Recorded before the first reply byte, so a test that acts on the client's view of
         # the reply never reads the record ahead of the server thread.
         self.requests.append((h.command, h.path.split("?")[0], status))
+        self.agents.append(h.headers.get("User-Agent") or "")
         h.send_response(status)
         h.send_header("Content-Type", "application/json")
         h.send_header("Content-Length", str(len(data)))
@@ -2502,6 +2505,7 @@ class FakeSignalService:
         # frame ahead of the 101.
         with self._cond:
             self.requests.append((h.command, h.path.split("?")[0], 101))
+            self.agents.append(h.headers.get("User-Agent") or "")
             self.ws_accepted += 1
             self._sockets.setdefault(node, []).append(sock)
             h.wfile.write(
