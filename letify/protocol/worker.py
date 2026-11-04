@@ -1567,11 +1567,16 @@ class _Scandir:
     """What the patched ``os.scandir`` answers: real entries, then the pending ones."""
 
     def __init__(self, entries, close):
-        self._entries = entries
+        self._entries = iter(entries)
         self._close = close
 
     def __iter__(self):
-        return iter(self._entries)
+        return self
+
+    def __next__(self):
+        # ``os.walk`` calls ``next`` on what ``os.scandir`` answers, so an object that is
+        # only iterable breaks every walk of a directory inside a running call.
+        return next(self._entries)
 
     def __enter__(self):
         return self
@@ -2371,12 +2376,50 @@ def _op_get_file(request):
     }
 
 
+def _pack_add(archive, path, arcname, top=True):
+    """Add ``path`` to ``archive``, leaving out what vanishes before it is read.
+
+    Spec "Google Drive is a store, not a volume": the pack runs beside the session's
+    calls, so a file or directory listed by the walk may be gone by the time it is opened.
+    The interpreter also writes a bytecode file as ``<name>.pyc.<digits>`` and renames it,
+    and that temporary name is left out. The root must exist.
+    """
+    if not top:
+        stem, _dot, tail = os.path.basename(path).rpartition(".")
+        if tail.isdigit() and stem.endswith(".pyc"):
+            return
+    try:
+        info = archive.gettarinfo(path, arcname)
+    except FileNotFoundError:
+        if top:
+            raise
+        return
+    if info is None:
+        return
+    if info.isreg():
+        try:
+            handle = open(path, "rb")
+        except FileNotFoundError:
+            return
+        with handle:
+            archive.addfile(info, handle)
+        return
+    archive.addfile(info)
+    if info.isdir():
+        try:
+            names = sorted(os.listdir(path))
+        except FileNotFoundError:
+            return
+        for name in names:
+            _pack_add(archive, os.path.join(path, name), arcname + "/" + name, False)
+
+
 def _op_pack_dir(request):
     """Pack a directory inside the runtime and return it as one payload."""
     buffer = io.BytesIO()
     root = request["path"]
     with tarfile.open(fileobj=buffer, mode="w:gz") as archive:
-        archive.add(root, arcname=os.path.basename(root.rstrip("/")), recursive=True)
+        _pack_add(archive, root, os.path.basename(root.rstrip("/")))
     payload = buffer.getvalue()
     return {
         "ok": True,
@@ -2424,7 +2467,7 @@ def _op_pack_blob(request):
             hashed = _HashedFile(handle, hasher)
             mode = "w:gz" if request.get("gzip", True) else "w"
             with tarfile.open(fileobj=hashed, mode=mode) as archive:
-                archive.add(root, arcname=os.path.basename(root.rstrip("/")), recursive=True)
+                _pack_add(archive, root, os.path.basename(root.rstrip("/")))
         digest = _data_finish(hasher)
         final = _data_file(directory, digest)
         os.makedirs(os.path.dirname(final), exist_ok=True)

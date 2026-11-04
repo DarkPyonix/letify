@@ -574,3 +574,198 @@ def test_the_gate_packs_only_when_the_build_took_twice_the_estimated_restore() -
     assert "not caching the environment" in said[-1]
     assert judged(restore * 2) is True
     assert judged(restore * 3) is True
+
+
+# -- a resumable upload that survives a failed piece -----------------------------
+
+PIECE = 256 * 1024
+
+
+def upload_setup(fake_drive, tmp_path: Path, monkeypatch, pieces: int = 4):
+    """A backend with 256 KiB pieces, no backoff wait, and a file of `pieces` whole pieces."""
+    from letify.store.backends import drive
+
+    monkeypatch.setattr(drive, "UPLOAD_PIECE", PIECE)
+    monkeypatch.setattr(drive, "RESUME_DELAYS", (0.0,) * 6)
+    data = bytes(range(256)) * (PIECE // 256 * pieces)
+    source = tmp_path / "big.bin"
+    source.write_bytes(data)
+    return backend_for(fake_drive), source, data
+
+
+def piece_starts(server: Any) -> list[int]:
+    ranges = [r["headers"]["content-range"] for r in server.uploads()]
+    return [int(c.split(" ")[1].split("-")[0]) for c in ranges if not c.startswith("bytes */")]
+
+
+def test_an_upload_resumes_at_the_offset_the_session_reports_after_a_dropped_answer(
+    fake_drive, tmp_path: Path, monkeypatch, capsys
+) -> None:
+    """Spec: Named handoffs on the Drive store, a failed piece asks the session where it is."""
+    backend, source, data = upload_setup(fake_drive, tmp_path, monkeypatch)
+    fake_drive.glitches = ["drop-after-store"]
+    backend.put_file("digest-a", source)
+    assert fake_drive.blobs()["digest-a"] == data
+    starts = piece_starts(fake_drive)
+    assert sorted(starts) == [0, PIECE, 2 * PIECE, 3 * PIECE]
+    assert any(
+        r["headers"]["content-range"] == f"bytes */{len(data)}"
+        and r["headers"]["content-length"] == "0"
+        for r in fake_drive.uploads()
+    )
+    said = capsys.readouterr().err
+    assert f"letify: Drive upload resumed at {PIECE} of {len(data)} after" in said
+
+
+def test_an_upload_resends_a_piece_the_session_never_stored_after_a_dropped_connection(
+    fake_drive, tmp_path: Path, monkeypatch
+) -> None:
+    """Spec: a 308 whose Range ends before the piece means the piece is sent again."""
+    backend, source, data = upload_setup(fake_drive, tmp_path, monkeypatch)
+    fake_drive.glitches = ["drop"]
+    backend.put_file("digest-b", source)
+    assert fake_drive.blobs()["digest-b"] == data
+    assert sorted(piece_starts(fake_drive)) == [0, 0, PIECE, 2 * PIECE, 3 * PIECE]
+
+
+@pytest.mark.parametrize("status", ["500", "502", "503", "504"])
+def test_an_upload_resumes_after_a_server_error_on_a_piece(
+    status: str, fake_drive, tmp_path: Path, monkeypatch
+) -> None:
+    """Spec: HTTP 500, 502, 503 and 504 are retried through a status query."""
+    backend, source, data = upload_setup(fake_drive, tmp_path, monkeypatch)
+    fake_drive.glitches = [status]
+    backend.put_file("digest-c", source)
+    assert fake_drive.blobs()["digest-c"] == data
+    assert sorted(piece_starts(fake_drive)) == [0, 0, PIECE, 2 * PIECE, 3 * PIECE]
+
+
+def test_an_upload_whose_last_piece_was_stored_but_not_answered_is_complete_on_the_status_query(
+    fake_drive, tmp_path: Path, monkeypatch
+) -> None:
+    """Spec: a 200 answer to the status query completes the upload and carries the file id."""
+    backend, source, data = upload_setup(fake_drive, tmp_path, monkeypatch, pieces=2)
+    fake_drive.glitches = ["", "drop-after-store"]
+    backend.put_file("digest-d", source)
+    assert fake_drive.blobs()["digest-d"] == data
+    assert sorted(piece_starts(fake_drive)) == [0, PIECE]
+    assert backend._ids["digest-d"] in fake_drive.files
+
+
+def test_scattered_failures_with_progress_between_them_never_exhaust_the_retries(
+    fake_drive, tmp_path: Path, monkeypatch
+) -> None:
+    """Spec: only consecutive failures without progress count toward the limit."""
+    backend, source, data = upload_setup(fake_drive, tmp_path, monkeypatch, pieces=12)
+    fake_drive.glitches = ["drop-after-store"] * 2 + ["", ""] + ["drop-after-store"] * 2
+    fake_drive.glitches += ["", "drop-after-store"] * 3
+    backend.put_file("digest-e", source)
+    assert fake_drive.blobs()["digest-e"] == data
+
+
+def test_an_upload_gives_up_after_six_waits_with_no_progress(
+    fake_drive, tmp_path: Path, monkeypatch
+) -> None:
+    """Spec: the seventh consecutive failure without progress raises RuntimeFailure."""
+    from letify.errors import RuntimeFailure
+    from letify.store.backends import drive
+
+    waits: list[float] = []
+    backend, source, _ = upload_setup(fake_drive, tmp_path, monkeypatch)
+    monkeypatch.setattr(drive, "RESUME_DELAYS", (1, 2, 4, 8, 16, 32))
+    monkeypatch.setattr(drive.time, "sleep", waits.append)
+    fake_drive.glitches = ["503"] * 20
+    with pytest.raises(RuntimeFailure, match="503"):
+        backend.put_file("digest-f", source)
+    assert waits == [1, 2, 4, 8, 16, 32]
+    assert len(piece_starts(fake_drive)) == 7
+
+
+def test_a_failed_status_query_counts_as_a_failure_and_the_upload_still_resumes(
+    fake_drive, tmp_path: Path, monkeypatch
+) -> None:
+    """Spec: a failed status query counts as a failure, then the sender asks again."""
+    backend, source, data = upload_setup(fake_drive, tmp_path, monkeypatch)
+    fake_drive.glitches = ["503"]
+    fake_drive.status_glitches = [503, 503]
+    backend.put_file("digest-g", source)
+    assert fake_drive.blobs()["digest-g"] == data
+
+
+def test_an_expired_upload_session_fails_saying_it_must_start_again(
+    fake_drive, tmp_path: Path, monkeypatch
+) -> None:
+    """Spec: HTTP 404 and 410 mean the session expired and are not retried."""
+    from letify.errors import RuntimeFailure
+
+    backend, source, _ = upload_setup(fake_drive, tmp_path, monkeypatch)
+    fake_drive.glitches = ["expired"]
+    with pytest.raises(RuntimeFailure, match="expired"):
+        backend.put_file("digest-h", source)
+    assert len(piece_starts(fake_drive)) == 1
+
+
+def test_a_client_error_on_a_piece_is_not_retried(
+    fake_drive, tmp_path: Path, monkeypatch
+) -> None:
+    """Spec: a 4xx other than 308, 404 and 410 is not retried."""
+    from letify.errors import RuntimeFailure
+
+    backend, source, _ = upload_setup(fake_drive, tmp_path, monkeypatch)
+    fake_drive.glitches = ["403"]
+    with pytest.raises(RuntimeFailure, match="403"):
+        backend.put_file("digest-i", source)
+    assert len(fake_drive.uploads()) == 1
+
+
+# -- the pack tolerates a tree that changes under it ----------------------------
+
+
+def test_a_file_that_vanishes_during_the_pack_is_left_out_not_fatal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Spec: Google Drive is a store, not a volume, the pack tolerates a changing tree."""
+    import os
+    import tarfile
+
+    from letify.protocol import worker as worker_module
+
+    text = worker_module.SOURCE.rstrip()
+    assert text.endswith("_serve()")
+    worker: dict[str, Any] = {"__name__": "probe"}
+    exec(compile(text[: -len("_serve()")], "worker", "exec"), worker)
+
+    root = tmp_path / "env"
+    (root / "pkg" / "__pycache__").mkdir(parents=True)
+    (root / "pkg" / "keep.py").write_text("x = 1")
+    (root / "pkg" / "__pycache__" / "keep.cpython-311.pyc").write_bytes(b"pyc")
+    temporary = root / "pkg" / "__pycache__" / "uuid.cpython-311.pyc.139776096370992"
+    temporary.write_bytes(b"half")
+    (root / "pkg" / "gone.txt").write_text("vanishes")
+    (root / "gonedir").mkdir()
+
+    real = os.listdir
+
+    def listing_then_removal(path: Any = ".") -> list[str]:
+        names = real(path)
+        if Path(path) == root / "pkg":
+            (root / "pkg" / "gone.txt").unlink()
+        if Path(path) == root:
+            (root / "gonedir").rmdir()
+        return names
+
+    monkeypatch.setattr(os, "listdir", listing_then_removal)
+    packed = worker["_op_pack_blob"](
+        {"path": str(root), "dir": str(tmp_path / "blobs"), "gzip": False}
+    )["value"]
+    monkeypatch.undo()
+
+    archive = Path(worker["_data_file"](str(tmp_path / "blobs"), packed["digest"]))
+    assert archive.stat().st_size == packed["size"]
+    with tarfile.open(archive, "r:") as tar:
+        names = sorted(tar.getnames())
+    assert "env/pkg/keep.py" in names
+    assert "env/pkg/__pycache__/keep.cpython-311.pyc" in names
+    assert "env/pkg/gone.txt" not in names
+    assert "env/gonedir" not in names
+    assert not any(".pyc." in name for name in names)

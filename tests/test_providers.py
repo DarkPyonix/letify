@@ -3323,3 +3323,20 @@ def test_a_punched_link_command_shares_no_connection() -> None:
     assert not any(part.startswith("Control") for part in command)
     assert command[:3] == ["ssh", "-p", "22"]
     link.close()
+
+
+def test_the_kaggle_cli_runs_with_six_because_its_release_imports_it_undeclared() -> None:
+    # Spec "Kaggle": kaggle 2.2.5 imports six without declaring it, so without the pin every
+    # CLI command fails on import and no notebook is deleted.
+    assert tools_module.kaggle_cli_command("/usr/bin/uv") == [
+        "/usr/bin/uv",
+        "tool",
+        "run",
+        "--python",
+        "3.13",
+        "--with",
+        "six",
+        "--from",
+        "kaggle",
+        "kaggle",
+    ]

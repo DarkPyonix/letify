@@ -87,6 +87,11 @@ class Provider(abc.ABC):
     #: Whether a session can outlive this process and keep billing.
     needs_lease: bool = True
 
+    #: Whether the runtime sees this machine's file system. True only for the local
+    #: provider. A call to such a provider keeps its paths as they are, with no staging
+    #: and no write-back. Spec "Data in place".
+    shares_filesystem: bool = False
+
     def __init__(self, config: ProviderConfig):
         self.config = config
         self.alias = config.alias

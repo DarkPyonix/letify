@@ -98,6 +98,14 @@ class Channel(abc.ABC):
         """
         self.close()
 
+    def worker_may_survive(self) -> bool:
+        """Whether the worker on the other end may still be running after this channel failed.
+
+        Spec "Reattaching after a lost channel", the first item. The default says no, for a
+        channel that cannot tell its transport breaking from its worker ending.
+        """
+        return False
+
     def declare_lost(self, message: str) -> None:
         """Make a call waiting on this channel fail with ``RuntimeLost(message)``.
 
@@ -1004,6 +1012,22 @@ class PersistentChannel(FramedChannel):
         code = exit_text(process.returncode)
         return f"the worker exited with {code}" if code else None
 
+    def worker_may_survive(self) -> bool:
+        """True unless the process ended with a status of its own.
+
+        Spec "Reattaching after a lost channel". A process still running, one that exited 255
+        (ssh could not keep the link) and one a signal ended are a transport that broke. Any
+        other status, including 0, is the worker's end and is passed on by the transport.
+        """
+        process = self._process
+        if process is None:
+            return False
+        try:
+            process.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            return True
+        return process.returncode == 255 or process.returncode < 0
+
     def _stderr_text(self) -> str:
         """The process's own standard error, complete once the process has exited."""
         process = self._process
@@ -1119,6 +1143,10 @@ class SocketChannel(FramedChannel):
                 self.name, lambda view: sock.send(view), sock.recv_into, self._emit
             )
             self._await_ready()
+
+    def worker_may_survive(self) -> bool:
+        """A closed door says nothing about the worker, which the next adoption finds out."""
+        return True
 
     def _kill(self) -> None:
         if self._socket is not None:

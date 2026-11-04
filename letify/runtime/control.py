@@ -17,12 +17,14 @@ from __future__ import annotations
 
 import atexit
 import contextlib
+import hashlib
 import json
 import os
 import secrets
 import socket
 import stat
 import sys
+import tempfile
 import threading
 import time
 from collections.abc import Iterator
@@ -30,7 +32,8 @@ from pathlib import Path
 from typing import Any
 
 from .. import paths
-from ..errors import LetifyError, RunNotFound, UnsupportedMode
+from ..errors import LetifyError, RunNotFound, RuntimeFailure, UnsupportedMode
+from ..protocol import wire
 from .channel import INTERRUPT_HOOK
 
 #: Characters of a run id: 12 lowercase hexadecimal digits.
@@ -49,6 +52,10 @@ INTERRUPT_WAIT_S = 10.0
 #: Seconds ``exec`` waits for the answer when the command names none.
 EXEC_WAIT_S = 60.0
 
+#: How long ``letify utilization`` waits for a run to print its card readings, so that an
+#: editor polling every 10 s never hangs behind a run that does not answer.
+UTILIZATION_WAIT_S = 10.0
+
 #: Seconds a takeover waits for the owning process to let go of a run. Spec "Taking over a
 #: running call": an owner that does not answer in this time is treated as gone.
 RELEASE_WAIT_S = 5.0
@@ -65,21 +72,35 @@ def runs_directory() -> Path:
 
 
 def socket_path(pid: int) -> Path:
-    """Where the process ``pid`` listens: ``runs/<pid>.sock``, or a shorter path if too long.
+    """Where the process ``pid`` listens, at most ``SOCKET_LIMIT`` bytes long where it can be.
 
-    A Unix socket path is limited to about 107 bytes. When the preferred path exceeds
-    ``SOCKET_LIMIT`` the socket goes in the SSH control directory, which letify already
-    keeps short for the same reason.
+    Spec "Controlling a running call": ``runs/<pid>.sock`` when that fits, else
+    ``run-<pid>.sock`` in the SSH control directory, else ``run-<h>-<pid>.sock`` in a
+    private per-user directory below the system temporary directory, where ``<h>`` hashes
+    the preferred path so two state roots never share a name. When that path is also too long
+    the preferred path is returned, and the caller reaches it through ``wire.unix_address``.
     """
     preferred = runs_directory() / f"{pid}.sock"
     if len(os.fsencode(preferred)) <= SOCKET_LIMIT:
         return preferred
-    return paths.ssh_control_directory() / f"run-{pid}.sock"
+    shared = paths.ssh_control_directory() / f"run-{pid}.sock"
+    if len(os.fsencode(shared)) <= SOCKET_LIMIT:
+        return shared
+    digest = hashlib.sha256(os.fsencode(preferred)).hexdigest()[:12]
+    name = f"run-{digest}-{pid}.sock"
+    private = Path(tempfile.gettempdir()) / f"letify-{os.getuid()}" / name
+    return private if len(os.fsencode(private)) <= SOCKET_LIMIT else preferred
 
 
 def _private_directory(directory: Path) -> None:
-    directory.mkdir(parents=True, exist_ok=True)
-    if stat.S_IMODE(directory.stat().st_mode) != 0o700:
+    """Create ``directory`` mode 0700 and refuse a symbolic link or another user's directory."""
+    directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+    info = directory.lstat()
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+        raise OSError(f"{directory} is not a plain directory")
+    if info.st_uid != os.getuid():
+        raise OSError(f"{directory} is not owned by this user")
+    if stat.S_IMODE(info.st_mode) != 0o700:
         directory.chmod(0o700)
 
 
@@ -137,6 +158,7 @@ class Run:
             "function": self.function,
             "runtime": str(getattr(self.runtime, "name", "")),
             "provider": self.provider,
+            "accelerator": getattr(getattr(self.runtime, "instance", None), "accelerator", None),
             "started_at": self.started_at,
             "pid": os.getpid(),
             "socket": str(socket_file) if socket_file is not None else None,
@@ -320,13 +342,18 @@ class _Server:
         with contextlib.suppress(FileNotFoundError):
             self.path.unlink()
         self.socket = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        descriptor = None
         try:
-            self.socket.bind(str(self.path))
+            address, descriptor = wire.unix_address(str(self.path))
+            self.socket.bind(address)
             self.path.chmod(0o600)
             self.socket.listen(8)
         except OSError:
             self.socket.close()
             raise
+        finally:
+            if descriptor is not None:
+                os.close(descriptor)
         threading.Thread(target=self._accept, name="letify-control", daemon=True).start()
         atexit.register(self.close)
 
@@ -523,14 +550,54 @@ def ask(run: str, command: dict[str, Any], *, wait: float = EXEC_WAIT_S + 30) ->
         return {"ok": False, "type": "RuntimeFailure", "error": f"run {run} has no control socket"}
     client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     client.settimeout(wait)
+    descriptor = None
     try:
-        client.connect(row["socket"])
+        address, descriptor = wire.unix_address(row["socket"])
+        client.connect(address)
         client.sendall(json.dumps({**command, "run": run}).encode("utf-8") + b"\n")
         answer = json.loads(_read_line(client))
     except (OSError, ValueError) as exc:
         return {"ok": False, "type": "RuntimeFailure", "error": f"run {run}: {exc}"}
     finally:
         client.close()
+        if descriptor is not None:
+            os.close(descriptor)
     if answer.get("type") == "RunNotFound":
         raise RunNotFound(f"no run {run} is live on this machine")
     return answer  # type: ignore[no-any-return]
+
+
+def read_session_smi(alias: str, accelerator: str) -> str:
+    """The nvidia-smi text of the session a live run of another process holds.
+
+    Picks the first live run whose ``provider`` and ``accelerator`` match, since runs of
+    one session share its cards, and runs the reader through that run's control socket with
+    the ``exec`` command. Opens no channel and starts no session. Raises ``RunNotFound``
+    when no live run matches, and ``RuntimeFailure`` with the reason when the run does not
+    answer within ``UTILIZATION_WAIT_S`` or the source fails there.
+    """
+    from .telemetry import smi_source
+
+    run = next(
+        (
+            row["run"]
+            for row in list_runs()
+            if row.get("provider") == alias and row.get("accelerator") == accelerator
+        ),
+        None,
+    )
+    if run is None:
+        raise RunNotFound(f"no live run holds a session of {alias} on {accelerator}")
+    wait = UTILIZATION_WAIT_S
+    try:
+        answer = ask(
+            run,
+            {"cmd": "exec", "source": smi_source(wait * 0.8), "timeout": wait},
+            wait=wait + 2,
+        )
+    except LetifyError as exc:
+        raise RuntimeFailure(str(exc)) from exc
+    if not answer.get("ok") or answer.get("error"):
+        reason = answer.get("error") or answer.get("reason") or "the run did not answer"
+        raise RuntimeFailure(str(reason).strip().splitlines()[-1] if reason else "failed")
+    return str(answer.get("stdout") or "")
