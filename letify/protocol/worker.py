@@ -402,9 +402,16 @@ def _op_call_body(request):
             os.environ["PYTHONPATH"] = os.pathsep.join([modules_dir, *parts])
     if data is None:
         return _call(request)
+    _data_sweep_kept(data["dir"])
     state = _data_register(data)
+    kept = False
     try:
-        outcome = _call(request)
+        try:
+            outcome = _call(request)
+        except BaseException:
+            # Spec "A failed call": the complete files still go back, and the directory stays.
+            kept = _data_after_failure(data, state)
+            raise
         # Unregistered first, so the write-back walks the real file system rather than the
         # manifest, and a file that never arrived is simply not there.
         _data_unregister(state)
@@ -419,7 +426,73 @@ def _op_call_body(request):
         _DATA_FAILED.pop("", None)
         _DATA_POLL_SEEN.pop(data["dir"], None)
         _DATA_POLL_SENT.pop(data["dir"], None)
-        shutil.rmtree(data["dir"], ignore_errors=True)
+        if not kept:
+            shutil.rmtree(data["dir"], ignore_errors=True)
+
+
+#: Call directories kept after a failed call, until data_written answers or the worker ends.
+_DATA_KEPT = set()
+
+#: Seconds after which a later call removes a kept directory a crashed worker left behind.
+KEPT_CALL_S = 3600.0
+
+
+def _data_after_failure(data, state):
+    """Collect the complete outputs of a call whose body raised, and keep its directory.
+
+    Spec "A failed call". Answers whether the directory is kept. A failure in here is
+    printed and never replaces the body's exception.
+    """
+    if not data.get("outputs"):
+        return False
+    try:
+        _data_unregister(state)
+        skipped = []
+        written = _data_collect(data, state["placed"], skipped)
+        _DATA_WRITTEN[data["dir"]] = written
+        files = [item for items in written.values() for item in items]
+        size = sum(item[2] for item in files)
+        print(
+            "letify: the call failed; wrote back %d file(s) (%.1f MiB) that were complete, "
+            "skipped %d still open" % (len(files), size / (1 << 20), len(skipped)),
+            file=sys.stderr,
+            flush=True,
+        )
+        with open(os.path.join(data["dir"], ".letify-kept"), "w") as marker:
+            marker.write("kept\n")
+        _DATA_KEPT.add(data["dir"])
+        return True
+    except BaseException as exc:
+        print("letify: collecting the outputs of the failed call failed: %s" % exc,
+              file=sys.stderr, flush=True)
+        return False
+
+
+def _data_remove_kept():
+    """Remove the call directories this worker kept, as it ends."""
+    import shutil
+    for directory in list(_DATA_KEPT):
+        _DATA_KEPT.discard(directory)
+        shutil.rmtree(directory, ignore_errors=True)
+
+
+def _data_sweep_kept(call_dir):
+    """Remove marked sibling directories older than KEPT_CALL_S, left by a crashed worker."""
+    import shutil
+    parent = os.path.dirname(call_dir)
+    try:
+        names = os.listdir(parent)
+    except OSError:
+        return
+    now = time.time()
+    for name in names:
+        marker = os.path.join(parent, name, ".letify-kept")
+        try:
+            old = now - os.stat(marker).st_mtime > KEPT_CALL_S
+        except OSError:
+            continue
+        if old:
+            shutil.rmtree(os.path.join(parent, name), ignore_errors=True)
 
 
 # Write-back lists of returned calls, by call directory, until data_written takes them.
@@ -476,10 +549,12 @@ def _data_same_bytes(path, digest):
         return False
 
 
-def _data_collect(data, placed):
+def _data_collect(data, placed, skipped=None):
     """Commit each file a returned call created or changed at an output into the cache."""
     import stat
-    skipped = (".git", ".venv", "__pycache__")
+    pruned = (".git", ".venv", "__pycache__")
+    # A failed call passes a list: a file a process still holds open is not final.
+    open_now = _data_open_files() if skipped is not None else None
     written = {}
     for output in data["outputs"]:
         files = []
@@ -488,7 +563,7 @@ def _data_collect(data, placed):
         elif os.path.isdir(output) and not os.path.islink(output):
             candidates = []
             for directory, names, found in os.walk(output, followlinks=False):
-                names[:] = [name for name in names if name not in skipped]
+                names[:] = [name for name in names if name not in pruned]
                 for name in found:
                     full = os.path.join(directory, name)
                     rel = os.path.relpath(full, output).replace(os.sep, "/")
@@ -501,6 +576,9 @@ def _data_collect(data, placed):
             except OSError:
                 continue
             if not stat.S_ISREG(info.st_mode):
+                continue
+            if open_now is not None and (info.st_dev, info.st_ino) in open_now:
+                skipped.append(full)
                 continue
             known = placed.get(full)
             # The placed record ends with the cache stamp, which is not part of the comparison.
@@ -565,7 +643,13 @@ def _data_check_cache(data, placed):
 
 def _op_data_written(request):
     """The write-back list of a returned call, removed as it is answered."""
-    return {"ok": True, "value": _DATA_WRITTEN.pop(request["dir"], {})}
+    value = _DATA_WRITTEN.pop(request["dir"], {})
+    if request["dir"] in _DATA_KEPT:
+        # Spec "A failed call": the list is taken, so the directory has nothing left to keep.
+        import shutil
+        _DATA_KEPT.discard(request["dir"])
+        shutil.rmtree(request["dir"], ignore_errors=True)
+    return {"ok": True, "value": value}
 
 
 # What the last output poll of a running call saw, by call directory: the size and the
@@ -2882,6 +2966,7 @@ def _run_exit_hooks(reason):
 
 def _exit_with_hooks(code, reason="the lease ended"):
     _run_exit_hooks(reason)
+    _data_remove_kept()
     _drop_record()
     os._exit(code)
 
@@ -2957,6 +3042,7 @@ def _end_by_owner():
     """
     import signal
     _run_exit_hooks("the owner shut down")
+    _data_remove_kept()
     _end_descendants()
     _drop_record()
     os._exit(128 + signal.SIGTERM)
@@ -2998,6 +3084,7 @@ def _watch_sigterm(fd):
             return
         if signal.SIGTERM in data and signal.getsignal(signal.SIGTERM) is _on_sigterm:
             _run_exit_hooks("SIGTERM")
+            _data_remove_kept()
             _drop_record()
             os._exit(128 + signal.SIGTERM)
 

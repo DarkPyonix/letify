@@ -580,10 +580,29 @@ class Runtime:
                 try:
                     if outcome is not None and collector.outputs:
                         added += pathdata.write_back(self, collector, blobs, back)
+                    elif collector.outputs and _user_code_failed():
+                        added += self._write_back_failed(collector, blobs, back)
                 finally:
                     if added:
                         pathdata.evict(self, blobs)
         return outcome
+
+    def _write_back_failed(self, collector: Any, blobs: str, back: Any) -> int:
+        """The final write-back of a call whose body raised, which never replaces its error.
+
+        Spec "A failed call".
+        """
+        from ..store import pathdata
+
+        try:
+            return pathdata.write_back(self, collector, blobs, back)
+        except Exception as exc:
+            print(
+                f"letify: the write-back of the failed call did not finish: {exc}",
+                file=sys.stderr,
+                flush=True,
+            )
+            return 0
 
     def _takeover_details(self, collector: Any, call_dir: str, blobs: str) -> dict[str, Any]:
         """What another process needs, from the record, to take this call over.
@@ -1503,3 +1522,14 @@ def _payload(value: Any) -> bytes:
 
 
 __all__ = ["Runtime"]
+
+
+def _user_code_failed() -> bool:
+    """Whether the exception now propagating is the body's own, not an infrastructure failure.
+
+    Spec "A failed call": only a failure of the user's code leaves outputs to collect.
+    """
+    import sys as _sys
+
+    failure = _sys.exc_info()[1]
+    return isinstance(failure, RemoteError)

@@ -174,7 +174,7 @@ def train(epochs):
 ```
 
 - A file whose contents did not change is not sent. A second call that only changes the logs receives only the logs.
-- A call that raised writes nothing back.
+- A call that raised still writes back the files that were complete, then raises. A file a process still holds open is skipped, and one line on stderr says how many files were written back and how many were skipped.
 - A file the body deleted on the runtime is not deleted locally.
 - Calls writing the same local path at the same time are applied one after the other, and for the same file the call that returned last wins. A file is never half from one call and half from another.
 - Files inside a directory are placed on the runtime as hard links to the runtime's cache, and a file becomes a private copy the moment the body opens it for writing, so the body may overwrite an existing file and a call that only reads copies nothing. A program the body starts, such as `sh` or `ffmpeg`, sees the read-only link and cannot write it in place unless it runs as root.

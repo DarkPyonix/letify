@@ -1577,7 +1577,7 @@ The first count and size are the total written back, the background write-back o
 
 #### Writing back <!-- id: project-data-write-back -->
 
-A write-back waits for nothing that is still arriving at the output location it is sending. Two write-backs run for a call with an output location: a background one while the call runs, and a final one after the call returns. A call that raised writes nothing back, in either form.
+A write-back waits for nothing that is still arriving at the output location it is sending. Two write-backs run for a call with an output location: a background one while the call runs, and a final one after the call returns. A call that raised still runs the final write-back, under [A failed call](#project-data-failed-write-back).
 
 The background write-back streams a completed output file to the local path as soon as it is complete, without the caller declaring anything new. The local process sends one `data_output_poll` request every `0.5` s, naming the call id and the output paths, and the worker answers with the relative path, digest and size of each file it has found complete since the poll before.
 
@@ -1615,6 +1615,18 @@ The local process hands each piece to one writing thread through a queue holding
 Concurrent calls that write back to the same local path take one local lock per resolved local path, held for the whole write-back of that output. So one call's files land after the other's, never interleaved inside one file, and the last call to return wins per file. Files only one of the calls wrote are all kept.
 
 A file placed as a hard link shares its inode with the cache file. When a process writes into such a file in place, which Copy on write leaves possible for a process the body starts fresh and running as root, the cache file no longer matches its digest. After every call, whether it returned or raised, the worker compares each placed cache file's size and modification time with those recorded at placement and removes the cache file when they differ, so the next call receives the digest again.
+
+
+#### A failed call <!-- id: project-data-failed-write-back -->
+
+A call whose body raised still writes back every output file that is complete, because the owner's real project paths must hold what the body wrote, as they do after a local run.
+
+1. **What counts as failed.** Any exception that leaves the body on the runtime: an error the body raised, a `KeyboardInterrupt` delivered by [Ctrl-C in the owning process](#ctrl-c-in-the-owning-process) or `letify interrupt`. The same rules as a returned call apply, with one change: a file is written back only when no process on the runtime holds it open, by the `/proc` check of the background write-back. A file still open is skipped, because its bytes are not final. Where `/proc` is absent, no file is skipped.
+2. **Order.** The worker unregisters the data patch, collects the complete files into the file blob cache as for a returned call, keeps the list for `data_written`, and then lets the body's exception propagate as the call's error. The owner runs its final write-back before it raises that error. User code errors are never retried, as before.
+3. **No masking.** A failure inside the write-back of a failed call is printed to standard error as `letify: the write-back of the failed call did not finish: <error>`, and the body's exception is the one that propagates.
+4. **Message.** The worker prints one line to standard error, once per failed call with an output location: `letify: the call failed; wrote back N file(s) (X MiB) that were complete, skipped M still open`. `N` and `X` count the files collected for the owner, `M` the files skipped because a process held them open.
+5. **The call directory is kept.** The worker does not remove the call directory of a failed call when the body raised, so [Taking over a running call](#run-takeover) and [Reattaching after a lost channel](#run-reattach) can still collect the outputs. It writes the file `.letify-kept` in the directory and removes the directory when `data_written` has answered, when the worker ends at the lease deadline or is stopped, or when a later call in the same workspace finds it older than 3600 s (`KEPT_CALL_S`), which is how a directory left by a crashed worker goes. A takeover or a reattach finishes the write-back for its new owner with the record's `call_dir`, `blobs` and `outputs`, also when the call failed.
+6. **Not covered.** A worker that is ended by `SIGTERM`, a shutdown frame or the lease deadline while the body runs runs the exit hooks and ends, and writes nothing back, because no owner is left to receive it. `SIGKILL` and the out of memory killer end the worker the same way.
 
 #### Runtime data cache budget <!-- id: project-data-cache-budget -->
 
