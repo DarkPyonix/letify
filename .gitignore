@@ -272,3 +272,4 @@ letify-ext/out/
 # letify-signal build output
 letify-signal/node_modules/
 letify-signal/.wrangler/
+letify-signal/.cloudflare/

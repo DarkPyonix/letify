@@ -8,12 +8,13 @@
   "scripts": {
     "test": "vitest run",
     "typecheck": "tsc --noEmit",
-    "dev": "wrangler dev",
-    "deploy": "wrangler deploy"
+    "dev": "cf dev",
+    "deploy": "cf deploy"
   },
   "devDependencies": {
     "@cloudflare/workers-types": "^5.20261023.1",
     "@types/node": "^18.19.0",
+    "cf": "^1.0.0-beta.27",
     "typescript": "^5.6.3",
     "vitest": "^2.1.9",
     "wrangler": "^4.0.0"
