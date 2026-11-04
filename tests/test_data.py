@@ -628,7 +628,7 @@ def test_an_output_still_open_when_the_call_raises_is_not_written_back(
         out.mkdir(parents=True)
         (out / "done.bin").write_bytes(b"done")
         # Kept on builtins so the handle outlives the frame the exception unwinds.
-        builtins._letify_test_handle = open(out / "live.bin", "wb")
+        builtins._letify_test_handle = open(out / "live.bin", "wb")  # noqa: SIM115
         builtins._letify_test_handle.write(b"partial")
         builtins._letify_test_handle.flush()
         raise ValueError("diverged")
