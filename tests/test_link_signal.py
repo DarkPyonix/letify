@@ -819,3 +819,18 @@ def test_every_signalling_request_names_letify_as_its_user_agent(signal_service,
     assert ("GET", f"/ws/{b.node_id}", 101) in signal_service.requests
     assert signal_service.agents
     assert set(signal_service.agents) == {f"letify/{letify.__version__}"}
+
+
+def test_a_closed_bootstrap_whose_sidecar_is_gone_ends_its_reader_quietly() -> None:
+    from letify.transport import linkd
+
+    class Gone:
+        daemon = None
+
+        def recv(self, after, wait_s=0.0):
+            bootstrap.close()
+            raise linkd.LinkClosed("the sidecar is gone")
+
+    bootstrap = linksignal.SignalBootstrap(Gone(), "ab" * 32, version="1")
+    bootstrap._loop()
+    assert bootstrap.recv_line() is None
