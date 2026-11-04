@@ -90,6 +90,16 @@ class Incoming:
     body: bytes
 
 
+def _user_agent() -> str:
+    """The User-Agent of every request. Spec "Signalling service" item 1, "User-Agent".
+
+    Cloudflare's Browser Integrity Check refuses the urllib default with error 1010.
+    """
+    from .. import __version__
+
+    return f"letify/{__version__}"
+
+
 def _opener(url: str) -> urllib.request.OpenerDirector:
     """An opener that never sends a loopback request through a proxy."""
     host = urllib.parse.urlsplit(url).hostname or ""
@@ -129,6 +139,7 @@ class SignalClient:
         text = f"{method}\n{target}\n{stamp}\n{nonce}\n{hashlib.sha256(body).hexdigest()}"
         signature = self.daemon.sign(REQUEST_DOMAIN, text.encode())
         return {
+            "User-Agent": _user_agent(),
             "X-Letify-Node": signer_id or self.daemon.node_id,
             "X-Letify-Time": stamp,
             "X-Letify-Nonce": nonce,
