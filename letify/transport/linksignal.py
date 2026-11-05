@@ -1,7 +1,7 @@
 """A letify-link bootstrap carried over the signalling service's mailbox.
 
-Owns talking to the signalling service (signed requests, the short long poll of a connect, the
-WebSocket watch of a standing wait), the signed envelope that
+Owns talking to the signalling service (signed requests on kept HTTP connections, the short
+long poll of a connect, the WebSocket watch of a standing wait), the signed envelope that
 wraps every bootstrap line, ``SignalBootstrap`` (the ``Bootstrap`` of ``linkchannel.py`` over
 that mailbox) and ``SignalAgent`` (the program on the address-less machine that serves a paired
 node's bootstrap). It does not own the service (``letify-signal/``), signing (the sidecar's
@@ -14,6 +14,7 @@ from __future__ import annotations
 import base64
 import contextlib
 import hashlib
+import http.client
 import json
 import queue
 import re
@@ -55,6 +56,8 @@ SHIM_OPS = ("rendezvous", "punch", "handover")
 #: Bounds of the WebSocket keepalive, in seconds. See ``linkwebsocket``.
 WS_PING_S = linkwebsocket.PING_S
 WS_PONG_S = linkwebsocket.PONG_S
+#: Idle HTTP connections a client keeps. Spec "Signalling service" item 1, "Connections".
+MAX_IDLE = 4
 #: Transient failures of the long poll a bootstrap rides out before it gives up.
 POLL_RETRIES = 3
 
@@ -100,6 +103,25 @@ def _user_agent() -> str:
     return f"letify/{__version__}"
 
 
+def _proxied(url: str) -> bool:
+    """Whether the environment sends a request for ``url`` through a proxy."""
+    parts = urllib.parse.urlsplit(url)
+    host = parts.hostname or ""
+    if host in ("127.0.0.1", "localhost", "::1"):
+        return False
+    return parts.scheme in urllib.request.getproxies() and not urllib.request.proxy_bypass(host)
+
+
+#: Failures of a reused connection that mean the service had already closed it.
+_STALE = (
+    http.client.RemoteDisconnected,
+    http.client.CannotSendRequest,
+    ConnectionResetError,
+    ConnectionAbortedError,
+    BrokenPipeError,
+)
+
+
 def _opener(url: str) -> urllib.request.OpenerDirector:
     """An opener that never sends a loopback request through a proxy."""
     host = urllib.parse.urlsplit(url).hostname or ""
@@ -126,6 +148,19 @@ class SignalClient:
         self._nonce = nonce or (lambda: secrets.token_hex(16))
         self._timeout = timeout
         self._opener = _opener(self.base_url)
+        parts = urllib.parse.urlsplit(self.base_url)
+        self._scheme = parts.scheme
+        self._netloc = parts.netloc
+        self._proxied = _proxied(self.base_url)
+        self._idle: list[http.client.HTTPConnection] = []
+        self._idle_lock = threading.Lock()
+
+    def close(self) -> None:
+        """Close the idle connections. A later request opens a new one."""
+        with self._idle_lock:
+            idle, self._idle = self._idle, []
+        for connection in idle:
+            connection.close()
 
     @property
     def node_id(self) -> str:
@@ -146,6 +181,54 @@ class SignalClient:
             "X-Letify-Signature": signature.hex(),
         }
 
+    def _take(self) -> tuple[http.client.HTTPConnection, bool]:
+        """An idle connection and True, or a new one and False."""
+        with self._idle_lock:
+            if self._idle:
+                return self._idle.pop(), True
+        factory = (
+            http.client.HTTPSConnection if self._scheme == "https" else http.client.HTTPConnection
+        )
+        return factory(self._netloc), False
+
+    def _give_back(self, connection: http.client.HTTPConnection) -> None:
+        with self._idle_lock:
+            if len(self._idle) < MAX_IDLE:
+                self._idle.append(connection)
+                return
+        connection.close()
+
+    def _exchange(
+        self, method: str, target: str, body: bytes, timeout: float, signer_id: str | None
+    ) -> tuple[int, Any, bytes]:
+        """One request on a kept connection: status, headers and the whole reply body."""
+        for _ in range(2):
+            connection, reused = self._take()
+            headers = self._headers(method, target, body, signer_id)
+            connection.timeout = timeout
+            if connection.sock is not None:
+                connection.sock.settimeout(timeout)
+            try:
+                connection.request(
+                    method, target, body=body if method == "POST" else None, headers=headers
+                )
+                response = connection.getresponse()
+                data = response.read()
+            except _STALE:
+                connection.close()
+                if reused:
+                    continue
+                raise
+            except BaseException:
+                connection.close()
+                raise
+            if response.will_close:
+                connection.close()
+            else:
+                self._give_back(connection)
+            return response.status, response.headers, data
+        raise AssertionError("unreachable")  # pragma: no cover
+
     def _request(
         self,
         method: str,
@@ -155,6 +238,33 @@ class SignalClient:
         timeout: float,
         signer_id: str | None = None,
     ) -> dict[str, Any]:
+        if self._proxied:
+            return self._request_urllib(method, target, body, timeout, signer_id)
+        try:
+            status, headers, data = self._exchange(method, target, body, timeout, signer_id)
+            if status >= 400:
+                code = "unknown"
+                with contextlib.suppress(ValueError, OSError, AttributeError):
+                    code = str(json.loads(data).get("error", code))
+                raise self._refused(status, code, headers.get("Retry-After"))
+            return json.loads(data)  # type: ignore[no-any-return]
+        except SignalError:
+            raise
+        except (http.client.HTTPException, TimeoutError, OSError, ValueError) as error:
+            reason = getattr(error, "reason", error)
+            raise SignalError(f"the signalling service did not answer: {reason}") from error
+
+    @staticmethod
+    def _refused(status: int, code: str, retry: str | None) -> SignalError:
+        return SignalError(
+            f"the signalling service refused the request: {code} (HTTP {status}"
+            + (f", retry in {retry} s)" if retry else ")")
+        )
+
+    def _request_urllib(
+        self, method: str, target: str, body: bytes, timeout: float, signer_id: str | None
+    ) -> dict[str, Any]:
+        """The request through ``urllib``, with a new connection, for a proxied service."""
         headers = self._headers(method, target, body, signer_id)
         request = urllib.request.Request(
             self.base_url + target, data=body if method == "POST" else None, method=method
@@ -168,11 +278,7 @@ class SignalClient:
             code = "unknown"
             with contextlib.suppress(ValueError, OSError):
                 code = str(json.loads(error.read()).get("error", code))
-            retry = error.headers.get("Retry-After")
-            raise SignalError(
-                f"the signalling service refused the request: {code} (HTTP {error.code}"
-                + (f", retry in {retry} s)" if retry else ")")
-            ) from error
+            raise self._refused(error.code, code, error.headers.get("Retry-After")) from error
         except (urllib.error.URLError, TimeoutError, OSError, ValueError) as error:
             reason = getattr(error, "reason", error)
             raise SignalError(f"the signalling service did not answer: {reason}") from error

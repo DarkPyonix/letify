@@ -834,3 +834,54 @@ def test_a_closed_bootstrap_whose_sidecar_is_gone_ends_its_reader_quietly() -> N
     bootstrap = linksignal.SignalBootstrap(Gone(), "ab" * 32, version="1")
     bootstrap._loop()
     assert bootstrap.recv_line() is None
+
+
+# -- the kept connection ------------------------------------------------------------------
+# Spec "Signalling service" item 1, "Connections".
+
+
+def test_requests_one_after_another_share_one_connection(signal_service, daemons) -> None:
+    a, b = daemons("a"), daemons("b")
+    sender = linksignal.SignalClient(a, signal_service.url)
+    receiver = linksignal.SignalClient(b, signal_service.url)
+    for number in range(5):
+        sender.send(b.node_id, f"m{number}".encode())
+    assert [m.body for m in drain(receiver, 5)] == [f"m{n}".encode() for n in range(5)]
+    assert signal_service.connections == 2  # one per client, not one per request
+
+
+def test_a_send_during_a_long_poll_does_not_wait_for_it(signal_service, daemons) -> None:
+    a, b = daemons("a"), daemons("b")
+    sender = linksignal.SignalClient(a, signal_service.url)
+    receiver = linksignal.SignalClient(b, signal_service.url)
+    polled: list[float] = []
+    poll = threading.Thread(
+        target=lambda: polled.append(receiver.recv(0, wait_s=5)[1]), daemon=True
+    )
+    poll.start()
+    time.sleep(0.3)
+    started = time.monotonic()
+    receiver.send(a.node_id, b"while polling")
+    assert time.monotonic() - started < 2.0
+    sender.send(b.node_id, b"wake")
+    poll.join(5)
+    assert polled
+
+
+def test_a_request_on_a_connection_the_service_closed_is_sent_again(
+    signal_service, daemons
+) -> None:
+    a, b = daemons("a"), daemons("b")
+    sender = linksignal.SignalClient(a, signal_service.url)
+    sender.send(b.node_id, b"first")
+    signal_service.drop_connections()
+    sender.send(b.node_id, b"second")
+    receiver = linksignal.SignalClient(b, signal_service.url)
+    assert [m.body for m in drain(receiver, 2)] == [b"first", b"second"]
+
+
+def test_a_failure_on_a_new_connection_is_not_retried(daemons) -> None:
+    a = daemons("a")
+    client = linksignal.SignalClient(a, "http://127.0.0.1:9")
+    with pytest.raises(linksignal.SignalError, match="did not answer"):
+        client.send("0" * 64, b"x")
