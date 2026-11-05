@@ -557,3 +557,61 @@ def test_an_agent_whose_socket_dropped_reconnects_and_still_serves_a_pairing(
     assert user_pair(signal_service, user, token) == agent.node_id
     assert recv_requests(signal_service, agent.node_id) == []
     assert list(agent.home.paired.nodes()) == [user.node_id]
+
+
+# -- the account that names an agent (item 11) --------------------------------------------
+
+
+def agent_account(isolated_home, agent, signal_service, **over: Any):
+    from conftest import provider_of
+
+    from letify.providers.tunnel import Tunnel
+
+    return provider_of(
+        Tunnel, "box", agent=agent.node_id, signal=signal_service.url, announce=False, **over
+    )
+
+
+def test_a_tunnel_account_naming_an_agent_has_no_address_and_races_nothing(
+    isolated_home, start_service, signal_service
+) -> None:
+    from letify.transport.linkchannel import PlainSshLink
+
+    provider = agent_account(isolated_home, start_service(), signal_service)
+    assert provider.address is None
+    assert provider.uses_letify_link is True
+    assert isinstance(provider.link(), PlainSshLink)
+
+
+def test_a_tunnel_account_naming_an_agent_refuses_link_ssh_by_name(
+    isolated_home, start_service, signal_service
+) -> None:
+    provider = agent_account(isolated_home, start_service(), signal_service, link="ssh")
+    with pytest.raises(ProviderUnavailable, match="agent"):
+        provider.uses_letify_link  # noqa: B018
+
+
+def test_a_paired_tunnel_account_carries_a_call_through_the_signalling_service_alone(
+    isolated_home, start_service, signal_service, sidecar_binary, udp_stun, monkeypatch
+) -> None:
+    from letify.config.secrets import account_directory
+
+    monkeypatch.setenv("LETIFY_LINK_STUN", udp_stun.env)
+    agent = start_service()
+    provider = agent_account(isolated_home, agent, signal_service)
+    directory = account_directory("box")
+    directory.mkdir(mode=0o700, parents=True)
+    user = linkd.LinkDaemon(directory / "link.key", binary=sidecar_binary)
+    try:
+        user_pair(signal_service, user, agent.service.new_token(signal_service.url))
+    finally:
+        user.close()
+    remote = provider.link_remote(None)
+    channel = linkchannel.LinkChannel(remote, name="r1")
+    try:
+        assert channel.call(pid_of_worker(), (), {})[0] != os.getpid()
+        assert agent.service.started == 1
+        assert set(remote.phases) >= {"bootstrap", "punch", "session", "probe"}
+    finally:
+        channel.close()
+        remote.close()

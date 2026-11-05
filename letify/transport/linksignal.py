@@ -28,7 +28,7 @@ from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from typing import Any, Protocol
 
-from . import linkwebsocket
+from . import linkd, linkwebsocket
 
 #: The service the owner operates.
 DEFAULT_URL = "https://letify.darkpyonix.dev"
@@ -209,7 +209,6 @@ class SignalClient:
     def recv(self, after: int = 0, wait_s: float = POLL_S) -> tuple[list[Incoming], int]:
         """Acknowledge up to ``after``, then wait up to ``wait_s`` for a message above it."""
         return self.recv_from(self.daemon.node_id, after, wait_s)
-
 
     def watch(self) -> SignalWatch:
         """A standing wait on this node's mailbox over ``/ws/<node>``, for an idle receiver."""
@@ -502,7 +501,7 @@ class SignalBootstrap:
         while not self._stop.is_set():
             try:
                 messages, _ = self._client.recv(after, wait_s=POLL_S)
-            except SignalError as error:
+            except (SignalError, linkd.LinkError) as error:
                 failures += 1
                 if self._stop.is_set():
                     return
