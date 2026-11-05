@@ -26,6 +26,7 @@ The terms used below:
 
 - letify is installed on the agent machine (`uv add letify`).
 - The `letify-link` binary is present. It ships in the platform wheels. When it is missing, the command fails with `letify-link is not in this wheel`. The environment variable `LETIFY_LINK_BIN` can name another executable.
+- `nvidia-smi` is on the agent's `PATH`. letify reads the cards through it. On Kaggle it is in `/opt/bin`, so start the agent with `PATH=/opt/bin:$PATH letify agent serve`.
 - The agent machine can open an outbound `https://` connection to the signalling service.
 - The signalling service URL is `https://letify.darkpyonix.dev` unless you set another. In order of priority:
   1. `letify agent serve --signal <URL>`
