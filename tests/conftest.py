@@ -181,6 +181,10 @@ class NoBlake3Local(Local):
         return PersistentChannel([sys.executable, "-u", "-c", hide + BOOTSTRAP], name=runtime.name)
 
 
+#: Seconds every test sync takes at least, see ``uv_project``.
+SYNC_FLOOR_S = 1.0
+
+
 @pytest.fixture(scope="session")
 def shared_uv_dirs(tmp_path_factory: pytest.TempPathFactory) -> dict[str, str]:
     """One uv cache and one managed-Python directory for every sync a test worker runs.
@@ -243,6 +247,10 @@ def uv_project(tmp_path: Path, monkeypatch, shared_uv_dirs: dict[str, str]) -> P
             "        os.makedirs(_shared, exist_ok=True)\n"
             "        os.makedirs(os.path.dirname(_d), exist_ok=True)\n"
             "        os.symlink(_shared, _d)\n"
+            # A warm shared cache can sync in a few milliseconds, which no remote runtime
+            # does. Tests that weigh a restore against the recorded build need the build to
+            # take a measurable time, as a cold sync on a runtime does.
+            f"__import__('time').sleep({SYNC_FLOOR_S})\n"
         )
         assert marker in source
         return source.replace(marker, link + marker, 1)
