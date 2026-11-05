@@ -23,6 +23,14 @@ jobs:
         run: uv run ruff check letify tests
       - name: Test
         run: uv run pytest -q
+      - name: Disk use
+        if: always()
+        run: |
+          df -h
+          df -i
+          quota -s 2>/dev/null || true
+          du -sh /tmp/pytest-of-* 2>/dev/null || true
+          du -k --max-depth=4 /tmp/pytest-of-* 2>/dev/null | sort -rn | head -15 || true
 
   extension:
     runs-on: ubuntu-latest
