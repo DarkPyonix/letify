@@ -154,13 +154,27 @@ class NoBlake3Local(Local):
         return PersistentChannel([sys.executable, "-u", "-c", hide + BOOTSTRAP], name=runtime.name)
 
 
+@pytest.fixture(scope="session")
+def shared_uv_dirs(tmp_path_factory: pytest.TempPathFactory) -> dict[str, str]:
+    """One uv cache and one managed-Python directory for every sync a test worker runs.
+
+    The runtime points uv at a cache and a Python directory under its own root, so each
+    test that syncs would otherwise download and unpack a whole CPython (about 108 MB) and
+    start a cold cache, which filled the CI runner's disk quota. One directory per xdist
+    worker bounds the total at the worker count times one interpreter.
+    """
+    root = tmp_path_factory.mktemp("shared-uv")
+    return {"UV_CACHE_DIR": str(root / "cache"), "UV_PYTHON_INSTALL_DIR": str(root / "python")}
+
+
 @pytest.fixture
-def uv_project(tmp_path: Path, monkeypatch) -> Path:
+def uv_project(tmp_path: Path, monkeypatch, shared_uv_dirs: dict[str, str]) -> Path:
     """A tiny uv project that depends on this checkout of letify, locked with the real uv.
 
     The working directory moves into it, so a default ``Env()`` names its ``uv.lock``. The
     runtime's project root moves under the test's temporary directory, so a sync through
-    PreparingLocal never writes into the developer's home.
+    PreparingLocal never writes into the developer's home. The sync shares one uv cache
+    and one Python directory with every other test on the worker, see ``shared_uv_dirs``.
     """
     import shutil
 
@@ -187,6 +201,26 @@ def uv_project(tmp_path: Path, monkeypatch) -> Path:
     if locked.returncode != 0:  # pragma: no cover - only a machine with a cold uv cache
         subprocess.run([uv, "lock"], cwd=project, capture_output=True, check=True)
     monkeypatch.chdir(project)
+    real_sync_source = bootstrap.sync_source
+    marker = "_letify_command = [_letify_uv] +"
+
+    def shared_sync_source(*args: Any, **kwargs: Any) -> str:
+        # Replace the directories the runtime chose with links to the shared ones just
+        # before the sync runs, so the script and the paths it names are the ones
+        # production uses and only where the bytes land differs.
+        source = real_sync_source(*args, **kwargs)
+        link = (
+            f"for _k, _shared in {shared_uv_dirs!r}.items():\n"
+            "    _d = _letify_uv_env.get(_k)\n"
+            "    if _d and not os.path.lexists(_d):\n"
+            "        os.makedirs(_shared, exist_ok=True)\n"
+            "        os.makedirs(os.path.dirname(_d), exist_ok=True)\n"
+            "        os.symlink(_shared, _d)\n"
+        )
+        assert marker in source
+        return source.replace(marker, link + marker, 1)
+
+    monkeypatch.setattr(bootstrap, "sync_source", shared_sync_source)
     monkeypatch.setattr(bootstrap, "DEFAULT_WORKSPACE_ROOT", str(tmp_path / "runtime-workspace"))
     # The automatic environment archive store lives under the user's own ~/.letify, so
     # without this an archive a previous run published is found and a test that expects a
