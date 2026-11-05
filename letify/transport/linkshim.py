@@ -459,7 +459,7 @@ class Shim:
             "public_ip": command.get("public_ip", "127.0.0.1"),
             "listener": self.listener,
         }
-        for key in ("udp", "observers", "lead_ms", "window_ms"):
+        for key in ("udp", "observers", "lead_ms", "window_ms", "answer_margin_ms"):
             if key in command:
                 request[key] = command[key]
         try:

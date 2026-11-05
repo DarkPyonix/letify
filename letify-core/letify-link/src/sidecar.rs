@@ -1209,6 +1209,10 @@ async fn op_punch(shared: &Arc<Shared>, req: &Value) -> OpResult {
     };
     let lead = opt_u64(req, "lead_ms", DEFAULT_LEAD_MS)?;
     let window = opt_u64(req, "window_ms", DEFAULT_WINDOW_MS)?;
+    let answer_margin = match req.get("answer_margin_ms") {
+        None | Some(Value::Null) => None,
+        Some(_) => Some(u64_field(req, "answer_margin_ms")?),
+    };
     let acceptor = if initiator {
         None
     } else {
@@ -1310,18 +1314,10 @@ async fn op_punch(shared: &Arc<Shared>, req: &Value) -> OpResult {
             .map_or(NatType::Unknown, |(_, e)| e.nat);
         policed_by_offer = police.is_some();
         if let (Some(o), Some((a, _))) = (&tcp_offer, &answers.tcp) {
-            tcp_terms = Some((
-                a.mappings.clone(),
-                o.token,
-                Plan::of(o).with_peer_until(a.until_ms),
-            ));
+            tcp_terms = Some((a.mappings.clone(), o.token, Plan::of(o).with_answer(a)));
         }
         if let (Some(o), Some((a, _))) = (&udp_offer, &answers.udp) {
-            udp_terms = Some((
-                a.mappings.clone(),
-                o.token,
-                Plan::of(o).with_peer_until(a.until_ms),
-            ));
+            udp_terms = Some((a.mappings.clone(), o.token, Plan::of(o).with_answer(a)));
         }
     } else {
         let offers = await_offers(
@@ -1340,22 +1336,29 @@ async fn op_punch(shared: &Arc<Shared>, req: &Value) -> OpResult {
             .next()
             .map_or(NatType::Unknown, |(_, e)| e.nat);
         policed_by_offer = offers.tcp.iter().chain(&offers.udp).any(|(_, e)| e.police);
+        // The start this side names, once, so TCP and UDP answers agree.
+        let named_start = answer_margin.map(|m| punch::now_ms() + m);
         for (terms, maps, slot) in [
             (&offers.tcp, &own.tcp_maps, &mut tcp_terms),
             (&offers.udp, &own.udp_maps, &mut udp_terms),
         ] {
             let Some((o, e)) = terms else { continue };
-            let answer = Punch {
+            let mut answer = Punch {
                 proto: o.proto,
                 token: o.token,
                 start_at_ms: o.start_at_ms,
                 until_ms: o.until_ms,
                 mappings: maps.clone(),
             };
+            if let Some(start) = named_start.filter(|s| *s < o.start_at_ms) {
+                answer.until_ms = start + (o.until_ms - o.start_at_ms);
+                answer.start_at_ms = start;
+            }
+            let plan = Plan::of(&answer);
             send_message(rdv, peer, &Message::PunchAnswerExt(answer, ext(e.police)))
                 .await
                 .map_err(|e| infra(e.to_string()))?;
-            *slot = Some((o.mappings.clone(), o.token, Plan::of(o)));
+            *slot = Some((o.mappings.clone(), o.token, plan));
         }
     }
 

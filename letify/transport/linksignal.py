@@ -803,7 +803,15 @@ class SignalAgent:
         if op == "rendezvous":
             return {"op": "rendezvous", "from": sender, "message": command.get("message", "")}
         if op == "punch":
-            allowed = ("sockets", "udp", "observers", "public_ip", "lead_ms", "window_ms")
+            allowed = (
+                "sockets",
+                "udp",
+                "observers",
+                "public_ip",
+                "lead_ms",
+                "window_ms",
+                "answer_margin_ms",
+            )
             return {
                 "op": "punch",
                 "peer": sender,

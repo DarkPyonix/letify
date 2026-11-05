@@ -57,6 +57,16 @@ impl Plan {
         }
     }
 
+    /// Adopt the times of the peer's answer: the earlier start, so a responder that names its
+    /// own start is not waited for until the offered one, and the earlier stop. An answer that
+    /// repeats the offer changes nothing.
+    pub fn with_answer(self, answer: &Punch) -> Plan {
+        Plan {
+            start_at_ms: self.start_at_ms.min(answer.start_at_ms),
+            until_ms: self.until_ms.min(answer.until_ms),
+        }
+    }
+
     /// Merge the sender's plan with the peer's reported stop: both sides stop at the earlier
     /// `until`, so neither spends a window the other has already closed.
     pub fn with_peer_until(self, peer_until_ms: u64) -> Plan {

@@ -50,6 +50,8 @@ RETRY_WINDOW_FACTOR = 3
 #: The least lead a punch gets, in milliseconds, and how many bootstrap round trips it is.
 PUNCH_LEAD_FLOOR_MS = 2000
 PUNCH_LEAD_ROUND_TRIPS = 3
+#: The least time, in milliseconds, between a responder's answer and the start it names.
+PUNCH_ANSWER_FLOOR_MS = 500
 #: Seconds the probe waits for every candidate of a session to join or be lost. Spec "Sidecar
 #: interface" item 8. A join takes a few round trips, so 10 s is many round trips of any link
 #: the floor admits.
@@ -94,6 +96,15 @@ def punch_lead_ms(rtt_s: float) -> int:
     and each crossing takes at most one round trip, so 3 leave a round trip of margin.
     """
     return max(PUNCH_LEAD_FLOOR_MS, math.ceil(round(PUNCH_LEAD_ROUND_TRIPS * rtt_s * 1000, 6)))
+
+
+def punch_answer_margin_ms(rtt_s: float) -> int:
+    """How long after it answers the responder names the start: one round trip, at least 0.5 s.
+
+    Spec "Sidecar interface" item 8. The answer needs at most one round trip to reach the
+    initiator, so a start named that far ahead is still ahead when the answer arrives.
+    """
+    return max(PUNCH_ANSWER_FLOOR_MS, math.ceil(round(rtt_s * 1000, 6)))
 
 
 class Bootstrap(Protocol):
@@ -914,6 +925,10 @@ def _punch(
         timing: dict[str, Any] = {}
         if window is not None:
             timing = {"lead_ms": punch_lead_ms(stream.rtt_s or 0.0), "window_ms": window}
+        # Only the responder reads the margin, and a shim of an older letify ignores it.
+        margin = {}
+        if window is not None:
+            margin = {"answer_margin_ms": punch_answer_margin_ms(stream.rtt_s or 0.0)}
         write(
             {
                 "op": "punch",
@@ -922,6 +937,7 @@ def _punch(
                 "udp": PUNCH_UDP,
                 **where,
                 **timing,
+                **margin,
             }
         )
         try:
@@ -1268,6 +1284,7 @@ __all__ = [
     "connect_signal",
     "letify_link_enabled",
     "prepare_binary",
+    "punch_answer_margin_ms",
     "punch_lead_ms",
     "settle_paths",
     "shim_path",

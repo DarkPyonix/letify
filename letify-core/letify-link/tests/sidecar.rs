@@ -912,6 +912,17 @@ async fn punch_pair(
     udp: u64,
     police: Option<Value>,
 ) -> (Sidecar, Sidecar, Value, Value, Value) {
+    punch_pair_timed(tcp, udp, police, 300, None).await
+}
+
+/// `punch_pair` with the initiator's `lead_ms` and the responder's `answer_margin_ms`.
+async fn punch_pair_timed(
+    tcp: u64,
+    udp: u64,
+    police: Option<Value>,
+    lead_ms: u64,
+    answer_margin_ms: Option<u64>,
+) -> (Sidecar, Sidecar, Value, Value, Value) {
     let servers = open_nat().await;
     let env = [("LETIFY_LINK_STUN", join_addrs(&servers))];
     let mut a = Sidecar::start_with(None, &env).await;
@@ -922,20 +933,32 @@ async fn punch_pair(
     let (a_id, b_id) = (a.node_id.clone(), b.node_id.clone());
     let mut init = json!({
         "op": "punch", "peer": b_id, "role": "initiator", "sockets": tcp, "udp": udp,
-        "observers": "default", "lead_ms": 300, "window_ms": 15000,
+        "observers": "default", "lead_ms": lead_ms, "window_ms": 15000,
     });
     if let Some(p) = police {
         init["police"] = p;
     }
-    let (ra, rb) = tokio::join!(
-        a.call(init),
-        b.call(json!({
-            "op": "punch", "peer": a_id, "role": "responder", "sockets": tcp, "udp": udp,
-            "observers": "default", "listener": l["listener"], "lead_ms": 300,
-            "window_ms": 15000,
-        })),
-    );
+    let mut resp = json!({
+        "op": "punch", "peer": a_id, "role": "responder", "sockets": tcp, "udp": udp,
+        "observers": "default", "listener": l["listener"], "lead_ms": lead_ms,
+        "window_ms": 15000,
+    });
+    if let Some(margin) = answer_margin_ms {
+        resp["answer_margin_ms"] = json!(margin);
+    }
+    let (ra, rb) = tokio::join!(a.call(init), b.call(resp));
     (a, b, ra, rb, l)
+}
+
+fn answers_of(sidecar: &Sidecar) -> Vec<Punch> {
+    sidecar
+        .sent
+        .iter()
+        .filter_map(|m| match Message::decode(m) {
+            Ok(Message::PunchAnswerExt(p, _)) => Some(p),
+            _ => None,
+        })
+        .collect()
 }
 
 async fn carries_a_stream(a: &mut Sidecar, b: &mut Sidecar, names: &[Value]) {
@@ -1267,4 +1290,51 @@ async fn several_udp_sockets_still_give_the_two_sides_one_working_path() {
         lost.is_empty(),
         "the UDP path was lost in rounds {lost:?} of 6"
     );
+}
+
+// -- The responder names the start (spec "Sidecar interface" item 7, Answer start) ------------
+
+#[tokio::test]
+async fn a_responder_that_names_a_start_makes_the_punch_begin_before_the_offered_lead() {
+    let begin = std::time::Instant::now();
+    let (a, b, ra, rb, _l) = punch_pair_timed(2, 0, None, 8000, Some(300)).await;
+    let took = begin.elapsed();
+    assert_eq!(ra["ok"], true, "{ra}");
+    assert_eq!(rb["ok"], true, "{rb}");
+    assert_eq!(ra["punched"].as_array().unwrap().len(), 2, "{ra}");
+    assert!(
+        took < Duration::from_secs(5),
+        "the punch took {took:?} with an 8 s lead"
+    );
+    let offer = &offers_of(&a)[0].0;
+    let answer = &answers_of(&b)[0];
+    assert!(
+        answer.start_at_ms + 5000 < offer.start_at_ms,
+        "start not moved earlier"
+    );
+    assert_eq!(
+        answer.until_ms - answer.start_at_ms,
+        offer.until_ms - offer.start_at_ms,
+        "the window is the offered one"
+    );
+}
+
+#[tokio::test]
+async fn a_responder_with_no_margin_repeats_the_offered_start() {
+    let (a, b, ra, rb, _l) = punch_pair_timed(1, 0, None, 700, None).await;
+    assert_eq!(ra["ok"], true, "{ra}");
+    assert_eq!(rb["ok"], true, "{rb}");
+    let offer = &offers_of(&a)[0].0;
+    let answer = &answers_of(&b)[0];
+    assert_eq!(answer.start_at_ms, offer.start_at_ms);
+    assert_eq!(answer.until_ms, offer.until_ms);
+}
+
+#[tokio::test]
+async fn a_margin_later_than_the_offered_start_does_not_delay_the_punch() {
+    let (a, b, ra, rb, _l) = punch_pair_timed(1, 0, None, 400, Some(30_000)).await;
+    assert_eq!(ra["ok"], true, "{ra}");
+    assert_eq!(rb["ok"], true, "{rb}");
+    let offer = &offers_of(&a)[0].0;
+    assert_eq!(answers_of(&b)[0].start_at_ms, offer.start_at_ms);
 }

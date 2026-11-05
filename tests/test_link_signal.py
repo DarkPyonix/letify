@@ -339,6 +339,10 @@ def test_the_agent_passes_only_the_ops_a_bootstrap_needs_and_pins_the_peer(
         a.node_id, {"op": "punch", "peer": "00" * 32, "sockets": 4, "command": "touch /tmp/x"}
     )
     assert punch == {"op": "punch", "peer": a.node_id, "sockets": 4}
+    timed = agent.shim_command(
+        a.node_id, {"op": "punch", "lead_ms": 3000, "answer_margin_ms": 1000, "x": 1}
+    )
+    assert timed == {"op": "punch", "peer": a.node_id, "lead_ms": 3000, "answer_margin_ms": 1000}
     rendezvous = agent.shim_command(
         a.node_id, {"op": "rendezvous", "from": "00" * 32, "message": "ab"}
     )
