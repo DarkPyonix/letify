@@ -250,6 +250,37 @@ def test_the_punch_lead_scales_with_the_measured_bootstrap_round_trip(
     assert linkchannel.punch_lead_ms(measured[1.2]) >= 3600
 
 
+def test_the_answer_margin_is_one_round_trip_with_a_floor_of_half_a_second() -> None:
+    assert linkchannel.punch_answer_margin_ms(0.1) == 500
+    assert linkchannel.punch_answer_margin_ms(0.5) == 500
+    assert linkchannel.punch_answer_margin_ms(2.5) == 2500
+    assert linkchannel.punch_answer_margin_ms(1.2345) == 1235
+
+
+def test_the_responder_is_told_the_answer_margin_with_every_punch_attempt(
+    sidecar_binary, isolated_home, tmp_path, monkeypatch
+) -> None:
+    monkeypatch.setattr(linkchannel, "POLICE", {"floor_bps": 1 << 50, "burst_ms": 200})
+    commands = FakeCommands(0.3, sidecar_binary)
+    provider = colab(tmp_path, commands, monkeypatch, link_binary=str(sidecar_binary))
+    sent: list[dict[str, Any]] = []
+    original = linkmailbox.MailboxBootstrap.send_line
+
+    def record(self, line):
+        text = line if isinstance(line, str) else line.decode()
+        if '"op": "punch"' in text:
+            sent.append(json.loads(text))
+        return original(self, line)
+
+    monkeypatch.setattr(linkmailbox.MailboxBootstrap, "send_line", record)
+    with pytest.raises(ProviderUnavailable):
+        provider.open_channel(runtime())
+    assert len(sent) == 2
+    for command in sent:
+        assert 500 <= command["answer_margin_ms"] <= command["lead_ms"]
+    provider.close_link(runtime())
+
+
 def test_a_missing_binary_on_the_runtime_fails_the_connect_naming_it(
     sidecar_binary, isolated_home, tmp_path, monkeypatch
 ) -> None:

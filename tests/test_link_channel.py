@@ -715,6 +715,20 @@ def load_shim() -> Any:
     return module
 
 
+def test_the_shim_hands_the_answer_margin_to_the_responders_punch() -> None:
+    shim = load_shim().Shim({"resume_s": 10, "wait_s": 60})
+    requests: list[dict[str, Any]] = []
+    shim.control = SimpleNamespace(request=lambda request: requests.append(request) or {})
+    shim.listener = 7
+    shim.emit = lambda **fields: None
+    shim.punch({"op": "punch", "peer": "ab", "lead_ms": 3000, "answer_margin_ms": 1000})
+    assert requests[0]["answer_margin_ms"] == 1000
+    assert requests[0]["role"] == "responder"
+    requests.clear()
+    shim.punch({"op": "punch", "peer": "ab", "lead_ms": 3000})
+    assert "answer_margin_ms" not in requests[0]
+
+
 def test_the_shim_leaves_when_no_session_has_a_path_for_the_resume_window() -> None:
     shim = load_shim().Shim({"resume_s": 10, "wait_s": 60})
     shim.started = time.monotonic()
