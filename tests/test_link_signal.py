@@ -885,3 +885,30 @@ def test_a_failure_on_a_new_connection_is_not_retried(daemons) -> None:
     client = linksignal.SignalClient(a, "http://127.0.0.1:9")
     with pytest.raises(linksignal.SignalError, match="did not answer"):
         client.send("0" * 64, b"x")
+
+
+class _SlowFirstPing(linksignal.SignalBootstrap):
+    """A bootstrap whose agent answers the first ping late, as a cold connection does."""
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self.sent: list[int] = []
+
+    def listen_only(self) -> None:
+        pass
+
+    def _send_json(self, line: dict[str, Any]) -> None:
+        number = int(line["id"])
+        self.sent.append(number)
+        delay = 0.4 if number == 1 else 0.02
+        threading.Timer(delay, self._pongs[number].set).start()
+
+
+def test_the_round_trip_is_measured_on_warm_connections_not_on_the_first_ping(
+    signal_service, daemons
+) -> None:
+    client = linksignal.SignalClient(daemons("a"), signal_service.url)
+    bootstrap = _SlowFirstPing(client, daemons("b").node_id)
+    bootstrap.start()
+    assert bootstrap.sent == [1, 2, 3]
+    assert bootstrap.rtt_s is not None and bootstrap.rtt_s < 0.2
