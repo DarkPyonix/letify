@@ -2411,6 +2411,9 @@ class FakeSignalService:
         with self._cond:
             self._closed = True
         self.drop_sockets()
+        # A keep-alive connection outlives server shutdown in its handler thread; a
+        # service that is gone answers on none of them.
+        self.drop_connections()
         self._server.shutdown()
         self._server.server_close()
 
