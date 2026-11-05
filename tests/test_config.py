@@ -505,3 +505,17 @@ def test_a_project_file_that_sets_a_workspace_is_refused(home_file, config_file)
     project = config_file('[lab]\nworkspace = "/workspace/me"\n')
     with pytest.raises(letify.ConfigError, match=r"workspace.*home"):
         load(project)
+
+
+def test_the_suite_cannot_reach_the_machines_own_letify_home() -> None:
+    # Spec "Materializing into a runtime": the environment archive goes to the Drive the
+    # machine configuration names. A test must never see that configuration, or an
+    # ephemeral sync publishes to a real account and a later run restores what an earlier
+    # one left there.
+    from letify import paths
+    from letify.config import drive_settings
+
+    assert paths.letify_root() == Path.home() / ".letify"
+    assert not list(Path.home().iterdir())
+    assert not paths.config_path().exists()
+    assert drive_settings() is None

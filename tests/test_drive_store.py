@@ -426,7 +426,7 @@ def test_a_restore_records_its_seconds_beside_the_build(
     finally:
         second.shutdown()
     seconds, size, restore = fake_drive.refs()[build_name].split()
-    assert float(seconds) > 0 and int(size) > 0
+    assert float(seconds) >= 1.0 and int(size) > 0
     assert float(restore) >= 0
 
 
