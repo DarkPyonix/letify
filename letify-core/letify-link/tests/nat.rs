@@ -270,6 +270,55 @@ async fn pump(
     let _ = to.shutdown().await;
 }
 
+/// A loopback proxy that holds every chunk for `one_way` in each direction, so a round trip
+/// through it takes twice that and bulk data is not limited.
+async fn delay_proxy(target: SocketAddr, one_way: Duration) -> SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        while let Ok((front, _)) = listener.accept().await {
+            tokio::spawn(async move {
+                let Ok(back) = TcpStream::connect(target).await else {
+                    return;
+                };
+                let (fr, fw) = front.into_split();
+                let (br, bw) = back.into_split();
+                tokio::join!(delayed(fr, bw, one_way), delayed(br, fw, one_way));
+            });
+        }
+    });
+    addr
+}
+
+async fn delayed(
+    mut from: tokio::net::tcp::OwnedReadHalf,
+    mut to: tokio::net::tcp::OwnedWriteHalf,
+    one_way: Duration,
+) {
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<(tokio::time::Instant, Vec<u8>)>();
+    let writer = tokio::spawn(async move {
+        while let Some((due, chunk)) = rx.recv().await {
+            tokio::time::sleep_until(due).await;
+            if to.write_all(&chunk).await.is_err() {
+                break;
+            }
+        }
+        let _ = to.shutdown().await;
+    });
+    let mut buf = vec![0u8; 16 * 1024];
+    while let Ok(n) = from.read(&mut buf).await {
+        if n == 0
+            || tx
+                .send((tokio::time::Instant::now() + one_way, buf[..n].to_vec()))
+                .is_err()
+        {
+            break;
+        }
+    }
+    drop(tx);
+    let _ = writer.await;
+}
+
 async fn responder() -> SocketAddr {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -316,4 +365,23 @@ async fn an_unthrottled_path_is_usable() {
         rates.up_bps > FLOOR as f64 && rates.down_bps > FLOOR as f64,
         "{rates:?}"
     );
+}
+
+/// Spec "NAT traversal" item 4: the round trips of the policing check decide no verdict, so
+/// they are few. At 80 ms a round trip, 30 of them take 2.4 s before the bursts start.
+#[tokio::test]
+async fn the_policing_check_of_an_80_ms_path_ends_within_a_second_and_a_half() {
+    let server = responder().await;
+    let proxy = delay_proxy(server, Duration::from_millis(40)).await;
+    let stream = TcpStream::connect(proxy).await.unwrap();
+    let began = std::time::Instant::now();
+    let verdict = policing::check(stream, FLOOR, Duration::from_millis(100))
+        .await
+        .unwrap();
+    let took = began.elapsed();
+    let Verdict::Usable(rates) = verdict else {
+        panic!("{verdict:?}")
+    };
+    assert!(rates.rtt >= Duration::from_millis(75), "{rates:?}");
+    assert!(took < Duration::from_millis(1500), "took {took:?}");
 }
