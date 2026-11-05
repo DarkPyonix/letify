@@ -79,6 +79,33 @@ def launcher_from(config_file):
     return build
 
 
+@pytest.fixture(autouse=True)
+def private_letify_home(monkeypatch, tmp_path: Path) -> Path:
+    """Give every test an empty home directory, so no test sees the machine's own ~/.letify.
+
+    Without this a test reads the accounts, tools and ``drive_login`` of the machine that
+    runs it. An ephemeral sync then publishes its environment archive to the developer's
+    real Drive, and a later run restores what an earlier one left. Only ``Path.home`` moves,
+    not the HOME variable, so subprocesses such as uv keep the real cache and interpreters.
+    The home is per test because the runs, leases and caches under it are state that tests
+    must not hand to one another. A test that patches ``Path.home`` or sets ``LETIFY_HOME``
+    itself overrides this, because its patch is applied after this fixture's. A test that
+    sets the HOME variable gets that directory back, as ``Path.home`` would give it.
+    """
+    real = os.environ.get("HOME")
+    home = tmp_path / "private-home"
+    home.mkdir()
+    monkeypatch.delenv("LETIFY_HOME", raising=False)
+    monkeypatch.delenv("LETIFY_CONFIG", raising=False)
+
+    def private(cls: type[Path]) -> Path:
+        current = os.environ.get("HOME")
+        return Path(current) if current != real else home
+
+    monkeypatch.setattr(Path, "home", classmethod(private))
+    return home
+
+
 @pytest.fixture
 def isolated_home(monkeypatch, tmp_path: Path) -> Path:
     """Point Path.home, "~" expansion and the working directory at empty directories.
