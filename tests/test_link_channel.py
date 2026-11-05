@@ -27,6 +27,8 @@ from letify.runtime.channel import PersistentChannel
 from letify.transport import linkchannel, linkd
 
 MIB = 1 << 20
+#: The probe the connect builds, taken before the autouse fixture swaps in a quick one.
+REAL_MAKE_PROBE = linkchannel.make_probe
 
 
 class LocalShell(Shell):
@@ -374,7 +376,9 @@ def test_a_session_at_the_floor_is_accepted() -> None:
 def test_a_connect_whose_probe_measures_below_the_floor_fails_and_closes(
     linked, monkeypatch
 ) -> None:
-    monkeypatch.setattr(linkchannel, "measure_session", lambda remote: measured(60.0, 0.5, 0.4))
+    monkeypatch.setattr(
+        linkchannel, "measure_session", lambda remote, min_bps=None: measured(60.0, 0.5, 0.4)
+    )
     with pytest.raises(ProviderUnavailable) as raised:
         linked.open_channel(runtime())
     text = str(raised.value)
@@ -383,7 +387,7 @@ def test_a_connect_whose_probe_measures_below_the_floor_fails_and_closes(
 
 
 def test_a_connect_whose_probe_cannot_run_fails_with_the_reason(linked, monkeypatch) -> None:
-    def broken(remote):
+    def broken(remote, min_bps=None):
         raise OSError("the probe responder answered out of order")
 
     monkeypatch.setattr(linkchannel, "measure_session", broken)
@@ -472,7 +476,9 @@ def test_the_connect_announces_nothing_when_announce_is_off(linked, capsys) -> N
 
 
 def test_a_rejected_session_announces_the_rejection(linked, capsys, monkeypatch) -> None:
-    monkeypatch.setattr(linkchannel, "measure_session", lambda remote: measured(60.0, 0.5, 0.4))
+    monkeypatch.setattr(
+        linkchannel, "measure_session", lambda remote, min_bps=None: measured(60.0, 0.5, 0.4)
+    )
     with pytest.raises(ProviderUnavailable):
         linked.open_channel(runtime())
     assert "lab letify-link: rejected, " in capsys.readouterr().err
@@ -922,3 +928,18 @@ def test_an_account_that_cannot_classify_its_nat_prints_the_nat_line_before_fail
     provider.close_link()
     nat = [line for line in capsys.readouterr().err.splitlines() if "letify-link: NAT " in line]
     assert nat and nat[0].split("letify-link: ")[1].startswith("NAT unknown here (cannot classify")
+
+
+def test_the_session_probe_ends_early_at_twice_the_account_floor() -> None:
+    """Spec "Choosing a link": the early stop is relative to the floor the account holds."""
+    probe = REAL_MAKE_PROBE(10.0 * MIB)
+    assert probe.early_bps == 20.0 * MIB
+    assert probe.min_round_trips == 10
+    assert (probe.round_trips, probe.seconds) == (30, 2.0)
+
+
+def test_a_session_probe_with_no_floor_never_ends_a_direction_early() -> None:
+    for floor in (None, 0.0):
+        probe = REAL_MAKE_PROBE(floor)
+        assert probe.early_bps is None
+        assert probe.min_round_trips == 10

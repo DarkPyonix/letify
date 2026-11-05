@@ -2312,7 +2312,9 @@ def quick_link_probe(monkeypatch):
         def warmup_for(self, rtt_ms: float) -> float:
             return 0.05
 
-    monkeypatch.setattr(linkchannel, "make_probe", lambda: Quick(round_trips=5, seconds=0.2))
+    monkeypatch.setattr(
+        linkchannel, "make_probe", lambda min_bps=None: Quick(round_trips=5, seconds=0.2)
+    )
 
 
 # -- the signalling service ----------------------------------------------------------------

@@ -262,6 +262,106 @@ def test_the_probe_discards_a_warm_up_transfer_in_each_direction() -> None:
     assert measured.download_bps > 0
 
 
+class _Counting:
+    """A stream to a real responder that records which ops the probe sent."""
+
+    def __init__(self, user: socket.socket):
+        self.user = user
+        self.ops: list[bytes] = []
+
+    def recv(self, size: int) -> bytes:
+        return self.user.recv(size)
+
+    def sendall(self, data: bytes) -> None:
+        if data[:1] in (b"P", b"U", b"D"):
+            self.ops.append(data[:1])
+        self.user.sendall(data)
+
+
+class _RoundTripClock:
+    """A clock whose first ``len(rtts_ms)`` round trips last exactly the given times.
+
+    The probe reads the clock twice per round trip, so the first calls alternate between a
+    start and a start plus the next round trip. After those it advances 10 ms per call.
+    """
+
+    def __init__(self, rtts_ms: list[float]):
+        self.rtts = [r / 1000.0 for r in rtts_ms]
+        self.calls = 0
+        self.now = 0.0
+
+    def __call__(self) -> float:
+        index, phase = divmod(self.calls, 2)
+        self.calls += 1
+        if index < len(self.rtts):
+            if phase == 0:
+                return self.now
+            self.now += self.rtts[index]
+            return self.now
+        self.now += 0.01
+        return self.now
+
+
+def _responder() -> socket.socket:
+    user, remote = socket.socketpair()
+    threading.Thread(target=nat.serve_probe, args=(remote,), daemon=True).start()
+    return user
+
+
+def test_the_round_trips_stop_at_ten_when_the_median_has_settled() -> None:
+    """Spec "Choosing a link": a steady round trip is not sampled thirty times."""
+    user = _responder()
+    stream = _Counting(user)
+    clock = _RoundTripClock([120.0] * 30)
+    Probe(round_trips=30, seconds=0.02, min_round_trips=10, clock=clock).measure(stream)
+    user.close()
+    assert stream.ops.count(b"P") == 10
+
+
+def test_the_round_trips_continue_to_thirty_while_the_median_keeps_moving() -> None:
+    """Spec "Choosing a link": a jittery link is sampled to the full thirty."""
+    user = _responder()
+    stream = _Counting(user)
+    # A round trip that keeps growing: the halves never agree at any length.
+    clock = _RoundTripClock([100.0 + 10.0 * i for i in range(30)])
+    Probe(round_trips=30, seconds=0.02, min_round_trips=10, clock=clock).measure(stream)
+    user.close()
+    assert stream.ops.count(b"P") == 30
+
+
+def test_a_probe_without_an_early_stop_takes_all_thirty_round_trips() -> None:
+    user = _responder()
+    stream = _Counting(user)
+    Probe(round_trips=30, seconds=0.02, clock=_RoundTripClock([120.0] * 30)).measure(stream)
+    user.close()
+    assert stream.ops.count(b"P") == 30
+
+
+def test_a_direction_well_above_the_floor_is_measured_for_one_window() -> None:
+    """Spec "Choosing a link": at least twice the floor ends the direction after one window."""
+    user = _responder()
+    stream = _Counting(user)
+    probe = Probe(round_trips=2, seconds=0.04, early_bps=1.0, early_window=0.02)
+    probe.warmup_for = lambda _rtt_ms: 0.02
+    measured = probe.measure(stream)
+    user.close()
+    assert stream.ops[2:] == [b"U", b"U", b"D", b"D"]
+    assert measured.upload_bps > 0 and measured.download_bps > 0
+
+
+def test_a_direction_under_twice_the_floor_is_measured_for_the_full_window() -> None:
+    """Spec "Choosing a link": a rate near the floor is judged on the same 2 s as before."""
+    user = _responder()
+    stream = _Counting(user)
+    probe = Probe(round_trips=2, seconds=0.04, early_bps=1e18, early_window=0.02)
+    probe.warmup_for = lambda _rtt_ms: 0.02
+    measured = probe.measure(stream)
+    user.close()
+    # A warm-up and two window segments each way.
+    assert stream.ops[2:] == [b"U", b"U", b"U", b"D", b"D", b"D"]
+    assert measured.upload_bps > 0 and measured.download_bps > 0
+
+
 def test_a_responder_asked_to_bridge_stops_answering_the_probe() -> None:
     user, remote = socket.socketpair()
     user.sendall(b"B")
