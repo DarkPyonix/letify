@@ -396,11 +396,11 @@ dependencies = [
 
 [[package]]
 name = "letify"
-version = "2.11.3"
+version = "2.11.4"
 
 [[package]]
 name = "letify-link"
-version = "2.11.3"
+version = "2.11.4"
 dependencies = [
  "ed25519-dalek",
  "getrandom 0.2.17",
@@ -416,7 +416,7 @@ dependencies = [
 
 [[package]]
 name = "letify-quic"
-version = "2.11.3"
+version = "2.11.4"
 dependencies = [
  "quinn",
  "rcgen",
