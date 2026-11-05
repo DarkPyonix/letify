@@ -2,7 +2,7 @@
 //! it. It owns the check protocol (a client side and a responder side) and the verdict. It does
 //! not own the floor, which the caller supplies, nor the decision to reject the path.
 //!
-//! The client runs 30 round trips, then a bulk burst up and a bulk burst down, each for the
+//! The client runs 5 round trips, then a bulk burst up and a bulk burst down, each for the
 //! burst time. Bulk data moves in frames of [`CHUNK`] bytes with at most [`WINDOW`] bytes
 //! unacknowledged, so a path that delivers little is measured within a bounded wait instead of
 //! after its whole buffer drains. A stream that was reported as policed is not reusable.
@@ -16,8 +16,9 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, split};
 use tokio::sync::Semaphore;
 use tokio::time::{Instant, timeout};
 
-/// Round trips measured before the bulk burst.
-pub const ROUND_TRIPS: usize = 30;
+/// Round trips measured before the bulk burst. They only report the path's round trip and
+/// show that it answers; the verdict comes from the bursts.
+pub const ROUND_TRIPS: usize = 5;
 /// Default time of each bulk burst.
 pub const BURST: Duration = Duration::from_secs(1);
 /// Bytes per bulk frame.
@@ -36,7 +37,7 @@ const END: u8 = b'E';
 /// What the check measured.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Rates {
-    /// Median round trip over the 30 pings.
+    /// Median round trip over the [`ROUND_TRIPS`] pings.
     pub rtt: Duration,
     /// Delivered upload rate in bytes per second.
     pub up_bps: f64,
