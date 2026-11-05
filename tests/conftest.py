@@ -1278,8 +1278,11 @@ class FakeDriveServer:
             if len(session["body"]) >= session["size"]:
                 identifier = self._new_id()
                 self.files[identifier] = {
-                    **session["meta"], "id": identifier, "content": session["body"],
-                    "folder": False, "trashed": False,
+                    **session["meta"],
+                    "id": identifier,
+                    "content": session["body"],
+                    "folder": False,
+                    "trashed": False,
                 }
                 session["id"] = identifier
             if glitch == "drop-after-store":
@@ -2375,9 +2378,21 @@ class FakeSignalService:
         self.answer_pings = True
         #: Set by ``close``, so a WebSocket still in its handshake is cut once it registers.
         self._closed = False
+        #: TCP connections accepted, and the ones still open (for ``drop_connections``).
+        self.connections = 0
+        self._open: list[Any] = []
         service = self
 
         class Handler(http.server.BaseHTTPRequestHandler):
+            # Keep-alive, as the Cloudflare edge serves it.
+            protocol_version = "HTTP/1.1"
+
+            def setup(self) -> None:
+                super().setup()
+                with service._cond:
+                    service.connections += 1
+                    service._open.append(self.connection)
+
             def log_message(self, *args: Any) -> None:
                 pass
 
@@ -2396,8 +2411,19 @@ class FakeSignalService:
         with self._cond:
             self._closed = True
         self.drop_sockets()
+        # A keep-alive connection outlives server shutdown in its handler thread; a
+        # service that is gone answers on none of them.
+        self.drop_connections()
         self._server.shutdown()
         self._server.server_close()
+
+    def drop_connections(self) -> None:
+        """Close every open HTTP connection from the server side, as an idle timeout does."""
+        with self._cond:
+            open_now, self._open = self._open, []
+        for conn in open_now:
+            with contextlib.suppress(OSError):
+                conn.shutdown(socket.SHUT_RDWR)
 
     def drop_sockets(self) -> None:
         """Cut every open WebSocket without a close frame, as a network failure does."""
