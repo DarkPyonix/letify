@@ -767,7 +767,7 @@ def connect_over(
         )
         began = clock()
         try:
-            result = measure_session(remote)
+            result = measure_session(remote, min_bps)
         except (OSError, EOFError, RuntimeFailure, linkd.LinkError) as error:
             remote.close()
             raise _fail(alias, f"cannot measure the session: {error}") from error
@@ -1009,12 +1009,24 @@ def attach(
     )
 
 
-def make_probe() -> Probe:
-    """The probe of Spec "Choosing a link": 30 round trips, a discarded warm-up, 2 s each way."""
-    return Probe()
+#: Round trips the session probe takes at least, and the share of the floor a direction must
+#: reach to end after its first window. Spec "Choosing a link".
+SESSION_MIN_ROUND_TRIPS = 10
+EARLY_FLOOR_FACTOR = 2.0
 
 
-def measure_session(remote: LinkRemote) -> ProbeResult:
+def make_probe(min_bps: float | None = None) -> Probe:
+    """The session probe of Spec "Choosing a link": up to 30 round trips, a discarded warm-up
+    and up to 2 s each way, each stage ended early on evidence.
+
+    A direction ends early only at ``EARLY_FLOOR_FACTOR`` times ``min_bps``. With no floor
+    there is nothing to be well above, so every direction runs its full window.
+    """
+    early = EARLY_FLOOR_FACTOR * min_bps if min_bps else None
+    return Probe(min_round_trips=SESSION_MIN_ROUND_TRIPS, early_bps=early)
+
+
+def measure_session(remote: LinkRemote, min_bps: float | None = None) -> ProbeResult:
     """Run the bulk probe over the session on a dedicated ``probe`` stream of the shim.
 
     The stream is in the bulk class, so the rates are the session's, summed over its subflows.
@@ -1023,7 +1035,7 @@ def measure_session(remote: LinkRemote) -> ProbeResult:
     sock = remote.open_stream("bulk")
     try:
         sock.sendall(stream_header("probe", secrets.token_hex(8)))
-        return make_probe().measure(sock)
+        return make_probe(min_bps).measure(sock)
     finally:
         with contextlib.suppress(OSError):
             sock.close()
