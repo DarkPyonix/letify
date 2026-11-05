@@ -49,8 +49,10 @@ MAX_WAIT_S = 600
 MAX_RESUME_S = 3600
 DEFAULT_WAIT_S = 120
 DEFAULT_RESUME_S = 30
-#: Pings sent before the shim config, and how many of their round trips are kept.
-PINGS = 2
+#: Pings sent before the shim config.
+PINGS = 3
+#: Pings sent and not timed: the first pays the one-time TCP and TLS set-up of both connections.
+WARM_PINGS = 1
 #: The ops of a bootstrap line that the agent passes to the shim.
 SHIM_OPS = ("rendezvous", "punch", "handover")
 #: Bounds of the WebSocket keepalive, in seconds. See ``linkwebsocket``.
@@ -580,7 +582,10 @@ class SignalBootstrap:
             self._thread.start()
 
     def start(self) -> None:
-        """Start reading, ping the agent twice to measure the round trip, or raise."""
+        """Start reading, ping the agent to measure the round trip on warm connections, or raise.
+
+        Spec "Signalling service" item 8. The first ping warms the connections and is not timed.
+        """
         self.listen_only()
         samples: list[float] = []
         for number in range(1, PINGS + 1):
@@ -594,7 +599,8 @@ class SignalBootstrap:
                     f"the agent {self._peer[:12]} did not answer in {self._ping_timeout_s:.0f} s"
                     + (f": {self.stderr_text()}" if self._notes else "")
                 )
-            samples.append(time.monotonic() - began)
+            if number > WARM_PINGS:
+                samples.append(time.monotonic() - began)
         self.rtt_s = max(samples)
 
     def _note(self, text: str) -> None:
