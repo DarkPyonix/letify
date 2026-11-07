@@ -103,7 +103,9 @@ def test_closing_before_the_hand_over_ends_the_pump_the_shim_and_the_sidecar(
     assert wait_until(lambda: not os.path.exists(directory))
 
 
-def test_a_pump_that_no_call_reaches_ends_its_runtime_side(sidecar_binary, peer_id, monkeypatch) -> None:
+def test_a_pump_that_no_call_reaches_ends_its_runtime_side(
+    sidecar_binary, peer_id, monkeypatch
+) -> None:
     source = linkmailbox.pump_source().replace("IDLE_S = 120.0", "IDLE_S = 1.0")
     monkeypatch.setattr(linkmailbox, "pump_source", lambda: source)
     before = sidecars(sidecar_binary)
