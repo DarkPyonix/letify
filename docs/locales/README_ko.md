@@ -295,10 +295,10 @@ Kaggle 선언에는 `host=letify.remote`를 써야 합니다. Kaggle은 인바�
 
 1. 머신 주소로 바로 SSH
 2. TCP 홀펀칭, 양쪽이 모두 NAT 뒤에 있을 때
-3. [Tailcat](https://github.com/tailscale/tailcat)으로 UDP 홀펀칭한 뒤 그 위로 SSH
+3. 홀펀칭한 UDP 쌍 위의 QUIC, 그 위로 SSH
 4. 프로바이더 자체 경로, 예를 들어 `colab exec`와 Colab 파일 API
 
-번호가 낮은 방법이 이깁니다. 다만 연결된 방법 중 가장 빠른 것보다 훨씬 느리면 탈락합니다. 이긴 방법은 계정과 네트워크별로 기억해 두고, 다음 연결에서 먼저 시도합니다. NAT 뒤에 있는 머신은 letify를 설치한 뒤 그 머신에서 `letify agent serve`를 한 번 실행하면 letify가 접속할 수 있고, SSH 서버도 Tailcat도 필요 없습니다. `letify client shell connect`로 만든 계정은 3.0까지 Tailcat으로 계속 동작하고, 그때 Tailcat이 제거된다는 안내를 출력합니다. 그 머신의 SSH 서버가 Docker의 `-p 30501:8022`처럼 다른 포트로 외부에도 열려 있다면 `letify client shell connect --ssh-port 8022 --public-address <host> --public-port 30501`로 실행합니다. 그러면 주소로 바로 하는 SSH는 30501 포트로 접속하고, 홀펀칭과 Tailcat은 계속 8022를 씁니다. 이미 있는 계정에는 `letify login tunnel <alias> --address <host> --public-port 30501`로 같은 값을 설정합니다. Colab과 Elice는 이 단계가 아예 필요 없습니다. 프로바이더 계층이 각 서비스의 API로 머신을 만들고 여는 과정이 `letify client shell connect`를 대신하기 때문입니다. Modal은 자체 API로 연결하므로 여기에 해당하지 않습니다.
+번호가 낮은 방법이 이깁니다. 다만 연결된 방법 중 가장 빠른 것보다 훨씬 느리면 탈락합니다. 이긴 방법은 계정과 네트워크별로 기억해 두고, 다음 연결에서 먼저 시도합니다. NAT 뒤에 있는 머신은 letify를 설치한 뒤 그 머신에서 `letify agent serve`를 한 번 실행하면 letify가 접속할 수 있고, SSH 서버가 필요 없습니다. Tailcat은 제거되었고, `tailcat`을 적은 계정은 `letify agent serve`로 옮기는 방법과 함께 거부됩니다. 머신의 SSH 서버가 Docker의 `-p 30501:8022`처럼 다른 포트로 외부에 열려 있다면 `letify login tunnel <alias> --address <host> --public-port 30501`로 기록합니다. 그러면 주소로 바로 하는 SSH는 30501 포트로 접속하고, 홀펀칭은 계속 8022를 씁니다. Colab과 Elice는 에이전트가 아예 필요 없습니다. 프로바이더 계층이 각 서비스의 API로 머신을 만들고 엽니다. Modal은 자체 API로 연결하므로 여기에 해당하지 않습니다.
 
 **여러 계정을 정식으로 지원합니다.** 설정 항목 하나가 계정 하나이고, 같은 종류를 여러 개 둘 수 있습니다. Colab 계정이 두 개면 동시 세션도 두 배가 됩니다.
 
@@ -465,8 +465,7 @@ def test_train_returns_a_loss():
 letify login shell lab # 계정을 등록하고, 이 저장소에서 참조
 letify logout lab     # 이 머신에서 계정 제거
 letify agent serve           # NAT 뒤 머신에서 실행해, letify가 접속할 수 있게 함
-letify client shell connect  # 같은 일의 Tailcat 방식, 3.0에서 제거
-letify setup tailcat  # 배포처에서 tailcat 또는 eci를 미리 설치
+letify setup eci  # 배포처에서 eci를 미리 설치
 letify providers      # 선언된 프로바이더, 저장소 수명, 기본 배치
 letify devices           # 각자 제공하는 GPU
 letify status         # 지금 돌고 있는 것
