@@ -231,7 +231,7 @@ async fn a_version_refusal_is_the_status_and_the_range_and_no_text() {
     ));
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_replayed_first_handshake_message_yields_no_session() {
     let a = Identity::generate();
     let b = Identity::generate();

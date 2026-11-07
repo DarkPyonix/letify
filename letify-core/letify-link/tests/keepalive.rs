@@ -52,7 +52,7 @@ async fn gated_pair() -> (Session, Session, Gate) {
     (initiator, responder.await.unwrap().unwrap(), gate)
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(start_paused = true)]
 async fn an_idle_subflow_stays_alive_on_keepalives() {
     let (a, b, _gate) = gated_pair().await;
     // Six intervals pass with no application traffic; each side sees records all along.
@@ -61,7 +61,7 @@ async fn an_idle_subflow_stays_alive_on_keepalives() {
     assert_eq!(b.subflow_count(), 1);
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(start_paused = true)]
 async fn a_dead_subflow_is_detected_by_missed_keepalives() {
     let (a, b, gate) = gated_pair().await;
     tokio::time::sleep(Duration::from_millis(100)).await;
@@ -78,7 +78,7 @@ async fn a_dead_subflow_is_detected_by_missed_keepalives() {
     drop(b);
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(start_paused = true)]
 async fn a_pong_gives_each_subflow_a_round_trip_estimate() {
     let (a, _b, _gate) = gated_pair().await;
     tokio::time::sleep(Duration::from_millis(200)).await;
@@ -88,7 +88,7 @@ async fn a_pong_gives_each_subflow_a_round_trip_estimate() {
     assert!(rtt < Duration::from_millis(500), "rtt {rtt:?}");
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(start_paused = true)]
 async fn a_zero_interval_turns_keepalives_off() {
     let cfg = Config {
         keepalive_interval: Duration::ZERO,
@@ -100,7 +100,7 @@ async fn a_zero_interval_turns_keepalives_off() {
     assert!(a.subflow_stats()[0].rtt.is_none());
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(start_paused = true)]
 async fn a_peer_with_a_longer_keepalive_interval_is_not_declared_dead() {
     // The peer pings every 400 ms, so the dead time of both sides is 3 x 400 ms = 1200 ms,
     // not 3 x 50 ms = 150 ms.
@@ -122,7 +122,7 @@ async fn a_peer_with_a_longer_keepalive_interval_is_not_declared_dead() {
     drop(b);
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(start_paused = true)]
 async fn a_peer_with_keepalives_off_leaves_the_dead_time_to_our_interval() {
     let (a, b, gate) = mixed_pair(50, 0).await;
     tokio::time::sleep(Duration::from_millis(300)).await;
@@ -138,7 +138,7 @@ async fn a_peer_with_keepalives_off_leaves_the_dead_time_to_our_interval() {
     drop(b);
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(start_paused = true)]
 async fn when_both_sides_advertise_zero_only_transport_errors_kill_a_subflow() {
     let (a, b, gate) = mixed_pair(0, 0).await;
     gate.close();

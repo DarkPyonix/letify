@@ -136,7 +136,15 @@ async fn a_punched_udp_candidate_has_a_gauge_through_the_path_manager() {
         std::time::Instant::now(),
         Some(pm.kinds()),
     );
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    // Wait for the first trace line instead of a fixed time, so a stalled scheduler cannot
+    // leave the file empty when it is read.
+    timeout(Duration::from_secs(30), async {
+        while std::fs::read_to_string(&file).map_or(true, |t| t.lines().next().is_none()) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the trace wrote a line");
     task.abort();
     // abort takes effect at the task's next await, so a line it is writing on another worker
     // thread would recreate the file while the directory is being removed.
