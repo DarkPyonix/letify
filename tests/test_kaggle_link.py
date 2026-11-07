@@ -22,7 +22,6 @@ def test_kaggle_races_the_strategies_that_need_no_address() -> None:
     names = [s.name for s in kaggle().strategies()]
     assert "direct_ssh" not in names
     assert "tcp_punch" in names
-    assert "quic" in names
     assert names[-1] == "fallback" or "fallback" not in names
 
 

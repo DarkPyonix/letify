@@ -1003,8 +1003,7 @@ def test_a_plain_shell_lists_the_default_strategies_in_rank_order() -> None:
         ("direct_ssh", 1),
         ("connect_back", 2),
         ("tcp_punch", 3),
-        ("quic", 4),
-        ("fallback", 5),
+        ("fallback", 4),
     ]
 
 
@@ -1015,7 +1014,6 @@ def test_an_account_that_turns_port_mapping_off_does_not_race_connect_back() -> 
     assert [s.name for s in provider.strategies()] == [
         "direct_ssh",
         "tcp_punch",
-        "quic",
         "fallback",
     ]
 
@@ -1028,7 +1026,7 @@ def test_a_shell_with_no_rendezvous_is_reached_by_forward_ssh_alone(patch_run) -
     assert recorder.calls == []
 
 
-def test_reverse_ssh_takes_rank_five_and_moves_the_fallback_to_six() -> None:
+def test_reverse_ssh_takes_rank_four_and_moves_the_fallback_to_five() -> None:
     provider = provider_of(
         Shell,
         "lab",
@@ -1036,8 +1034,8 @@ def test_reverse_ssh_takes_rank_five_and_moves_the_fallback_to_six() -> None:
         reverse_ssh={"address": "home.example.com", "port": 2222, "user": "me"},
     )
     assert [(s.name, s.rank) for s in provider.strategies()][-2:] == [
-        ("reverse_ssh", 5),
-        ("fallback", 6),
+        ("reverse_ssh", 4),
+        ("fallback", 5),
     ]
 
 
@@ -1054,7 +1052,6 @@ def test_colab_races_without_forward_ssh(isolated_home, patch_which) -> None:
     assert [s.name for s in provider.strategies()] == [
         "connect_back",
         "tcp_punch",
-        "quic",
         "fallback",
     ]
 

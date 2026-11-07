@@ -495,7 +495,6 @@ def test_the_wheel_extraction_names_the_sidecar_binary() -> None:
     source = install.remote_link_source("2.10.2")
     assert "letify/remoting/lib/letify-link" in source and "LETIFY-LINK" in source
     assert "letify-quic" not in source and "LETIFY-QUIC" not in source
-    assert "LETIFY-QUIC" in install.remote_quic_source("2.10.2")
 
 
 # -- Gap 1: the transfer decision reads the session ---------------------------------
