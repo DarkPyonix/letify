@@ -35,7 +35,7 @@ LOCAL = '[a]\nkind = "local"\n'
 #: worker's own status, as ssh passes on the status of the remote command.
 PROXY = textwrap.dedent(
     """
-    import os, signal, subprocess, sys, threading
+    import os, signal, subprocess, sys, threading, time
 
     signal.signal(signal.SIGTERM, lambda *_: os._exit(255))
     worker = subprocess.Popen(
@@ -64,6 +64,9 @@ PROXY = textwrap.dedent(
         data = os.read(worker.stdout.fileno(), 65536)
         if not data:
             break
+        # A test can hold what is on its way to the owner, as a link that stalls does.
+        while os.path.exists(os.environ.get("LETIFY_TEST_HOLD", "/nonexistent-hold")):
+            time.sleep(0.01)
         os.write(1, data)
     sys.exit(worker.wait())
     """
@@ -191,6 +194,42 @@ def test_a_call_whose_channel_broke_is_adopted_again_and_returns_its_value(
     assert "during the gap" in captured.out
     assert f"during {run}; reattaching (attempt 1)" in captured.err
     assert f"letify: reattached to {run} on " in captured.err
+
+
+def test_output_the_broken_link_never_delivered_is_replayed_on_reattach(
+    let, tmp_path, capfd, monkeypatch
+) -> None:
+    hold = tmp_path / "hold"
+    monkeypatch.setenv("LETIFY_TEST_HOLD", str(hold))
+    ready, stop = tmp_path / "ready", tmp_path / "stop"
+
+    @let.function(device=let.providers.a.CPU, host=letify.remote, retries=1)
+    def train(hold_file: str, ready_file: str, stop_file: str) -> int:
+        import os
+        import time
+        from pathlib import Path
+
+        # The link stalls first, so the line is written into it and never read by the owner.
+        Path(hold_file).touch()
+        print("before the gap", flush=True)
+        Path(ready_file).touch()
+        while not os.path.exists(stop_file):
+            time.sleep(0.02)
+        print("during the gap", flush=True)
+        return 7
+
+    call = Running(train, str(hold), str(ready), str(stop))
+    until(ready.exists, "the body to start")
+    time.sleep(0.3)
+    cut_the_link(let)
+    hold.unlink()
+    stop.touch()
+    call.join()
+    assert call.error is None
+    assert call.value == 7
+    out = capfd.readouterr().out
+    assert out.count("before the gap") == 1
+    assert out.index("before the gap") < out.index("during the gap")
 
 
 def test_a_reattached_call_goes_on_renewing_the_lease_over_the_new_channel(let, tmp_path) -> None:
