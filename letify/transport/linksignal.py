@@ -755,6 +755,7 @@ class SignalAgent:
         bind: str = "0.0.0.0:0",
         worker_command: str | None = None,
         relay_command: str | None = None,
+        ssh_target: str | None = None,
     ) -> None:
         if version is None:
             import letify
@@ -773,6 +774,9 @@ class SignalAgent:
             self._own["worker_command"] = worker_command
         if relay_command:
             self._own["relay_command"] = relay_command
+        if ssh_target:
+            # The agent's own choice; no line from a paired node can name the target.
+            self._own["ssh_target"] = ssh_target
         self._version = version
         self._stop = threading.Event()
         self._session: _Session | None = None

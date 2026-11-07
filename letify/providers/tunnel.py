@@ -99,6 +99,17 @@ class Tunnel(Shell):
             say=printer(self.announce),
         )
 
+    def ssh_forward(self, runtime: Any = None, port: int = 0) -> Any:
+        """A loopback port that reaches the agent machine's sshd, on an agent account.
+
+        Spec "Sidecar interface" item 11. Connect with ``ssh -p <forward.port> <user>@127.0.0.1``.
+        """
+        if self.agent is None:
+            raise ProviderUnavailable(
+                self.kind, f"{self.alias} names no agent, so it has no session to forward over"
+            )
+        return self.link_remote(runtime).forward_ssh(port)
+
     def _run_helper(self, argv: list[str], timeout: float) -> subprocess.CompletedProcess[str]:
         if self.agent is not None:
             self.link_remote(None)

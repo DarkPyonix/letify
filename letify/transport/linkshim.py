@@ -100,6 +100,22 @@ def serve_probe(sock):
             pass
 
 
+def pump_ssh(source, sink):
+    """Copy ``source`` to ``sink`` until end of file, then end that direction of ``sink``."""
+    try:
+        while True:
+            data = source.recv(PROBE_CHUNK)
+            if not data:
+                break
+            sink.sendall(data)
+    except OSError:
+        pass
+    try:
+        sink.shutdown(socket.SHUT_WR)
+    except OSError:
+        pass
+
+
 class Control:
     """The sidecar's framed JSON control channel."""
 
@@ -382,6 +398,29 @@ class Shim:
     def log_path(self, token):
         return os.path.join(self.directory, "stream-%s.log" % token)
 
+    def ssh_address(self):
+        """The sshd this shim reaches for an ssh stream, from its own configuration only."""
+        host, _, port = (self.config.get("ssh_target") or "127.0.0.1:22").rpartition(":")
+        return host, int(port)
+
+    def serve_ssh(self, sock):
+        """Copy one stream to a connection to the ssh target. Spec "Sidecar interface" item 11."""
+        host, port = self.ssh_address()
+        try:
+            target = socket.create_connection((host, port), timeout=10.0)
+        except OSError as error:
+            sys.stderr.write("ssh target %s:%d refused: %s\n" % (host, port, error))
+            sys.stderr.flush()
+            sock.close()
+            return
+        target.settimeout(None)
+        back = threading.Thread(target=pump_ssh, args=(target, sock), daemon=True)
+        back.start()
+        pump_ssh(sock, target)
+        back.join()
+        sock.close()
+        target.close()
+
     def serve_socket(self, sock):
         header = self.read_header(sock)
         kind = header.get("kind") if header else None
@@ -401,6 +440,9 @@ class Shim:
             return
         elif kind == "probe":
             threading.Thread(target=serve_probe, args=(sock,), daemon=True).start()
+            return
+        elif kind == "ssh":
+            threading.Thread(target=self.serve_ssh, args=(sock,), daemon=True).start()
             return
         elif kind == "exec":
             threading.Thread(target=run_exec, args=(sock, header), daemon=True).start()
