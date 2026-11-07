@@ -10,7 +10,8 @@ This file is planning. The design is in [SPEC.md, letify-link](SPEC.md#letify-li
 |---|---|
 | 2.11 | letify-link ships as an opt-in feature. The switch is the account option `link = "letify-link"`. With it off, the connection path is that of 2.10.x |
 | 2.12 | The signalling Worker is deployed, the NAT-to-NAT connect is measured live, and the tunnel moves onto letify-link |
-| 3.0 | letify-link is the default connection layer and Tailcat is removed, with `letify setup tailcat` and the Tunnel account's `tailcat` fields |
+| 2.13 | letify-link is the default connection layer. `link = "ssh"` is the explicit opt-out. Tailcat, QUIC and the ssh data path stay |
+| 3.0 | Tailcat is removed, with `letify setup tailcat` and the Tunnel account's `tailcat` fields |
 
 ## Milestones
 

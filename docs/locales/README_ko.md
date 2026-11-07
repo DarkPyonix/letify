@@ -173,7 +173,7 @@ persistent = true
 
 연결 파이프라인의 기본 기준은 양방향 `10 MiB/s`, RTT `300 ms`입니다. Colab의 측정된 지속 전송 최고값은 올리기 `8.8 MiB/s`, 내리기 `10.7 MiB/s`라서 기본 기준을 통과하지 못합니다. 위 계정의 `min_mib_per_s = 0.05`는 느린 연결을 명시적으로 허용하는 예시입니다. 실제 측정에 맞춰 `min_mib_per_s`와 `max_rtt_ms`를 설정하세요. 측정된 링크가 모두 기준 미달이면 측정하지 않은 fallback으로 바꾸지 않고 연결을 거부합니다.
 
-letify-link는 2.11에서 선택 기능이고 2.x 내내 선택 기능으로 남습니다. 켜지 않으면 계정은 2.10과 같은 방식으로 연결합니다. 한 계정의 워커 채널을 letify-link로 보내려면 그 계정에 `link = "letify-link"`를 추가합니다. 그러면 양쪽 모두에 플랫폼 휠의 `letify-link` 바이너리가 필요합니다. 주소가 없는 머신은 [docs/guide/ko/09-에이전트.md](../guide/ko/09-에이전트.md)를 보세요.
+letify-link는 2.13부터 기본 연결 계층입니다. `link` 옵션이 없는 계정은 워커 채널을 letify-link로 보내고, 계정에 `link = "ssh"`를 쓰면 ssh를 데이터 경로로 하는 2.11의 연결 방식을 유지합니다. letify-link 계정은 양쪽 모두에 플랫폼 휠의 `letify-link` 바이너리가 필요합니다. 주소가 없는 머신은 [docs/guide/ko/09-에이전트.md](../guide/ko/09-에이전트.md)를 보세요.
 
 프로젝트의 `.letify/config.toml`에는 alias만 들어갑니다. 이 줄이 있어야 그 계정을 이 프로젝트에서 쓸 수 있습니다.
 
