@@ -140,7 +140,7 @@ uv add letify
 
 모든 프로바이더에 이것 하나면 됩니다. letify는 cloudpickle과 blake3만 설치합니다. 머신에 [uv](https://docs.astral.sh/uv/)가 있어야 합니다. Colab CLI와 Modal 클라이언트 같은 프로바이더 도구는 여러분의 `.venv`가 아니라 uv로 별도 환경에서 실행되기 때문입니다.
 
-휠에는 Rust 워크스페이스 [letify-core](../../letify-core/)에서 빌드한 `letify-quic` 바이너리가 들어 있습니다. 휠은 Linux x86_64와 aarch64, Windows x86_64와 arm64, macOS arm64와 x86_64용으로 빌드됩니다. 다른 플랫폼에서는 `letify-quic`이 없는 소스 배포판이 설치되고 QUIC 연결 전략은 건너뜁니다.
+휠에는 Rust 워크스페이스 [letify-core](../../letify-core/)에서 빌드한 `letify-link` 바이너리가 들어 있습니다. 휠은 Linux x86_64와 aarch64, Windows x86_64와 arm64, macOS arm64와 x86_64용으로 빌드됩니다. 다른 플랫폼에서는 `letify-link`가 없는 소스 배포판이 설치되고 모든 letify-link 경로는 건너뜁니다.
 
 ---
 
@@ -295,8 +295,7 @@ Kaggle 선언에는 `host=letify.remote`를 써야 합니다. Kaggle은 인바�
 
 1. 머신 주소로 바로 SSH
 2. TCP 홀펀칭, 양쪽이 모두 NAT 뒤에 있을 때
-3. 홀펀칭한 UDP 쌍 위의 QUIC, 그 위로 SSH
-4. 프로바이더 자체 경로, 예를 들어 `colab exec`와 Colab 파일 API
+3. 프로바이더 자체 경로, 예를 들어 `colab exec`와 Colab 파일 API
 
 번호가 낮은 방법이 이깁니다. 다만 연결된 방법 중 가장 빠른 것보다 훨씬 느리면 탈락합니다. 이긴 방법은 계정과 네트워크별로 기억해 두고, 다음 연결에서 먼저 시도합니다. NAT 뒤에 있는 머신은 letify를 설치한 뒤 그 머신에서 `letify agent serve`를 한 번 실행하면 letify가 접속할 수 있고, SSH 서버가 필요 없습니다. Tailcat은 제거되었고, `tailcat`을 적은 계정은 `letify agent serve`로 옮기는 방법과 함께 거부됩니다. 머신의 SSH 서버가 Docker의 `-p 30501:8022`처럼 다른 포트로 외부에 열려 있다면 `letify login tunnel <alias> --address <host> --public-port 30501`로 기록합니다. 그러면 주소로 바로 하는 SSH는 30501 포트로 접속하고, 홀펀칭은 계속 8022를 씁니다. Colab과 Elice는 에이전트가 아예 필요 없습니다. 프로바이더 계층이 각 서비스의 API로 머신을 만들고 엽니다. Modal은 자체 API로 연결하므로 여기에 해당하지 않습니다.
 

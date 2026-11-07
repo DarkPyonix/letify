@@ -11,7 +11,7 @@ This file is planning. The design is in [SPEC.md, letify-link](SPEC.md#letify-li
 | 2.11 | letify-link ships as an opt-in feature. The switch is the account option `link = "letify-link"`. With it off, the connection path is that of 2.10.x |
 | 2.12 | The signalling Worker is deployed, the NAT-to-NAT connect is measured live, and the tunnel moves onto letify-link |
 | 2.13 | letify-link is the default connection layer. `link = "ssh"` is the explicit opt-out. Tailcat, QUIC and the ssh data path stay |
-| 3.0 | Tailcat is removed, with `letify setup tailcat`, `letify client shell connect` and the Tunnel account's `tailcat` fields. An account that names one is refused by name with the migration to `letify agent serve`. Done on `feat/remove-tailcat`. QUIC and the ssh data path are removed in a later step |
+| 3.0 | Tailcat is removed, with `letify setup tailcat`, `letify client shell connect` and the Tunnel account's `tailcat` fields. An account that names one is refused by name with the migration to `letify agent serve`. Done on `feat/remove-tailcat`. QUIC over a punched UDP pair is removed, with the `letify-quic` crate and binary, its strategy (rank 4) and its Python module, and letify-link carries UDP paths. Done on `feat/remove-quic`. The ssh data path is removed in a later step |
 
 ## Milestones
 
