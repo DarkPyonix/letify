@@ -52,6 +52,7 @@ from ..errors import (
 from ..protocol import wire
 from ..runtime.channel import Connection, FramedChannel, _drain, _Tail
 from ..transport import sshopts
+from ..useragent import user_agent, with_agent
 from .base import Provider
 from .usage import Usage
 
@@ -240,6 +241,7 @@ def cookie_headers(cookie: str) -> dict[str, str]:
     jar = require_cookie_shape(cookie)
     return {
         "Content-Type": "application/json",
+        "User-Agent": user_agent(),
         "cookie": cookie,
         "x-xsrf-token": jar["XSRF-TOKEN"],
         "x-kaggle-build-version": jar.get("build-hash", "1"),
@@ -365,7 +367,7 @@ def _call(cookie: str, path: str, body: dict[str, Any]) -> dict[str, Any]:
 def _post(url: str, body: dict[str, Any], headers: dict[str, str]) -> dict[str, Any]:
     request = urllib.request.Request(
         url, data=json.dumps(body).encode(), method="POST",
-        headers={**headers, "Content-Type": "application/json"},
+        headers=with_agent({**headers, "Content-Type": "application/json"}),
     )
     with urlopen(request) as response:
         return json.loads(response.read())
@@ -497,7 +499,9 @@ def jupyter_token(id_token: str, webtier: str, deadline: float) -> str:
     url = FIRESTORE_BASE + urllib.parse.quote(
         FIRESTORE_DOCUMENT.format(sid=webtier), safe="/()"
     )
-    request = urllib.request.Request(url, headers={"Authorization": "Bearer " + id_token})
+    request = urllib.request.Request(
+        url, headers=with_agent({"Authorization": "Bearer " + id_token})
+    )
     while True:
         try:
             with urlopen(request) as response:
@@ -947,6 +951,7 @@ class Session:
         query = f"?{urllib.parse.urlencode({'token': self.token})}" if self.token else ""
         data = json.dumps(body).encode() if body is not None else None
         request = urllib.request.Request(f"{self.base}{path}{query}", data=data, method=method)
+        request.add_header("User-Agent", user_agent())
         if self.token:
             request.add_header("Authorization", f"token {self.token}")
         if data is not None:
