@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from ..errors import ConfigError, InterpreterMismatch
+from ..useragent import user_agent
 
 if TYPE_CHECKING:
     from ..declare.env import Env
@@ -74,13 +75,6 @@ TAIL_LINES = 40
 
 #: Reports the major.minor of whichever interpreter runs it.
 VERSION_SOURCE = "import sys\n__letify_value__ = '%d.%d' % sys.version_info[:2]\n"
-
-
-def user_agent() -> str:
-    """The User-Agent a runtime sends when it downloads the uv installer."""
-    from .. import __version__
-
-    return f"letify/{__version__}"
 
 
 def local_python() -> str:

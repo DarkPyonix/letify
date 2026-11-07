@@ -18,6 +18,7 @@ from typing import Any
 import pytest
 from conftest import PreparingLocal, provider_of
 
+import letify
 from letify.declare.env import Env
 from letify.declare.instance import Instance
 from letify.errors import ConfigError
@@ -221,6 +222,7 @@ def test_pull_source_is_the_media_url_with_the_token_and_the_project(fake_drive)
     assert source["headers"] == {
         "Authorization": f"Bearer {fake_drive.token}",
         "x-goog-user-project": fake_drive.project,
+        "User-Agent": f"letify/{letify.__version__}",
     }
 
 
