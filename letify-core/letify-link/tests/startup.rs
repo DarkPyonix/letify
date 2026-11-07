@@ -164,7 +164,10 @@ async fn a_small_message_beside_the_bulk_stream_waits_for_the_round_trip_and_lit
     // The same echo with no bulk stream running: what this machine and these paths cost in
     // this run, with no queueing at all.
     let idle = echo_rtts(&mut s, 3).await;
-    let bulk = a.open_stream_with(letify_link::Priority::Bulk).await.unwrap();
+    let bulk = a
+        .open_stream_with(letify_link::Priority::Bulk)
+        .await
+        .unwrap();
     let writer = tokio::spawn({
         let stop = stop.clone();
         let mut bulk = bulk;
