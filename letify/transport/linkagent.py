@@ -53,6 +53,8 @@ LABEL_CHARS = 64
 MIN_PREFIX = 8
 #: Conversations with a running shim at once, and the seconds a conversation with no shim lives.
 MAX_CONVERSATIONS = 4
+#: The sshd the ssh stream reaches when nothing names one. Spec "Agent and pairing" item 12.
+DEFAULT_SSH_TARGET = "127.0.0.1:22"
 IDLE_S = 120.0
 #: Seconds one read of the loop waits before it checks for changes, and the pause after the
 #: 1st, 2nd, ... failure in a row.
@@ -202,6 +204,29 @@ def signal_url(home: AgentHome, flag: str | None = None) -> str:
         if isinstance(value, str) and value:
             return _check_url(value, AgentError)
     return DEFAULT_URL
+
+
+def parse_ssh_target(text: object) -> str:
+    """``host:port`` with a port from 1 to 65535, or an :class:`AgentError` naming the value."""
+    value = text if isinstance(text, str) else ""
+    host, _, port = value.rpartition(":")
+    valid = host and not any(ch.isspace() for ch in host) and port.isdigit()
+    if not (valid and 1 <= int(port) <= 65535):
+        raise AgentError(f"ssh target {value!r} is not host:port with a port from 1 to 65535")
+    return f"{host}:{int(port)}"
+
+
+def ssh_target(home: AgentHome, flag: str | None = None) -> str:
+    """The sshd of the ssh stream: the flag, ``ssh_target`` in config.toml, the default."""
+    if flag:
+        return parse_ssh_target(flag)
+    with contextlib.suppress(OSError, ValueError):
+        value = tomllib.loads((home.path / "config.toml").read_text(encoding="utf-8")).get(
+            "ssh_target"
+        )
+        if value is not None:
+            return parse_ssh_target(value)
+    return DEFAULT_SSH_TARGET
 
 
 # -- the token ----------------------------------------------------------------------------
@@ -371,6 +396,7 @@ class AgentService:
         bind: str = "0.0.0.0:0",
         worker_command: str | None = None,
         relay_command: str | None = None,
+        ssh_target: str | None = None,
         log: Callable[[str], None] = lambda line: None,
         max_conversations: int = MAX_CONVERSATIONS,
         secret_ttl_s: float = SECRET_TTL_S,
@@ -394,6 +420,7 @@ class AgentService:
             "bind": bind,
             "worker_command": worker_command,
             "relay_command": relay_command,
+            "ssh_target": ssh_target,
         }
         self._log = log
         self._max = max_conversations

@@ -285,6 +285,13 @@ def build_parser() -> argparse.ArgumentParser:
         default=4,
         help="how many nodes may have a running shim at once",
     )
+    serve.add_argument(
+        "--ssh-target",
+        dest="ssh_target",
+        metavar="HOST:PORT",
+        help="the sshd a paired node reaches over its session; defaults to agent/config.toml, "
+        "then 127.0.0.1:22",
+    )
     serve.add_argument("--name", help="the alias the printed login command names")
     unpair = agent_sub.add_parser("unpair", help="stop serving a paired node")
     unpair.add_argument("node", help="the node id, or a prefix of at least 8 characters")
@@ -324,6 +331,7 @@ def _agent_command(args: argparse.Namespace) -> int:
 
     try:
         url = linkagent.signal_url(home, args.signal)
+        target = linkagent.ssh_target(home, args.ssh_target)
         binary = linkd.require_binary()
         daemon = linkagent.open_daemon(home, binary=binary)
     except (linkagent.AgentError, linkd.LinkError) as exc:
@@ -342,6 +350,7 @@ def _agent_command(args: argparse.Namespace) -> int:
         relay=relay_program(),
         log=log,
         max_conversations=args.max_conversations,
+        ssh_target=target,
     )
     token = service.new_token(url)
     alias = args.name or setup_default_alias()

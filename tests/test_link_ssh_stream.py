@@ -165,6 +165,7 @@ def test_a_good_ssh_target_is_host_and_port_and_a_bad_one_is_refused_by_name() -
 def test_the_ssh_target_comes_from_the_flag_then_the_file_then_the_default(tmp_path) -> None:
     home = linkagent.AgentHome(tmp_path / "agent")
     assert linkagent.ssh_target(home) == "127.0.0.1:22"
+    home.path.mkdir(parents=True, exist_ok=True)
     (home.path / "config.toml").write_text('ssh_target = "127.0.0.1:2200"\n', encoding="utf-8")
     assert linkagent.ssh_target(home) == "127.0.0.1:2200"
     assert linkagent.ssh_target(home, "127.0.0.1:2300") == "127.0.0.1:2300"

@@ -253,6 +253,87 @@ def _read_exact(sock: socket.socket, size: int) -> bytes:
     return bytes(data)
 
 
+def _copy(source: socket.socket, sink: socket.socket) -> None:
+    """Copy until end of file, then end that direction of ``sink``."""
+    try:
+        while data := source.recv(64 * 1024):
+            sink.sendall(data)
+    except OSError:
+        pass
+    with contextlib.suppress(OSError):
+        sink.shutdown(socket.SHUT_WR)
+
+
+class SshForward:
+    """A loopback TCP port whose connections are ssh streams of one session.
+
+    Spec "Sidecar interface" item 11. Each connection opens one stream with the ``ssh`` header
+    and copies bytes both ways. The shim picks the target; nothing here names a host.
+    """
+
+    def __init__(self, remote: LinkRemote, port: int = 0):
+        self._remote = remote
+        self.listener = socket.create_server(("127.0.0.1", port))
+        self.port: int = self.listener.getsockname()[1]
+        self._lock = threading.Lock()
+        self._open: set[socket.socket] = set()
+        self._closed = False
+        threading.Thread(target=self._accept, daemon=True).start()
+
+    def _accept(self) -> None:
+        while True:
+            try:
+                conn, _ = self.listener.accept()
+            except OSError:
+                return
+            threading.Thread(target=self._carry, args=(conn,), daemon=True).start()
+
+    def _carry(self, conn: socket.socket) -> None:
+        try:
+            stream = self._remote.open_stream("interactive")
+        except (RuntimeFailure, OSError):
+            conn.close()
+            return
+        with self._lock:
+            if self._closed:
+                conn.close()
+                stream.close()
+                return
+            self._open |= {conn, stream}
+        try:
+            stream.sendall(stream_header("ssh", secrets.token_hex(8)))
+            back = threading.Thread(target=_copy, args=(stream, conn), daemon=True)
+            back.start()
+            _copy(conn, stream)
+            back.join()
+        except OSError:
+            pass
+        finally:
+            with self._lock:
+                self._open -= {conn, stream}
+            for sock in (conn, stream):
+                with contextlib.suppress(OSError):
+                    sock.close()
+
+    def close(self) -> None:
+        """Stop listening and end every connection."""
+        with self._lock:
+            self._closed = True
+            carried = list(self._open)
+        with contextlib.suppress(OSError):
+            # close alone does not wake a thread blocked in accept on Linux
+            self.listener.shutdown(socket.SHUT_RDWR)
+        with contextlib.suppress(OSError):
+            self.listener.close()
+        for sock in carried:
+            with contextlib.suppress(OSError):
+                sock.shutdown(socket.SHUT_RDWR)
+            with contextlib.suppress(OSError):
+                sock.close()
+        with contextlib.suppress(ValueError):
+            self._remote._forwards.remove(self)
+
+
 class LinkRemote:
     """One connected machine: the local sidecar, the session, and the ssh command that ended."""
 
@@ -275,6 +356,13 @@ class LinkRemote:
         self.measured: ProbeResult | None = None
         #: Seconds each phase of the connect took, by phase name. Spec "Sidecar interface" item 7.
         self.phases: dict[str, float] = {}
+        self._forwards: list[SshForward] = []
+
+    def forward_ssh(self, port: int = 0) -> SshForward:
+        """Forward ``127.0.0.1:port`` (a free port when 0) to the machine's sshd."""
+        forward = SshForward(self, port)
+        self._forwards.append(forward)
+        return forward
 
     def record(self) -> dict[str, str]:
         """What a second process needs to open its own session to this machine."""
@@ -389,6 +477,8 @@ class LinkRemote:
         return not self.session.closed.is_set()
 
     def close(self) -> None:
+        for forward in list(self._forwards):
+            forward.close()
         with contextlib.suppress(Exception):
             self.session.close()
         with contextlib.suppress(Exception):
