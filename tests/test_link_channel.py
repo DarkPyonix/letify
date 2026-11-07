@@ -295,9 +295,8 @@ def test_a_session_over_a_punched_pair_carries_a_call(sidecar_binary, isolated_h
         provider.close_link()
 
 
-@pytest.mark.parametrize("option", [{}, {"link": "ssh"}])
-def test_link_option_absent_keeps_ssh(isolated_home, tmp_path, ssh, option) -> None:
-    provider = machine(tmp_path, ssh, **option)
+def test_link_ssh_keeps_the_ssh_data_path(isolated_home, tmp_path, ssh) -> None:
+    provider = machine(tmp_path, ssh, link="ssh")
     assert provider.uses_letify_link is False
     assert type(provider.open_channel(runtime())) is PersistentChannel
     assert type(provider.transfer_channel(runtime())) is PersistentChannel
@@ -555,7 +554,7 @@ def test_a_link_stream_costs_nothing_even_when_the_account_sets_a_cost(
     linked_ = machine(tmp_path, ssh, link="letify-link", transfer_connection_cost_s=10)
     assert linked_.transfer_connection_cost_s == 0.0
     assert pathdata._streams_for(with_session(linked_, paths), 512 * MIB) == pathdata.STREAMS
-    costly = machine(tmp_path, ssh, transfer_connection_cost_s=10)
+    costly = machine(tmp_path, ssh, link="ssh", transfer_connection_cost_s=10)
     assert costly.transfer_connection_cost_s == 10.0
 
 

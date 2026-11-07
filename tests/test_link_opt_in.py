@@ -39,7 +39,9 @@ def test_a_shell_account_without_the_switch_races_nothing(isolated_home, raced) 
     assert raced == []
 
 
-def test_a_shell_account_with_the_switch_off_by_name_races_the_2_11_strategies(isolated_home, raced) -> None:
+def test_a_shell_account_with_the_switch_off_by_name_races_the_2_11_strategies(
+    isolated_home, raced
+) -> None:
     provider = provider_of(Shell, "lab", address="gpu.example.edu", link="ssh", port_mapping=False)
     provider.link()
     assert raced == [["direct_ssh", "tcp_punch", "tailcat", "quic", "fallback"]]

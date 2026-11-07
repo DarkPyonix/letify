@@ -14,7 +14,7 @@ from letify.providers.kaggle import Kaggle
 
 
 def kaggle(**options):
-    return provider_of(Kaggle, "kaggle_a", **options)
+    return provider_of(Kaggle, "kaggle_a", **{"link": "ssh", **options})
 
 
 def test_kaggle_races_the_strategies_that_need_no_address() -> None:

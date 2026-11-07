@@ -626,7 +626,9 @@ def test_a_shell_runtime_is_taken_over_through_the_relay_program(
 
     monkeypatch.setattr(Shell, "link", lambda self, runtime=None: LoopbackLink())
     monkeypatch.setattr(Shell, "remote_python", property(lambda self: shlex.quote(sys.executable)))
-    shell_dir = config_file('[a]\nkind = "shell"\naddress = "127.0.0.1"\n', name="shell-config")
+    shell_dir = config_file(
+        '[a]\nkind = "shell"\naddress = "127.0.0.1"\nlink = "ssh"\n', name="shell-config"
+    )
     taker = letify.Launcher(shell_dir, home=False, announce=False)
     owner = owners()
     taking = Running(lambda: letify.takeover(owner.run, launcher=taker))

@@ -375,7 +375,7 @@ def test_a_colab_worker_started_over_ssh_is_given_the_driver_library_path(
     # started over SSH without it sees no CUDA device on a session that holds a GPU.
     from conftest import FakeLink
 
-    provider = provider_of(Colab, "colab_a")
+    provider = provider_of(Colab, "colab_a", link="ssh")
     runtime = type("R", (), {"name": "letify-l4-1"})()
     provider.__dict__["_links"] = {"letify-l4-1": FakeLink("tcp_punch", 2)}
     channel = provider.open_channel(runtime)
@@ -979,7 +979,7 @@ def test_a_check_that_fails_names_the_command_it_tried(patch_run) -> None:
 
 def test_a_remote_worker_is_one_python_reading_framed_requests(patch_run) -> None:
     patch_run(shell_module)
-    provider = provider_of(Shell, "lab", address="gpu.example.edu")
+    provider = provider_of(Shell, "lab", address="gpu.example.edu", link="ssh")
     runtime = type("R", (), {"name": "letify-a100-1"})()
     channel = provider.open_channel(runtime)
     assert isinstance(channel, PersistentChannel)
@@ -998,7 +998,7 @@ def test_a_plain_shell_lists_the_default_strategies_in_rank_order() -> None:
     # connect_back is there because port_mapping is on by default: letify asks the NAT for
     # a forwarding, and the asking happens inside the attempt. Spec "Asking the NAT for a
     # mapping".
-    provider = provider_of(Shell, "lab", address="gpu.example.edu")
+    provider = provider_of(Shell, "lab", address="gpu.example.edu", link="ssh")
     assert [(s.name, s.rank) for s in provider.strategies()] == [
         ("direct_ssh", 1),
         ("connect_back", 2),
@@ -1052,7 +1052,7 @@ def test_an_account_with_a_tailcat_address_has_the_agent_as_its_rendezvous() -> 
 
 def test_a_tunnel_with_no_address_and_no_tailcat_says_what_is_missing(isolated_home) -> None:
     with pytest.raises(letify.ProviderUnavailable) as caught:
-        provider_of(Tunnel, "lab").link()
+        provider_of(Tunnel, "lab", link="ssh").link()
     assert "no address" in str(caught.value)
     assert "no rendezvous" in str(caught.value)
 
@@ -1091,7 +1091,7 @@ def test_colab_falls_back_to_exec_when_nothing_else_connects(
         present=lambda name: None if name == "tailcat" else f"/usr/bin/{name}",
     )
     recorder = patch_run(colab_module)
-    provider = provider_of(Colab, "colab_a", stun="127.0.0.1:9")
+    provider = provider_of(Colab, "colab_a", stun="127.0.0.1:9", link="ssh")
     runtime = type("R", (), {"name": "letify-g4-1"})()
     channel = provider.open_channel(runtime)
     assert isinstance(channel, OneShotChannel)
@@ -3340,7 +3340,9 @@ def test_the_worker_channel_runs_its_own_ssh_connection(isolated_home, monkeypat
 
     monkeypatch.setattr(sshopts, "WINDOWS", False)
     monkeypatch.setattr(sshopts, "SOCKET_LIMIT", 500)
-    provider = provider_of(Shell, "lab", address="gpu.lab.example.edu", user="researcher")
+    provider = provider_of(
+        Shell, "lab", address="gpu.lab.example.edu", user="researcher", link="ssh"
+    )
     runtime = type("R", (), {"name": "lab-1"})()
     link = type(
         "L",
