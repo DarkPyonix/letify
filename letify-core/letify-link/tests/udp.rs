@@ -115,6 +115,64 @@ async fn a_udp_listener_refuses_a_source_it_was_not_given() {
     );
 }
 
+/// Open one path over loopback with `client` settings on the connecting end and `server`
+/// settings on the accepting end.
+async fn pair_with(
+    client: &UdpConfig,
+    server: &UdpConfig,
+) -> (std::io::Result<UdpPath>, std::io::Result<UdpPath>) {
+    let sock = udp_socket();
+    let addr = sock.local_addr().unwrap();
+    let mut listener = UdpListener::new(sock, None, server).unwrap();
+    let accepted = tokio::spawn(async move {
+        timeout(Duration::from_secs(3), listener.accept())
+            .await
+            .unwrap_or_else(|_| Err(std::io::Error::other("no path was accepted")))
+    });
+    let connected = UdpPath::connect_with(udp_socket(), addr, client).await;
+    (connected, accepted.await.unwrap())
+}
+
+fn h3() -> UdpConfig {
+    UdpConfig {
+        alpn: b"h3".to_vec(),
+        server_name: "cdnjs.cloudflare.com".into(),
+        ..UdpConfig::default()
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_udp_path_presents_the_default_alpn_and_server_name_unless_told_otherwise() {
+    let (client, server) = pair_with(&UdpConfig::default(), &UdpConfig::default()).await;
+    let (_client, server) = (client.unwrap(), server.unwrap());
+    let seen = server.handshake();
+    assert_eq!(seen.alpn.as_deref(), Some(&b"letify-link/udp/1"[..]));
+    assert_eq!(seen.server_name.as_deref(), Some("letify"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_udp_path_presents_h3_and_a_cdn_server_name_when_configured() {
+    let (client, server) = pair_with(&h3(), &h3()).await;
+    let (mut client, mut server) = (client.unwrap(), server.unwrap());
+    let seen = server.handshake();
+    assert_eq!(seen.alpn.as_deref(), Some(&b"h3"[..]));
+    assert_eq!(seen.server_name.as_deref(), Some("cdnjs.cloudflare.com"));
+    client.write_all(b"ping").await.unwrap();
+    let mut got = [0u8; 4];
+    server.read_exact(&mut got).await.unwrap();
+    assert_eq!(&got, b"ping", "bytes cross a path that presents as h3");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_udp_path_is_refused_when_the_two_ends_disagree_on_the_alpn() {
+    let quick = UdpConfig {
+        connect_timeout: Duration::from_millis(800),
+        ..UdpConfig::default()
+    };
+    let (client, _server) = pair_with(&h3(), &quick).await;
+    assert!(client.is_err(), "an h3 client does not reach a default server");
+}
+
 /// Both kinds of candidate toward one server. The TCP one runs through a throttle.
 struct Duo {
     client: Identity,
