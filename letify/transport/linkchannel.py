@@ -184,9 +184,7 @@ def letify_link_enabled(provider: Any) -> bool:
     if value == "ssh":
         return False
     if value in (None, "letify-link"):
-        if value is None and provider.config.option("channel") == "exec":
-            return False
-        return True
+        return not (value is None and provider.config.option("channel") == "exec")
     raise ProviderUnavailable(
         provider.kind, f'{provider.alias} sets link = {value!r}; use "ssh" or "letify-link"'
     )
