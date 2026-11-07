@@ -130,61 +130,6 @@ def stun_mapping(
         sock.close()
 
 
-def _udp_socket(port: int) -> socket.socket:
-    """A UDP socket on ``port``, bound so the QUIC carrier can take the port after it."""
-    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    if hasattr(socket, "SO_REUSEPORT"):
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
-    sock.bind(("0.0.0.0", port))
-    return sock
-
-
-def udp_stun_mapping(
-    port: int, server: tuple[str, int] = DEFAULT_STUN, *, timeout: float = 5.0, tries: int = 3
-) -> tuple[str, int]:
-    """The public address and port a NAT gives UDP datagrams from local ``port``.
-
-    A NAT keeps UDP and TCP mappings apart, so a UDP carrier is asked about over UDP.
-    The request is sent again on a lost reply, since nothing else retransmits it.
-    """
-    transaction = secrets.token_bytes(12)
-    address = socket.getaddrinfo(server[0], server[1], socket.AF_INET, socket.SOCK_DGRAM)[0][4]
-    sock = _udp_socket(port)
-    try:
-        sock.settimeout(timeout / tries)
-        for _ in range(tries):
-            sock.sendto(stun_request(transaction), address)
-            try:
-                while True:
-                    data, _ = sock.recvfrom(2048)
-                    try:
-                        return parse_stun_response(data, transaction)
-                    except ValueError:
-                        continue
-            except TimeoutError:
-                continue
-        raise TimeoutError(f"no UDP STUN reply from {server[0]}:{server[1]}")
-    finally:
-        sock.close()
-
-
-def punch_udp(port: int, peer: tuple[str, int], *, count: int = 5, interval: float = 0.1) -> None:
-    """Send a few datagrams from ``port`` to ``peer``, so the NAT in front admits its reply.
-
-    Datagrams that reach the peer before it is listening are dropped there; what counts is
-    the mapping they leave behind on this side.
-    """
-    sock = _udp_socket(port)
-    try:
-        for index in range(count):
-            sock.sendto(HELLO, tuple(peer))
-            if interval and index + 1 < count:
-                time.sleep(interval)
-    finally:
-        sock.close()
-
-
 def default_route_interface(route_table: Path = Path("/proc/net/route")) -> str | None:
     """The name of the interface the default route leaves through."""
     if route_table.is_file():
@@ -685,32 +630,6 @@ def begin(request: dict):
             serve_link(sock, ssh)
 
         return {"dialing": True}, dial_and_serve
-    if kind == "quic":
-        # Spec "QUIC over a punched UDP pair": the same punched endpoints a TCP punch
-        # exchanges, carrying a QUIC connection instead.
-        holder = _udp_socket(0)
-        port = holder.getsockname()[1]
-        holder.close()
-        mapping = udp_stun_mapping(port, tuple(request.get("stun") or DEFAULT_STUN))
-        peer = (str(request["mapping"][0]), int(request["mapping"][1]))
-        # The carrier only listens, so this side sends first or its NAT drops the client.
-        punch_udp(port, peer)
-        command = [
-            str(request.get("binary", "letify-quic")),
-            "serve",
-            "--bind",
-            str(port),
-            "--peer",
-            f"{peer[0]}:{peer[1]}",
-            "--token",
-            str(request["token"]),
-            "--forward",
-            str(int(request.get("ssh_port", 22))),
-        ]
-        carrier = subprocess.Popen(
-            command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True
-        )
-        return {"mapping": list(mapping)}, _drain_then_wait(carrier)
     if kind == "reverse_ssh":
         # The directory is under the account's workspace root, which may start with ~.
         key = Path(os.path.expanduser(request["key_directory"])) / "letify_reverse"
@@ -781,26 +700,6 @@ def _match_then_drain(process, stream, pattern: str) -> str | None:
 
     threading.Thread(target=drain, name="letify-drain", daemon=True).start()
     return found
-
-
-def _drain_then_wait(process):
-    """Keep reading a helper's output while it runs, then wait for it.
-
-    The same reason as the drain of ``_match_then_drain``: a pipe
-    holds about 64 KiB and a helper nobody reads blocks on its next write.
-    """
-
-    def hold() -> None:
-        stream = process.stdout
-        if stream is not None:
-            try:
-                for _ in stream:
-                    pass
-            except (OSError, ValueError):
-                pass
-        process.wait()
-
-    return hold
 
 
 def _authorize(public_key: str) -> None:

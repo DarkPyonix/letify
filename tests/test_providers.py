@@ -2817,36 +2817,6 @@ def test_every_provider_start_accepts_the_keywords_the_pool_passes() -> None:
         parameters = inspect.signature(cls.start).parameters
         missing = wanted - parameters.keys()
         assert not missing, f"{cls.__name__}.start lacks {sorted(missing)}"
-
-
-def test_colab_prepares_letify_quic_only_when_its_strategy_requests_an_endpoint(
-    isolated_home, patch_which, patch_run
-) -> None:
-    # Spec "Colab", Runtime tools: lazy preparation keeps verification strict.
-    patch_which(tools_module, present=True)
-
-    def respond(command):
-        source = recorder.calls[-1]["input"]
-        if "LETIFY-QUIC" in source and "run_detached" not in source:
-            return FakeCompleted(stdout='LETIFY-QUIC "/remote/letify-quic"\n')
-        return FakeCompleted(stdout='LETIFY-ANSWER {"mapping": ["203.0.113.5", 4000]}\n')
-
-    recorder = patch_run(colab_module, result=respond)
-    key = Path.home() / "id.pub"
-    key.write_text("ssh-ed25519 AAAA")
-    provider = provider_of(Colab, key=str(key)[:-4])
-    runtime = type("R", (), {"name": "live"})()
-    target = provider.target(runtime)
-    assert recorder.calls == []
-    request = {"kind": "quic", "mapping": ["198.51.100.1", 5000], "token": "00", "ssh_port": 22}
-    assert target.rendezvous.exchange(request, 30) == {"mapping": ["203.0.113.5", 4000]}
-    assert recorder.command == [*COLAB_CLI, "exec", "-s", "live"]
-    assert "LETIFY-QUIC" in recorder.calls[0]["input"]
-    assert '"binary": "/remote/letify-quic"' in recorder.calls[-1]["input"]
-    assert "binary" not in target.rendezvous.extras()
-    assert target.rendezvous.quic_binary == "/remote/letify-quic"
-
-
 def test_colab_requires_the_daemon_to_acknowledge_startup(
     isolated_home, patch_which, patch_run
 ) -> None:
@@ -3026,45 +2996,6 @@ def test_colab_rendezvous_completes_while_a_wake_holds_the_account_lock(
         waking.join(2)
         if punching.ident is not None:
             punching.join(2)
-
-
-def test_colab_punch_rendezvous_completes_during_quic_preparation(
-    isolated_home, patch_which, patch_run
-) -> None:
-    # Spec "Colab", Runtime tools: preparation cannot occupy the punch path.
-    patch_which(tools_module, present=True)
-    key = Path.home() / "id.pub"
-    key.write_text("ssh-ed25519 AAAA")
-    provider = provider_of(Colab, key=str(key)[:-4])
-    recorder = patch_run(colab_module)
-    target = provider.target(type("R", (), {"name": "live"})())
-    assert recorder.calls == []
-    entered = threading.Event()
-    release = threading.Event()
-    prepared = []
-
-    def respond(command):
-        source = recorder.calls[-1]["input"]
-        if "LETIFY-QUIC" in source and "run_detached" not in source:
-            entered.set()
-            assert release.wait(5)
-            return FakeCompleted(stdout='LETIFY-QUIC "/remote/letify-quic"\n')
-        return FakeCompleted(stdout='LETIFY-ANSWER {"pong": true}\n')
-
-    recorder.result = respond
-    preparing = threading.Thread(target=lambda: prepared.append(target.rendezvous.prepare_quic()))
-    preparing.start()
-    try:
-        assert entered.wait(2)
-        assert target.rendezvous.exchange({"kind": "tcp_punch"}, 30)["pong"] is True
-        assert preparing.is_alive()
-        assert "binary" not in target.rendezvous.extras()
-    finally:
-        release.set()
-        preparing.join(2)
-    assert prepared == ["/remote/letify-quic"]
-
-
 def test_a_modal_sandbox_is_not_given_an_hour_long_deadline(config_file) -> None:
     """Spec "Modal": a deadline letify invented would end a two hour run at its guess.
 

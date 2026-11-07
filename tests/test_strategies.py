@@ -658,17 +658,6 @@ def test_the_remote_half_keeps_reading_what_a_helper_prints_after_the_line_it_wa
         assert process.wait(30.0) == 0, "the helper blocked writing to a pipe nobody reads"
     finally:
         process.kill()
-
-
-def test_a_carrier_that_prints_a_lot_is_drained_until_it_ends() -> None:
-    process = _flooding_process("started", 1 << 20)
-    waiter = threading.Thread(target=nat._drain_then_wait(process), daemon=True)
-    waiter.start()
-    waiter.join(30.0)
-    assert not waiter.is_alive(), "the carrier blocked writing to a pipe nobody reads"
-    process.kill()
-
-
 def test_the_punch_asks_the_remote_for_a_window_and_stops_when_it_does(patch_run) -> None:
     # Spec "the simultaneous open": the strategy names the window in the request and uses
     # the punch_until the remote answers with, so a slow rendezvous does not leave the two

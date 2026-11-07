@@ -557,36 +557,25 @@ __all__ = [
 ]
 
 
-def remote_quic_source(version: str) -> str:
-    """Prepare ``letify-quic`` on the remote from the letify wheel of this version.
+def remote_link_source(version: str) -> str:
+    """Prepare ``letify-link`` on the remote from the letify wheel of this version.
 
-    Spec "QUIC over a punched UDP pair": the binary changes with every letify release, so
-    a hash pinned in this source cannot describe the build that is about to be made. The
+    Spec "Sidecar interface" item 7: the binary changes with every letify release, so a
+    hash pinned in this source cannot describe the build that is about to be made. The
     remote therefore fetches the wheel for its own platform at exactly this version, which
-    PyPI verifies, and takes the binary out of it.
+    PyPI verifies, and takes the sidecar binary out of it.
     """
     import inspect
 
     return (
-        inspect.getsource(_remote_quic)
-        + f"\nbinary = _remote_quic({version!r})\n"
-        + "import json\nprint('LETIFY-QUIC ' + json.dumps(binary))\n"
+        inspect.getsource(_remote_link)
+        + f"\nbinary = _remote_link({version!r})\n"
+        + "import json\nprint('LETIFY-LINK ' + json.dumps(binary))\n"
     )
 
 
-def remote_link_source(version: str) -> str:
-    """Prepare ``letify-link`` on the remote from the letify wheel of this version.
-
-    Spec "Sidecar interface" item 7: the same extraction as ``remote_quic_source``, for the
-    sidecar binary that sits beside ``letify-quic`` in the wheel.
-    """
-    return remote_quic_source(version).replace("letify-quic", "letify-link").replace(
-        "LETIFY-QUIC", "LETIFY-LINK"
-    )
-
-
-def _remote_quic(version):
-    """Take letify-quic out of the letify wheel for this machine, standard library only."""
+def _remote_link(version):
+    """Take letify-link out of the letify wheel for this machine, standard library only."""
     import json
     import os
     import sys
@@ -594,11 +583,11 @@ def _remote_quic(version):
     import zipfile
     from pathlib import Path
 
-    inside = "letify/remoting/lib/letify-quic"
-    target = Path(tempfile.gettempdir()) / f"letify-quic-{version}"
+    inside = "letify/remoting/lib/letify-link"
+    target = Path(tempfile.gettempdir()) / f"letify-link-{version}"
     if target.is_file() and os.access(target, os.X_OK):
         return str(target)
-    directory = tempfile.mkdtemp(prefix="letify-quic-")
+    directory = tempfile.mkdtemp(prefix="letify-link-")
     done = subprocess.run(
         [
             sys.executable, "-m", "pip", "download", f"letify=={version}",
@@ -610,7 +599,7 @@ def _remote_quic(version):
     )
     if done.returncode != 0:
         raise RuntimeError(
-            "could not download the letify wheel for letify-quic: "
+            "could not download the letify wheel for letify-link: "
             + (done.stderr or done.stdout).strip()[-400:]
         )
     wheels = sorted(Path(directory).glob("letify-*.whl"))

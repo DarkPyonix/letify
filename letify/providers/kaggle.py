@@ -1482,9 +1482,9 @@ class Kaggle(Provider):
 
     def strategies(self) -> list[Any]:
         """The strategies a session with no address can use, in rank order."""
-        from ..transport.strategies import ProviderFallback, QuicUDP, TCPPunch
+        from ..transport.strategies import ProviderFallback, TCPPunch
 
-        return [TCPPunch(), QuicUDP(), ProviderFallback(rank=5)]
+        return [TCPPunch(), ProviderFallback(rank=4)]
 
     def link_over(self, channel: Any, *, name: str | None = None) -> Any:
         """Race the strategies over the bridge and return the link that wins."""

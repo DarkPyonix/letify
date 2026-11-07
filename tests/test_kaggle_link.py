@@ -158,33 +158,6 @@ def test_a_program_that_opens_with_a_future_import_still_compiles() -> None:
     scope: dict = {}
     exec(compile(wrapped, "<worker>", "exec"), scope)
     assert "LETIFY-ANSWER" in scope["__letify_value__"]
-
-
-def test_a_kaggle_quic_request_carries_the_prepared_carrier_path() -> None:
-    """Spec "Kaggle runtimes", An SSH link over the kernel: letify-quic is prepared lazily.
-
-    The preparation belongs to the rendezvous, so a Kaggle request carries a carrier path
-    the way a Colab one does, and the remote side never runs a bare ``letify-quic``.
-    """
-    from letify.transport import nat
-
-    binary = "/root/.letify/tools/letify-quic/1.0/letify-quic"
-    sources: list[str] = []
-
-    class Bridge:
-        def request(self, message, timeout=None):
-            source = message["source"]
-            sources.append(source)
-            if "LETIFY-QUIC" in source and "run_detached" not in source:
-                return f'LETIFY-QUIC "{binary}"', None
-            return nat.ANSWER_MARKER + '{"mapping": ["203.0.113.5", 4000]}', None
-
-    rendezvous = kaggle().rendezvous_over(Bridge())
-    request = {"kind": "quic", "mapping": ["198.51.100.1", 5000], "token": "00", "ssh_port": 22}
-    assert rendezvous.exchange(request, 30.0) == {"mapping": ["203.0.113.5", 4000]}
-    assert binary in sources[-1]
-
-
 def test_the_kaggle_punch_target_logs_in_as_root_with_the_authorized_key(tmp_path) -> None:
     """Spec "Kaggle runtimes", An SSH link over the kernel: the link uses the key it authorized.
 

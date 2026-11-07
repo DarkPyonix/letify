@@ -27,7 +27,7 @@ from typing import Any, Protocol
 
 from ..errors import LetifyError, RuntimeFailure
 
-#: Where the wheel puts letify-core's binaries, beside letify-quic.
+#: Where the wheel puts letify-core's binaries.
 LIB_DIR = Path(__file__).resolve().parent.parent / "remoting" / "lib"
 #: What cargo names the sidecar on each platform.
 BINARY = "letify-link.exe" if sys.platform == "win32" else "letify-link"

@@ -109,7 +109,7 @@ class Shell(Provider):
         """The port forward SSH dials at the address.
 
         ``public_port`` is the port the machine publishes to the outside, such as Docker's
-        ``-p 30501:8022``. Without it forward SSH dials ``port``. Hole punching and QUIC
+        ``-p 30501:8022``. Without it forward SSH dials ``port``. Hole punching
         always splice to ``port`` inside the machine.
         """
         value = self.config.option("public_port")
@@ -231,7 +231,6 @@ class Shell(Provider):
             ConnectBack,
             DirectSSH,
             ProviderFallback,
-            QuicUDP,
             ReverseSSH,
             TCPPunch,
         )
@@ -239,10 +238,10 @@ class Shell(Provider):
         chosen: list[Strategy] = [DirectSSH()]
         if self.connect_back or self.port_mapping:
             chosen.append(ConnectBack(mapping=self.port_mapping))
-        chosen.extend((TCPPunch(), QuicUDP()))
+        chosen.append(TCPPunch())
         if self.reverse_ssh:
             chosen.append(ReverseSSH())
-        chosen.append(ProviderFallback(rank=6 if self.reverse_ssh else 5))
+        chosen.append(ProviderFallback(rank=5 if self.reverse_ssh else 4))
         return chosen
 
     def fallback(self, runtime: Runtime | None = None) -> Callable[[], Link] | None:
