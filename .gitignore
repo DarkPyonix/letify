@@ -257,7 +257,7 @@ __marimo__/
 .letify/
 typings/
 
-# The letify-quic binary, copied here by letify-core/build.py
+# The letify-link binary, copied here by letify-core/build.py
 letify/remoting/lib/
 
 # Artifacts the examples write where they run
