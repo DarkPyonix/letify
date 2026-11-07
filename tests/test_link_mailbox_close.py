@@ -117,3 +117,40 @@ def test_a_pump_that_no_call_reaches_ends_its_runtime_side(
     assert wait_until(lambda: not pids_of(directory), 15.0), pids_of(directory)
     assert wait_until(lambda: not (sidecars(sidecar_binary) & mine))
     assert wait_until(lambda: not os.path.exists(directory))
+
+
+STUBBORN_SHIM = '''
+import json, os, signal, subprocess, sys, time
+child = subprocess.Popen(["sleep", "300"])
+signal.signal(signal.SIGTERM, lambda signum, frame: os._exit(0))
+sys.stdin.readline()
+print(json.dumps({"event": "ready", "child": child.pid}), flush=True)
+while True:
+    time.sleep(1)
+'''
+
+
+def alive(pid: int) -> bool:
+    try:
+        state = Path(f"/proc/{pid}/stat").read_text().rpartition(")")[2].split()[0]
+    except OSError:
+        return False
+    return state != "Z"
+
+
+def test_a_child_of_a_shim_that_ignores_its_input_ending_is_still_ended() -> None:
+    bootstrap = linkmailbox.MailboxBootstrap(run_here, python=sys.executable, shim=STUBBORN_SHIM)
+    bootstrap.start()
+    bootstrap.send_line("{}")
+    child = 0
+    while not child:
+        line = bootstrap.recv_line()
+        assert line is not None, bootstrap.stderr_text()
+        child = int(json.loads(line).get("child", 0))
+    assert alive(child)
+    try:
+        bootstrap.close()
+        assert wait_until(lambda: not alive(child), 15.0)
+    finally:
+        if alive(child):
+            os.kill(child, 9)
