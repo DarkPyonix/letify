@@ -45,6 +45,7 @@ from .. import tools
 from ..config.secrets import account_directory
 from ..declare.instance import Instance
 from ..errors import ProviderUnavailable, RuntimeFailure, RuntimeLost
+from ..useragent import with_agent
 from .shell import Shell
 from .usage import Usage
 
@@ -116,7 +117,9 @@ def _access_token(stored: dict[str, Any]) -> str:
             "grant_type": "refresh_token",
         }
     ).encode()
-    request = urllib.request.Request(str(stored["token_uri"]), data=form, method="POST")
+    request = urllib.request.Request(
+        str(stored["token_uri"]), data=form, method="POST", headers=with_agent()
+    )
     with urllib.request.urlopen(request, timeout=USAGE_HTTP_TIMEOUT) as response:
         return str(json.loads(response.read())["access_token"])
 
@@ -207,12 +210,12 @@ class Colab(Shell):
                 token = _access_token(stored)
                 request = urllib.request.Request(
                     CCU_INFO_URL,
-                    headers={
+                    headers=with_agent({
                         "Authorization": f"Bearer {token}",
                         "Accept": "application/json",
                         "X-Colab-Client-Agent": "colab-cli",
                         "X-Colab-Tunnel": "Google",
-                    },
+                    }),
                 )
                 with urllib.request.urlopen(request, timeout=USAGE_HTTP_TIMEOUT) as response:
                     text = response.read().decode(errors="replace")
