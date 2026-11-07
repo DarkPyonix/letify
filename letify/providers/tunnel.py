@@ -1,15 +1,15 @@
 """Tunnel, a plain machine behind NAT with no provider API.
 
-The machine's user runs ``letify client shell connect`` on it once. That starts the
-remote agent behind ``tailcat serve`` and prints a Tailcat address and port, which go into
-this account as ``tailcat`` and ``tailcat_port``. From there the connection pipeline in
-``Shell`` does the rest: it reaches the agent over Tailcat, exchanges the TCP punch
-mapping through it, and races the strategies as the spec describes. This class adds no
-transport of its own; it exists so the configuration kind says what the machine is.
+The machine's user runs ``letify agent serve`` on it once. An account that names an
+``agent`` (spec "Agent and pairing" item 11) is reached through the signalling service and
+a letify-link session, with no ssh and no Tailcat. The agent machine's sshd is reachable
+through ``ssh_forward`` when the user wants it.
 
-An account that names an ``agent`` (``letify agent serve``, spec "Agent and pairing" item 11)
-is reached through the signalling service and a letify-link session, with no ssh and no
-Tailcat.
+An older account names ``tailcat`` and ``tailcat_port``, printed by ``letify client shell
+connect``. The connection pipeline in ``Shell`` reaches that agent over Tailcat, exchanges
+the TCP punch mapping through it and races the strategies as the spec describes. It keeps
+working until 3.0 and says once per process that Tailcat is removed then (spec "Agent and
+pairing" item 14).
 """
 
 from __future__ import annotations
@@ -19,6 +19,9 @@ from typing import Any
 
 from ..errors import ProviderUnavailable, RuntimeFailure
 from .shell import Shell
+
+#: Whether this process has already printed the Tailcat notice. Spec "Agent and pairing" item 14.
+_tailcat_noticed = False
 
 
 class Tunnel(Shell):
@@ -36,6 +39,21 @@ class Tunnel(Shell):
         """The node id of the agent this account is paired with, or None for a Tailcat account."""
         value = self.config.option("agent")
         return value if isinstance(value, str) and value else None
+
+    def _notice_tailcat(self) -> None:
+        """Say once per process that Tailcat is removed in 3.0 and how to migrate this account."""
+        global _tailcat_noticed
+        if _tailcat_noticed or not isinstance(self.config.option("tailcat"), str):
+            return
+        _tailcat_noticed = True
+        from ..transport.announce import printer
+
+        printer(self.announce)(
+            f"{self.alias} reaches its machine through Tailcat, which is removed in 3.0. "
+            f"To migrate it, run 'letify agent serve' on the machine, then "
+            f"'letify login tunnel {self.alias} --connect letify-agent2:<token>' "
+            f"with the token it prints."
+        )
 
     @property
     def address(self) -> str | None:
@@ -57,6 +75,7 @@ class Tunnel(Shell):
     def link(self, runtime: Any = None) -> Any:
         """The session's measurements with no ssh command, on an agent account."""
         if self.agent is None:
+            self._notice_tailcat()
             return super().link(runtime)
         from ..transport.linkchannel import PlainSshLink
 
@@ -109,6 +128,13 @@ class Tunnel(Shell):
                 self.kind, f"{self.alias} names no agent, so it has no session to forward over"
             )
         return self.link_remote(runtime).forward_ssh(port)
+
+    def run_command(self, command: str, timeout: float = 120) -> subprocess.CompletedProcess[str]:
+        """Run one shell command on the machine, over the session on an agent account.
+
+        Login uses it for the workspace check and the GPU query, which need no ssh.
+        """
+        return self._run_helper(["sh", "-c", command], timeout)
 
     def _run_helper(self, argv: list[str], timeout: float) -> subprocess.CompletedProcess[str]:
         if self.agent is not None:

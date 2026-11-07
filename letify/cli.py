@@ -430,6 +430,7 @@ def _client_shell_connect(args: argparse.Namespace) -> int:
             "A restart gets a new address, so run the login again with the new token it prints."
         )
     )
+    print(style.dim("Tailcat is removed in 3.0. Run 'letify agent serve' on this machine instead."))
     sys.stdout.flush()
     try:
         agent.serve_forever()

@@ -226,7 +226,7 @@ Provider (abstract)
 ├── Kaggle                ephemeral, host="remote" only, account reached through a browser cookie
 └── Shell                 ephemeral by default, reached through the connection pipeline
     ├── Colab             session created by the Colab CLI, rendezvous over colab exec
-    ├── Tunnel            a machine behind NAT, rendezvous through letify client shell connect
+    ├── Tunnel            a machine behind NAT, reached through letify agent serve (a Tailcat account works until 3.0)
     └── Elice             machine allocated through the Elice Cloud API, rendezvous over SSH to it
 ```
 
@@ -1926,15 +1926,16 @@ The public IP address is learned from the same STUN servers the punch uses. The 
 
 ### Rendezvous <!-- id: rendezvous -->
 
-> Hole punching needs a way to start a program on the remote side and swap addresses. For Colab and Elice the provider layer fills that role; a plain machine behind NAT runs `letify client shell connect`.
+> Hole punching needs a way to start a program on the remote side and swap addresses. For Colab and Elice the provider layer fills that role; a machine behind NAT runs `letify agent serve`, and until 3.0 a Tailcat account still uses `letify client shell connect`.
 
 | Provider | Rendezvous |
 |---|---|
 | `Colab` | the provider layer: `colab new` creates the runtime and `colab exec` runs the remote half |
 | `Elice` | the provider layer: `eci` launches or starts the machine, and the remote half runs over forward SSH to its public IP |
-| `Tunnel`, and a plain `Shell` behind NAT | the remote agent started by `letify client shell connect`, reached over Tailcat |
+| `Tunnel` with an `agent` | `letify agent serve`, reached through the signalling service ([Agent and pairing](#link-agent)) |
+| `Tunnel` with `tailcat`, and a plain `Shell` behind NAT | the remote agent started by `letify client shell connect`, reached over Tailcat; removed in 3.0 |
 
-Colab and Elice never need `letify client shell connect`. Their create and open step is what puts letify's remote half on the machine.
+Colab and Elice never need an agent. Their create and open step is what puts letify's remote half on the machine.
 
 `letify client shell connect` is run once on a plain machine by its user. The agent needs letify installed on that machine. Before starting anything it checks two things, and each failure prints what to do and exits 1:
 
@@ -2297,10 +2298,12 @@ Hypothesis: one long-running process holding a list of paired node ids replaces 
 6. **Unpair.** `letify agent unpair <node>` removes the node from `paired.json`, where `<node>` is the full id or a unique prefix of at least 8 characters, and `letify agent paired` lists the nodes with label and time. A running agent that sees the change ends that node's conversation, killing its shim even after hand-over, and answers its later messages with nothing.
 7. **The URL.** The service URL is, in order: `--signal`, the environment variable `LETIFY_SIGNAL_URL`, `signal` in `~/.letify/agent/config.toml`, then `https://letify.darkpyonix.dev`. The token carries the URL the agent used, and the user side uses the token's URL, so the two sides cannot disagree. A plain `http://` URL is accepted only for a loopback host.
 8. **Login.** `letify login tunnel <alias> --connect <token>` dispatches on the prefix of the token: `letify-agent2:` takes this path, anything else takes the Tailcat path. This path needs no ssh and no Tailcat. It makes the account's node key `~/.letify/accounts/<alias>/link.key` (the key `connect_over` uses for the same account), pairs as item 3 says and writes `kind = "tunnel"`, `agent = "<agent node id>"` and `signal = "<URL>"`. A token past its `exp` is refused before anything is sent.
-9. **Commands.** `letify agent` runs on the address-less machine and builds no Launcher, like `letify client`. It is a command of its own and not a flag of `letify client shell connect`, because that command is the Tailcat agent with an ssh server and the next branch removes it.
+9. **Commands.** `letify agent` runs on the address-less machine and builds no Launcher, like `letify client`. It is a command of its own and not a flag of `letify client shell connect`, because that command is the Tailcat agent with an ssh server. From 2.12 `letify agent serve` is the documented tunnel setup, and `letify client shell connect` prints, after its login command, one dim line: `Tailcat is removed in 3.0. Run 'letify agent serve' on this machine instead.`
 10. **Dependencies.** The agent is the standard library and the `letify-link` binary. It adds no package.
 11. **Connect.** A `tunnel` account with an `agent` field is reached through the agent, with no ssh and no Tailcat. The account is a letify-link account without a `link` option: `link = "ssh"` on it is refused by name, because there is no ssh server to reach. It has no address, so `Tunnel.address` is `None` and no strategy is raced. `Tunnel.link()` returns the session's measurements with no ssh command, as `Colab.link()` does. `connect_link` calls `linkchannel.connect_signal`, which opens the sidecar of the account's `link.key`, builds a `SignalClient` for the account's `signal` URL and a `SignalBootstrap` for the node `agent`, and calls `connect_over` with no address, `punch=True`, the channel named `the signalling service` and no binary preparation, because the agent holds the binary of its own machine. The ping of `SignalBootstrap.start` is the bootstrap round trip, so `lead_ms` and the shim wait follow the rules of [Sidecar interface](#link-sidecar) item 8. A failure raises `ProviderUnavailable` with the reason and falls back to nothing.
 12. **The ssh target.** `letify agent serve --ssh-target HOST:PORT`, or `ssh_target` in `~/.letify/agent/config.toml`, sets the sshd that the ssh stream of [Sidecar interface](#link-sidecar) item 11 reaches on this machine. It defaults to `127.0.0.1:22`. The agent has no ssh server of its own, so the stream is useful only on a machine that runs one; without one the stream is closed and nothing else is affected.
+13. **What needed ssh.** Every step of the Tailcat login that used ssh has a session equivalent on an agent account: the workspace check and the device query of `letify login tunnel` run over the `exec` stream (Tunnel login section), `letify login tunnel <alias> --detect-devices` asks an agent account again over the same stream and then follows [Recording devices at login](#login-records-devices) item 7, and `Tunnel.check`, the device listing and the worker listing already run over it. The key install and key confirmation have no equivalent and are not done, because the session authenticates with node keys. An agent account's `--detect-devices` is no longer refused for having no address.
+14. **The Tailcat notice.** A `tunnel` account with `tailcat` and no `agent` prints once per process, when its link is first chosen, the line `<alias> reaches its machine through Tailcat, which is removed in 3.0. To migrate it, run 'letify agent serve' on the machine, then 'letify login tunnel <alias> --connect letify-agent2:<token>' with the token it prints.` It goes through the account's announce setting like every connection line, so `announce = false` silences it. The account keeps working unchanged. A second Tailcat account in the same process prints nothing more. Tailcat code is removed in 3.0, not before.
 
 #### NAT traversal <!-- id: link-nat -->
 
@@ -2765,7 +2768,19 @@ After the sign in succeeds, the Colab login records `key`, the SSH private key w
 
 The account is written with `kind = "elice"`, `zone_id`, `key`, `machine_id` and `price_type` when chosen, and `endpoint` only when it is not the default.
 
-`letify login tunnel <alias> --connect <token>` declares a machine behind NAT from the command `letify client shell connect` printed on it. Without `--connect`, a terminal is asked `Token printed by 'letify client shell connect': `, and `--no-input` refuses. The steps run in this order, and a failure at any step writes nothing to either file and raises `LoginError` whose message starts with `tunnel login failed at <step>: `:
+`letify login tunnel <alias> --connect <token>` declares a machine behind NAT. The token is the one `letify agent serve` prints (prefix `letify-agent2:`), and that is the setup letify documents. A token from `letify client shell connect` still declares a Tailcat account until 3.0. Without `--connect`, a terminal is asked `Token printed by 'letify agent serve' or 'letify client shell connect': `, and `--no-input` refuses. The prefix decides the path. A failure at any step writes nothing to either file and raises `LoginError` whose message starts with `tunnel login failed at <step>: `.
+
+The agent path runs these steps and uses no ssh key, no Tailcat and no ssh server:
+
+1. `token`: the token is decoded and its expiry checked, as [Agent and pairing](#link-agent) item 8 says.
+2. `pairing`: the node is paired as item 3 says.
+3. `session`: one letify-link session to the agent is opened with the account just paired, under the [Link floor](#link-floor). A session that cannot be opened fails the login, because every later step and every call needs it.
+4. `workspace`: the workspace root is chosen as for `shell` and checked over the session's `exec` stream. `exec` runs as the agent's user, so it needs no key.
+5. `devices`: the GPUs are recorded as Recording devices at login describes, with `nvidia-smi` run over the same `exec` stream. A failure here never fails the login.
+
+The session is closed when the login ends. The account is written with `kind = "tunnel"`, `agent`, `signal`, `workspace` when it is not the default, and the `devices` table. It has no `address`, `user`, `port` or `key`. The ssh server of the agent machine is reached only when the user asks for it, through `Tunnel.ssh_forward()` ([Sidecar interface](#link-sidecar) item 11), and nothing in letify needs it.
+
+The Tailcat path is for an account that already exists and for a machine that cannot run the agent. A Tailcat token is accepted, and the login prints one line saying that Tailcat is removed in 3.0 and that `letify agent serve` replaces it. Its steps are these, and every one runs over Tailcat:
 
 1. `tailcat`: `tailcat` must be found by the lookup of Installing external tools, and every SSH command runs it by the path found. Otherwise it is installed automatically, and when automatic install is turned off the message is the same install instructions `letify client shell connect` prints, for this machine's operating system and architecture.
 2. `token`: the token is decoded. A token that is not the base64 JSON described under Rendezvous, or that lacks `tailcat` or `tailcat_port`, is refused.
@@ -2774,7 +2789,7 @@ The account is written with `kind = "elice"`, `zone_id`, `key`, `machine_id` and
 5. `workspace`: the workspace root is chosen and checked as for `shell`, over the same `ProxyCommand`.
 6. `devices`: the GPUs are recorded as Recording devices at login describes, over the same `ProxyCommand`.
 
-The account is written with `kind = "tunnel"`, `tailcat`, `tailcat_port`, `user`, `port` and `key` from the token and the options. It has no `address` unless the token or `--address` gives one, and `public_port` is written when the token or `--public-port` gives it. A value in the token wins over the option. Every login step still runs over Tailcat.
+The account is written with `kind = "tunnel"`, `tailcat`, `tailcat_port`, `user`, `port` and `key` from the token and the options. It has no `address` unless the token or `--address` gives one, and `public_port` is written when the token or `--public-port` gives it. A value in the token wins over the option.
 
 `letify login kaggle <alias>` declares a Kaggle account from the browser session cookie of a logged-in kaggle.com tab. The cookie is `--cookie`, a file it names, or with a terminal it is asked for with hidden input as `Kaggle cookie (from a logged-in kaggle.com tab): `, and `--no-input` without `--cookie` refuses. It is checked for shape (it must carry `ka_sessionid`, `CLIENT-TOKEN` and `XSRF-TOKEN`) and expiry (from the `CLIENT-TOKEN` `exp` claim) before any network call, then proven with `users.UsersService/GetCurrentUser`, which returns the account only for a real session. Nothing is written until the check passes. The cookie is stored at `~/.letify/accounts/<alias>/cookie` with mode 0600, and it never appears in `config.toml` or in output.
 
@@ -2833,7 +2848,7 @@ One other approach is not the default. `sshpass` feeds a stored password to each
 | Kind | Written to the home file | Credential |
 |---|---|---|
 | `shell` | address, user, port, key path, `workspace` when it is not the default, and the `devices` table the machine reported | an SSH key, installed by `login`; no password stored |
-| `tunnel` | `tailcat`, `tailcat_port`, user and port from the token `letify client shell connect` printed, key path, `workspace` when it is not the default, and the `devices` table; `address` and `public_port` only when the token or the options give them | an SSH key, installed by `login` over Tailcat; no password stored |
+| `tunnel` | `agent` and `signal` from the token `letify agent serve` printed, `workspace` when it is not the default, and the `devices` table; or, for a Tailcat account until 3.0, `tailcat`, `tailcat_port`, user, port and key path from the token `letify client shell connect` printed, with `address` and `public_port` only when the token or the options give them | an agent account: the account's node key `link.key`, paired with the agent. A Tailcat account: an SSH key, installed by `login` over Tailcat; no password stored |
 | `elice` | endpoint when not the default, zone, key path, and `machine_id`, `price_type` and `workspace` when given | access token in `~/.letify/accounts/<alias>/access_token`; the generated machine password in `machine_password` once letify launches a machine |
 | `colab` | account email, `workspace` when given | the Colab CLI's token, written by its own sign in under `~/.letify/accounts/<alias>/` |
 | `modal` | `profile` and `workspace`, each when given | Modal's token, written by `modal token new` to `~/.letify/accounts/<alias>/modal.toml` |
@@ -3225,7 +3240,7 @@ Connection decision lines stay on standard error as `letify: <message>`, with th
 | `logout` | `✓ <alias> removed from <home>`, then the note about the project reference, dim |
 | `stubs` | `✓ <path written>` |
 | `setup <tool>` | `✓ <tool> <version> at <path>`, or with `--where` the `cache`, `link`, `PATH` and `uses` lines, as Installing external tools describes |
-| `client shell connect` | `On your own machine, run:` bold, the login command plain so it can be copied, and the notes dim |
+| `client shell connect` | `On your own machine, run:` bold, the login command plain so it can be copied, and the notes dim, ending with the line that says Tailcat is removed in 3.0 |
 
 A runtime block in `status` is:
 

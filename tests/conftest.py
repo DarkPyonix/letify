@@ -36,6 +36,7 @@ import letify
 from letify.config.schema import ProviderConfig
 from letify.declare.env import Env
 from letify.declare.instance import Instance
+from letify.errors import ProviderUnavailable
 from letify.providers.local import Local
 from letify.runtime import telemetry
 
@@ -2738,3 +2739,70 @@ def refusing_port() -> socket.socket:
     holder = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     holder.bind(("127.0.0.1", 0))
     return holder
+
+
+# -- an agent account's session, for the tunnel login (spec "Agent and pairing" item 13) ---------
+
+
+class FakeAgentSession:
+    """Stands in for the letify-link session of a Tunnel account that names an agent.
+
+    The real session needs a built sidecar, a signalling service and an agent, and the
+    tests that run it live in test_link_agent.py. The login steps that only need a command
+    answered over the session use this instead.
+    """
+
+    def __init__(self) -> None:
+        self.commands: list[list[str]] = []
+        self.opened = 0
+        self.closed = 0
+        self.open_error: str | None = None
+        self.workspace_error: str | None = None
+        self.gpus = "0, NVIDIA A100-SXM4-80GB, 81920 MiB\n"
+
+    def run(self, argv: list[str], timeout: float) -> FakeCompleted:
+        self.commands.append(list(argv))
+        text = " ".join(argv)
+        if "nvidia-smi" in text:
+            return FakeCompleted(stdout=self.gpus)
+        if self.workspace_error:
+            return FakeCompleted(returncode=1, stderr=self.workspace_error)
+        return FakeCompleted()
+
+
+@pytest.fixture
+def agent_session_only(monkeypatch) -> FakeAgentSession:
+    """Answer an agent account's session without a sidecar. Pairing is left as it is."""
+    from letify.providers.tunnel import Tunnel
+
+    fake = FakeAgentSession()
+
+    def link_remote(self, runtime=None):
+        if fake.open_error:
+            raise ProviderUnavailable("tunnel", fake.open_error)
+        fake.opened += 1
+        return object()
+
+    monkeypatch.setattr(Tunnel, "link_remote", link_remote)
+    monkeypatch.setattr(Tunnel, "_run_helper", lambda self, argv, timeout: fake.run(argv, timeout))
+    monkeypatch.setattr(
+        Tunnel, "close_link", lambda self, runtime=None: setattr(fake, "closed", fake.closed + 1)
+    )
+    return fake
+
+
+@pytest.fixture
+def agent_session(monkeypatch, agent_session_only) -> FakeAgentSession:
+    """The fake session, and a pairing that needs no sidecar and no signalling service."""
+    from letify.transport import linkagent, linkd
+
+    class Daemon:
+        def __init__(self, path, **kwargs) -> None:
+            pass
+
+        def close(self) -> None:
+            pass
+
+    monkeypatch.setattr(linkd, "LinkDaemon", Daemon)
+    monkeypatch.setattr(linkagent, "pair", lambda client, fields, label: None)
+    return agent_session_only
