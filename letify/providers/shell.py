@@ -588,8 +588,8 @@ class Shell(Provider):
     def uses_letify_link(self) -> bool:
         """Whether the account carries the worker channel over letify-link instead of ssh.
 
-        Spec "Sidecar interface" item 7: ``link = "letify-link"`` opts in, and the default,
-        ``"ssh"``, keeps the ssh data path.
+        Spec "Sidecar interface" item 7: no ``link`` key or ``"letify-link"`` is on, and
+        ``"ssh"`` keeps the ssh data path.
         """
         from ..transport.linkchannel import letify_link_enabled
 
