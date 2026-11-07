@@ -49,6 +49,12 @@ pub struct UdpConfig {
     pub keep_alive: Duration,
     /// Time limit for the QUIC handshake and the stream. Default 10 s.
     pub connect_timeout: Duration,
+    /// The ALPN protocol both ends offer, and the handshake is refused when they differ.
+    /// Default `letify-link/udp/1`. Set `h3` to present the handshake of HTTP/3.
+    pub alpn: Vec<u8>,
+    /// The server name the connecting end sends. The accepting end does not check it.
+    /// Default `letify`. Set a host name a CDN serves to look like web traffic.
+    pub server_name: String,
 }
 
 impl Default for UdpConfig {
@@ -60,6 +66,8 @@ impl Default for UdpConfig {
             idle_timeout: Duration::from_secs(30),
             keep_alive: Duration::from_secs(10),
             connect_timeout: Duration::from_secs(10),
+            alpn: ALPN.to_vec(),
+            server_name: "letify".into(),
         }
     }
 }
@@ -97,7 +105,7 @@ fn server_config(cfg: &UdpConfig) -> io::Result<ServerConfig> {
         .with_no_client_auth()
         .with_single_cert(chain, key)
         .map_err(other)?;
-    crypto.alpn_protocols = vec![ALPN.to_vec()];
+    crypto.alpn_protocols = vec![cfg.alpn.clone()];
     let mut server =
         ServerConfig::with_crypto(Arc::new(QuicServerConfig::try_from(crypto).map_err(other)?));
     server.transport_config(transport(cfg)?);
@@ -111,7 +119,7 @@ fn client_config(cfg: &UdpConfig) -> io::Result<ClientConfig> {
         .dangerous()
         .with_custom_certificate_verifier(Arc::new(AnyPeer))
         .with_no_client_auth();
-    crypto.alpn_protocols = vec![ALPN.to_vec()];
+    crypto.alpn_protocols = vec![cfg.alpn.clone()];
     let mut client =
         ClientConfig::new(Arc::new(QuicClientConfig::try_from(crypto).map_err(other)?));
     client.transport_config(transport(cfg)?);
@@ -180,6 +188,15 @@ fn endpoint(
     )
 }
 
+/// What the handshake of a path negotiated.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Handshake {
+    /// The ALPN protocol both ends agreed on.
+    pub alpn: Option<Vec<u8>>,
+    /// The server name the connecting end sent. Only the accepting end learns it.
+    pub server_name: Option<String>,
+}
+
 /// One UDP path: a QUIC connection and its one stream, usable as a session subflow.
 pub struct UdpPath {
     send: SendStream,
@@ -203,7 +220,7 @@ impl UdpPath {
     ) -> io::Result<UdpPath> {
         let endpoint = endpoint(socket, None, cfg)?;
         let connecting = endpoint
-            .connect_with(client_config(cfg)?, peer, "letify")
+            .connect_with(client_config(cfg)?, peer, &cfg.server_name)
             .map_err(other)?;
         let timeout = || io::Error::new(io::ErrorKind::TimedOut, "the UDP path did not open");
         let conn = tokio::time::timeout(cfg.connect_timeout, connecting)
@@ -242,6 +259,21 @@ impl UdpPath {
     /// The local address of the socket.
     pub fn local_addr(&self) -> io::Result<SocketAddr> {
         self._endpoint.local_addr()
+    }
+
+    /// The ALPN and server name of the handshake of this path.
+    pub fn handshake(&self) -> Handshake {
+        let data = self
+            .conn
+            .handshake_data()
+            .and_then(|d| d.downcast::<quinn::crypto::rustls::HandshakeData>().ok());
+        match data {
+            Some(d) => Handshake {
+                alpn: d.protocol.clone(),
+                server_name: d.server_name.clone(),
+            },
+            None => Handshake::default(),
+        }
     }
 
     /// The address of the peer.
