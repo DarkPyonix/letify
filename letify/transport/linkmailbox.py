@@ -29,6 +29,8 @@ PINGS = 2
 SAMPLES = 3
 #: Seconds close waits for a call in flight to come back.
 JOIN_S = 30.0
+#: Seconds the close call may take before close gives up on it.
+CLOSE_TIMEOUT_S = 30.0
 
 
 def pump_source() -> str:
@@ -155,11 +157,18 @@ class MailboxBootstrap:
         return self._stderr
 
     def close(self) -> None:
-        """Stop moving lines. The pump ends by itself once the shim has handed over or died."""
+        """Stop moving lines and tell the pump to end its runtime side.
+
+        The pump stops a shim that has not handed over and removes its directory. A pump the
+        call cannot reach ends the same way by itself after ``linkpump.IDLE_S``.
+        """
         self._stop.set()
         thread = self._thread
         if thread is not None and thread is not threading.current_thread():
             thread.join(timeout=JOIN_S)
+        if self._directory:
+            with contextlib.suppress(Exception):
+                self._call({"op": "close", "dir": self._directory}, CLOSE_TIMEOUT_S)
         self._inbound.put(None)
 
 

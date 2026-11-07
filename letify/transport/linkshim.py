@@ -490,6 +490,7 @@ class Shim:
                 return
         if not self.handed_over:
             # The local side went away before the session started: nothing to serve.
+            self.proc.kill()
             os._exit(0)
 
     def punch(self, command):
@@ -528,6 +529,7 @@ class Shim:
 
     def run(self):
         self.started = time.monotonic()
+        signal.signal(signal.SIGTERM, lambda signum, frame: sys.exit(0))
         self.start_sidecar()
         reply = self.control.request(self.listen_request())
         self.listener = reply["listener"]
