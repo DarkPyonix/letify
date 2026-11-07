@@ -12,6 +12,7 @@ channel runs, so it imports nothing from letify and avoids syntax newer than Pyt
 import json
 import os
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -66,6 +67,8 @@ def pump(directory):
         stdout=subprocess.PIPE,
         stderr=errors,
         close_fds=True,
+        # Its own process group, so that everything the shim started can be ended together.
+        start_new_session=True,
     )
 
     state = {"handed": False}
@@ -84,6 +87,11 @@ def pump(directory):
                     shim.wait(timeout=STOP_WAIT_S)
                 except subprocess.TimeoutExpired:
                     shim.kill()
+            # Sweep the group: the sidecar must not outlive a shim that exited without it.
+            try:
+                os.killpg(shim.pid, signal.SIGKILL)
+            except OSError:
+                pass
 
     def watch():
         """End this side when the client closed the mailbox or no call has come for IDLE_S."""

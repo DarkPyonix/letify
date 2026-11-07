@@ -530,16 +530,19 @@ class Shim:
     def run(self):
         self.started = time.monotonic()
         signal.signal(signal.SIGTERM, lambda signum, frame: sys.exit(0))
-        self.start_sidecar()
-        reply = self.control.request(self.listen_request())
-        self.listener = reply["listener"]
-        port = int(reply["addr"].rpartition(":")[2])
-        say(event="ready", node_id=self.node_id, port=port)
-        threading.Thread(target=self.stdin_loop, daemon=True).start()
         try:
+            self.start_sidecar()
+            reply = self.control.request(self.listen_request())
+            self.listener = reply["listener"]
+            port = int(reply["addr"].rpartition(":")[2])
+            say(event="ready", node_id=self.node_id, port=port)
+            threading.Thread(target=self.stdin_loop, daemon=True).start()
             self.pump()
         finally:
-            self.proc.kill()
+            # Every exit path, a SIGTERM during start-up included, ends the sidecar.
+            proc = getattr(self, "proc", None)
+            if proc is not None:
+                proc.kill()
 
 
 def main():

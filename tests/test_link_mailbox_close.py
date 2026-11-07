@@ -61,6 +61,19 @@ def sidecars(binary: Path) -> set[int]:
     return found
 
 
+def children_of(parents: list[int], binary: Path) -> set[int]:
+    """The sidecars whose parent is one of ``parents``, so a parallel test's are not counted."""
+    found = set()
+    for pid in sidecars(binary):
+        try:
+            stat = Path(f"/proc/{pid}/stat").read_text()
+        except OSError:
+            continue
+        if int(stat.rpartition(")")[2].split()[1]) in parents:
+            found.add(pid)
+    return found
+
+
 def wait_until(check, seconds: float = 5.0) -> bool:
     end = time.monotonic() + seconds
     while time.monotonic() < end:
@@ -91,11 +104,10 @@ def started(sidecar_binary: Path, peer: str) -> linkmailbox.MailboxBootstrap:
 def test_closing_before_the_hand_over_ends_the_pump_the_shim_and_the_sidecar(
     sidecar_binary, peer_id
 ) -> None:
-    before = sidecars(sidecar_binary)
     bootstrap = started(sidecar_binary, peer_id)
     directory = bootstrap._directory
     assert len(pids_of(directory)) >= 2
-    mine = sidecars(sidecar_binary) - before
+    mine = children_of(pids_of(directory), sidecar_binary)
     assert mine
     bootstrap.close()
     assert wait_until(lambda: not pids_of(directory)), pids_of(directory)
@@ -108,10 +120,9 @@ def test_a_pump_that_no_call_reaches_ends_its_runtime_side(
 ) -> None:
     source = linkmailbox.pump_source().replace("IDLE_S = 120.0", "IDLE_S = 1.0")
     monkeypatch.setattr(linkmailbox, "pump_source", lambda: source)
-    before = sidecars(sidecar_binary)
     bootstrap = started(sidecar_binary, peer_id)
     directory = bootstrap._directory
-    mine = sidecars(sidecar_binary) - before
+    mine = children_of(pids_of(directory), sidecar_binary)
     # Stop the poll thread without the close call, as a client that died would.
     bootstrap._stop.set()
     assert wait_until(lambda: not pids_of(directory), 15.0), pids_of(directory)
