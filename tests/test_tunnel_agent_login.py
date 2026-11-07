@@ -1,6 +1,6 @@
-"""The agent as the tunnel login, and the notice a Tailcat account gets.
+"""The agent as the tunnel login.
 
-Spec "Agent and pairing" items 13 and 14, "Logging in" (``letify login tunnel``) and
+Spec "Agent and pairing" item 13, "Logging in" (``letify login tunnel``) and
 "Recording devices at login". The session itself is faked here; its real behaviour is
 pinned in test_link_agent.py and test_link_ssh_stream.py.
 """
@@ -12,14 +12,10 @@ import tomllib
 from pathlib import Path
 
 import pytest
-from conftest import provider_of
 
 from letify.cli import main
 from letify.config import login
-from letify.providers import shell as shell_module
-from letify.providers import tunnel as tunnel_module
-from letify.providers.tunnel import Tunnel
-from letify.transport import linkagent, setup
+from letify.transport import linkagent
 
 AGENT = "ab" * 32
 SIGNAL = "https://signal.example"
@@ -144,83 +140,3 @@ def test_a_new_workspace_of_an_existing_agent_account_is_checked_over_the_sessio
     with pytest.raises(login.LoginError, match="Read-only file system"):
         login.log_in(answers)
     assert "workspace" not in home_config()["box"]
-
-
-# -- the Tailcat notice ---------------------------------------------------------------------
-
-
-@pytest.fixture
-def tailcat_link(monkeypatch):
-    """Stop the pipeline where a Tailcat account would race it, and reset the notice."""
-    monkeypatch.setattr(tunnel_module, "_tailcat_noticed", False, raising=False)
-    monkeypatch.setattr(shell_module.Shell, "link", lambda self, runtime=None: object())
-
-
-def tailcat_account(alias: str = "box", **over):
-    return provider_of(Tunnel, alias, tailcat="tcAbc123", tailcat_port=40123, **over)
-
-
-def test_a_tailcat_account_is_told_once_that_tailcat_is_removed_in_3_0_and_how_to_migrate(
-    tailcat_link, capsys
-) -> None:
-    tailcat_account().link()
-    err = capsys.readouterr().err
-    assert "box reaches its machine through Tailcat" in err
-    assert "removed in 3.0" in err
-    assert "letify agent serve" in err
-    assert "letify login tunnel box --connect letify-agent2:" in err
-
-
-def test_a_second_tailcat_account_or_link_in_one_process_prints_nothing_more(
-    tailcat_link, capsys
-) -> None:
-    first = tailcat_account()
-    first.link()
-    capsys.readouterr()
-    first.link()
-    tailcat_account("other").link()
-    assert capsys.readouterr().err == ""
-
-
-def test_a_tailcat_account_with_announce_off_prints_no_notice(tailcat_link, capsys) -> None:
-    provider = tailcat_account()
-    provider.announce = False
-    provider.link()
-    assert capsys.readouterr().err == ""
-
-
-def test_an_agent_account_prints_no_tailcat_notice(tailcat_link, capsys) -> None:
-    provider_of(Tunnel, "box", agent=AGENT, signal=SIGNAL).link()
-    assert capsys.readouterr().err == ""
-
-
-def test_a_tailcat_login_says_that_tailcat_is_removed_in_3_0(
-    isolated_home, monkeypatch, capsys
-) -> None:
-    monkeypatch.setattr(
-        "letify.install.ensure", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("stop"))
-    )
-    token = setup.encode_token({"tailcat": "tcAbc123", "tailcat_port": 40123})
-    answers = login.Answers(
-        alias="box", kind="tunnel", values={"connect": token}, interactive=False
-    )
-    with pytest.raises(RuntimeError, match="stop"):
-        login.tunnel_account(answers)
-    err = capsys.readouterr().err
-    assert "removed in 3.0" in err
-    assert "letify agent serve" in err
-
-
-def test_client_shell_connect_ends_with_the_line_that_says_tailcat_is_removed_in_3_0(
-    monkeypatch, capsys
-) -> None:
-    from letify.transport import agent as agent_module
-
-    monkeypatch.setattr(setup, "tailcat_on_path", lambda binary: True)
-    monkeypatch.setattr(setup, "ssh_answers", lambda port: True)
-    monkeypatch.setattr(agent_module.Agent, "bind", lambda self: 4000)
-    monkeypatch.setattr(agent_module.Agent, "start_tailcat", lambda self: "tcAbc123")
-    monkeypatch.setattr(agent_module.Agent, "serve_forever", lambda self: None)
-    monkeypatch.setattr(setup, "local_user", lambda: "researcher")
-    assert main(["client", "shell", "connect", "--tailcat", "/x/tailcat", "--name", "b"]) == 0
-    assert "Tailcat is removed in 3.0. Run 'letify agent serve'" in capsys.readouterr().out

@@ -134,7 +134,7 @@ def build_parser() -> argparse.ArgumentParser:
     log_in.add_argument(
         "--connect",
         metavar="TOKEN",
-        help="the token 'letify agent serve' or 'letify client shell connect' printed, for tunnel",
+        help="the token 'letify agent serve' printed, for tunnel",
     )
     log_in.add_argument(
         "--cookie",
@@ -232,37 +232,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     setup_parser = sub.add_parser(
-        "setup", help="install tailcat or eci from its publisher ahead of time"
+        "setup", help="install eci from its publisher ahead of time"
     )
-    setup_parser.add_argument("tool", choices=("tailcat", "eci"), help="the tool to install")
+    setup_parser.add_argument("tool", choices=("eci",), help="the tool to install")
     setup_parser.add_argument(
         "--where", action="store_true", help="print where the tool is and which copy letify uses"
-    )
-
-    client = sub.add_parser("client", help="run letify's side on a remote machine")
-    client_sub = client.add_subparsers(dest="client_command", required=True)
-    client_shell = client_sub.add_parser("shell", help="a plain machine with no provider API")
-    shell_sub = client_shell.add_subparsers(dest="shell_command", required=True)
-    connect = shell_sub.add_parser(
-        "connect", help="start the remote agent behind tailcat serve and print its address"
-    )
-    connect.add_argument(
-        "--ssh-port", dest="ssh_port", type=int, default=22, help="this machine's SSH server"
-    )
-    connect.add_argument(
-        "--public-address",
-        dest="public_address",
-        help="the address this machine's SSH server is reachable at from outside",
-    )
-    connect.add_argument(
-        "--public-port",
-        dest="public_port",
-        type=int,
-        help="the port published for this machine's SSH server, such as Docker's -p host port",
-    )
-    connect.add_argument("--tailcat", default="tailcat", help="the tailcat command")
-    connect.add_argument(
-        "--name", help="the alias the printed login command names; defaults to the host name"
     )
 
     agent = sub.add_parser(
@@ -353,7 +327,7 @@ def _agent_command(args: argparse.Namespace) -> int:
         ssh_target=target,
     )
     token = service.new_token(url)
-    alias = args.name or setup_default_alias()
+    alias = args.name or default_alias()
     style = _out()
     print(style.bold("On your own machine, within 15 minutes, run:"))
     print()
@@ -371,74 +345,14 @@ def _agent_command(args: argparse.Namespace) -> int:
     return 0
 
 
-def setup_default_alias() -> str:
-    from .transport import setup
+def default_alias(hostname: str | None = None) -> str:
+    """This machine's host name as a Python identifier, for the printed login command."""
+    import re
+    import socket
 
-    return setup.default_alias()
-
-
-def _client_shell_connect(args: argparse.Namespace) -> int:
-    """Check tailcat and the SSH server, run the remote agent, and print the login command."""
-    from .install import InstallError, ensure
-    from .transport import setup
-    from .transport.agent import Agent
-
-    if args.tailcat == "tailcat":
-        try:
-            args.tailcat = ensure("tailcat", instructions=setup.tailcat_install_instructions())
-        except InstallError as exc:
-            _fail(str(exc))
-            return 1
-    elif not setup.tailcat_on_path(args.tailcat):
-        _fail(setup.tailcat_install_instructions())
-        return 1
-    if not setup.ssh_answers(args.ssh_port):
-        _fail(setup.sshd_missing_message(args.ssh_port))
-        return 1
-
-    agent = Agent(ssh=("127.0.0.1", args.ssh_port), tailcat=args.tailcat)
-    port = agent.bind()
-    try:
-        address = agent.start_tailcat()
-    except (OSError, RuntimeError) as exc:
-        agent.close()
-        _fail(str(exc))
-        return 1
-    fields = {
-        "tailcat": address,
-        "tailcat_port": port,
-        "user": setup.local_user(),
-        "port": args.ssh_port,
-    }
-    if args.public_address:
-        fields["address"] = args.public_address
-    if args.public_port:
-        fields["public_port"] = args.public_port
-    token = setup.encode_token(fields)
-    alias = args.name or setup.default_alias()
-    style = _out()
-    print(style.bold("On your own machine, run:"))
-    print()
-    print(f"  letify login tunnel {alias} --connect {token}")
-    print()
-    print(style.dim("Keep this agent running: every connection to this machine goes through it."))
-    print(style.dim("To keep it running after you log out, start it inside tmux or with nohup:"))
-    print("  tmux new -s letify 'letify client shell connect'")
-    print("  nohup letify client shell connect > letify-agent.log 2>&1 &")
-    print(
-        style.dim(
-            "A restart gets a new address, so run the login again with the new token it prints."
-        )
-    )
-    print(style.dim("Tailcat is removed in 3.0. Run 'letify agent serve' on this machine instead."))
-    sys.stdout.flush()
-    try:
-        agent.serve_forever()
-    except KeyboardInterrupt:  # pragma: no cover - interactive
-        pass
-    finally:
-        agent.close()
-    return 0
+    name = re.sub(r"\W", "_", hostname if hostname is not None else socket.gethostname())
+    name = name.strip("_") or "machine"
+    return f"machine_{name}" if name[0].isdigit() else name
 
 
 def _setup_tool(args: argparse.Namespace) -> int:
@@ -461,7 +375,7 @@ def _setup_tool(args: argparse.Namespace) -> int:
             _fail(str(exc))
             return 1
         found = install.find(tool)
-    if found is None:  # pragma: no cover - brew put tailcat off PATH
+    if found is None:  # pragma: no cover - the install left the tool off every lookup path
         _fail(f"{tool} was installed but letify cannot find it")
         return 1
     _say("ok", f"{tool} {version} at {found}")
@@ -935,10 +849,6 @@ def _dispatch(args: argparse.Namespace) -> int:
     if args.command == "agent":
         # Runs on the address-less machine, which has no accounts, so no Launcher is built.
         return _agent_command(args)
-
-    if args.command == "client":
-        # Runs on the remote machine, which has no accounts, so no Launcher is built.
-        return _client_shell_connect(args)
 
     if args.command == "login":
         alias = args.alias or args.kind

@@ -46,7 +46,7 @@ from letify.providers.tunnel import Tunnel
 from letify.runtime.channel import OneShotChannel, PersistentChannel
 from letify.store.backends.filesystem import FilesystemBackend
 from letify.transport import strategies as strategies_module
-from letify.transport.rendezvous import ShellCommandRendezvous, TailcatRendezvous
+from letify.transport.rendezvous import ShellCommandRendezvous
 
 usage_module = import_module("letify.providers.usage")
 
@@ -1003,9 +1003,8 @@ def test_a_plain_shell_lists_the_default_strategies_in_rank_order() -> None:
         ("direct_ssh", 1),
         ("connect_back", 2),
         ("tcp_punch", 3),
-        ("tailcat", 4),
-        ("quic", 5),
-        ("fallback", 6),
+        ("quic", 4),
+        ("fallback", 5),
     ]
 
 
@@ -1016,7 +1015,6 @@ def test_an_account_that_turns_port_mapping_off_does_not_race_connect_back() -> 
     assert [s.name for s in provider.strategies()] == [
         "direct_ssh",
         "tcp_punch",
-        "tailcat",
         "quic",
         "fallback",
     ]
@@ -1030,7 +1028,7 @@ def test_a_shell_with_no_rendezvous_is_reached_by_forward_ssh_alone(patch_run) -
     assert recorder.calls == []
 
 
-def test_reverse_ssh_takes_rank_six_and_moves_the_fallback_to_seven() -> None:
+def test_reverse_ssh_takes_rank_five_and_moves_the_fallback_to_six() -> None:
     provider = provider_of(
         Shell,
         "lab",
@@ -1038,19 +1036,12 @@ def test_reverse_ssh_takes_rank_six_and_moves_the_fallback_to_seven() -> None:
         reverse_ssh={"address": "home.example.com", "port": 2222, "user": "me"},
     )
     assert [(s.name, s.rank) for s in provider.strategies()][-2:] == [
-        ("reverse_ssh", 6),
-        ("fallback", 7),
+        ("reverse_ssh", 5),
+        ("fallback", 6),
     ]
 
 
-def test_an_account_with_a_tailcat_address_has_the_agent_as_its_rendezvous() -> None:
-    provider = provider_of(Tunnel, "lab", tailcat="tcHome", tailcat_port=40123)
-    rendezvous = provider.rendezvous()
-    assert isinstance(rendezvous, TailcatRendezvous)
-    assert (rendezvous.address, rendezvous.port) == ("tcHome", 40123)
-
-
-def test_a_tunnel_with_no_address_and_no_tailcat_says_what_is_missing(isolated_home) -> None:
+def test_a_tunnel_with_no_address_and_no_agent_says_what_is_missing(isolated_home) -> None:
     with pytest.raises(letify.ProviderUnavailable) as caught:
         provider_of(Tunnel, "lab", link="ssh").link()
     assert "no address" in str(caught.value)
@@ -1063,7 +1054,6 @@ def test_colab_races_without_forward_ssh(isolated_home, patch_which) -> None:
     assert [s.name for s in provider.strategies()] == [
         "connect_back",
         "tcp_punch",
-        "tailcat",
         "quic",
         "fallback",
     ]
@@ -1085,11 +1075,7 @@ def test_the_colab_rendezvous_is_colab_exec_and_asks_for_an_ssh_server(
 def test_colab_falls_back_to_exec_when_nothing_else_connects(
     isolated_home, patch_which, patch_run
 ) -> None:
-    # One shutil module backs every which, so only tailcat is hidden and uv stays found.
-    patch_which(
-        strategies_module,
-        present=lambda name: None if name == "tailcat" else f"/usr/bin/{name}",
-    )
+    patch_which(strategies_module, present=True)
     recorder = patch_run(colab_module)
     provider = provider_of(Colab, "colab_a", stun="127.0.0.1:9", link="ssh")
     runtime = type("R", (), {"name": "letify-g4-1"})()
@@ -2836,33 +2822,32 @@ def test_every_provider_start_accepts_the_keywords_the_pool_passes() -> None:
         assert not missing, f"{cls.__name__}.start lacks {sorted(missing)}"
 
 
-def test_colab_prepares_verified_tailcat_only_when_its_strategy_requests_an_endpoint(
-    isolated_home, patch_which, patch_run, monkeypatch
+def test_colab_prepares_letify_quic_only_when_its_strategy_requests_an_endpoint(
+    isolated_home, patch_which, patch_run
 ) -> None:
     # Spec "Colab", Runtime tools: lazy preparation keeps verification strict.
-    from letify import install
-
     patch_which(tools_module, present=True)
-    found = FakeCompleted(
-        stdout='LETIFY-TAILCAT "/remote/tailcat"\nLETIFY-ANSWER {"address": "fake"}\n'
-    )
-    recorder = patch_run(colab_module, result=found)
-    monkeypatch.setattr(install, "find", lambda *a, **k: "/local/tailcat")
+
+    def respond(command):
+        source = recorder.calls[-1]["input"]
+        if "LETIFY-QUIC" in source and "run_detached" not in source:
+            return FakeCompleted(stdout='LETIFY-QUIC "/remote/letify-quic"\n')
+        return FakeCompleted(stdout='LETIFY-ANSWER {"mapping": ["203.0.113.5", 4000]}\n')
+
+    recorder = patch_run(colab_module, result=respond)
     key = Path.home() / "id.pub"
     key.write_text("ssh-ed25519 AAAA")
     provider = provider_of(Colab, key=str(key)[:-4])
     runtime = type("R", (), {"name": "live"})()
     target = provider.target(runtime)
     assert recorder.calls == []
-    target.rendezvous.tailcat_endpoint(22, 30)
+    request = {"kind": "quic", "mapping": ["198.51.100.1", 5000], "token": "00", "ssh_port": 22}
+    assert target.rendezvous.exchange(request, 30) == {"mapping": ["203.0.113.5", 4000]}
     assert recorder.command == [*COLAB_CLI, "exec", "-s", "live"]
-    assert "SHA-256" in recorder.calls[0]["input"]
-    assert '"binary": "/remote/tailcat"' in recorder.calls[-1]["input"]
+    assert "LETIFY-QUIC" in recorder.calls[0]["input"]
+    assert '"binary": "/remote/letify-quic"' in recorder.calls[-1]["input"]
     assert "binary" not in target.rendezvous.extras()
-    assert target.rendezvous.binary == "/remote/tailcat"
-    patch_run(colab_module, result=FakeCompleted(returncode=1, stderr="tailcat SHA-256 mismatch"))
-    with pytest.raises(letify.RuntimeFailure, match="SHA-256"):
-        provider.target(type("R", (), {"name": "another"})()).rendezvous.tailcat_endpoint(22, 30)
+    assert target.rendezvous.quic_binary == "/remote/letify-quic"
 
 
 def test_colab_requires_the_daemon_to_acknowledge_startup(
@@ -3046,14 +3031,11 @@ def test_colab_rendezvous_completes_while_a_wake_holds_the_account_lock(
             punching.join(2)
 
 
-def test_colab_punch_rendezvous_completes_during_tailcat_installation(
-    isolated_home, patch_which, patch_run, monkeypatch
+def test_colab_punch_rendezvous_completes_during_quic_preparation(
+    isolated_home, patch_which, patch_run
 ) -> None:
-    # Spec "Colab", Runtime tools: installation cannot occupy the punch path.
-    from letify import install
-
+    # Spec "Colab", Runtime tools: preparation cannot occupy the punch path.
     patch_which(tools_module, present=True)
-    monkeypatch.setattr(install, "find", lambda *a, **k: "/local/tailcat")
     key = Path.home() / "id.pub"
     key.write_text("ssh-ed25519 AAAA")
     provider = provider_of(Colab, key=str(key)[:-4])
@@ -3062,30 +3044,28 @@ def test_colab_punch_rendezvous_completes_during_tailcat_installation(
     assert recorder.calls == []
     entered = threading.Event()
     release = threading.Event()
-    endpoints = []
+    prepared = []
 
     def respond(command):
         source = recorder.calls[-1]["input"]
-        if "SHA-256" in source:
+        if "LETIFY-QUIC" in source and "run_detached" not in source:
             entered.set()
             assert release.wait(5)
-            return FakeCompleted(stdout='LETIFY-TAILCAT "/remote/tailcat"\n')
-        return FakeCompleted(stdout='LETIFY-ANSWER {"address": "fake", "pong": true}\n')
+            return FakeCompleted(stdout='LETIFY-QUIC "/remote/letify-quic"\n')
+        return FakeCompleted(stdout='LETIFY-ANSWER {"pong": true}\n')
 
     recorder.result = respond
-    installing = threading.Thread(
-        target=lambda: endpoints.append(target.rendezvous.tailcat_endpoint(22, 30))
-    )
-    installing.start()
+    preparing = threading.Thread(target=lambda: prepared.append(target.rendezvous.prepare_quic()))
+    preparing.start()
     try:
         assert entered.wait(2)
         assert target.rendezvous.exchange({"kind": "tcp_punch"}, 30)["pong"] is True
-        assert installing.is_alive()
+        assert preparing.is_alive()
         assert "binary" not in target.rendezvous.extras()
     finally:
         release.set()
-        installing.join(2)
-    assert endpoints == [("fake", 22)]
+        preparing.join(2)
+    assert prepared == ["/remote/letify-quic"]
 
 
 def test_a_modal_sandbox_is_not_given_an_hour_long_deadline(config_file) -> None:

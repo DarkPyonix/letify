@@ -33,7 +33,13 @@ from typing import TYPE_CHECKING, Any, Literal
 from ..config import ProviderConfig
 from ..config.inventory import Devices, read_table
 from ..declare.instance import Host, Instance
-from ..errors import ConfigError, LetifyError, UnknownInstance, UnsupportedMode
+from ..errors import (
+    ConfigError,
+    LetifyError,
+    ProviderUnavailable,
+    UnknownInstance,
+    UnsupportedMode,
+)
 from .usage import Usage, from_command
 
 if TYPE_CHECKING:
@@ -55,6 +61,11 @@ class RuntimeState:
 
     status: Literal["ended", "running", "unknown"] = "unknown"
     detail: str = ""
+
+
+#: Account fields of the removed Tailcat connection. An account that names one is refused.
+#: Spec "Connection strategies".
+REMOVED_TAILCAT_FIELDS = ("tailcat", "tailcat_port", "tailcat_binary")
 
 
 class Provider(abc.ABC):
@@ -93,6 +104,15 @@ class Provider(abc.ABC):
     shares_filesystem: bool = False
 
     def __init__(self, config: ProviderConfig):
+        for removed in REMOVED_TAILCAT_FIELDS:
+            if removed in config.options:
+                raise ProviderUnavailable(
+                    self.kind,
+                    f"{config.alias} names {removed!r}, but Tailcat was removed in 3.0. "
+                    f"Run 'letify agent serve' on the machine, then "
+                    f"'letify login tunnel {config.alias} --connect letify-agent2:<token>' "
+                    f"with the token it prints",
+                )
         self.config = config
         self.alias = config.alias
         self._instances: dict[str, Instance] | None = None

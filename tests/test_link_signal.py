@@ -440,7 +440,7 @@ def connect_through_signal(signal_service, daemon, agent_node, tmp_path, **over:
     )
 
 
-def test_an_address_less_machine_is_reached_through_the_mailbox_with_no_ssh_and_no_tailcat(
+def test_an_address_less_machine_is_reached_through_the_mailbox_with_no_ssh(
     signal_service, daemons, sidecar_binary, tmp_path, udp_stun, monkeypatch
 ) -> None:
     monkeypatch.setenv("LETIFY_LINK_STUN", udp_stun.env)

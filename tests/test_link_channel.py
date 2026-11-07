@@ -40,8 +40,14 @@ class LocalShell(Shell):
         """The account's plain ssh command, run on this machine under ``sh -c``."""
         return self.__dict__["fake_ssh"].ssh_command(remote_command)
 
+    @property
+    def address(self) -> str | None:
+        """None when the account declares none, as a Colab or Kaggle account has none."""
+        value = self.config.option("address")
+        return value if isinstance(value, str) and value else None
+
     def link(self, runtime: Any = None) -> Any:
-        """An account with no address is reached through its pipeline, here the same hop."""
+        """An account with no address is reached through one hop, here the fake ssh."""
         if self.address is None:
             return self.__dict__["fake_ssh"]
         return super().link(runtime)
@@ -590,8 +596,6 @@ def no_address_machine(tmp_path: Path, fake: FakeSshLink, sidecar_binary: Path) 
     provider = provider_of(
         LocalShell,
         "lab",
-        tailcat="100.64.0.9",
-        tailcat_port=7001,
         workspace=str(tmp_path / "ws"),
         link="letify-link",
         link_binary=str(sidecar_binary),

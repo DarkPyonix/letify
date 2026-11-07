@@ -215,7 +215,7 @@ def find_eci(binary: str = "eci", confirm: Any = None) -> str:
     """The eci executable, or ``ProviderUnavailable`` carrying the install command.
 
     The default name goes through the lookup of spec "Installing external tools", which
-    installs it when automatic install is on. Another name is run as written.
+    installs it only after ``confirm`` says yes. Another name is run as written.
     """
     from .. import install
 

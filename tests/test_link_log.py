@@ -59,13 +59,13 @@ def one(found: list[str], *pieces: str) -> str:
 def test_the_race_start_names_attempted_and_skipped_strategies(isolated_home, capsys) -> None:
     direct = FakeStrategy("direct_ssh", 1, unmet="no address")
     punch = FakeStrategy("tcp_punch", 2, result=result(13, 14, rtt=180.5))
-    tailcat = FakeStrategy("tailcat", 3, delay=0.05, result=result(24, 20))
+    quic = FakeStrategy("quic", 3, delay=0.05, result=result(24, 20))
     fallback = FakeStrategy("fallback", 4, probed=False)
-    pipeline([direct, punch, tailcat, fallback]).connect()
+    pipeline([direct, punch, quic, fallback]).connect()
     found = lines(capsys)
     start = one(found, "connecting to lab")
     assert "direct_ssh" in start and "no address" in start
-    assert "tcp_punch" in start and "tailcat" in start
+    assert "tcp_punch" in start and "quic" in start
     assert "fallback held back" in start
     one(found, "lab", "tcp_punch connected in", " s")
     one(found, "lab", "tcp_punch", "180.5 ms", "13.0 MiB/s", "14.0 MiB/s")
@@ -74,11 +74,11 @@ def test_the_race_start_names_attempted_and_skipped_strategies(isolated_home, ca
 
 def test_a_failed_and_a_timed_out_strategy_are_each_printed(isolated_home, capsys) -> None:
     hanging = FakeStrategy("direct_ssh", 1, delay=3.0, result=result(10, 10))
-    broken = FakeStrategy("tailcat", 3, error="no UDP")
+    broken = FakeStrategy("quic", 3, error="no UDP")
     punch = FakeStrategy("tcp_punch", 2, result=result(10, 10))
     pipeline([hanging, punch, broken], grace=0.2).connect()
     found = lines(capsys)
-    one(found, "lab", "tailcat failed", "no UDP")
+    one(found, "lab", "quic failed", "no UDP")
     one(found, "lab", "direct_ssh timed out")
     one(found, "lab", "chose tcp_punch", "only one connected")
 
@@ -87,10 +87,10 @@ def test_a_strategy_rejected_by_the_ratio_rule_is_printed_with_its_numbers(
     isolated_home, capsys
 ) -> None:
     punch = FakeStrategy("tcp_punch", 2, result=result(13, 14))
-    tailcat = FakeStrategy("tailcat", 3, result=result(24, 3))
-    pipeline([punch, tailcat]).connect()
+    quic = FakeStrategy("quic", 3, result=result(24, 3))
+    pipeline([punch, quic]).connect()
     found = lines(capsys)
-    rejected = one(found, "lab", "rejected tailcat")
+    rejected = one(found, "lab", "rejected quic")
     assert "3.0 MiB/s" in rejected and "14.0 MiB/s" in rejected
     one(found, "lab", "chose tcp_punch")
 
@@ -120,16 +120,16 @@ def test_a_strategy_that_takes_over_from_the_first_connected_is_printed(
     isolated_home, capsys
 ) -> None:
     punch = FakeStrategy("tcp_punch", 2, delay=0.1, result=result(20, 20))
-    tailcat = FakeStrategy("tailcat", 3, result=result(20, 20))
-    pipeline([punch, tailcat], grace=1.0).connect()
-    one(lines(capsys), "lab", "switching from tailcat to tcp_punch")
+    quic = FakeStrategy("quic", 3, result=result(20, 20))
+    pipeline([punch, quic], grace=1.0).connect()
+    one(lines(capsys), "lab", "switching from quic to tcp_punch")
 
 
 def test_a_link_connected_again_names_the_old_and_new_strategy(isolated_home, capsys) -> None:
     punch = FakeStrategy("tcp_punch", 2, result=result(20, 20))
-    tailcat = FakeStrategy("tailcat", 3, error="no UDP")
-    pipeline([punch, tailcat], previous="tailcat").connect()
-    one(lines(capsys), "lab", "re-established over tcp_punch", "was tailcat")
+    quic = FakeStrategy("quic", 3, error="no UDP")
+    pipeline([punch, quic], previous="quic").connect()
+    one(lines(capsys), "lab", "re-established over tcp_punch", "was quic")
 
 
 # -- Spec: Transport, Link cache ------------------------------------------------------
@@ -139,45 +139,45 @@ def test_a_cached_strategy_accepted_is_printed_with_its_cached_throughput(
     isolated_home, capsys
 ) -> None:
     cache = LinkCache("lab")
-    cache.save("tailcat", result(20, 20), Fingerprint("203.0.113.7", "eth0"))
+    cache.save("quic", result(20, 20), Fingerprint("203.0.113.7", "eth0"))
     punch = FakeStrategy("tcp_punch", 2, result=result(30, 30))
-    tailcat = FakeStrategy("tailcat", 3, result=result(10, 10))
-    pipeline([punch, tailcat], cache=cache).connect()
+    quic = FakeStrategy("quic", 3, result=result(10, 10))
+    pipeline([punch, quic], cache=cache).connect()
     found = lines(capsys)
-    one(found, "lab", "cached tailcat alone", "20.0 MiB/s")
-    one(found, "lab", "cached tailcat accepted")
+    one(found, "lab", "cached quic alone", "20.0 MiB/s")
+    one(found, "lab", "cached quic accepted")
 
 
 def test_a_cached_strategy_below_half_is_rejected_and_the_cache_rewritten(
     isolated_home, capsys
 ) -> None:
     cache = LinkCache("lab")
-    cache.save("tailcat", result(20, 20), Fingerprint("203.0.113.7", "eth0"))
+    cache.save("quic", result(20, 20), Fingerprint("203.0.113.7", "eth0"))
     punch = FakeStrategy("tcp_punch", 2, result=result(30, 30))
-    tailcat = FakeStrategy("tailcat", 3, result=result(20, 9))
-    pipeline([punch, tailcat], cache=cache).connect()
+    quic = FakeStrategy("quic", 3, result=result(20, 9))
+    pipeline([punch, quic], cache=cache).connect()
     found = lines(capsys)
-    rejected = one(found, "lab", "cached tailcat rejected", "below 50%")
+    rejected = one(found, "lab", "cached quic rejected", "below 50%")
     assert "9.0 MiB/s" in rejected and "20.0 MiB/s" in rejected
     one(found, "lab", "cache rewritten", "tcp_punch")
 
 
 def test_a_cached_strategy_that_fails_to_connect_is_rejected(isolated_home, capsys) -> None:
     cache = LinkCache("lab")
-    cache.save("tailcat", result(20, 20), Fingerprint("203.0.113.7", "eth0"))
+    cache.save("quic", result(20, 20), Fingerprint("203.0.113.7", "eth0"))
     punch = FakeStrategy("tcp_punch", 2, result=result(30, 30))
-    tailcat = FakeStrategy("tailcat", 3, error="no UDP")
-    pipeline([punch, tailcat], cache=cache).connect()
-    one(lines(capsys), "lab", "cached tailcat rejected", "failed to connect", "no UDP")
+    quic = FakeStrategy("quic", 3, error="no UDP")
+    pipeline([punch, quic], cache=cache).connect()
+    one(lines(capsys), "lab", "cached quic rejected", "failed to connect", "no UDP")
 
 
 def test_a_changed_network_fingerprint_is_printed(isolated_home, capsys) -> None:
     cache = LinkCache("lab")
-    cache.save("tailcat", result(20, 20), Fingerprint("203.0.113.7", "eth0"))
+    cache.save("quic", result(20, 20), Fingerprint("203.0.113.7", "eth0"))
     punch = FakeStrategy("tcp_punch", 2, result=result(20, 20))
-    tailcat = FakeStrategy("tailcat", 3, result=result(20, 20))
-    pipeline([punch, tailcat], cache=cache, interface="wlan0").connect()
-    one(lines(capsys), "lab", "cached tailcat rejected", "network fingerprint changed")
+    quic = FakeStrategy("quic", 3, result=result(20, 20))
+    pipeline([punch, quic], cache=cache, interface="wlan0").connect()
+    one(lines(capsys), "lab", "cached quic rejected", "network fingerprint changed")
 
 
 # -- Spec: Transport, Choosing a link: the Launcher's announce flag -------------------
@@ -201,15 +201,15 @@ def test_a_quiet_launcher_prints_no_connection_lines(config_file, capsys) -> Non
 
 def test_a_strategy_rejected_by_the_floor_does_not_end_the_race() -> None:
     # The reported Colab run: tcp_punch connected at 10.7 s and was rejected by the floor,
-    # and tailcat connected 2 s later and was closed unprobed, so the connection failed
-    # although tailcat was acceptable. Spec "Choosing a link".
+    # and quic connected 2 s later and was closed unprobed, so the connection failed
+    # although quic was acceptable. Spec "Choosing a link".
     floor = LinkFloor(min_bps=10 * MIB, max_rtt_ms=300.0)
     punch = FakeStrategy("tcp_punch", 2, delay=0.05, result=result(8.1, 0.2, rtt=138.0))
-    tailcat = FakeStrategy("tailcat", 3, delay=0.45, result=result(24.0, 20.0))
+    quic = FakeStrategy("quic", 3, delay=0.45, result=result(24.0, 20.0))
 
-    chosen = pipeline([punch, tailcat], grace=0.2, floor=floor).connect()
+    chosen = pipeline([punch, quic], grace=0.2, floor=floor).connect()
 
-    assert chosen.strategy == "tailcat"
+    assert chosen.strategy == "quic"
 
 
 def test_the_connection_still_fails_when_the_later_strategy_is_also_below_the_floor() -> None:
@@ -217,12 +217,12 @@ def test_the_connection_still_fails_when_the_later_strategy_is_also_below_the_fl
     # below the floor, so the connection fails and names both rejections.
     floor = LinkFloor(min_bps=10 * MIB, max_rtt_ms=300.0)
     punch = FakeStrategy("tcp_punch", 2, delay=0.05, result=result(8.1, 0.2, rtt=138.0))
-    tailcat = FakeStrategy("tailcat", 3, delay=0.45, result=result(4.0, 0.1))
+    quic = FakeStrategy("quic", 3, delay=0.45, result=result(4.0, 0.1))
 
     with pytest.raises(ProviderUnavailable) as raised:
-        pipeline([punch, tailcat], grace=0.2, floor=floor).connect()
+        pipeline([punch, quic], grace=0.2, floor=floor).connect()
 
-    assert "tcp_punch" in str(raised.value) and "tailcat" in str(raised.value)
+    assert "tcp_punch" in str(raised.value) and "quic" in str(raised.value)
 
 
 # -- Spec: Link floor, naming what a healthy round trip with no throughput means ----

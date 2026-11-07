@@ -617,7 +617,7 @@ def begin(request: dict):
     """Answer one rendezvous request and return ``(answer, continuation)``.
 
     The answer goes back through the rendezvous at once. The continuation is what keeps
-    running afterwards: the punch and the splice, or the Tailcat or SSH process.
+    running afterwards: the punch and the splice, or the carrier or SSH process.
     """
     kind = request.get("kind")
     if kind == "ping":
@@ -639,7 +639,6 @@ def begin(request: dict):
 
         def punch_and_serve() -> None:
             where = f"{peer[0]}:{peer[1]}"
-            fallback = "the Tailcat link is used instead"
             try:
                 socks = punch_many(
                     ports,
@@ -650,14 +649,14 @@ def begin(request: dict):
                     until=until,
                 )
             except TimeoutError:
-                # A punch that does not connect is the normal path to the Tailcat link.
+                # A punch that does not connect is expected: another strategy may win.
                 message = f"TCP punch with {where} did not connect within {window:g} s"
-                print(f"letify agent: {message}; {fallback}", file=sys.stderr, flush=True)
+                print(f"letify agent: {message}", file=sys.stderr, flush=True)
                 return
             except OSError as error:
                 if error.errno in _UNREACHABLE:
                     message = f"TCP punch with {where} failed ({error.strerror or error})"
-                    print(f"letify agent: {message}; {fallback}", file=sys.stderr, flush=True)
+                    print(f"letify agent: {message}", file=sys.stderr, flush=True)
                     return
                 raise
             serve_links(socks, ssh)
@@ -712,17 +711,6 @@ def begin(request: dict):
             command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True
         )
         return {"mapping": list(mapping)}, _drain_then_wait(carrier)
-    if kind == "tailcat":
-        process = subprocess.Popen(
-            [request.get("binary", "tailcat"), "serve", str(request.get("ssh_port", 22))],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-        )
-        address = _match_then_drain(process, process.stdout, r"address:\s*(tc\S+)")
-        if address is None:
-            raise RuntimeError("tailcat serve exited without printing its address")
-        return {"address": address}, process.wait
     if kind == "reverse_ssh":
         # The directory is under the account's workspace root, which may start with ~.
         key = Path(os.path.expanduser(request["key_directory"])) / "letify_reverse"
@@ -766,8 +754,8 @@ def _match_then_drain(process, stream, pattern: str) -> str | None:
 
     A helper letify starts and reads one line from keeps writing afterwards. Its pipe holds
     about 64 KiB, so once nobody reads it the helper blocks on its next write and stops
-    moving bytes. ``tailcat serve`` carries the SSH connection itself, so that stall shows
-    up as a link that connects and then measures far below the link underneath it. Reading
+    moving bytes. That stall shows up as a link that connects and then measures far below
+    the link underneath it. Reading
     on and discarding keeps the writer running, and keeps ``process.wait`` from deadlocking
     against a full pipe.
 
@@ -798,7 +786,7 @@ def _match_then_drain(process, stream, pattern: str) -> str | None:
 def _drain_then_wait(process):
     """Keep reading a helper's output while it runs, then wait for it.
 
-    The same reason as the drain beside the address line of ``tailcat serve``: a pipe
+    The same reason as the drain of ``_match_then_drain``: a pipe
     holds about 64 KiB and a helper nobody reads blocks on its next write.
     """
 
