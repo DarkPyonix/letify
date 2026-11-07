@@ -304,7 +304,7 @@ A Kaggle declaration must say `host=letify.remote`. That kernel channel is the o
 3. UDP hole punching with [Tailcat](https://github.com/tailscale/tailcat), then SSH over it
 4. The provider's own path, such as `colab exec` and the Colab file API
 
-A lower number wins unless it is far slower than the fastest one that connected. The winner is remembered per account and per network, so the next connection starts with it. A plain machine behind NAT needs letify installed and `letify client shell connect` run on it once, so letify can reach it. When that machine's SSH server is also published to the outside under another port, such as Docker's `-p 30501:8022`, run `letify client shell connect --ssh-port 8022 --public-address <host> --public-port 30501`: SSH straight to the address then dials port 30501, while hole punching and Tailcat keep using 8022. On an existing account, `letify login tunnel <alias> --address <host> --public-port 30501` sets the same. Colab and Elice never need that step: their provider layer creates and opens the machine through the provider's own API, so that layer takes the place of `letify client shell connect`. Modal is reached through its own API and is not part of this.
+A lower number wins unless it is far slower than the fastest one that connected. The winner is remembered per account and per network, so the next connection starts with it. A machine behind NAT needs letify installed and `letify agent serve` run on it once, so letify can reach it, with no SSH server and no Tailcat. Until 3.0 an account made by `letify client shell connect` still works through Tailcat and prints a notice that Tailcat is removed then. When that machine's SSH server is also published to the outside under another port, such as Docker's `-p 30501:8022`, run `letify client shell connect --ssh-port 8022 --public-address <host> --public-port 30501`: SSH straight to the address then dials port 30501, while hole punching and Tailcat keep using 8022. On an existing account, `letify login tunnel <alias> --address <host> --public-port 30501` sets the same. Colab and Elice never need that step: their provider layer creates and opens the machine through the provider's own API, so that layer takes the place of `letify client shell connect`. Modal is reached through its own API and is not part of this.
 
 **Multiple accounts are first class.** Each configuration entry is one account, and entries of the same kind coexist. Two Colab accounts means twice the concurrent sessions.
 
@@ -464,7 +464,8 @@ def test_train_returns_a_loss():
 ```bash
 letify login shell lab        # declare an account, and reference it here
 letify logout lab             # take the account off this machine
-letify client shell connect   # run on a remote machine behind NAT, so letify can reach it
+letify agent serve            # run on a machine behind NAT, so letify can reach it
+letify client shell connect   # the Tailcat way of the same, removed in 3.0
 letify setup tailcat          # install tailcat or eci from its publisher ahead of time
 letify providers              # who is declared, storage, channel kind
 letify devices                # what each one offers

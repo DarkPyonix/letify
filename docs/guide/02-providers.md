@@ -156,31 +156,51 @@ In a script, `--no-input` records every card, and `--indices A100=0-1` (repeatab
 
 ## 🕳️ Tunnel, for a machine behind NAT
 
-For a machine that cannot accept an inbound connection. letify reaches it over [Tailcat](https://github.com/tailscale/tailcat), which needs no account and no server of your own. SSH still does the work.
+For a machine that cannot accept an inbound connection. letify reaches it through a small agent you run on the machine, so the machine needs no SSH server, no open port and no extra program. Setup is one command on each machine, and the machine needs letify. [The agent guide](09-agent.md) has the full walk-through.
 
-Setup is two commands, one on each machine. Both machines need `tailcat`, and the remote one needs letify and an SSH server.
-
-**1. On the remote machine**, start the agent:
+**1. On the machine**, start the agent:
 
 ```bash
-letify client shell connect --name home_box
+letify agent serve
 ```
 
-If `tailcat` is missing, the command installs it as [Installing tailcat and eci](#installing-tailcat-and-eci) describes. If automatic install is turned off, or the SSH server is missing, it prints the exact install steps for that machine and exits. Otherwise it prints one command to run on your own machine:
+It prints one command to run on your own machine, with a token that expires in 15 minutes and works once:
 
 ```
-letify login tunnel home_box --connect eyJ0YWlsY2F0Ijoi...
+letify login tunnel home_box --connect letify-agent2:eyJ2IjoyLCJhZ2Vu...
 ```
 
-Keep the agent running, for example inside `tmux`. It carries every connection, and a restart gives it a new address, so you would log in again with the new token.
+Keep the agent running, for example inside `tmux`. It keeps serving after a restart of your laptop, and its paired list survives its own restart.
 
 **2. On your own machine**, run the printed command:
 
 ```bash
-letify login tunnel home_box --connect eyJ0YWlsY2F0Ijoi...
+letify login tunnel home_box --connect letify-agent2:eyJ2IjoyLCJhZ2Vu...
 ```
 
-It installs your SSH key over Tailcat (you type the remote password once), confirms the key, checks the workspace root and records the GPUs, as `letify login shell` does. Then `letify check home_box` confirms the machine answers. The account in `~/.letify/config.toml` looks like this, with no address:
+It pairs this machine with the agent, opens one session to it, checks the workspace root and records the GPUs, all over that session. No SSH key is installed and no SSH server is needed. Then `letify check home_box` confirms the machine answers. The account in `~/.letify/config.toml` looks like this, with no address:
+
+```toml
+[home_box]
+kind = "tunnel"
+agent = "3f9c..."
+signal = "https://letify.darkpyonix.dev"
+```
+
+`letify login tunnel home_box --detect-devices` asks the machine for its GPUs again over the same session. If you do want plain `ssh` to the machine, `Tunnel.ssh_forward()` opens a loopback port that reaches the agent machine's SSH server, as [the agent guide](09-agent.md) describes.
+
+### An existing Tailcat account
+
+A Tunnel account made by `letify client shell connect` keeps working in this release, and it prints once per process that Tailcat is removed in 3.0. To migrate it, run `letify agent serve` on the machine and run `letify login tunnel home_box --connect letify-agent2:...` with the token it prints. Use `--replace` to renew an account that is already declared. The Tailcat setup below stays available until 3.0.
+
+<details>
+<summary>The Tailcat setup, until 3.0</summary>
+
+letify reaches the machine over [Tailcat](https://github.com/tailscale/tailcat), and SSH does the work. Both machines need `tailcat`, and the remote one needs letify and an SSH server.
+
+On the remote machine, run `letify client shell connect --name home_box`. If `tailcat` is missing, the command installs it as [Installing tailcat and eci](#installing-tailcat-and-eci) describes. If automatic install is turned off, or the SSH server is missing, it prints the exact install steps for that machine and exits. Otherwise it prints one command to run on your own machine, `letify login tunnel home_box --connect eyJ0YWlsY2F0Ijoi...`. Keep the agent running, because it carries every connection and a restart gives it a new address.
+
+On your own machine, the login installs your SSH key over Tailcat (you type the remote password once), confirms the key, checks the workspace root and records the GPUs, as `letify login shell` does. The account looks like this:
 
 ```toml
 [home_box]
@@ -191,6 +211,8 @@ user = "researcher"
 port = 22
 key = "~/.ssh/id_letify"
 ```
+
+</details>
 
 Try the simpler paths first. A direct address, then a jump host, then this. Campus machines often allow one of the first two. Details and measurements are in [docs/NETWORK.md](../NETWORK.md).
 

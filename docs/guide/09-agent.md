@@ -90,7 +90,9 @@ letify creates this account's key `~/.letify/accounts/lab_box/link.key`, sends a
 
 On success the account is written with `kind = "tunnel"`, the agent's node id and the service URL. The agent logs `paired <12 hex of node> (<label>)`, where the label is `<user>@<hostname>` of your machine.
 
-A token that does not start with `letify-agent2:` takes the older Tailcat path of `letify client shell connect`, which this guide does not cover.
+The login then opens one session to the agent, checks the workspace root and records the GPUs over it, so no SSH key and no SSH server are involved. A token that does not start with `letify-agent2:` takes the older Tailcat path of `letify client shell connect`. That path still works until 3.0, prints a notice that Tailcat is removed then, and is covered in [Tunnel](02-providers.md).
+
+To reach the machine's SSH server anyway, call `Tunnel.ssh_forward()` on the account. It returns a loopback port, and `ssh -p <port> <user>@127.0.0.1` reaches the sshd that `letify agent serve --ssh-target HOST:PORT` names (default `127.0.0.1:22`). letify itself never needs it.
 
 ---
 
