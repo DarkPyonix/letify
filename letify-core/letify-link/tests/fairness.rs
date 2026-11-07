@@ -15,6 +15,9 @@ use tokio::time::Instant;
 
 const MIB: f64 = 1024.0 * 1024.0;
 
+/// Seconds the starvation test measures the byte shares over.
+const WINDOW_S: u64 = 15;
+
 /// The peer: streams that start with 0 are read and counted in `counters[n]` where n is the
 /// second byte, and streams that start with 1 are echoed.
 fn spawn_server(b: Session, counters: Vec<Arc<AtomicU64>>) -> tokio::task::JoinHandle<()> {
@@ -209,11 +212,13 @@ async fn bulk_is_not_starved_by_an_interactive_stream_that_keeps_its_queue_full(
     });
     tokio::time::sleep(Duration::from_secs(1)).await;
     let before: Vec<u64> = counters.iter().map(|c| c.load(Ordering::Relaxed)).collect();
-    tokio::time::sleep(Duration::from_secs(5)).await;
+    // A long window averages out scheduler stalls on a loaded runner, which move the share of
+    // a short window by a few percentage points.
+    tokio::time::sleep(Duration::from_secs(WINDOW_S)).await;
     let got: Vec<f64> = counters
         .iter()
         .zip(&before)
-        .map(|(c, b)| (c.load(Ordering::Relaxed) - b) as f64 / 5.0 / MIB)
+        .map(|(c, b)| (c.load(Ordering::Relaxed) - b) as f64 / WINDOW_S as f64 / MIB)
         .collect();
     stop.store(true, Ordering::Relaxed);
     bulk.abort();

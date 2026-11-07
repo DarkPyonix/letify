@@ -10,7 +10,7 @@ use letify_link::{Config, REPLAY_WINDOW};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::time::{sleep, timeout};
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_replayed_record_is_dropped() {
     let (a, b, mitm) = session_pair_through_mitm(Config::default()).await;
     let mut s = a.open_stream().await.unwrap();
@@ -31,7 +31,7 @@ async fn a_replayed_record_is_dropped() {
     assert_eq!(&buf, b"again");
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_replayed_stream_close_does_not_end_the_session() {
     let (a, b, mitm) = session_pair_through_mitm(Config::default()).await;
     let mut s = a.open_stream().await.unwrap();
@@ -53,7 +53,7 @@ async fn a_replayed_stream_close_does_not_end_the_session() {
     assert!(b.dropped_records() > 0);
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn records_arriving_out_of_order_within_the_window_are_accepted() {
     let (a, b, mitm) = session_pair_through_mitm(Config::default()).await;
     mitm.withhold.store(true, Ordering::SeqCst);
@@ -80,7 +80,7 @@ async fn records_arriving_out_of_order_within_the_window_are_accepted() {
     assert_eq!(b.dropped_records(), 0);
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_record_older_than_the_window_is_dropped() {
     let (a, b, mitm) = session_pair_through_mitm(Config::default()).await;
     let mut s = a.open_stream().await.unwrap();
@@ -110,7 +110,7 @@ async fn a_record_older_than_the_window_is_dropped() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_replayed_resume_hello_is_refused() {
     let (a, b) = session_pair(Config::default()).await;
     // Add a subflow legitimately through an attacker that records the initiator's side.
