@@ -851,11 +851,13 @@ def test_a_punch_whose_window_has_already_closed_fails_at_once() -> None:
     assert "window" in str(raised.value)
 
 
-def test_the_remote_half_reports_when_it_stops_punching() -> None:
+def test_the_remote_half_reports_when_it_stops_punching(stun_server: StunServer) -> None:
     # Spec "the simultaneous open": punch_until travels in the answer so both sides stop
-    # together.
+    # together. begin asks a STUN server for its mapping, so the test names the loopback
+    # one and never reaches the public default.
     answer, _ = nat.begin(
         {
+            "stun": list(stun_server.address),
             "kind": "tcp_punch",
             "mapping": ["203.0.113.7", 41000],
             "token": ("a" * 32),
