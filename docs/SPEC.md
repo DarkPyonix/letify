@@ -2467,7 +2467,7 @@ The sidecar is a binary named `letify-link`, built for each wheel and installed 
 
 > An opt-in strategy for a remote machine that can reach the user's machine over SSH. It is not raced by default.
 
-When an account sets `reverse_ssh`, the remote side opens an SSH connection to the user's machine and forwards a port back with `ssh -R`. It then takes rank 4 and the provider fallback moves to rank 5.
+When an account sets `reverse_ssh`, the remote side opens an SSH connection to the user's machine and forwards a port back with `ssh -R`. It then takes rank 5 and the provider fallback moves to rank 6.
 
 ```toml
 [lab_behind_nat]
@@ -2742,7 +2742,7 @@ After the sign in succeeds, the Colab login records `key`, the SSH private key w
 
 `letify login elice <alias>` checks the access token with `eci` before it writes anything, and needs no machine to exist. Every `eci` command runs as [Elice machines](#elice-machines) describes. The steps run in this order, and a failure at any step writes nothing: no `config.toml` entry and no file in the account directory.
 
-1. `eci` must be found as Elice machines describes. Otherwise it is installed automatically, and when automatic install is turned off `LoginError` carries the install command.
+1. `eci` must be found as Elice machines describes. Otherwise a terminal is asked whether to install it, and without a terminal `LoginError` carries the install command.
 2. The token comes from `--token`, or else from a hidden prompt, `Elice access token: `. `--no-input` without `--token` refuses.
 3. `eci zone list --format json`. `endpoint` is `--endpoint` or `https://portal.elice.cloud/api`. A non zero exit fails the login with `LoginError`, whose message starts with `Elice refused the access token`.
 4. The zone is `--zone-id`. Without it, a terminal is shown the listed zones, one numbered line each, `1. <name> (<id>)`, and asked `Elice zone [1-<n>]: `. A blank answer takes the only zone when there is exactly one. An answer that is not a listed number is refused and asked again. `--no-input` without `--zone-id` refuses, and so does an empty list.
@@ -3233,7 +3233,7 @@ The header ends `busy` while a call runs and `idle` otherwise. `cards` is left o
 
 ### Installing external tools <!-- id: confirmed-tool-install -->
 
-> letify installs a missing `eci` when `letify setup eci` or `letify login elice` asks, and says so on standard error. It is fetched from Elice's GitHub release, verified against pinned SHA-256 digests, cached per version under `~/.letify/tools` and linked into the project's virtual environment. The binary is not part of letify or covered by its license, and letify never writes to a shared `PATH` directory.
+> letify installs a missing `eci` only when `letify setup eci` or `letify login elice` asks, and says so on standard error. It is fetched from Elice's GitHub release, verified against pinned SHA-256 digests, cached per version under `~/.letify/tools` and linked into the project's virtual environment. The binary is not part of letify or covered by its license, and letify never writes to a shared `PATH` directory.
 
 | Tool | Pinned version | Release | Assets |
 |---|---|---|---|
@@ -3252,14 +3252,14 @@ An account's `eci_binary`, when set, skips the lookup and is run as written.
 
 letify does not reach for another host of its own accord. The host a release redirects to is an implementation detail of the service, not an interface, so a hard coded alternative would fail everyone the day it changes rather than only the blocked network. A blocked network configures the way in once.
 
-**Automatic install.** `eci` is not installed automatically: `letify login elice` asks first, as [Elice machines](#elice-machines) describes, and otherwise only `letify setup eci` installs it. Two lines go to standard error, as connection decision lines do:
+**Installing on need.** `eci` is never installed without being asked: `letify login elice` asks first, as [Elice machines](#elice-machines) describes, and otherwise only `letify setup eci` installs it. Two lines go to standard error, as connection decision lines do:
 
 - before the download, `letify: installing <tool> <version> from <asset URL> into <version directory>`
 - after it, `letify: <tool> <version> verified sha256 <digest>, linked at <path>`, where the path is the project link, or the cache path when nothing is linked
 
 **Download progress.** The asset download reports progress on standard error, because a release archive can take minutes over a slow link. The download reads 64 KiB at a time. On a terminal one line is redrawn in place with a carriage return, at most every 0.1 s and once at the end: `letify: downloading <tool> <version> [<gauge>] <percent>% <done>/<total> MiB <rate> MiB/s`, where the gauge is the command line gauge 20 cells wide. When the server sends no `Content-Length` the gauge and percent are left out and the line shows `<done> MiB <rate> MiB/s`. The finished line ends with a newline. When standard error is not a terminal, nothing is redrawn: one line without a gauge is written at 25, 50, 75 and 100 percent, or a single line at the end when the size is unknown, so a log file gets at most four lines. `checksums.txt` is small and shows no progress.
 
-Automatic install is on by default. `auto_install = false` at the top level of `~/.letify/config.toml` turns it off, and so does the environment variable `LETIFY_AUTO_INSTALL` set to `0`, `false` or `no`. The environment variable, when set to any value, decides over the file. Turned off, a missing tool fails with the install instructions followed by `Install it with: letify setup <tool>`.
+A missing `eci` that is not installed fails with the install instructions followed by `Install it with: letify setup eci`.
 
 **Installing.**
 
@@ -3278,7 +3278,7 @@ Elice's `install.sh` is not run, because it writes to `/usr/local` or `~/.local`
 
 With no project environment nothing is linked and the cache path is used.
 
-**`letify setup eci`** runs the lookup, installs into the cache when nothing is found, whatever the automatic install setting, links into the project environment, prints the two `letify:` lines when it installed, and prints `✓ <tool> <version> at <path>`. `--where` installs nothing and prints four aligned lines: `cache` with the cache path and `present` or `missing`, `link` with the link path and `letify <version>`, `not letify's`, `missing` or `no project environment`, `PATH` with the path found or `none`, and `uses` with the path the lookup chose or `nothing`.
+**`letify setup eci`** runs the lookup, installs into the cache when nothing is found, links into the project environment, prints the two `letify:` lines when it installed, and prints `✓ <tool> <version> at <path>`. `--where` installs nothing and prints four aligned lines: `cache` with the cache path and `present` or `missing`, `link` with the link path and `letify <version>`, `not letify's`, `missing` or `no project environment`, `PATH` with the path found or `none`, and `uses` with the path the lookup chose or `nothing`.
 
 ### Machine-readable output <!-- id: machine-readable-output -->
 
