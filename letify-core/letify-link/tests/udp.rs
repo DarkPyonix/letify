@@ -170,7 +170,10 @@ async fn a_udp_path_is_refused_when_the_two_ends_disagree_on_the_alpn() {
         ..UdpConfig::default()
     };
     let (client, _server) = pair_with(&h3(), &quick).await;
-    assert!(client.is_err(), "an h3 client does not reach a default server");
+    assert!(
+        client.is_err(),
+        "an h3 client does not reach a default server"
+    );
 }
 
 /// Both kinds of candidate toward one server. The TCP one runs through a throttle.
