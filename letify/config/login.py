@@ -319,6 +319,28 @@ def check_workspace(
     print(f"workspace {workspace}: writable")
 
 
+def check_workspace_over_session(provider: Any, workspace: str) -> None:
+    """The same proof as ``check_workspace``, run over an agent account's session.
+
+    The ``exec`` stream runs as the agent's user, so it needs no ssh key.
+    """
+    from ..runtime.bootstrap import workspace_check
+
+    try:
+        result = provider.run_command(workspace_check(workspace), 120)
+    except (LetifyError, OSError, subprocess.SubprocessError) as exc:
+        raise LoginError(
+            f"the workspace {workspace} could not be checked on {provider.alias}: {exc}"
+        ) from exc
+    if result.returncode != 0:
+        detail = result.stderr.strip() or result.stdout.strip() or f"exit {result.returncode}"
+        raise LoginError(
+            f"the workspace {workspace} cannot be created and written on {provider.alias} "
+            f"without root, so nothing was written: {detail}"
+        )
+    print(f"workspace {workspace}: writable")
+
+
 def record_workspace(answers: Answers, options: dict[str, Any]) -> None:
     """Write ``--workspace`` to an account whose kind has no machine to check it on."""
     given = answers.get("workspace")
@@ -400,6 +422,11 @@ def detect_devices(
         result = subprocess.run(command, capture_output=True, text=True, timeout=120)
     except (OSError, subprocess.SubprocessError) as exc:
         return [], f"nvidia-smi could not be run on {target}: {exc}"
+    return devices_from(result, target)
+
+
+def devices_from(result: Any, target: str) -> tuple[list[FoundDevices], str | None]:
+    """The groups in one finished ``nvidia-smi`` query, or none and the reason."""
     if result.returncode != 0:
         detail = result.stderr.strip() or result.stdout.strip() or f"exit {result.returncode}"
         return [], f"nvidia-smi did not answer on {target}: {detail}"
@@ -407,6 +434,15 @@ def detect_devices(
     if not groups:
         return [], f"nvidia-smi reports no GPU on {target}"
     return groups, None
+
+
+def detect_devices_over_session(provider: Any) -> tuple[list[FoundDevices], str | None]:
+    """Ask an agent account's machine for its GPUs over the session, with no ssh."""
+    try:
+        result = provider.run_command(DEVICE_QUERY, 120)
+    except (LetifyError, OSError, subprocess.SubprocessError) as exc:
+        return [], f"nvidia-smi could not be run on {provider.alias}: {exc}"
+    return devices_from(result, provider.alias)
 
 
 def _chosen(group: FoundDevices, spec: str) -> tuple[int, ...]:
@@ -483,6 +519,25 @@ def record_devices(
     groups, reason = detect_devices(
         address=address, user=user, port=port, key_path=key_path, proxy=proxy
     )
+    if not groups:
+        print(f"{reason}. {FALLBACK_NOTE}")
+        return None
+    return choose_devices(answers, groups)
+
+
+def agent_provider(alias: str, options: dict[str, Any]) -> Any:
+    """The Tunnel provider of an account that names an agent, built from its options alone."""
+    from ..providers.tunnel import Tunnel
+    from .schema import ProviderConfig
+
+    return Tunnel(ProviderConfig(alias, "tunnel", dict(options), 0))
+
+
+def record_devices_over_session(
+    answers: Answers, provider: Any
+) -> dict[str, dict[str, str]] | None:
+    """``record_devices`` for an agent account: the query goes over its session."""
+    groups, reason = detect_devices_over_session(provider)
     if not groups:
         print(f"{reason}. {FALLBACK_NOTE}")
         return None
@@ -878,6 +933,13 @@ def kaggle_account(answers: Answers) -> dict[str, Any]:
 TOKEN_PROMPT = "Token printed by 'letify agent serve' or 'letify client shell connect': "
 
 
+#: Printed by a Tailcat login. Spec "Agent and pairing" item 9.
+TAILCAT_NOTICE = (
+    "Tailcat is removed in 3.0. Run 'letify agent serve' on the machine "
+    "and log in with the letify-agent2: token it prints."
+)
+
+
 def link_tunnel_account(answers: Answers, token: str) -> dict[str, Any]:
     """Pair this machine with the agent of a token v2 and record the agent and the service.
 
@@ -912,6 +974,26 @@ def link_tunnel_account(answers: Answers, token: str) -> dict[str, Any]:
     options: dict[str, Any] = {"kind": "tunnel", "agent": fields.agent, "signal": fields.signal}
     if answers.get("persistent") is not None:
         options["persistent"] = bool(answers.get("persistent"))
+    # The rest of the login runs over one session, which asks for no key and no ssh server.
+    workspace, default = choose_workspace(answers, "the agent machine")
+    if workspace != default:
+        options["workspace"] = workspace
+    provider = agent_provider(answers.alias, options)
+    step = "session"
+    try:
+        try:
+            provider.link_remote(None)
+        except LetifyError as exc:
+            raise LoginError(str(exc)) from exc
+        step = "workspace"
+        check_workspace_over_session(provider, workspace)
+        devices = record_devices_over_session(answers, provider)
+    except LoginError as exc:
+        raise failed(step, exc) from None
+    finally:
+        provider.close_link()
+    if devices:
+        options["devices"] = devices
     return options
 
 
@@ -938,6 +1020,9 @@ def tunnel_account(answers: Answers) -> dict[str, Any]:
     if token.strip().startswith(linkagent.PREFIX):
         return link_tunnel_account(answers, token.strip())
 
+    from ..transport.announce import say
+
+    say(TAILCAT_NOTICE)
     try:
         tailcat = ensure(
             "tailcat",
@@ -1130,7 +1215,13 @@ def change_workspace(answers: Answers, text: str, home: Path) -> None:
     entry = tomllib.loads(text).get(answers.alias, {})
     workspace = valid_workspace(answers.alias, str(answers.get("workspace")))
     kind = entry.get("kind", answers.kind)
-    if kind in ("shell", "tunnel") and entry.get("auth") != "password" and entry.get("address"):
+    if kind == "tunnel" and entry.get("agent"):
+        provider = agent_provider(answers.alias, entry)
+        try:
+            check_workspace_over_session(provider, workspace)
+        finally:
+            provider.close_link()
+    elif kind in ("shell", "tunnel") and entry.get("auth") != "password" and entry.get("address"):
         check_workspace(
             address=str(entry["address"]),
             user=entry.get("user"),
@@ -1150,18 +1241,26 @@ def detect_again(answers: Answers, text: str, home: Path) -> dict[str, dict[str,
     kind = entry.get("kind", answers.kind)
     if kind not in ("shell", "tunnel"):
         raise LoginError(f"--detect-devices applies to shell and tunnel accounts, not {kind!r}")
-    if entry.get("auth") == "password" or not entry.get("address"):
+    over_session = kind == "tunnel" and bool(entry.get("agent"))
+    if not over_session and (entry.get("auth") == "password" or not entry.get("address")):
         raise LoginError(
             f"{answers.alias} has no key and address to ask the machine with, so its GPUs "
             f"cannot be detected. Declare them in [{devices_table(answers.alias)}] by hand."
         )
-    devices = record_devices(
-        answers,
-        address=str(entry["address"]),
-        user=entry.get("user"),
-        port=int(entry.get("port") or 22),
-        key_path=str(entry.get("key") or DEFAULT_KEY),
-    )
+    if over_session:
+        provider = agent_provider(answers.alias, entry)
+        try:
+            devices = record_devices_over_session(answers, provider)
+        finally:
+            provider.close_link()
+    else:
+        devices = record_devices(
+            answers,
+            address=str(entry["address"]),
+            user=entry.get("user"),
+            port=int(entry.get("port") or 22),
+            key_path=str(entry.get("key") or DEFAULT_KEY),
+        )
     if devices and answers.interactive:
         reply = read_line(f"Replace the devices table of {answers.alias} in {home}? [y/N] ")
         if not reply.lower().startswith("y"):

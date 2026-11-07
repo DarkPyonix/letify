@@ -124,11 +124,13 @@ def test_detecting_devices_again_works_for_an_agent_account(
     isolated_home, agent_session, no_ssh_at_login
 ) -> None:
     declare_agent_account()
-    agent_session.gpus = "0, NVIDIA H100 80GB HBM3, 81559 MiB\n1, NVIDIA H100 80GB HBM3, 81559 MiB\n"
+    agent_session.gpus = (
+        "0, NVIDIA A100-SXM4-80GB, 81920 MiB\n1, NVIDIA A100-SXM4-80GB, 81920 MiB\n"
+    )
     assert main(["login", "tunnel", "box", "--no-input", "--detect-devices"]) == 0
     devices = home_config()["box"]["devices"]
     assert "OLD" not in devices
-    assert devices["H100"]["indices"] == "0-1"
+    assert devices["A100"]["indices"] == "0-1"
 
 
 def test_a_new_workspace_of_an_existing_agent_account_is_checked_over_the_session(
@@ -181,7 +183,9 @@ def test_a_second_tailcat_account_or_link_in_one_process_prints_nothing_more(
 
 
 def test_a_tailcat_account_with_announce_off_prints_no_notice(tailcat_link, capsys) -> None:
-    tailcat_account(announce=False).link()
+    provider = tailcat_account()
+    provider.announce = False
+    provider.link()
     assert capsys.readouterr().err == ""
 
 

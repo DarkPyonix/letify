@@ -2771,10 +2771,9 @@ class FakeAgentSession:
 
 
 @pytest.fixture
-def agent_session(monkeypatch) -> FakeAgentSession:
-    """Answer an agent account's session without a sidecar, and pair without a service."""
+def agent_session_only(monkeypatch) -> FakeAgentSession:
+    """Answer an agent account's session without a sidecar. Pairing is left as it is."""
     from letify.providers.tunnel import Tunnel
-    from letify.transport import linkagent, linkd
 
     fake = FakeAgentSession()
 
@@ -2784,6 +2783,19 @@ def agent_session(monkeypatch) -> FakeAgentSession:
         fake.opened += 1
         return object()
 
+    monkeypatch.setattr(Tunnel, "link_remote", link_remote)
+    monkeypatch.setattr(Tunnel, "_run_helper", lambda self, argv, timeout: fake.run(argv, timeout))
+    monkeypatch.setattr(
+        Tunnel, "close_link", lambda self, runtime=None: setattr(fake, "closed", fake.closed + 1)
+    )
+    return fake
+
+
+@pytest.fixture
+def agent_session(monkeypatch, agent_session_only) -> FakeAgentSession:
+    """The fake session, and a pairing that needs no sidecar and no signalling service."""
+    from letify.transport import linkagent, linkd
+
     class Daemon:
         def __init__(self, path, **kwargs) -> None:
             pass
@@ -2791,11 +2803,6 @@ def agent_session(monkeypatch) -> FakeAgentSession:
         def close(self) -> None:
             pass
 
-    monkeypatch.setattr(Tunnel, "link_remote", link_remote)
-    monkeypatch.setattr(Tunnel, "_run_helper", lambda self, argv, timeout: fake.run(argv, timeout))
-    monkeypatch.setattr(
-        Tunnel, "close_link", lambda self, runtime=None: setattr(fake, "closed", fake.closed + 1)
-    )
     monkeypatch.setattr(linkd, "LinkDaemon", Daemon)
     monkeypatch.setattr(linkagent, "pair", lambda client, fields, label: None)
-    return fake
+    return agent_session_only

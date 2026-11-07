@@ -466,10 +466,11 @@ def test_the_agent_commands_list_and_unpair_a_node(tmp_path, monkeypatch, capsys
 
 
 def test_login_pairs_with_the_agent_and_records_its_node_and_url(
-    start_service, signal_service, tmp_path, monkeypatch
+    start_service, signal_service, tmp_path, monkeypatch, agent_session_only
 ) -> None:
     from letify.config import login
 
+    agent_session_only.gpus = ""
     monkeypatch.setenv("LETIFY_HOME", str(tmp_path / "home"))
     agent = start_service()
     token = agent.service.new_token(signal_service.url)
