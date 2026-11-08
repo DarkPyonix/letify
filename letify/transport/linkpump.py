@@ -131,6 +131,14 @@ def pump(directory):
     threading.Thread(target=watch, daemon=True).start()
     with open(os.path.join(directory, "outbox"), "ab") as outbox:
         for line in shim.stdout:
+            if b"handed_over" in line:
+                # Known before the client can read the line, so that a close that follows at
+                # once finds the shim handed over and leaves it, and what it started, alone.
+                try:
+                    if json.loads(line).get("event") == "handed_over":
+                        state["handed"] = True
+                except ValueError:
+                    pass
             outbox.write(line)
             outbox.flush()
         try:
