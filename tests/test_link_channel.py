@@ -497,6 +497,19 @@ def test_the_wheel_extraction_names_the_sidecar_binary() -> None:
     assert "letify-quic" not in source and "LETIFY-QUIC" not in source
 
 
+def test_the_wheel_extraction_runs_standalone_on_a_runtime(tmp_path, monkeypatch) -> None:
+    # Spec "Sidecar interface" item 7: the source is sent to a bare interpreter, so it has to
+    # import everything it uses. With no index to reach, pip fails and the source reports that
+    # failure, which it cannot do when a name it uses is missing.
+    from letify import install
+
+    monkeypatch.setenv("PIP_NO_INDEX", "1")
+    monkeypatch.setenv("TMPDIR", str(tmp_path))
+    source = install.remote_link_source("0.0.0.dev0")
+    with pytest.raises(RuntimeError, match="could not download the letify wheel"):
+        exec(compile(source, "remote-link", "exec"), {"__name__": "__main__"})
+
+
 # -- Gap 1: the transfer decision reads the session ---------------------------------
 
 

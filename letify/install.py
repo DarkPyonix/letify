@@ -19,7 +19,6 @@ import os
 import platform
 import posixpath
 import shutil
-import subprocess
 import sys
 import tarfile
 import tempfile
@@ -581,6 +580,7 @@ def _remote_link(version):
     """Take letify-link out of the letify wheel for this machine, standard library only."""
     import json
     import os
+    import subprocess
     import sys
     import tempfile
     import zipfile
