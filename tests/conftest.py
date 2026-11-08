@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import base64
 import contextlib
+import ipaddress
 import json
 import os
 import shutil
@@ -105,6 +106,114 @@ def private_letify_home(monkeypatch, tmp_path: Path) -> Path:
 
     monkeypatch.setattr(Path, "home", classmethod(private))
     return home
+
+
+class PublicNetworkAccess(AssertionError):
+    """A test reached for an address that is not on this machine."""
+
+
+_public_network_attempts: list[str] = []
+_current_test: list[str] = ["<outside a test>"]
+_real_socket_methods = {
+    name: getattr(socket.socket, name) for name in ("connect", "connect_ex", "sendto")
+}
+_real_getaddrinfo = socket.getaddrinfo
+
+
+_DOCUMENTATION_NETWORKS = [
+    ipaddress.ip_network(net) for net in ("192.0.2.0/24", "198.51.100.0/24", "203.0.113.0/24")
+]
+
+
+def _is_local_host(host: Any) -> bool:
+    if isinstance(host, bytes):
+        host = host.decode("ascii", "replace")
+    if host in (None, "", "localhost", "ip6-localhost", "<broadcast>"):
+        return True
+    host = str(host).split("%", 1)[0]
+    try:
+        address = ipaddress.ip_address(host)
+    except ValueError:
+        return host.endswith(".localhost")
+    if address.is_loopback or host in ("0.0.0.0", "::"):
+        return True
+    # RFC 5737 documentation ranges are never routed, so a packet to one reaches no service.
+    # Tests use them as a peer that answers nothing, which loopback cannot imitate.
+    return any(address in net for net in _DOCUMENTATION_NETWORKS)
+
+
+def _refuse(host: Any, port: Any) -> None:
+    message = (
+        f"{_current_test[0]} reached for the public address {host}:{port}. The suite has no "
+        "public network: use the stun_server fixture, FakeSignalService or a loopback server, "
+        "or mark the test with @pytest.mark.network and say why."
+    )
+    _public_network_attempts.append(message)
+    raise PublicNetworkAccess(message)
+
+
+def _guarded_method(name: str):
+    real = _real_socket_methods[name]
+
+    def guarded(self: socket.socket, *args: Any):
+        address = args[-1]
+        inet = self.family in (socket.AF_INET, socket.AF_INET6) and isinstance(address, tuple)
+        if inet and not _is_local_host(address[0]) and not _current_test_allows_network():
+            _refuse(address[0], address[1] if len(address) > 1 else "")
+        return real(self, *args)
+
+    guarded.__name__ = name
+    return guarded
+
+
+def _guarded_getaddrinfo(host, port, *args: Any, **kwargs: Any):
+    if not _is_local_host(host) and not _current_test_allows_network():
+        _refuse(host, port)
+    return _real_getaddrinfo(host, port, *args, **kwargs)
+
+
+_network_allowed = [False]
+
+
+def _current_test_allows_network() -> bool:
+    return _network_allowed[0]
+
+
+def pytest_configure(config) -> None:
+    config.addinivalue_line(
+        "markers", "network: the test genuinely needs the public network (say why in the marker)"
+    )
+    for name in _real_socket_methods:
+        setattr(socket.socket, name, _guarded_method(name))
+    # create_connection resolves through socket.getaddrinfo and then connects, so both are covered.
+    socket.getaddrinfo = _guarded_getaddrinfo
+
+
+@pytest.fixture(autouse=True)
+def no_public_network(request, monkeypatch) -> Any:
+    """Make a connection to any address that is not loopback fail the test.
+
+    The guard patches ``socket.socket.connect``, ``connect_ex``, ``sendto`` and
+    ``socket.getaddrinfo`` for the whole run, so ``create_connection``, ``urllib`` and
+    ``http.client`` are covered. The exception is an AssertionError rather than an OSError
+    so code that handles a network failure does not swallow it, and each attempt is
+    recorded so a test that swallows it anyway still fails at teardown. Subprocesses are
+    not covered by an in-process guard, so the environment variables letify honours are
+    pointed at loopback: the STUN list of the sidecar and the signalling service URL.
+    A test marked ``network`` is exempt.
+    """
+    _current_test[0] = request.node.nodeid
+    _network_allowed[0] = request.node.get_closest_marker("network") is not None
+    _public_network_attempts.clear()
+    monkeypatch.setenv("LETIFY_LINK_STUN", "127.0.0.1:9")
+    monkeypatch.setenv("LETIFY_SIGNAL_URL", "http://127.0.0.1:9")
+    yield
+    attempts = list(_public_network_attempts)
+    _public_network_attempts.clear()
+    _network_allowed[0] = False
+    _current_test[0] = "<outside a test>"
+    if attempts:
+        pytest.fail("\n".join(attempts), pytrace=False)
 
 
 @pytest.fixture
