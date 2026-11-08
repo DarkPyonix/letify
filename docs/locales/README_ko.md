@@ -297,7 +297,7 @@ Kaggle 선언에는 `host=letify.remote`를 써야 합니다. Kaggle은 인바�
 2. TCP 홀펀칭, 양쪽이 모두 NAT 뒤에 있을 때
 3. 프로바이더 자체 경로, 예를 들어 `colab exec`와 Colab 파일 API
 
-번호가 낮은 방법이 이깁니다. 다만 연결된 방법 중 가장 빠른 것보다 훨씬 느리면 탈락합니다. 이긴 방법은 계정과 네트워크별로 기억해 두고, 다음 연결에서 먼저 시도합니다. NAT 뒤에 있는 머신은 letify를 설치한 뒤 그 머신에서 `letify agent serve`를 한 번 실행하면 letify가 접속할 수 있고, SSH 서버가 필요 없습니다. Tailcat은 제거되었고, `tailcat`을 적은 계정은 `letify agent serve`로 옮기는 방법과 함께 거부됩니다. 머신의 SSH 서버가 Docker의 `-p 30501:8022`처럼 다른 포트로 외부에 열려 있다면 `letify login tunnel <alias> --address <host> --public-port 30501`로 기록합니다. 그러면 주소로 바로 하는 SSH는 30501 포트로 접속하고, 홀펀칭은 계속 8022를 씁니다. Colab과 Elice는 에이전트가 아예 필요 없습니다. 프로바이더 계층이 각 서비스의 API로 머신을 만들고 엽니다. Modal은 자체 API로 연결하므로 여기에 해당하지 않습니다.
+번호가 낮은 방법이 이깁니다. 다만 연결된 방법 중 가장 빠른 것보다 훨씬 느리면 탈락합니다. 이긴 방법은 계정과 네트워크별로 기억해 두고, 다음 연결에서 먼저 시도합니다. NAT 뒤에 있는 머신은 letify를 설치한 뒤 그 머신에서 `letify agent serve`를 한 번 실행하면 letify가 접속할 수 있고, SSH 서버가 필요 없습니다. Tailcat은 제거되었고, `tailcat`을 적은 tunnel 계정은 `letify agent serve`로 옮기는 방법과 함께 거부되고, 다른 종류의 계정은 그 필드를 지우라는 안내와 함께 거부되며, `tailcat_binary`는 한 줄 안내만 출력하고 무시됩니다. 머신의 SSH 서버가 Docker의 `-p 30501:8022`처럼 다른 포트로 외부에 열려 있다면 `letify login tunnel <alias> --address <host> --public-port 30501`로 기록합니다. 그러면 주소로 바로 하는 SSH는 30501 포트로 접속하고, 홀펀칭은 계속 8022를 씁니다. Colab과 Elice는 에이전트가 아예 필요 없습니다. 프로바이더 계층이 각 서비스의 API로 머신을 만들고 엽니다. Modal은 자체 API로 연결하므로 여기에 해당하지 않습니다.
 
 **여러 계정을 정식으로 지원합니다.** 설정 항목 하나가 계정 하나이고, 같은 종류를 여러 개 둘 수 있습니다. Colab 계정이 두 개면 동시 세션도 두 배가 됩니다.
 

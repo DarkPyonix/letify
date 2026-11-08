@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import abc
 import dataclasses
+import sys
 import threading
 from collections.abc import Iterator, Mapping, Sequence
 from typing import TYPE_CHECKING, Any, Literal
@@ -40,6 +41,7 @@ from ..errors import (
     UnknownInstance,
     UnsupportedMode,
 )
+from ..paths import config_label
 from .usage import Usage, from_command
 
 if TYPE_CHECKING:
@@ -63,9 +65,16 @@ class RuntimeState:
     detail: str = ""
 
 
-#: Account fields of the removed Tailcat connection. An account that names one is refused.
-#: Spec "Connection strategies".
-REMOVED_TAILCAT_FIELDS = ("tailcat", "tailcat_port", "tailcat_binary")
+#: Account fields that named a Tailcat address to connect to. An account that names one is
+#: refused. Spec "Connection strategies".
+REMOVED_TAILCAT_FIELDS = ("tailcat", "tailcat_port")
+
+#: The field that only pointed at, or disabled, a Tailcat binary. It selects nothing in 3.0,
+#: so it is ignored with a notice. Spec "Connection strategies".
+OBSOLETE_TAILCAT_FIELD = "tailcat_binary"
+
+#: The aliases already told that ``tailcat_binary`` is obsolete, one notice per process.
+_NOTIFIED: set[str] = set()
 
 
 class Provider(abc.ABC):
@@ -106,13 +115,26 @@ class Provider(abc.ABC):
     def __init__(self, config: ProviderConfig):
         for removed in REMOVED_TAILCAT_FIELDS:
             if removed in config.options:
+                if self.kind == "tunnel":
+                    raise ProviderUnavailable(
+                        self.kind,
+                        f"{config.alias} names {removed!r}, but Tailcat was removed in 3.0. "
+                        f"Run 'letify agent serve' on the machine, then "
+                        f"'letify login tunnel {config.alias} --connect letify-agent2:<token>' "
+                        f"with the token it prints",
+                    )
                 raise ProviderUnavailable(
                     self.kind,
-                    f"{config.alias} names {removed!r}, but Tailcat was removed in 3.0. "
-                    f"Run 'letify agent serve' on the machine, then "
-                    f"'letify login tunnel {config.alias} --connect letify-agent2:<token>' "
-                    f"with the token it prints",
+                    f"{config.alias} names {removed!r}, which is obsolete since 3.0. Delete "
+                    f"it from {config.alias} in {config_label()}",
                 )
+        if OBSOLETE_TAILCAT_FIELD in config.options and config.alias not in _NOTIFIED:
+            _NOTIFIED.add(config.alias)
+            print(
+                f"{config.alias}: {OBSOLETE_TAILCAT_FIELD!r} is obsolete since 3.0 and is "
+                f"ignored. Delete it from {config.alias} in {config_label()}",
+                file=sys.stderr,
+            )
         self.config = config
         self.alias = config.alias
         self._instances: dict[str, Instance] | None = None
