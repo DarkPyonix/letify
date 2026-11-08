@@ -81,6 +81,7 @@ def request(
     """
     started = time.monotonic()
     assert runtime.channel is not None
+    seen = dict(getattr(runtime.channel, "received", {}))
     try:
         return runtime.channel.request(payload, timeout=timeout)
     except ProtocolError as exc:
@@ -91,7 +92,7 @@ def request(
             remaining = timeout - (time.monotonic() - started)
             if remaining <= 0:
                 raise RuntimeFailure(f"{runtime.name}: the call exceeded {timeout}s") from failure
-        pieces = _reattach(runtime, run, failure, remaining, on_channel)
+        pieces = _reattach(runtime, run, failure, remaining, on_channel, seen)
         try:
             return next(pieces), ""
         except ProtocolError as exc:
@@ -107,10 +108,14 @@ def _reattach(
     failure: ProtocolError,
     timeout: float | None,
     on_channel: Callable[[Channel], None] | None,
+    seen: dict[str, int],
 ) -> Iterator[Any]:
     """Adopt the run again over a new channel and return the stream that carries its reply.
 
-    Raises ``failure`` when the conditions do not hold or no attempt succeeds.
+    Raises ``failure`` when the conditions do not hold or no attempt succeeds. ``seen`` is what
+    the channel had received when the call was sent, so the difference is what the call's own
+    output amounted to. It goes to the worker as ``have``, and the new channel goes on counting
+    from the old one's totals.
     """
     if not eligible(runtime, run, failure):
         raise failure
@@ -137,11 +142,15 @@ def _reattach(
             flush=True,
         )
         channel.echo, channel.on_output = old.echo, old.on_output
+        total = dict(getattr(old, "received", {}))
+        have = {name: count - seen.get(name, 0) for name, count in total.items()}
+        if hasattr(channel, "received"):
+            channel.received = total
         pieces = None
         try:
             channel.start()
             pieces = channel.stream(
-                {"op": "adopt", "run": run.id, "owner": os.getpid()}, timeout=timeout
+                {"op": "adopt", "run": run.id, "owner": os.getpid(), "have": have}, timeout=timeout
             )
             next(pieces)
         except RemoteError:

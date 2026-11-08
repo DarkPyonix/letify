@@ -45,6 +45,7 @@ from .. import tools
 from ..config.secrets import account_directory
 from ..declare.instance import Instance
 from ..errors import ProviderUnavailable, RuntimeFailure, RuntimeLost
+from ..useragent import with_agent
 from .shell import Shell
 from .usage import Usage
 
@@ -116,7 +117,9 @@ def _access_token(stored: dict[str, Any]) -> str:
             "grant_type": "refresh_token",
         }
     ).encode()
-    request = urllib.request.Request(str(stored["token_uri"]), data=form, method="POST")
+    request = urllib.request.Request(
+        str(stored["token_uri"]), data=form, method="POST", headers=with_agent()
+    )
     with urllib.request.urlopen(request, timeout=USAGE_HTTP_TIMEOUT) as response:
         return str(json.loads(response.read())["access_token"])
 
@@ -207,12 +210,12 @@ class Colab(Shell):
                 token = _access_token(stored)
                 request = urllib.request.Request(
                     CCU_INFO_URL,
-                    headers={
+                    headers=with_agent({
                         "Authorization": f"Bearer {token}",
                         "Accept": "application/json",
                         "X-Colab-Client-Agent": "colab-cli",
                         "X-Colab-Tunnel": "Google",
-                    },
+                    }),
                 )
                 with urllib.request.urlopen(request, timeout=USAGE_HTTP_TIMEOUT) as response:
                     text = response.read().decode(errors="replace")
@@ -301,8 +304,12 @@ class Colab(Shell):
         timeout: float | None = None,
         stdin: str | None = None,
         script: str | None = None,
+        stderr_to: list[str] | None = None,
     ) -> str:
-        """Run the CLI; with ``script``, run that code in the CLI's Python with ``args`` as argv."""
+        """Run the CLI; with ``script``, run that code in the CLI's Python with ``args`` as argv.
+
+        With ``stderr_to``, the standard error of a successful run is appended to that list.
+        """
         if script is None:
             command = [*self._colab(), *args]
         else:
@@ -325,6 +332,8 @@ class Colab(Shell):
                 command=" ".join(shown),
                 stderr=(result.stderr or "").strip(),
             )
+        if stderr_to is not None:
+            stderr_to.append(result.stderr or "")
         return result.stdout
 
     def _env(self) -> dict[str, str]:
@@ -335,7 +344,23 @@ class Colab(Shell):
 
     def _exec(self, session: str, source: str, timeout: float | None) -> str:
         try:
-            return self._cli("exec", "-s", session, stdin=source, timeout=timeout)
+            errors: list[str] = []
+            out = self._cli(
+                "exec", "-s", session, stdin=source, timeout=timeout, stderr_to=errors
+            )
+            stderr = errors[0] if errors else ""
+            # The CLI exits 0 when the program raised and prints the traceback on stderr.
+            if (
+                "Traceback (most recent call last)" in stderr
+                and "__LETIFY_EVAL__" not in out
+                and "__LETIFY_RESULT_BEGIN__" not in out
+            ):
+                raise RuntimeFailure(
+                    f"{session}: the program raised on the runtime\n{stderr.strip()[-2000:]}",
+                    command=" ".join([*self._colab(), "exec", "-s", session]),
+                    stderr=stderr.strip(),
+                )
+            return out
         except subprocess.TimeoutExpired as exc:
             stderr = exc.stderr or ""
             if isinstance(stderr, bytes):

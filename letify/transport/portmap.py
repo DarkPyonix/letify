@@ -18,6 +18,8 @@ import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
 
+from ..useragent import with_agent
+
 #: Seconds a mapping is asked to live. One hour outlasts a session's setup and is short
 #: enough that a mapping letify fails to release expires on its own.
 LIFETIME = 3600
@@ -239,7 +241,9 @@ def _ssdp_location(timeout: float) -> str | None:
 
 def _fetch(url: str, timeout: float) -> str | None:
     try:
-        with urllib.request.urlopen(url, timeout=timeout) as answer:
+        with urllib.request.urlopen(
+            urllib.request.Request(url, headers=with_agent()), timeout=timeout
+        ) as answer:
             return answer.read(1 << 18).decode("latin-1")
     except Exception:
         return None
@@ -266,10 +270,10 @@ def _soap(url: str, service: str, action: str, body: str, timeout: float) -> str
     request = urllib.request.Request(
         url,
         data=envelope,
-        headers={
+        headers=with_agent({
             "Content-Type": 'text/xml; charset="utf-8"',
             "SOAPAction": f'"{service}#{action}"',
-        },
+        }),
     )
     try:
         with urllib.request.urlopen(request, timeout=timeout) as answer:

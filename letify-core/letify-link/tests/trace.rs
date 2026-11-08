@@ -9,7 +9,7 @@ use letify_link::Config;
 use letify_link::trace::{TraceConfig, spawn};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_traced_session_appends_a_line_with_its_subflows_while_it_carries_data() {
     let (a, b) = session_pair(Config::default()).await;
     let dir = std::env::temp_dir().join(format!("ll-trace-{}", std::process::id()));
@@ -61,7 +61,7 @@ fn trace_file(name: &str) -> (std::path::PathBuf, std::path::PathBuf) {
     (dir, path)
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_tcp_like_subflow_line_names_its_kind_and_that_it_has_no_gauge() {
     let (a, b) = session_pair(Config::default()).await;
     let (dir, path) = trace_file("kind");
@@ -88,7 +88,7 @@ async fn a_tcp_like_subflow_line_names_its_kind_and_that_it_has_no_gauge() {
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn closing_a_subflow_writes_one_event_line_with_the_reason() {
     let (a, _b) = session_pair(Config::default()).await;
     let (dir, path) = trace_file("closed");
@@ -110,7 +110,7 @@ async fn closing_a_subflow_writes_one_event_line_with_the_reason() {
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_failed_session_writes_an_event_line_with_the_failure_text() {
     let config = Config {
         resume_window: Duration::from_millis(100),

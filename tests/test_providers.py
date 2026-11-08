@@ -3382,3 +3382,43 @@ def test_the_kaggle_cli_runs_with_six_because_its_release_imports_it_undeclared(
         "kaggle",
         "kaggle",
     ]
+
+
+# Spec: Colab, the fallback raises a remote traceback instead of discarding it.
+def test_colab_exec_that_exited_zero_with_a_traceback_raises_it(
+    isolated_home, patch_which, patch_run
+):
+    patch_which(tools_module, present=True)
+    traceback = (
+        "Traceback (most recent call last):\n"
+        '  File "<x>", line 3\n'
+        "RuntimeError: uv sync failed"
+    )
+    patch_run(colab_module, result=FakeCompleted(returncode=0, stdout="", stderr=traceback))
+    provider = provider_of(Colab, "colab_a", channel="exec")
+    runtime = type("R", (), {"name": "letify-cpu-1"})()
+    with pytest.raises(letify.RuntimeFailure) as caught:
+        provider.open_channel(runtime).eval("1", timeout=120)
+    assert "uv sync failed" in caught.value.stderr
+    assert "letify-cpu-1" in str(caught.value)
+
+
+def test_colab_exec_stderr_beside_a_result_marker_is_not_an_error(
+    isolated_home, patch_which, patch_run
+):
+    import base64
+    import pickle
+
+    patch_which(tools_module, present=True)
+    value = base64.b64encode(pickle.dumps(5, protocol=4)).decode()
+    patch_run(
+        colab_module,
+        result=FakeCompleted(
+            returncode=0,
+            stdout=f"__LETIFY_EVAL__{value}\n",
+            stderr="Traceback (most recent call last):\nthe program's own output\n",
+        ),
+    )
+    provider = provider_of(Colab, "colab_a", channel="exec")
+    runtime = type("R", (), {"name": "letify-cpu-1"})()
+    assert provider.open_channel(runtime).eval("1", timeout=120) == 5

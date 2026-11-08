@@ -34,6 +34,7 @@ from pathlib import Path
 from . import render
 from .errors import LetifyError
 from .transport.setup import TAILCAT_VERSION
+from .useragent import user_agent, with_agent
 
 #: Seconds to wait for a release server.
 DOWNLOAD_TIMEOUT = 60.0
@@ -390,7 +391,9 @@ def _download(url: str, *, label: str | None = None, stream=None) -> bytes:
     """Fetch ``url``; with ``label``, report progress on ``stream`` (standard error)."""
     _reachable(url)
     try:
-        with urllib.request.urlopen(url, timeout=DOWNLOAD_TIMEOUT) as response:
+        with urllib.request.urlopen(
+            urllib.request.Request(url, headers=with_agent()), timeout=DOWNLOAD_TIMEOUT
+        ) as response:
             if label is None:
                 return response.read()
             length = response.headers.get("Content-Length")
@@ -656,7 +659,8 @@ def remote_tailcat_source() -> str:
     return (
         inspect.getsource(_remote_tailcat)
         + f"\nbinary = _remote_tailcat({TAILCAT_VERSION!r}, "
-        + f"{TAILCAT_RELEASE.format(version=TAILCAT_VERSION)!r}, {TAILCAT_SHA256!r})\n"
+        + f"{TAILCAT_RELEASE.format(version=TAILCAT_VERSION)!r}, {TAILCAT_SHA256!r}, "
+        + f"{user_agent()!r})\n"
         + "import json\nprint('LETIFY-TAILCAT ' + json.dumps(binary))\n"
     )
 
@@ -730,7 +734,7 @@ def _remote_quic(version):
     return str(target)
 
 
-def _remote_tailcat(version, release, pins):
+def _remote_tailcat(version, release, pins, agent):
     """Install a verified Linux tailcat using only the runtime's standard library."""
     import hashlib
     import io
@@ -757,7 +761,10 @@ def _remote_tailcat(version, release, pins):
         if verified.get("archive") != pins[asset] or verified.get("binary") != actual:
             raise RuntimeError("tailcat cached binary SHA-256 mismatch; refused")
         return str(binary)
-    with urllib.request.urlopen(f"{release}/{asset}", timeout=60) as response:
+    with urllib.request.urlopen(
+        urllib.request.Request(f"{release}/{asset}", headers={"User-Agent": agent}),
+        timeout=60,
+    ) as response:
         data = response.read()
     actual = hashlib.sha256(data).hexdigest()
     if actual != pins[asset]:

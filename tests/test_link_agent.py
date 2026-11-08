@@ -382,14 +382,25 @@ def test_a_stopped_agent_leaves_its_loop_at_once(start_service) -> None:
     assert not agent.thread.is_alive() and time.monotonic() - began < 10
 
 
+@pytest.mark.parametrize("connected", [False, True], ids=["down_at_connect", "dropped_while_open"])
 def test_a_service_that_fails_is_retried_with_a_backoff_and_logged_once(
-    start_service, signal_service, daemons
+    start_service, signal_service, daemons, connected: bool
 ) -> None:
+    # Spec "Agent and pairing" item 5: the first failure prints one line, whether the
+    # connect is refused ("the signalling service did not answer") or an open socket ends
+    # ("the signalling WebSocket ended"). Which one comes first depends on whether the
+    # agent had connected before the service went away, so both orders are pinned.
     agent = start_service(backoff_s=(0.05, 0.1))
+    if connected:
+        assert wait_for(lambda: signal_service.sockets_open(agent.node_id) == 1)
     signal_service.close()
-    assert wait_for(lambda: any("signalling service" in line for line in agent.lines))
+
+    def failures() -> list[str]:
+        return [line for line in agent.lines if "retrying with a backoff" in line]
+
+    assert wait_for(lambda: len(failures()) >= 1), agent.lines
     time.sleep(0.5)
-    assert sum("signalling service" in line for line in agent.lines) == 1
+    assert len(failures()) == 1 and "signalling" in failures()[0], agent.lines
     assert agent.thread.is_alive()
 
 
@@ -439,6 +450,9 @@ def test_a_paired_node_connects_end_to_end_and_unpairing_stops_the_next_connect(
             )
         finally:
             channel.close()
+            # The channel does not own the remote: closing it ends the session, so the shim
+            # leaves at once instead of waiting out the resume window.
+            remote.close()
         agent.home.paired.remove(local.node_id)
         assert wait_for(lambda: any(line.startswith("unpaired") for line in agent.lines), 15)
         with pytest.raises(ProviderUnavailable, match="did not answer"):

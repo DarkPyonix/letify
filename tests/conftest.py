@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import base64
 import contextlib
+import ipaddress
 import json
 import os
 import shutil
@@ -105,6 +106,192 @@ def private_letify_home(monkeypatch, tmp_path: Path) -> Path:
 
     monkeypatch.setattr(Path, "home", classmethod(private))
     return home
+
+
+class PublicNetworkAccess(AssertionError):
+    """A test reached for an address that is not on this machine."""
+
+
+_public_network_attempts: list[str] = []
+_current_test: list[str] = ["<outside a test>"]
+_real_socket_methods = {
+    name: getattr(socket.socket, name) for name in ("connect", "connect_ex", "sendto")
+}
+_real_getaddrinfo = socket.getaddrinfo
+
+
+_DOCUMENTATION_NETWORKS = [
+    ipaddress.ip_network(net) for net in ("192.0.2.0/24", "198.51.100.0/24", "203.0.113.0/24")
+]
+
+
+def _is_local_host(host: Any) -> bool:
+    if isinstance(host, bytes):
+        host = host.decode("ascii", "replace")
+    if host in (None, "", "localhost", "ip6-localhost", "<broadcast>"):
+        return True
+    host = str(host).split("%", 1)[0]
+    try:
+        address = ipaddress.ip_address(host)
+    except ValueError:
+        return host.endswith(".localhost")
+    if address.is_loopback or host in ("0.0.0.0", "::"):
+        return True
+    # RFC 5737 documentation ranges are never routed, so a packet to one reaches no service.
+    # Tests use them as a peer that answers nothing, which loopback cannot imitate.
+    return any(address in net for net in _DOCUMENTATION_NETWORKS)
+
+
+def _refuse(host: Any, port: Any) -> None:
+    message = (
+        f"{_current_test[0]} reached for the public address {host}:{port}. The suite has no "
+        "public network: use the stun_server fixture, FakeSignalService or a loopback server, "
+        "or mark the test with @pytest.mark.network and say why."
+    )
+    _public_network_attempts.append(message)
+    raise PublicNetworkAccess(message)
+
+
+def _guarded_method(name: str):
+    real = _real_socket_methods[name]
+
+    def guarded(self: socket.socket, *args: Any):
+        address = args[-1]
+        inet = self.family in (socket.AF_INET, socket.AF_INET6) and isinstance(address, tuple)
+        if inet and not _is_local_host(address[0]) and not _current_test_allows_network():
+            _refuse(address[0], address[1] if len(address) > 1 else "")
+        return real(self, *args)
+
+    guarded.__name__ = name
+    return guarded
+
+
+def _guarded_getaddrinfo(host, port, *args: Any, **kwargs: Any):
+    if not _is_local_host(host) and not _current_test_allows_network():
+        _refuse(host, port)
+    return _real_getaddrinfo(host, port, *args, **kwargs)
+
+
+_network_allowed = [False]
+
+
+def _current_test_allows_network() -> bool:
+    return _network_allowed[0]
+
+
+def pytest_configure(config) -> None:
+    config.addinivalue_line(
+        "markers", "network: the test genuinely needs the public network (say why in the marker)"
+    )
+    for name in _real_socket_methods:
+        setattr(socket.socket, name, _guarded_method(name))
+    # create_connection resolves through socket.getaddrinfo and then connects, so both are covered.
+    socket.getaddrinfo = _guarded_getaddrinfo
+
+
+@pytest.fixture(autouse=True)
+def no_public_network(request, monkeypatch) -> Any:
+    """Make a connection to any address that is not loopback fail the test.
+
+    The guard patches ``socket.socket.connect``, ``connect_ex``, ``sendto`` and
+    ``socket.getaddrinfo`` for the whole run, so ``create_connection``, ``urllib`` and
+    ``http.client`` are covered. The exception is an AssertionError rather than an OSError
+    so code that handles a network failure does not swallow it, and each attempt is
+    recorded so a test that swallows it anyway still fails at teardown. Subprocesses are
+    not covered by an in-process guard, so the environment variables letify honours are
+    pointed at loopback: the STUN list of the sidecar and the signalling service URL.
+    A test marked ``network`` is exempt.
+    """
+    _current_test[0] = request.node.nodeid
+    _network_allowed[0] = request.node.get_closest_marker("network") is not None
+    _public_network_attempts.clear()
+    monkeypatch.setenv("LETIFY_LINK_STUN", "127.0.0.1:9")
+    monkeypatch.setenv("LETIFY_SIGNAL_URL", "http://127.0.0.1:9")
+    yield
+    attempts = list(_public_network_attempts)
+    _public_network_attempts.clear()
+    _network_allowed[0] = False
+    _current_test[0] = "<outside a test>"
+    if attempts:
+        pytest.fail("\n".join(attempts), pytrace=False)
+
+
+#: The environment variable that names the test a process was started under. Every process a
+#: test starts, detached or not, inherits it, so the teardown can find what the test left.
+TEST_MARK = "LETIFY_TEST_MARK"
+
+
+def leaked_link_processes(mark: str, wait: float = 5.0) -> dict[int, str]:
+    """The letify-link processes still running that were started under ``mark``.
+
+    A sidecar, a shim and a mailbox pump all carry ``letify-link`` in their command line. A
+    process gets ``wait`` seconds to exit, because a close returns before the process is
+    reaped. Zombies are not running and are skipped.
+    """
+    import time
+
+    needle = f"{TEST_MARK}={mark}".encode()
+    deadline = time.monotonic() + wait
+    while True:
+        found: dict[int, str] = {}
+        for entry in Path("/proc").iterdir():
+            if not entry.name.isdigit() or int(entry.name) == os.getpid():
+                continue
+            try:
+                state = (entry / "stat").read_text().rsplit(")", 1)[1].split()[0]
+                environ = (entry / "environ").read_bytes().split(b"\0")
+                raw = (entry / "cmdline").read_bytes()
+            except (OSError, IndexError):
+                continue
+            command = raw.replace(b"\0", b" ").decode("utf-8", "replace")
+            if state != "Z" and needle in environ and "letify-link" in command:
+                found[int(entry.name)] = command[:120]
+        if not found or time.monotonic() >= deadline:
+            return found
+        time.sleep(0.1)
+
+
+def end_link_processes(mark: str | None = None, wait: float = 5.0) -> dict[int, str]:
+    """Kill by pid the letify-link processes started under ``mark``, this test's by default.
+
+    Returns what was still running. A test that must end a process the product keeps by
+    design, such as the shim that serves a taken-over run for its lease window, calls this
+    and says why.
+    """
+    import signal
+
+    found = leaked_link_processes(mark or os.environ[TEST_MARK], wait)
+    for pid in found:
+        with contextlib.suppress(OSError):
+            os.kill(pid, signal.SIGKILL)
+    return found
+
+
+@pytest.fixture(autouse=True)
+def no_link_process_survives(request) -> Any:
+    """Fail a test that leaves a letify-link process it started running at teardown.
+
+    The sidecar of a session, the shim that serves it on the remote side and the mailbox
+    pump are started by the test or by a process the test started. A test that does not
+    close what it opened leaves them for the lease window (300 s), and a full run then ends
+    with orphans. The leftovers are killed by pid so they cannot pile up, and the test fails.
+    """
+    import uuid
+
+    mark = f"{request.node.nodeid}#{uuid.uuid4().hex}"
+    os.environ[TEST_MARK] = mark
+    try:
+        yield
+    finally:
+        os.environ.pop(TEST_MARK, None)
+    left = end_link_processes(mark) if sys.platform == "linux" else {}
+    if left:
+        listing = "\n".join(f"  {pid}: {command}" for pid, command in left.items())
+        pytest.fail(
+            f"{request.node.nodeid} left letify-link processes running (now killed):\n{listing}\n"
+            "Close the LinkRemote, LinkChannel or bootstrap the test opened.",
+            pytrace=False,
+        )
 
 
 @pytest.fixture

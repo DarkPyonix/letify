@@ -469,6 +469,9 @@ def test_an_address_less_machine_is_reached_through_the_mailbox_with_no_ssh_and_
             assert {method for method, _, _ in signal_service.requests} <= {"GET", "POST"}
         finally:
             channel.close()
+            # The channel does not own the remote. Closing it ends the session, so the shim
+            # on the agent's side leaves at once instead of waiting out the resume window.
+            remote.close()
             agent.stop()
             thread.join(timeout=15)
     finally:

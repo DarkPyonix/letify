@@ -26,6 +26,7 @@ from letify.config import login
 from letify.providers import shell as shell_module
 from letify.providers.tunnel import Tunnel
 from letify.transport import agent as agent_module
+from letify.transport import portmap as portmap_module
 from letify.transport import setup
 from letify.transport import strategies as strategies_module
 from letify.transport.pipeline import Pipeline
@@ -408,8 +409,11 @@ def test_a_tunnel_account_naming_tailcat_needs_no_address() -> None:
 
 
 def test_letify_check_on_a_tunnel_account_runs_over_tailcat(
-    isolated_home, patch_which, patch_run, patch_popen, capsys
+    isolated_home, patch_which, patch_run, patch_popen, capsys, monkeypatch
 ) -> None:
+    # The router of the machine that runs the suite is not asked for a port mapping (NAT-PMP
+    # to the gateway, UPnP over multicast); a router that grants none gives the same answer.
+    monkeypatch.setattr(portmap_module, "request", lambda port: None)
     (Path.home() / ".letify" / "config.toml").write_text(
         "[home_box]\n"
         'kind = "tunnel"\n'

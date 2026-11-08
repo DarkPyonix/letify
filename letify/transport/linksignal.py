@@ -29,6 +29,7 @@ from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from typing import Any, Protocol
 
+from ..useragent import user_agent
 from . import linkd, linkwebsocket
 
 #: The service the owner operates.
@@ -93,16 +94,6 @@ class Incoming:
     sender: str
     at: int
     body: bytes
-
-
-def _user_agent() -> str:
-    """The User-Agent of every request. Spec "Signalling service" item 1, "User-Agent".
-
-    Cloudflare's Browser Integrity Check refuses the urllib default with error 1010.
-    """
-    from .. import __version__
-
-    return f"letify/{__version__}"
 
 
 def _proxied(url: str) -> bool:
@@ -176,7 +167,7 @@ class SignalClient:
         text = f"{method}\n{target}\n{stamp}\n{nonce}\n{hashlib.sha256(body).hexdigest()}"
         signature = self.daemon.sign(REQUEST_DOMAIN, text.encode())
         return {
-            "User-Agent": _user_agent(),
+            "User-Agent": user_agent(),
             "X-Letify-Node": signer_id or self.daemon.node_id,
             "X-Letify-Time": stamp,
             "X-Letify-Nonce": nonce,
