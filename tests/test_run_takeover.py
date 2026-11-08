@@ -685,6 +685,12 @@ def test_a_link_run_is_taken_over_by_a_second_process(
     assert taking.error is None
     assert taking.value == 42
     until(lambda: gone(owner.worker), "the new owner to end the session")
+    # The shim serves every owner's session and leaves only after the resume window with no
+    # live path (Spec "Sidecar interface" item 7). The old owner was killed without closing
+    # its session, so the test ends the shim itself.
+    from conftest import end_link_processes
+
+    assert end_link_processes(), "the shim of the run should still be serving"
 
 
 def test_a_link_run_is_not_taken_over_by_another_node(
