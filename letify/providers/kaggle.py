@@ -590,6 +590,30 @@ def read_notebook_owner(alias: str) -> str | None:
     return owner or None
 
 
+def owner_refusal(owner: str) -> str | None:
+    """Say why ``owner`` cannot be a Kaggle username, or return None when it can.
+
+    Spec "Kaggle" token input and notebook owner: only ``@``, whitespace and ``/`` are
+    refused, because the spec states no fuller charset rule.
+    """
+    if "@" in owner:
+        return (
+            f"{owner} looks like an email address; enter the Kaggle username shown in "
+            f"your profile URL kaggle.com/<username>"
+        )
+    if "/" in owner or any(character.isspace() for character in owner):
+        return (
+            f"{owner} is not a Kaggle username; enter the username shown in your "
+            f"profile URL kaggle.com/<username>, with no whitespace or slash"
+        )
+    return None
+
+
+def owner_fix_command(alias: str) -> str:
+    """The command that replaces a wrong stored owner and keeps the credentials."""
+    return f"letify login kaggle {alias} --replace --username <username>"
+
+
 def notebook_record(alias: str) -> Path:
     """Where the refs of the notebooks letify created on this account are kept."""
     return account_directory(alias) / "notebooks"
@@ -865,7 +889,8 @@ def delete_notebook_best_effort(alias: str, kernel_id: int, slug: str | None) ->
     Never raises. A notebook the CLI could not delete, for want of a token, of uv, of a
     slug, or because the command itself failed, is reported with a warning naming it by
     slug or id, never by its cookie, so the user can delete it by hand on kaggle.com. A
-    command that ran and failed adds what the CLI said, and a 403 adds the likely cause.
+    command that ran and failed adds what the CLI said, and a 403 adds that the owner must be
+    the Kaggle username, not an email, with the command that fixes it.
     """
     reason = delete_notebook_failure(alias, slug)
     if reason is None:
@@ -876,9 +901,10 @@ def delete_notebook_best_effort(alias: str, kernel_id: int, slug: str | None) ->
     name = f"slug {slug}" if slug else f"id {kernel_id}"
     detail = f": {reason}" if reason else ""
     if "403" in reason:
+        owner = read_notebook_owner(alias) or "<owner>"
         detail += (
-            ". The account's API token may lack the permission to delete notebooks; "
-            "create a new token on kaggle.com with that permission"
+            f". Kaggle refused the notebook {owner}/{slug or kernel_id}; the owner must be "
+            f"the Kaggle username, not an email. Fix it with: {owner_fix_command(alias)}"
         )
     print(
         f"letify: {alias}: could not delete the Kaggle notebook ({name}){detail}; delete it "
@@ -1720,10 +1746,17 @@ class Kaggle(Provider):
         The notebook is created fresh for this runtime alone, never reused from an earlier
         one: spec "Kaggle session token chain".
         """
-        if read_notebook_owner(self.alias) is None:
+        owner = read_notebook_owner(self.alias)
+        if owner is None:
             raise ConfigError(
                 f"{self.alias} has no Kaggle notebook owner. Log in again with: "
                 f"letify login kaggle {self.alias} --username <owner>"
+            )
+        refusal = owner_refusal(owner)
+        if refusal is not None:
+            raise ConfigError(
+                f"{self.alias}: the stored notebook owner is wrong: {refusal}. "
+                f"Fix it with: {owner_fix_command(self.alias)}"
             )
         cookie = self._require_live_cookie()
         self._leave_a_gap()

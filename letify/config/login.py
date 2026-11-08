@@ -840,6 +840,7 @@ def read_kaggle_token(
     username = (given_username or "").strip()
     if not username and answers.interactive:
         username = read_line(KAGGLE_OWNER_PROMPT).strip()
+    from ..providers import kaggle as kg
     from ..providers.kaggle import read_api_token
 
     stored = read_api_token(answers.alias)
@@ -856,6 +857,9 @@ def read_kaggle_token(
             f"{answers.alias} needs the Kaggle API token and notebook owner: pass "
             f"--username <owner> and --key <KGAT_token> from kaggle.com, or drop --no-input."
         )
+    refusal = kg.owner_refusal(username)
+    if refusal is not None:
+        raise LoginError(f"{answers.alias}: {refusal}")
     if not key.startswith("KGAT_") or len(key) <= len("KGAT_") or any(
         character.isspace() for character in key
     ):
