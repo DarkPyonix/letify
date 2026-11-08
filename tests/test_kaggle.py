@@ -292,7 +292,7 @@ def kaggle_provider():
 
     from letify.providers import Kaggle
 
-    return provider_of(Kaggle, "kaggle_a")
+    return provider_of(Kaggle, "kaggle_a", link="ssh")
 
 
 @pytest.mark.parametrize("name, devices", [("T4", 2)])
@@ -963,7 +963,7 @@ def test_kaggle_never_opts_out_of_preparing_the_runtime(fake_kaggle) -> None:
 
     from letify.providers import Kaggle
 
-    provider = provider_of(Kaggle, "kaggle_a")
+    provider = provider_of(Kaggle, "kaggle_a", link="ssh")
     assert provider.prepares_workspace is True
     assert provider.remote_env is True
 

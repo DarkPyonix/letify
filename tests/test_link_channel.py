@@ -40,8 +40,14 @@ class LocalShell(Shell):
         """The account's plain ssh command, run on this machine under ``sh -c``."""
         return self.__dict__["fake_ssh"].ssh_command(remote_command)
 
+    @property
+    def address(self) -> str | None:
+        """None when the account declares none, as a Colab or Kaggle account has none."""
+        value = self.config.option("address")
+        return value if isinstance(value, str) and value else None
+
     def link(self, runtime: Any = None) -> Any:
-        """An account with no address is reached through its pipeline, here the same hop."""
+        """An account with no address is reached through one hop, here the fake ssh."""
         if self.address is None:
             return self.__dict__["fake_ssh"]
         return super().link(runtime)
@@ -295,9 +301,8 @@ def test_a_session_over_a_punched_pair_carries_a_call(sidecar_binary, isolated_h
         provider.close_link()
 
 
-@pytest.mark.parametrize("option", [{}, {"link": "ssh"}])
-def test_link_option_absent_keeps_ssh(isolated_home, tmp_path, ssh, option) -> None:
-    provider = machine(tmp_path, ssh, **option)
+def test_link_ssh_keeps_the_ssh_data_path(isolated_home, tmp_path, ssh) -> None:
+    provider = machine(tmp_path, ssh, link="ssh")
     assert provider.uses_letify_link is False
     assert type(provider.open_channel(runtime())) is PersistentChannel
     assert type(provider.transfer_channel(runtime())) is PersistentChannel
@@ -490,7 +495,19 @@ def test_the_wheel_extraction_names_the_sidecar_binary() -> None:
     source = install.remote_link_source("2.10.2")
     assert "letify/remoting/lib/letify-link" in source and "LETIFY-LINK" in source
     assert "letify-quic" not in source and "LETIFY-QUIC" not in source
-    assert "LETIFY-QUIC" in install.remote_quic_source("2.10.2")
+
+
+def test_the_wheel_extraction_runs_standalone_on_a_runtime(tmp_path, monkeypatch) -> None:
+    # Spec "Sidecar interface" item 7: the source is sent to a bare interpreter, so it has to
+    # import everything it uses. With no index to reach, pip fails and the source reports that
+    # failure, which it cannot do when a name it uses is missing.
+    from letify import install
+
+    monkeypatch.setenv("PIP_NO_INDEX", "1")
+    monkeypatch.setenv("TMPDIR", str(tmp_path))
+    source = install.remote_link_source("0.0.0.dev0")
+    with pytest.raises(RuntimeError, match="could not download the letify wheel"):
+        exec(compile(source, "remote-link", "exec"), {"__name__": "__main__"})
 
 
 # -- Gap 1: the transfer decision reads the session ---------------------------------
@@ -555,7 +572,7 @@ def test_a_link_stream_costs_nothing_even_when_the_account_sets_a_cost(
     linked_ = machine(tmp_path, ssh, link="letify-link", transfer_connection_cost_s=10)
     assert linked_.transfer_connection_cost_s == 0.0
     assert pathdata._streams_for(with_session(linked_, paths), 512 * MIB) == pathdata.STREAMS
-    costly = machine(tmp_path, ssh, transfer_connection_cost_s=10)
+    costly = machine(tmp_path, ssh, link="ssh", transfer_connection_cost_s=10)
     assert costly.transfer_connection_cost_s == 10.0
 
 
@@ -591,8 +608,6 @@ def no_address_machine(tmp_path: Path, fake: FakeSshLink, sidecar_binary: Path) 
     provider = provider_of(
         LocalShell,
         "lab",
-        tailcat="100.64.0.9",
-        tailcat_port=7001,
         workspace=str(tmp_path / "ws"),
         link="letify-link",
         link_binary=str(sidecar_binary),

@@ -1,7 +1,7 @@
-"""letify-link is opt-in in 2.x.
+"""letify-link is the default connection layer.
 
-Spec "letify-link": with no ``link`` option the connection path is that of 2.10.x, and with
-``link = "letify-link"`` the account carries its channel over letify-link.
+Spec "letify-link": with no ``link`` option the account carries its channel over letify-link,
+and ``link = "ssh"`` keeps the connection path of 2.11.x.
 """
 
 from __future__ import annotations
@@ -32,16 +32,19 @@ def raced(monkeypatch):
     return seen
 
 
-def test_a_shell_account_without_the_switch_races_the_2_10_strategies(isolated_home, raced) -> None:
-    provider = provider_of(Shell, "lab", address="gpu.example.edu", port_mapping=False)
-    provider.link()
-    assert raced == [["direct_ssh", "tcp_punch", "tailcat", "quic", "fallback"]]
+def test_a_shell_account_without_the_switch_races_nothing(isolated_home, raced) -> None:
+    provider = provider_of(Shell, "lab", address="gpu.example.edu")
+    assert provider.uses_letify_link is True
+    assert isinstance(provider.link(), PlainSshLink)
+    assert raced == []
 
 
-def test_a_shell_account_with_the_switch_off_by_name_races_the_same(isolated_home, raced) -> None:
+def test_a_shell_account_with_the_switch_off_by_name_races_the_2_11_strategies(
+    isolated_home, raced
+) -> None:
     provider = provider_of(Shell, "lab", address="gpu.example.edu", link="ssh", port_mapping=False)
     provider.link()
-    assert raced == [["direct_ssh", "tcp_punch", "tailcat", "quic", "fallback"]]
+    assert raced == [["direct_ssh", "tcp_punch", "fallback"]]
 
 
 def test_a_shell_account_with_the_switch_on_races_nothing(isolated_home, raced) -> None:
@@ -62,13 +65,23 @@ def test_a_shell_account_with_the_switch_on_tries_letify_link(isolated_home, tmp
         provider.link_remote(None)
 
 
-def test_kaggle_and_colab_without_the_switch_keep_tailcat_in_the_race(isolated_home) -> None:
-    kaggle = provider_of(Kaggle, "k")
-    assert [s.name for s in kaggle.strategies()] == ["tcp_punch", "tailcat", "quic", "fallback"]
+def test_kaggle_and_colab_without_the_switch_use_letify_link(isolated_home) -> None:
+    assert provider_of(Kaggle, "k").uses_letify_link is True
+    assert provider_of(Colab, "c").uses_letify_link is True
+
+
+def test_kaggle_and_colab_with_link_ssh_keep_tcp_punch_in_the_race(isolated_home) -> None:
+    kaggle = provider_of(Kaggle, "k", link="ssh")
+    assert [s.name for s in kaggle.strategies()] == ["tcp_punch", "fallback"]
     assert kaggle.uses_letify_link is False
-    colab = provider_of(Colab, "c")
-    assert "tailcat" in [s.name for s in colab.strategies()]
+    colab = provider_of(Colab, "c", link="ssh")
+    assert "tcp_punch" in [s.name for s in colab.strategies()]
     assert colab.uses_letify_link is False
+
+
+def test_a_colab_account_with_the_exec_channel_and_no_link_key_keeps_exec(isolated_home) -> None:
+    assert provider_of(Colab, "c", channel="exec").uses_letify_link is False
+    assert provider_of(Colab, "c", channel="exec", link="ssh").uses_letify_link is False
 
 
 def test_the_switch_is_read_from_the_account_option_link(isolated_home) -> None:

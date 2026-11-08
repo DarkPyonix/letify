@@ -30,7 +30,7 @@ Read this table first. Most confusion about letify is one of these words meaning
 | **path manager** | The part of letify-link that probes paths, moves the session to a faster one and reconnects when one dies. |
 | **Rendezvous trait** | The interface letify-link calls to carry small messages between two nodes before a path exists. letify implements it with provider bootstraps. |
 | **sidecar** | The `letify-link` executable the Python package starts and talks to over local sockets. |
-| **letify-core** | The Rust workspace in `letify-core/`: the `letify` crate and the `letify-quic` binary. The CUDA driver stand-in it once held is removed. |
+| **letify-core** | The Rust workspace in `letify-core/`: the `letify` crate and the `letify-link` binary. The CUDA driver stand-in it once held is removed. |
 
 ## The shape of the thing
 
@@ -100,7 +100,7 @@ Provider
 ├── Modal      persistent, a sandbox with framed pipes, reached through the Modal adapter
 └── Shell      ephemeral by default, SSH transport
     ├── Colab  Colab CLI for sessions, its SSH bridge or exec for the channel
-    ├── Tunnel Tailcat UDP hole punch first, then SSH; no relay
+    ├── Tunnel a machine behind NAT, reached through letify agent serve; no relay
     └── Elice  Elice Cloud API allocates, then SSH
 ```
 
@@ -203,4 +203,4 @@ It refuses rather than degrading when PyTorch is absent or too old. It does not 
 
 ## letify-core
 
-The Rust workspace in `letify-core/`. It holds the crate `letify`, published to crates.io, and the binary `letify-quic`, which the wheels carry in `letify/remoting/lib/` and `letify/transport/quic.py` runs. The driver stand-in it once held is removed; the spec's "The driver stand-in is removed" gives the measurement and where the code is.
+The Rust workspace in `letify-core/`. It holds the crate `letify`, published to crates.io, and the binary `letify-link`, which the wheels carry in `letify/remoting/lib/` and `letify/transport/linkd.py` runs. The driver stand-in it once held is removed; the spec's "The driver stand-in is removed" gives the measurement and where the code is.

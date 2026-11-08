@@ -21,7 +21,7 @@ import letify
 from letify.errors import ProviderUnavailable
 from letify.protocol.worker import BOOTSTRAP
 from letify.runtime.channel import relay_program
-from letify.transport import linkagent, linkchannel, linkd, linksignal, setup
+from letify.transport import linkagent, linkchannel, linkd, linksignal
 
 # -- helpers ------------------------------------------------------------------------------
 
@@ -127,9 +127,17 @@ def test_a_token_v2_carries_the_agent_the_secret_the_url_and_the_version() -> No
     assert (fields.version, fields.exp) == ("1.2.3", 99)
 
 
+def old_token(**fields) -> str:
+    """A token as the removed ``letify client shell connect`` printed it."""
+    import base64
+
+    raw = json.dumps(fields, separators=(",", ":")).encode()
+    return base64.urlsafe_b64encode(raw).decode().rstrip("=")
+
+
 def test_an_old_tailcat_token_is_refused_by_name() -> None:
-    old = setup.encode_token({"tailcat": "tc1abc", "tailcat_port": 4000, "user": "u", "port": 22})
-    with pytest.raises(linkagent.TokenError, match="Tailcat token"):
+    old = old_token(tailcat="tc1abc", tailcat_port=4000, user="u", port=22)
+    with pytest.raises(linkagent.TokenError, match=r"Tailcat was removed in 3\.0"):
         linkagent.parse_token(old)
 
 
@@ -496,42 +504,6 @@ def test_login_pairs_with_the_agent_and_records_its_node_and_url(
     key = tmp_path / "home" / "accounts" / "box" / "link.key"
     assert stat.S_IMODE(key.stat().st_mode) == 0o600
     assert len(agent.home.paired.nodes()) == 1
-
-
-def test_login_with_a_tailcat_token_does_not_take_the_agent_path(tmp_path, monkeypatch) -> None:
-    from letify.config import login
-
-    monkeypatch.setenv("LETIFY_HOME", str(tmp_path / "home"))
-    taken: list[str] = []
-    monkeypatch.setattr(login, "link_tunnel_account", lambda answers, token: taken.append(token))
-    monkeypatch.setattr(
-        "letify.install.ensure", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("tailcat"))
-    )
-    old = setup.encode_token({"tailcat": "tc1abc", "tailcat_port": 4000})
-    with pytest.raises(Exception, match="tailcat"):
-        login.tunnel_account(
-            login.Answers(alias="box", kind="tunnel", values={"connect": old}, interactive=False)
-        )
-    assert taken == []
-    new = linkagent.encode_token(
-        agent="ab" * 32, secret="cd" * 32, signal="https://x.example", version="1", exp=1
-    )
-    login.tunnel_account(
-        login.Answers(alias="box", kind="tunnel", values={"connect": new}, interactive=False)
-    )
-    assert taken == [new]
-
-
-def test_a_tailcat_token_given_to_the_agent_login_is_refused_by_name(tmp_path, monkeypatch) -> None:
-    from letify.config import login
-
-    monkeypatch.setenv("LETIFY_HOME", str(tmp_path / "home"))
-    old = setup.encode_token({"tailcat": "tc1abc", "tailcat_port": 4000})
-    with pytest.raises(login.LoginError, match="Tailcat token"):
-        login.link_tunnel_account(
-            login.Answers(alias="box", kind="tunnel", values={"connect": old}, interactive=False),
-            old,
-        )
 
 
 # -- the standing wait ----------------------------------------------------------------------

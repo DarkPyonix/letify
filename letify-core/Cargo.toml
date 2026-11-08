@@ -1,11 +1,11 @@
 # letify-core: the Rust components of letify.
 #
 # letify's Python package stays pure Python. What cannot be done from Python lives here and
-# is built separately: the letify crate for crates.io and the letify-quic binary that the
+# is built separately: the letify crate for crates.io and the letify-link binary that the
 # wheels carry. A user who only ships functions to remote machines over SSH never needs it.
 [workspace]
 resolver = "3"
-members = ["letify", "letify-quic", "letify-link"]
+members = ["letify", "letify-link"]
 
 [workspace.package]
 version = "2.12.6"

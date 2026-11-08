@@ -1,8 +1,8 @@
 """PyTorch forwarding for ``host="local"`` and the arithmetic that prices it.
 
 ``remoting/device/`` is the forwarding itself. What is defined here is the efficiency
-formula, which needs neither PyTorch nor a connection. It does not own the letify-quic
-binary in ``lib/``, which ``letify.transport.quic`` finds.
+formula, which needs neither PyTorch nor a connection. It does not own the letify-link
+binary in ``lib/``, which ``letify.transport.linkd`` finds.
 """
 
 from __future__ import annotations

@@ -146,7 +146,7 @@ uv add letify
 
 That is the whole install, for every provider. letify installs only cloudpickle and blake3. It needs [uv](https://docs.astral.sh/uv/) on the machine, because provider tools such as the Colab CLI and the Modal client run through uv in their own environments, not in your `.venv`.
 
-The wheel carries the `letify-quic` binary built from [letify-core](letify-core/), the Rust workspace. Wheels are built for Linux x86_64 and aarch64, Windows x86_64 and arm64, and macOS arm64 and x86_64. On another platform, pip falls back to the source distribution, which has no `letify-quic`, so the QUIC connection strategy is skipped.
+The wheel carries the `letify-link` binary built from [letify-core](letify-core/), the Rust workspace. Wheels are built for Linux x86_64 and aarch64, Windows x86_64 and arm64, and macOS arm64 and x86_64. On another platform, pip falls back to the source distribution, which has no `letify-link`, so every letify-link path is skipped.
 
 ---
 
@@ -179,7 +179,7 @@ persistent = true
 
 The connection pipeline defaults to `10 MiB/s` in each direction and `300 ms` RTT. Colab's measured sustained best is `8.8 MiB/s` up and `10.7 MiB/s` down, so it fails the default floor. The account example explicitly permits a slow link with `min_mib_per_s = 0.05`. Set `min_mib_per_s` and `max_rtt_ms` for your measurements. When all measured links fail the floor, the connection is refused even if an unprobed fallback connected.
 
-letify-link is an opt-in connection layer in 2.11 and stays opt-in through 2.x. Without it, an account connects as it did in 2.10. To carry one account's worker channel over letify-link, add `link = "letify-link"` to that account. The account then needs the `letify-link` binary from the platform wheel on both ends. See [docs/guide/09-agent.md](docs/guide/09-agent.md) for a machine with no address.
+letify-link is the default connection layer from 2.13. An account with no `link` option carries its worker channel over letify-link, and `link = "ssh"` on an account keeps the 2.11 connection path with ssh as the data path. A letify-link account needs the `letify-link` binary from the platform wheel on both ends. See [docs/guide/09-agent.md](docs/guide/09-agent.md) for a machine with no address.
 
 The project's `.letify/config.toml` gets only the alias, which is what makes the account usable in this project:
 
@@ -301,10 +301,9 @@ A Kaggle declaration must say `host=letify.remote`. That kernel channel is the o
 
 1. SSH straight to the machine's address
 2. TCP hole punching, for two machines that are both behind NAT
-3. UDP hole punching with [Tailcat](https://github.com/tailscale/tailcat), then SSH over it
-4. The provider's own path, such as `colab exec` and the Colab file API
+3. The provider's own path, such as `colab exec` and the Colab file API
 
-A lower number wins unless it is far slower than the fastest one that connected. The winner is remembered per account and per network, so the next connection starts with it. A machine behind NAT needs letify installed and `letify agent serve` run on it once, so letify can reach it, with no SSH server and no Tailcat. Until 3.0 an account made by `letify client shell connect` still works through Tailcat and prints a notice that Tailcat is removed then. When that machine's SSH server is also published to the outside under another port, such as Docker's `-p 30501:8022`, run `letify client shell connect --ssh-port 8022 --public-address <host> --public-port 30501`: SSH straight to the address then dials port 30501, while hole punching and Tailcat keep using 8022. On an existing account, `letify login tunnel <alias> --address <host> --public-port 30501` sets the same. Colab and Elice never need that step: their provider layer creates and opens the machine through the provider's own API, so that layer takes the place of `letify client shell connect`. Modal is reached through its own API and is not part of this.
+A lower number wins unless it is far slower than the fastest one that connected. The winner is remembered per account and per network, so the next connection starts with it. A machine behind NAT needs letify installed and `letify agent serve` run on it once, so letify can reach it, with no SSH server. Tailcat is removed, and an account that names `tailcat` is refused with the steps to move it to `letify agent serve`. When a machine's SSH server is published to the outside under another port, such as Docker's `-p 30501:8022`, `letify login tunnel <alias> --address <host> --public-port 30501` records it: SSH straight to the address then dials port 30501, while hole punching keeps using 8022. Colab and Elice never need an agent: their provider layer creates and opens the machine through the provider's own API. Modal is reached through its own API and is not part of this.
 
 **Multiple accounts are first class.** Each configuration entry is one account, and entries of the same kind coexist. Two Colab accounts means twice the concurrent sessions.
 
@@ -465,8 +464,7 @@ def test_train_returns_a_loss():
 letify login shell lab        # declare an account, and reference it here
 letify logout lab             # take the account off this machine
 letify agent serve            # run on a machine behind NAT, so letify can reach it
-letify client shell connect   # the Tailcat way of the same, removed in 3.0
-letify setup tailcat          # install tailcat or eci from its publisher ahead of time
+letify setup eci              # install eci from its publisher ahead of time
 letify providers              # who is declared, storage, channel kind
 letify devices                # what each one offers
 letify status                 # what is running right now
@@ -492,7 +490,7 @@ Add `--json` to `usage`, `utilization` or `status` for output a program can read
 | 📐 [docs/SPEC.md](docs/SPEC.md) | The design as it stands, decision by decision |
 | 🧩 [docs/COMPONENT.md](docs/COMPONENT.md) | Every class, and the vocabulary |
 | 🌐 [docs/NETWORK.md](docs/NETWORK.md) | Transports, latency measurements, tunnel choices |
-| 🦀 [letify-core/](letify-core/) | The Rust workspace: the `letify` crate and the `letify-quic` binary |
+| 🦀 [letify-core/](letify-core/) | The Rust workspace: the `letify` crate and the `letify-link` binary |
 | 🧭 [docs/guide/](docs/guide/) | Task-oriented guides |
 | 🇰🇷 [docs/locales/README_ko.md](docs/locales/README_ko.md) | 한국어 |
 

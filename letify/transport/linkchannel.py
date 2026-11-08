@@ -174,15 +174,17 @@ class PopenBootstrap:
 
 
 def letify_link_enabled(provider: Any) -> bool:
-    """Whether the account's ``link`` option is ``"letify-link"``; ``"ssh"`` or absent is not.
+    """Whether the account carries its channel over letify-link; ``link = "ssh"`` opts out.
 
-    Spec "Sidecar interface" item 7. Any other value is refused by name.
+    Spec "letify-link" intro and "Sidecar interface" item 7. No ``link`` key is on, except
+    for a Colab account that names ``channel = "exec"``, which has no session. Any other
+    value is refused by name.
     """
-    value = provider.config.option("link", "ssh")
-    if value in (None, "ssh"):
+    value = provider.config.option("link")
+    if value == "ssh":
         return False
-    if value == "letify-link":
-        return True
+    if value in (None, "letify-link"):
+        return not (value is None and provider.config.option("channel") == "exec")
     raise ProviderUnavailable(
         provider.kind, f'{provider.alias} sets link = {value!r}; use "ssh" or "letify-link"'
     )

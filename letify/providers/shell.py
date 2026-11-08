@@ -4,7 +4,7 @@ The shared ability is command execution, not any one transport. Every Shell reac
 machine through the connection pipeline in ``letify.transport``, and a subclass differs
 only in its rendezvous and its strategy list: ``Colab`` runs its remote half over
 ``colab exec``, ``Elice`` over forward SSH to a machine its API allocated, and a plain
-machine behind NAT through the remote agent over Tailcat.
+machine reached by forward SSH has no rendezvous at all.
 
 Persistence defaults to ephemeral. Guessing wrong in that direction only costs
 time, because letify rebuilds the environment each runtime and the work still
@@ -75,12 +75,10 @@ class Shell(Provider):
 
     @property
     def address(self) -> str | None:
-        """The address forward SSH uses. An account naming ``tailcat`` needs none."""
+        """The address forward SSH uses."""
         value = self.config.option("address")
         if isinstance(value, str) and value:
             return value
-        if isinstance(self.config.option("tailcat"), str):
-            return None
         raise ProviderUnavailable(self.kind, f"{self.alias} has no 'address' field")
 
     @property
@@ -111,7 +109,7 @@ class Shell(Provider):
         """The port forward SSH dials at the address.
 
         ``public_port`` is the port the machine publishes to the outside, such as Docker's
-        ``-p 30501:8022``. Without it forward SSH dials ``port``. Hole punching and Tailcat
+        ``-p 30501:8022``. Without it forward SSH dials ``port``. Hole punching
         always splice to ``port`` inside the machine.
         """
         value = self.config.option("public_port")
@@ -167,8 +165,7 @@ class Shell(Provider):
         """The slowest probe this account accepts, from ``min_mib_per_s`` and ``max_rtt_ms``.
 
         Both default to the floor in ``letify.transport.pipeline.LinkFloor.default``. A
-        relayed path, such as Tailcat's own fallback to a DERP relay when the direct UDP
-        punch fails, measures far below this and is refused rather than used.
+        relayed path measures far below this and is refused rather than used.
         """
         from ..transport.pipeline import MIB, LinkFloor
 
@@ -179,16 +176,6 @@ class Shell(Provider):
             min_bps=float(min_mib) * MIB if isinstance(min_mib, (int, float)) else default.min_bps,
             max_rtt_ms=float(max_rtt) if isinstance(max_rtt, (int, float)) else default.max_rtt_ms,
         )
-
-    @property
-    def tailcat_binary(self) -> str:
-        """The account's ``tailcat_binary``, or the tool lookup's answer without asking."""
-        given = self.config.option("tailcat_binary")
-        if given:
-            return str(given)
-        from ..install import find
-
-        return find("tailcat", link_cache=False) or "tailcat"
 
     def remote_command(self, command: str) -> str:
         """The command a link runs on the machine, which a provider may wrap.
@@ -235,20 +222,8 @@ class Shell(Provider):
     # -- the pipeline ----------------------------------------------------------
 
     def rendezvous(self, runtime: Runtime | None = None) -> Rendezvous | None:
-        """The remote agent over Tailcat, when the account names its address."""
-        address = self.config.option("tailcat")
-        if not isinstance(address, str):
-            return None
-        port = self.config.option("tailcat_port")
-        if not isinstance(port, (int, str)):
-            raise ProviderUnavailable(
-                self.kind,
-                f"{self.alias} names a tailcat address but no tailcat_port. "
-                f"'letify client shell connect' prints both",
-            )
-        from ..transport.rendezvous import TailcatRendezvous
-
-        return TailcatRendezvous(address, int(port), self.tailcat_binary)
+        """The way to start letify's remote half. A plain machine has none."""
+        return None
 
     def strategies(self) -> list[Strategy]:
         """The ranked strategy list. Reverse SSH joins only when the account sets it."""
@@ -256,19 +231,17 @@ class Shell(Provider):
             ConnectBack,
             DirectSSH,
             ProviderFallback,
-            QuicUDP,
             ReverseSSH,
-            TailcatUDP,
             TCPPunch,
         )
 
         chosen: list[Strategy] = [DirectSSH()]
         if self.connect_back or self.port_mapping:
             chosen.append(ConnectBack(mapping=self.port_mapping))
-        chosen.extend((TCPPunch(), TailcatUDP(), QuicUDP()))
+        chosen.append(TCPPunch())
         if self.reverse_ssh:
             chosen.append(ReverseSSH())
-        chosen.append(ProviderFallback(rank=7 if self.reverse_ssh else 6))
+        chosen.append(ProviderFallback(rank=5 if self.reverse_ssh else 4))
         return chosen
 
     def fallback(self, runtime: Runtime | None = None) -> Callable[[], Link] | None:
@@ -299,7 +272,6 @@ class Shell(Provider):
             connect_back=self.connect_back,
             fallback=self.fallback(runtime),
             stun=stun,
-            tailcat=self.tailcat_binary,
             workspace=self.workspace_root,
         )
 
@@ -588,8 +560,8 @@ class Shell(Provider):
     def uses_letify_link(self) -> bool:
         """Whether the account carries the worker channel over letify-link instead of ssh.
 
-        Spec "Sidecar interface" item 7: ``link = "letify-link"`` opts in, and the default,
-        ``"ssh"``, keeps the ssh data path.
+        Spec "Sidecar interface" item 7: no ``link`` key or ``"letify-link"`` is on, and
+        ``"ssh"`` keeps the ssh data path.
         """
         from ..transport.linkchannel import letify_link_enabled
 
@@ -617,18 +589,9 @@ class Shell(Provider):
         from ..transport.announce import printer
 
         address = self.address
-        if address is None:
-            # No address: the pipeline's link (Tailcat for a machine behind a NAT) carries the
-            # bootstrap's standard input and output and nothing else. The session starts from
-            # punched candidates only.
-            bootstrap = self.link(runtime)
-            ssh = lambda command: sshopts.unshared(  # noqa: E731
-                bootstrap.ssh_command(self.remote_command(command))
-            )
-        else:
-            ssh = lambda command: sshopts.unshared(  # noqa: E731
-                self.ssh_command(self.remote_command(command))
-            )
+        ssh = lambda command: sshopts.unshared(  # noqa: E731
+            self.ssh_command(self.remote_command(command))
+        )
         directory = account_directory(self.alias)
         directory.mkdir(mode=0o700, parents=True, exist_ok=True)
         floor = self.link_floor

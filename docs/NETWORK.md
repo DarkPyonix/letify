@@ -46,15 +46,13 @@ This is also the only provider family where call forwarding is worth offering. R
 
 ## Tunnel
 
-> For a machine behind NAT that cannot accept an inbound connection. Tailcat punches a direct UDP hole between the two sides and nothing else; no relay path is offered.
+> For a machine behind NAT that cannot accept an inbound connection. letify reaches it through the agent that `letify agent serve` runs, and no relay path is built in.
 
-### Why Tailcat, and why only the direct punch
+### Why only a direct path
 
-Tailcat, from Tailscale, needs no account and no server of your own, and letify runs it only to agree on addresses and to punch a direct UDP connection, never as a mesh VPN or a relay client. [Connection strategies](SPEC.md#connection-strategies) lists forward SSH, TCP hole punching, Tailcat's UDP hole punching, reverse SSH and the provider's own path; none of these is a relay, and none is meant to be.
+[Connection strategies](SPEC.md#connection-strategies) lists forward SSH, connect back, TCP hole punching, reverse SSH and the provider's own path; none of these is a relay, and none is meant to be.
 
-The reason is the gap between a direct path and a relayed one, not a difference in reliability. A relayed Tailscale path has been measured as low as 2.2 Mbit/s across continents where the direct path expected 30 to 40 Mbit/s, and Tailscale states that its relay servers limit throughput for fairness; `lab_docker`, below, measured 2 MiB/s and 69 ms over a punched Tailcat link where a direct LAN connection on the same hardware measured 50 MiB/s and under 1 ms. A relayed path still completes, which is the problem: it bills GPU hours while the transfer dominates the run, and nothing in the result tells the user that happened. So letify does not add a relay path to fall back to, and holds every strategy, Tailcat's punch included, to the floor in [Link floor](SPEC.md#link-floor): a probe below 10 MiB/s or above 300 ms fails the connection rather than completing it. When Tailcat's own punch fails to reach the peer directly, the agent lets the attempt fail as the spec's Rendezvous section describes rather than falling through to Tailscale's own relay network, because letify's use of the `tailcat` binary is limited to one punch and one splice, not a joined tailnet.
-
-Costs to know about. Tailcat's free personal plan covers 6 users with unlimited user devices, but only 1,000 ephemeral resource minutes per month, which is about 16 hours. Bringing up a Colab node on every session runs into that. The seventh user converts the whole tailnet to paid and bills every seat.
+The reason is the gap between a direct path and a relayed one, not a difference in reliability. A relayed Tailscale path has been measured as low as 2.2 Mbit/s across continents where the direct path expected 30 to 40 Mbit/s, and Tailscale states that its relay servers limit throughput for fairness; `lab_docker`, below, measured 2 MiB/s and 69 ms over a Tailcat link (Tailcat was removed in 3.0) where a direct LAN connection on the same hardware measured 50 MiB/s and under 1 ms. A relayed path still completes, which is the problem: it bills GPU hours while the transfer dominates the run, and nothing in the result tells the user that happened. So letify does not add a relay path to fall back to, and holds every strategy to the floor in [Link floor](SPEC.md#link-floor): a probe below 10 MiB/s or above 300 ms fails the connection rather than completing it.
 
 ### Candidates considered and rejected
 
@@ -157,7 +155,7 @@ Local pipe, client and `Local` worker on one Linux machine, Python 3.13, best of
 
 A first send of a 64 MiB argument costs three round trips on top of the bytes: `have`, `put_blob` and the call. At 35 to 48 ms each that is most of the gap to raw SSH.
 
-`lab_docker`, a Tunnel account reached over Tailcat, whose link measured 69 ms and about 2 MiB/s when this was written:
+`lab_docker`, a Tunnel account reached over Tailcat (removed in 3.0), whose link measured 69 ms and about 2 MiB/s when this was written:
 
 | Measurement | Base64 lines | Raw SSH through Tailcat |
 |---|---|---|
@@ -189,6 +187,8 @@ Raw UDP, numbered 1200 byte packets sent at a fixed rate for 5 s, NAT punched by
 About 1000 packets arrive per 5 s whatever the send rate, and the same holds between two Colab sessions. The limit is on Colab's outbound UDP, about 200 packets per second or 0.23 MiB/s. Inbound UDP to Colab is not limited at 5 MiB/s. Tailcat over the same path gave 0.59 MiB/s up and 0.10 MiB/s down, and pacing the sender at 2 MiB/s did not help, which rules out buffer overflow as the cause.
 
 ### Tailcat between two ordinary NATs
+
+Tailcat was removed in 3.0. The measurement stays as the record of what a UDP punch reached between two ordinary NATs.
 
 Windows desktop on home Wi-Fi to the Daejeon server, both behind NAT, no Colab:
 

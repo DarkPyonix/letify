@@ -425,24 +425,24 @@ def test_a_lone_strategy_whose_probe_fails_is_still_used(isolated_home) -> None:
 
 def test_the_lowest_rank_wins_when_it_is_not_far_slower_than_the_fastest(isolated_home) -> None:
     punch = FakeStrategy("tcp_punch", 2, result=result(5, 5))
-    tailcat = FakeStrategy("tailcat", 3, result=result(18, 18))
-    link = pipeline([tailcat, punch]).connect()
+    quic = FakeStrategy("quic", 3, result=result(18, 18))
+    link = pipeline([quic, punch]).connect()
     assert link.strategy == "tcp_punch"
-    assert tailcat.links[0].closed
+    assert quic.links[0].closed
 
 
 def test_a_strategy_below_a_quarter_of_the_fastest_in_either_direction_is_rejected(
     isolated_home,
 ) -> None:
-    # Colab's outbound UDP limit is the case: Tailcat uploads fine and downloads slowly.
+    # Colab's outbound UDP limit is the case: QUIC uploads fine and downloads slowly.
     punch = FakeStrategy("tcp_punch", 2, result=result(13, 14))
-    tailcat = FakeStrategy("tailcat", 3, result=result(24, 3))
+    quic = FakeStrategy("quic", 3, result=result(24, 3))
     fallback = FakeStrategy("fallback", 4)
-    assert pipeline([punch, tailcat, fallback]).connect().strategy == "tcp_punch"
+    assert pipeline([punch, quic, fallback]).connect().strategy == "tcp_punch"
 
     slow_up = FakeStrategy("tcp_punch", 2, result=result(2, 30))
-    fast = FakeStrategy("tailcat", 3, result=result(20, 20))
-    assert pipeline([slow_up, fast]).connect().strategy == "tailcat"
+    fast = FakeStrategy("quic", 3, result=result(20, 20))
+    assert pipeline([slow_up, fast]).connect().strategy == "quic"
     assert slow_up.links[0].closed
 
 
@@ -525,14 +525,14 @@ def test_a_cancelled_attempt_is_printed_as_cancelled_not_failed(isolated_home) -
 
 def test_a_lone_connected_strategy_is_chosen_even_when_its_probe_fails(isolated_home) -> None:
     broken = FakeStrategy("tcp_punch", 2, probe_error=True)
-    failed = FakeStrategy("tailcat", 3, error="no UDP")
+    failed = FakeStrategy("quic", 3, error="no UDP")
     assert pipeline([broken, failed]).connect().strategy == "tcp_punch"
 
 
 def test_a_probe_failure_rejects_a_strategy_when_another_connected(isolated_home) -> None:
     broken = FakeStrategy("tcp_punch", 2, probe_error=True)
-    tailcat = FakeStrategy("tailcat", 3, result=result(1, 1))
-    assert pipeline([broken, tailcat]).connect().strategy == "tailcat"
+    quic = FakeStrategy("quic", 3, result=result(1, 1))
+    assert pipeline([broken, quic]).connect().strategy == "quic"
     assert broken.links[0].closed
 
 
@@ -551,13 +551,13 @@ def test_an_unprobed_link_is_chosen_only_when_no_probed_link_remains(isolated_ho
 def test_when_nothing_connects_every_strategy_is_named_with_its_reason(isolated_home) -> None:
     strategies = [
         FakeStrategy("tcp_punch", 2, error="connection refused"),
-        FakeStrategy("tailcat", 3, error="no UDP"),
+        FakeStrategy("quic", 3, error="no UDP"),
         FakeStrategy("reverse_ssh", 4, unmet="no reverse_ssh entry"),
     ]
     with pytest.raises(letify.ProviderUnavailable) as caught:
         pipeline(strategies).connect()
     message = str(caught.value)
-    for piece in ("tcp_punch: connection refused", "tailcat: no UDP", "no reverse_ssh entry"):
+    for piece in ("tcp_punch: connection refused", "quic: no UDP", "no reverse_ssh entry"):
         assert piece in message
 
 
@@ -567,8 +567,8 @@ def test_when_nothing_connects_every_strategy_is_named_with_its_reason(isolated_
 def test_the_winner_is_written_to_the_account_directory(isolated_home) -> None:
     cache = LinkCache("lab")
     punch = FakeStrategy("tcp_punch", 2, result=result(13, 14, rtt=180.5))
-    tailcat = FakeStrategy("tailcat", 3, result=result(1, 1))
-    pipeline([punch, tailcat], cache=cache).connect()
+    quic = FakeStrategy("quic", 3, result=result(1, 1))
+    pipeline([punch, quic], cache=cache).connect()
     written = json.loads(cache.path.read_text())
     assert cache.path.parent.name == "lab"
     assert cache.path.name == "link.json"
@@ -582,10 +582,10 @@ def test_the_cached_strategy_is_tried_alone_and_kept_at_half_its_throughput(
     isolated_home,
 ) -> None:
     cache = LinkCache("lab")
-    cache.save("tailcat", result(20, 20), Fingerprint("203.0.113.7", "eth0"))
+    cache.save("quic", result(20, 20), Fingerprint("203.0.113.7", "eth0"))
     punch = FakeStrategy("tcp_punch", 2, result=result(30, 30))
-    tailcat = FakeStrategy("tailcat", 3, result=result(10, 10))
-    assert pipeline([punch, tailcat], cache=cache).connect().strategy == "tailcat"
+    quic = FakeStrategy("quic", 3, result=result(10, 10))
+    assert pipeline([punch, quic], cache=cache).connect().strategy == "quic"
     assert punch.attempts == 0
 
 
@@ -605,41 +605,41 @@ def test_the_only_applicable_strategy_still_reports_its_round_trip(isolated_home
 def test_a_link_taken_from_the_cache_reports_its_round_trip(isolated_home) -> None:
     """Spec "Several connections at once": the cache path records it too."""
     cache = LinkCache("lab")
-    cache.save("tailcat", result(20, 20), Fingerprint("203.0.113.7", "eth0"))
+    cache.save("quic", result(20, 20), Fingerprint("203.0.113.7", "eth0"))
     punch = FakeStrategy("tcp_punch", 2, result=result(30, 30))
-    tailcat = FakeStrategy("tailcat", 3, result=result(20, 20, rtt=193.0))
-    link = pipeline([punch, tailcat], cache=cache).connect()
-    assert link.strategy == "tailcat", "the cached strategy was tried alone"
+    quic = FakeStrategy("quic", 3, result=result(20, 20, rtt=193.0))
+    link = pipeline([punch, quic], cache=cache).connect()
+    assert link.strategy == "quic", "the cached strategy was tried alone"
     assert punch.attempts == 0
     assert link.rtt_ms == 193.0
 
 
 def test_a_cached_strategy_below_half_its_throughput_runs_the_full_race(isolated_home) -> None:
     cache = LinkCache("lab")
-    cache.save("tailcat", result(20, 20), Fingerprint("203.0.113.7", "eth0"))
+    cache.save("quic", result(20, 20), Fingerprint("203.0.113.7", "eth0"))
     punch = FakeStrategy("tcp_punch", 2, result=result(30, 30))
-    tailcat = FakeStrategy("tailcat", 3, result=result(20, 9))
-    assert pipeline([punch, tailcat], cache=cache).connect().strategy == "tcp_punch"
+    quic = FakeStrategy("quic", 3, result=result(20, 9))
+    assert pipeline([punch, quic], cache=cache).connect().strategy == "tcp_punch"
     assert cache.load().strategy == "tcp_punch"
 
 
 def test_a_changed_network_runs_the_full_race(isolated_home) -> None:
     cache = LinkCache("lab")
-    cache.save("tailcat", result(20, 20), Fingerprint("203.0.113.7", "eth0"))
+    cache.save("quic", result(20, 20), Fingerprint("203.0.113.7", "eth0"))
     punch = FakeStrategy("tcp_punch", 2, result=result(20, 20))
-    tailcat = FakeStrategy("tailcat", 3, result=result(20, 20))
-    link = pipeline([punch, tailcat], cache=cache, fp=fingerprint(interface="wlan0")).connect()
+    quic = FakeStrategy("quic", 3, result=result(20, 20))
+    link = pipeline([punch, quic], cache=cache, fp=fingerprint(interface="wlan0")).connect()
     assert link.strategy == "tcp_punch"
-    assert tailcat.attempts == 1
+    assert quic.attempts == 1
     assert cache.load().fingerprint == Fingerprint("203.0.113.7", "wlan0")
 
 
 def test_an_unknown_public_address_matches_no_cache_entry(isolated_home) -> None:
     cache = LinkCache("lab")
-    cache.save("tailcat", result(20, 20), Fingerprint(None, "eth0"))
+    cache.save("quic", result(20, 20), Fingerprint(None, "eth0"))
     punch = FakeStrategy("tcp_punch", 2, result=result(20, 20))
-    tailcat = FakeStrategy("tailcat", 3, result=result(20, 20))
-    chosen = pipeline([punch, tailcat], cache=cache, fp=fingerprint(ip=None)).connect()
+    quic = FakeStrategy("quic", 3, result=result(20, 20))
+    chosen = pipeline([punch, quic], cache=cache, fp=fingerprint(ip=None)).connect()
     assert chosen.strategy == "tcp_punch"
 
 
@@ -657,9 +657,9 @@ def test_a_relayed_strategy_below_the_floor_is_refused_even_though_it_connected(
     isolated_home,
 ) -> None:
     """Spec "Link floor": a strategy below the default floor is a failure, not a fallback,
-    even when it is the only probed strategy left. This is the reported case: a Tailcat
+    even when it is the only probed strategy left. This is the reported case: a QUIC
     relay measures 1.9 MiB/s, 99.6 ms against a direct LAN link that measures 51 MiB/s."""
-    relay = FakeStrategy("tailcat", 3, result=result(1.9, 1.9, rtt=99.6))
+    relay = FakeStrategy("quic", 3, result=result(1.9, 1.9, rtt=99.6))
     broken = FakeStrategy("tcp_punch", 2, error="no mapping")
     floor = LinkFloor.default()
     with pytest.raises(letify.ProviderUnavailable, match="below the floor"):
@@ -668,7 +668,7 @@ def test_a_relayed_strategy_below_the_floor_is_refused_even_though_it_connected(
 
 def test_a_relayed_strategy_is_refused_when_a_faster_one_also_connected(isolated_home) -> None:
     direct = FakeStrategy("direct_ssh", 1, result=result(51, 51, rtt=0.2))
-    relay = FakeStrategy("tailcat", 3, result=result(1.9, 1.9, rtt=99.6))
+    relay = FakeStrategy("quic", 3, result=result(1.9, 1.9, rtt=99.6))
     floor = LinkFloor.default()
     chosen = pipeline([direct, relay], floor=floor).connect()
     assert chosen.strategy == "direct_ssh"
@@ -676,7 +676,7 @@ def test_a_relayed_strategy_is_refused_when_a_faster_one_also_connected(isolated
 
 
 def test_a_round_trip_above_the_floor_is_refused_even_with_fast_throughput(isolated_home) -> None:
-    slow_round_trip = FakeStrategy("tailcat", 3, result=result(20, 20, rtt=500.0))
+    slow_round_trip = FakeStrategy("quic", 3, result=result(20, 20, rtt=500.0))
     floor = LinkFloor(min_bps=0.0, max_rtt_ms=300.0)
     broken = FakeStrategy("tcp_punch", 2, error="unreachable")
     expected = "round trip 500.0 ms above the floor"
@@ -692,9 +692,9 @@ def test_the_default_floor_is_ten_mib_per_second_and_three_hundred_ms() -> None:
 
 def test_a_cached_strategy_below_the_floor_is_rejected_and_the_race_runs(isolated_home) -> None:
     cache = LinkCache("lab")
-    cache.save("tailcat", result(1.9, 1.9, rtt=99.6), Fingerprint("203.0.113.7", "eth0"))
+    cache.save("quic", result(1.9, 1.9, rtt=99.6), Fingerprint("203.0.113.7", "eth0"))
     direct = FakeStrategy("direct_ssh", 1, result=result(51, 51, rtt=0.2))
-    relay = FakeStrategy("tailcat", 3, result=result(1.9, 1.9, rtt=99.6))
+    relay = FakeStrategy("quic", 3, result=result(1.9, 1.9, rtt=99.6))
     chosen = pipeline([direct, relay], cache=cache, floor=LinkFloor.default()).connect()
     assert chosen.strategy == "direct_ssh"
     assert cache.load().strategy == "direct_ssh"
@@ -706,21 +706,21 @@ def test_a_cached_strategy_below_the_floor_is_rejected_and_the_race_runs(isolate
 def test_a_stale_cache_entry_runs_the_full_race_even_on_the_same_network(isolated_home) -> None:
     cache = LinkCache("lab")
     cache.save(
-        "tailcat", result(20, 20), Fingerprint("203.0.113.7", "eth0"), cached_at=time.time() - 7200
+        "quic", result(20, 20), Fingerprint("203.0.113.7", "eth0"), cached_at=time.time() - 7200
     )
     punch = FakeStrategy("tcp_punch", 2, result=result(30, 30))
-    tailcat = FakeStrategy("tailcat", 3, result=result(20, 20))
-    chosen = pipeline([punch, tailcat], cache=cache).connect()
+    quic = FakeStrategy("quic", 3, result=result(20, 20))
+    chosen = pipeline([punch, quic], cache=cache).connect()
     assert chosen.strategy == "tcp_punch"
-    assert tailcat.attempts == 1
+    assert quic.attempts == 1
 
 
 def test_a_fresh_cache_entry_is_not_raced_again(isolated_home) -> None:
     cache = LinkCache("lab")
-    cache.save("tailcat", result(20, 20), Fingerprint("203.0.113.7", "eth0"))
+    cache.save("quic", result(20, 20), Fingerprint("203.0.113.7", "eth0"))
     punch = FakeStrategy("tcp_punch", 2, result=result(30, 30))
-    tailcat = FakeStrategy("tailcat", 3, result=result(20, 20))
-    assert pipeline([punch, tailcat], cache=cache).connect().strategy == "tailcat"
+    quic = FakeStrategy("quic", 3, result=result(20, 20))
+    assert pipeline([punch, quic], cache=cache).connect().strategy == "quic"
     assert punch.attempts == 0
 
 
@@ -730,7 +730,7 @@ def test_a_cache_file_in_an_older_format_is_ignored_and_remeasured(isolated_home
     cache.path.write_text(
         json.dumps(
             {
-                "strategy": "tailcat",
+                "strategy": "quic",
                 "probe": result(20, 20).to_dict(),
                 "fingerprint": {"public_ip": "203.0.113.7", "interface": "eth0"},
             }
@@ -758,12 +758,12 @@ def test_a_fingerprint_with_no_stun_answer_has_no_public_address() -> None:
 # Spec: Transport, Link floor.
 @pytest.mark.parametrize("up,down,rtt", [(2.6, 0.1, 177.4), (8.8, 10.7, 175.0)])
 def test_floor_rejection_cannot_select_an_unprobed_fallback(isolated_home, up, down, rtt):
-    slow = FakeStrategy("tailcat", 3, result=result(up, down, rtt))
+    slow = FakeStrategy("quic", 3, result=result(up, down, rtt))
     fallback = FakeStrategy("fallback", 4, probed=False)
     with pytest.raises(letify.ProviderUnavailable) as caught:
         pipeline([slow, fallback], floor=LinkFloor.default()).connect()
     message = str(caught.value)
-    assert "tailcat: below the floor" in message
+    assert "quic: below the floor" in message
     assert f"up {up:.1f} MiB/s" in message
     assert "10.0 MiB/s" in message
     assert "min_mib_per_s" in message
@@ -777,8 +777,8 @@ def test_a_cached_floor_rejection_cannot_escape_to_an_unprobed_fallback(
     isolated_home, monkeypatch, race_fails
 ):
     cache = LinkCache("lab")
-    cache.save("tailcat", result(20, 20), Fingerprint("203.0.113.7", "eth0"))
-    slow = FakeStrategy("tailcat", 3, result=result(2.6, 0.1, 177.4))
+    cache.save("quic", result(20, 20), Fingerprint("203.0.113.7", "eth0"))
+    slow = FakeStrategy("quic", 3, result=result(2.6, 0.1, 177.4))
     fallback = FakeStrategy("fallback", 4, probed=False)
     attempt = slow.attempt
 
@@ -788,7 +788,7 @@ def test_a_cached_floor_rejection_cannot_escape_to_an_unprobed_fallback(
         return attempt(target, cancel=cancel)
 
     monkeypatch.setattr(slow, "attempt", reconnect)
-    with pytest.raises(letify.ProviderUnavailable, match="tailcat: below the floor"):
+    with pytest.raises(letify.ProviderUnavailable, match="quic: below the floor"):
         pipeline([slow, fallback], cache=cache, floor=LinkFloor.default()).connect()
     assert all(link.closed for link in slow.links + fallback.links)
     assert cache.load().probe == result(20, 20)
@@ -806,8 +806,8 @@ def test_floor_rejections_name_both_account_overrides():
 # Spec: Transport, Link floor.
 def test_a_cached_floor_rejection_cannot_accept_a_lone_failed_probe(isolated_home, monkeypatch):
     cache = LinkCache("lab")
-    cache.save("tailcat", result(20, 20), Fingerprint("203.0.113.7", "eth0"))
-    slow = FakeStrategy("tailcat", 3, result=result(2.6, 0.1, 177.4))
+    cache.save("quic", result(20, 20), Fingerprint("203.0.113.7", "eth0"))
+    slow = FakeStrategy("quic", 3, result=result(2.6, 0.1, 177.4))
     fallback = FakeStrategy("fallback", 4, probed=False, error="fallback unavailable")
     attempt = slow.attempt
 
@@ -817,7 +817,7 @@ def test_a_cached_floor_rejection_cannot_accept_a_lone_failed_probe(isolated_hom
         return attempt(target, cancel=cancel)
 
     monkeypatch.setattr(slow, "attempt", reconnect)
-    with pytest.raises(letify.ProviderUnavailable, match="tailcat: below the floor"):
+    with pytest.raises(letify.ProviderUnavailable, match="quic: below the floor"):
         pipeline([slow, fallback], cache=cache, floor=LinkFloor.default()).connect()
     assert all(link.closed for link in slow.links)
 
@@ -1039,15 +1039,14 @@ def test_a_provider_with_no_known_fallback_keeps_failing_below_the_floor(isolate
 
 # Spec: Transport, Link floor.
 def test_a_strategy_that_connects_after_a_floor_rejection_is_still_considered(isolated_home):
-    """The Colab Pro+ case: Tailcat connected first and measured below the floor, and the TCP
-    punch connected while that probe ran. The punch must be probed and chosen, not reported as
-    not connected in time."""
+    """The Colab Pro+ case: a UDP path connected first and measured below the floor, and the
+    TCP punch connected while that probe ran. The punch must be probed and chosen, not reported
+    as not connected in time."""
     fallback = FakeStrategy("fallback", 6, probed=False)
     connect_back = FakeStrategy("connect_back", 1, error="no connect_back endpoint")
-    quic = FakeStrategy("quic", 5, error="no letify-quic")
-    slow = FakeStrategy("tailcat", 3, result=result(0.5, 0.2, rtt=129.1), delay=0.3)
+    slow = FakeStrategy("reverse_ssh", 3, result=result(0.5, 0.2, rtt=129.1), delay=0.3)
     punch = FakeStrategy("tcp_punch", 2, result=result(40, 40, rtt=30.0), delay=0.7)
-    strategies = [connect_back, punch, slow, quic, fallback]
+    strategies = [connect_back, punch, slow, fallback]
     chosen = pipeline(strategies, floor=LinkFloor.default()).connect()
     assert chosen.strategy == "tcp_punch"
     assert slow.links[0].closed
@@ -1074,13 +1073,13 @@ def test_a_connected_strategy_is_considered_even_when_a_slow_probe_used_up_the_t
     """A probe of a slow link can outlast the race timeout. A strategy that connected while
     it ran has an outcome already, so it is probed and chosen rather than reported as not
     connected in time."""
-    slow = FakeStrategy("tailcat", 3, result=result(0.5, 0.2, rtt=129.1), delay=0.3)
+    slow = FakeStrategy("quic", 3, result=result(0.5, 0.2, rtt=129.1), delay=0.3)
     punch = FakeStrategy("tcp_punch", 2, result=result(40, 40, rtt=30.0), delay=0.7)
     race = Pipeline(
         [punch, slow],
         target=None,
         alias="lab",
-        probe=SlowProbe("tailcat", 1.5),
+        probe=SlowProbe("quic", 1.5),
         fingerprint=fingerprint(),
         grace=0.2,
         timeout=1.0,

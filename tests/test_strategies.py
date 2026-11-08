@@ -1,8 +1,8 @@
-"""Tests for the connection strategies, the rendezvous and the remote agent.
+"""Tests for the connection strategies and the rendezvous.
 
 Spec: Transport, Connection strategies, Rendezvous, Reverse SSH and Colab. The TCP punch
-and the agent run over loopback sockets; ssh, ssh-keygen and tailcat are faked because
-they need a remote machine.
+runs over loopback sockets; ssh and ssh-keygen are faked because they need a remote
+machine.
 """
 
 from __future__ import annotations
@@ -22,18 +22,14 @@ import pytest
 from conftest import CannedRendezvous, FakeCompleted, LoopbackRendezvous
 
 import letify
-from letify.cli import build_parser, main
-from letify.transport import agent as agent_module
 from letify.transport import nat, strategies
-from letify.transport import rendezvous as rendezvous_module
 from letify.transport.link import OneShotLink
 from letify.transport.probe import Probe
-from letify.transport.rendezvous import CommandRendezvous, TailcatRendezvous, remote_script
+from letify.transport.rendezvous import CommandRendezvous, remote_script
 from letify.transport.strategies import (
     DirectSSH,
     ProviderFallback,
     ReverseSSH,
-    TailcatUDP,
     Target,
     TCPPunch,
 )
@@ -83,8 +79,8 @@ def test_forward_ssh_assumed_alone_runs_nothing(patch_run) -> None:
 
 def test_a_tcp_punch_needs_a_rendezvous() -> None:
     assert TCPPunch().needs(Target(alias="lab")) == "no rendezvous"
-    blocked = CannedRendezvous(unavailable="tailcat is not on PATH")
-    assert TCPPunch().needs(Target(alias="lab", rendezvous=blocked)) == "tailcat is not on PATH"
+    blocked = CannedRendezvous(unavailable="no key")
+    assert TCPPunch().needs(Target(alias="lab", rendezvous=blocked)) == "no key"
     assert TCPPunch.rank == 3
 
 
@@ -101,10 +97,8 @@ def test_a_colab_account_without_a_key_skips_the_strategies_that_log_in_over_ssh
 
     keyless = Target(alias="colab_a", rendezvous=ColabRendezvous(run, None))
     assert TCPPunch().needs(keyless) == "no key"
-    assert TailcatUDP().needs(keyless) == "no key"
     keyed = Target(alias="colab_a", rendezvous=ColabRendezvous(run, "ssh-ed25519 AAAA me"))
     assert TCPPunch().needs(keyed) is None
-    assert TailcatUDP().needs(keyed) is None
 
 
 def test_a_tcp_punch_over_loopback_carries_the_probe_and_then_ssh(stun_server) -> None:
@@ -161,7 +155,7 @@ def test_building_an_ssh_command_creates_the_account_directory_for_known_hosts(
 ) -> None:
     monkeypatch.setenv("HOME", str(tmp_path))
     monkeypatch.setenv("USERPROFILE", str(tmp_path))
-    command = Target(alias="lab").proxied_ssh("tailcat tcX 22")
+    command = Target(alias="lab").proxied_ssh("carrier connect 22")
     directory = tmp_path / ".letify" / "accounts" / "lab"
     assert f"UserKnownHostsFile={directory / 'known_hosts'}" in command
     assert "StrictHostKeyChecking=accept-new" in command
@@ -249,48 +243,6 @@ def test_ssh_through_a_proxy_records_the_key_quietly_and_refuses_a_changed_one(
         server.wait()
 
 
-# -- Spec: Transport, Rendezvous: Tailcat -------------------------------------------
-
-
-def test_tailcat_needs_the_binary_on_path_and_a_rendezvous(patch_which) -> None:
-    patch_which(strategies, present=False)
-    target = Target(alias="lab", rendezvous=CannedRendezvous())
-    assert "tailcat" in TailcatUDP().needs(target)
-    patch_which(strategies, present=True)
-    assert TailcatUDP().needs(target) is None
-    assert TailcatUDP().needs(Target(alias="lab")) == "no rendezvous"
-    assert TailcatUDP.rank == 4
-
-
-def test_ssh_over_tailcat_uses_it_as_the_proxy_command(patch_which, patch_run) -> None:
-    patch_which(strategies, present=True)
-    recorder = patch_run(strategies)
-    rendezvous = CannedRendezvous({"address": "tcQ3xY"})
-    target = Target(alias="lab", rendezvous=rendezvous, user="root")
-    link = TailcatUDP().attempt(target)
-    command = link.ssh_command("uname")
-    assert "ProxyCommand=tailcat tcQ3xY 22" in command
-    assert command[-1] == "uname"
-    assert recorder.command[-1] == "exit 0"
-    assert rendezvous.requests == [{"kind": "tailcat", "ssh_port": 22}]
-
-
-def test_the_remote_half_reads_the_address_tailcat_serve_prints(patch_popen) -> None:
-    started = patch_popen(nat, ["starting\n", "Server listening with new address: tcAbC123\n"])
-    answer, _ = nat.begin({"kind": "tailcat", "ssh_port": 22})
-    assert answer == {"address": "tcAbC123"}
-    assert started[0].command == ["tailcat", "serve", "22"]
-
-
-def test_a_rendezvous_through_the_agent_needs_no_exchange_for_tailcat(patch_which) -> None:
-    patch_which(rendezvous_module, present=True)
-    rendezvous = TailcatRendezvous("tcAgent", 40123)
-    assert rendezvous.unavailable() is None
-    assert rendezvous.tailcat_endpoint(22, 5.0) == ("tcAgent", 40123)
-    patch_which(rendezvous_module, present=False)
-    assert "tailcat" in TailcatRendezvous("tcAgent", 40123).unavailable()
-
-
 # -- Spec: Transport, Reverse SSH ---------------------------------------------------
 
 
@@ -306,7 +258,7 @@ def keygen(command: list[str]) -> FakeCompleted:
 def test_reverse_ssh_is_only_raced_when_the_account_sets_it() -> None:
     target = Target(alias="lab", rendezvous=CannedRendezvous())
     assert ReverseSSH().needs(target) == "no reverse_ssh entry"
-    assert ReverseSSH.rank == 6
+    assert ReverseSSH.rank == 4
 
 
 def test_a_reverse_session_key_is_restricted_marked_and_removed_on_close(
@@ -501,8 +453,8 @@ def test_the_remote_half_of_a_reverse_forward_lets_the_server_choose_the_port(
 
 
 def test_the_provider_fallback_is_last_and_moves_behind_reverse_ssh() -> None:
-    assert ProviderFallback().rank == 6
-    assert ProviderFallback(rank=7).rank == 7
+    assert ProviderFallback().rank == 4
+    assert ProviderFallback(rank=5).rank == 5
     assert ProviderFallback().needs(Target(alias="lab")) == "no provider fallback"
     link = OneShotLink("fallback", 4, lambda source, timeout: "out")
     target = Target(alias="lab", fallback=lambda: link)
@@ -560,10 +512,7 @@ def test_a_punch_that_never_connects_prints_one_line_and_no_traceback(stun_serve
     _, continuation = nat.begin(request)
     continuation()
     err = capsys.readouterr().err
-    assert err == (
-        "letify agent: TCP punch with 192.0.2.1:9 did not connect within 0.3 s;"
-        " the Tailcat link is used instead\n"
-    )
+    assert err == "letify agent: TCP punch with 192.0.2.1:9 did not connect within 0.3 s\n"
 
 
 def test_an_unexpected_failure_in_the_punch_still_raises(stun_server, monkeypatch) -> None:
@@ -589,90 +538,9 @@ def test_a_ping_is_answered_without_a_continuation() -> None:
     assert continuation() is None
 
 
-# -- Spec: Transport, Rendezvous: the remote agent ------------------------------------
-
-
-def test_the_agent_answers_a_rendezvous_line_and_splices_ssh() -> None:
-    sshd = fake_sshd()
-    agent = agent_module.Agent(ssh=sshd.getsockname())
-    port = agent.bind()
-    assert port != 0
-    threading.Thread(target=agent.serve_forever, daemon=True).start()
-
-    with socket.create_connection(("127.0.0.1", port)) as client:
-        client.sendall(b"LETIFY-RDV " + json.dumps({"kind": "ping"}).encode() + b"\n")
-        assert json.loads(client.makefile("rb").readline()) == {"pong": True}
-
-    with socket.create_connection(("127.0.0.1", port)) as client:
-        client.sendall(b"SSH-2.0-letify\r\n")
-        conn, _ = sshd.accept()
-        assert nat.recv_exact(conn, 16) == b"SSH-2.0-letify\r\n"
-        conn.close()
-    agent.close()
-    sshd.close()
-
-
-def test_the_agent_reports_a_failed_request_as_an_error_line() -> None:
-    agent = agent_module.Agent()
-    port = agent.bind()
-    threading.Thread(target=agent.serve_forever, daemon=True).start()
-    with socket.create_connection(("127.0.0.1", port)) as client:
-        client.sendall(b"LETIFY-RDV " + json.dumps({"kind": "nonsense"}).encode() + b"\n")
-        assert "unknown rendezvous request" in json.loads(client.makefile("rb").readline())["error"]
-    agent.close()
-
-
-def test_the_client_side_sends_one_request_line_through_tailcat(patch_popen, patch_which) -> None:
-    patch_which(rendezvous_module, present=True)
-    started = patch_popen(rendezvous_module, ['{"mapping": ["198.51.100.4", 41000]}\n'])
-    answer = TailcatRendezvous("tcAgent", 40123).exchange({"kind": "tcp_punch"}, 5.0)
-    assert answer == {"mapping": ["198.51.100.4", 41000]}
-    assert started[0].command == ["tailcat", "tcAgent", "40123"]
-
-
-def test_the_agent_starts_tailcat_serve_on_its_own_port(patch_popen, patch_which) -> None:
-    patch_which(agent_module, present=True)
-    started = patch_popen(agent_module, ["Server listening with new address: tcHome\n"])
-    agent = agent_module.Agent()
-    port = agent.bind()
-    assert agent.start_tailcat() == "tcHome"
-    assert started[0].command == ["tailcat", "serve", str(port)]
-    agent.close()
-
-
-def test_client_shell_connect_is_a_three_level_command() -> None:
-    args = build_parser().parse_args(["client", "shell", "connect"])
-    assert (args.command, args.client_command, args.shell_command) == (
-        "client",
-        "shell",
-        "connect",
-    )
-
-
-def test_client_shell_connect_prints_what_the_account_needs(
-    isolated_home, patch_popen, patch_which, monkeypatch, capsys
-) -> None:
-    # Spec "Rendezvous": the account details reach the user's machine as one login command.
-    from letify.transport import setup
-
-    patch_which(agent_module, present=True)
-    patch_popen(agent_module, ["Server listening with new address: tcHome\n"])
-    monkeypatch.setattr(agent_module.Agent, "serve_forever", lambda self: None)
-    # The banner check has its own tests over a loopback socket.
-    monkeypatch.setattr(setup, "ssh_answers", lambda port: True)
-    assert main(["client", "shell", "connect", "--name", "home_box"]) == 0
-    out = capsys.readouterr().out
-    prefix = "letify login tunnel home_box --connect "
-    (line,) = [line.strip() for line in out.splitlines() if prefix in line]
-    fields = setup.decode_token(line[len(prefix) :])
-    assert fields["tailcat"] == "tcHome"
-    assert fields["tailcat_port"] > 0
-
-
-def test_client_shell_connect_without_tailcat_says_so(isolated_home, patch_which, capsys) -> None:
-    patch_which(agent_module, present=False)
-    assert main(["client", "shell", "connect"]) == 1
-    assert "tailcat" in capsys.readouterr().err
+def test_an_unknown_rendezvous_request_is_an_error() -> None:
+    with pytest.raises(Exception, match="unknown rendezvous request"):
+        nat.begin({"kind": "nonsense"})
 
 
 def _silent_port() -> int:
@@ -767,43 +635,29 @@ def test_the_remote_half_starts_no_sshd_when_an_ssh_server_already_answers(
     assert not any(str(binary) in command for command in recorder.commands)
 
 
-def _flooding_binary(directory, address: str, bytes_after: int) -> str:
-    """An executable that prints ``address`` the way tailcat does, then floods its output."""
-    import os
+def _flooding_process(match: str, bytes_after: int):
+    """A process that prints ``match`` the way ssh -R prints its port, then floods its output."""
+    import subprocess
     import sys
-    from pathlib import Path
 
-    path = Path(directory) / "flooding_tailcat"
-    path.write_text(
-        f"#!{sys.executable}\n"
+    code = (
         "import sys\n"
-        f"print('Server listening with new address: {address}', flush=True)\n"
+        f"print({match!r}, flush=True)\n"
         f"sys.stdout.write('x' * {bytes_after})\n"
         "sys.stdout.flush()\n"
     )
-    path.chmod(0o755)
-    return os.fspath(path)
+    return subprocess.Popen([sys.executable, "-c", code], stdout=subprocess.PIPE, text=True)
 
 
-def test_the_remote_half_keeps_reading_what_tailcat_serve_prints_after_the_address(
-    tmp_path,
-) -> None:
+def test_the_remote_half_keeps_reading_what_a_helper_prints_after_the_line_it_wants() -> None:
     # A pipe holds about 64 KiB, so a megabyte is far past the point where an unread
-    # pipe blocks the writer and the tunnel stops moving bytes.
-    binary = _flooding_binary(tmp_path, "tcReal1", 1 << 20)
-    answer, serve = nat.begin({"kind": "tailcat", "ssh_port": 22, "binary": binary})
-    assert answer == {"address": "tcReal1"}
-
-    import threading
-
-    waiter = threading.Thread(target=serve, daemon=True)
-    waiter.start()
-    waiter.join(30.0)
-    assert not waiter.is_alive(), (
-        "tailcat serve never finished, so it blocked writing to a pipe nobody reads"
-    )
-
-
+    # pipe blocks the writer and the link stops moving bytes.
+    process = _flooding_process("Allocated port 4242", 1 << 20)
+    assert nat._match_then_drain(process, process.stdout, r"Allocated port (\d+)") == "4242"
+    try:
+        assert process.wait(30.0) == 0, "the helper blocked writing to a pipe nobody reads"
+    finally:
+        process.kill()
 def test_the_punch_asks_the_remote_for_a_window_and_stops_when_it_does(patch_run) -> None:
     # Spec "the simultaneous open": the strategy names the window in the request and uses
     # the punch_until the remote answers with, so a slow rendezvous does not leave the two
