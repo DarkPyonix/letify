@@ -36,10 +36,9 @@ def old_token(**fields) -> str:
         {"tailcat": "tc1abc", "tailcat_port": 4000},
         {"tailcat": "tc1abc"},
         {"tailcat_port": 4000},
-        {"tailcat_binary": "/usr/bin/tailcat"},
     ],
 )
-def test_an_account_that_names_a_tailcat_field_is_refused_by_name(
+def test_an_account_that_names_a_tailcat_address_is_refused_by_name(
     isolated_home, cls, options
 ) -> None:
     field = next(iter(options))
@@ -48,9 +47,36 @@ def test_an_account_that_names_a_tailcat_field_is_refused_by_name(
     message = str(raised.value)
     assert "box" in message
     assert f"'{field}'" in message
-    assert "Tailcat was removed in 3.0" in message
-    assert "letify agent serve" in message
-    assert "letify login tunnel box --connect letify-agent2:" in message
+    assert "obsolete since 3.0" in message or "Tailcat was removed in 3.0" in message
+    if cls is Tunnel:
+        assert "Tailcat was removed in 3.0" in message
+        assert "letify agent serve" in message
+        assert "letify login tunnel box --connect letify-agent2:" in message
+    else:
+        assert "obsolete since 3.0" in message
+        assert "Delete" in message
+        assert "letify agent serve" not in message
+        assert "letify login tunnel" not in message
+
+
+@pytest.mark.parametrize("cls", [Shell, Tunnel, Colab, Kaggle, Elice])
+def test_tailcat_binary_is_ignored_with_one_notice_per_alias(
+    isolated_home, cls, capsys, monkeypatch
+) -> None:
+    from letify.providers import base
+
+    monkeypatch.setattr(base, "_NOTIFIED", set())
+    options = {"tailcat_binary": "tailcat-disabled-for-this-account"}
+    assert provider_of(cls, "box", **options).alias == "box"
+    provider_of(cls, "box", **options)
+    err = capsys.readouterr().err
+    assert err.count("tailcat_binary") == 1
+    assert "box" in err
+    assert "obsolete since 3.0" in err
+    assert "Delete" in err
+    assert err.count("\n") == 1
+    provider_of(cls, "other", **options)
+    assert "other" in capsys.readouterr().err
 
 
 def test_an_account_without_a_tailcat_field_is_built(isolated_home) -> None:
