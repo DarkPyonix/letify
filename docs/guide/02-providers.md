@@ -189,30 +189,9 @@ signal = "https://letify.darkpyonix.dev"
 
 `letify login tunnel home_box --detect-devices` asks the machine for its GPUs again over the same session. If you do want plain `ssh` to the machine, `Tunnel.ssh_forward()` opens a loopback port that reaches the agent machine's SSH server, as [the agent guide](09-agent.md) describes.
 
-### An existing Tailcat account
+### A Tailcat account
 
-A Tunnel account made by `letify client shell connect` keeps working in this release, and it prints once per process that Tailcat is removed in 3.0. To migrate it, run `letify agent serve` on the machine and run `letify login tunnel home_box --connect letify-agent2:...` with the token it prints. Use `--replace` to renew an account that is already declared. The Tailcat setup below stays available until 3.0.
-
-<details>
-<summary>The Tailcat setup, until 3.0</summary>
-
-letify reaches the machine over [Tailcat](https://github.com/tailscale/tailcat), and SSH does the work. Both machines need `tailcat`, and the remote one needs letify and an SSH server.
-
-On the remote machine, run `letify client shell connect --name home_box`. If `tailcat` is missing, the command installs it as [Installing tailcat and eci](#installing-tailcat-and-eci) describes. If automatic install is turned off, or the SSH server is missing, it prints the exact install steps for that machine and exits. Otherwise it prints one command to run on your own machine, `letify login tunnel home_box --connect eyJ0YWlsY2F0Ijoi...`. Keep the agent running, because it carries every connection and a restart gives it a new address.
-
-On your own machine, the login installs your SSH key over Tailcat (you type the remote password once), confirms the key, checks the workspace root and records the GPUs, as `letify login shell` does. The account looks like this:
-
-```toml
-[home_box]
-kind = "tunnel"
-tailcat = "tc..."
-tailcat_port = 40123
-user = "researcher"
-port = 22
-key = "~/.ssh/id_letify"
-```
-
-</details>
+Tailcat was removed in 3.0. An account that names `tailcat`, `tailcat_port` or `tailcat_binary` is refused, and the message names the account and the field. To migrate it, run `letify agent serve` on the machine and run `letify login tunnel home_box --connect letify-agent2:...` with the token it prints. Use `--replace` to renew an account that is already declared.
 
 Try the simpler paths first. A direct address, then a jump host, then this. Campus machines often allow one of the first two. Details and measurements are in [docs/NETWORK.md](../NETWORK.md).
 
@@ -255,7 +234,7 @@ letify setup eci                 # letify downloads Elice's release
 curl -fsSL https://raw.githubusercontent.com/elice-dev/eci-cli/main/scripts/install.sh | sh
 ```
 
-See [Installing tailcat and eci](#installing-tailcat-and-eci) for where letify puts it.
+See [Installing eci](#installing-eci) for where letify puts it.
 
 **No machine has to exist.** `letify login elice elice_a100` checks the token with `eci`, and without a machine it records none. On the first call letify launches `letify-elice-a100`, or `letify-elice-a100-spot` for spot, with an instance type matching the declaration. It keeps a generated password in `~/.letify/accounts/elice_a100/machine_password` and installs your SSH key. Later calls start the same machine again. To use a machine you made yourself, pick it at login or set `machine_id`.
 
@@ -342,29 +321,27 @@ letify check lab_a100
 
 [← Getting started](01-getting-started.md) · [Guides](README.md) · [Next: Execution modes →](03-execution-modes.md)
 
-## Installing tailcat and eci
+## Installing eci
 
-letify runs two programs it does not ship: `tailcat`, from Tailscale, for Tunnel accounts, and `eci`, from Elice, for Elice accounts. Neither is part of letify or covered by its license. When a command needs one and finds none, letify installs it and prints two lines on standard error:
+letify runs one program it does not ship: `eci`, from Elice, for Elice accounts. It is not part of letify or covered by its license, so letify asks before it installs it. `letify login elice` asks on a terminal, and `letify setup eci` installs it without asking. An install prints two lines on standard error:
 
 ```
-letify: installing tailcat 0.6.0 from https://github.com/tailscale/tailcat/releases/download/v0.6.0/tailcat_0.6.0_linux_amd64.tar.gz into ~/.letify/tools/tailcat/0.6.0
-letify: tailcat 0.6.0 verified sha256 f3597a9a..., linked at .venv/bin/tailcat
+letify: installing eci 0.2.1 from https://github.com/elice-dev/eci-cli/releases/download/0.2.1/eci-linux-x86_64-0.2.1.tar.gz into ~/.letify/tools/eci/0.2.1
+letify: eci 0.2.1 verified sha256 f9649ca8..., linked at .venv/bin/eci
 ```
 
 To install ahead of time, or to see what letify uses:
 
 ```bash
-letify setup tailcat          # install now
+letify setup eci              # install now
 letify setup eci --where      # where it is and which copy letify uses
 ```
 
-To turn automatic install off, put `auto_install = false` at the top of `~/.letify/config.toml`, or set `LETIFY_AUTO_INSTALL=0`. A missing tool then fails with the install steps and the `letify setup <tool>` command.
-
 What an install does:
 
-1. Downloads the pinned release archive from the publisher's GitHub releases, `tailscale/tailcat` or `elice-dev/eci-cli`.
+1. Downloads the pinned release archive from the GitHub releases of `elice-dev/eci-cli`.
 2. Checks its SHA-256 against the digest pinned in letify and against the release's `checksums.txt`, and refuses a mismatch.
-3. Unpacks it into `~/.letify/tools/<tool>/<version>/`, refusing any archive entry that points outside that directory.
-4. Links it into your project's `.venv/bin`: a hard link for `tailcat` (a copy when a hard link is impossible), a small launcher script for `eci`.
+3. Unpacks it into `~/.letify/tools/eci/<version>/`, refusing any archive entry that points outside that directory.
+4. Links it into your project's `.venv/bin` as a small launcher script.
 
-letify never writes to `~/.local/bin`, `/usr/local/bin` or your shell profile. A copy you installed yourself on `PATH` is used as it is and never replaced, and a file in `.venv/bin` that letify did not create is left alone. On macOS with Homebrew, `tailcat` comes from `brew install tailcat`.
+letify never writes to `~/.local/bin`, `/usr/local/bin` or your shell profile. A copy you installed yourself on `PATH` is used as it is and never replaced, and a file in `.venv/bin` that letify did not create is left alone.

@@ -10,7 +10,7 @@
 
 `letify agent` is for a machine that cannot accept an inbound connection, such as a lab server behind NAT. You run `letify agent serve` on that machine and pair your own machine with it once. After that, your machine reaches it through the signalling service, a small web service that passes signed messages between the two.
 
-The agent needs no SSH server and no Tailcat. letify runs no relay for it.
+The agent needs no SSH server. letify runs no relay for it.
 
 The terms used below:
 
@@ -90,7 +90,7 @@ letify creates this account's key `~/.letify/accounts/lab_box/link.key`, sends a
 
 On success the account is written with `kind = "tunnel"`, the agent's node id and the service URL. The agent logs `paired <12 hex of node> (<label>)`, where the label is `<user>@<hostname>` of your machine.
 
-The login then opens one session to the agent, checks the workspace root and records the GPUs over it, so no SSH key and no SSH server are involved. A token that does not start with `letify-agent2:` takes the older Tailcat path of `letify client shell connect`. That path still works until 3.0, prints a notice that Tailcat is removed then, and is covered in [Tunnel](02-providers.md).
+The login then opens one session to the agent, checks the workspace root and records the GPUs over it, so no SSH key and no SSH server are involved. A token that does not start with `letify-agent2:` is refused, and a Tailcat token from the removed `letify client shell connect` is refused by name with these steps. [Tunnel](02-providers.md) covers the move.
 
 To reach the machine's SSH server anyway, call `Tunnel.ssh_forward()` on the account. It returns a loopback port, and `ssh -p <port> <user>@127.0.0.1` reaches the sshd that `letify agent serve --ssh-target HOST:PORT` names (default `127.0.0.1:22`). letify itself never needs it.
 
@@ -160,7 +160,7 @@ SIGTERM or Ctrl-C stops it. It ends every conversation that has not handed over 
 | `letify-link is not in this wheel` | The sidecar binary is missing. Install a platform wheel, or set `LETIFY_LINK_BIN` |
 | `the signalling URL '...' must be https, or http for a loopback host, not ...` | Fix `--signal`, `LETIFY_SIGNAL_URL` or `signal` in `config.toml` |
 | `that is not a token: it should start with letify-agent2: ...` | You pasted something else. Use the token `letify agent serve` printed |
-| `this is a Tailcat token from 'letify client shell connect'; this login needs ...` | Wrong token. Use the one `letify agent serve` prints |
+| `Tailcat was removed in 3.0, and this is a Tailcat token ...` | Wrong token. Run `letify agent serve` on the machine and use the token it prints |
 | `the token expired; run 'letify agent serve' again for a new one` | The 15 minutes passed. Run it again |
 | `the pairing secret is wrong, used or expired` | One text for three causes: a typo, a token already used, or one past 15 minutes. Get a new token. After 5 refusals to your node in 15 minutes the agent stops answering |
 | `the agent <12 hex> did not answer in 30 s` | The agent is not running, was restarted (its tokens are void), or cannot reach the service |

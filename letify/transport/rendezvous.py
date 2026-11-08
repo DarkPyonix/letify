@@ -1,16 +1,14 @@
 """Rendezvous, the way to start letify's remote half and swap addresses with it.
 
-Owns sending a request to the remote side and reading its answer. Colab and Elice fill
-this role with their provider layer, which runs the remote half as a program; a plain
-machine behind NAT answers through the remote agent over Tailcat. It does not own what a
-request asks for; the strategies do.
+Owns sending a request to the remote side and reading its answer. Colab, Kaggle and Elice
+fill this role with their provider layer, which runs the remote half as a program; a plain
+machine has none. It does not own what a request asks for; the strategies do.
 """
 
 from __future__ import annotations
 
 import abc
 import json
-import shutil
 import subprocess
 from collections.abc import Callable
 from pathlib import Path
@@ -42,11 +40,6 @@ class Rendezvous(abc.ABC):
     def exchange(self, request: dict[str, Any], timeout: float) -> dict[str, Any]:
         """Send one request and return the remote side's answer."""
 
-    def tailcat_endpoint(self, ssh_port: int, timeout: float) -> tuple[str, int]:
-        """A Tailcat address and port that reach the machine's SSH server."""
-        answer = self.exchange({"kind": "tailcat", "ssh_port": ssh_port}, timeout)
-        return str(answer["address"]), ssh_port
-
 
 def _answer(output: str) -> dict[str, Any]:
     for line in output.splitlines():
@@ -61,16 +54,9 @@ def _answer(output: str) -> dict[str, Any]:
 class CommandRendezvous(Rendezvous):
     """A rendezvous that can run a Python program on the remote machine.
 
-    Because it can, it can also install tailcat on the machine. That belongs here rather
-    than to one provider: a runtime image that ships no ``tailcat`` fails the strategy with
-    FileNotFoundError when the request carries no path.
+    Because it can, it can also prepare ``letify-quic`` on the machine. That belongs here
+    rather than to one provider.
     """
-
-    #: Installs tailcat on the machine and returns its absolute path, or None.
-    _prepare_tailcat: Callable[[], str | None] | None = None
-
-    #: The path the last preparation returned, so it runs once per rendezvous.
-    binary: str | None = None
 
     #: The path of ``letify-quic`` on the machine, taken out of the letify wheel once.
     quic_binary: str | None = None
@@ -84,12 +70,7 @@ class CommandRendezvous(Rendezvous):
         """Run ``source`` remotely and return what it printed."""
 
     def exchange(self, request: dict[str, Any], timeout: float) -> dict[str, Any]:
-        if request.get("kind") == "tailcat":
-            if self.binary is None and self._prepare_tailcat is not None:
-                self.binary = self._prepare_tailcat()
-            if self.binary is not None:
-                request = {**request, "binary": self.binary}
-        elif request.get("kind") == "quic":
+        if request.get("kind") == "quic":
             request = {**request, "binary": self.prepare_quic()}
         return _answer(self.run_python(remote_script({**self.extras(), **request}), timeout))
 
@@ -117,42 +98,12 @@ class CommandRendezvous(Rendezvous):
         raise OSError(f"letify-quic preparation gave no binary path: {output.strip()[-500:]}")
 
 
-def prepare_tailcat(
-    run: Callable[[str, float], str], binary_option: str | None = None
-) -> Callable[[], str | None]:
-    """Install tailcat on the machine ``run`` reaches and return its verified path.
-
-    Returns None when this machine has no tailcat of its own, because the SSH
-    ``ProxyCommand`` runs one locally and there would be nothing to run it with.
-    """
-    from .. import install
-
-    def prepare() -> str | None:
-        if not (install.find("tailcat", link_cache=False) or binary_option):
-            return None
-        output = run(install.remote_tailcat_source(), 180)
-        for line in output.splitlines():
-            if line.startswith("LETIFY-TAILCAT "):
-                return json.loads(line[len("LETIFY-TAILCAT ") :])
-        raise OSError(f"tailcat installation gave no verified binary path: {output.strip()[-500:]}")
-
-    return prepare
-
-
 class ColabRendezvous(CommandRendezvous):
     """``colab exec`` on one runtime. A Colab VM has no SSH server, so each request starts one."""
 
-    def __init__(
-        self,
-        run: Callable[[str, float], str],
-        public_key: str | None = None,
-        *,
-        prepare_tailcat: Callable[[], str | None] | None = None,
-    ):
-        self._prepare_tailcat = prepare_tailcat
+    def __init__(self, run: Callable[[str, float], str], public_key: str | None = None):
         self._run = run
         self.public_key = public_key
-        self.binary: str | None = None
 
     def unavailable(self) -> str | None:
         # The VM authorizes the account's public key; without one SSH cannot log in.
@@ -186,49 +137,10 @@ class ShellCommandRendezvous(CommandRendezvous):
         return result.stdout + result.stderr
 
 
-class TailcatRendezvous(Rendezvous):
-    """The remote agent started by ``letify client shell connect``, reached over Tailcat."""
-
-    lead_seconds = 5.0
-
-    def __init__(self, address: str, port: int, binary: str = "tailcat"):
-        self.address = address
-        self.port = port
-        self.binary = binary
-
-    def unavailable(self) -> str | None:
-        return None if shutil.which(self.binary) else f"{self.binary} is not on PATH"
-
-    def tailcat_endpoint(self, ssh_port: int, timeout: float) -> tuple[str, int]:
-        # The agent splices a connection that opens with SSH- to the SSH server itself.
-        return self.address, self.port
-
-    def exchange(self, request: dict[str, Any], timeout: float) -> dict[str, Any]:
-        process = subprocess.Popen(
-            [self.binary, self.address, str(self.port)],
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            text=True,
-        )
-        try:
-            process.stdin.write("LETIFY-RDV " + json.dumps(request) + "\n")  # type: ignore[union-attr]
-            process.stdin.flush()  # type: ignore[union-attr]
-            line = process.stdout.readline()  # type: ignore[union-attr]
-        finally:
-            process.terminate()
-        if not line.strip():
-            raise OSError(f"the agent at {self.address} did not answer")
-        answer = json.loads(line)
-        if "error" in answer:
-            raise OSError(answer["error"])
-        return answer
-
-
 __all__ = [
     "ColabRendezvous",
     "CommandRendezvous",
     "Rendezvous",
     "ShellCommandRendezvous",
-    "TailcatRendezvous",
     "remote_script",
 ]

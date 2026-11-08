@@ -270,8 +270,9 @@ def parse_token(text: str) -> Token:
     if not text.startswith(PREFIX):
         if _looks_like_tailcat(text):
             raise TokenError(
-                "this is a Tailcat token from 'letify client shell connect'; this login needs "
-                f"the token that 'letify agent serve' prints, which starts with {PREFIX}"
+                "Tailcat was removed in 3.0, and this is a Tailcat token from the removed "
+                "'letify client shell connect'. Run 'letify agent serve' on the machine, then "
+                f"log in with the token it prints, which starts with {PREFIX}"
             )
         raise TokenError(
             f"that is not a token: it should start with {PREFIX} and be printed by "

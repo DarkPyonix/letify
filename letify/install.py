@@ -1,13 +1,13 @@
 """Finding and, after the user confirms, installing the external tools letify runs.
 
-Owns the lookup of ``tailcat`` and ``eci`` (project environment, per-version cache,
-``PATH``), the automatic install and its switch, the verified download of each tool's pinned GitHub
+Owns the lookup of ``eci`` (project environment, per-version cache,
+``PATH``), the confirmed install, the verified download of the tool's pinned GitHub
 release from its publisher into ``~/.letify/tools/<tool>/<version>/``, safe extraction,
 and linking the cached tool into the project's virtual environment. Spec "Installing
 external tools".
 
 It does not own what the tools are asked to do, the install instructions printed when
-nothing is installed (``letify.transport.setup`` and ``letify.providers.elice`` do), or
+nothing is installed (``letify.providers.elice`` does), or
 any shared ``PATH`` directory, which it never writes to.
 """
 
@@ -24,7 +24,6 @@ import sys
 import tarfile
 import tempfile
 import time
-import tomllib
 import urllib.request
 import zipfile
 from collections.abc import Callable
@@ -33,14 +32,13 @@ from pathlib import Path
 
 from . import render
 from .errors import LetifyError
-from .transport.setup import TAILCAT_VERSION
-from .useragent import user_agent, with_agent
+from .useragent import with_agent
 
 #: Seconds to wait for a release server.
 DOWNLOAD_TIMEOUT = 60.0
 #: Seconds to wait for the connection alone. A host a network blocks has to fail in
 #: seconds, not after the read timeout, and twice that when a release redirects.
-#: Spec "Automatic install".
+#: Spec "Installing external tools".
 CONNECT_TIMEOUT = 10.0
 
 #: Bytes read from a release server at a time, so progress can be reported.
@@ -51,28 +49,6 @@ PROGRESS_INTERVAL = 0.1
 
 #: Cells in the progress gauge.
 PROGRESS_CELLS = 20
-
-TAILCAT_RELEASE = "https://github.com/tailscale/tailcat/releases/download/v{version}"
-TAILCAT_RELEASES_PAGE = "https://github.com/tailscale/tailcat/releases"
-
-#: SHA-256 of every tailcat release archive for ``TAILCAT_VERSION``.
-TAILCAT_SHA256 = {
-    "tailcat_0.6.0_linux_amd64.tar.gz": (
-        "f3597a9ad02f5cca538f8f5a6f89123910bce3e9611d1e5a8e96d5f2d3cc90fd"
-    ),
-    "tailcat_0.6.0_linux_arm64.tar.gz": (
-        "fff48f25d223aea31f985bae8a2c01378b22e51e985e8c7d270e1a8586598506"
-    ),
-    "tailcat_0.6.0_linux_armv7.tar.gz": (
-        "3c1009d0b0d1db1584a19c9017541457f9610e9aeae71883423a60647e5b7594"
-    ),
-    "tailcat_0.6.0_windows_amd64.zip": (
-        "649781e178b070a7a0635bb57408f540a1da36e224042e2cb48a6058dd7b9160"
-    ),
-    "tailcat_0.6.0_windows_arm64.zip": (
-        "c4acad6fa2f94f527dc0e9dce1e9adfb36ddfa3a9d43a5e8e66f872cda539362"
-    ),
-}
 
 #: The eci release letify installs.
 ECI_VERSION = "0.2.1"
@@ -93,19 +69,8 @@ ECI_SHA256 = {
     ),
 }
 
-TOOLS = ("tailcat", "eci")
+TOOLS = ("eci",)
 
-_TAILCAT_ARCH = {
-    "Linux": {
-        "x86_64": "amd64",
-        "amd64": "amd64",
-        "aarch64": "arm64",
-        "arm64": "arm64",
-        "armv7l": "armv7",
-        "armv7": "armv7",
-    },
-    "Windows": {"amd64": "amd64", "x86_64": "amd64", "arm64": "arm64", "aarch64": "arm64"},
-}
 _ECI_ARCH = {
     "Darwin": {"arm64": "arm64", "aarch64": "arm64"},
     "Linux": {"x86_64": "x86_64", "amd64": "x86_64"},
@@ -133,7 +98,7 @@ def host() -> tuple[str, str]:
 
 
 def version_of(tool: str) -> str:
-    return TAILCAT_VERSION if tool == "tailcat" else ECI_VERSION
+    return ECI_VERSION
 
 
 def _executable(tool: str) -> str:
@@ -161,21 +126,6 @@ def project_environment() -> Path | None:
 
 def _bin_directory(environment: Path) -> Path:
     return environment / ("Scripts" if host()[0] == "Windows" else "bin")
-
-
-def auto_install_enabled() -> bool:
-    """``LETIFY_AUTO_INSTALL`` when set, else ``auto_install`` in the home file, else on."""
-    value = os.environ.get("LETIFY_AUTO_INSTALL")
-    if value is not None:
-        return value.strip().lower() not in ("0", "false", "no")
-    from .paths import config_path
-
-    home_file = config_path()
-    try:
-        settings = tomllib.loads(home_file.read_text(encoding="utf-8"))
-    except (OSError, tomllib.TOMLDecodeError):
-        return True
-    return settings.get("auto_install") is not False
 
 
 def log(message: str) -> None:
@@ -247,14 +197,7 @@ def link(tool: str, *, say: Say = _say) -> str:
             return str(target)
         target.unlink()
     target.parent.mkdir(parents=True, exist_ok=True)
-    if tool == "eci":
-        _write_launcher(target, cached)
-    else:
-        try:
-            os.link(cached, target)
-        except OSError as exc:
-            shutil.copy2(cached, target)
-            say("warn", f"linked by copy: {exc.strerror or exc}")
+    _write_launcher(target, cached)
     marker.write_text(version + "\n", encoding="utf-8")
     return str(target)
 
@@ -284,16 +227,10 @@ def asset_for(tool: str) -> Asset:
     """The release archive for this host, or ``InstallError`` naming the releases page."""
     system, machine = host()
     machine = machine.lower()
-    if tool == "tailcat":
-        arch = _TAILCAT_ARCH.get(system, {}).get(machine)
-        extension = "zip" if system == "Windows" else "tar.gz"
-        name = f"tailcat_{TAILCAT_VERSION}_{system.lower()}_{arch}.{extension}"
-        base, pins, page = TAILCAT_RELEASE, TAILCAT_SHA256, TAILCAT_RELEASES_PAGE
-    else:
-        arch = _ECI_ARCH.get(system, {}).get(machine)
-        extension = "zip" if system == "Windows" else "tar.gz"
-        name = f"eci-{system.lower()}-{arch}-{ECI_VERSION}.{extension}"
-        base, pins, page = ECI_RELEASE, ECI_SHA256, ECI_RELEASES_PAGE
+    arch = _ECI_ARCH.get(system, {}).get(machine)
+    extension = "zip" if system == "Windows" else "tar.gz"
+    name = f"eci-{system.lower()}-{arch}-{ECI_VERSION}.{extension}"
+    base, pins, page = ECI_RELEASE, ECI_SHA256, ECI_RELEASES_PAGE
     if arch is None:
         raise InstallError(
             f"{tool} {version_of(tool)} publishes no release for {system} {machine}; see {page}"
@@ -364,7 +301,7 @@ def _isatty(stream) -> bool:
 def _reachable(url: str) -> None:
     """Refuse a download whose host does not answer, before the request is made.
 
-    Spec "Automatic install": the error names the host so a blocked network is told what
+    Spec "Installing external tools": the error names the host so a blocked network is told what
     to open or to configure around, rather than being told the tool is broken.
     """
     import socket
@@ -383,7 +320,7 @@ def _reachable(url: str) -> None:
             f"{url} was not downloaded. The host, not letify, is what is unreachable: a "
             f"network that allows github.com can still block the host its releases "
             f"redirect to. Fetch the archive another way and name the binary with the "
-            f"account's tailcat_binary or eci_binary"
+            f"account's eci_binary"
         ) from None
 
 
@@ -502,33 +439,12 @@ def _strip_top(members: list[_Member]) -> list[_Member]:
 
 
 def _select(tool: str, members: list[_Member]) -> list[_Member]:
-    if tool == "eci":
-        return _strip_top(members)
-    binary = _executable(tool)
-    for member in members:
-        if member.name.split("/")[-1] == binary and member.name.count("/") <= 1:
-            if member.kind != "file":
-                raise InstallError(f"archive member {member.name!r} is not a regular file; refused")
-            return [_Member(binary, "file", member.read)]
-    return []
+    """The members to keep: the whole eci bundle, because the binary loads libraries beside it."""
+    return _strip_top(members)
 
 
 def install(tool: str, *, say: Say = _say) -> Path:
     """Download, verify and extract the pinned release into the cache. Spec, Installing."""
-    system = host()[0]
-    if tool == "tailcat" and system == "Darwin":
-        brew = shutil.which("brew")
-        if brew is None:
-            raise InstallError(
-                f"tailcat publishes no macOS archive and Homebrew is not on PATH; "
-                f"see {TAILCAT_RELEASES_PAGE}"
-            )
-        done = subprocess.run([brew, "install", "tailcat"], check=False)
-        if done.returncode != 0:
-            raise InstallError(f"brew install tailcat exited with {done.returncode}")
-        found = shutil.which("tailcat")
-        return Path(found) if found else Path("tailcat")
-
     asset = asset_for(tool)
     log(f"installing {tool} {version_of(tool)} from {asset.url} into {cache_path(tool).parent}")
     data = _download(asset.url, label=f"{tool} {version_of(tool)}")
@@ -587,10 +503,6 @@ def install_and_link(tool: str, *, say: Say = _say) -> str:
     return path
 
 
-#: Tools whose release carries no license, installed only after the user says yes.
-ASK_FIRST = frozenset({"eci"})
-
-
 def ensure(
     tool: str,
     *,
@@ -598,19 +510,15 @@ def ensure(
     say: Say = _say,
     confirm: Callable[[], bool] | None = None,
 ) -> str:
-    """The command to run ``tool`` by, installing it first when that is allowed.
+    """The command to run ``tool`` by, installing it first when the user says yes.
 
-    ``tailcat`` installs when automatic install is on. ``eci`` installs only when
-    ``confirm`` is given and returns true, which a login asks on a terminal.
+    The release carries no license, so ``eci`` installs only when ``confirm`` is given and
+    returns true, which a login asks on a terminal.
     """
     found = find(tool, say=say)
     if found is not None:
         return found
-    if tool in ASK_FIRST:
-        if confirm is None or not confirm():
-            raise InstallError(f"{instructions}\n\n{setup_hint(tool)}")
-        return install_and_link(tool, say=say)
-    if not auto_install_enabled():
+    if confirm is None or not confirm():
         raise InstallError(f"{instructions}\n\n{setup_hint(tool)}")
     return install_and_link(tool, say=say)
 
@@ -652,19 +560,6 @@ __all__ = [
 ]
 
 
-def remote_tailcat_source() -> str:
-    """Prepare the pinned Linux binary on Colab using this installer's release metadata."""
-    import inspect
-
-    return (
-        inspect.getsource(_remote_tailcat)
-        + f"\nbinary = _remote_tailcat({TAILCAT_VERSION!r}, "
-        + f"{TAILCAT_RELEASE.format(version=TAILCAT_VERSION)!r}, {TAILCAT_SHA256!r}, "
-        + f"{user_agent()!r})\n"
-        + "import json\nprint('LETIFY-TAILCAT ' + json.dumps(binary))\n"
-    )
-
-
 def remote_quic_source(version: str) -> str:
     """Prepare ``letify-quic`` on the remote from the letify wheel of this version.
 
@@ -697,7 +592,6 @@ def _remote_quic(version):
     """Take letify-quic out of the letify wheel for this machine, standard library only."""
     import json
     import os
-    import subprocess
     import sys
     import tempfile
     import zipfile
@@ -732,76 +626,3 @@ def _remote_quic(version):
     target.chmod(0o755)
     json.dumps(str(target))
     return str(target)
-
-
-def _remote_tailcat(version, release, pins, agent):
-    """Install a verified Linux tailcat using only the runtime's standard library."""
-    import hashlib
-    import io
-    import json
-    import os
-    import platform
-    import tarfile
-    import tempfile
-    import urllib.request
-    from pathlib import Path
-
-    arch = {"x86_64": "amd64", "aarch64": "arm64", "arm64": "arm64", "armv7l": "armv7"}.get(
-        platform.machine().lower()
-    )
-    asset = f"tailcat_{version}_linux_{arch}.tar.gz"
-    if platform.system() != "Linux" or asset not in pins:
-        raise RuntimeError(f"tailcat: unsupported runtime platform {platform.machine()}")
-    destination = Path.home() / ".letify" / "tools" / "tailcat" / version
-    binary = destination / "tailcat"
-    marker = destination / "verified.json"
-    if binary.is_file() and marker.is_file():
-        verified = json.loads(marker.read_text())
-        actual = hashlib.sha256(binary.read_bytes()).hexdigest()
-        if verified.get("archive") != pins[asset] or verified.get("binary") != actual:
-            raise RuntimeError("tailcat cached binary SHA-256 mismatch; refused")
-        return str(binary)
-    with urllib.request.urlopen(
-        urllib.request.Request(f"{release}/{asset}", headers={"User-Agent": agent}),
-        timeout=60,
-    ) as response:
-        data = response.read()
-    actual = hashlib.sha256(data).hexdigest()
-    if actual != pins[asset]:
-        raise RuntimeError(
-            f"tailcat archive SHA-256 mismatch: expected {pins[asset]}, got {actual}"
-        )
-    with tarfile.open(fileobj=io.BytesIO(data), mode="r:gz") as archive:
-        members = archive.getmembers()
-        if any(
-            Path(m.name).is_absolute()
-            or ".." in Path(m.name).parts
-            or m.isdev()
-            or m.islnk()
-            or m.issym()
-            for m in members
-        ):
-            raise RuntimeError("tailcat archive contains an unsafe member; refused")
-        candidates = [
-            m
-            for m in members
-            if m.isfile() and Path(m.name).name == "tailcat" and len(Path(m.name).parts) <= 2
-        ]
-        if len(candidates) != 1:
-            raise RuntimeError("tailcat archive must hold one regular tailcat binary")
-        payload = archive.extractfile(candidates[0]).read()
-    destination.mkdir(parents=True, exist_ok=True)
-    descriptor, temporary = tempfile.mkstemp(prefix=".tailcat-", dir=destination)
-    try:
-        with os.fdopen(descriptor, "wb") as handle:
-            handle.write(payload)
-        os.chmod(temporary, 0o555)
-        os.replace(temporary, binary)
-    finally:
-        if os.path.exists(temporary):
-            os.unlink(temporary)
-    marker.write_text(
-        json.dumps({"archive": actual, "binary": hashlib.sha256(payload).hexdigest()})
-    )
-    marker.chmod(0o444)
-    return str(binary)

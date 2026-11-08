@@ -84,7 +84,7 @@ class ProcessStream:
 
 
 class SSHLink(Link):
-    """A link that is an SSH command line: forward SSH, SSH over Tailcat, or a reverse forward."""
+    """A link that is an SSH command line: forward SSH, SSH over QUIC, or a reverse forward."""
 
     def __init__(
         self,

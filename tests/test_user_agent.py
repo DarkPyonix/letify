@@ -162,9 +162,3 @@ def test_a_runtime_pull_carries_the_user_agent_in_its_headers() -> None:
     gcs = GCSBackend("b", tokens=_Token())
     gcs.read_token = lambda: "tok"  # type: ignore[method-assign]
     assert gcs.pull_source("d" * 64)["headers"]["User-Agent"] == expected  # type: ignore[index]
-
-
-def test_the_tailcat_download_on_a_runtime_names_letify() -> None:
-    from letify import install
-
-    assert f"'letify/{letify.__version__}'" in install.remote_tailcat_source()

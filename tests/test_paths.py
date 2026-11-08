@@ -155,7 +155,6 @@ def test_installing_new_tool_version_prunes_older_versions(
     server = ReleaseServer()
     monkeypatch.setattr(install, "ECI_RELEASE", server.url + "/{version}")
     monkeypatch.setattr(install, "host", lambda: ("Linux", "x86_64"))
-    monkeypatch.delenv("LETIFY_AUTO_INSTALL", raising=False)
 
     # Pre-populate older versions in tools directory
     tools_dir = Path.home() / ".letify" / "tools" / "eci"
@@ -462,19 +461,16 @@ def test_the_local_provider_workspace_follows_letify_home(isolated_home, monkeyp
     assert local_runtime_directory() == tmp_path / "moved" / "runtime"
 
 
-def test_the_install_cache_and_home_settings_follow_letify_home(
+def test_the_install_cache_follows_letify_home(
     isolated_home, monkeypatch, tmp_path
 ):
     moved = tmp_path / "moved"
     moved.mkdir()
-    (moved / "config.toml").write_text("auto_install = false\n", encoding="utf-8")
     monkeypatch.setenv("LETIFY_HOME", str(moved))
-    monkeypatch.delenv("LETIFY_AUTO_INSTALL", raising=False)
     monkeypatch.delenv("LETIFY_CONFIG", raising=False)
 
     assert install.tools_home() == moved / "tools"
     assert install.cache_path("eci").is_relative_to(moved / "tools")
-    assert install.auto_install_enabled() is False
 
 
 def test_the_device_auto_fetch_setting_is_read_from_the_moved_root(

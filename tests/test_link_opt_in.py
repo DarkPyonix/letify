@@ -44,7 +44,7 @@ def test_a_shell_account_with_the_switch_off_by_name_races_the_2_11_strategies(
 ) -> None:
     provider = provider_of(Shell, "lab", address="gpu.example.edu", link="ssh", port_mapping=False)
     provider.link()
-    assert raced == [["direct_ssh", "tcp_punch", "tailcat", "quic", "fallback"]]
+    assert raced == [["direct_ssh", "tcp_punch", "quic", "fallback"]]
 
 
 def test_a_shell_account_with_the_switch_on_races_nothing(isolated_home, raced) -> None:
@@ -70,12 +70,12 @@ def test_kaggle_and_colab_without_the_switch_use_letify_link(isolated_home) -> N
     assert provider_of(Colab, "c").uses_letify_link is True
 
 
-def test_kaggle_and_colab_with_link_ssh_keep_tailcat_in_the_race(isolated_home) -> None:
+def test_kaggle_and_colab_with_link_ssh_keep_quic_in_the_race(isolated_home) -> None:
     kaggle = provider_of(Kaggle, "k", link="ssh")
-    assert [s.name for s in kaggle.strategies()] == ["tcp_punch", "tailcat", "quic", "fallback"]
+    assert [s.name for s in kaggle.strategies()] == ["tcp_punch", "quic", "fallback"]
     assert kaggle.uses_letify_link is False
     colab = provider_of(Colab, "c", link="ssh")
-    assert "tailcat" in [s.name for s in colab.strategies()]
+    assert "quic" in [s.name for s in colab.strategies()]
     assert colab.uses_letify_link is False
 
 

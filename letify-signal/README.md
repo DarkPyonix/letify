@@ -1,6 +1,6 @@
 # letify-signal
 
-The letify signalling service: a Cloudflare Worker with one Durable Object mailbox per node id. It carries signed bootstrap lines to a machine that has no address, so letify reaches it with no ssh and no Tailcat. The protocol, the limits and the trust model are in `docs/SPEC.md`, section "Signalling service". The Python side is `letify/transport/linksignal.py`.
+The letify signalling service: a Cloudflare Worker with one Durable Object mailbox per node id. It carries signed bootstrap lines to a machine that has no address, so letify reaches it with no ssh. The protocol, the limits and the trust model are in `docs/SPEC.md`, section "Signalling service". The Python side is `letify/transport/linksignal.py`.
 
 The service is untrusted for content. Every line is signed by the sending node and verified by the receiving node, and the receiving agent never runs a command that a line supplies.
 

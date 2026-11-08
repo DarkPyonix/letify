@@ -22,7 +22,7 @@ def test_kaggle_races_the_strategies_that_need_no_address() -> None:
     names = [s.name for s in kaggle().strategies()]
     assert "direct_ssh" not in names
     assert "tcp_punch" in names
-    assert "tailcat" in names
+    assert "quic" in names
     assert names[-1] == "fallback" or "fallback" not in names
 
 
@@ -161,49 +161,29 @@ def test_a_program_that_opens_with_a_future_import_still_compiles() -> None:
     assert "LETIFY-ANSWER" in scope["__letify_value__"]
 
 
-def test_a_kaggle_tailcat_request_carries_the_installed_binary_path(monkeypatch) -> None:
-    """Spec "Kaggle runtimes", An SSH link over the kernel: tailcat is prepared lazily.
+def test_a_kaggle_quic_request_carries_the_prepared_carrier_path() -> None:
+    """Spec "Kaggle runtimes", An SSH link over the kernel: letify-quic is prepared lazily.
 
-    Preparation used to belong to ColabRendezvous alone, so a Kaggle tailcat request
-    carried no binary, the remote side ran a bare ``tailcat``, and the strategy failed
-    with FileNotFoundError on an image that ships no such binary.
+    The preparation belongs to the rendezvous, so a Kaggle request carries a carrier path
+    the way a Colab one does, and the remote side never runs a bare ``letify-quic``.
     """
-    from letify import install
     from letify.transport import nat
 
-    monkeypatch.setattr(install, "find", lambda *a, **k: "/usr/bin/tailcat")
-    binary = "/root/.letify/tools/tailcat/1.0/tailcat"
+    binary = "/root/.letify/tools/letify-quic/1.0/letify-quic"
     sources: list[str] = []
 
     class Bridge:
         def request(self, message, timeout=None):
             source = message["source"]
             sources.append(source)
-            if "LETIFY-TAILCAT" in source:
-                return f'LETIFY-TAILCAT "{binary}"', None
-            return nat.ANSWER_MARKER + '{"address": "cat.example"}', None
+            if "LETIFY-QUIC" in source and "run_detached" not in source:
+                return f'LETIFY-QUIC "{binary}"', None
+            return nat.ANSWER_MARKER + '{"mapping": ["203.0.113.5", 4000]}', None
 
     rendezvous = kaggle().rendezvous_over(Bridge())
-    assert rendezvous.tailcat_endpoint(2222, 30.0) == ("cat.example", 2222)
+    request = {"kind": "quic", "mapping": ["198.51.100.1", 5000], "token": "00", "ssh_port": 22}
+    assert rendezvous.exchange(request, 30.0) == {"mapping": ["203.0.113.5", 4000]}
     assert binary in sources[-1]
-
-
-def test_a_kaggle_tailcat_request_omits_the_binary_when_the_user_has_none(monkeypatch) -> None:
-    """Spec: a locally missing tailcat cannot run the ProxyCommand, so nothing is installed."""
-    from letify import install
-    from letify.transport import nat
-
-    monkeypatch.setattr(install, "find", lambda *a, **k: None)
-    sources: list[str] = []
-
-    class Bridge:
-        def request(self, message, timeout=None):
-            sources.append(message["source"])
-            return nat.ANSWER_MARKER + '{"address": "cat.example"}', None
-
-    rendezvous = kaggle().rendezvous_over(Bridge())
-    assert rendezvous.tailcat_endpoint(2222, 30.0) == ("cat.example", 2222)
-    assert not any("LETIFY-TAILCAT" in source for source in sources)
 
 
 def test_the_kaggle_punch_target_logs_in_as_root_with_the_authorized_key(tmp_path) -> None:

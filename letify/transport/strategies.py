@@ -1,9 +1,9 @@
 """Strategy, one way to connect, and the strategies the spec ranks.
 
-Owns checking a strategy's needs and attempting it: forward SSH (rank 1), TCP hole
-punching (rank 2), UDP hole punching with Tailcat (rank 3), reverse SSH when an account
-opts in (rank 4), and the provider fallback (last). It does not own racing or choosing;
-the pipeline does.
+Owns checking a strategy's needs and attempting it: forward SSH (rank 1), connect back
+(rank 2), TCP hole punching (rank 3), QUIC over a punched UDP pair (rank 4), reverse SSH
+when an account opts in (rank 5), and the provider fallback (last). It does not own
+racing or choosing; the pipeline does.
 """
 
 from __future__ import annotations
@@ -57,7 +57,6 @@ class Target:
     fallback: Callable[[], Link] | None = None
     ssh_port: int = 22
     stun: tuple[str, int] = nat.DEFAULT_STUN
-    tailcat: str = "tailcat"
     host_key_alias: str | None = None
     #: The account's workspace root on the machine, before ``~`` is expanded there.
     workspace: str = "~/.letify-runtime"
@@ -323,31 +322,8 @@ class TCPPunch(Strategy):
         )
 
 
-class TailcatUDP(Strategy):
-    """UDP hole punching with Tailcat, then SSH over it."""
-
-    name = "tailcat"
-    rank = 4
-
-    def needs(self, target: Target) -> str | None:
-        if shutil.which(target.tailcat) is None:
-            hint = "; run 'letify setup tailcat'" if target.tailcat == "tailcat" else ""
-            return f"{target.tailcat} is not on PATH{hint}"
-        return _rendezvous_unmet(target)
-
-    def attempt(self, target: Target, cancel: threading.Event | None = None) -> Link:
-        address, port = target.rendezvous.tailcat_endpoint(target.ssh_port, CONNECT_TIMEOUT)
-        proxy = f"{target.tailcat} {address} {port}"
-
-        def command(remote_command: str | None = None) -> list[str]:
-            return target.proxied_ssh(proxy, remote_command)
-
-        _verify(command("exit 0"))
-        return SSHLink(self.name, self.rank, command, remote_python=target.remote_python)
-
-
 class QuicUDP(Strategy):
-    """The same UDP punch as Tailcat's, carrying a real QUIC connection, then SSH over it.
+    """A UDP punch carrying a real QUIC connection, then SSH over it.
 
     Spec "QUIC over a punched UDP pair": a network that shapes UDP it cannot classify
     often lets QUIC through, because HTTP/3 is QUIC. The rendezvous exchanges both punched
@@ -355,7 +331,7 @@ class QuicUDP(Strategy):
     """
 
     name = "quic"
-    rank = 5
+    rank = 4
 
     def needs(self, target: Target) -> str | None:
         unmet = _rendezvous_unmet(target)
@@ -501,7 +477,7 @@ class ReverseSSH(Strategy):
     """The remote side forwards its SSH server back to the user's machine with ``ssh -R 0:``."""
 
     name = "reverse_ssh"
-    rank = 6
+    rank = 5
 
     def __init__(self, keys: AuthorizedKeys | None = None):
         self.keys = keys
@@ -601,7 +577,7 @@ class ProviderFallback(Strategy):
     #: The fallback cannot carry the probe, so it does not start the grace period.
     probed = False
 
-    def __init__(self, rank: int = 6):
+    def __init__(self, rank: int = 5):
         self.rank = rank
 
     def needs(self, target: Target) -> str | None:
@@ -623,6 +599,5 @@ __all__ = [
     "ReverseSSH",
     "Strategy",
     "TCPPunch",
-    "TailcatUDP",
     "Target",
 ]

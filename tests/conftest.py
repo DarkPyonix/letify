@@ -532,8 +532,6 @@ def no_project_environment(monkeypatch):
     from letify import install
 
     monkeypatch.setattr(install, "project_environment", lambda: None)
-    # Automatic install would reach GitHub; a test that installs serves a release locally.
-    monkeypatch.setenv("LETIFY_AUTO_INSTALL", "0")
 
 
 @pytest.fixture
@@ -2016,7 +2014,7 @@ class LoopbackRendezvous:
 
 class CannedRendezvous:
     """A rendezvous that answers every request with the same reply, for strategies whose
-    remote half needs a live tool such as ssh or tailcat."""
+    remote half needs a live tool such as ssh."""
 
     lead_seconds = 0.0
 
@@ -2031,10 +2029,6 @@ class CannedRendezvous:
     def exchange(self, request: dict[str, Any], timeout: float) -> dict[str, Any]:
         self.requests.append(request)
         return dict(self.answer)
-
-    def tailcat_endpoint(self, ssh_port: int, timeout: float) -> tuple[str, int]:
-        answer = self.exchange({"kind": "tailcat", "ssh_port": ssh_port}, timeout)
-        return answer["address"], ssh_port
 
 
 class FakeProcess:

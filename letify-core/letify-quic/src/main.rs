@@ -4,12 +4,12 @@
 //! rendezvous, so this binary does not discover anything. It is given the local port to
 //! bind, the peer's endpoint, and a token, and it puts a QUIC connection between them.
 //!
-//! Why QUIC at all, when Tailcat already carries a session over UDP: a network that
+//! Why QUIC and not a bare UDP carrier: a network that
 //! shapes UDP it cannot classify often lets QUIC through, because QUIC is what the web
 //! runs on. The handshake is a real QUIC v1 handshake with a TLS certificate, so a device
 //! that classifies by payload sees HTTP/3's transport rather than unknown datagrams.
 //!
-//! Two modes, matching how letify drives Tailcat:
+//! Two modes:
 //!
 //!     letify-quic serve --bind <port> --peer <ip:port> --token <hex> --forward <port>
 //!     letify-quic connect --bind <port> --peer <ip:port> --token <hex>

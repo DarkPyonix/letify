@@ -33,7 +33,7 @@ def test_no_carrier_anywhere_is_not_an_error(monkeypatch, tmp_path) -> None:
 
 
 def test_quic_needs_the_carrier_and_a_rendezvous(monkeypatch, tmp_path) -> None:
-    assert QuicUDP.rank == 5
+    assert QuicUDP.rank == 4
     monkeypatch.setattr(quic, "LIB_DIR", tmp_path)
     monkeypatch.setattr(quic.shutil, "which", lambda name: None)
     target = Target(alias="lab", rendezvous=CannedRendezvous())
