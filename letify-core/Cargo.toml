@@ -8,7 +8,7 @@ resolver = "3"
 members = ["letify", "letify-link"]
 
 [workspace.package]
-version = "2.12.0"
+version = "2.12.5"
 edition = "2024"
 license = "MIT"
 repository = "https://github.com/DarkPyonix/letify"

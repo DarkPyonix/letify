@@ -9,7 +9,7 @@ use letify_link::{Config, Identity, PeerPolicy, Session};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::time::timeout;
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(start_paused = true)]
 async fn many_streams_on_one_session_deliver_in_order_independently() {
     let (a, b) = session_pair(Config::default()).await;
     let streams = 16u64;
@@ -52,7 +52,7 @@ async fn many_streams_on_one_session_deliver_in_order_independently() {
     }
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_stream_close_is_separate_from_the_session_close() {
     let (a, b) = session_pair(Config::default()).await;
     let mut first = a.open_stream().await.unwrap();
@@ -71,7 +71,7 @@ async fn a_stream_close_is_separate_from_the_session_close() {
     assert_eq!(&buf, b"more");
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn either_side_can_open_a_stream() {
     let (a, b) = session_pair(Config::default()).await;
     let mut from_b = b.open_stream().await.unwrap();
@@ -82,7 +82,7 @@ async fn either_side_can_open_a_stream() {
     assert_eq!(&buf, b"hi");
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_closed_session_ends_the_peer_with_a_graceful_end() {
     let (a, b) = session_pair(Config::default()).await;
     let mut s = a.open_stream().await.unwrap();
@@ -95,7 +95,7 @@ async fn a_closed_session_ends_the_peer_with_a_graceful_end() {
     assert!(b.accept_stream().await.is_err());
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_stream_writer_waits_for_window_when_the_reader_is_slow() {
     let config = Config {
         stream_window: 64 * 1024,
@@ -133,7 +133,7 @@ async fn session_pair_with_subflows(n: usize, config: Config) -> (Session, Sessi
     (a, b)
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(start_paused = true)]
 async fn frames_spread_over_several_subflows_arrive_in_order() {
     let config = Config {
         subflow_window: 128 * 1024,
@@ -168,7 +168,7 @@ async fn frames_spread_over_several_subflows_arrive_in_order() {
     );
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(start_paused = true)]
 async fn the_unacknowledged_buffer_is_bounded_in_bytes() {
     let bound = 256 * 1024;
     let config = Config {
@@ -228,7 +228,7 @@ async fn the_unacknowledged_buffer_is_bounded_in_bytes() {
 /// A waiter that a local close must end returns within this long, or the test fails.
 const PROMPT: Duration = Duration::from_secs(3);
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(start_paused = true)]
 async fn a_local_close_ends_a_pending_accept_on_the_same_side() {
     let (a, _b) = session_pair(Config::default()).await;
     let a = std::sync::Arc::new(a);
@@ -242,7 +242,7 @@ async fn a_local_close_ends_a_pending_accept_on_the_same_side() {
     assert!(matches!(ended.unwrap(), Err(letify_link::Error::Closed)));
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(start_paused = true)]
 async fn accept_after_a_local_close_returns_closed() {
     let (a, _b) = session_pair(Config::default()).await;
     a.close().await;
@@ -252,7 +252,7 @@ async fn accept_after_a_local_close_returns_closed() {
     assert!(matches!(ended, Err(letify_link::Error::Closed)));
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(start_paused = true)]
 async fn a_local_close_ends_a_pending_read_on_an_open_stream() {
     let (a, b) = session_pair(Config::default()).await;
     let mut s = a.open_stream().await.unwrap();
@@ -270,7 +270,7 @@ async fn a_local_close_ends_a_pending_read_on_an_open_stream() {
     assert_eq!(ended.unwrap().unwrap(), 0);
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(start_paused = true)]
 async fn a_local_close_ends_a_write_that_waits_for_window() {
     let (a, b) = session_pair(Config::default()).await;
     let mut s = a.open_stream().await.unwrap();

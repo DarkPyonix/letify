@@ -1793,3 +1793,21 @@ def test_a_server_error_during_the_cookie_check_names_its_status(monkeypatch) ->
     monkeypatch.setattr(kaggle_module, "urlopen", fail)
     with pytest.raises(ValueError, match="could not be checked: HTTP 503"):
         kaggle_module.verify_cookie(make_cookie())
+
+
+def test_every_kaggle_request_names_letify_as_its_user_agent(fake_kaggle, monkeypatch) -> None:
+    """Spec "Kaggle", User-Agent: kaggle.com answers the urllib default with HTTP 404."""
+    import letify
+    from letify.providers import kaggle as kaggle_module
+
+    seen = []
+
+    def record(request, timeout=None):
+        seen.append(request)
+        return fake_kaggle.urlopen(request, timeout)
+
+    monkeypatch.setattr(kaggle_module, "urlopen", record)
+    session_channel(fake_kaggle)
+    assert seen
+    expected = f"letify/{letify.__version__}"
+    assert [r.full_url for r in seen if r.get_header("User-agent") != expected] == []

@@ -851,11 +851,13 @@ def test_a_punch_whose_window_has_already_closed_fails_at_once() -> None:
     assert "window" in str(raised.value)
 
 
-def test_the_remote_half_reports_when_it_stops_punching() -> None:
+def test_the_remote_half_reports_when_it_stops_punching(stun_server: StunServer) -> None:
     # Spec "the simultaneous open": punch_until travels in the answer so both sides stop
-    # together.
+    # together. begin asks a STUN server for its mapping, so the test names the loopback
+    # one and never reaches the public default.
     answer, _ = nat.begin(
         {
+            "stun": list(stun_server.address),
             "kind": "tcp_punch",
             "mapping": ["203.0.113.7", 41000],
             "token": ("a" * 32),
@@ -1037,15 +1039,14 @@ def test_a_provider_with_no_known_fallback_keeps_failing_below_the_floor(isolate
 
 # Spec: Transport, Link floor.
 def test_a_strategy_that_connects_after_a_floor_rejection_is_still_considered(isolated_home):
-    """The Colab Pro+ case: QUIC connected first and measured below the floor, and the TCP
-    punch connected while that probe ran. The punch must be probed and chosen, not reported as
-    not connected in time."""
+    """The Colab Pro+ case: a UDP path connected first and measured below the floor, and the
+    TCP punch connected while that probe ran. The punch must be probed and chosen, not reported
+    as not connected in time."""
     fallback = FakeStrategy("fallback", 6, probed=False)
     connect_back = FakeStrategy("connect_back", 1, error="no connect_back endpoint")
-    quic = FakeStrategy("quic", 5, error="no letify-quic")
-    slow = FakeStrategy("quic", 3, result=result(0.5, 0.2, rtt=129.1), delay=0.3)
+    slow = FakeStrategy("reverse_ssh", 3, result=result(0.5, 0.2, rtt=129.1), delay=0.3)
     punch = FakeStrategy("tcp_punch", 2, result=result(40, 40, rtt=30.0), delay=0.7)
-    strategies = [connect_back, punch, slow, quic, fallback]
+    strategies = [connect_back, punch, slow, fallback]
     chosen = pipeline(strategies, floor=LinkFloor.default()).connect()
     assert chosen.strategy == "tcp_punch"
     assert slow.links[0].closed

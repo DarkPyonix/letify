@@ -32,6 +32,7 @@ from pathlib import Path
 
 from . import render
 from .errors import LetifyError
+from .useragent import with_agent
 
 #: Seconds to wait for a release server.
 DOWNLOAD_TIMEOUT = 60.0
@@ -327,7 +328,9 @@ def _download(url: str, *, label: str | None = None, stream=None) -> bytes:
     """Fetch ``url``; with ``label``, report progress on ``stream`` (standard error)."""
     _reachable(url)
     try:
-        with urllib.request.urlopen(url, timeout=DOWNLOAD_TIMEOUT) as response:
+        with urllib.request.urlopen(
+            urllib.request.Request(url, headers=with_agent()), timeout=DOWNLOAD_TIMEOUT
+        ) as response:
             if label is None:
                 return response.read()
             length = response.headers.get("Content-Length")
