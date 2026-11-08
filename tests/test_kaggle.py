@@ -947,6 +947,28 @@ def test_a_notebook_is_warned_about_by_name_when_the_cli_delete_fails(
     assert fake_kaggle.token not in err
 
 
+def test_a_failed_cli_delete_warning_carries_the_http_status_and_reason(
+    fake_kaggle, fake_kaggle_cli, capsys
+) -> None:
+    """Spec "Kaggle session token chain": the warning names what the CLI said, so a token
+    that Kaggle refuses is told apart from a notebook that is already gone."""
+    fake_kaggle_cli.fail.add("delete")
+    fake_kaggle_cli.fail_stderr = (
+        "\n403 Client Error: Forbidden for url: "
+        "https://api.kaggle.com/v1/kernels.KernelsApiService/DeleteKernel\n\n"
+        "You don't have access to this resource.\n"
+    )
+    provider, runtime, _channel = session_channel(fake_kaggle)
+    provider.stop(runtime)
+
+    err = capsys.readouterr().err
+    assert "403 Client Error: Forbidden" in err
+    assert "DeleteKernel" in err
+    assert "API token" in err
+    assert "delete it by hand" in err
+    assert fake_kaggle.token not in err
+
+
 def test_a_notebook_without_a_token_is_warned_about_not_deleted_via_the_cookie(
     fake_kaggle, fake_kaggle_cli
 ) -> None:
