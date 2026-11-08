@@ -191,7 +191,7 @@ signal = "https://letify.darkpyonix.dev"
 
 ### A Tailcat account
 
-Tailcat was removed in 3.0. An account that names `tailcat`, `tailcat_port` or `tailcat_binary` is refused, and the message names the account and the field. To migrate it, run `letify agent serve` on the machine and run `letify login tunnel home_box --connect letify-agent2:...` with the token it prints. Use `--replace` to renew an account that is already declared.
+Tailcat was removed in 3.0. An account that names `tailcat` or `tailcat_port` is refused, and the message names the account and the field. On a `tunnel` account the message gives the migration, and on any other kind it says the field is obsolete since 3.0 and to delete it from the config file. `tailcat_binary` is ignored on every kind, with one line printed per alias saying it can be deleted. To migrate a tunnel account, run `letify agent serve` on the machine and run `letify login tunnel home_box --connect letify-agent2:...` with the token it prints. Use `--replace` to renew an account that is already declared.
 
 Try the simpler paths first. A direct address, then a jump host, then this. Campus machines often allow one of the first two. Details and measurements are in [docs/NETWORK.md](../NETWORK.md).
 
