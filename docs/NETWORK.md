@@ -50,7 +50,7 @@ This is also the only provider family where call forwarding is worth offering. R
 
 ### Why only a direct path
 
-[Connection strategies](SPEC.md#connection-strategies) lists forward SSH, connect back, TCP hole punching, QUIC over a punched UDP pair, reverse SSH and the provider's own path; none of these is a relay, and none is meant to be.
+[Connection strategies](SPEC.md#connection-strategies) lists forward SSH, connect back, TCP hole punching, reverse SSH and the provider's own path; none of these is a relay, and none is meant to be.
 
 The reason is the gap between a direct path and a relayed one, not a difference in reliability. A relayed Tailscale path has been measured as low as 2.2 Mbit/s across continents where the direct path expected 30 to 40 Mbit/s, and Tailscale states that its relay servers limit throughput for fairness; `lab_docker`, below, measured 2 MiB/s and 69 ms over a Tailcat link (Tailcat was removed in 3.0) where a direct LAN connection on the same hardware measured 50 MiB/s and under 1 ms. A relayed path still completes, which is the problem: it bills GPU hours while the transfer dominates the run, and nothing in the result tells the user that happened. So letify does not add a relay path to fall back to, and holds every strategy to the floor in [Link floor](SPEC.md#link-floor): a probe below 10 MiB/s or above 300 ms fails the connection rather than completing it.
 

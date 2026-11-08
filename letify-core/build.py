@@ -1,10 +1,9 @@
-"""Build letify-quic and letify-link and put them where letify looks.
+"""Build letify-link and put it where letify looks.
 
-The wheels carry the QUIC carrier binary in ``letify/remoting/lib/``. The spec's "QUIC over a
-punched UDP pair" describes what it does, and ``letify/transport/quic.py`` finds it there.
-The letify-link sidecar of the spec's "Sidecar interface" sits beside it, built with the Cargo
-feature ``relay``, and ``letify/transport/linkd.py`` finds it there. This script builds the
-workspace and copies both binaries into place.
+The wheels carry the letify-link sidecar in ``letify/remoting/lib/``. The spec's "Sidecar
+interface" describes what it does, built with the Cargo feature ``relay``, and
+``letify/transport/linkd.py`` finds it there. This script builds the workspace and copies
+the binary into place.
 
 Run it from the repository root or from here:
 
@@ -24,15 +23,7 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parent
 
-#: The QUIC carrier each platform's wheel ships. Spec "QUIC over a punched UDP pair": the
-#: remote fetches the same wheel to get its own copy.
-CARRIERS = {
-    "Windows": "letify-quic.exe",
-    "Linux": "letify-quic",
-    "Darwin": "letify-quic",
-}
-
-#: The letify-link sidecar each platform's wheel ships, beside the carrier.
+#: The letify-link sidecar each platform's wheel ships.
 SIDECARS = {
     "Windows": "letify-link.exe",
     "Linux": "letify-link",
@@ -44,19 +35,19 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--debug", action="store_true", help="build without optimizations")
     parser.add_argument(
-        "--target-dir", default=None, help="where letify should find letify-quic"
+        "--target-dir", default=None, help="where letify should find letify-link"
     )
     args = parser.parse_args(argv)
 
     system = platform.system()
-    if system not in CARRIERS:
-        print(f"letify: {system} is not a supported platform for letify-quic", file=sys.stderr)
+    if system not in SIDECARS:
+        print(f"letify: {system} is not a supported platform for letify-link", file=sys.stderr)
         return 1
 
     if shutil.which("cargo") is None:
         print(
             "letify: cargo is not on PATH. Install Rust from https://rustup.rs to build "
-            "letify-quic, or skip it: the QUIC strategy is then left out.",
+            "letify-link.",
             file=sys.stderr,
         )
         return 1
@@ -72,13 +63,6 @@ def main(argv: list[str] | None = None) -> int:
     built = HERE / "target" / profile
     destination = Path(args.target_dir) if args.target_dir else ROOT / "letify" / "remoting" / "lib"
     destination.mkdir(parents=True, exist_ok=True)
-
-    carrier = built / CARRIERS[system]
-    if not carrier.is_file():
-        print(f"letify: cargo did not produce {carrier}", file=sys.stderr)
-        return 1
-    shutil.copy2(carrier, destination / carrier.name)
-    print(f"letify: QUIC carrier installed at {destination / carrier.name}")
 
     sidecar = built / SIDECARS[system]
     if not sidecar.is_file():

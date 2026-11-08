@@ -3,7 +3,7 @@
 Sessions are created and destroyed with ``colab new`` and ``colab stop``. Colab is a
 ``Shell`` whose rendezvous is its provider layer: ``colab exec`` runs letify's remote half
 on the runtime, which installs and starts an SSH server (a Colab VM has none) and answers
-the punch request. The connection pipeline then races TCP hole punching and QUIC, with
+the punch request. The connection pipeline then races TCP hole punching with
 no forward SSH, and falls back to ``colab exec`` itself, one program per
 call. ``channel = "exec"`` in the configuration skips the pipeline and uses that fallback
 directly.

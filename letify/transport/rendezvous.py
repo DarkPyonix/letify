@@ -16,9 +16,6 @@ from typing import Any
 
 from . import nat
 
-#: Seconds the remote gets to download the letify wheel and take ``letify-quic`` out of it.
-QUIC_PREPARE_TIMEOUT = 600.0
-
 
 def remote_script(request: dict[str, Any]) -> str:
     """The standard library module plus one call that answers ``request`` and stays running."""
@@ -54,12 +51,9 @@ def _answer(output: str) -> dict[str, Any]:
 class CommandRendezvous(Rendezvous):
     """A rendezvous that can run a Python program on the remote machine.
 
-    Because it can, it can also prepare ``letify-quic`` on the machine. That belongs here
-    rather than to one provider.
+    Because it can, ``letify.transport.linkchannel`` can also take the letify-link sidecar
+    out of the wheel on the machine through it.
     """
-
-    #: The path of ``letify-quic`` on the machine, taken out of the letify wheel once.
-    quic_binary: str | None = None
 
     def extras(self) -> dict[str, Any]:
         """Fields this provider adds to every request."""
@@ -70,32 +64,7 @@ class CommandRendezvous(Rendezvous):
         """Run ``source`` remotely and return what it printed."""
 
     def exchange(self, request: dict[str, Any], timeout: float) -> dict[str, Any]:
-        if request.get("kind") == "quic":
-            request = {**request, "binary": self.prepare_quic()}
         return _answer(self.run_python(remote_script({**self.extras(), **request}), timeout))
-
-    def prepare_quic(self) -> str:
-        """The path of ``letify-quic`` on the machine, prepared on the first call."""
-        if self.quic_binary is None:
-            self.quic_binary = self._prepare_quic()
-        return self.quic_binary
-
-    def _prepare_quic(self) -> str:
-        """Take ``letify-quic`` out of the letify wheel of this version on the machine.
-
-        Spec "QUIC over a punched UDP pair": a runtime image ships no carrier, and the
-        remote half otherwise looks it up on PATH and fails with FileNotFoundError.
-        """
-        import letify
-
-        from .. import install
-
-        source = install.remote_quic_source(letify.__version__)
-        output = self.run_python(source, QUIC_PREPARE_TIMEOUT)
-        for line in output.splitlines():
-            if line.startswith("LETIFY-QUIC "):
-                return json.loads(line[len("LETIFY-QUIC ") :])
-        raise OSError(f"letify-quic preparation gave no binary path: {output.strip()[-500:]}")
 
 
 class ColabRendezvous(CommandRendezvous):

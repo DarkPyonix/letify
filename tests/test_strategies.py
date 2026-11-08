@@ -258,7 +258,7 @@ def keygen(command: list[str]) -> FakeCompleted:
 def test_reverse_ssh_is_only_raced_when_the_account_sets_it() -> None:
     target = Target(alias="lab", rendezvous=CannedRendezvous())
     assert ReverseSSH().needs(target) == "no reverse_ssh entry"
-    assert ReverseSSH.rank == 5
+    assert ReverseSSH.rank == 4
 
 
 def test_a_reverse_session_key_is_restricted_marked_and_removed_on_close(
@@ -453,8 +453,8 @@ def test_the_remote_half_of_a_reverse_forward_lets_the_server_choose_the_port(
 
 
 def test_the_provider_fallback_is_last_and_moves_behind_reverse_ssh() -> None:
-    assert ProviderFallback().rank == 5
-    assert ProviderFallback(rank=6).rank == 6
+    assert ProviderFallback().rank == 4
+    assert ProviderFallback(rank=5).rank == 5
     assert ProviderFallback().needs(Target(alias="lab")) == "no provider fallback"
     link = OneShotLink("fallback", 4, lambda source, timeout: "out")
     target = Target(alias="lab", fallback=lambda: link)
@@ -658,17 +658,6 @@ def test_the_remote_half_keeps_reading_what_a_helper_prints_after_the_line_it_wa
         assert process.wait(30.0) == 0, "the helper blocked writing to a pipe nobody reads"
     finally:
         process.kill()
-
-
-def test_a_carrier_that_prints_a_lot_is_drained_until_it_ends() -> None:
-    process = _flooding_process("started", 1 << 20)
-    waiter = threading.Thread(target=nat._drain_then_wait(process), daemon=True)
-    waiter.start()
-    waiter.join(30.0)
-    assert not waiter.is_alive(), "the carrier blocked writing to a pipe nobody reads"
-    process.kill()
-
-
 def test_the_punch_asks_the_remote_for_a_window_and_stops_when_it_does(patch_run) -> None:
     # Spec "the simultaneous open": the strategy names the window in the request and uses
     # the punch_until the remote answers with, so a slow rendezvous does not leave the two

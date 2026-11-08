@@ -78,13 +78,13 @@ def test_the_strategy_lists_have_no_tailcat_entry(isolated_home) -> None:
 
     assert not hasattr(strategies, "TailcatUDP")
     shell = provider_of(Shell, "lab", address="gpu.example.edu", port_mapping=False)
-    assert [s.name for s in shell.strategies()] == ["direct_ssh", "tcp_punch", "quic", "fallback"]
+    assert [s.name for s in shell.strategies()] == ["direct_ssh", "tcp_punch", "fallback"]
     kaggle = provider_of(Kaggle, "k", link="ssh")
-    assert [s.name for s in kaggle.strategies()] == ["tcp_punch", "quic", "fallback"]
+    assert [s.name for s in kaggle.strategies()] == ["tcp_punch", "fallback"]
     assert "tailcat" not in [s.name for s in provider_of(Colab, "c", link="ssh").strategies()]
 
 
-def test_the_ranks_are_forward_connect_back_punch_quic_fallback(isolated_home) -> None:
+def test_the_ranks_are_forward_connect_back_punch_fallback(isolated_home) -> None:
     shell = provider_of(
         Shell, "lab", address="gpu.example.edu", port_mapping=False, connect_back={"port": 20130}
     )
@@ -92,8 +92,7 @@ def test_the_ranks_are_forward_connect_back_punch_quic_fallback(isolated_home) -
         ("direct_ssh", 1),
         ("connect_back", 2),
         ("tcp_punch", 3),
-        ("quic", 4),
-        ("fallback", 5),
+        ("fallback", 4),
     ]
 
 

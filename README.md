@@ -146,7 +146,7 @@ uv add letify
 
 That is the whole install, for every provider. letify installs only cloudpickle and blake3. It needs [uv](https://docs.astral.sh/uv/) on the machine, because provider tools such as the Colab CLI and the Modal client run through uv in their own environments, not in your `.venv`.
 
-The wheel carries the `letify-quic` binary built from [letify-core](letify-core/), the Rust workspace. Wheels are built for Linux x86_64 and aarch64, Windows x86_64 and arm64, and macOS arm64 and x86_64. On another platform, pip falls back to the source distribution, which has no `letify-quic`, so the QUIC connection strategy is skipped.
+The wheel carries the `letify-link` binary built from [letify-core](letify-core/), the Rust workspace. Wheels are built for Linux x86_64 and aarch64, Windows x86_64 and arm64, and macOS arm64 and x86_64. On another platform, pip falls back to the source distribution, which has no `letify-link`, so every letify-link path is skipped.
 
 ---
 
@@ -301,8 +301,7 @@ A Kaggle declaration must say `host=letify.remote`. That kernel channel is the o
 
 1. SSH straight to the machine's address
 2. TCP hole punching, for two machines that are both behind NAT
-3. QUIC over a punched UDP pair, then SSH over it
-4. The provider's own path, such as `colab exec` and the Colab file API
+3. The provider's own path, such as `colab exec` and the Colab file API
 
 A lower number wins unless it is far slower than the fastest one that connected. The winner is remembered per account and per network, so the next connection starts with it. A machine behind NAT needs letify installed and `letify agent serve` run on it once, so letify can reach it, with no SSH server. Tailcat is removed, and an account that names `tailcat` is refused with the steps to move it to `letify agent serve`. When a machine's SSH server is published to the outside under another port, such as Docker's `-p 30501:8022`, `letify login tunnel <alias> --address <host> --public-port 30501` records it: SSH straight to the address then dials port 30501, while hole punching keeps using 8022. Colab and Elice never need an agent: their provider layer creates and opens the machine through the provider's own API. Modal is reached through its own API and is not part of this.
 
@@ -491,7 +490,7 @@ Add `--json` to `usage`, `utilization` or `status` for output a program can read
 | 📐 [docs/SPEC.md](docs/SPEC.md) | The design as it stands, decision by decision |
 | 🧩 [docs/COMPONENT.md](docs/COMPONENT.md) | Every class, and the vocabulary |
 | 🌐 [docs/NETWORK.md](docs/NETWORK.md) | Transports, latency measurements, tunnel choices |
-| 🦀 [letify-core/](letify-core/) | The Rust workspace: the `letify` crate and the `letify-quic` binary |
+| 🦀 [letify-core/](letify-core/) | The Rust workspace: the `letify` crate and the `letify-link` binary |
 | 🧭 [docs/guide/](docs/guide/) | Task-oriented guides |
 | 🇰🇷 [docs/locales/README_ko.md](docs/locales/README_ko.md) | 한국어 |
 
