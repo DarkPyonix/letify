@@ -25,6 +25,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from ..errors import ConfigError, ProtocolError, RemoteError, RuntimeFailure
+from ..useragent import with_agent
 
 if TYPE_CHECKING:
     from ..providers.base import Provider
@@ -1026,7 +1027,7 @@ class Stream:
                     "op": "data_pull",
                     "dir": self.blobs,
                     "items": [[digest, bucket.blob_url(digest)]],
-                    "headers": {"Authorization": f"Bearer {self._token}"},
+                    "headers": with_agent({"Authorization": f"Bearer {self._token}"}),
                 },
             )
         if not uploaded:

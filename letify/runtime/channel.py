@@ -313,6 +313,9 @@ class Connection:
         self._slots_lock = threading.Lock()
         self._next_stream = 1
         self._tail = _Tail()
+        #: Bytes of worker output received on this channel, by stream. Spec "Reattaching after
+        #: a lost channel": a reattach tells the worker how much of a call's output arrived.
+        self.received: dict[str, int] = {"stdout": 0, "stderr": 0}
         #: Device executor messages that arrived on ``wire.DEVICE_STREAM``, or None when closed.
         self._device: collections.deque | None = None
         #: ``data_want`` payloads that arrived on ``wire.DATA_STREAM``, for the data sender.
@@ -343,7 +346,9 @@ class Connection:
                 open_slots = list(self._slots.values())
             for slot in open_slots:
                 slot.tail.add(value)
-            self._emit("stdout" if kind == wire.STDOUT else "stderr", value)
+            name = "stdout" if kind == wire.STDOUT else "stderr"
+            self.received[name] += len(value)
+            self._emit(name, value)
         elif kind == wire.HELLO:
             with self._turn:
                 self.hello = value

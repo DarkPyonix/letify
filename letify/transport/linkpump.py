@@ -11,6 +11,8 @@ channel runs, so it imports nothing from letify and avoids syntax newer than Pyt
 # ruff: noqa: SIM115, UP031
 import json
 import os
+import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -21,6 +23,10 @@ MARKER = "LETIFY-MAILBOX "
 POLL_S = 0.05
 STDERR_TAIL = 400
 EXIT_WAIT_S = 2.0
+#: Seconds without a call after which the pump ends its runtime side, whoever is gone.
+IDLE_S = 120.0
+#: Seconds the shim gets to stop its sidecar after its input ends, before it is killed.
+STOP_WAIT_S = 3.0
 
 
 def answer(**fields):
@@ -38,7 +44,7 @@ def start(request, source):
     ):
         with open(os.path.join(directory, name), "w") as handle:
             handle.write(text)
-    for name in ("inbox", "outbox"):
+    for name in ("inbox", "outbox", "seen"):
         open(os.path.join(directory, name), "wb").close()
     errors = open(os.path.join(directory, "pump.err"), "wb")
     subprocess.Popen(
@@ -61,7 +67,45 @@ def pump(directory):
         stdout=subprocess.PIPE,
         stderr=errors,
         close_fds=True,
+        # Its own process group, so that everything the shim started can be ended together.
+        start_new_session=True,
     )
+
+    state = {"handed": False}
+
+    def stop_shim():
+        if shim.poll() is None and not state["handed"]:
+            try:
+                shim.stdin.close()
+            except (OSError, ValueError):
+                pass
+            try:
+                shim.wait(timeout=STOP_WAIT_S)
+            except subprocess.TimeoutExpired:
+                shim.terminate()
+                try:
+                    shim.wait(timeout=STOP_WAIT_S)
+                except subprocess.TimeoutExpired:
+                    shim.kill()
+            # Sweep the group: the sidecar must not outlive a shim that exited without it.
+            try:
+                os.killpg(shim.pid, signal.SIGKILL)
+            except OSError:
+                pass
+
+    def watch():
+        """End this side when the client closed the mailbox or no call has come for IDLE_S."""
+        seen = os.path.join(directory, "seen")
+        while True:
+            time.sleep(0.2)
+            try:
+                idle = time.time() - os.stat(seen).st_mtime > IDLE_S
+            except OSError:
+                idle = True
+            if idle or os.path.exists(os.path.join(directory, "closed")):
+                stop_shim()
+                shutil.rmtree(directory, ignore_errors=True)
+                os._exit(0)
 
     def feed():
         offset = 0
@@ -84,6 +128,7 @@ def pump(directory):
             pass
 
     threading.Thread(target=feed, daemon=True).start()
+    threading.Thread(target=watch, daemon=True).start()
     with open(os.path.join(directory, "outbox"), "ab") as outbox:
         for line in shim.stdout:
             outbox.write(line)
@@ -92,7 +137,10 @@ def pump(directory):
             shim.wait(timeout=EXIT_WAIT_S)
         except subprocess.TimeoutExpired:
             # The shim closed its output and runs on: the hand-over, which ends the mailbox.
-            return
+            # The directory stays until the client's close call or IDLE_S, so a late read works.
+            state["handed"] = True
+            while True:
+                time.sleep(1.0)
         try:
             with open(os.path.join(directory, "shim.err"), "rb") as handle:
                 tail = handle.read()[-STDERR_TAIL:].decode("utf-8", "replace")
@@ -100,11 +148,14 @@ def pump(directory):
             tail = ""
         outbox.write((json.dumps({"event": "eof", "stderr": tail}) + "\n").encode())
         outbox.flush()
+    while True:
+        time.sleep(1.0)
 
 
 def exchange(request, source=None):
     """Append ``send`` to the inbox, wait up to ``wait_s`` for the outbox to pass ``offset``."""
     directory = request["dir"]
+    os.utime(os.path.join(directory, "seen"), None)
     if request.get("send"):
         with open(os.path.join(directory, "inbox"), "ab") as handle:
             for line in request["send"]:
@@ -125,8 +176,14 @@ def exchange(request, source=None):
         time.sleep(POLL_S)
 
 
+def close(request, source=None):
+    """Tell the pump to end its side: stop a shim that has not handed over, remove the directory."""
+    open(os.path.join(request["dir"], "closed"), "wb").close()
+    answer(ok=True)
+
+
 def run(request, source):
     try:
-        {"start": start, "exchange": exchange}[request["op"]](request, source)
+        {"start": start, "exchange": exchange, "close": close}[request["op"]](request, source)
     except Exception as error:
         answer(ok=False, error="%s: %s" % (type(error).__name__, error))

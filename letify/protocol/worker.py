@@ -98,13 +98,23 @@ _SENDER = (TextSender if _LETIFY_TEXT_FRAMES else Sender)(fd_writer(_FRAME_FD))
 #   owner        the door connection that adopted the call, and owner_stream its request id
 #   finished/outcome  the call's reply once the body has ended and before it is delivered
 #   backlog      the tail of output made while no channel could take it
+#   history      the tail of all output the call made, per stream, and total the number of
+#                bytes it made, so an owner that says how much it has received can be given
+#                the rest. Guarded by _HISTORY_LOCK, which also guards the choice of sender.
 _TAKE = {
     "run": None, "path": None, "listener": None, "stream": None, "live": True,
     "ended_input": False, "moved": False, "owner": None, "owner_stream": None,
     "finished": False, "outcome": None, "primary": None, "new_owner": None,
     "backlog": {STDOUT: bytearray(), STDERR: bytearray()},
+    "history": {STDOUT: bytearray(), STDERR: bytearray()},
+    "total": {STDOUT: 0, STDERR: 0},
 }
 _TAKE_COND = threading.Condition()
+
+#: Held by a pump while it records output and picks the sender it goes to, and by an adoption
+#: while it replays the history and switches the sender, so each byte goes to exactly one side
+#: of the switch. Taken after _TAKE_COND, never before.
+_HISTORY_LOCK = threading.Lock()
 
 #: The most output kept for a new owner while no channel could take it, per stream.
 _BACKLOG_BYTES = 256 << 10
@@ -117,6 +127,17 @@ _DOOR_IDLE_S = 30.0
 #: read in order, so every byte written before this has been framed once it is reached.
 #: It is never forwarded. Spec "Worker output".
 _DRAIN_TOKEN = b"\x1a\x1aLETIFY-DRAIN-7f3a9c4e\x1a\x1a"
+
+
+def _remember_output(kind, data):
+    """Add output to the history of the call being served. The caller holds _HISTORY_LOCK."""
+    if _TAKE["run"] is None:
+        return
+    kept = _TAKE["history"][kind]
+    kept += data
+    _TAKE["total"][kind] += len(data)
+    if len(kept) > _BACKLOG_BYTES:
+        del kept[: len(kept) - _BACKLOG_BYTES]
 
 
 def _held_back(data):
@@ -148,7 +169,10 @@ class _Pump(threading.Thread):
             return
         self.busy = True
         try:
-            _SENDER.frame(self.kind, 0, data)
+            with _HISTORY_LOCK:
+                _remember_output(self.kind, data)
+                sender = _SENDER
+            sender.frame(self.kind, 0, data)
         except OSError:
             # While a call runs, a channel that closed must not take the pump with it: the body
             # would die of a broken pipe on its next print. The output is kept for a new owner.
@@ -3759,8 +3783,9 @@ def _door_open(take):
             run=take["run"], live=True, ended_input=False, finished=False, outcome=None,
             path=take["door"],
         )
-        for kept in _TAKE["backlog"].values():
+        for kept in list(_TAKE["backlog"].values()) + list(_TAKE["history"].values()):
             del kept[:]
+        _TAKE["total"] = {STDOUT: 0, STDERR: 0}
     listener = None
     try:
         import socket
@@ -3838,20 +3863,34 @@ def _door_adopt(door, stream, request):
             "state": "finished" if _TAKE["finished"] else "running",
             "orphaned": not was_live,
         }
+        have = request.get("have")
         try:
             door.sender.message(REPLY, stream, {"ok": True, "value": state})
-            for kind in (STDOUT, STDERR):
-                kept = _TAKE["backlog"][kind]
-                if kept:
-                    door.sender.frame(kind, 0, bytes(kept))
-                    del kept[:]
         except OSError:
             return
         door.connection.settimeout(None)
-        _TAKE.update(
-            owner=door, owner_stream=stream, moved=True, live=True, ended_input=False
-        )
-        _SENDER = door.sender
+        with _HISTORY_LOCK:
+            try:
+                for kind in (STDOUT, STDERR):
+                    kept = _TAKE["backlog"][kind]
+                    if have is None:
+                        data = bytes(kept)
+                    else:
+                        # What the owner has not received: the history after its count. A
+                        # count older than the history replays all of it.
+                        key = "stdout" if kind == STDOUT else "stderr"
+                        history = _TAKE["history"][kind]
+                        first = _TAKE["total"][kind] - len(history)
+                        data = bytes(history[max(int(have.get(key, 0)) - first, 0):])
+                    if data:
+                        door.sender.frame(kind, 0, data)
+                    del kept[:]
+            except OSError:
+                return
+            _TAKE.update(
+                owner=door, owner_stream=stream, moved=True, live=True, ended_input=False
+            )
+            _SENDER = door.sender
         _TAKE_COND.notify_all()
         # Told last, after the output has been switched, so that nothing the body prints from
         # the moment the former owner learns of the move is sent to a channel that has stopped

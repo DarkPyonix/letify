@@ -19,7 +19,7 @@ fn tiny_limit(records: u64) -> Config {
     }
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(start_paused = true)]
 async fn a_session_rekeys_after_the_record_limit() {
     let (a, b) = session_pair(tiny_limit(16)).await;
     assert_eq!((a.send_epoch(), b.receive_epoch()), (0, 0));
@@ -103,7 +103,7 @@ async fn add_subflows(a: &letify_link::Session, b: &letify_link::Session, n: usi
     }
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(start_paused = true)]
 async fn records_in_flight_across_a_rekey_are_recovered_by_retransmission() {
     // Four subflows and a limit of 16 records: records of the old epoch are still in flight on
     // some subflows when another subflow carries the first record of the new one. The receiver
@@ -131,7 +131,7 @@ async fn records_in_flight_across_a_rekey_are_recovered_by_retransmission() {
     assert!(b.receive_epoch() >= 4, "epoch {}", b.receive_epoch());
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(start_paused = true)]
 async fn a_forged_epoch_header_does_not_switch_keys() {
     let (a, b, mitm) = session_pair_through_mitm(tiny_limit(1000)).await;
     let mut tx = a.open_stream().await.unwrap();
@@ -159,7 +159,7 @@ async fn a_forged_epoch_header_does_not_switch_keys() {
     assert_eq!(b.dropped_records(), 3);
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(start_paused = true)]
 async fn a_session_resumes_across_a_rekey() {
     // The only subflow runs through an attacker who withholds everything after the handshake,
     // so the receiver sees none of the announcements. The initiator rekeys several times,
@@ -205,7 +205,7 @@ async fn a_session_resumes_across_a_rekey() {
     assert!(got == sent);
 }
 
-#[tokio::test(flavor = "multi_thread")]
+#[tokio::test(start_paused = true)]
 async fn a_session_resumes_across_epochs() {
     let (a, b) = session_pair(tiny_limit(8)).await;
     let mut tx = a.open_stream().await.unwrap();

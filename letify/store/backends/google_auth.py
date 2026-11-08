@@ -24,6 +24,7 @@ import urllib.request
 from pathlib import Path
 
 from ...errors import ProviderUnavailable, RuntimeFailure
+from ...useragent import user_agent
 
 #: Where Google exchanges a refresh token when the credentials file names no other place.
 DEFAULT_TOKEN_URI = "https://oauth2.googleapis.com/token"
@@ -109,6 +110,7 @@ class TokenSource:
         ).encode()
         uri = str(info.get("token_uri") or DEFAULT_TOKEN_URI)
         request = urllib.request.Request(uri, data=form, method="POST")
+        request.add_header("User-Agent", user_agent())
         request.add_header("Content-Type", "application/x-www-form-urlencoded")
         try:
             with urllib.request.urlopen(request, timeout=60) as response:

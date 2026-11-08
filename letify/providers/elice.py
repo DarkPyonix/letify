@@ -44,6 +44,7 @@ from ..errors import (
     UnsupportedMode,
 )
 from ..paths import accounts_label, tools_label
+from ..useragent import user_agent
 from .naming import normalize_gpu
 from .shell import Shell
 from .usage import Usage
@@ -152,6 +153,7 @@ def request(
         url = f"{url}?{urllib.parse.urlencode(params)}"
     data = None if json is None else _json.dumps(json).encode()
     call = urllib.request.Request(url, data=data, method=method)
+    call.add_header("User-Agent", user_agent())
     call.add_header("Authorization", f"Bearer {token}")
     call.add_header("Accept", "application/json")
     for name, value in (headers or {}).items():

@@ -31,6 +31,7 @@ from collections.abc import Iterator
 from typing import Any
 
 from ...errors import ConfigError, ProviderUnavailable, RuntimeFailure
+from ...useragent import with_agent
 from ..cas import Backend
 from .google_auth import TokenSource
 
@@ -265,10 +266,10 @@ class DriveBackend(Backend):
     # -- HTTP ------------------------------------------------------------------
 
     def _headers(self) -> dict[str, str]:
-        return {
+        return with_agent({
             "Authorization": f"Bearer {self.tokens.token()}",
             "x-goog-user-project": self.project,
-        }
+        })
 
     def _call(
         self,
@@ -416,7 +417,7 @@ class DriveBackend(Backend):
             raise RuntimeFailure(f"Drive upload session for {digest} named no upload URL")
         return {
             "url": location,
-            "headers": {"x-goog-user-project": self.project},
+            "headers": with_agent({"x-goog-user-project": self.project}),
             "piece": UPLOAD_PIECE,
         }
 

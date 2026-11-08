@@ -21,6 +21,7 @@ from collections.abc import Iterator
 from typing import Any
 
 from ...errors import ConfigError, ProviderUnavailable, RuntimeFailure
+from ...useragent import user_agent, with_agent
 from ..cas import Backend
 from .google_auth import TokenSource
 from .layout import BLOB_PREFIX, blob_key, ref_key
@@ -93,6 +94,7 @@ class GCSBackend(Backend):
             }
         ).encode()
         request = urllib.request.Request(self.sts_endpoint, data=form, method="POST")
+        request.add_header("User-Agent", user_agent())
         request.add_header("Content-Type", "application/x-www-form-urlencoded")
         try:
             with urllib.request.urlopen(request, timeout=60) as response:
@@ -111,7 +113,7 @@ class GCSBackend(Backend):
         """A Colab runtime is a Compute Engine VM, so it reads the bucket over Google's network."""
         return {
             "url": self.blob_url(digest),
-            "headers": {"Authorization": f"Bearer {self.read_token()}"},
+            "headers": with_agent({"Authorization": f"Bearer {self.read_token()}"}),
         }
 
     def _key(self, key: str) -> str:
@@ -133,6 +135,7 @@ class GCSBackend(Backend):
     ) -> bytes | None:
         """Send one request. A 404 answers None, any other failure raises."""
         request = urllib.request.Request(url, data=data, method=method)
+        request.add_header("User-Agent", user_agent())
         request.add_header("Authorization", f"Bearer {self.tokens.token()}")
         if data is not None:
             request.add_header("Content-Type", "application/octet-stream")
@@ -165,6 +168,7 @@ class GCSBackend(Backend):
         with open(path, "rb") as handle:
             body = _CountingReader(handle, progress)
             request = urllib.request.Request(url, data=body, method="POST")  # type: ignore[arg-type]
+            request.add_header("User-Agent", user_agent())
             request.add_header("Authorization", f"Bearer {self.tokens.token()}")
             request.add_header("Content-Type", "application/octet-stream")
             request.add_header("Content-Length", str(size))

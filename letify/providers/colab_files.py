@@ -24,6 +24,7 @@ from typing import Any
 
 from ..config.secrets import account_directory
 from ..errors import RuntimeFailure
+from ..useragent import with_agent
 
 #: Size of one upload part and one download range.
 PART_BYTES = 32 * 1024 * 1024
@@ -89,7 +90,7 @@ class ContentsTransfer:
         headers: dict[str, str] | None = None,
     ) -> bytes:
         request = urllib.request.Request(address, data=body, method=method)
-        for key, value in {**self._auth_headers(), **(headers or {})}.items():
+        for key, value in with_agent({**self._auth_headers(), **(headers or {})}).items():
             request.add_header(key, value)
         try:
             with urllib.request.urlopen(request, timeout=3600) as response:
