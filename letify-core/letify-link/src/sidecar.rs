@@ -1136,7 +1136,7 @@ async fn await_offers(
 
 /// The result of checking one punched path on the initiator.
 enum Vetted {
-    Usable(String, Punched),
+    Usable(String, Punched, Option<policing::Rates>),
     Policed(String, &'static str, policing::Rates),
     Failed(String, String),
 }
@@ -1151,14 +1151,15 @@ async fn vet<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin + Send,
 {
+    let mut measured = None;
     if let Some((floor, burst)) = police {
         match policing::check(&mut stream, floor, burst).await {
-            Ok(Verdict::Usable(_)) => {}
+            Ok(Verdict::Usable(rates)) => measured = Some(rates),
             Ok(Verdict::Policed(rates)) => return Vetted::Policed(name, proto, rates),
             Err(e) => return Vetted::Failed(name, e.to_string()),
         }
     }
-    Vetted::Usable(name, wrap(stream))
+    Vetted::Usable(name, wrap(stream), measured)
 }
 
 /// Check a punched path as the responder, then hand it to the acceptor.
@@ -1206,6 +1207,14 @@ async fn op_punch(shared: &Arc<Shared>, req: &Value) -> OpResult {
             u64_field(p, "floor_bps")?,
             Duration::from_millis(opt_u64(p, "burst_ms", DEFAULT_BURST_MS)?),
         )),
+    };
+    let shaped_ratio = match req.get("police").and_then(|p| p.get("shaped_ratio")) {
+        None | Some(Value::Null) => None,
+        Some(v) => Some(
+            v.as_f64()
+                .filter(|r| r.is_finite() && *r >= 0.0)
+                .ok_or_else(|| usage("shaped_ratio must be a number of at least 0"))?,
+        ),
     };
     let lead = opt_u64(req, "lead_ms", DEFAULT_LEAD_MS)?;
     let window = opt_u64(req, "window_ms", DEFAULT_WINDOW_MS)?;
@@ -1479,24 +1488,62 @@ async fn op_punch(shared: &Arc<Shared>, req: &Value) -> OpResult {
                     }
                 });
             }
-            let mut names = Vec::new();
+            let mut usable: Vec<(String, Punched, Option<policing::Rates>)> = Vec::new();
             let mut policed = Vec::new();
             let mut failed = Vec::new();
             while let Some(done) = set.join_next().await {
                 match done {
-                    Ok(Vetted::Usable(name, path)) => {
-                        lock(&shared.punched).insert(name.clone(), path);
-                        names.push(name);
-                    }
+                    Ok(Vetted::Usable(name, path, rates)) => usable.push((name, path, rates)),
                     Ok(Vetted::Policed(name, proto, rates)) => {
                         shared.emit(json!({
                             "event": "path_policed", "peer": peer.to_string(), "name": name,
                             "proto": proto, "up_bps": rates.up_bps, "down_bps": rates.down_bps,
+                            "reason": "policed",
                         }));
                         policed.push(name);
                     }
                     Ok(Vetted::Failed(name, why)) => failed.push(format!("{name}: {why}")),
                     Err(e) => failed.push(e.to_string()),
+                }
+            }
+            // The shaped path rule compares the paths that were measured with each other.
+            let measured: Vec<usize> = (0..usable.len())
+                .filter(|i| usable[*i].2.is_some())
+                .collect();
+            let shaped = match shaped_ratio {
+                Some(ratio) => {
+                    let rates: Vec<policing::Rates> =
+                        measured.iter().filter_map(|i| usable[*i].2).collect();
+                    policing::shaped_out(&rates, ratio)
+                }
+                None => vec![false; measured.len()],
+            };
+            let mut dropped = vec![false; usable.len()];
+            for (k, i) in measured.iter().enumerate() {
+                dropped[*i] = shaped[k];
+            }
+            let mut names = Vec::new();
+            for (i, (name, path, rates)) in usable.into_iter().enumerate() {
+                if dropped[i] {
+                    let rates = rates.unwrap_or(policing::Rates {
+                        rtt: Duration::ZERO,
+                        up_bps: 0.0,
+                        down_bps: 0.0,
+                    });
+                    let proto = if matches!(path, Punched::Udp(_)) {
+                        "udp"
+                    } else {
+                        "tcp"
+                    };
+                    shared.emit(json!({
+                        "event": "path_policed", "peer": peer.to_string(), "name": name,
+                        "proto": proto, "up_bps": rates.up_bps, "down_bps": rates.down_bps,
+                        "reason": "shaped",
+                    }));
+                    policed.push(name);
+                } else {
+                    lock(&shared.punched).insert(name.clone(), path);
+                    names.push(name);
                 }
             }
             names.sort();

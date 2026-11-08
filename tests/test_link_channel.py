@@ -972,3 +972,8 @@ def test_a_session_probe_with_no_floor_never_ends_a_direction_early() -> None:
         probe = REAL_MAKE_PROBE(floor)
         assert probe.early_bps is None
         assert probe.min_round_trips == 10
+
+
+def test_the_punch_check_leaves_a_path_under_five_percent_of_the_best_out() -> None:
+    # Spec "NAT traversal" item 4 (Shaped paths): letify asks for the relative rule.
+    assert linkchannel.POLICE["shaped_ratio"] == 0.05
