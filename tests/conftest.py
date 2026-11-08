@@ -216,6 +216,84 @@ def no_public_network(request, monkeypatch) -> Any:
         pytest.fail("\n".join(attempts), pytrace=False)
 
 
+#: The environment variable that names the test a process was started under. Every process a
+#: test starts, detached or not, inherits it, so the teardown can find what the test left.
+TEST_MARK = "LETIFY_TEST_MARK"
+
+
+def leaked_link_processes(mark: str, wait: float = 5.0) -> dict[int, str]:
+    """The letify-link processes still running that were started under ``mark``.
+
+    A sidecar, a shim and a mailbox pump all carry ``letify-link`` in their command line. A
+    process gets ``wait`` seconds to exit, because a close returns before the process is
+    reaped. Zombies are not running and are skipped.
+    """
+    import time
+
+    needle = f"{TEST_MARK}={mark}".encode()
+    deadline = time.monotonic() + wait
+    while True:
+        found: dict[int, str] = {}
+        for entry in Path("/proc").iterdir():
+            if not entry.name.isdigit() or int(entry.name) == os.getpid():
+                continue
+            try:
+                state = (entry / "stat").read_text().rsplit(")", 1)[1].split()[0]
+                environ = (entry / "environ").read_bytes().split(b"\0")
+                raw = (entry / "cmdline").read_bytes()
+            except (OSError, IndexError):
+                continue
+            command = raw.replace(b"\0", b" ").decode("utf-8", "replace")
+            if state != "Z" and needle in environ and "letify-link" in command:
+                found[int(entry.name)] = command[:120]
+        if not found or time.monotonic() >= deadline:
+            return found
+        time.sleep(0.1)
+
+
+def end_link_processes(mark: str | None = None, wait: float = 5.0) -> dict[int, str]:
+    """Kill by pid the letify-link processes started under ``mark``, this test's by default.
+
+    Returns what was still running. A test that must end a process the product keeps by
+    design, such as the shim that serves a taken-over run for its lease window, calls this
+    and says why.
+    """
+    import signal
+
+    found = leaked_link_processes(mark or os.environ[TEST_MARK], wait)
+    for pid in found:
+        with contextlib.suppress(OSError):
+            os.kill(pid, signal.SIGKILL)
+    return found
+
+
+@pytest.fixture(autouse=True)
+def no_link_process_survives(request) -> Any:
+    """Fail a test that leaves a letify-link process it started running at teardown.
+
+    The sidecar of a session, the shim that serves it on the remote side and the mailbox
+    pump are started by the test or by a process the test started. A test that does not
+    close what it opened leaves them for the lease window (300 s), and a full run then ends
+    with orphans. The leftovers are killed by pid so they cannot pile up, and the test fails.
+    """
+    import uuid
+
+    mark = f"{request.node.nodeid}#{uuid.uuid4().hex}"
+    os.environ[TEST_MARK] = mark
+    try:
+        yield
+    finally:
+        os.environ.pop(TEST_MARK, None)
+    left = end_link_processes(mark) if sys.platform == "linux" else {}
+    if left:
+        listing = "\n".join(f"  {pid}: {command}" for pid, command in left.items())
+        pytest.fail(
+            f"{request.node.nodeid} left letify-link processes running (now killed):\n{listing}\n"
+            "Close the LinkRemote, LinkChannel or bootstrap the test opened.",
+            pytrace=False,
+        )
+
+
 @pytest.fixture
 def isolated_home(monkeypatch, tmp_path: Path) -> Path:
     """Point Path.home, "~" expansion and the working directory at empty directories.

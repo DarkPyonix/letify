@@ -450,6 +450,9 @@ def test_a_paired_node_connects_end_to_end_and_unpairing_stops_the_next_connect(
             )
         finally:
             channel.close()
+            # The channel does not own the remote: closing it ends the session, so the shim
+            # leaves at once instead of waiting out the resume window.
+            remote.close()
         agent.home.paired.remove(local.node_id)
         assert wait_for(lambda: any(line.startswith("unpaired") for line in agent.lines), 15)
         with pytest.raises(ProviderUnavailable, match="did not answer"):
