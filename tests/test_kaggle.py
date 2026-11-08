@@ -141,6 +141,34 @@ def test_login_refuses_a_missing_owner_before_declaring_the_account(
     assert accept_cookie == []
 
 
+@pytest.mark.parametrize("owner", ["me@gmail.com", "a b", "me/slug"])
+def test_login_refuses_an_owner_that_is_not_a_kaggle_username(
+    isolated_home, accept_cookie, capsys, owner
+) -> None:
+    """Spec "Kaggle" token input and notebook owner: an email address is not an owner."""
+    assert main(["login", "kaggle", "kaggle_a", "--cookie", make_cookie(),
+                 "--key", API_TOKEN, "--username", owner, "--no-input"]) == 1
+    err = capsys.readouterr().err
+    assert "kaggle.com/<username>" in err
+    assert not account("kaggle_a").exists()
+    assert not (Path.home() / ".letify" / "config.toml").exists()
+    assert accept_cookie == []
+
+
+def test_a_session_with_a_stored_email_owner_is_refused_before_creating_a_notebook(
+    fake_kaggle
+) -> None:
+    """Spec "Kaggle" token input and notebook owner: a stored email owner names no notebook."""
+    from letify.errors import ConfigError
+
+    (account("kaggle_a") / "username").write_text("me@gmail.com", encoding="utf-8")
+    pattern = r"letify login kaggle kaggle_a --replace --username <username>"
+    with pytest.raises(ConfigError, match=pattern):
+        session_channel(fake_kaggle)
+    assert fake_kaggle.cloud_calls == []
+    assert fake_kaggle.kernels == set()
+
+
 def test_an_expired_cookie_is_refused_with_nothing_written(
     isolated_home, accept_cookie, capsys
 ) -> None:
@@ -964,7 +992,10 @@ def test_a_failed_cli_delete_warning_carries_the_http_status_and_reason(
     err = capsys.readouterr().err
     assert "403 Client Error: Forbidden" in err
     assert "DeleteKernel" in err
-    assert "API token" in err
+    assert "irack000/" in err
+    assert "Kaggle username, not an email" in err
+    assert "letify login kaggle kaggle_a --replace --username <username>" in err
+    assert "lack" not in err
     assert "delete it by hand" in err
     assert fake_kaggle.token not in err
 
