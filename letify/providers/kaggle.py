@@ -812,26 +812,27 @@ def list_notebooks_via_cli(alias: str) -> list[str]:
     return live
 
 
-def delete_notebook_via_cli(alias: str, slug: str | None) -> bool:
-    """Delete the ephemeral notebook through the official CLI, the only way it is deleted.
+def delete_notebook_failure(alias: str, slug: str | None) -> str | None:
+    """Delete the ephemeral notebook through the official CLI; None on success, else why not.
 
     Spec "Kaggle session token chain": the cookie is for the interactive session alone, so
-    deleting the notebook afterward never touches it, win or lose. Returns whether the
-    command exited 0; never raises, because the accelerator quota is already released by
-    cancelling the run, and a notebook this call fails to delete is not a new failure for
-    the runtime that just ended.
+    deleting the notebook afterward never touches it, win or lose. Never raises, because the
+    accelerator quota is already released by cancelling the run, and a notebook this call
+    fails to delete is not a new failure for the runtime that just ended. The reason is the
+    first nonblank line of the CLI's standard error when the command ran and failed, which
+    carries the HTTP status and Kaggle's words, and an empty string when it could not run.
     """
     if not slug:
-        return False
+        return ""
     token = read_api_token(alias)
     if token is None:
-        return False
+        return ""
     username = read_notebook_owner(alias)
     if username is None:
-        return False
+        return ""
     uv = tools.find_uv()
     if uv is None:
-        return False
+        return ""
     import subprocess
 
     try:
@@ -841,9 +842,21 @@ def delete_notebook_via_cli(alias: str, slug: str | None) -> bool:
             capture_output=True,
             timeout=REST_TIMEOUT,
         )
-    except (OSError, subprocess.SubprocessError):
-        return False
-    return result.returncode == 0
+    except (OSError, subprocess.SubprocessError) as exc:
+        return type(exc).__name__
+    if result.returncode == 0:
+        return None
+    stderr = result.stderr
+    if isinstance(stderr, bytes):
+        stderr = stderr.decode("utf-8", "replace")
+    lines = [line.strip() for line in (stderr or "").splitlines() if line.strip()]
+    reason = lines[0].replace(token, "***") if lines else f"exit code {result.returncode}"
+    return reason
+
+
+def delete_notebook_via_cli(alias: str, slug: str | None) -> bool:
+    """Whether the CLI deleted the notebook. See ``delete_notebook_failure``."""
+    return delete_notebook_failure(alias, slug) is None
 
 
 def delete_notebook_best_effort(alias: str, kernel_id: int, slug: str | None) -> None:
@@ -851,17 +864,25 @@ def delete_notebook_best_effort(alias: str, kernel_id: int, slug: str | None) ->
 
     Never raises. A notebook the CLI could not delete, for want of a token, of uv, of a
     slug, or because the command itself failed, is reported with a warning naming it by
-    slug or id, never by its cookie, so the user can delete it by hand on kaggle.com.
+    slug or id, never by its cookie, so the user can delete it by hand on kaggle.com. A
+    command that ran and failed adds what the CLI said, and a 403 adds the likely cause.
     """
-    if delete_notebook_via_cli(alias, slug):
+    reason = delete_notebook_failure(alias, slug)
+    if reason is None:
         forget_notebook(alias, slug)
         return
     import sys
 
     name = f"slug {slug}" if slug else f"id {kernel_id}"
+    detail = f": {reason}" if reason else ""
+    if "403" in reason:
+        detail += (
+            ". The account's API token may lack the permission to delete notebooks; "
+            "create a new token on kaggle.com with that permission"
+        )
     print(
-        f"letify: {alias}: could not delete the Kaggle notebook ({name}); delete it by hand "
-        f"on kaggle.com",
+        f"letify: {alias}: could not delete the Kaggle notebook ({name}){detail}; delete it "
+        f"by hand on kaggle.com",
         file=sys.stderr,
     )
 
@@ -1823,6 +1844,7 @@ __all__ = [
     "cookie_expiry",
     "cookie_headers",
     "delete_notebook_best_effort",
+    "delete_notebook_failure",
     "delete_notebook_via_cli",
     "live_session_url",
     "read_api_token",

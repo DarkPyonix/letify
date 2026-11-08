@@ -2349,6 +2349,8 @@ class FakeKaggleCLI:
         self.calls: list[list[str]] = []
         self.environments: list[dict[str, str]] = []
         self.fail: set[str] = set()
+        #: Standard error a failing command answers with.
+        self.fail_stderr = "refused"
         #: Standard output a ``kernels list --csv`` call answers with. Kaggle names a
         #: notebook itself, so the titles are its own and the record is what tells
         #: letify's notebooks from the user's.
@@ -2386,7 +2388,7 @@ class FakeKaggleCLI:
             return FakeCompleted(returncode=1, stdout="", stderr="Authentication required")
         for marker in self.fail:
             if marker in command:
-                return FakeCompleted(returncode=1, stdout="", stderr="refused")
+                return FakeCompleted(returncode=1, stdout="", stderr=self.fail_stderr)
         if "quota" in command:
             return FakeCompleted(returncode=0, stdout=self.quota_json, stderr="")
         if "list" in command:
