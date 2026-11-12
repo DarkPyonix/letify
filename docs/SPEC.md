@@ -739,13 +739,13 @@ A frame is a header followed by `length` payload bytes. The header is `struct.St
 |---|---|---|
 | magic | 2 bytes | `b"LF"`. Any other value is a `ProtocolError` |
 | type | 1 byte | the frame type below |
-| flags | 1 byte | 0, reserved |
+| flags | 1 byte | bit 0, `PICKLED_HEAD`: the head of this `REQUEST` or `REPLY` is a protocol 5 pickle, as [Worker protocol](#worker-protocol) says. Bits 1 to 7 are 0. A frame with one set is refused with the code `bad_frame` |
 | stream | 4 bytes | the stream id, unsigned, little endian |
 | length | 8 bytes | payload bytes that follow, unsigned, little endian |
 
 | Type | Name | Direction | Payload |
 |---|---|---|---|
-| 1 | `HELLO` | worker to client | the interpreter's `<major>.<minor>` in ASCII |
+| 1 | `HELLO` | both | a handshake map, as [Worker protocol](#worker-protocol) describes. The worker sends it first and the client answers with its own |
 | 2 | `REQUEST` | client to worker | a message head |
 | 3 | `REPLY` | worker to client | a message head |
 | 4 | `DATA` | both | the next bytes of the out-of-band buffers of the message open on `stream` |
@@ -755,7 +755,7 @@ A frame is a header followed by `length` payload bytes. The header is `struct.St
 
 Streams multiplex the one pipe pair. Stream 0 carries `HELLO`, `STDOUT`, `STDERR` and `SHUTDOWN`. Each request takes the next odd stream id from 1 upward, and its `REQUEST`, its `REPLY` and the `DATA` frames of both use that id. Stream 2 carries the PyTorch device executor's messages, as [Transport](#forwarding-transport) describes.
 
-A message is one Python object. It is pickled with protocol 5 and a `buffer_callback`, so every `PickleBuffer` inside it, such as a `bytearray`, a `bytes` value of 1 MiB or more at the top level or inside a list, tuple or dict, or a NumPy array, becomes an out-of-band buffer instead of being copied into the pickle. The head frame's payload is `<I>` buffer count, `<Q>` length of each buffer, then the pickle. The buffers follow in order as `DATA` frames of at most 8 MiB each. The sender writes each frame with `os.write` on a `memoryview` of the buffer, so no joined copy is made. The receiver preallocates one buffer per out-of-band buffer and fills it with `readinto`, then unpickles with `buffers=`. The high bit of a buffer's 8 byte length marks a buffer that unpickles as a `bytes` value. For such a buffer the receiver allocates an uninitialized `bytes` object of that length with `PyBytes_FromStringAndSize(NULL, n)` through `ctypes` and reads into it, so the unpickled value is that object and no copy is made. Where `ctypes` is unavailable it reads into a `bytearray` and `bytes()` copies it once. Any other buffer is read into a `bytearray`. Peak memory for a `bytes` value is therefore one copy on each side.
+A message is a head and its out-of-band buffers. The head is a map in the encoding of [Worker protocol](#worker-protocol), where a byte string of 1 MiB or more is an out-of-band buffer instead of being copied into the head. The head of a message on stream 2 is instead one Python object pickled with protocol 5 and a `buffer_callback`, so every `PickleBuffer` inside it, such as a `bytearray` or a NumPy array, becomes an out-of-band buffer, and the frame has `PICKLED_HEAD` set. A pickle inside a head envelope, as the `call` op carries, is built the same way. The head frame's payload is `<I>` buffer count, `<Q>` length of each buffer, then the head. The buffers follow in order as `DATA` frames of at most 8 MiB each. The sender writes each frame with `os.write` on a `memoryview` of the buffer, so no joined copy is made. The receiver preallocates one buffer per out-of-band buffer and fills it with `readinto`, then unpickles with `buffers=`. The high bit of a buffer's 8 byte length marks a buffer that the receiver materializes as a `bytes` value: every buffer a head references as a byte string, and a buffer of a pickle that was a `bytes` value. A receiver that has no such type, such as the Rust crate, treats every buffer as a byte string. For such a buffer the receiver allocates an uninitialized `bytes` object of that length with `PyBytes_FromStringAndSize(NULL, n)` through `ctypes` and reads into it, so the unpickled value is that object and no copy is made. Where `ctypes` is unavailable it reads into a `bytearray` and `bytes()` copies it once. Any other buffer is read into a `bytearray`. Peak memory for a `bytes` value is therefore one copy on each side.
 
 A PyTorch tensor is pickled by letify's own reducer rather than by `Tensor.__reduce_ex__`, which copies the whole storage into the pickle. The reducer applies to an object of exact type `torch.Tensor` or `torch.nn.Parameter` on the CPU, with a strided layout, no autograd history of its own (a leaf) and at least one element. Such a tensor, made contiguous first when it is not, pickles as `torch.frombuffer` over its bytes, then `reshape` to its shape, then `requires_grad_` when it requires grad, and `Parameter` wraps it when it was one. Its bytes are a `PickleBuffer` when they are 64 KiB or more, so they travel as an out-of-band buffer written from the tensor's own memory, and a `bytearray` copied into the pickle otherwise. Every other tensor keeps PyTorch's own pickling. The reducer references PyTorch functions only, so a worker without letify unpickles it, and a message without tensors pays nothing for it. The same reducer is used by `wire.dumps`, by `codec.dumps_call_parts` on top of cloudpickle, and by `codec.pickle_value_parts` on top of cloudpickle for the `put_blob` pickle of [argument addressing](#argument-addressing). A view is sent as the bytes it covers, not the whole storage it views, and two tensors that share one storage arrive as two separate tensors.
 
@@ -765,7 +765,153 @@ Frames of different streams interleave. A writer holds the write lock for one fr
 
 A 64 MiB value moves at least 300 MiB/s in each direction through a local worker. The test `a_64_mib_value_moves_at_least_300_mib_per_second_each_way_on_this_machine` checks that floor as it stands, except when the `CI` environment variable is set: a shared runner moves bytes at a rate that varies several times between runs, so there the floor is 5% of the rate of a plain socketpair copy of 64 MiB measured in the same process. The measurements behind the 5% are in the pull request of the commit that introduced it.
 
-The worker announces itself with a `HELLO` frame naming the version of the interpreter it runs on. A worker asked to move to another interpreter replies, then replaces its process with `os.execv(<interpreter>, [<interpreter>, "-u", "-c", <bootstrap stub>])` on the same pipes, and the channel sends the worker source again and waits for the new `HELLO`. No other request is sent between the `reexec` request and that `HELLO`.
+The worker announces itself with a `HELLO` frame, and no request is read before the client has answered it, as [Worker protocol](#worker-protocol) describes. A worker asked to move to another interpreter replies, then replaces its process with `os.execv(<interpreter>, [<interpreter>, "-u", "-c", <bootstrap stub>])` on the same pipes, and the channel sends the worker source again, waits for the new `HELLO` and answers it, so the handshake runs again against the new interpreter. No other request is sent between the `reexec` request and that `HELLO`.
+
+### Worker protocol <!-- id: worker-protocol -->
+
+> The framed protocol is version 4: a handshake that negotiates capabilities, and message heads in a binary format that any language can read, so a client that is not Python can talk to a letify worker directly.
+
+The frame header and the frame types are those of [Frames](#frames). This section defines what the frames carry. The Rust crate [letify-proto](#letify-proto-crate) implements it, and the Python side implements the same bytes in pure Python with the standard library only, in `letify/protocol/head.py`. That module owns the head encoding and no I/O. Like `wire.py`, its source is sent to the runtime ahead of the worker body.
+
+#### Handshake <!-- id: worker-handshake -->
+
+A carrier is one pipe pair or one connection that frames run over: the worker's standard input and output, a data connection, or a connection to the second door of [Taking over a running call](#run-takeover). Each carrier starts the same way:
+
+1. The worker sends a `HELLO` frame on stream 0. Its payload is a head map with these keys, all required:
+
+   | Key | Value |
+   |---|---|
+   | `role` | `"worker"` |
+   | `proto` | the highest protocol version the worker speaks, an integer. This specification defines 4 |
+   | `min` | the lowest protocol version the worker accepts, an integer |
+   | `language` | the language of the worker's `exec` source, such as `"python"` |
+   | `runtime` | the interpreter or runtime version, `"3.12"` for Python 3.12 |
+   | `agent` | the implementation and its version, such as `"letify 3.1.0"`, for messages only |
+   | `capabilities` | an array of the capability names the worker offers |
+   | `limits` | a map with `head`, the largest head frame payload in bytes (67108864), and `chunk`, the largest `DATA` payload (8388608) |
+
+2. The client sends a `HELLO` frame on stream 0 with the same keys, `role` `"client"`, no `runtime` and no `limits`. Its `capabilities` are the ones it wants to use. A key the receiver does not know is ignored.
+3. The worker answers with a `REPLY` on stream 0. The agreed protocol is the lower of the two `proto` values, and it must be at least both `min` values. The agreed capabilities are those in both arrays. On success the reply is `{"ok": true, "proto": <agreed>, "capabilities": [<agreed>]}`. On failure it is an outcome with `failure` `"infrastructure"` and `code` `"version_mismatch"`, whose `error` names both sides' `proto` and `min`, their `agent`, and which side to upgrade, and the worker exits with status 4.
+
+The worker reads no `REQUEST` until it has the client's `HELLO`. A frame of another type than `HELLO` first on stream 0 from the client means the client speaks protocol 3 or older: the worker writes `letify: the client speaks an older letify protocol than 4; upgrade the client` to its standard error and exits with status 4. A client reads the worker's `HELLO` before anything else. A payload whose first byte is an ASCII digit is the `<major>.<minor>` of protocol 3 or older, and the client raises `ProtocolError` saying that the worker speaks an older protocol, naming the interpreter version it announced and that the worker is started by the letify that ships with the client, so a worker left over from an older letify must be ended.
+
+A request an agreed capability set does not cover is answered with `failure` `"infrastructure"` and `code` `"capability_missing"`. No frame sent before the handshake is complete is read as a request.
+
+Python letify accepts protocol 4 only, so its `min` and `proto` are both 4. The worker source is sent by the client at the start of every session from the same wheel, so a Python client and the worker it starts are never of different versions, and nothing older is kept. A worker that outlives its client for [Taking over a running call](#run-takeover) or [Reattaching after a lost channel](#run-reattach) and was started by a different protocol version is refused by the handshake with `version_mismatch`, and the run is not taken over.
+
+Capabilities:
+
+| Name | Offered by | Covers |
+|---|---|---|
+| `blobs` | every worker | `have`, `put_blob` with `kind` `"bytes"`, `release`, `blob_dir` |
+| `files` | every worker | `put_file`, `get_file`, `pull`, `pack_dir`, `pack_blob`, `push_blob`, `pack_push_start`, `pack_push_target`, `pack_push_state` |
+| `data` | every worker | the `data_*` ops and the requests the worker sends on stream 4 |
+| `exec` | every worker | `exec`, `eval`, `inspect_exec` |
+| `takeover` | every worker | `adopt` |
+| `python` | a Python worker | `call`, `reexec`, `device`, `place_blob`, `reduce_peers`, `drive_grant`, and the requests the worker sends on streams 6 and 8 |
+| `pickle` | a Python worker and a Python client | pickle envelopes, `put_blob` with a pickled value, and the pickled heads of stream 2 |
+
+`stat`, `lease`, `register`, `interrupt`, `STDOUT`, `STDERR` and `SHUTDOWN` need no capability. The Python client offers all of them. A Rust client offers the first five rows and no more.
+
+#### Head encoding <!-- id: worker-head-encoding -->
+
+A head is one value in a subset of CBOR, RFC 8949, called the head encoding here. A `REQUEST` or `REPLY` payload is `<I>` buffer count, `<Q>` length of each buffer, then the head, all little endian as in [Frames](#frames), and the head is a map with text keys. The subset:
+
+| CBOR | Use |
+|---|---|
+| major type 0 and 1 | an integer from -2^63 to 2^64 - 1. The encoder writes the shortest form, and the decoder accepts any definite form |
+| major type 2 | a byte string of definite length |
+| major type 3 | UTF-8 text of definite length. Invalid UTF-8 is `bad_head` |
+| major type 4 | an array of definite length |
+| major type 5 | a map of definite length whose keys are all text. A duplicate key is `bad_head` |
+| `0xF4`, `0xF5`, `0xF6` | false, true, null |
+| `0xFB` | a 64 bit float, big endian. A float of another width is `bad_head` |
+| tag 40001 | an out-of-band buffer reference, below |
+| tag 40002 | a pickle envelope, below |
+
+Anything else is `bad_head`: indefinite lengths, other tags, other simple values, `undefined`, maps with a non-text key. Nesting is at most 32 levels deep. Integers in a head are those of the op's own fields, so a Python `bool` is a boolean and not 0 or 1.
+
+An encoder writes the keys of a map in the bytewise order of their encoded form, which is RFC 8949 section 4.2.1, so one message has one encoding and the test vectors compare bytes. A decoder accepts any order.
+
+A byte string may be an out-of-band buffer. The encoder writes tag 40001 around an unsigned integer, the index into the head frame's buffer table, in place of the byte string. The decoder gives the byte string at that index. A byte string of 1 MiB or more is always sent this way, and a smaller one may be. Indexes are used in increasing order from 0, each once, and a head that breaks that is `bad_head`. The `DATA` frames, their 8 MiB chunks and the in-place read are those of [Frames](#frames). Every entry the head references as a byte string has the high bit of its length set.
+
+A pickle envelope is tag 40002 around an array of two items: the pickle as a byte string, and an array of the out-of-band buffer references the pickle was made with, in the order `pickle.loads(buffers=)` takes them. Its entries do not have the high bit set, except for a `bytes` value inside the pickle that the reducer sent as a buffer. An envelope is a value of kind `python`; every other value is a value of kind `neutral`. A peer without the `pickle` capability that receives an envelope answers `capability_missing`, and a Rust client that receives one in a reply hands it to its caller as the opaque bytes it is.
+
+The encoder never pickles on its own. A Python value of a type the head encoding lacks, such as a `set`, a tuple used as a key or an object, raises `TypeError` where it is encoded. A tuple is an array, and a `pathlib.Path` is its text. The decoder gives `None`, `bool`, `int`, `float`, `str`, `bytes`, `list` and `dict`, and a pickle envelope as an object the receiver unpickles when it needs the value. Where the agreed capabilities include `pickle`, an op whose value is any Python object, which is `call`, `eval` and `inspect_exec`, sends the value as an envelope when it is not natively encodable. Without `pickle`, such a value is a `user` failure with `code` `"unencodable_value"`.
+
+The head of a message on stream 2 is a protocol 5 pickle with `PICKLED_HEAD` set, and a peer uses stream 2 only when both `python` and `pickle` are agreed. A head of any other stream with `PICKLED_HEAD` set is `bad_head`. Stream 2 is a hot path of at most a few thousand messages per second, and its heads are already built from tensors and handles, which have no neutral form.
+
+#### Requests <!-- id: worker-requests -->
+
+A request head is a map with `op`, the op name, and the op's own fields, whose names and meanings are those of the section that describes the op. The ops that need no pickle are neutral. A neutral op is available to a client in any language, and its fields use only the types above. The ops that carry or return Python objects are the ones in the `python` and `pickle` rows of the capability table. `exec`, `eval` and `inspect_exec` take `source` in the language the worker's `HELLO` names, so they are neutral in encoding and not in meaning. A reply to `eval` carries the value `__letify_value__` or its equivalent.
+
+A request that fails to decode is answered with `failure` `"infrastructure"` and `code` `"bad_head"`. An `op` the worker does not have is answered with `code` `"unknown_op"`. Neither runs anything.
+
+The ops of [Call protocol](#call-protocol), [Argument addressing](#argument-addressing) and the other sections that define them are unchanged in meaning. Two fields change shape. `call` carries `payload` as a pickle envelope and has no `buffers` field, because the envelope names its buffers. `put_blob` with `kind` `"bytes"` carries `value` as a byte string, and with any other `kind` carries `value` as a pickle envelope in place of `head` and `buffers`.
+
+#### Outcomes and failures <!-- id: worker-outcomes -->
+
+A `REPLY` head is a map with these keys:
+
+| Key | When | Value |
+|---|---|---|
+| `ok` | always | a boolean |
+| `last` | on the last reply of a streamed answer | `true` |
+| `value` | `ok` is true | a head value, native or an envelope. `null` when the op returns nothing |
+| `failure` | `ok` is false | `"user"` or `"infrastructure"` |
+| `code` | `ok` is false | a short stable text naming the cause, below |
+| `error` | `ok` is false | text for a person: the exception's type and message for a `user` failure |
+| `traceback` | `ok` is false | text, empty when there is none. It is in the worker's own language and format |
+| `error_type` | `failure` is `"user"` | the exception class name, empty when the language has none |
+| `run`, `owner` | `code` is `"moved"` | the run id as text and the new owner's process id as an integer |
+
+`failure` is `"user"` when the code a client sent raised, and it is never retried. It is `"infrastructure"` when the worker or its link failed, and it may be retried on a fresh runtime. The two never share a code. The codes:
+
+| `failure` | `code` | Python client raises |
+|---|---|---|
+| `user` | `exception` | `RemoteError`, with `error` and `traceback` |
+| `user` | `unencodable_value` | `RemoteError`, saying the return value could not be encoded and why |
+| `infrastructure` | `runtime` | `RuntimeFailure`. A blob that did not arrive, a full disk, a failed pull |
+| `infrastructure` | `moved` | `OwnershipMoved` |
+| `infrastructure` | `bad_frame`, `bad_head`, `unknown_op`, `capability_missing`, `version_mismatch` | `ProtocolError` |
+
+A client written in another language maps `failure` to its own retry rule and uses `code` for display and tests. A code it does not know is treated as its `failure` value says. A worker's own reply of a code not in this table is a bug.
+
+A reply that cannot be framed, such as a value that cannot be encoded, becomes a reply that can: a `user` failure with `code` `"unencodable_value"` and the reason in `error`.
+
+#### Frames that are not messages <!-- id: worker-stream-frames -->
+
+`STDOUT` and `STDERR` payloads are raw bytes with no head, and `SHUTDOWN` is empty, as before. A frame with an unknown type, a bad magic, a set flag bit that is not defined, a head longer than `limits.head`, or a `DATA` frame for a stream with no open message is `bad_frame`. The receiver answers a request's stream with that failure when the frame has one, and otherwise ends the carrier.
+
+#### Not part of this protocol <!-- id: worker-protocol-scope -->
+
+The one-shot driver of [Call protocol](#call-protocol) is not framed and does not change. It keeps its own pickled outcome and its own version constant `DRIVER_VERSION`, which is 3 and is renamed from `PROTOCOL_VERSION`. The `SEGMENT` frame of a striped connection is a transport detail below the message layer and is not part of the crate.
+
+### The letify-proto crate <!-- id: letify-proto-crate -->
+
+> `letify-proto` is a Rust crate that encodes and decodes the frames and heads of the worker protocol and runs its handshake, and does no I/O of its own.
+
+The crate lives in `letify-core/letify-proto` as a member of the workspace and has the workspace's version. It depends on the standard library only. Its modules:
+
+| Module | Holds |
+|---|---|
+| `head` | `Value` (null, bool, int, float, text, bytes, array, map, buffer reference, pickle envelope), `encode` and `decode` of the head encoding, with the limits above |
+| `frame` | `Header`, `FrameType`, `FrameReader<R: Read>` and `FrameWriter<W: Write>`, and message assembly: a head frame and its `DATA` frames become a `Message` of a head `Value` and its buffers, a message is written as a head frame and `DATA` frames of at most 8 MiB |
+| `handshake` | `ClientHandshake` and `WorkerHandshake`, state machines that take frames and give frames, the agreed protocol and capabilities, and the refusal with `version_mismatch` |
+| `outcome` | `Outcome`, `Failure`, `FailureKind` and the code table of [Outcomes and failures](#worker-outcomes) |
+| `ops` | builders and parsers for the neutral ops |
+
+The crate has no unsafe code and no required dependency. The `tokio` feature adds `AsyncFrameReader` and `AsyncFrameWriter` over `AsyncRead` and `AsyncWrite`. A transport, such as a child process, SSH or a letify-link session, is the caller's. Its crates.io name is reserved at 0.0.0 as [Versioning and releases](#versioning) describes for every `letify-*` name.
+
+### Worker protocol conformance <!-- id: worker-protocol-conformance -->
+
+> One file of hex frames and their meaning is checked by the Python tests and the Rust tests, and a Rust client is checked against a real Python worker.
+
+1. **Shared vectors.** `tests/vectors/worker-protocol.json` holds a list of cases, each with `name`, `kind` (`head`, `frame`, `handshake` or `outcome`), `hex` (the bytes), `buffers` (the hex of each out-of-band buffer, when there are any), `decoded` (the meaning in JSON, with a byte string as `{"$bytes": "<hex>"}`, a buffer reference as `{"$buffer": <index>}` and an envelope as `{"$pickle": "<hex>", "buffers": [...]}`) and `error` (null, or the code the decoder gives). Every positive case is decoded and re-encoded, and the bytes must equal `hex`. Every negative case must fail with its code. The cases cover each CBOR major type and integer width at its boundary, each refusal in the head encoding, the buffer table, each frame type, a `HELLO` in each direction, a refusal with `version_mismatch`, a protocol 3 `HELLO`, and one outcome for each `code`.
+2. **Python tests.** `tests/test_head.py` and `tests/test_worker_protocol.py` read the file through `letify/protocol/head.py` and `wire.py`. A vector is added in the same change as the behaviour it pins, and a behaviour that changes a vector changes this section.
+3. **Rust tests.** The crate's tests read the same file. `cargo package` leaves `tests/` out, so a published crate carries no copy.
+4. **Live check.** A Rust test client starts a worker through the `Local` provider's own start-up and completes the handshake, sends `stat`, `put_file`, `get_file`, `have`, `put_blob` and `exec` with output on standard output, and reads the `STDOUT` frames, then `SHUTDOWN`. It also checks that a worker started at a different `proto` is refused with `version_mismatch`. The check runs in CI beside the crate's tests.
+5. **A live run before merge.** A change to the head encoding, the handshake or the frames is merged only after one live run on Colab or Kaggle that covers a call with a large argument, a returned value, output on both streams and a deliberate shutdown. The `Local` provider tests the code and not a link that loses bytes.
 
 ### Worker output <!-- id: worker-output -->
 
@@ -916,7 +1062,7 @@ The adapter never deploys an app. `create` starts `modal.App(app).run()` the fir
 
 > A call is a serialized function plus arguments, and the outcome comes back on the same channel.
 
-The local side pickles `(function, args, kwargs)` with cloudpickle, protocol 5 and a `buffer_callback`, and sends `{"op": "call", "payload": <pickle>, "buffers": [<out-of-band buffers>]}` as one message in [frames](#frames). The outcome comes back as the message `{"ok": True, "value": <value>}` or `{"ok": False, "error": <text>, "traceback": <text>}`, so a large returned value travels as out-of-band buffers too.
+The local side pickles `(function, args, kwargs)` with cloudpickle, protocol 5 and a `buffer_callback`, and sends the message `{"op": "call", "payload": <pickle envelope>}` in [frames](#frames), where the pickle envelope of [Worker protocol](#worker-protocol) carries the pickle and its out-of-band buffers. The outcome comes back as the message `{"ok": true, "value": <pickle envelope>}` or a failure with the fields [Outcomes and failures](#worker-outcomes) defines, so a large returned value travels as out-of-band buffers too. `call` needs the capabilities `python` and `pickle`. A client without them does not send it.
 
 Base64 appears only where a transport carries text: the one-shot driver, the Colab contents API, and the JSON lines of the Modal adapter.
 
