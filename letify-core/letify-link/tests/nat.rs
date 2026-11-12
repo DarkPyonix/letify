@@ -317,3 +317,65 @@ async fn an_unthrottled_path_is_usable() {
         "{rates:?}"
     );
 }
+
+// -- A path far below the best path of its session is left out (spec "Shaped paths") ----------
+
+/// Measure a loopback path whose two directions are limited to `rate` bytes per second. The
+/// floor is 100 KiB/s, so a twentieth of it is 5 KiB/s.
+async fn measured(rate: f64) -> policing::Rates {
+    let server = responder().await;
+    let proxy = policing_proxy(server, rate).await;
+    let stream = TcpStream::connect(proxy).await.unwrap();
+    let verdict = policing::check(stream, 100 * 1024, Duration::from_millis(500))
+        .await
+        .unwrap();
+    let Verdict::Usable(rates) = verdict else {
+        panic!("{verdict:?}")
+    };
+    rates
+}
+
+fn rates(up: f64, down: f64) -> policing::Rates {
+    policing::Rates {
+        rtt: Duration::from_millis(10),
+        up_bps: up,
+        down_bps: down,
+    }
+}
+
+#[tokio::test]
+async fn a_path_at_two_percent_of_the_others_is_shaped_out() {
+    let fast = measured(2.0 * 1024.0 * 1024.0).await;
+    let also_fast = measured(2.0 * 1024.0 * 1024.0).await;
+    let shaped = measured(40.0 * 1024.0).await;
+    let ratio = shaped.down_bps / fast.down_bps;
+    assert!(ratio < 0.05, "the throttled path is {ratio} of the others");
+    let out = policing::shaped_out(&[fast, shaped, also_fast], policing::SHAPED_RATIO);
+    assert_eq!(out, vec![false, true, false]);
+}
+
+#[test]
+fn a_path_at_half_the_best_is_kept() {
+    let out = policing::shaped_out(&[rates(1e6, 1e6), rates(5e5, 5e5)], policing::SHAPED_RATIO);
+    assert_eq!(out, vec![false, false]);
+}
+
+#[test]
+fn a_path_shaped_in_one_direction_only_is_shaped_out() {
+    let out = policing::shaped_out(&[rates(1e6, 1e6), rates(1e6, 2e4)], policing::SHAPED_RATIO);
+    assert_eq!(out, vec![false, true]);
+}
+
+#[test]
+fn the_best_path_is_never_shaped_out_whatever_the_ratio() {
+    // A ratio above 1 asks every path to beat the best, which none can.
+    let out = policing::shaped_out(&[rates(2e6, 2e6), rates(1e6, 1e6)], 2.0);
+    assert_eq!(out, vec![false, true]);
+    assert_eq!(policing::shaped_out(&[rates(1.0, 1.0)], 2.0), vec![false]);
+    let same = policing::shaped_out(&[rates(1e6, 1e6), rates(1e6, 1e6)], 2.0);
+    assert_eq!(same.iter().filter(|s| !**s).count(), 1);
+    // Paths that measured nothing give no best to compare with.
+    let none = policing::shaped_out(&[rates(0.0, 0.0), rates(0.0, 0.0)], policing::SHAPED_RATIO);
+    assert_eq!(none, vec![false, false]);
+    assert!(policing::shaped_out(&[], policing::SHAPED_RATIO).is_empty());
+}

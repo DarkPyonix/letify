@@ -39,10 +39,11 @@ PREPARE_TIMEOUT = 600.0
 #: Seconds the shim gets to start the remote sidecar and print its ready line.
 SHIM_TIMEOUT = 60.0
 #: TCP and UDP sockets a punch opens, and the policing check each punched path passes: a floor of
-#: 1 MiB/s and bursts of 500 ms. Spec "Sidecar interface" item 3.
+#: 1 MiB/s, bursts of 500 ms and a path under 5% of the best one left out. Spec "Sidecar
+#: interface" item 3.
 PUNCH_TCP = 4
 PUNCH_UDP = 1
-POLICE = {"floor_bps": 1 << 20, "burst_ms": 500}
+POLICE = {"floor_bps": 1 << 20, "burst_ms": 500, "shaped_ratio": 0.05}
 #: The punch window of a first attempt over a command channel, in milliseconds, and the factor
 #: the retry's window is longer by. Spec "Sidecar interface" item 8.
 PUNCH_WINDOW_MS = 20_000

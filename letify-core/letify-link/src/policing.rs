@@ -33,6 +33,34 @@ const OP_DOWN: u8 = b'D';
 const ACK: u8 = b'A';
 const END: u8 = b'E';
 
+/// The share of the best usable path's rate under which a path is shaped, in either direction.
+pub const SHAPED_RATIO: f64 = 0.05;
+
+/// The paths of one set that the shaped path rule leaves out: `true` at the index of a path
+/// whose rate in either direction is under `ratio` times the best path's rate in that
+/// direction. The path with the highest share of the best in its weaker direction is never
+/// left out, so the set keeps a path. A direction in which no path measured anything has no
+/// best, and a set of one path has nothing to compare with.
+pub fn shaped_out(rates: &[Rates], ratio: f64) -> Vec<bool> {
+    let best_up = rates.iter().map(|r| r.up_bps).fold(0.0, f64::max);
+    let best_down = rates.iter().map(|r| r.down_bps).fold(0.0, f64::max);
+    let share = |x: f64, best: f64| if best > 0.0 { x / best } else { 1.0 };
+    let weakest: Vec<f64> = rates
+        .iter()
+        .map(|r| share(r.up_bps, best_up).min(share(r.down_bps, best_down)))
+        .collect();
+    let keeper = weakest
+        .iter()
+        .enumerate()
+        .max_by(|a, b| a.1.total_cmp(b.1).then(b.0.cmp(&a.0)))
+        .map(|(i, _)| i);
+    weakest
+        .iter()
+        .enumerate()
+        .map(|(i, w)| Some(i) != keeper && *w < ratio)
+        .collect()
+}
+
 /// What the check measured.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Rates {

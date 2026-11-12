@@ -508,14 +508,15 @@ class LinkDaemon:
         window_ms: int | None = None,
         udp: int | None = None,
         observers: str | list[str] | None = None,
-        police: dict[str, int] | None = None,
+        police: dict[str, int | float] | None = None,
     ) -> list[str]:
         """Run the punch plan through the rendezvous.
 
         ``sockets`` TCP sockets and ``udp`` UDP sockets are punched. ``observers`` is
         ``"default"`` or a list of ``host:port`` STUN servers, and makes the offer carry the
         mappings they report; without it the mappings are the bound ports on ``public_ip``.
-        ``police`` is ``{"floor_bps": ..., "burst_ms": ...}`` and runs the policing check on every
+        ``police`` is ``{"floor_bps": ..., "burst_ms": ..., "shaped_ratio": ...}`` (the ratio is
+        optional) and runs the policing check on every
         punched path. The initiator gets the names of its usable paths, to pass as ``punched``
         candidates, and the whole reply (``policed``, ``nat``, ``peer_nat``, ``mapped``) in
         ``last_punch``. The responder hands its paths to ``listener`` and gets an empty list.

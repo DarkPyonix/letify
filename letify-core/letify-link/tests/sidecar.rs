@@ -1040,6 +1040,29 @@ async fn a_path_above_the_policing_floor_is_kept() {
     carries_a_stream(&mut a, &mut b, &names).await;
 }
 
+#[tokio::test]
+async fn a_path_far_below_the_best_is_left_out_of_the_punch_when_asked() {
+    // A ratio above 1 leaves only the best path of the set, so the rule is observable on
+    // loopback, where every path is fast. The best path is never left out.
+    let police = json!({"floor_bps": 1024, "burst_ms": 200, "shaped_ratio": 2.0});
+    let (mut a, mut b, ra, rb, _l) = punch_pair(3, 0, Some(police)).await;
+    assert_eq!(ra["ok"], true, "{ra}");
+    assert_eq!(rb["ok"], true, "{rb}");
+    assert_eq!(ra["punched"].as_array().unwrap().len(), 1, "{ra}");
+    assert_eq!(ra["policed"].as_array().unwrap().len(), 2, "{ra}");
+    let ev = a.event("path_policed").await;
+    assert_eq!(ev["reason"], "shaped", "{ev}");
+    let names = ra["punched"].as_array().unwrap().clone();
+    carries_a_stream(&mut a, &mut b, &names).await;
+}
+
+#[tokio::test]
+async fn every_path_is_kept_when_no_shaped_ratio_is_given() {
+    let police = json!({"floor_bps": 1024, "burst_ms": 200});
+    let (_a, _b, ra, _rb, _l) = punch_pair(3, 0, Some(police)).await;
+    assert_eq!(ra["punched"].as_array().unwrap().len(), 3, "{ra}");
+}
+
 // -- A failed punch explains itself (spec "NAT traversal" item 8) -----------------------
 
 /// Three servers that claim every client holds the TEST-NET-3 address `203.0.113.9`, with the
