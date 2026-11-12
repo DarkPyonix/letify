@@ -320,7 +320,7 @@ That is the only install. `letify` installs cloudpickle and blake3 and nothing e
 
 ## Rust crate
 
-The Rust crate `letify` is published on crates.io at the same version as the Python package. It will re-export the components meant for use outside letify, first the connection library `letify-link`.
+The Rust crate `letify` is published on crates.io at the same version as the Python package. It depends on the connection library `letify-link`, which is published at the same version, and re-exports it as `letify::link`.
 
 ## How this project is built
 
