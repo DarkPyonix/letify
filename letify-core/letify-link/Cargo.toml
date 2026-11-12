@@ -5,7 +5,11 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
-publish = false
+readme = "README.md"
+homepage = "https://github.com/DarkPyonix/letify"
+documentation = "https://docs.rs/letify-link"
+keywords = ["nat-traversal", "multipath", "noise", "quic", "networking"]
+categories = ["network-programming", "asynchronous"]
 
 [dependencies]
 # snow is the Noise implementation, with its pure Rust default crypto resolver.

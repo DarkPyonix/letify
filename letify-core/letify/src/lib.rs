@@ -1,8 +1,12 @@
 //! The Rust face of letify.
 //!
 //! This crate owns the name `letify` on crates.io and the version that is shared with the
-//! Python package. It does not hold the letify runtime, which is the Python package.
+//! Python package. It re-exports the connection library as [`link`] and does not hold the
+//! letify runtime, which is the Python package.
 #![doc = include_str!("../README.md")]
+
+/// The connection library letify-link, re-exported whole and unchanged.
+pub use letify_link as link;
 
 /// The version of this crate, which is also the version of the Python package `letify`.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

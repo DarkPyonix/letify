@@ -397,6 +397,9 @@ dependencies = [
 [[package]]
 name = "letify"
 version = "3.0.3"
+dependencies = [
+ "letify-link",
+]
 
 [[package]]
 name = "letify-link"
