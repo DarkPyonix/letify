@@ -16,4 +16,4 @@ This crate is the Rust face of the project. It re-exports the letify components 
 
 ## License
 
-MIT.
+Apache License 2.0, the same as the Python package letify.

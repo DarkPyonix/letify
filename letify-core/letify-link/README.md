@@ -19,4 +19,4 @@ Source, specification and issues are at <https://github.com/DarkPyonix/letify>. 
 
 ## License
 
-MIT.
+Apache License 2.0, the same as the Python package letify.
