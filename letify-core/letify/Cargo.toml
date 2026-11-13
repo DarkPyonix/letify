@@ -12,3 +12,10 @@ keywords = ["infrastructure", "gpu", "remote", "nat-traversal", "declarative"]
 categories = ["development-tools", "network-programming"]
 
 [dependencies]
+# The pin keeps a published letify on the letify-link of its own release. scripts/version.py
+# rewrites it with the version.
+letify-link = { version = "=3.0.4", path = "../letify-link" }
+
+[features]
+# Enable the relay role of letify-link.
+relay = ["letify-link/relay"]

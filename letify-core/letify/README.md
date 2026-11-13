@@ -12,10 +12,8 @@ Source, documentation and issues are at <https://github.com/DarkPyonix/letify>.
 
 ## This crate
 
-This crate is the Rust face of the project. It will re-export the letify components that are meant for use outside letify. The first is the connection library `letify-link`, which provides NAT traversal and multipath links.
-
-Today the crate exports only `VERSION`. Its version follows the Python package: crate `letify` 2.8.6 is released together with PyPI `letify` 2.8.6.
+This crate is the Rust face of the project. It re-exports the letify components that are meant for use outside letify. The first is the connection library [`letify-link`](https://crates.io/crates/letify-link), which provides NAT traversal and multipath links, as the module `letify::link`. The Cargo feature `relay` enables the relay role of `letify-link`. The crate also exports `VERSION`. Its version follows the Python package: crate `letify` 2.8.6 is released together with PyPI `letify` 2.8.6.
 
 ## License
 
-MIT.
+Apache License 2.0, the same as the Python package letify.

@@ -31,6 +31,11 @@ def _tree(tmp_path: Path, *, extension: bool = True) -> Path:
     shutil.copy(ROOT / "letify" / "__init__.py", tmp_path / "letify" / "__init__.py")
     shutil.copy(ROOT / "letify-core" / "Cargo.toml", tmp_path / "letify-core" / "Cargo.toml")
     shutil.copy(ROOT / "letify-core" / "Cargo.lock", tmp_path / "letify-core" / "Cargo.lock")
+    (tmp_path / "letify-core" / "letify").mkdir()
+    shutil.copy(
+        ROOT / "letify-core" / "letify" / "Cargo.toml",
+        tmp_path / "letify-core" / "letify" / "Cargo.toml",
+    )
     if extension:
         ext = tmp_path / "letify-ext"
         ext.mkdir()
@@ -51,7 +56,7 @@ def test_set_writes_one_version_into_every_file(tmp_path: Path) -> None:
     version.set_version(root, "2.3.4")
     found = version.read_versions(root)
     assert set(found.values()) == {"2.3.4"}
-    assert len(found) == 7
+    assert len(found) == 8
     assert version.check(root, tag="v2.3.4") == []
 
 
@@ -105,3 +110,19 @@ def test_set_writes_the_version_into_every_crate_entry_of_the_lockfile(tmp_path:
     for crate in version.CRATES:
         assert f'name = "{crate}"\nversion = "3.1.4"' in lock
     assert "letify-quic" not in version.CRATES
+
+
+def test_set_writes_the_version_into_the_letify_link_pin(tmp_path: Path) -> None:
+    root = _tree(tmp_path, extension=False)
+    version.set_version(root, "3.1.4")
+    manifest = (root / "letify-core" / "letify" / "Cargo.toml").read_text()
+    assert 'letify-link = { version = "=3.1.4", path = "../letify-link" }' in manifest
+
+
+def test_a_letify_link_pin_that_disagrees_is_reported(tmp_path: Path) -> None:
+    root = _tree(tmp_path, extension=False)
+    version.set_version(root, "1.0.0")
+    manifest = root / "letify-core" / "letify" / "Cargo.toml"
+    manifest.write_text(manifest.read_text().replace('"=1.0.0"', '"=0.9.0"'))
+    errors = version.check(root)
+    assert len(errors) == 1 and "letify/Cargo.toml" in errors[0]

@@ -2,7 +2,8 @@
 
 Owns the version rule in docs/SPEC.md, Packaging, Versioning and releases: `pyproject.toml`
 `[project].version` is the source of truth, and `letify/__init__.py`, the letify-core workspace
-(`Cargo.toml` and the crate entries in `Cargo.lock`), and the VS Code extension (`package.json`
+(`Cargo.toml`, the crate entries in `Cargo.lock` and the `=<version>` pin of letify-link in
+`letify/Cargo.toml`), and the VS Code extension (`package.json`
 and `package-lock.json`, when `letify-ext/` exists) must equal it, as must a `v<version>` tag.
 It does not build, tag or publish anything. Standard library only.
 
@@ -27,6 +28,7 @@ PYPROJECT_RE = re.compile(r'(\[project\][^\[]*?^version = ")([^"]*)(")', re.MULT
 CARGO_RE = re.compile(
     r'(\[workspace\.package\][^\[]*?^version = ")([^"]*)(")', re.MULTILINE | re.DOTALL
 )
+PIN_RE = re.compile(r'(^letify-link = \{ version = "=)([^"]*)(")', re.MULTILINE)
 
 
 def _lock_re(crate: str) -> re.Pattern[str]:
@@ -49,6 +51,8 @@ def read_versions(root: Path) -> dict[str, str]:
     found["letify-core/Cargo.lock"] = (
         locked.pop() if len(locked) == 1 else " / ".join(sorted(locked))
     )
+    pin = PIN_RE.search((root / "letify-core" / "letify" / "Cargo.toml").read_text())
+    found["letify-core/letify/Cargo.toml letify-link pin"] = pin.group(2) if pin else "<missing>"
     ext = root / "letify-ext"
     if (ext / "package.json").exists():
         found["letify-ext/package.json"] = json.loads((ext / "package.json").read_text())["version"]
@@ -92,6 +96,7 @@ def set_version(root: Path, value: str) -> None:
     _sub(root / "letify-core" / "Cargo.toml", CARGO_RE, value)
     for crate in CRATES:
         _sub(root / "letify-core" / "Cargo.lock", _lock_re(crate), value)
+    _sub(root / "letify-core" / "letify" / "Cargo.toml", PIN_RE, value)
     ext = root / "letify-ext"
     for name in ("package.json", "package-lock.json"):
         path = ext / name

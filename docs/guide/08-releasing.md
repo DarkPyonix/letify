@@ -1,6 +1,6 @@
 # Releasing
 
-A release is one version number pushed as the tag `v<version>`. GitHub Actions builds everything, attaches it to a GitHub Release and publishes the crate `letify` to crates.io.
+A release is one version number pushed as the tag `v<version>`. GitHub Actions builds everything, attaches it to a GitHub Release and publishes the crates `letify-link` and `letify` to crates.io.
 
 ## The version rule
 
@@ -38,7 +38,7 @@ The `ci` workflow runs `check` on every push and pull request.
 
 4. It creates the GitHub Release `v1.2.0` with all of those files attached, and uploads the sdist and wheels to PyPI through trusted publishing.
 
-5. The `publish-crates` workflow runs on the same tag. Its `verify` job checks the version files, that the tagged commit is on `develop`, the workspace build and tests, and `cargo publish -p letify --dry-run`. Its `publish-crate` job then uploads the crate `letify` 1.2.0 to crates.io. If that version is already there, the job says so and succeeds without uploading. crates.io never replaces a version, so a wrong upload can only be yanked.
+5. The `publish-crates` workflow runs on the same tag. Its `verify` job checks the version files, that the tagged commit is on `develop`, the workspace build and tests, and `scripts/publish-crates.sh --dry-run`. Its `publish-crate` job then runs `scripts/publish-crates.sh`, which uploads `letify-link` 1.2.0 and then `letify` 1.2.0 to crates.io. A crate whose version is already there is skipped and the script says so, so a rerun uploads only what is missing. crates.io never replaces a version, so a wrong upload can only be yanked.
 
 ## One-time setup for crates.io
 
