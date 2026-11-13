@@ -396,14 +396,14 @@ dependencies = [
 
 [[package]]
 name = "letify"
-version = "3.0.3"
+version = "3.0.4"
 dependencies = [
  "letify-link",
 ]
 
 [[package]]
 name = "letify-link"
-version = "3.0.3"
+version = "3.0.4"
 dependencies = [
  "ed25519-dalek",
  "getrandom 0.2.17",
