@@ -76,8 +76,8 @@ async fn bulk_and_count(a: &Session, b: Session, stop: Arc<AtomicBool>, count: A
     });
 }
 
-/// Cumulative MiB delivered at 1, 1.5, 2 and `secs` seconds after the stream starts.
-async fn startup_marks(secs: u64, delayed: bool) -> Vec<(f64, f64)> {
+/// Cumulative MiB delivered at 1 and 2 seconds after the stream starts.
+async fn startup_marks(delayed: bool) -> (f64, f64) {
     let (a, b, _p) = if delayed {
         five_slow_paths().await
     } else {
@@ -87,48 +87,83 @@ async fn startup_marks(secs: u64, delayed: bool) -> Vec<(f64, f64)> {
     let stop = Arc::new(AtomicBool::new(false));
     let t0 = Instant::now();
     bulk_and_count(&a, b, stop.clone(), count.clone()).await;
-    let mut out = Vec::new();
-    for at in [1.0, 1.5, 2.0, secs as f64] {
+    let mut out = [0.0; 2];
+    for (i, at) in [1.0, 2.0].into_iter().enumerate() {
         tokio::time::sleep_until(t0 + Duration::from_secs_f64(at)).await;
-        out.push((at, count.load(Ordering::Relaxed) as f64 / MIB));
+        out[i] = count.load(Ordering::Relaxed) as f64 / MIB;
     }
     stop.store(true, Ordering::Relaxed);
-    out
+    (out[0], out[1])
+}
+
+fn median(v: &mut [f64]) -> f64 {
+    v.sort_by(f64::total_cmp);
+    v[v.len() / 2]
+}
+
+/// One pair: the no-delay ceiling and the delayed run, back to back, so that a change in the
+/// load of the machine between them is small. `delayed_first` alternates the order, so a drift
+/// in one direction does not favour either side. Returns the delayed run's rate over 1 to 2 s
+/// and over the first 2 s, each as a fraction of the ceiling of the same pair over the same
+/// window, with the first 1 s in MiB/s for the report.
+async fn pair(delayed_first: bool) -> (f64, f64, f64, f64) {
+    let (slow, fast) = if delayed_first {
+        let s = startup_marks(true).await;
+        (s, startup_marks(false).await)
+    } else {
+        let f = startup_marks(false).await;
+        (startup_marks(true).await, f)
+    };
+    // The ceiling cannot exceed what the paths carry, and a runner that reaches more than that
+    // would only make the check harder.
+    let cap = SUBFLOWS as f64 * PER_FLOW / MIB;
+    let late_full = (fast.1 - fast.0).min(cap);
+    let mean_full = (fast.1 / 2.0).min(cap);
+    (
+        (slow.1 - slow.0) / late_full,
+        slow.1 / 2.0 / mean_full,
+        slow.1 - slow.0,
+        late_full,
+    )
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_bulk_stream_over_five_long_round_trip_subflows_fills_them_within_two_seconds() {
-    // What this machine carries over the same paths without delay, measured first and in this
-    // run. A shared runner with 3 vCPUs gave 21 to 26 MiB/s here where a developer machine
-    // gives 42, because the 10 proxy pumps and the debug build of the session compete for
-    // CPU, and the check would then measure the runner and not the cap.
-    // Both sides are the median of three runs in this process: one 0.5 s window on a shared
-    // runner gave 31.25 MiB/s against a ceiling of 40 in one run and 38 or more in others.
-    let mut ceilings = Vec::new();
-    for _ in 0..3 {
-        let r = startup_marks(2, false).await;
-        ceilings.push((r[1].1 - r[0].1) / 0.5);
+    // What this machine carries over the same paths without delay is measured beside every
+    // delayed run, in this process. A shared runner with 3 vCPUs gave 21 to 26 MiB/s without
+    // delay where a developer machine gives 42, because the 10 proxy pumps and the debug build
+    // of the session compete for CPU, so a fixed target would measure the runner and not the
+    // cap. Ceilings measured in a block apart from the delayed runs did not follow the load
+    // the delayed runs saw, and one 0.5 s window was too short to average a scheduler stall
+    // (29.25 and 31.09 MiB/s against 32 needed, on 2026-11-13). So the runs are five pairs,
+    // each judged by its own ratio over the 1 s from 1.0 to 2.0 s, and the median of the five
+    // ratios is checked.
+    let mut late = Vec::new();
+    let mut mean = Vec::new();
+    let mut detail = Vec::new();
+    for i in 0..5 {
+        let (l, m, rate, full) = pair(i % 2 == 1).await;
+        late.push(l);
+        mean.push(m);
+        detail.push((
+            format!("{l:.2}"),
+            format!("{m:.2}"),
+            format!("{rate:.1}/{full:.1}"),
+        ));
     }
-    let mut runs = Vec::new();
-    for _ in 0..3 {
-        let m = startup_marks(2, true).await;
-        runs.push(((m[1].1 - m[0].1) / 0.5, m[2].1 / 2.0, m[0].1));
-    }
-    ceilings.sort_by(f64::total_cmp);
-    let full = ceilings[1].min(SUBFLOWS as f64 * PER_FLOW / MIB);
-    runs.sort_by(|x, y| x.0.total_cmp(&y.0));
-    let (late, _, first) = runs[1];
-    runs.sort_by(|x, y| x.1.total_cmp(&y.1));
-    let mean2 = runs[1].1;
+    let (late, mean) = (median(&mut late), median(&mut mean));
     eprintln!(
-        "of {full:.0} MiB/s (median of 3): first 1 s {first:.2}, 1.0-1.5 s {late:.2}, mean of first 2 s {mean2:.2}; runs {runs:?}"
+        "median ratio to the no-delay run beside it: 1.0-2.0 s {late:.2}, first 2 s {mean:.2}; pairs (late, mean, MiB/s late/ceiling) {detail:?}"
     );
-    assert!(late >= 0.8 * full, "rate over 1.0-1.5 s {late:.2} MiB/s");
-    // The target is 70%. Runs gave 23 to 28 MiB/s of 40 (the base commit gave 7), so the check leaves 3 MiB/s
-    // for a loaded test machine.
     assert!(
-        mean2 >= 0.5 * full,
-        "mean of the first 2 s {mean2:.2} MiB/s"
+        late >= 0.8,
+        "rate over 1.0-2.0 s is {late:.2} of the no-delay rate, pairs {detail:?}"
+    );
+    // The target is 70% of the ceiling over the first 2 s. Runs gave 23 to 28 MiB/s of 40
+    // (the base commit gave 7), so the check leaves room for a loaded test machine.
+    assert!(
+        mean >= 0.5,
+        "mean of the first 2 s is {mean:.2} of the no-delay rate, pairs {detail:?}"
     );
 }
 
