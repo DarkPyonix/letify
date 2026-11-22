@@ -26,6 +26,13 @@ quinn = { version = "0.11", default-features = false, features = ["runtime-tokio
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 rcgen = "0.13"
 serde_json = "1.0.154"
+# The signal feature. rustls is the dependency above, with the ring backend. webpki-roots
+# carries the Mozilla trust roots as data, so the client verifies the service the same way on
+# Linux, macOS, Windows, iOS and Android without a platform verifier.
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring"], optional = true }
+webpki-roots = { version = "1", optional = true }
+sha2 = { version = "0.10", optional = true }
+base64 = { version = "0.22", optional = true }
 
 [target.'cfg(unix)'.dependencies]
 # geteuid, to check who owns a key file.
@@ -35,6 +42,13 @@ libc = "0.2"
 # The relay role: a node that forwards session ciphertext between two authenticated nodes, and
 # the dialer that reaches a peer through one. The sidecar is built with it.
 relay = ["tokio/rt-multi-thread"]
+# SignalRendezvous: the Rendezvous trait over the signalling service, for an embedder that
+# wants the owner's Worker without writing a client. It adds tokio-rustls, webpki-roots, sha2
+# and base64 to the build, and nothing when the feature is off.
+signal = ["dep:tokio-rustls", "dep:webpki-roots", "dep:sha2", "dep:base64"]
 
 [dev-dependencies]
+# The signal test verifies requests the way the Worker does.
+sha2 = "0.10"
+base64 = "0.22"
 tokio = { version = "1", features = ["full", "test-util"] }
