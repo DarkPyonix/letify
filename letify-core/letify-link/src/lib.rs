@@ -135,6 +135,8 @@ pub mod rendezvous;
 mod replay;
 mod session;
 pub mod sidecar;
+#[cfg(feature = "signal")]
+pub mod signal;
 mod stream;
 pub mod stun;
 pub mod tcp;

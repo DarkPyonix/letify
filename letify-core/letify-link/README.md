@@ -9,6 +9,8 @@ letify-link is the connection layer of [letify](https://github.com/DarkPyonix/le
 
 The crate has a Cargo feature `relay`, which adds a node that forwards session ciphertext between two authenticated nodes.
 
+The feature `signal` adds `signal::SignalRendezvous`, a `Rendezvous` over the owner's signalling service at `https://letify.darkpyonix.dev`: `SignalRendezvous::new(url, identity).user_agent("my-app/1.0")`. It adds `tokio-rustls`, `webpki-roots`, `sha2` and `base64`.
+
 ```sh
 cargo add letify-link
 ```

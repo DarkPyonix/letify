@@ -48,8 +48,8 @@ jobs:
         run: cargo clippy -p letify-link --all-targets --all-features --locked -- -D warnings
       - name: Build
         run: cargo build -p letify-link --all-features --locked
-      - name: Test with the relay role
-        run: cargo test -p letify-link --features relay --locked
+      - name: Test with the relay role and the signalling client
+        run: cargo test -p letify-link --features relay,signal --locked
 
   mobile-ios:
     name: check (aarch64-apple-ios)

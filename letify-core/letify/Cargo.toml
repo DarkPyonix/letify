@@ -19,3 +19,5 @@ letify-link = { version = "=3.0.6", path = "../letify-link" }
 [features]
 # Enable the relay role of letify-link.
 relay = ["letify-link/relay"]
+# Enable letify_link::signal, the Rendezvous over the signalling service.
+signal = ["letify-link/signal"]
