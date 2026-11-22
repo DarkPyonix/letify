@@ -116,6 +116,7 @@
 
 mod acceptor;
 mod config;
+pub mod driver;
 mod error;
 mod frame;
 mod handshake;
