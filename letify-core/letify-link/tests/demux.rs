@@ -259,15 +259,17 @@ async fn a_dropped_handle_discards_its_backlog_and_the_peer_is_new_again() {
     assert_eq!(h3.recv().await.unwrap().1, b"retry");
 }
 
+type Recv = io::Result<(NodeId, Vec<u8>)>;
+
 /// A Rendezvous that replays scripted recv results, then waits forever.
 struct Scripted {
-    script: Mutex<VecDeque<io::Result<(NodeId, Vec<u8>)>>>,
+    script: Mutex<VecDeque<Recv>>,
     calls: Mutex<usize>,
     alive: Arc<()>,
 }
 
 impl Scripted {
-    fn new(script: Vec<io::Result<(NodeId, Vec<u8>)>>) -> (Self, Weak<()>) {
+    fn new(script: Vec<Recv>) -> (Self, Weak<()>) {
         let alive = Arc::new(());
         let weak = Arc::downgrade(&alive);
         (
@@ -296,7 +298,7 @@ impl Rendezvous for Scripted {
     }
 }
 
-fn err(kind: io::ErrorKind, text: &str) -> io::Result<(NodeId, Vec<u8>)> {
+fn err(kind: io::ErrorKind, text: &str) -> Recv {
     Err(io::Error::new(kind, text.to_string()))
 }
 
