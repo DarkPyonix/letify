@@ -19,33 +19,33 @@ use tokio::io::{
     AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadHalf, WriteHalf,
     copy_bidirectional_with_sizes,
 };
-use tokio::net::{TcpListener, TcpStream, UdpSocket};
+use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
 use tokio::task::AbortHandle;
-use tokio::task::JoinSet;
 
 use crate::acceptor::{Accepted, Acceptor};
 use crate::config::Config;
+use crate::driver::{
+    self, DEFAULT_BURST_MS, DEFAULT_LEAD_MS, DEFAULT_WINDOW_MS, Policing, PunchError,
+    PunchErrorKind, PunchOptions, PunchedPath, Role, nat_name,
+};
+// The tests of the report clause live below and name it through this module.
+#[cfg(test)]
+use crate::driver::udp_clause;
 use crate::error::Error;
 use crate::identity::{Identity, NodeId, PeerPolicy};
-use crate::observe::AddressObserver;
 use crate::paths::{
     BoxTransport, Candidate, ManagerConfig, PathEvent, PathKind, PathKinds, PathManager,
 };
-use crate::plan;
-use crate::policing::{self, Verdict};
-use crate::punch::{self, Plan};
-use crate::rendezvous::{Message, Proto, Punch, PunchExt, Rendezvous, recv_message, send_message};
+use crate::punch;
+use crate::rendezvous::Rendezvous;
 use crate::session::{Priority, Session};
-use crate::stun::{self, NatType, StunObserver, classify_with};
-use crate::udp::UdpPath;
+use crate::stun;
 
 /// The longest control message accepted, in bytes.
 pub const MAX_CONTROL_MESSAGE: usize = 1 << 20;
 /// How long a local stream socket waits for the controlling process to connect.
 pub const STREAM_CONNECT_WAIT: Duration = Duration::from_secs(30);
-const DEFAULT_LEAD_MS: u64 = 2000;
-const DEFAULT_WINDOW_MS: u64 = 20_000;
 
 /// Where the sidecar listens and what its stream sockets are.
 #[derive(Clone, Debug)]
@@ -414,7 +414,7 @@ struct Shared {
     next_punch: AtomicU64,
     sessions: Mutex<HashMap<u64, SessionEntry>>,
     listeners: Mutex<HashMap<u64, ListenerEntry>>,
-    punched: Mutex<HashMap<String, Punched>>,
+    punched: Mutex<HashMap<String, PunchedPath>>,
     /// When the sidecar started, the zero of the diagnostic trace.
     started: std::time::Instant,
 }
@@ -775,10 +775,8 @@ async fn op_open_session(shared: &Arc<Shared>, req: &Value) -> OpResult {
             let path = lock(&shared.punched)
                 .remove(key)
                 .ok_or_else(|| usage(format!("no unused punched socket {key}")))?;
-            let (udp, transport): (bool, BoxTransport) = match path {
-                Punched::Tcp(s) => (false, Box::new(s)),
-                Punched::Udp(p) => (true, Box::new(p)),
-            };
+            let udp = path.is_udp();
+            let transport: BoxTransport = path.into_transport();
             let slot = Arc::new(Mutex::new(Some(transport)));
             let dial = move || {
                 let slot = slot.clone();
@@ -808,28 +806,6 @@ async fn op_open_session(shared: &Arc<Shared>, req: &Value) -> OpResult {
     let session = handle_of(manager.session());
     let id = register(shared, session, Some(manager), None);
     Ok(json!({"session": id, "peer": peer.to_string()}))
-}
-
-/// A path that a punch made and has not yet been given to a session.
-enum Punched {
-    Tcp(TcpStream),
-    Udp(UdpPath),
-}
-
-/// How long each address observer has to answer one query.
-const OBSERVE_WAIT: Duration = Duration::from_millis(1500);
-/// How long the initiator waits for the second answer after the first, and the responder for
-/// the second offer. Both messages leave together, so they arrive together.
-const SECOND_MESSAGE_GRACE: Duration = Duration::from_millis(400);
-/// The default length of a policing burst.
-const DEFAULT_BURST_MS: u64 = 500;
-
-fn nat_name(nat: NatType) -> String {
-    match nat {
-        NatType::Unknown => "unknown".into(),
-        NatType::EndpointIndependent => "endpoint_independent".into(),
-        NatType::Symmetric { step } => format!("symmetric:{step}"),
-    }
 }
 
 /// The STUN servers named by the `observers` field: none, the default list (or the servers of
@@ -873,310 +849,6 @@ async fn observer_servers(req: &Value) -> Result<Option<Vec<SocketAddr>>, OpErro
     Ok(Some(found))
 }
 
-/// What one punch offers: this side's sockets, mappings and NAT.
-struct Own {
-    nat: NatType,
-    tcp_maps: Vec<SocketAddr>,
-    udp_maps: Vec<SocketAddr>,
-}
-
-/// What the other side offered, as far as the exchange got.
-struct There {
-    nat: NatType,
-    tcp: usize,
-    udp: usize,
-}
-
-/// The facts of one punch that explain how it went. Spec "NAT traversal" item 8.
-struct Report {
-    /// This side's NAT, or why there is none.
-    here: Result<NatType, String>,
-    tcp: usize,
-    tcp_predicted: usize,
-    udp: usize,
-    /// `None` until the peer has answered.
-    there: Option<There>,
-    /// The UDP plan, once both NATs are known.
-    plan: Option<String>,
-}
-
-impl Report {
-    fn new(own: &Own, bound: &[u16]) -> Report {
-        let predicted = own
-            .tcp_maps
-            .iter()
-            .zip(bound)
-            .filter(|(m, port)| m.port() != **port)
-            .count();
-        Report {
-            here: Ok(own.nat),
-            tcp: own.tcp_maps.len(),
-            tcp_predicted: predicted,
-            udp: own.udp_maps.len(),
-            there: None,
-            plan: None,
-        }
-    }
-
-    fn text(&self) -> String {
-        let here = match &self.here {
-            Ok(nat) => format!(
-                "NAT {}, offered tcp {} ({} predicted) udp {}",
-                nat_name(*nat),
-                self.tcp,
-                self.tcp_predicted,
-                self.udp
-            ),
-            Err(why) => format!("NAT unknown ({why}), nothing offered"),
-        };
-        let there = match &self.there {
-            Some(t) => format!(
-                "NAT {}, offered tcp {} udp {}",
-                nat_name(t.nat),
-                t.tcp,
-                t.udp
-            ),
-            None => "no answer".to_string(),
-        };
-        let mut out = format!("here: {here}; there: {there}");
-        if let Some(plan) = &self.plan {
-            out.push_str("; udp plan: ");
-            out.push_str(plan);
-        }
-        out
-    }
-
-    /// `e` with the report appended to its message and its facts in `detail`.
-    fn explain(&self, mut e: OpError) -> OpError {
-        let text = self.text();
-        e.msg = format!("{}; {text}", e.msg);
-        let mut detail = json!({
-            "nat": self.here.as_ref().ok().map(|n| nat_name(*n)),
-            "peer_nat": self.there.as_ref().map(|t| nat_name(t.nat)),
-            "report": text,
-        });
-        if let Err(why) = &self.here {
-            detail["nat_error"] = json!(why);
-        }
-        e.detail = Some(detail);
-        e
-    }
-}
-
-/// Ask the observers about the first UDP socket and work out the mappings to offer. Without
-/// observers the mappings are the bound addresses on `public_ip`.
-async fn own_mappings(
-    observers: Option<&[SocketAddr]>,
-    public_ip: std::net::IpAddr,
-    tcp_ports: &[u16],
-    udp: &[UdpSocket],
-    probe: &UdpSocket,
-) -> Result<Own, OpError> {
-    let Some(servers) = observers else {
-        return Ok(Own {
-            nat: NatType::Unknown,
-            tcp_maps: plan::tcp_mappings(public_ip, tcp_ports, NatType::Unknown, None),
-            udp_maps: udp
-                .iter()
-                .map(|s| {
-                    s.local_addr()
-                        .map(|a| SocketAddr::new(public_ip, a.port()))
-                        .map_err(|e| infra(e.to_string()))
-                })
-                .collect::<Result<_, _>>()?,
-        });
-    };
-    let observers: Vec<StunObserver> = servers
-        .iter()
-        .map(|s| StunObserver::new(*s, OBSERVE_WAIT))
-        .collect();
-    let refs: Vec<&dyn AddressObserver> = observers
-        .iter()
-        .map(|o| o as &dyn AddressObserver)
-        .collect();
-    let class = classify_with(probe, &refs)
-        .await
-        .map_err(|e| infra(format!("cannot classify the NAT: {e}")))?;
-    let last = class.last_mapped();
-    let ip = class.mappings[0].mapped.ip();
-    let mut udp_maps = Vec::new();
-    for (i, sock) in udp.iter().enumerate() {
-        if i == 0 {
-            udp_maps.extend(last);
-        } else {
-            let seen = refs[0]
-                .observe(sock)
-                .await
-                .map_err(|e| infra(format!("cannot observe a UDP socket: {e}")))?;
-            udp_maps.push(seen.mapped);
-        }
-    }
-    Ok(Own {
-        nat: class.nat,
-        tcp_maps: plan::tcp_mappings(ip, tcp_ports, class.nat, last),
-        udp_maps,
-    })
-}
-
-/// One side's view of an exchanged offer or answer.
-type Terms = (Punch, PunchExt);
-
-fn terms_of(msg: Message) -> Option<(bool, Terms)> {
-    let plain = PunchExt {
-        nat: NatType::Unknown,
-        police: false,
-    };
-    match msg {
-        Message::PunchOffer(p) => Some((true, (p, plain))),
-        Message::PunchOfferExt(p, e) => Some((true, (p, e))),
-        Message::PunchAnswer(p) => Some((false, (p, plain))),
-        Message::PunchAnswerExt(p, e) => Some((false, (p, e))),
-        _ => None,
-    }
-}
-
-/// What the initiator got back for the offers it sent.
-struct Answers {
-    tcp: Option<Terms>,
-    udp: Option<Terms>,
-}
-
-async fn await_answers(
-    rdv: &ControlRendezvous,
-    peer: NodeId,
-    tcp: Option<&Punch>,
-    udp: Option<&Punch>,
-    wait: Duration,
-) -> Result<Answers, OpError> {
-    let overall = tokio::time::Instant::now() + wait;
-    let mut deadline = overall;
-    let mut got = Answers {
-        tcp: None,
-        udp: None,
-    };
-    while (tcp.is_some() && got.tcp.is_none()) || (udp.is_some() && got.udp.is_none()) {
-        let next = match tokio::time::timeout_at(deadline, recv_message(rdv)).await {
-            Err(_) => break,
-            Ok(Ok(next)) => next,
-            Ok(Err(e)) if e.kind() == io::ErrorKind::InvalidData => continue,
-            Ok(Err(e)) => return Err(infra(e.to_string())),
-        };
-        let (from, msg) = next;
-        let Some((false, (answer, ext))) = terms_of(msg) else {
-            continue;
-        };
-        if from != peer {
-            continue;
-        }
-        match (answer.proto, tcp, udp) {
-            (Proto::Tcp, Some(o), _) if o.token == answer.token => got.tcp = Some((answer, ext)),
-            (Proto::Udp, _, Some(o)) if o.token == answer.token => got.udp = Some((answer, ext)),
-            _ => continue,
-        }
-        deadline = overall.min(tokio::time::Instant::now() + SECOND_MESSAGE_GRACE);
-    }
-    if got.tcp.is_none() && got.udp.is_none() {
-        return Err(infra("the punch window closed before the peer answered"));
-    }
-    Ok(got)
-}
-
-/// What the responder got from the initiator.
-struct Offers {
-    tcp: Option<Terms>,
-    udp: Option<Terms>,
-}
-
-async fn await_offers(
-    rdv: &ControlRendezvous,
-    peer: NodeId,
-    want_tcp: bool,
-    want_udp: bool,
-    wait: Duration,
-) -> Result<Offers, OpError> {
-    let overall = tokio::time::Instant::now() + wait;
-    let mut deadline = overall;
-    let mut got = Offers {
-        tcp: None,
-        udp: None,
-    };
-    let mut first = false;
-    loop {
-        let next = match tokio::time::timeout_at(deadline, recv_message(rdv)).await {
-            Err(_) => break,
-            Ok(Ok(next)) => next,
-            Ok(Err(e)) if e.kind() == io::ErrorKind::InvalidData => continue,
-            Ok(Err(e)) => return Err(infra(e.to_string())),
-        };
-        let (from, msg) = next;
-        let Some((true, terms)) = terms_of(msg) else {
-            continue;
-        };
-        if from != peer {
-            continue;
-        }
-        match terms.0.proto {
-            Proto::Tcp if want_tcp && got.tcp.is_none() => got.tcp = Some(terms),
-            Proto::Udp if want_udp && got.udp.is_none() => got.udp = Some(terms),
-            _ => continue,
-        }
-        if !first {
-            first = true;
-            deadline = overall.min(tokio::time::Instant::now() + SECOND_MESSAGE_GRACE);
-        }
-        if (!want_tcp || got.tcp.is_some()) && (!want_udp || got.udp.is_some()) {
-            break;
-        }
-    }
-    if got.tcp.is_none() && got.udp.is_none() {
-        return Err(infra("the punch window closed before the peer answered"));
-    }
-    Ok(got)
-}
-
-/// The result of checking one punched path on the initiator.
-enum Vetted {
-    Usable(String, Punched),
-    Policed(String, &'static str, policing::Rates),
-    Failed(String, String),
-}
-
-async fn vet<S>(
-    name: String,
-    proto: &'static str,
-    mut stream: S,
-    police: Option<(u64, Duration)>,
-    wrap: impl FnOnce(S) -> Punched,
-) -> Vetted
-where
-    S: AsyncRead + AsyncWrite + Unpin + Send,
-{
-    if let Some((floor, burst)) = police {
-        match policing::check(&mut stream, floor, burst).await {
-            Ok(Verdict::Usable(_)) => {}
-            Ok(Verdict::Policed(rates)) => return Vetted::Policed(name, proto, rates),
-            Err(e) => return Vetted::Failed(name, e.to_string()),
-        }
-    }
-    Vetted::Usable(name, wrap(stream))
-}
-
-/// Check a punched path as the responder, then hand it to the acceptor.
-async fn accept_punched<T: crate::session::Transport>(
-    shared: Arc<Shared>,
-    acceptor: Arc<Acceptor>,
-    listener: u64,
-    mut transport: T,
-    police: bool,
-) {
-    if police && policing::serve(&mut transport).await.is_err() {
-        return;
-    }
-    if let Ok(Accepted::Session(session)) = acceptor.accept(transport).await {
-        register(&shared, session, None, Some(listener));
-    }
-}
-
 async fn op_punch(shared: &Arc<Shared>, req: &Value) -> OpResult {
     let peer = node_id(str_field(req, "peer")?)?;
     let initiator = match str_field(req, "role")? {
@@ -1202,10 +874,10 @@ async fn op_punch(shared: &Arc<Shared>, req: &Value) -> OpResult {
     };
     let police = match req.get("police") {
         None | Some(Value::Null) => None,
-        Some(p) => Some((
-            u64_field(p, "floor_bps")?,
-            Duration::from_millis(opt_u64(p, "burst_ms", DEFAULT_BURST_MS)?),
-        )),
+        Some(p) => Some(Policing {
+            floor_bps: u64_field(p, "floor_bps")?,
+            burst: Duration::from_millis(opt_u64(p, "burst_ms", DEFAULT_BURST_MS)?),
+        }),
     };
     let lead = opt_u64(req, "lead_ms", DEFAULT_LEAD_MS)?;
     let window = opt_u64(req, "window_ms", DEFAULT_WINDOW_MS)?;
@@ -1222,344 +894,107 @@ async fn op_punch(shared: &Arc<Shared>, req: &Value) -> OpResult {
     };
     let observers = observer_servers(req).await?;
 
-    // Hold the bound sockets until the punch ends, so no other process takes the ports.
-    let mut held = Vec::new();
-    let mut locals = Vec::new();
-    for _ in 0..tcp_n {
-        let sock = punch::reusable_socket("0.0.0.0:0".parse().unwrap())
-            .map_err(|e| infra(format!("cannot bind a punch socket: {e}")))?;
-        locals.push(sock.local_addr().map_err(|e| infra(e.to_string()))?);
-        held.push(sock);
-    }
-    let mut udp_socks = Vec::new();
-    for _ in 0..udp_n {
-        udp_socks.push(
-            UdpSocket::bind("0.0.0.0:0")
-                .await
-                .map_err(|e| infra(format!("cannot bind a UDP socket: {e}")))?,
-        );
-    }
-    // The NAT is classified from the first UDP socket, or from one made for it.
-    let spare;
-    let probe = match udp_socks.first() {
-        Some(s) => s,
-        None => {
-            spare = UdpSocket::bind("0.0.0.0:0")
-                .await
-                .map_err(|e| infra(format!("cannot bind a UDP socket: {e}")))?;
-            &spare
-        }
-    };
-    let ports: Vec<u16> = locals.iter().map(|a| a.port()).collect();
-    let own = match own_mappings(observers.as_deref(), ip, &ports, &udp_socks, probe).await {
-        Ok(own) => own,
-        Err(e) => {
-            let report = Report {
-                here: Err(e.msg.clone()),
-                tcp: 0,
-                tcp_predicted: 0,
-                udp: 0,
-                there: None,
-                plan: None,
-            };
-            return Err(report.explain(e));
-        }
-    };
-    let mut report = Report::new(&own, &ports);
-    let rdv = &shared.rendezvous;
-    let ext = |police: bool| PunchExt {
-        nat: own.nat,
+    let opts = PunchOptions {
+        tcp_sockets: tcp_n,
+        udp_sockets: udp_n,
+        public_ip: ip,
+        observers,
         police,
+        lead: Duration::from_millis(lead),
+        window: Duration::from_millis(window),
+        answer_margin: answer_margin.map(Duration::from_millis),
     };
-
-    // The terms of each protocol: (theirs, token, plan, peer nat).
-    let mut tcp_terms: Option<(Vec<SocketAddr>, [u8; 16], Plan)> = None;
-    let mut udp_terms: Option<(Vec<SocketAddr>, [u8; 16], Plan)> = None;
-    let peer_nat;
-    let policed_by_offer;
-    if initiator {
-        let start = punch::now_ms() + lead;
-        let make = |proto: Proto, mappings: &[SocketAddr]| Punch {
-            proto,
-            token: random_token(),
-            start_at_ms: start,
-            until_ms: start + window,
-            mappings: mappings.to_vec(),
-        };
-        let tcp_offer = (tcp_n > 0).then(|| make(Proto::Tcp, &own.tcp_maps));
-        let udp_offer = (udp_n > 0).then(|| make(Proto::Udp, &own.udp_maps));
-        for offer in tcp_offer.iter().chain(&udp_offer) {
-            send_message(
-                rdv,
-                peer,
-                &Message::PunchOfferExt(offer.clone(), ext(police.is_some())),
-            )
-            .await
-            .map_err(|e| infra(e.to_string()))?;
-        }
-        let answers = await_answers(
-            rdv,
-            peer,
-            tcp_offer.as_ref(),
-            udp_offer.as_ref(),
-            Duration::from_millis(lead + window),
-        )
-        .await
-        .map_err(|e| report.explain(e))?;
-        peer_nat = answers
-            .tcp
-            .iter()
-            .chain(&answers.udp)
-            .next()
-            .map_or(NatType::Unknown, |(_, e)| e.nat);
-        policed_by_offer = police.is_some();
-        if let (Some(o), Some((a, _))) = (&tcp_offer, &answers.tcp) {
-            tcp_terms = Some((a.mappings.clone(), o.token, Plan::of(o).with_answer(a)));
-        }
-        if let (Some(o), Some((a, _))) = (&udp_offer, &answers.udp) {
-            udp_terms = Some((a.mappings.clone(), o.token, Plan::of(o).with_answer(a)));
-        }
+    let role = if initiator {
+        Role::Initiator
     } else {
-        let offers = await_offers(
-            rdv,
-            peer,
-            tcp_n > 0,
-            udp_n > 0,
-            Duration::from_millis(lead + window + 60_000),
-        )
+        Role::Responder
+    };
+    let punched = driver::punch(&shared.rendezvous, peer, role, &opts)
         .await
-        .map_err(|e| report.explain(e))?;
-        peer_nat = offers
-            .tcp
-            .iter()
-            .chain(&offers.udp)
-            .next()
-            .map_or(NatType::Unknown, |(_, e)| e.nat);
-        policed_by_offer = offers.tcp.iter().chain(&offers.udp).any(|(_, e)| e.police);
-        // The start this side names, once, so TCP and UDP answers agree.
-        let named_start = answer_margin.map(|m| punch::now_ms() + m);
-        for (terms, maps, slot) in [
-            (&offers.tcp, &own.tcp_maps, &mut tcp_terms),
-            (&offers.udp, &own.udp_maps, &mut udp_terms),
-        ] {
-            let Some((o, e)) = terms else { continue };
-            let mut answer = Punch {
-                proto: o.proto,
-                token: o.token,
-                start_at_ms: o.start_at_ms,
-                until_ms: o.until_ms,
-                mappings: maps.clone(),
-            };
-            if let Some(start) = named_start.filter(|s| *s < o.start_at_ms) {
-                answer.until_ms = start + (o.until_ms - o.start_at_ms);
-                answer.start_at_ms = start;
-            }
-            let plan = Plan::of(&answer);
-            send_message(rdv, peer, &Message::PunchAnswerExt(answer, ext(e.police)))
-                .await
-                .map_err(|e| infra(e.to_string()))?;
-            *slot = Some((o.mappings.clone(), o.token, plan));
-        }
-    }
-
-    report.there = Some(There {
-        nat: peer_nat,
-        tcp: tcp_terms.as_ref().map_or(0, |t| t.0.len()),
-        udp: udp_terms.as_ref().map_or(0, |t| t.0.len()),
-    });
-    // The UDP plan depends on both NATs, so it is made after the exchange.
-    let udp_job = match &udp_terms {
-        Some((theirs, token, plan)) => {
-            let p = plan::udp_plan(own.nat, peer_nat, udp_n, theirs);
-            let have = udp_socks.len();
-            if p.sockets > have {
-                udp_socks.extend(
-                    punch::bind_birthday_sockets("0.0.0.0".parse().unwrap(), p.sockets - have)
-                        .await
-                        .map_err(|e| infra(format!("cannot bind UDP sockets: {e}")))?,
-                );
-            }
-            udp_socks.truncate(p.sockets);
-            report.plan = Some(match &p.dests {
-                plan::Destinations::Fixed(v) => {
-                    let extra = v.len().saturating_sub(theirs.len());
-                    let kind = if extra == 0 {
-                        "fixed".to_string()
-                    } else {
-                        format!("fixed, {extra} predicted")
-                    };
-                    format!(
-                        "{} socket(s) to {} destination(s) ({kind})",
-                        p.sockets,
-                        v.len()
-                    )
-                }
-                plan::Destinations::Birthday { count, .. } => {
-                    format!(
-                        "{} socket(s) to {count} destination(s) (birthday)",
-                        p.sockets
-                    )
-                }
-            });
-            let dests = match p.dests {
-                plan::Destinations::Fixed(v) => v,
-                plan::Destinations::Birthday { ip, count } => {
-                    punch::birthday_destinations(ip, count)
-                }
-            };
-            Some((dests, *token, *plan))
-        }
-        None => None,
-    };
-    let tcp_fut = async {
-        match &tcp_terms {
-            Some((theirs, token, plan)) => {
-                punch::punch_tcp_many(&locals, theirs, token, initiator, *plan)
-                    .await
-                    .map(Some)
-            }
-            None => Ok(None),
-        }
-    };
-    let udp_fut = async {
-        match udp_job {
-            Some((dests, token, plan)) => punch::punch_udp_all(
-                std::mem::take(&mut udp_socks),
-                &dests,
-                &token,
-                plan,
-                punch::SPRAY_PER_SECOND,
-            )
-            .await
-            .map(|(socks, index, from)| Some((socks, index, from, plan))),
-            None => Ok(None),
-        }
-    };
-    let (tcp_res, udp_res) = tokio::join!(tcp_fut, udp_fut);
-    drop(held);
-    let (tcp_streams, udp_found) = match (tcp_res, udp_res) {
-        (Err(t), Err(u)) => {
-            return Err(report.explain(infra(format!("punch failed: tcp: {t}; udp: {u}"))));
-        }
-        (Err(t), Ok(None)) => return Err(report.explain(infra(format!("punch failed: {t}")))),
-        (Ok(None), Err(u)) => return Err(report.explain(infra(format!("punch failed: {u}")))),
-        (t, u) => (t.ok().flatten().unwrap_or_default(), u.ok().flatten()),
-    };
-    let mapped = json!({
-        "tcp": own.tcp_maps.iter().map(|a| a.to_string()).collect::<Vec<_>>(),
-        "udp": own.udp_maps.iter().map(|a| a.to_string()).collect::<Vec<_>>(),
-    });
-    let summary = |mut reply: Value, udp_failed: &[String]| {
-        reply["nat"] = json!(nat_name(own.nat));
-        reply["peer_nat"] = json!(nat_name(peer_nat));
-        reply["mapped"] = mapped.clone();
-        reply["report"] = json!(format!("{}{}", report.text(), udp_clause(udp_failed)));
+        .map_err(op_error)?;
+    let info = punched.info().clone();
+    let summary = |mut reply: Value, report: String| {
+        reply["nat"] = json!(nat_name(info.nat));
+        reply["peer_nat"] = json!(nat_name(info.peer_nat));
+        reply["mapped"] = json!({
+            "tcp": info.mapped_tcp.iter().map(|a| a.to_string()).collect::<Vec<_>>(),
+            "udp": info.mapped_udp.iter().map(|a| a.to_string()).collect::<Vec<_>>(),
+        });
+        reply["report"] = json!(report);
         reply
     };
     match acceptor {
         None => {
             let batch = shared.next_punch.fetch_add(1, Ordering::Relaxed) + 1;
-            let mut set = JoinSet::new();
-            for (i, s) in tcp_streams.into_iter().enumerate() {
-                let name = format!("punched-{batch}-{i}");
-                set.spawn(vet(name, "tcp", s, police, Punched::Tcp));
+            let vetting = punched
+                .vet(&format!("punched-{batch}"))
+                .await
+                .map_err(op_error)?;
+            for p in &vetting.policed {
+                shared.emit(json!({
+                    "event": "path_policed", "peer": peer.to_string(), "name": p.name,
+                    "proto": p.proto, "up_bps": p.rates.up_bps, "down_bps": p.rates.down_bps,
+                }));
             }
-            if let Some((mut socks, index, from, _)) = udp_found {
-                let socket = socks.swap_remove(index);
-                drop(socks);
-                let name = format!("punched-{batch}-u");
-                set.spawn(async move {
-                    let std = match socket.into_std() {
-                        Ok(s) => s,
-                        Err(e) => return Vetted::Failed(name, e.to_string()),
-                    };
-                    match UdpPath::connect(std, from).await {
-                        Ok(path) => vet(name, "udp", path, police, Punched::Udp).await,
-                        Err(e) => Vetted::Failed(name, e.to_string()),
-                    }
-                });
+            if vetting.usable.is_empty() {
+                return Err(infra(vetting.dropped_message()));
             }
+            let report = vetting.report();
+            let mut policed: Vec<String> = vetting.policed.iter().map(|p| p.name.clone()).collect();
+            policed.sort();
             let mut names = Vec::new();
-            let mut policed = Vec::new();
-            let mut failed = Vec::new();
-            while let Some(done) = set.join_next().await {
-                match done {
-                    Ok(Vetted::Usable(name, path)) => {
-                        lock(&shared.punched).insert(name.clone(), path);
-                        names.push(name);
-                    }
-                    Ok(Vetted::Policed(name, proto, rates)) => {
-                        shared.emit(json!({
-                            "event": "path_policed", "peer": peer.to_string(), "name": name,
-                            "proto": proto, "up_bps": rates.up_bps, "down_bps": rates.down_bps,
-                        }));
-                        policed.push(name);
-                    }
-                    Ok(Vetted::Failed(name, why)) => failed.push(format!("{name}: {why}")),
-                    Err(e) => failed.push(e.to_string()),
-                }
+            for (name, path) in vetting.usable {
+                lock(&shared.punched).insert(name.clone(), path);
+                names.push(name);
             }
             names.sort();
-            policed.sort();
-            if names.is_empty() {
-                return Err(infra(format!(
-                    "every punched path was dropped: {} policed ({}), {} failed its check ({})",
-                    policed.len(),
-                    policed.join(", "),
-                    failed.len(),
-                    failed.join("; ")
-                )));
-            }
-            let udp_failed: Vec<String> = failed
-                .iter()
-                .filter(|f| f.starts_with("punched-") && f.contains("-u: "))
-                .cloned()
-                .collect();
             Ok(summary(
                 json!({"punched": names, "policed": policed}),
-                &udp_failed,
+                report,
             ))
         }
         Some((l, acceptor)) => {
-            let count = tcp_streams.len() + usize::from(udp_found.is_some());
-            for s in tcp_streams {
-                tokio::spawn(accept_punched(
-                    shared.clone(),
-                    acceptor.clone(),
-                    l,
-                    s,
-                    policed_by_offer,
-                ));
-            }
-            if let Some((socks, _, _, plan)) = udp_found {
-                let (sh, acc) = (shared.clone(), acceptor.clone());
-                tokio::spawn(async move {
-                    if let Ok(path) = punch::accept_udp(socks, plan).await {
-                        accept_punched(sh, acc, l, path, policed_by_offer).await;
+            let report = info.report.clone();
+            let shared = shared.clone();
+            let count = punched
+                .accept_with(move |path| {
+                    let (shared, acceptor) = (shared.clone(), acceptor.clone());
+                    async move {
+                        if let Ok(Accepted::Session(session)) =
+                            acceptor.accept(path.into_transport()).await
+                        {
+                            register(&shared, session, None, Some(l));
+                        }
                     }
-                });
-            }
-            Ok(summary(json!({"sockets": count}), &[]))
+                })
+                .map_err(op_error)?;
+            Ok(summary(json!({"sockets": count}), report))
         }
     }
 }
 
-/// The report clause for UDP paths that failed their QUIC connect, from the `name: reason`
-/// entries of the failed vets. Empty when none failed. Spec "NAT traversal" item 8.
-fn udp_clause(failed: &[String]) -> String {
-    match failed.first() {
-        Some(first) => {
-            let why = first.split_once(": ").map_or(first.as_str(), |(_, w)| w);
-            format!("; udp: did not open: {why}")
+/// A failed punch as a failed request, with its facts in `detail`.
+fn op_error(e: PunchError) -> OpError {
+    let kind = match e.kind() {
+        PunchErrorKind::Usage => "usage",
+        PunchErrorKind::Infrastructure => "infrastructure",
+    };
+    let detail = e.report().map(|report| {
+        let mut detail = json!({
+            "nat": e.nat(),
+            "peer_nat": e.peer_nat(),
+            "report": report,
+        });
+        if let Some(why) = e.nat_error() {
+            detail["nat_error"] = json!(why);
         }
-        None => String::new(),
+        detail
+    });
+    OpError {
+        kind,
+        msg: e.message().to_string(),
+        detail,
     }
-}
-
-fn random_token() -> [u8; 16] {
-    let mut t = [0u8; 16];
-    getrandom::getrandom(&mut t).expect("the operating system gave no random bytes");
-    t
 }
 
 async fn op_close(shared: &Arc<Shared>, req: &Value) -> OpResult {
