@@ -12,6 +12,12 @@ use std::time::Duration;
 
 use tokio::sync::mpsc;
 
+mod demux;
+pub use demux::{
+    Demux, MAX_PENDING_PEERS, PEER_QUEUE, PENDING_TTL, PUMP_MAX_RETRIES, PUMP_RETRY_FIRST,
+    PUMP_RETRY_MAX, PeerRendezvous,
+};
+
 use crate::identity::NodeId;
 use crate::stun::NatType;
 
