@@ -2210,6 +2210,33 @@ A `PunchOffer` with no mappings is a punch with no sockets and nothing else. It 
 
 letify implements the trait with its provider bootstraps (ssh, `colab exec`, the Kaggle API and the Drive mailbox), and these are its default rendezvous. The owner also operates a signalling service at `letify.darkpyonix.dev`, a Cloudflare Worker, which letify uses as an auxiliary rendezvous in three cases: reconnection and resumption after the client changed (a new network or a new machine), pairing of two runtimes under `host="distributed"` without the client, and nodes that have no bootstrap. The service carries only small messages, signed address records and punch timing, and never session data, so its cost is small. When the service is unreachable, letify uses the bootstrap. That changes only how addresses are exchanged, not the path that carries data, so it is not a fallback to a slower path. A relay never runs on the service: a Worker cannot accept UDP, and a relay is a node role as the [Relay](#link-relay) subsection says. Another program implements it with its own signalling. darkpyonix Ember, for example, would use a hub that publishes pkarr signed packets. The library holds no provider-specific code.
 
+#### Rendezvous demultiplexer <!-- id: link-rendezvous-demux -->
+
+> One Rendezvous shared by many concurrent punches: `Demux` routes each message to the queue of its sender.
+
+A node with one identity has one `Rendezvous` and one receive cursor. A punch (`driver::punch`, `punch_session`) reads that cursor and discards every message whose sender is not its peer, so two punches over the same Rendezvous at once steal and discard each other's messages. `letify_link::rendezvous::Demux<R>` removes that: it owns the Rendezvous `R`, runs one pump task that calls `R::recv()` and files each `(from, bytes)` under `from`, and hands out one `PeerRendezvous` per peer. The driver API is unchanged: a `PeerRendezvous` is a `Rendezvous` and is passed as `rdv`.
+
+1. **API.** `Demux::new(r: R) -> Demux<R>` (needs a running tokio runtime, spawns the pump). `Demux::peer(node) -> PeerRendezvous<R>` returns the handle of a node, for an initiator that knows whom it dials. `Demux::accept().await -> io::Result<(NodeId, PeerRendezvous<R>)>` waits for a sender that has no live handle and returns its handle, with every message already queued for it. `PeerRendezvous::send(to, msg)` passes straight to `R::send`, to any node. `PeerRendezvous::recv()` yields only the messages whose sender is the handle's node, in arrival order. Counters: `PeerRendezvous::dropped()`, `Demux::dropped()` (all handles and pending peers) and `Demux::refused()`.
+2. **Bounded queues.** Each peer queue holds at most `PEER_QUEUE` (64) messages. A message that arrives at a full queue evicts the oldest message of that queue and adds 1 to the dropped counters, so one chatty sender loses only its own oldest messages and cannot grow memory or push out another peer. Messages are at most `MAX_MESSAGE` bytes, so a queue holds at most 256 KiB.
+3. **Unclaimed peers.** A message from a sender with no live handle opens a pending peer holding its messages in a queue as in item 2. At most `MAX_PENDING_PEERS` (64) peers are pending; a message from a further new sender is discarded and counted in `refused()`, and messages from an already pending sender are still queued. A pending peer is removed `PENDING_TTL` (60 s, the signalling TTL) after its first message if nobody claimed it, and its messages are discarded. Expiry is checked when a message arrives and when `accept` or `peer` runs. `accept` returns pending peers oldest first. `peer(node)` for a node that is pending claims that pending peer with its messages, so `peer` and `accept` never both hand out the same pending peer.
+4. **Handles.** `peer(node)` for a node that already has a live handle returns another handle on the same queue; the handles compete for its messages. A handle that is dropped discards the messages still queued for it, and when the last handle of a node is dropped the node has no live handle. The next message from that node is a new pending peer for `accept`, and a later `peer(node)` starts empty (plus what a pending peer holds). Messages are not kept for a dropped handle, so a device that retries after its first punch ended is accepted as a new peer.
+5. **Pump errors.** An error of kind `BrokenPipe`, `NotConnected` or `UnexpectedEof` from `R::recv` means the Rendezvous is closed and ends the pump. Any other error is treated as transient: the pump waits 1 s, doubling to at most 30 s (`PUMP_RETRY_FIRST`, `PUMP_RETRY_MAX`), and calls `recv` again, and a recv that succeeds resets the wait. After `PUMP_MAX_RETRIES` (8) errors in a row the pump ends with the last error. When the pump ends, every `PeerRendezvous::recv` and `accept` first returns what is already queued, then fails with that error (same kind and message). Nothing is retried after that, and nothing falls back: the embedder builds a new `Demux`.
+6. **Drop.** Dropping the `Demux` aborts the pump, which drops its reference to `R`. Handles keep `R` alive for `send`. A `recv` or `accept` after the drop returns what is queued, then fails with `BrokenPipe` ("the demux was dropped").
+7. **Undecodable messages.** The pump routes raw bytes and does not decode them, so a message that fails `Message::decode` is delivered to the handle like any other and the driver skips it as it does today. Routing by sender trusts the sender reported by `R`, as the driver does; the session handshake authenticates the peer.
+
+A server:
+
+```rust
+let demux = Demux::new(SignalRendezvous::new(url, identity.clone())?);
+loop {
+    let (peer, rdv) = demux.accept().await?;
+    tokio::spawn(async move {
+        let got = punch_session(&rdv, peer, Endpoint::Responder { acceptor }, &opts).await;
+        // use got.session; rdv is dropped when the punch ends
+    });
+}
+```
+
 #### Signalling service <!-- id: link-signal -->
 
 > A Worker with one mailbox per node id carries signed bootstrap lines to a machine that has no address, so the machine needs no ssh.
